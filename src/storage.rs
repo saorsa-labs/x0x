@@ -205,7 +205,7 @@ pub async fn save_agent_keypair<P: AsRef<Path>>(kp: &AgentKeypair, path: P) -> R
 /// # Returns
 ///
 /// `Ok(())` on success, or an error if file I/O fails
-pub async fn save_machine_keypair_to<P: AsRef<Path>>(kp: &MachineKeypair, path: P) -> Result<()> {
+pub async fn save_machine_keypair_to<P: AsRef<Path> + Clone>(kp: &MachineKeypair, path: P) -> Result<()> {
     let bytes = serialize_machine_keypair(kp)?;
 
     // Ensure parent directory exists
@@ -215,7 +215,7 @@ pub async fn save_machine_keypair_to<P: AsRef<Path>>(kp: &MachineKeypair, path: 
             .map_err(IdentityError::from)?;
     }
 
-    tokio::fs::write(path, bytes)
+    tokio::fs::write(path.clone(), bytes)
         .await
         .map_err(IdentityError::from)?;
 
@@ -264,8 +264,9 @@ pub async fn load_agent_keypair<P: AsRef<Path>>(path: P) -> Result<AgentKeypair>
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::identity::{AgentKeypair, MachineKeypair};
 

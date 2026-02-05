@@ -72,6 +72,8 @@ pub type Result<T> = std::result::Result<T, IdentityError>;
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
     use super::*;
 
     #[test]
@@ -296,6 +298,7 @@ pub type NetworkResult<T> = std::result::Result<T, NetworkError>;
 
 #[cfg(test)]
 mod network_tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use std::time::Duration;
 
