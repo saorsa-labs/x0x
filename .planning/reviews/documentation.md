@@ -1,36 +1,39 @@
 # Documentation Review
-**Date**: 2026-02-05 22:42:00 GMT
+**Date**: 2026-02-05 22:44:00 GMT
 **Mode**: gsd-task
-**Task**: Task 4 - MLS Message Encryption/Decryption
+**Task**: Task 5 - MLS Welcome Flow
 
 ## Documentation Coverage
 
 ### Module documentation:
-- [OK] Clear module-level docs explaining AEAD encryption
-- [OK] ChaCha20-Poly1305 mentioned prominently
+- [OK] Clear module-level docs explaining MLS Welcome flow
+- [OK] Purpose stated: "inviting new members to groups"
+- [OK] Key concepts explained (encrypted group secrets)
 
 ### Type documentation:
-- [OK] MlsCipher fully documented
-- [OK] Fields explained (key, base_nonce)
-- [OK] Purpose and usage described
+- [OK] MlsWelcome struct fully documented
+- [OK] All fields explained with purpose
+- [OK] Security model described
 
 ### Method documentation:
-- [OK] new() - constructor with security notes
-- [OK] encrypt() - comprehensive with **CRITICAL** nonce reuse warning
-- [OK] decrypt() - explains authentication failure scenarios
-- [OK] derive_nonce() - helper method documented
-- [OK] Accessors (key, base_nonce) documented
+- [OK] create() - comprehensive with security notes
+- [OK] verify() - explains authenticity checking
+- [OK] accept() - describes decryption and reconstruction
+- [OK] Helper methods documented (derive_invitee_key, etc.)
+- [OK] Accessors (group_id, epoch) documented
 
 ### Security documentation:
-- [OK] **CRITICAL** nonce reuse warning prominently displayed
-- [OK] Authentication failure scenarios explained
-- [OK] Security implications of counter reuse documented
+- [OK] Key derivation process explained
+- [OK] Authentication mechanism described
+- [OK] Access control model documented
+- [OK] Proper use of # Security, # Arguments, # Returns, # Errors sections
 
 ## Findings
 - [OK] 100% public API documentation
-- [OK] Critical security warnings prominently placed
+- [OK] Security implications clearly explained
 - [OK] Clear explanations of cryptographic operations
-- [OK] Proper use of # Security, # Arguments, # Returns, # Errors sections
+- [OK] Proper rustdoc structure with examples in tests
+- [OK] Internal helper methods also documented
 
 ## Grade: A
-Documentation is excellent with critical security warnings properly highlighted.
+Documentation is excellent with clear security explanations throughout.

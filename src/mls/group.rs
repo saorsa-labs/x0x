@@ -44,6 +44,34 @@ impl MlsGroupContext {
         }
     }
 
+    /// Creates a group context with specific cryptographic material.
+    ///
+    /// This is used when reconstructing a context from a Welcome message.
+    /// Unlike `new()`, this allows setting all fields including epoch and hashes.
+    ///
+    /// # Arguments
+    /// * `group_id` - Unique identifier for the group
+    /// * `epoch` - Current epoch number
+    /// * `tree_hash` - Hash of the ratchet tree structure
+    /// * `confirmed_transcript_hash` - Hash of the confirmed transcript
+    ///
+    /// # Returns
+    /// A new `MlsGroupContext` with the specified cryptographic material.
+    #[must_use]
+    pub(crate) fn new_with_material(
+        group_id: Vec<u8>,
+        epoch: u64,
+        tree_hash: Vec<u8>,
+        confirmed_transcript_hash: Vec<u8>,
+    ) -> Self {
+        Self {
+            group_id,
+            epoch,
+            tree_hash,
+            confirmed_transcript_hash,
+        }
+    }
+
     /// Gets the group ID.
     #[must_use]
     pub fn group_id(&self) -> &[u8] {

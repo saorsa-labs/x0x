@@ -1,36 +1,39 @@
 # Security Review
-**Date**: 2026-02-05 22:42:00 GMT
+**Date**: 2026-02-05 22:44:00 GMT
 **Mode**: gsd-task
-**Task**: Task 4 - MLS Message Encryption/Decryption
+**Task**: Task 5 - MLS Welcome Flow
 
 ## Scan Results
 
 ### unsafe code:
-None found
+None found in src/mls/welcome.rs
 
 ### Cryptographic implementation:
-- [OK] Using ChaCha20-Poly1305 from `chacha20poly1305` crate (well-audited)
-- [OK] AEAD provides both confidentiality and authenticity
-- [OK] Per-message nonce derivation via XOR with counter
-- [OK] Authentication tag verified on decryption
-- [OK] AAD (Additional Authenticated Data) properly supported
-
-### Security warnings:
-- [OK] **CRITICAL** nonce reuse warning in encrypt() documentation
-- [OK] Authentication failure scenarios documented
-- [OK] Clear explanation of security implications
+- [OK] Using ChaCha20-Poly1305 via MlsCipher (industry-standard AEAD)
+- [OK] Key derivation using BLAKE3 (modern, fast, secure hash)
+- [OK] Per-invitee key derivation (derive_invitee_key)
+- [OK] Authentication via confirmation_tag (BLAKE3-based)
+- [OK] Additional Authenticated Data (AAD) properly constructed
+- [OK] Encrypted secrets only decrypt able by intended invitee
 
 ### Key management:
 - [OK] No hardcoded keys
-- [OK] Keys passed in constructor (from key schedule)
-- [OK] No key material leakage
+- [OK] Keys derived from AgentId + group_id + epoch
+- [OK] Unique key per invitee
+- [OK] Epoch-specific keys (forward secrecy)
+
+### Access control:
+- [OK] HashMap<AgentId, Vec<u8>> ensures per-invitee encryption
+- [OK] accept() method validates invitee identity
+- [OK] Wrong agent cannot decrypt (test_welcome_accept_rejects_wrong_agent)
 
 ## Findings
-- [OK] Industry-standard AEAD cipher (ChaCha20-Poly1305)
-- [OK] Proper nonce handling (base + counter XOR)
-- [OK] Authentication tag prevents tampering
-- [OK] Critical security warnings documented
-- [OK] No cryptographic vulnerabilities identified
+- [OK] Modern cryptographic primitives (BLAKE3, ChaCha20-Poly1305)
+- [OK] Proper key derivation with unique-per-invitee keys
+- [OK] Authentication prevents tampering (confirmation_tag)
+- [OK] Access control enforced (only intended invitee can decrypt)
+- [OK] No security vulnerabilities identified
+- [OK] Follows MLS security model
 
 ## Grade: A
-Security is excellent. Proper use of authenticated encryption with clear security warnings.
+Security is excellent. Proper use of authenticated encryption with secure key derivation.

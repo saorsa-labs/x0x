@@ -1,35 +1,34 @@
 # Test Coverage Review
-**Date**: 2026-02-05 22:42:00 GMT
+**Date**: 2026-02-05 22:44:00 GMT
 **Mode**: gsd-task
-**Task**: Task 4 - MLS Message Encryption/Decryption
+**Task**: Task 5 - MLS Welcome Flow
 
 ## Test Statistics
 
 ### Test counts:
-- New tests: 13 comprehensive tests in src/mls/cipher.rs
-- Total tests: 232/232 PASS
+- New tests: 11 comprehensive tests in src/mls/welcome.rs
+- Total tests: 243/243 PASS (+11 from previous 232)
 
 ### Test coverage:
-- [x] Encrypt/decrypt round-trip (test_encrypt_decrypt_roundtrip)
-- [x] Authentication tag verification (test_authentication_tag_verification)
-- [x] Wrong AAD fails (test_wrong_aad_fails)
-- [x] Wrong counter fails (test_wrong_counter_fails)
-- [x] Different counters produce different ciphertexts (test_different_counters_produce_different_ciphertexts)
-- [x] Empty plaintext (test_empty_plaintext)
-- [x] Empty AAD (test_empty_aad)
-- [x] Large plaintext (test_large_plaintext - 10KB)
-- [x] Counter edge cases (test_counter_zero, test_counter_max)
-- [x] Accessors (test_cipher_accessors)
-- [x] Nonce derivation deterministic (test_nonce_derivation_deterministic)
-- [x] Different keys (test_different_keys_produce_different_ciphertexts)
+- [x] Welcome creation (test_welcome_creation)
+- [x] Welcome verification (test_welcome_verification)  
+- [x] Verification rejects empty group_id (test_welcome_verification_rejects_empty_group_id)
+- [x] Verification rejects empty tree (test_welcome_verification_rejects_empty_tree)
+- [x] Verification rejects invalid tag (test_welcome_verification_rejects_invalid_tag)
+- [x] Accept by invitee (test_welcome_accept_by_invitee)
+- [x] Accept rejects wrong agent (test_welcome_accept_rejects_wrong_agent)
+- [x] Key derivation deterministic (test_invitee_key_derivation_is_deterministic)
+- [x] Key varies with epoch (test_invitee_key_varies_with_epoch)
+- [x] Key varies with agent (test_invitee_key_varies_with_agent)
+- [x] Serialization round-trip (test_welcome_serialization)
 
 ## Findings
 - [OK] Comprehensive test coverage for all requirements
-- [OK] Security properties tested (authentication, tampering detection)
-- [OK] Edge cases tested (empty data, large data, counter limits)
-- [OK] All 232 tests pass
-- [OK] Authentication failure scenarios tested
-- [OK] Counter uniqueness tested
+- [OK] Security properties tested (access control, authentication)
+- [OK] Edge cases tested (empty fields, invalid data, wrong agent)
+- [OK] All 243 tests pass
+- [OK] Cryptographic properties tested (key uniqueness, determinism)
+- [OK] Helper functions create_test_group() and create_test_invitee() for clean test setup
 
 ## Grade: A
-Test coverage is excellent. All specification requirements and edge cases thoroughly tested.
+Test coverage is excellent. All specification requirements and security properties thoroughly tested with 11 comprehensive tests.

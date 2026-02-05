@@ -1,53 +1,58 @@
 # Task Specification Review
-**Date**: 2026-02-05 22:42:00 GMT
-**Task**: Phase 1.5, Task 4 - Implement MLS Message Encryption/Decryption
+**Date**: 2026-02-05 22:44:00 GMT
+**Task**: Phase 1.5, Task 5 - Implement MLS Welcome Flow
 **Mode**: gsd-task
 
 ## Task Specification
 
 From `.planning/PLAN-phase-1.5.md`:
-- File: `src/mls/cipher.rs`
-- Implement MlsCipher struct
-- Required methods: new, encrypt, decrypt
-- Requirements: Use chacha20poly1305 crate, per-message nonces, authenticated encryption, proper error handling
-- Tests: Encrypt/decrypt round-trip, authentication tag verification, different counters
+- File: `src/mls/welcome.rs`
+- Implement MlsWelcome struct
+- Required methods: create, verify, accept
+- Requirements: Encrypt group secrets per invitee, include tree, verification, proper error handling
+- Tests: Welcome creation/verification, invitee can decrypt, invalid welcomes rejected
 
 ## Spec Compliance
 
 ### Data Structure:
-- [x] MlsCipher implemented
-- [x] Fields: key (Vec<u8>), base_nonce (Vec<u8>)
+- [x] MlsWelcome implemented with all required fields
+- [x] Fields: group_id, epoch, encrypted_group_secrets, tree, confirmation_tag
+- [x] Proper Serialize/Deserialize derives
 
 ### Required Methods:
-- [x] new(key, base_nonce) -> Self
-- [x] encrypt(&self, plaintext, aad, counter) -> Result<Vec<u8>>
-- [x] decrypt(&self, ciphertext, aad, counter) -> Result<Vec<u8>>
+- [x] create(group, invitee) -> Result<Self>
+- [x] verify(&self) -> Result<()>
+- [x] accept(&self, agent_id) -> Result<MlsGroupContext>
 
 ### Requirements:
-- [x] Use chacha20poly1305 crate (added to Cargo.toml)
-- [x] Per-message nonce from counter (derive_nonce with XOR)
-- [x] Authenticated encryption (AEAD via ChaCha20-Poly1305)
-- [x] Proper error handling (MlsError::EncryptionError, DecryptionError)
+- [x] Encrypt group secrets per invitee (using derive_invitee_key with BLAKE3)
+- [x] Include tree for new member (serialize_tree method)
+- [x] Verification of welcome authenticity (confirmation_tag with BLAKE3)
+- [x] Proper error handling (MlsError types, no unwrap in production)
 
-### Tests:
-- [x] Encrypt/decrypt round-trip (test_encrypt_decrypt_roundtrip)
-- [x] Authentication tag verification (test_authentication_tag_verification)
-- [x] Different counters produce different ciphertexts (test_different_counters_produce_different_ciphertexts)
-- [x] Additional tests: wrong AAD, wrong counter, empty data, large data, edge cases
+### Required Tests:
+- [x] Welcome creation and verification (test_welcome_creation, test_welcome_verification)
+- [x] Invitee can decrypt welcome (test_welcome_accept_by_invitee)
+- [x] Invalid welcomes rejected (test_welcome_verification_rejects_* - 3 tests)
 
 ## Beyond Spec (Good Additions):
-- [+] Helper method derive_nonce() (DRY principle)
-- [+] Accessors for key and base_nonce
-- [+] Critical nonce reuse security warning
-- [+] 13 tests vs 3 required
-- [+] Edge case testing (empty, large, counter limits)
+- [+] Additional test: test_welcome_accept_rejects_wrong_agent
+- [+] Additional tests: test_invitee_key_derivation_is_deterministic
+- [+] Additional tests: test_invitee_key_varies_with_epoch/agent
+- [+] Additional test: test_welcome_serialization (bincode)
+- [+] Helper methods: derive_invitee_key, build_aad, serialize_group_secrets, serialize_tree, generate_confirmation_tag, deserialize_group_context
+- [+] new_with_material constructor added to MlsGroupContext in group.rs
+- [+] Accessors: group_id(), epoch()
+- [+] Comprehensive documentation with security notes
+- [+] Total 11 tests vs 3 minimum required
 
 ## Findings
 - [OK] All specification requirements met
 - [OK] Implementation matches task description exactly
 - [OK] Cryptographic quality exceeds requirements
 - [OK] Security documentation excellent
-- [OK] No scope creep
+- [OK] No scope creep - additions are logical helpers
+- [OK] Proper module integration (mod.rs exports MlsWelcome)
 
 ## Grade: A
-Task specification fully implemented with excellent quality and comprehensive testing.
+Task specification fully implemented with excellent quality and comprehensive testing. 11 tests provide thorough coverage beyond minimum requirements.
