@@ -278,13 +278,19 @@ impl Agent {
     /// ```ignore
     /// let list = agent.create_task_list("Sprint Planning", "team-sprint").await?;
     /// ```
-    pub async fn create_task_list(&self, _name: &str, _topic: &str) -> error::Result<TaskListHandle> {
+    pub async fn create_task_list(
+        &self,
+        _name: &str,
+        _topic: &str,
+    ) -> error::Result<TaskListHandle> {
         // TODO: Implement task list creation when gossip runtime is available
         // This would:
         // 1. Create a new TaskList with TaskListId::from_content(name, agent_id, timestamp)
         // 2. Wrap it in TaskListSync with the gossip runtime
         // 3. Return a TaskListHandle
-        Err(error::IdentityError::Storage(std::io::Error::other("TaskList creation not yet implemented")))
+        Err(error::IdentityError::Storage(std::io::Error::other(
+            "TaskList creation not yet implemented",
+        )))
     }
 
     /// Join an existing task list by topic.
@@ -312,7 +318,9 @@ impl Agent {
         // 2. Subscribe to the topic to receive updates
         // 3. Start anti-entropy sync
         // 4. Return a TaskListHandle
-        Err(error::IdentityError::Storage(std::io::Error::other("TaskList joining not yet implemented")))
+        Err(error::IdentityError::Storage(std::io::Error::other(
+            "TaskList joining not yet implemented",
+        )))
     }
 }
 
@@ -463,9 +471,15 @@ impl TaskListHandle {
     /// # Returns
     ///
     /// The TaskId of the created task.
-    pub async fn add_task(&self, _title: String, _description: String) -> error::Result<crdt::TaskId> {
+    pub async fn add_task(
+        &self,
+        _title: String,
+        _description: String,
+    ) -> error::Result<crdt::TaskId> {
         // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other("TaskListHandle not yet implemented")))
+        Err(error::IdentityError::Storage(std::io::Error::other(
+            "TaskListHandle not yet implemented",
+        )))
     }
 
     /// Claim a task in the list.
@@ -475,7 +489,9 @@ impl TaskListHandle {
     /// * `task_id` - ID of the task to claim
     pub async fn claim_task(&self, _task_id: crdt::TaskId) -> error::Result<()> {
         // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other("TaskListHandle not yet implemented")))
+        Err(error::IdentityError::Storage(std::io::Error::other(
+            "TaskListHandle not yet implemented",
+        )))
     }
 
     /// Complete a task in the list.
@@ -485,7 +501,9 @@ impl TaskListHandle {
     /// * `task_id` - ID of the task to complete
     pub async fn complete_task(&self, _task_id: crdt::TaskId) -> error::Result<()> {
         // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other("TaskListHandle not yet implemented")))
+        Err(error::IdentityError::Storage(std::io::Error::other(
+            "TaskListHandle not yet implemented",
+        )))
     }
 
     /// List all tasks in their current order.
@@ -495,7 +513,9 @@ impl TaskListHandle {
     /// A vector of `TaskSnapshot` representing the current state.
     pub async fn list_tasks(&self) -> error::Result<Vec<TaskSnapshot>> {
         // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other("TaskListHandle not yet implemented")))
+        Err(error::IdentityError::Storage(std::io::Error::other(
+            "TaskListHandle not yet implemented",
+        )))
     }
 
     /// Reorder tasks in the list.
@@ -505,7 +525,9 @@ impl TaskListHandle {
     /// * `task_ids` - New ordering of task IDs
     pub async fn reorder(&self, _task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
         // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other("TaskListHandle not yet implemented")))
+        Err(error::IdentityError::Storage(std::io::Error::other(
+            "TaskListHandle not yet implemented",
+        )))
     }
 }
 

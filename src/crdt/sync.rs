@@ -159,11 +159,7 @@ impl TaskListSync {
     /// # Errors
     ///
     /// Returns an error if the merge fails.
-    pub async fn apply_remote_delta(
-        &self,
-        peer_id: PeerId,
-        delta: TaskListDelta,
-    ) -> Result<()> {
+    pub async fn apply_remote_delta(&self, peer_id: PeerId, delta: TaskListDelta) -> Result<()> {
         // Acquire write lock
         let mut task_list = self.task_list.write().await;
 
@@ -237,7 +233,7 @@ impl TaskListSync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crdt::{TaskListId, TaskMetadata, TaskItem, TaskId};
+    use crate::crdt::{TaskId, TaskItem, TaskListId, TaskMetadata};
     use crate::identity::AgentId;
 
     fn agent(n: u8) -> AgentId {

@@ -30,6 +30,7 @@
 pub mod checkbox;
 pub mod delta;
 pub mod error;
+pub mod persistence;
 pub mod sync;
 pub mod task;
 pub mod task_item;
@@ -39,6 +40,7 @@ pub mod task_list;
 pub use checkbox::{CheckboxError, CheckboxState};
 pub use delta::TaskListDelta;
 pub use error::{CrdtError, Result};
+pub use persistence::TaskListStorage;
 pub use sync::TaskListSync;
 pub use task::{TaskId, TaskMetadata};
 pub use task_item::TaskItem;

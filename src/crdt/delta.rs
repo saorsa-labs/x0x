@@ -133,12 +133,7 @@ impl TaskList {
         }
 
         // Include current ordering
-        delta.ordering_update = Some(
-            self.tasks_ordered()
-                .iter()
-                .map(|t| *t.id())
-                .collect(),
-        );
+        delta.ordering_update = Some(self.tasks_ordered().iter().map(|t| *t.id()).collect());
 
         // Include current name
         delta.name_update = Some(self.name().to_string());

@@ -8,7 +8,7 @@
 //! ## Ordering Strategy
 //!
 //! Since saorsa-gossip doesn't provide RGA (Replicated Growable Array),
-//! we use LwwRegister<Vec<TaskId>> for ordering:
+//! we use `LwwRegister<Vec<TaskId>>` for ordering:
 //! - On merge, the latest vector clock wins
 //! - Tasks in OR-Set but not in ordering vector are appended to the end
 //!

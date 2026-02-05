@@ -39,7 +39,7 @@ impl MachineId {
     pub fn as_bytes(&self) -> &[u8; PEER_ID_LENGTH] {
         &self.0
     }
-    /// Convert to Vec<u8>.
+    /// Convert to `Vec<u8>`.
     #[inline]
     #[must_use]
     pub fn to_vec(&self) -> Vec<u8> {
@@ -69,7 +69,7 @@ impl AgentId {
     pub fn as_bytes(&self) -> &[u8; PEER_ID_LENGTH] {
         &self.0
     }
-    /// Convert to Vec<u8>.
+    /// Convert to `Vec<u8>`.
     #[inline]
     #[must_use]
     pub fn to_vec(&self) -> Vec<u8> {
