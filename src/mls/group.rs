@@ -296,8 +296,8 @@ impl MlsGroup {
 
     /// Adds a new member to the group.
     ///
-    /// Creates a commit that adds the specified agent to the group. The commit
-    /// must be applied via `apply_commit` to take effect.
+    /// Creates and applies a commit that adds the specified agent to the group.
+    /// The commit is automatically applied to update the group state.
     ///
     /// # Arguments
     /// * `member` - Agent ID to add to the group
@@ -320,16 +320,16 @@ impl MlsGroup {
         let operations = vec![CommitOperation::AddMember(member)];
         let commit = self.create_commit(operations)?;
 
-        // Store as pending
-        self.pending_commits.push(commit.clone());
+        // Apply the commit immediately
+        self.apply_commit(&commit)?;
 
         Ok(commit)
     }
 
     /// Removes a member from the group.
     ///
-    /// Creates a commit that removes the specified agent from the group. The commit
-    /// must be applied via `apply_commit` to take effect.
+    /// Creates and applies a commit that removes the specified agent from the group.
+    /// The commit is automatically applied to update the group state.
     ///
     /// # Arguments
     /// * `member` - Agent ID to remove from the group
@@ -352,8 +352,8 @@ impl MlsGroup {
         let operations = vec![CommitOperation::RemoveMember(member)];
         let commit = self.create_commit(operations)?;
 
-        // Store as pending
-        self.pending_commits.push(commit.clone());
+        // Apply the commit immediately
+        self.apply_commit(&commit)?;
 
         Ok(commit)
     }
@@ -500,7 +500,7 @@ mod tests {
 
         let mut group = MlsGroup::new(group_id, initiator).unwrap();
 
-        // Add member
+        // Add member (auto-applies commit)
         let commit = group.add_member(new_member);
         assert!(commit.is_ok());
 
@@ -508,11 +508,7 @@ mod tests {
         assert_eq!(commit.epoch(), 0);
         assert_eq!(commit.operations().len(), 1);
 
-        // Apply commit
-        let result = group.apply_commit(&commit);
-        assert!(result.is_ok());
-
-        // Verify member was added
+        // Verify member was added (commit was auto-applied)
         assert_eq!(group.current_epoch(), 1);
         assert_eq!(group.members().len(), 2);
         assert!(group.is_member(&new_member));
@@ -539,19 +535,14 @@ mod tests {
 
         let mut group = MlsGroup::new(group_id, initiator).unwrap();
 
-        // Add and apply
-        let commit = group.add_member(member).unwrap();
-        group.apply_commit(&commit).unwrap();
+        // Add member (auto-applies)
+        let _commit = group.add_member(member).unwrap();
 
         assert_eq!(group.members().len(), 2);
 
-        // Remove member
+        // Remove member (auto-applies)
         let commit = group.remove_member(member);
         assert!(commit.is_ok());
-
-        let commit = commit.unwrap();
-        let result = group.apply_commit(&commit);
-        assert!(result.is_ok());
 
         // Verify member was removed
         assert_eq!(group.current_epoch(), 2);
