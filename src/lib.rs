@@ -57,6 +57,12 @@ pub mod storage;
 /// Network transport layer for x0x.
 pub mod network;
 
+/// Gossip overlay networking for x0x.
+pub mod gossip;
+
+// Re-export key gossip types
+pub use gossip::{GossipConfig, GossipRuntime};
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
