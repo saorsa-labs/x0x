@@ -146,7 +146,7 @@ impl Agent {
     /// The machine keypair is stored persistently in `~/.x0x/machine.key`.
     ///
     /// For more control, use [`Agent::builder()`].
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new() -> error::Result<Self> {
         Agent::builder().build().await
     }
 
@@ -206,7 +206,7 @@ impl Agent {
     ///
     /// This begins the gossip protocol, discovering peers and
     /// participating in epidemic broadcast.
-    pub async fn join_network(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn join_network(&self) -> error::Result<()> {
         // Placeholder — will connect via ant-quic and join saorsa-gossip overlay
         Ok(())
     }
@@ -218,7 +218,7 @@ impl Agent {
     pub async fn subscribe(
         &self,
         _topic: &str,
-    ) -> Result<Subscription, Box<dyn std::error::Error>> {
+    ) -> error::Result<Subscription> {
         Ok(Subscription { _private: () })
     }
 
@@ -231,7 +231,7 @@ impl Agent {
         &self,
         _topic: &str,
         _payload: Vec<u8>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> error::Result<()> {
         // Placeholder — will use saorsa-gossip pubsub
         Ok(())
     }
