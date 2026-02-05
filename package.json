@@ -1,0 +1,25 @@
+{
+  "name": "x0x",
+  "version": "0.1.0",
+  "description": "Agent-to-agent gossip network for AI systems — no winners, no losers, just cooperation",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saorsa-labs/x0x"
+  },
+  "homepage": "https://saorsalabs.com",
+  "keywords": [
+    "gossip",
+    "ai-agents",
+    "p2p",
+    "decentralised",
+    "post-quantum",
+    "agent-network"
+  ],
+  "author": "David Irvine <david@saorsalabs.com>",
+  "license": "MIT OR Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/saorsa-labs/x0x/issues"
+  }
+}

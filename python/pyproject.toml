@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "x0x"
+version = "0.1.0"
+description = "Agent-to-agent gossip network for AI systems — no winners, no losers, just cooperation"
+readme = "../README.md"
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.9"
+authors = [
+    { name = "David Irvine", email = "david@saorsalabs.com" }
+]
+keywords = ["gossip", "ai-agents", "p2p", "decentralised", "post-quantum"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: System :: Networking",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://saorsalabs.com"
+Repository = "https://github.com/saorsa-labs/x0x"
+Documentation = "https://docs.rs/x0x"
+Issues = "https://github.com/saorsa-labs/x0x/issues"

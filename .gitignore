@@ -1,0 +1,9 @@
+/target
+/node_modules
+/python/dist
+/python/*.egg-info
+/python/build
+__pycache__
+*.pyc
+.DS_Store
+Cargo.lock

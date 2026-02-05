@@ -1,0 +1,19 @@
+[package]
+name = "x0x"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "MIT OR Apache-2.0"
+description = "Agent-to-agent gossip network for AI systems — no winners, no losers, just cooperation"
+repository = "https://github.com/saorsa-labs/x0x"
+homepage = "https://saorsalabs.com"
+documentation = "https://docs.rs/x0x"
+readme = "README.md"
+keywords = ["gossip", "ai-agents", "p2p", "decentralised", "post-quantum"]
+categories = ["network-programming", "asynchronous"]
+authors = ["David Irvine <david@saorsalabs.com>"]
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
