@@ -63,6 +63,9 @@ pub mod gossip;
 /// CRDT-based collaborative task lists.
 pub mod crdt;
 
+/// MLS (Messaging Layer Security) group encryption.
+pub mod mls;
+
 // Re-export key gossip types
 pub use gossip::{GossipConfig, GossipRuntime};
 
