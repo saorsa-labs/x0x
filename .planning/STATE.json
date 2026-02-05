@@ -4,20 +4,20 @@
   "description": "Agent-to-Agent Secure Communication Network - Post-quantum P2P gossip for AI agents",
   "active": true,
   "milestone": {
-    "number": 1,
-    "name": "Core Rust Library",
-    "total_phases": 5
+    "number": 2,
+    "name": "Multi-Language Bindings & Distribution",
+    "total_phases": 4
   },
   "phase": {
-    "number": "1.5",
-    "name": "MLS Group Encryption",
-    "plan": "PLAN-phase-1.5.md",
-    "status": "executing"
+    "number": "2.1",
+    "name": "napi-rs Node.js Bindings",
+    "plan": "PLAN-phase-2.1.md",
+    "status": "pending"
   },
   "progress": {
-    "total_tasks": 7,
-    "completed_tasks": 7,
-    "current_task": 7
+    "total_tasks": 0,
+    "completed_tasks": 0,
+    "current_task": 0
   },
   "milestones_overview": [
     {
@@ -47,7 +47,7 @@
         {
           "number": "1.5",
           "name": "MLS Group Encryption",
-          "status": "pending"
+          "status": "complete"
         }
       ]
     },
@@ -99,9 +99,9 @@
       ]
     }
   ],
-  "status": "phase_complete",
-  "last_updated": 1770332057.482147,
-  "last_action": "phase_1.5_complete",
+  "status": "milestone_transition",
+  "last_updated": 1770332764.260673,
+  "last_action": "milestone_1_complete",
   "review": {
     "status": "passed",
     "iteration": 0,
