@@ -113,5 +113,6 @@
   },
   "task_3_ready_for_review": true,
   "task_3_review_complete": true,
-  "task_3_consensus": "UNANIMOUS PASS"
+  "task_3_consensus": "UNANIMOUS PASS",
+  "task_3_glm_review": "complete"
 }
