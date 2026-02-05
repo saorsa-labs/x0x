@@ -1,4 +1,16 @@
 // Copyright 2024 Saorsa Labs Ltd.
+//! Core identity types for x0x agents.
+//!
+//! This module provides cryptographic identity primitives for agents in the x0x network:
+//!
+//! - **MachineId**: Identifies physical hardware (one per machine)
+//! - **AgentId**: Identifies individual AI agents (one per agent instance)
+//! - **Keypairs**: ML-DSA-65 post-quantum cryptographic keypairs
+//! - **Identity**: Combined machine + agent identity for network participation
+//!
+//! All identifiers are cryptographically derived from ML-DSA-65 public keys,
+//! ensuring tamper-proof and verifiable identities without central authorities.
+
 use ant_quic::{derive_peer_id_from_public_key, MlDsaPublicKey, MlDsaSecretKey, PeerId as AntQuicPeerId};
 use serde::{Deserialize, Serialize};
 use hex;

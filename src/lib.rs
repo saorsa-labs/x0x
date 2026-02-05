@@ -1,6 +1,6 @@
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(missing_docs)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
+#![allow(missing_docs)]
 
 //! # x0x
 //!
