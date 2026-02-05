@@ -25,9 +25,11 @@
 
 use ant_quic::{derive_peer_id_from_public_key, MlDsaPublicKey, MlDsaSecretKey};
 use serde::{Deserialize, Serialize};
-
 // Used for Display impl to show hex fingerprints
 use hex;
+
+/// Length of a PeerId in bytes (SHA-256 hash output).
+pub const PEER_ID_LENGTH: usize = 32;
 
 /// Machine-pinned identity derived from ML-DSA-65 keypair.
 ///
@@ -47,7 +49,7 @@ use hex;
 /// let machine_id = keypair.machine_id();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MachineId(pub [u8; 32]);
+pub struct MachineId(pub [u8; PEER_ID_LENGTH]);
 
 /// Portable agent identity derived from ML-DSA-65 keypair.
 ///
@@ -67,7 +69,7 @@ pub struct MachineId(pub [u8; 32]);
 /// let agent_id = keypair.agent_id();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AgentId(pub [u8; 32]);
+pub struct AgentId(pub [u8; PEER_ID_LENGTH]);
 
 impl MachineId {
     /// Derive a MachineId from an ML-DSA-65 public key.
@@ -95,7 +97,7 @@ impl MachineId {
     /// A reference to the 32-byte array.
     #[inline]
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub fn as_bytes(&self) -> &[u8; PEER_ID_LENGTH] {
         &self.0
     }
 
@@ -164,7 +166,7 @@ impl AgentId {
     /// A reference to the 32-byte array.
     #[inline]
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub fn as_bytes(&self) -> &[u8; PEER_ID_LENGTH] {
         &self.0
     }
 
@@ -232,12 +234,23 @@ impl std::fmt::Display for AgentId {
 ///
 /// The secret key is never exposed directly - accessors return references
 /// to prevent cloning.
-#[derive(Debug)]
 pub struct MachineKeypair {
     /// The public key component.
     public_key: MlDsaPublicKey,
     /// The secret key component (never exposed directly).
     secret_key: MlDsaSecretKey,
+}
+
+/// Custom Debug implementation that redacts secret key material.
+///
+/// This prevents secret keys from being leaked in logs or debug output.
+impl std::fmt::Debug for MachineKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MachineKeypair")
+            .field("public_key", &self.public_key)
+            .field("secret_key", &"<REDACTED>")
+            .finish()
+    }
 }
 
 impl MachineKeypair {
@@ -344,12 +357,23 @@ impl MachineKeypair {
 ///
 /// The secret key is never exposed directly - accessors return references
 /// to prevent cloning.
-#[derive(Debug)]
 pub struct AgentKeypair {
     /// The public key component.
     public_key: MlDsaPublicKey,
     /// The secret key component (never exposed directly).
     secret_key: MlDsaSecretKey,
+}
+
+/// Custom Debug implementation that redacts secret key material.
+///
+/// This prevents secret keys from being leaked in logs or debug output.
+impl std::fmt::Debug for AgentKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentKeypair")
+            .field("public_key", &self.public_key)
+            .field("secret_key", &"<REDACTED>")
+            .finish()
+    }
 }
 
 impl AgentKeypair {
@@ -455,12 +479,23 @@ impl AgentKeypair {
 ///
 /// The machine keypair is stored locally and used for transport authentication.
 /// The agent keypair is portable and represents the agent's persistent identity.
-#[derive(Debug)]
 pub struct Identity {
     /// The machine-pinned keypair for QUIC transport.
     machine_keypair: MachineKeypair,
     /// The portable agent keypair for cross-machine identity.
     agent_keypair: AgentKeypair,
+}
+
+/// Custom Debug implementation that redacts secret key material.
+///
+/// This prevents secret keys from being leaked in logs or debug output.
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("machine_keypair", &self.machine_keypair)
+            .field("agent_keypair", &self.agent_keypair)
+            .finish()
+    }
 }
 
 impl Identity {
@@ -554,7 +589,7 @@ mod tests {
         let machine_id = MachineId::from_public_key(keypair.public_key());
 
         // Verify it's a 32-byte array
-        assert_eq!(machine_id.as_bytes().len(), 32);
+        assert_eq!(machine_id.as_bytes().len(), PEER_ID_LENGTH);
     }
 
     #[test]
@@ -583,7 +618,7 @@ mod tests {
         let agent_id = AgentId::from_public_key(keypair.public_key());
 
         // Verify it's a 32-byte array
-        assert_eq!(agent_id.as_bytes().len(), 32);
+        assert_eq!(agent_id.as_bytes().len(), PEER_ID_LENGTH);
     }
 
     #[test]
@@ -619,8 +654,8 @@ mod tests {
     fn test_identity_generation() {
         let identity = Identity::generate().unwrap();
 
-        assert!(identity.machine_id().as_bytes().len() == 32);
-        assert!(identity.agent_id().as_bytes().len() == 32);
+        assert!(identity.machine_id().as_bytes().len() == PEER_ID_LENGTH);
+        assert!(identity.agent_id().as_bytes().len() == PEER_ID_LENGTH);
     }
 
     #[test]

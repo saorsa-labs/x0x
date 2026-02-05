@@ -60,7 +60,7 @@ pub mod storage;
 /// Agents discover each other through gossip and communicate
 /// via epidemic broadcast.
 ///
-/// An Agent wraps an [`Identity`] that provides:
+/// An Agent wraps an [`identity::Identity`] that provides:
 /// - `machine_id`: Tied to this computer (for QUIC transport authentication)
 /// - `agent_id`: Portable across machines (for agent persistence)
 ///
@@ -166,7 +166,7 @@ impl Agent {
     ///
     /// # Returns
     ///
-    /// A reference to the agent's [`Identity`].
+    /// A reference to the agent's [`identity::Identity`].
     #[inline]
     #[must_use]
     pub fn identity(&self) -> &identity::Identity {

@@ -1,0 +1,7 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on artifact directory
+ Documenting x0x v0.1.0 (/Users/davidirvine/Desktop/Devel/projects/x0x)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 04s
+   Generated /Users/davidirvine/Desktop/Devel/projects/x0x/target/doc/x0x/index.html

@@ -1,0 +1,21 @@
+ Documenting x0x v0.1.0 (/Users/davidirvine/Desktop/Devel/projects/x0x)
+warning: unresolved link to `Identity`
+  --> src/lib.rs:63:25
+   |
+63 | /// An Agent wraps an [`Identity`] that provides:
+   |                         ^^^^^^^^ no item named `Identity` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+   = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default
+
+warning: unresolved link to `Identity`
+   --> src/lib.rs:169:38
+    |
+169 |     /// A reference to the agent's [`Identity`].
+    |                                      ^^^^^^^^ no item named `Identity` in scope
+    |
+    = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: `x0x` (lib doc) generated 2 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.73s
+   Generated /Users/davidirvine/Desktop/Devel/projects/x0x/target/doc/x0x/index.html

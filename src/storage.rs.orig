@@ -122,11 +122,11 @@ async fn x0x_dir() -> Result<std::path::PathBuf> {
 pub async fn save_machine_keypair(kp: &MachineKeypair) -> Result<()> {
     let dir = x0x_dir().await?;
     fs::create_dir_all(&dir).await
-        From::from?;
+        .map_err(|e| IdentityError::Storage(e))?;
     let path = dir.join(MACHINE_KEY_FILE);
     let bytes = serialize_machine_keypair(kp)?;
     fs::write(&path, bytes).await
-        From::from?;
+        .map_err(|e| IdentityError::Storage(e))?;
     Ok(())
 }
 
@@ -138,7 +138,7 @@ pub async fn save_machine_keypair(kp: &MachineKeypair) -> Result<()> {
 pub async fn load_machine_keypair() -> Result<MachineKeypair> {
     let path = x0x_dir().await?.join(MACHINE_KEY_FILE);
     let bytes = fs::read(&path).await
-        From::from?;
+        .map_err(|e| IdentityError::Storage(e))?;
     deserialize_machine_keypair(&bytes)
 }
 
@@ -170,9 +170,9 @@ pub async fn save_agent_keypair<P: AsRef<Path>>(kp: &AgentKeypair, path: P) -> R
             "invalid path: missing parent directory"
         )))?;
     fs::create_dir_all(parent).await
-        From::from?;
+        .map_err(|e| IdentityError::Storage(e))?;
     fs::write(path, bytes).await
-        From::from?;
+        .map_err(|e| IdentityError::Storage(e))?;
     Ok(())
 }
 
@@ -238,7 +238,10 @@ pub async fn load_agent_keypair<P: AsRef<Path>>(path: P) -> Result<AgentKeypair>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{MachineKeypair, AgentKeypair};
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+    #![allow(clippy::redundant_closure)]
+    #![allow(clippy::needless_borrow)]
 
     #[tokio::test]
     async fn test_keypair_serialization_roundtrip() {
@@ -300,13 +303,13 @@ mod tests {
     async fn save_machine_keypair_to_path(kp: &MachineKeypair, path: &Path) -> Result<()> {
         let bytes = serialize_machine_keypair(kp)?;
         let parent = path.parent().unwrap();
-        fs::create_dir_all(parent).awaitFrom::from?;
-        fs::write(path, bytes).awaitFrom::from?;
+        fs::create_dir_all(parent).await.map_err(|e| IdentityError::Storage(e))?;
+        fs::write(path, bytes).await.map_err(|e| IdentityError::Storage(e))?;
         Ok(())
     }
 
     async fn load_machine_keypair_from_path(path: &Path) -> Result<MachineKeypair> {
-        let bytes = fs::read(path).awaitFrom::from?;
+        let bytes = fs::read(path).await.map_err(|e| IdentityError::Storage(e))?;
         deserialize_machine_keypair(&bytes)
     }
 
