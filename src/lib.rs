@@ -48,6 +48,12 @@ pub mod error;
 /// - [`identity::AgentId`]: Portable agent identity for cross-machine persistence
 pub mod identity;
 
+/// Key storage serialization for x0x identities.
+///
+/// This module provides serialization and deserialization functions for
+/// persistent storage of MachineKeypair and AgentKeypair.
+pub mod storage;
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.

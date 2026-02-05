@@ -7,7 +7,7 @@
 
 //! Core identity types for x0x agents.
 //!
-//! This module provides [`MachineId`] and [`AgentId`] types that wrap
+//! This module provides [`crate::identity::MachineId`] and [`crate::identity::AgentId`] types that wrap
 //! ML-DSA-65 derived PeerIds for machine-pinned and portable agent identities.
 //!
 //! ## Architecture
@@ -655,15 +655,15 @@ mod tests {
         let machine_id = keypair.machine_id();
 
         let display = format!("{}", machine_id);
-        assert!(display.starts_with("MachineId("));
-        assert!(display.len() > "MachineId(".len());
+        assert!(display.starts_with("MachineId(0x"));
+        assert!(display.len() > "MachineId(0x".len());
 
         let keypair = AgentKeypair::generate().unwrap();
         let agent_id = keypair.agent_id();
 
         let display = format!("{}", agent_id);
-        assert!(display.starts_with("AgentId("));
-        assert!(display.len() > "AgentId(".len());
+        assert!(display.starts_with("AgentId(0x"));
+        assert!(display.len() > "AgentId(0x".len());
     }
 
     #[test]
