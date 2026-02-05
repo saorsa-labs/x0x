@@ -1,34 +1,35 @@
 # Complexity Review
-**Date**: 2026-02-05 22:36:00 GMT
+**Date**: 2026-02-05 22:42:00 GMT
 **Mode**: gsd-task
-**Task**: Task 3 - MLS Key Derivation
+**Task**: Task 4 - MLS Message Encryption/Decryption
 
 ## File Statistics
 
 ### Lines of code:
-- src/mls/keys.rs: 337 lines total
-  - Production code: ~170 lines
-  - Test code: ~167 lines
+- src/mls/cipher.rs: 375 lines total
+  - Production code: ~160 lines
+  - Test code: ~215 lines
 - Well within acceptable range
 
 ### Function complexity:
-- from_group(): ~60 lines (complex but clear, single responsibility)
-- derive_nonce(): ~15 lines (simple XOR operation)
-- Accessors: 3-5 lines each (trivial)
-- Average complexity: Low
+- encrypt(): ~20 lines (straightforward AEAD)
+- decrypt(): ~20 lines (straightforward AEAD)
+- derive_nonce(): ~15 lines (simple XOR)
+- Accessors: 3-5 lines each
+- Average complexity: Very low
 
 ### Control flow:
 - Minimal branching
-- Linear key derivation steps
+- Linear encryption/decryption flow
 - Simple for loop in derive_nonce()
 - No deep nesting
 
 ## Findings
 - [OK] File size manageable (<400 LOC)
-- [OK] from_group() is complex but unavoidable (crypto operations)
-- [OK] Well-commented to explain crypto steps
-- [OK] Low cyclomatic complexity overall
+- [OK] Functions are small and focused
+- [OK] Low cyclomatic complexity
+- [OK] Clear, linear flow
 - [OK] No unnecessary complexity
 
 ## Grade: A
-Complexity is appropriate for cryptographic code. Well-managed.
+Complexity is minimal. Code is simple and easy to understand.

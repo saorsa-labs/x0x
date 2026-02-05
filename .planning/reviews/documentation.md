@@ -1,36 +1,36 @@
 # Documentation Review
-**Date**: 2026-02-05 22:36:00 GMT
+**Date**: 2026-02-05 22:42:00 GMT
 **Mode**: gsd-task
-**Task**: Task 3 - MLS Key Derivation
+**Task**: Task 4 - MLS Message Encryption/Decryption
 
 ## Documentation Coverage
 
 ### Module documentation:
-- [OK] Clear module-level docs explaining purpose
-- [OK] Describes key schedule and deterministic derivation
+- [OK] Clear module-level docs explaining AEAD encryption
+- [OK] ChaCha20-Poly1305 mentioned prominently
 
 ### Type documentation:
-- [OK] MlsKeySchedule fully documented
-- [OK] All fields explained
-- [OK] Purpose and security properties described
+- [OK] MlsCipher fully documented
+- [OK] Fields explained (key, base_nonce)
+- [OK] Purpose and usage described
 
 ### Method documentation:
-- [OK] from_group() - comprehensive docs with security notes
-- [OK] encryption_key() - clear return description
-- [OK] base_nonce() - explains XOR usage
-- [OK] derive_nonce() - **CRITICAL** security warning about nonce reuse
-- [OK] All accessor methods documented
+- [OK] new() - constructor with security notes
+- [OK] encrypt() - comprehensive with **CRITICAL** nonce reuse warning
+- [OK] decrypt() - explains authentication failure scenarios
+- [OK] derive_nonce() - helper method documented
+- [OK] Accessors (key, base_nonce) documented
 
 ### Security documentation:
-- [OK] **CRITICAL** nonce reuse warning in derive_nonce()
-- [OK] Forward secrecy explanation in from_group()
-- [OK] Key uniqueness guarantees documented
+- [OK] **CRITICAL** nonce reuse warning prominently displayed
+- [OK] Authentication failure scenarios explained
+- [OK] Security implications of counter reuse documented
 
 ## Findings
 - [OK] 100% public API documentation
-- [OK] Security-critical information prominently documented
+- [OK] Critical security warnings prominently placed
 - [OK] Clear explanations of cryptographic operations
-- [OK] Proper use of # Security sections
+- [OK] Proper use of # Security, # Arguments, # Returns, # Errors sections
 
 ## Grade: A
-Documentation is excellent with critical security warnings.
+Documentation is excellent with critical security warnings properly highlighted.
