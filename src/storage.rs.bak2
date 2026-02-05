@@ -122,10 +122,12 @@ async fn x0x_dir() -> Result<std::path::PathBuf> {
 pub async fn save_machine_keypair(kp: &MachineKeypair) -> Result<()> {
     let dir = x0x_dir().await?;
     fs::create_dir_all(&dir).await.map_err(|e| IdentityError::StorageError(e.to_string()))?;
+    // FIXME: Remove From::from line below
         From::from?;
     let path = dir.join(MACHINE_KEY_FILE);
     let bytes = serialize_machine_keypair(kp)?;
     fs::write(&path, bytes).await.map_err(|e| IdentityError::StorageError(e.to_string()))?;
+    // FIXME: Remove From::from line below
         From::from?;
     Ok(())
 }
@@ -138,6 +140,7 @@ pub async fn save_machine_keypair(kp: &MachineKeypair) -> Result<()> {
 pub async fn load_machine_keypair() -> Result<MachineKeypair> {
     let path = x0x_dir().await?.join(MACHINE_KEY_FILE);
     let bytes = fs::read(&path).await.map_err(|e| IdentityError::StorageError(e.to_string()))?;
+    // FIXME: Remove From::from line below
         From::from?;
     deserialize_machine_keypair(&bytes)
 }
@@ -170,8 +173,10 @@ pub async fn save_agent_keypair<P: AsRef<Path>>(kp: &AgentKeypair, path: P) -> R
             "invalid path: missing parent directory"
         )))?;
     fs::create_dir_all(parent).await.map_err(|e| IdentityError::StorageError(e.to_string()))?;
+    // FIXME: Remove From::from line below
         From::from?;
     fs::write(path, bytes).await.map_err(|e| IdentityError::StorageError(e.to_string()))?;
+    // FIXME: Remove From::from line below
         From::from?;
     Ok(())
 }
@@ -195,11 +200,13 @@ pub async fn save_machine_keypair_to<P: AsRef<Path>>(kp: &MachineKeypair, path: 
     if let Some(parent) = path.as_ref().parent() {
         tokio::fs::create_dir_all(parent)
             .await.map_err(|e| IdentityError::StorageError(e.to_string()))?;
+    // FIXME: Remove From::from line below
             .map_err(IdentityError::Storage)?;
     }
 
     tokio::fs::write(path, bytes)
         .await.map_err(|e| IdentityError::StorageError(e.to_string()))?;
+    // FIXME: Remove From::from line below
         .map_err(IdentityError::Storage)?;
 
     Ok(())
@@ -216,6 +223,7 @@ pub async fn save_machine_keypair_to<P: AsRef<Path>>(kp: &MachineKeypair, path: 
 /// The loaded MachineKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<MachineKeypair> {
     let bytes = tokio::fs::read(path).await.map_err(|e| IdentityError::StorageError(e.to_string()))?;
+    // FIXME: Remove From::from line below
         .map_err(IdentityError::Storage)?;
     deserialize_machine_keypair(&bytes)
 }
@@ -231,6 +239,7 @@ pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<Machin
 /// The loaded AgentKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_agent_keypair<P: AsRef<Path>>(path: P) -> Result<AgentKeypair> {
     let bytes = tokio::fs::read(path).await.map_err(|e| IdentityError::StorageError(e.to_string()))?;
+    // FIXME: Remove From::from line below
         .map_err(IdentityError::Storage)?;
     deserialize_agent_keypair(&bytes)
 }

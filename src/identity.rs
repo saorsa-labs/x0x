@@ -234,6 +234,7 @@ impl std::fmt::Display for AgentId {
 ///
 /// The secret key is never exposed directly - accessors return references
 /// to prevent cloning.
+#[zeroize(drop)]
 pub struct MachineKeypair {
     /// The public key component.
     public_key: MlDsaPublicKey,
@@ -357,6 +358,7 @@ impl MachineKeypair {
 ///
 /// The secret key is never exposed directly - accessors return references
 /// to prevent cloning.
+#[zeroize(drop)]
 pub struct AgentKeypair {
     /// The public key component.
     public_key: MlDsaPublicKey,

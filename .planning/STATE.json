@@ -9,26 +9,22 @@
     "total_phases": 5
   },
   "phase": {
-    "number": "1.1",
-    "name": "Agent Identity & Key Management",
-    "plan": "PLAN-phase-1.1.md",
-    "status": "complete"
-  },
-  "progress": {
-    "total_tasks": 13,
-    "completed_tasks": 7,
-    "current_task": 8,
-    "task_1_complete": true,
-    "task_2_complete": true,
-    "task_3_complete": true,
-    "task_4_complete": true,
-    "task_5_complete": true,
-    "task_6_complete": true,
-    "task_7_complete": true,
-    "task_8_complete": true,
-    "task_9_complete": true,
-    "task_10_complete": true,
-    "task_11_complete": true
+    "number": "1.2",
+    "name": "Network Transport Integration",
+    "plan": "PLAN-phase-1.2.md",
+    "status": "executing",
+    "tasks": {
+      "1": { "name": "Node Configuration", "complete": true },
+      "2": { "name": "Bootstrap Cache", "complete": false },
+      "3": { "name": "NAT Traversal Configuration", "complete": false },
+      "4": { "name": "Connection Event Handling", "complete": false },
+      "5": { "name": "Address Discovery", "complete": false },
+      "6": { "name": "Connection Management", "complete": false },
+      "7": { "name": "Stream Multiplexing", "complete": false },
+      "8": { "name": "TLS-less PQC Configuration", "complete": false },
+      "9": { "name": "Socket Configuration", "complete": false },
+      "10": { "name": "Integration Tests", "complete": false }
+    }
   },
   "milestones_overview": [
     {
@@ -38,12 +34,12 @@
         {
           "number": "1.1",
           "name": "Agent Identity & Key Management",
-          "status": "pending"
+          "status": "complete"
         },
         {
           "number": "1.2",
           "name": "Network Transport Integration",
-          "status": "pending"
+          "status": "executing"
         },
         {
           "number": "1.3",
@@ -110,12 +106,11 @@
       ]
     }
   ],
-  "status": "milestone_complete",
-  "last_updated": 1770318731.000000,
-  "last_action": "phase_1.1_complete_committed",
+  "status": "executing",
+  "last_updated": 1770321000,
+  "last_action": "phase_1.2_started_task_1_complete",
   "review": {
-    "status": "passed",
-    "iteration": 8,
-    "phase_1.1_consensus": "UNANIMOUS PASS - all 7 tasks complete"
+    "status": "pending",
+    "iteration": 0
   }
 }
