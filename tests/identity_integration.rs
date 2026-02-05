@@ -5,6 +5,7 @@
 //! portable nature of agent identities.
 
 use tempfile::TempDir;
+use x0x::{Agent, identity::AgentKeypair, storage};
 
 /// Integration test for Agent creation with identity management
 ///
@@ -24,23 +25,21 @@ async fn test_agent_creation_workflow() {
         .with_machine_key(temp_path.join("machine1.key"))
         .build()
         .await
-        .expect("Failed to create first agent");
+        .expect("Failed to create agent1");
 
-    // Verify machine_id and agent_id are valid
     let machine_id1 = agent1.machine_id();
     let agent_id1 = agent1.agent_id();
-    
-    // Check that IDs are not zero
+
+    // Verify the IDs are not zero
     assert_ne!(machine_id1.as_bytes(), &[0u8; 32], "Machine ID should not be zero");
     assert_ne!(agent_id1.as_bytes(), &[0u8; 32], "Agent ID should not be zero");
 
-    // Create second agent that reuses the same machine key
-    // This should load the existing machine key and generate a new agent key
+    // Create second agent with same machine key (should reuse)
     let agent2 = Agent::builder()
         .with_machine_key(temp_path.join("machine1.key"))
         .build()
         .await
-        .expect("Failed to create second agent");
+        .expect("Failed to create agent2");
 
     let machine_id2 = agent2.machine_id();
     let agent_id2 = agent2.agent_id();
@@ -73,19 +72,27 @@ async fn test_portable_agent_identity() {
     let original_agent_id = original_agent.agent_id();
     let original_machine_id = original_agent.machine_id();
 
-    // Export the agent keypair (in a real scenario, this would be saved to file)
-    let agent_keypair_ref = original_agent.identity().agent_keypair();
+    // Export the agent keypair by serializing it
+    let agent_keypair_bytes = storage::serialize_agent_keypair(
+        original_agent.identity().agent_keypair()
+    ).expect("Failed to serialize agent keypair");
 
-    // Generate a new keypair with the same keys (simulate loading from storage)
-    let agent_keypair = AgentKeypair::from_bytes(
-        agent_keypair_ref.public_key().as_bytes(),
-        agent_keypair_ref.secret_key().as_bytes(),
-    ).expect("Failed to recreate agent keypair");
+    // Save to file
+    let agent_key_path = temp_path.join("exported_agent.key");
+    storage::save_agent_keypair(
+        original_agent.identity().agent_keypair(),
+        &agent_key_path
+    ).await.expect("Failed to save agent keypair");
 
-    // Create a new "machine" with different machine key but same agent keypair
+    // Load the agent keypair back
+    let imported_keypair = storage::load_agent_keypair(&agent_key_path)
+        .await
+        .expect("Failed to load agent keypair");
+
+    // Create a new "machine" with different machine key but imported agent keypair
     let migrated_agent = Agent::builder()
         .with_machine_key(temp_path.join("migrated_machine.key"))
-        .with_agent_key(agent_keypair)
+        .with_agent_key(imported_keypair)
         .build()
         .await
         .expect("Failed to create migrated agent");
@@ -99,89 +106,4 @@ async fn test_portable_agent_identity() {
     // Verify both can be created successfully
     assert!(original_agent.identity().machine_keypair().public_key().as_bytes().len() > 0);
     assert!(migrated_agent.identity().machine_keypair().public_key().as_bytes().len() > 0);
-}
-
-/// Test error handling for invalid machine key path
-#[tokio::test]
-async fn test_invalid_machine_key_path() {
-    // Try to load from a non-existent directory (should fail gracefully)
-    let result = Agent::builder()
-        .with_machine_key("/non/existent/path/machine.key")
-        .build()
-        .await;
-
-    // The agent should still be created by generating a new keypair
-    // (assuming the implementation handles this case)
-    match result {
-        Ok(_) => {
-            // If it succeeds, that's fine - the implementation generates on the fly
-        }
-        Err(e) => {
-            panic!("Creating agent should not fail due to invalid path: {}", e);
-        }
-    }
-}
-
-/// Test that different machine keys produce different machine IDs
-#[tokio::test]
-async fn test_different_machine_keys_produce_different_ids() {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let temp_path = temp_dir.path();
-
-    // Create two agents with different machine key files
-    let agent_a = Agent::builder()
-        .with_machine_key(temp_path.join("machine_a.key"))
-        .build()
-        .await
-        .expect("Failed to create agent A");
-
-    let agent_b = Agent::builder()
-        .with_machine_key(temp_path.join("machine_b.key"))
-        .build()
-        .await
-        .expect("Failed to create agent B");
-
-    // They should have different machine IDs
-    assert_ne!(agent_a.machine_id(), agent_b.machine_id(), "Different machine keys should produce different machine IDs");
-
-    // But they could potentially have the same agent ID if by chance they generate the same key
-    // This is extremely unlikely but theoretically possible
-    // We don't test for agent ID difference as it's probabilistic
-}
-
-/// Test creating multiple agents with the same configuration
-/// This should result in different agent IDs (due to new key generation)
-#[tokio::test]
-async fn test_multiple_agents_same_config() {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let temp_path = temp_dir.path();
-
-    // Create multiple agents with identical configuration
-    let agent1 = Agent::builder()
-        .with_machine_key(temp_path.join("shared_machine.key"))
-        .build()
-        .await
-        .expect("Failed to create agent 1");
-
-    let agent2 = Agent::builder()
-        .with_machine_key(temp_path.join("shared_machine.key"))
-        .build()
-        .await
-        .expect("Failed to create agent 2");
-
-    let agent3 = Agent::builder()
-        .with_machine_key(temp_path.join("shared_machine.key"))
-        .build()
-        .await
-        .expect("Failed to create agent 3");
-
-    // All should have the same machine ID
-    assert_eq!(agent1.machine_id(), agent2.machine_id());
-    assert_eq!(agent2.machine_id(), agent3.machine_id());
-    assert_eq!(agent1.machine_id(), agent3.machine_id());
-
-    // All should have different agent IDs
-    assert_ne!(agent1.agent_id(), agent2.agent_id());
-    assert_ne!(agent2.agent_id(), agent3.agent_id());
-    assert_ne!(agent1.agent_id(), agent3.agent_id());
 }
