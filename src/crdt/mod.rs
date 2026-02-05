@@ -27,7 +27,9 @@
 //! task_list.complete_task(&task_id, agent_id, peer_id, seq)?;
 //! ```
 
+pub mod checkbox;
 pub mod error;
 
 // Re-export commonly used types
-pub use error::{CheckboxState, CrdtError, Result, TaskId};
+pub use checkbox::{CheckboxError, CheckboxState};
+pub use error::{CrdtError, Result, TaskId};

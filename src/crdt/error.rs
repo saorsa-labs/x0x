@@ -1,5 +1,6 @@
 //! Error types for CRDT task list operations.
 
+use crate::crdt::CheckboxState;
 use crate::identity::AgentId;
 
 /// Result type for CRDT operations.
@@ -15,27 +16,6 @@ impl TaskId {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-}
-
-/// Checkbox state for task items.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CheckboxState {
-    /// Task is not claimed.
-    Empty,
-    /// Task is claimed by an agent.
-    Claimed {
-        /// The agent who claimed this task.
-        agent_id: AgentId,
-        /// When the task was claimed (Unix timestamp).
-        timestamp: u64,
-    },
-    /// Task is completed.
-    Done {
-        /// The agent who completed this task.
-        agent_id: AgentId,
-        /// When the task was completed (Unix timestamp).
-        timestamp: u64,
-    },
 }
 
 /// Errors that can occur during CRDT task list operations.
