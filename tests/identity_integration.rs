@@ -5,7 +5,7 @@
 //! portable nature of agent identities.
 
 use tempfile::TempDir;
-use x0x::{Agent, identity::AgentKeypair, storage};
+use x0x::{storage, Agent};
 
 /// Integration test for Agent creation with identity management
 ///
@@ -31,8 +31,16 @@ async fn test_agent_creation_workflow() {
     let agent_id1 = agent1.agent_id();
 
     // Verify the IDs are not zero
-    assert_ne!(machine_id1.as_bytes(), &[0u8; 32], "Machine ID should not be zero");
-    assert_ne!(agent_id1.as_bytes(), &[0u8; 32], "Agent ID should not be zero");
+    assert_ne!(
+        machine_id1.as_bytes(),
+        &[0u8; 32],
+        "Machine ID should not be zero"
+    );
+    assert_ne!(
+        agent_id1.as_bytes(),
+        &[0u8; 32],
+        "Agent ID should not be zero"
+    );
 
     // Create second agent with same machine key (should reuse)
     let agent2 = Agent::builder()
@@ -45,14 +53,28 @@ async fn test_agent_creation_workflow() {
     let agent_id2 = agent2.agent_id();
 
     // Both agents should have the same machine ID (same machine key)
-    assert_eq!(machine_id1, machine_id2, "Machine ID should be consistent for same machine key");
+    assert_eq!(
+        machine_id1, machine_id2,
+        "Machine ID should be consistent for same machine key"
+    );
 
     // Agents should have different agent IDs (different agent keys)
-    assert_ne!(agent_id1, agent_id2, "Agent ID should be different for different agent keys");
+    assert_ne!(
+        agent_id1, agent_id2,
+        "Agent ID should be different for different agent keys"
+    );
 
     // Verify the IDs are still valid
-    assert_ne!(machine_id2.as_bytes(), &[0u8; 32], "Machine ID should not be zero");
-    assert_ne!(agent_id2.as_bytes(), &[0u8; 32], "Agent ID should not be zero");
+    assert_ne!(
+        machine_id2.as_bytes(),
+        &[0u8; 32],
+        "Machine ID should not be zero"
+    );
+    assert_ne!(
+        agent_id2.as_bytes(),
+        &[0u8; 32],
+        "Agent ID should not be zero"
+    );
 }
 
 /// Test demonstrating portable agent identity concept
@@ -73,16 +95,15 @@ async fn test_portable_agent_identity() {
     let original_machine_id = original_agent.machine_id();
 
     // Export the agent keypair by serializing it
-    let agent_keypair_bytes = storage::serialize_agent_keypair(
-        original_agent.identity().agent_keypair()
-    ).expect("Failed to serialize agent keypair");
+    let _agent_keypair_bytes =
+        storage::serialize_agent_keypair(original_agent.identity().agent_keypair())
+            .expect("Failed to serialize agent keypair");
 
     // Save to file
     let agent_key_path = temp_path.join("exported_agent.key");
-    storage::save_agent_keypair(
-        original_agent.identity().agent_keypair(),
-        &agent_key_path
-    ).await.expect("Failed to save agent keypair");
+    storage::save_agent_keypair(original_agent.identity().agent_keypair(), &agent_key_path)
+        .await
+        .expect("Failed to save agent keypair");
 
     // Load the agent keypair back
     let imported_keypair = storage::load_agent_keypair(&agent_key_path)
@@ -98,12 +119,30 @@ async fn test_portable_agent_identity() {
         .expect("Failed to create migrated agent");
 
     // The agent ID should be the same (portable identity)
-    assert_eq!(original_agent_id, migrated_agent.agent_id(), "Agent ID should be portable");
+    assert_eq!(
+        original_agent_id,
+        migrated_agent.agent_id(),
+        "Agent ID should be portable"
+    );
 
     // The machine ID should be different (different machine)
-    assert_ne!(original_machine_id, migrated_agent.machine_id(), "Machine ID should be different for different machines");
+    assert_ne!(
+        original_machine_id,
+        migrated_agent.machine_id(),
+        "Machine ID should be different for different machines"
+    );
 
     // Verify both can be created successfully
-    assert!(original_agent.identity().machine_keypair().public_key().as_bytes().len() > 0);
-    assert!(migrated_agent.identity().machine_keypair().public_key().as_bytes().len() > 0);
+    assert!(!original_agent
+        .identity()
+        .machine_keypair()
+        .public_key()
+        .as_bytes()
+        .is_empty());
+    assert!(!migrated_agent
+        .identity()
+        .machine_keypair()
+        .public_key()
+        .as_bytes()
+        .is_empty());
 }

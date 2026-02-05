@@ -22,6 +22,7 @@ saorsa-pqc = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
+zeroize = "1.8.2"
 
 [dev-dependencies]
 tempfile = "3.14"
