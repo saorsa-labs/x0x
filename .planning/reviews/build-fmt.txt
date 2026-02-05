@@ -1,0 +1,45 @@
+Diff in /Users/davidirvine/Desktop/Devel/projects/x0x/src/storage.rs:66:
+ /// Returns `IdentityError::Serialization` if deserialization fails, or
+ /// `IdentityError::InvalidPublicKey`/`InvalidSecretKey` if the key bytes are invalid.
+ pub fn deserialize_machine_keypair(bytes: &[u8]) -> Result<MachineKeypair> {
+[31m-    let data: SerializedKeypair = bincode::deserialize(bytes)
+(B[m[31m-        .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+(B[m[32m+    let data: SerializedKeypair =
+(B[m[32m+        bincode::deserialize(bytes).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+(B[m     MachineKeypair::from_bytes(&data.public_key, &data.secret_key)
+ }
+ 
+Diff in /Users/davidirvine/Desktop/Devel/projects/x0x/src/storage.rs:113:
+ /// Returns `IdentityError::Serialization` if deserialization fails, or
+ /// `IdentityError::InvalidPublicKey`/`InvalidSecretKey` if the key bytes are invalid.
+ pub fn deserialize_agent_keypair(bytes: &[u8]) -> Result<AgentKeypair> {
+[31m-    let data: SerializedKeypair = bincode::deserialize(bytes)
+(B[m[31m-        .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+(B[m[32m+    let data: SerializedKeypair =
+(B[m[32m+        bincode::deserialize(bytes).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+(B[m     AgentKeypair::from_bytes(&data.public_key, &data.secret_key)
+ }
+ 
+Diff in /Users/davidirvine/Desktop/Devel/projects/x0x/src/storage.rs:233:
+ /// # Errors
+ ///
+ /// Returns `IdentityError::Storage` if file I/O fails.
+[31m-pub async fn save_agent_keypair_to<P: AsRef<Path>>(
+(B[m[31m-    kp: &AgentKeypair,
+(B[m[31m-    path: P,
+(B[m[31m-) -> Result<()> {
+(B[m[32m+pub async fn save_agent_keypair_to<P: AsRef<Path>>(kp: &AgentKeypair, path: P) -> Result<()> {
+(B[m     let bytes = serialize_agent_keypair(kp)?;
+ 
+     // Ensure parent directory exists
+Diff in /Users/davidirvine/Desktop/Devel/projects/x0x/src/storage.rs:396:
+         let key_path = temp_dir.path().join("agent.key");
+ 
+         let original = AgentKeypair::generate().unwrap();
+[31m-        save_agent_keypair_to(&original, &key_path)
+(B[m[31m-            .await
+(B[m[31m-            .unwrap();
+(B[m[32m+        save_agent_keypair_to(&original, &key_path).await.unwrap();
+(B[m 
+         let loaded = load_agent_keypair_from(&key_path).await.unwrap();
+         assert_eq!(original.agent_id(), loaded.agent_id());

@@ -1,1 +1,2 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+    Checking x0x v0.1.0 (/Users/davidirvine/Desktop/Devel/projects/x0x)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.34s

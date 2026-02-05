@@ -1,0 +1,44 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+────────────
+ Nextest run ID 6bd1e3be-5e43-4c5c-b1f3-ccdb6ecad617 with nextest profile: default
+    Starting 38 tests across 1 binary
+        PASS [   0.014s] ( 1/38) x0x identity::tests::test_agent_id_hash
+        PASS [   0.015s] ( 2/38) x0x error::tests::test_serialization_error_display
+        PASS [   0.016s] ( 3/38) x0x error::tests::test_error_debug
+        PASS [   0.016s] ( 4/38) x0x error::tests::test_result_type_err
+        PASS [   0.017s] ( 5/38) x0x error::tests::test_result_type_ok
+        PASS [   0.017s] ( 6/38) x0x error::tests::test_invalid_public_key_error_display
+        PASS [   0.019s] ( 7/38) x0x error::tests::test_storage_error_conversion
+        PASS [   0.020s] ( 8/38) x0x error::tests::test_peer_id_mismatch_error_display
+        PASS [   0.020s] ( 9/38) x0x error::tests::test_invalid_secret_key_error_display
+        PASS [   0.021s] (10/38) x0x identity::tests::test_agent_id_serialization
+        PASS [   0.022s] (11/38) x0x error::tests::test_key_generation_error_display
+        PASS [   0.025s] (12/38) x0x identity::tests::test_agent_id_from_public_key
+        PASS [   0.018s] (13/38) x0x identity::tests::test_machine_id_hash
+        PASS [   0.026s] (14/38) x0x identity::tests::test_agent_id_verification
+        PASS [   0.029s] (15/38) x0x identity::tests::test_agent_id_verification_failure
+        PASS [   0.029s] (16/38) x0x identity::tests::test_agent_keypair_serialization_roundtrip
+        PASS [   0.027s] (17/38) x0x identity::tests::test_machine_id_as_bytes
+        PASS [   0.022s] (18/38) x0x identity::tests::test_machine_id_serialization
+        PASS [   0.026s] (19/38) x0x identity::tests::test_machine_id_from_public_key
+        PASS [   0.034s] (20/38) x0x identity::tests::test_identity_generation
+        PASS [   0.034s] (21/38) x0x identity::tests::test_display_impl
+        PASS [   0.038s] (22/38) x0x identity::tests::test_keypair_generation
+        PASS [   0.040s] (23/38) x0x identity::tests::test_keypair_serialization_roundtrip
+        PASS [   0.031s] (24/38) x0x identity::tests::test_machine_id_verification
+        PASS [   0.026s] (25/38) x0x storage::tests::test_agent_keypair_serialization_roundtrip
+        PASS [   0.020s] (26/38) x0x tests::agent_creates
+        PASS [   0.056s] (27/38) x0x identity::tests::test_different_keys_different_ids
+        PASS [   0.033s] (28/38) x0x identity::tests::test_machine_id_verification_failure
+        PASS [   0.018s] (29/38) x0x tests::agent_joins_network
+        PASS [   0.026s] (30/38) x0x storage::tests::test_deserialization_invalid_data_returns_error
+        PASS [   0.028s] (31/38) x0x storage::tests::test_deserialization_corrupted_data_returns_error
+        PASS [   0.018s] (32/38) x0x tests::agent_subscribes
+        PASS [   0.032s] (33/38) x0x storage::tests::test_machine_keypair_serialization_roundtrip
+        PASS [   0.009s] (34/38) x0x tests::name_is_ai_native
+        PASS [   0.010s] (35/38) x0x tests::name_is_palindrome
+        PASS [   0.037s] (36/38) x0x storage::tests::test_agent_keypair_different_from_machine_keypair
+        PASS [   0.011s] (37/38) x0x tests::name_is_three_bytes
+        PASS [   0.032s] (38/38) x0x storage::tests::test_serialization_produces_output
+────────────
+     Summary [   0.084s] 38 tests run: 38 passed, 0 skipped
