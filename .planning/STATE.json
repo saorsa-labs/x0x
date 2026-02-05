@@ -16,8 +16,8 @@
   },
   "progress": {
     "total_tasks": 12,
-    "completed_tasks": 0,
-    "current_task": 1
+    "completed_tasks": 1,
+    "current_task": 2
   },
   "milestones_overview": [
     {
@@ -100,11 +100,11 @@
     }
   ],
   "status": "task_complete",
-  "last_updated": 1770335021.619699,
-  "last_action": "task_1_review_passed",
+  "last_updated": 1770335334.28331,
+  "last_action": "task_2_complete",
   "review": {
     "status": "passed",
-    "iteration": 1,
+    "iteration": 0,
     "last_verdict": "PASS",
     "findings_count": {
       "critical": 0,
