@@ -202,4 +202,3 @@ mod tests {
         assert!(Arc::ptr_eq(runtime.transport(), &transport));
     }
 }
-

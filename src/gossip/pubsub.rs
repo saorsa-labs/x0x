@@ -53,7 +53,10 @@ impl PubSubManager {
     /// # Errors
     ///
     /// Returns an error if subscription fails.
-    pub async fn subscribe(&self, topic: &str) -> NetworkResult<broadcast::Receiver<PubSubMessage>> {
+    pub async fn subscribe(
+        &self,
+        topic: &str,
+    ) -> NetworkResult<broadcast::Receiver<PubSubMessage>> {
         // TODO: Integrate saorsa-gossip-pubsub Plumtree
         let _ = topic;
         let (tx, rx) = broadcast::channel(1024);

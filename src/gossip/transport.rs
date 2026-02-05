@@ -82,8 +82,9 @@ impl QuicTransportAdapter {
 
         // Wait for all sends to complete
         for task in tasks {
-            task.await
-                .map_err(|e| NetworkError::ConnectionFailed(format!("broadcast task failed: {}", e)))??;
+            task.await.map_err(|e| {
+                NetworkError::ConnectionFailed(format!("broadcast task failed: {}", e))
+            })??;
         }
 
         Ok(())
@@ -123,7 +124,9 @@ mod tests {
     #[tokio::test]
     async fn test_transport_adapter_creation() {
         let config = NetworkConfig::default();
-        let network = NetworkNode::new(config).await.expect("Failed to create network");
+        let network = NetworkNode::new(config)
+            .await
+            .expect("Failed to create network");
         let adapter = QuicTransportAdapter::new(Arc::new(network));
 
         // Verify adapter was created
@@ -133,7 +136,9 @@ mod tests {
     #[tokio::test]
     async fn test_event_subscription() {
         let config = NetworkConfig::default();
-        let network = NetworkNode::new(config).await.expect("Failed to create network");
+        let network = NetworkNode::new(config)
+            .await
+            .expect("Failed to create network");
         let adapter = QuicTransportAdapter::new(Arc::new(network));
 
         // Subscribe to events
@@ -146,7 +151,9 @@ mod tests {
     #[tokio::test]
     async fn test_send_placeholder() {
         let config = NetworkConfig::default();
-        let network = NetworkNode::new(config).await.expect("Failed to create network");
+        let network = NetworkNode::new(config)
+            .await
+            .expect("Failed to create network");
         let adapter = QuicTransportAdapter::new(Arc::new(network));
 
         let peer: SocketAddr = "127.0.0.1:12000".parse().unwrap();
@@ -160,7 +167,9 @@ mod tests {
     #[tokio::test]
     async fn test_broadcast_placeholder() {
         let config = NetworkConfig::default();
-        let network = NetworkNode::new(config).await.expect("Failed to create network");
+        let network = NetworkNode::new(config)
+            .await
+            .expect("Failed to create network");
         let adapter = QuicTransportAdapter::new(Arc::new(network));
 
         let peers: Vec<SocketAddr> = vec![

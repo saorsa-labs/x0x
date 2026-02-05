@@ -60,6 +60,9 @@ pub mod network;
 /// Gossip overlay networking for x0x.
 pub mod gossip;
 
+/// CRDT-based collaborative task lists.
+pub mod crdt;
+
 // Re-export key gossip types
 pub use gossip::{GossipConfig, GossipRuntime};
 
