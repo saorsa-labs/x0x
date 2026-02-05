@@ -49,7 +49,7 @@ pub enum CheckboxError {
 /// When using OR-Set semantics, concurrent claims from different agents
 /// can both succeed. The state machine handles this through timestamp-based
 /// conflict resolution. The claim with the earliest timestamp wins.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CheckboxState {
     /// Task is not claimed by anyone.
     Empty,

@@ -22,6 +22,7 @@ dirs = "5.0"
 hex = "0.4"
 rand = "0.8"
 saorsa-gossip-coordinator = { path = "../saorsa-gossip/crates/coordinator" }
+saorsa-gossip-crdt-sync = { path = "../saorsa-gossip/crates/crdt-sync" }
 saorsa-gossip-membership = { path = "../saorsa-gossip/crates/membership" }
 saorsa-gossip-presence = { path = "../saorsa-gossip/crates/presence" }
 saorsa-gossip-pubsub = { path = "../saorsa-gossip/crates/pubsub" }
