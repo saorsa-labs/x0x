@@ -4,5 +4,7 @@
 //! MLS-inspired protocols with ChaCha20-Poly1305 AEAD encryption.
 
 pub mod error;
+pub mod group;
 
 pub use error::{MlsError, Result};
+pub use group::{CommitOperation, MlsCommit, MlsGroup, MlsGroupContext, MlsMemberInfo};
