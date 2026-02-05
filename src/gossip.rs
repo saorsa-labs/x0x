@@ -6,6 +6,8 @@
 
 pub mod config;
 pub mod runtime;
+pub mod transport;
 
 pub use config::GossipConfig;
 pub use runtime::GossipRuntime;
+pub use transport::{QuicTransportAdapter, TransportEvent};
