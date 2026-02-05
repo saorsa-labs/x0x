@@ -464,6 +464,24 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Create a new identity from existing keypairs.
+    ///
+    /// # Arguments
+    ///
+    /// * `machine_keypair` - The machine-pinned keypair.
+    /// * `agent_keypair` - The portable agent keypair.
+    ///
+    /// # Returns
+    ///
+    /// A new Identity combining both keypairs.
+    #[inline]
+    pub fn new(machine_keypair: MachineKeypair, agent_keypair: AgentKeypair) -> Self {
+        Self {
+            machine_keypair,
+            agent_keypair,
+        }
+    }
+
     /// Create a new identity with freshly generated keys.
     ///
     /// Generates both a new MachineKeypair (stored locally) and AgentKeypair.
