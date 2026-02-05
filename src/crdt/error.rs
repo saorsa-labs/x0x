@@ -1,22 +1,10 @@
 //! Error types for CRDT task list operations.
 
-use crate::crdt::CheckboxState;
+use crate::crdt::{CheckboxState, TaskId};
 use crate::identity::AgentId;
 
 /// Result type for CRDT operations.
 pub type Result<T> = std::result::Result<T, CrdtError>;
-
-/// Task identifier (BLAKE3 hash).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TaskId([u8; 32]);
-
-impl TaskId {
-    /// Get the bytes of this task ID.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
 
 /// Errors that can occur during CRDT task list operations.
 #[derive(Debug, thiserror::Error)]
@@ -64,13 +52,7 @@ mod tests {
     }
 
     fn mock_task_id() -> TaskId {
-        TaskId([1u8; 32])
-    }
-
-    #[test]
-    fn test_task_id_as_bytes() {
-        let id = TaskId([1u8; 32]);
-        assert_eq!(id.as_bytes(), &[1u8; 32]);
+        TaskId::from_bytes([1u8; 32])
     }
 
     #[test]

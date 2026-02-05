@@ -29,7 +29,9 @@
 
 pub mod checkbox;
 pub mod error;
+pub mod task;
 
 // Re-export commonly used types
 pub use checkbox::{CheckboxError, CheckboxState};
-pub use error::{CrdtError, Result, TaskId};
+pub use error::{CrdtError, Result};
+pub use task::{TaskId, TaskMetadata};
