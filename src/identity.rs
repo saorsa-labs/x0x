@@ -25,6 +25,7 @@
 
 use ant_quic::{derive_peer_id_from_public_key, MlDsaPublicKey, MlDsaSecretKey};
 use serde::{Deserialize, Serialize};
+use zeroize::ZeroizeOnDrop;
 // Used for Display impl to show hex fingerprints
 use hex;
 
@@ -234,6 +235,7 @@ impl std::fmt::Display for AgentId {
 ///
 /// The secret key is never exposed directly - accessors return references
 /// to prevent cloning.
+#[ZeroizeOnDrop]
 pub struct MachineKeypair {
     /// The public key component.
     public_key: MlDsaPublicKey,
@@ -357,6 +359,7 @@ impl MachineKeypair {
 ///
 /// The secret key is never exposed directly - accessors return references
 /// to prevent cloning.
+#[ZeroizeOnDrop]
 pub struct AgentKeypair {
     /// The public key component.
     public_key: MlDsaPublicKey,
@@ -578,9 +581,6 @@ impl Identity {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-    #![allow(clippy::expect_used)]
-
     use super::*;
 
     #[test]
