@@ -4,9 +4,9 @@
 //! adding tasks, managing state transitions (claim/complete),
 //! and synchronizing across multiple agents.
 
+use saorsa_gossip_types::PeerId;
 use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
 use x0x::identity::AgentId;
-use saorsa_gossip_types::PeerId;
 
 /// Helper to create a test agent ID.
 fn test_agent_id(n: u8) -> AgentId {
@@ -89,7 +89,9 @@ fn test_task_list_claim_task() {
     let metadata = test_metadata("Write code", agent_id.as_bytes()[0]);
     let task = TaskItem::new(task_id, metadata, peer_id);
 
-    task_list.add_task(task, peer_id, 1).expect("Failed to add task");
+    task_list
+        .add_task(task, peer_id, 1)
+        .expect("Failed to add task");
     let claim_result = task_list.claim_task(&task_id, agent_id, peer_id, 2);
 
     assert!(claim_result.is_ok());
@@ -109,7 +111,9 @@ fn test_task_list_complete_task() {
     let metadata = test_metadata("Test code", agent_id.as_bytes()[0]);
     let task = TaskItem::new(task_id, metadata, peer_id);
 
-    task_list.add_task(task, peer_id, 1).expect("Failed to add task");
+    task_list
+        .add_task(task, peer_id, 1)
+        .expect("Failed to add task");
     task_list
         .claim_task(&task_id, agent_id, peer_id, 2)
         .expect("Failed to claim task");
@@ -132,7 +136,9 @@ fn test_task_list_remove_task() {
     let metadata = test_metadata("Cleanup", agent_id.as_bytes()[0]);
     let task = TaskItem::new(task_id, metadata, peer_id);
 
-    task_list.add_task(task, peer_id, 1).expect("Failed to add task");
+    task_list
+        .add_task(task, peer_id, 1)
+        .expect("Failed to add task");
     assert_eq!(task_list.tasks_ordered().len(), 1);
 
     let remove_result = task_list.remove_task(&task_id);
@@ -150,11 +156,7 @@ fn test_task_list_reorder() {
     let mut task_list = TaskList::new(list_id, "Sprint".to_string(), peer_id);
 
     // Add 3 tasks
-    let task_ids: Vec<TaskId> = vec![
-        test_task_id(1),
-        test_task_id(2),
-        test_task_id(3),
-    ];
+    let task_ids: Vec<TaskId> = vec![test_task_id(1), test_task_id(2), test_task_id(3)];
 
     for (i, task_id) in task_ids.iter().enumerate() {
         let metadata = test_metadata(&format!("Task {}", i), agent_id.as_bytes()[0]);
@@ -192,7 +194,9 @@ fn test_task_list_merge() {
     let metadata = test_metadata("Sync test", agent_id_a.as_bytes()[0]);
     let task = TaskItem::new(task_id, metadata, peer_id_a);
 
-    task_list_a.add_task(task, peer_id_a, 1).expect("Failed to add");
+    task_list_a
+        .add_task(task, peer_id_a, 1)
+        .expect("Failed to add");
 
     // Agent B has empty list
     let mut task_list_b = TaskList::new(list_id, "Sprint".to_string(), peer_id_b);
@@ -208,7 +212,10 @@ fn test_task_list_merge() {
     assert_eq!(task_list_b.tasks_ordered().len(), 1);
 
     // Both should have same task
-    assert_eq!(task_list_a.tasks_ordered().len(), task_list_b.tasks_ordered().len());
+    assert_eq!(
+        task_list_a.tasks_ordered().len(),
+        task_list_b.tasks_ordered().len()
+    );
 }
 
 /// Test concurrent claims on the same task (OR-Set semantics).
@@ -225,7 +232,9 @@ fn test_concurrent_claims() {
     let metadata = test_metadata("Claim test", agent_id_a.as_bytes()[0]);
     let task = TaskItem::new(task_id, metadata, peer_id_a);
 
-    task_list.add_task(task, peer_id_a, 1).expect("Failed to add");
+    task_list
+        .add_task(task, peer_id_a, 1)
+        .expect("Failed to add");
 
     // Agent A claims the task
     task_list
@@ -276,7 +285,9 @@ fn test_delta_apply() {
     let mut task_list_1 = TaskList::new(list_id, "Sprint".to_string(), peer_id);
     let metadata = test_metadata("Delta apply test", agent_id.as_bytes()[0]);
     let task = TaskItem::new(task_id, metadata, peer_id);
-    task_list_1.add_task(task, peer_id, 1).expect("Failed to add");
+    task_list_1
+        .add_task(task, peer_id, 1)
+        .expect("Failed to add");
 
     // Create second list and merge with first
     let mut task_list_2 = TaskList::new(list_id, "Sprint".to_string(), peer_id);
@@ -368,12 +379,16 @@ fn test_merge_conflict_resolution() {
     let mut task_list_a = TaskList::new(list_id, "Sprint A".to_string(), peer_id_a);
     let metadata_a = test_metadata("Title A", agent_id_a.as_bytes()[0]);
     let task_a = TaskItem::new(task_id, metadata_a, peer_id_a);
-    task_list_a.add_task(task_a, peer_id_a, 1).expect("Failed to add");
+    task_list_a
+        .add_task(task_a, peer_id_a, 1)
+        .expect("Failed to add");
 
     let mut task_list_b = TaskList::new(list_id, "Sprint B".to_string(), peer_id_b);
     let metadata_b = test_metadata("Title B", agent_id_b.as_bytes()[0]);
     let task_b = TaskItem::new(task_id, metadata_b, peer_id_b);
-    task_list_b.add_task(task_b, peer_id_b, 1).expect("Failed to add");
+    task_list_b
+        .add_task(task_b, peer_id_b, 1)
+        .expect("Failed to add");
 
     // Merge - should use LWW semantics for metadata
     let merge_result = task_list_a.merge(&task_list_b);
