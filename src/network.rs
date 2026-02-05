@@ -545,3 +545,51 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert!(cache.select_peers(5).is_empty());
     }
+
+    #[tokio::test]
+    async fn test_network_node_subscribe_events() {
+        let config = NetworkConfig::default();
+        let node = NetworkNode::new(config).await.unwrap();
+
+        // Subscribe to events
+        let mut receiver = node.subscribe();
+
+        // Emit an event
+        let event = NetworkEvent::PeerConnected {
+            peer_id: [1; 32],
+            address: "127.0.0.1:9000".parse().unwrap(),
+        };
+        node.emit_event(event);
+
+        // Receive the event
+        let received = receiver.recv().await;
+        assert!(received.is_ok());
+        
+        match received.unwrap() {
+            NetworkEvent::PeerConnected { peer_id, address } => {
+                assert_eq!(peer_id, [1; 32]);
+                assert_eq!(address, "127.0.0.1:9000".parse().unwrap());
+            }
+            _ => panic!("Expected PeerConnected event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_network_node_multiple_subscribers() {
+        let config = NetworkConfig::default();
+        let node = NetworkNode::new(config).await.unwrap();
+
+        // Multiple subscribers
+        let mut rx1 = node.subscribe();
+        let mut rx2 = node.subscribe();
+
+        // Emit event
+        let event = NetworkEvent::NatTypeDetected {
+            nat_type: "Full Cone".to_string(),
+        };
+        node.emit_event(event);
+
+        // Both should receive
+        assert!(rx1.recv().await.is_ok());
+        assert!(rx2.recv().await.is_ok());
+    }
