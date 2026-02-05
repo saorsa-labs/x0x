@@ -125,7 +125,10 @@ impl NetworkNode {
     /// Returns `NetworkError` if node creation fails.
     pub async fn new(config: NetworkConfig) -> NetworkResult<Self> {
         let (event_sender, _event_receiver) = broadcast::channel(32);
-        Ok(Self { config, event_sender })
+        Ok(Self {
+            config,
+            event_sender,
+        })
     }
 
     /// Get the configuration for this node.
@@ -259,19 +262,18 @@ impl PeerCache {
     pub async fn load_or_create(path: &PathBuf) -> NetworkResult<Self> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
-                tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                    NetworkError::CacheError(e.to_string())
-                })?;
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| NetworkError::CacheError(e.to_string()))?;
             }
         }
 
         if path.exists() {
-            let data = tokio::fs::read(path).await.map_err(|e| {
-                NetworkError::CacheError(e.to_string())
-            })?;
-            let cache: PeerCache = bincode::deserialize(&data).map_err(|e| {
-                NetworkError::CacheError(e.to_string())
-            })?;
+            let data = tokio::fs::read(path)
+                .await
+                .map_err(|e| NetworkError::CacheError(e.to_string()))?;
+            let cache: PeerCache =
+                bincode::deserialize(&data).map_err(|e| NetworkError::CacheError(e.to_string()))?;
             return Ok(cache);
         }
 
@@ -332,11 +334,14 @@ impl PeerCache {
         sorted_peers.sort_by(|a, b| {
             let a_rate = a.success_count as f64 / (a.attempt_count.max(1) as f64);
             let b_rate = b.success_count as f64 / (b.attempt_count.max(1) as f64);
-            b_rate.partial_cmp(&a_rate).unwrap_or(std::cmp::Ordering::Equal)
+            b_rate
+                .partial_cmp(&a_rate)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let exploit_count = ((count as f64) * (1.0 - self.epsilon)).floor() as usize;
-        let explore_count = (count - exploit_count).min(self.peers.len().saturating_sub(exploit_count));
+        let explore_count =
+            (count - exploit_count).min(self.peers.len().saturating_sub(exploit_count));
 
         let mut selected: Vec<SocketAddr> = sorted_peers[..exploit_count.min(count)]
             .iter()
@@ -346,11 +351,11 @@ impl PeerCache {
         // Add random exploration peers.
         if explore_count > 0 && self.peers.len() > exploit_count {
             let explore_from: Vec<_> = sorted_peers[exploit_count..].to_vec();
-            
+
             // Convert Vec<&CachedPeer> to slice for choose()
             let explore_slice: Vec<CachedPeer> = explore_from.iter().map(|&p| p.clone()).collect();
             let explore_refs: Vec<&CachedPeer> = explore_slice.iter().collect();
-            
+
             let mut rng = rand::thread_rng();
             for _ in 0..explore_count {
                 if let Some(random_peer) = explore_refs.as_slice().choose(&mut rng) {
@@ -372,12 +377,10 @@ impl PeerCache {
     ///
     /// Returns an error if saving fails.
     pub async fn save(&self, path: &PathBuf) -> NetworkResult<()> {
-        let data = bincode::serialize(self).map_err(|e| {
-            NetworkError::CacheError(e.to_string())
-        })?;
-        tokio::fs::write(path, data).await.map_err(|e| {
-            NetworkError::CacheError(e.to_string())
-        })?;
+        let data = bincode::serialize(self).map_err(|e| NetworkError::CacheError(e.to_string()))?;
+        tokio::fs::write(path, data)
+            .await
+            .map_err(|e| NetworkError::CacheError(e.to_string()))?;
         Ok(())
     }
 
@@ -483,113 +486,111 @@ mod tests {
     }
 }
 
-    #[tokio::test]
-    async fn test_peer_cache_epsilon_greedy_selection() {
-        
-        
-        let mut cache = PeerCache {
-            peers: Vec::new(),
-            cache_path: PathBuf::from("/tmp/test"),
-            epsilon: 0.5, // 50% exploration for testing
-        };
+#[tokio::test]
+async fn test_peer_cache_epsilon_greedy_selection() {
+    let mut cache = PeerCache {
+        peers: Vec::new(),
+        cache_path: PathBuf::from("/tmp/test"),
+        epsilon: 0.5, // 50% exploration for testing
+    };
 
-        // Add peers with different success rates
-        // Peer A: 10 attempts, 9 successes (90% success rate)
-        cache.peers.push(CachedPeer {
-            peer_id: [1; 32],
-            address: "127.0.0.1:9000".parse().unwrap(),
-            success_count: 9,
-            attempt_count: 10,
-            last_seen: 0,
-            last_attempt: 0,
-        });
+    // Add peers with different success rates
+    // Peer A: 10 attempts, 9 successes (90% success rate)
+    cache.peers.push(CachedPeer {
+        peer_id: [1; 32],
+        address: "127.0.0.1:9000".parse().unwrap(),
+        success_count: 9,
+        attempt_count: 10,
+        last_seen: 0,
+        last_attempt: 0,
+    });
 
-        // Peer B: 10 attempts, 5 successes (50% success rate)
-        cache.peers.push(CachedPeer {
-            peer_id: [2; 32],
-            address: "127.0.0.1:9001".parse().unwrap(),
-            success_count: 5,
-            attempt_count: 10,
-            last_seen: 0,
-            last_attempt: 0,
-        });
+    // Peer B: 10 attempts, 5 successes (50% success rate)
+    cache.peers.push(CachedPeer {
+        peer_id: [2; 32],
+        address: "127.0.0.1:9001".parse().unwrap(),
+        success_count: 5,
+        attempt_count: 10,
+        last_seen: 0,
+        last_attempt: 0,
+    });
 
-        // Peer C: 10 attempts, 2 successes (20% success rate)
-        cache.peers.push(CachedPeer {
-            peer_id: [3; 32],
-            address: "127.0.0.1:9002".parse().unwrap(),
-            success_count: 2,
-            attempt_count: 10,
-            last_seen: 0,
-            last_attempt: 0,
-        });
+    // Peer C: 10 attempts, 2 successes (20% success rate)
+    cache.peers.push(CachedPeer {
+        peer_id: [3; 32],
+        address: "127.0.0.1:9002".parse().unwrap(),
+        success_count: 2,
+        attempt_count: 10,
+        last_seen: 0,
+        last_attempt: 0,
+    });
 
-        // Select 2 peers with 50% exploration
-        // Should mostly select A, sometimes B or C
-        let selected = cache.select_peers(2);
-        assert_eq!(selected.len(), 2);
+    // Select 2 peers with 50% exploration
+    // Should mostly select A, sometimes B or C
+    let selected = cache.select_peers(2);
+    assert_eq!(selected.len(), 2);
 
-        // Peer A (highest success rate) should always be in selection
-        assert!(selected.contains(&"127.0.0.1:9000".parse().unwrap()));
-    }
+    // Peer A (highest success rate) should always be in selection
+    assert!(selected.contains(&"127.0.0.1:9000".parse().unwrap()));
+}
 
-    #[tokio::test]
-    async fn test_peer_cache_empty() {
-        let cache = PeerCache {
-            peers: Vec::new(),
-            cache_path: PathBuf::from("/tmp/test"),
-            epsilon: 0.1,
-        };
+#[tokio::test]
+async fn test_peer_cache_empty() {
+    let cache = PeerCache {
+        peers: Vec::new(),
+        cache_path: PathBuf::from("/tmp/test"),
+        epsilon: 0.1,
+    };
 
-        assert!(cache.is_empty());
-        assert_eq!(cache.len(), 0);
-        assert!(cache.select_peers(5).is_empty());
-    }
+    assert!(cache.is_empty());
+    assert_eq!(cache.len(), 0);
+    assert!(cache.select_peers(5).is_empty());
+}
 
-    #[tokio::test]
-    async fn test_network_node_subscribe_events() {
-        let config = NetworkConfig::default();
-        let node = NetworkNode::new(config).await.unwrap();
+#[tokio::test]
+async fn test_network_node_subscribe_events() {
+    let config = NetworkConfig::default();
+    let node = NetworkNode::new(config).await.unwrap();
 
-        // Subscribe to events
-        let mut receiver = node.subscribe();
+    // Subscribe to events
+    let mut receiver = node.subscribe();
 
-        // Emit an event
-        let event = NetworkEvent::PeerConnected {
-            peer_id: [1; 32],
-            address: "127.0.0.1:9000".parse().unwrap(),
-        };
-        node.emit_event(event);
+    // Emit an event
+    let event = NetworkEvent::PeerConnected {
+        peer_id: [1; 32],
+        address: "127.0.0.1:9000".parse().unwrap(),
+    };
+    node.emit_event(event);
 
-        // Receive the event
-        let received = receiver.recv().await;
-        assert!(received.is_ok());
-        
-        match received.unwrap() {
-            NetworkEvent::PeerConnected { peer_id, address } => {
-                assert_eq!(peer_id, [1; 32]);
-                assert_eq!(address, "127.0.0.1:9000".parse().unwrap());
-            }
-            _ => panic!("Expected PeerConnected event"),
+    // Receive the event
+    let received = receiver.recv().await;
+    assert!(received.is_ok());
+
+    match received.unwrap() {
+        NetworkEvent::PeerConnected { peer_id, address } => {
+            assert_eq!(peer_id, [1; 32]);
+            assert_eq!(address, "127.0.0.1:9000".parse().unwrap());
         }
+        _ => panic!("Expected PeerConnected event"),
     }
+}
 
-    #[tokio::test]
-    async fn test_network_node_multiple_subscribers() {
-        let config = NetworkConfig::default();
-        let node = NetworkNode::new(config).await.unwrap();
+#[tokio::test]
+async fn test_network_node_multiple_subscribers() {
+    let config = NetworkConfig::default();
+    let node = NetworkNode::new(config).await.unwrap();
 
-        // Multiple subscribers
-        let mut rx1 = node.subscribe();
-        let mut rx2 = node.subscribe();
+    // Multiple subscribers
+    let mut rx1 = node.subscribe();
+    let mut rx2 = node.subscribe();
 
-        // Emit event
-        let event = NetworkEvent::NatTypeDetected {
-            nat_type: "Full Cone".to_string(),
-        };
-        node.emit_event(event);
+    // Emit event
+    let event = NetworkEvent::NatTypeDetected {
+        nat_type: "Full Cone".to_string(),
+    };
+    node.emit_event(event);
 
-        // Both should receive
-        assert!(rx1.recv().await.is_ok());
-        assert!(rx2.recv().await.is_ok());
-    }
+    // Both should receive
+    assert!(rx1.recv().await.is_ok());
+    assert!(rx2.recv().await.is_ok());
+}

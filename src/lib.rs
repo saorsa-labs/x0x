@@ -356,10 +356,10 @@ impl AgentBuilder {
         // Create network node if configured
         let network = if let Some(config) = self.network_config {
             Some(network::NetworkNode::new(config).await.map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("network initialization failed: {}", e),
-                ))
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "network initialization failed: {}",
+                    e
+                )))
             })?)
         } else {
             None
