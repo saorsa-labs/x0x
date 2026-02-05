@@ -6,10 +6,12 @@
 
 pub mod config;
 pub mod membership;
+pub mod pubsub;
 pub mod runtime;
 pub mod transport;
 
 pub use config::GossipConfig;
 pub use membership::MembershipManager;
+pub use pubsub::{PubSubManager, PubSubMessage};
 pub use runtime::GossipRuntime;
 pub use transport::{QuicTransportAdapter, TransportEvent};
