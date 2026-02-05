@@ -1,0 +1,20 @@
+[package]
+name = "x0x-nodejs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Saorsa Labs <david@saorsalabs.com>"]
+description = "Node.js bindings for x0x - Agent-to-Agent secure communication"
+license = "AGPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib"]
+name = "x0x_nodejs"
+
+[dependencies]
+napi = "2"
+napi-derive = "2"
+tokio = { version = "1", features = ["full"] }
+x0x = { path = "../.." }
+
+[build-dependencies]
+napi-build = "2"
