@@ -215,10 +215,7 @@ impl Agent {
     ///
     /// Returns a [`Subscription`] that yields messages as they arrive
     /// through the gossip network.
-    pub async fn subscribe(
-        &self,
-        _topic: &str,
-    ) -> error::Result<Subscription> {
+    pub async fn subscribe(&self, _topic: &str) -> error::Result<Subscription> {
         Ok(Subscription { _private: () })
     }
 
@@ -227,11 +224,7 @@ impl Agent {
     /// The message will propagate through the gossip network via
     /// epidemic broadcast — every agent that receives it will
     /// relay it to its neighbours.
-    pub async fn publish(
-        &self,
-        _topic: &str,
-        _payload: Vec<u8>,
-    ) -> error::Result<()> {
+    pub async fn publish(&self, _topic: &str, _payload: Vec<u8>) -> error::Result<()> {
         // Placeholder — will use saorsa-gossip pubsub
         Ok(())
     }
@@ -335,8 +328,6 @@ pub const NAME: &str = "x0x";
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]

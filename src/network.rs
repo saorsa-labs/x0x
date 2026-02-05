@@ -451,3 +451,90 @@ mod tests {
         assert_eq!(stats.peer_count, 0);
     }
 }
+
+    #[tokio::test]
+    async fn test_peer_cache_epsilon_greedy_selection() {
+        use rand::seq::SliceRandom;
+        
+        let mut cache = PeerCache {
+            peers: Vec::new(),
+            cache_path: PathBuf::from("/tmp/test"),
+            epsilon: 0.5, // 50% exploration for testing
+        };
+
+        // Add peers with different success rates
+        // Peer A: 10 attempts, 9 successes (90% success rate)
+        cache.peers.push(CachedPeer {
+            peer_id: [1; 32],
+            address: "127.0.0.1:9000".parse().unwrap(),
+            success_count: 9,
+            attempt_count: 10,
+            last_seen: 0,
+            last_attempt: 0,
+        });
+
+        // Peer B: 10 attempts, 5 successes (50% success rate)
+        cache.peers.push(CachedPeer {
+            peer_id: [2; 32],
+            address: "127.0.0.1:9001".parse().unwrap(),
+            success_count: 5,
+            attempt_count: 10,
+            last_seen: 0,
+            last_attempt: 0,
+        });
+
+        // Peer C: 10 attempts, 2 successes (20% success rate)
+        cache.peers.push(CachedPeer {
+            peer_id: [3; 32],
+            address: "127.0.0.1:9002".parse().unwrap(),
+            success_count: 2,
+            attempt_count: 10,
+            last_seen: 0,
+            last_attempt: 0,
+        });
+
+        // Select 2 peers with 50% exploration
+        // Should mostly select A, sometimes B or C
+        let selected = cache.select_peers(2);
+        assert_eq!(selected.len(), 2);
+        
+        // Peer A (highest success rate) should always be in selection
+        assert!(selected.contains(&"127.0.0.1:9000".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_peer_cache_record_attempt() {
+        let mut cache = PeerCache {
+            peers: Vec::new(),
+            cache_path: PathBuf::from("/tmp/test"),
+            epsilon: 0.1,
+        };
+
+        // Add a peer
+        cache.add_peer([1; 32], "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(cache.peers[0].success_count, 1);
+        assert_eq!(cache.peers[0].attempt_count, 1);
+
+        // Record successful connection
+        cache.record_attempt([1; 32], true);
+        assert_eq!(cache.peers[0].success_count, 2);
+        assert_eq!(cache.peers[0].attempt_count, 2);
+
+        // Record failed connection
+        cache.record_attempt([1; 32], false);
+        assert_eq!(cache.peers[0].success_count, 2);
+        assert_eq!(cache.peers[0].attempt_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_peer_cache_empty() {
+        let cache = PeerCache {
+            peers: Vec::new(),
+            cache_path: PathBuf::from("/tmp/test"),
+            epsilon: 0.1,
+        };
+
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        assert!(cache.select_peers(5).is_empty());
+    }
