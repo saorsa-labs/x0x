@@ -38,6 +38,9 @@
 #![deny(clippy::expect_used)]
 #![warn(missing_docs)]
 
+/// Error types for x0x identity and network operations.
+pub mod error;
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
