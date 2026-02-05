@@ -1,0 +1,183 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.18s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+────────────
+ Nextest run ID 04613f5d-7279-4f29-9785-56af3c17f83c with nextest profile: default
+    Starting 32 tests across 1 binary
+        PASS [   0.011s] ( 1/32) x0x error::tests::test_key_generation_error_display
+        PASS [   0.011s] ( 2/32) x0x error::tests::test_storage_error_conversion
+        PASS [   0.012s] ( 3/32) x0x error::tests::test_result_type_err
+        PASS [   0.012s] ( 4/32) x0x identity::tests::test_agent_id_serialization
+        PASS [   0.014s] ( 5/32) x0x error::tests::test_error_debug
+        PASS [   0.014s] ( 6/32) x0x error::tests::test_result_type_ok
+        PASS [   0.014s] ( 7/32) x0x error::tests::test_serialization_error_display
+        PASS [   0.015s] ( 8/32) x0x error::tests::test_invalid_public_key_error_display
+        PASS [   0.016s] ( 9/32) x0x error::tests::test_peer_id_mismatch_error_display
+        PASS [   0.017s] (10/32) x0x identity::tests::test_agent_id_hash
+        PASS [   0.023s] (11/32) x0x identity::tests::test_agent_id_from_public_key
+        PASS [   0.023s] (12/32) x0x error::tests::test_invalid_secret_key_error_display
+        PASS [   0.019s] (13/32) x0x identity::tests::test_agent_id_verification
+        PASS [   0.020s] (14/32) x0x identity::tests::test_agent_keypair_serialization_roundtrip
+        PASS [   0.011s] (15/32) x0x identity::tests::test_machine_id_hash
+        PASS [   0.024s] (16/32) x0x identity::tests::test_agent_id_verification_failure
+        PASS [   0.022s] (17/32) x0x identity::tests::test_machine_id_as_bytes
+        PASS [   0.023s] (18/32) x0x identity::tests::test_keypair_serialization_roundtrip
+        PASS [   0.016s] (19/32) x0x identity::tests::test_machine_id_serialization
+        PASS [   0.025s] (20/32) x0x identity::tests::test_machine_id_from_public_key
+        PASS [   0.030s] (21/32) x0x identity::tests::test_keypair_generation
+        PASS [   0.013s] (22/32) x0x tests::agent_creates
+        PASS [   0.012s] (23/32) x0x tests::agent_joins_network
+        PASS [   0.035s] (24/32) x0x identity::tests::test_identity_generation
+        PASS [   0.012s] (25/32) x0x tests::name_is_ai_native
+        PASS [   0.037s] (26/32) x0x identity::tests::test_display_impl
+        PASS [   0.014s] (27/32) x0x tests::agent_subscribes
+        PASS [   0.022s] (28/32) x0x identity::tests::test_machine_id_verification
+        PASS [   0.013s] (29/32) x0x tests::name_is_palindrome
+        PASS [   0.012s] (30/32) x0x tests::name_is_three_bytes
+        PASS [   0.043s] (31/32) x0x identity::tests::test_different_keys_different_ids
+        PASS [   0.030s] (32/32) x0x identity::tests::test_machine_id_verification_failure
+────────────
+     Summary [   0.062s] 32 tests run: 32 passed, 0 skipped
+Diff in /Users/davidirvine/Desktop/Devel/projects/x0x/src/identity.rs:23:
+ //! Both identities derive their PeerIds from ML-DSA-65 public keys via
+ //! SHA-256 hashing, providing post-quantum security.
+ 
+[31m-use ant_quic::{
+(B[m[31m-    derive_peer_id_from_public_key,
+(B[m[31m-    MlDsaPublicKey, MlDsaSecretKey,
+(B[m[31m-};
+(B[m[32m+use ant_quic::{derive_peer_id_from_public_key, MlDsaPublicKey, MlDsaSecretKey};
+(B[m use serde::{Deserialize, Serialize};
+ 
+ // Used for Display impl to show hex fingerprints
+Diff in /Users/davidirvine/Desktop/Devel/projects/x0x/src/identity.rs:311:
+         public_key_bytes: &[u8],
+         secret_key_bytes: &[u8],
+     ) -> Result<Self, crate::error::IdentityError> {
+[31m-        let public_key = MlDsaPublicKey::from_bytes(public_key_bytes)
+(B[m[31m-            .map_err(|_| crate::error::IdentityError::InvalidPublicKey(
+(B[m[31m-                "failed to parse public key".to_string(),
+(B[m[31m-            ))?;
+(B[m[31m-        let secret_key = MlDsaSecretKey::from_bytes(secret_key_bytes)
+(B[m[31m-            .map_err(|_| crate::error::IdentityError::InvalidSecretKey(
+(B[m[31m-                "failed to parse secret key".to_string(),
+(B[m[31m-            ))?;
+(B[m[32m+        let public_key = MlDsaPublicKey::from_bytes(public_key_bytes).map_err(|_| {
+(B[m[32m+            crate::error::IdentityError::InvalidPublicKey("failed to parse public key".to_string())
+(B[m[32m+        })?;
+(B[m[32m+        let secret_key = MlDsaSecretKey::from_bytes(secret_key_bytes).map_err(|_| {
+(B[m[32m+            crate::error::IdentityError::InvalidSecretKey("failed to parse secret key".to_string())
+(B[m[32m+        })?;
+(B[m         Ok(Self {
+             public_key,
+             secret_key,
+Diff in /Users/davidirvine/Desktop/Devel/projects/x0x/src/identity.rs:425:
+         public_key_bytes: &[u8],
+         secret_key_bytes: &[u8],
+     ) -> Result<Self, crate::error::IdentityError> {
+[31m-        let public_key = MlDsaPublicKey::from_bytes(public_key_bytes)
+(B[m[31m-            .map_err(|_| crate::error::IdentityError::InvalidPublicKey(
+(B[m[31m-                "failed to parse public key".to_string(),
+(B[m[31m-            ))?;
+(B[m[31m-        let secret_key = MlDsaSecretKey::from_bytes(secret_key_bytes)
+(B[m[31m-            .map_err(|_| crate::error::IdentityError::InvalidSecretKey(
+(B[m[31m-                "failed to parse secret key".to_string(),
+(B[m[31m-            ))?;
+(B[m[32m+        let public_key = MlDsaPublicKey::from_bytes(public_key_bytes).map_err(|_| {
+(B[m[32m+            crate::error::IdentityError::InvalidPublicKey("failed to parse public key".to_string())
+(B[m[32m+        })?;
+(B[m[32m+        let secret_key = MlDsaSecretKey::from_bytes(secret_key_bytes).map_err(|_| {
+(B[m[32m+            crate::error::IdentityError::InvalidSecretKey("failed to parse secret key".to_string())
+(B[m[32m+        })?;
+(B[m         Ok(Self {
+             public_key,
+             secret_key,
+Diff in /Users/davidirvine/Desktop/Devel/projects/x0x/src/identity.rs:630:
+ 
+         let recovered = MachineKeypair::from_bytes(&pub_bytes, &sec_bytes).unwrap();
+ 
+[31m-        assert_eq!(
+(B[m[31m-            original.machine_id(),
+(B[m[31m-            recovered.machine_id()
+(B[m[31m-        );
+(B[m[32m+        assert_eq!(original.machine_id(), recovered.machine_id());
+(B[m     }
+ 
+     #[test]
+Diff in /Users/davidirvine/Desktop/Devel/projects/x0x/src/identity.rs:643:
+ 
+         let recovered = AgentKeypair::from_bytes(&pub_bytes, &sec_bytes).unwrap();
+ 
+[31m-        assert_eq!(
+(B[m[31m-            original.agent_id(),
+(B[m[31m-            recovered.agent_id()
+(B[m[31m-        );
+(B[m[32m+        assert_eq!(original.agent_id(), recovered.agent_id());
+(B[m     }
+ 
+     #[test]
+ Documenting x0x v0.1.0 (/Users/davidirvine/Desktop/Devel/projects/x0x)
+warning: unresolved link to `MachineId`
+  --> src/lib.rs:44:1
+   |
+24 | | //!     .build()
+   | |_________________^
+...
+44 | / /// Core identity types for x0x agents.
+   |
+   = note: the link appears in this line:
+           
+           - [`MachineId`]: Machine-pinned identity for QUIC authentication
+              ^^^^^^^^^^^
+   = note: no item named `MachineId` in scope
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+   = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default
+
+warning: unresolved link to `AgentId`
+  --> src/lib.rs:44:1
+   |
+24 | | //!     .build()
+   | |_________________^
+...
+44 | / /// Core identity types for x0x agents.
+   |
+   = note: the link appears in this line:
+           
+           - [`AgentId`]: Portable agent identity for cross-machine persistence
+              ^^^^^^^^^
+   = note: no item named `AgentId` in scope
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `MachineId`
+  --> src/lib.rs:44:1
+   |
+24 | | //!     .build()
+   | |_________________^
+...
+44 | / /// Core identity types for x0x agents.
+   |
+   = note: the link appears in this line:
+           
+           This module provides [`MachineId`] and [`AgentId`] types that wrap
+                                 ^^^^^^^^^^^
+   = note: no item named `MachineId` in scope
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `AgentId`
+  --> src/lib.rs:44:1
+   |
+24 | | //!     .build()
+   | |_________________^
+...
+44 | / /// Core identity types for x0x agents.
+   |
+   = note: the link appears in this line:
+           
+           This module provides [`MachineId`] and [`AgentId`] types that wrap
+                                                   ^^^^^^^^^
+   = note: no item named `AgentId` in scope
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: `x0x` (lib doc) generated 4 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.63s
+   Generated /Users/davidirvine/Desktop/Devel/projects/x0x/target/doc/x0x/index.html

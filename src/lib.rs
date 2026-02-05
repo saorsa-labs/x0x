@@ -44,8 +44,8 @@ pub mod error;
 /// Core identity types for x0x agents.
 ///
 /// This module provides the cryptographic identity foundation for x0x:
-/// - [`MachineId`]: Machine-pinned identity for QUIC authentication
-/// - [`AgentId`]: Portable agent identity for cross-machine persistence
+/// - [`identity::MachineId`]: Machine-pinned identity for QUIC authentication
+/// - [`identity::AgentId`]: Portable agent identity for cross-machine persistence
 pub mod identity;
 
 /// The core agent that participates in the x0x gossip network.

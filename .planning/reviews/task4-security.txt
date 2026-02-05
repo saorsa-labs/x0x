@@ -1,0 +1,28 @@
+535:    #![allow(clippy::unwrap_used)]
+536:    #![allow(clippy::expect_used)]
+542:        let keypair = MachineKeypair::generate().unwrap();
+551:        let keypair = MachineKeypair::generate().unwrap();
+555:        machine_id.verify(keypair.public_key()).unwrap();
+560:        let keypair1 = MachineKeypair::generate().unwrap();
+561:        let keypair2 = MachineKeypair::generate().unwrap();
+571:        let keypair = AgentKeypair::generate().unwrap();
+580:        let keypair = AgentKeypair::generate().unwrap();
+584:        agent_id.verify(keypair.public_key()).unwrap();
+589:        let keypair1 = AgentKeypair::generate().unwrap();
+590:        let keypair2 = AgentKeypair::generate().unwrap();
+600:        let machine_kp = MachineKeypair::generate().unwrap();
+601:        let agent_kp = AgentKeypair::generate().unwrap();
+609:        let identity = Identity::generate().unwrap();
+617:        let identity1 = Identity::generate().unwrap();
+618:        let identity2 = Identity::generate().unwrap();
+628:        let original = MachineKeypair::generate().unwrap();
+631:        let recovered = MachineKeypair::from_bytes(&pub_bytes, &sec_bytes).unwrap();
+641:        let original = AgentKeypair::generate().unwrap();
+644:        let recovered = AgentKeypair::from_bytes(&pub_bytes, &sec_bytes).unwrap();
+654:        let keypair = MachineKeypair::generate().unwrap();
+667:        let keypair = MachineKeypair::generate().unwrap();
+674:        let keypair = AgentKeypair::generate().unwrap();
+687:        let serialized = bincode::serialize(&id).expect("serialization failed");
+689:            bincode::deserialize(&serialized).expect("deserialization failed");
+699:        let serialized = bincode::serialize(&id).expect("serialization failed");
+701:            bincode::deserialize(&serialized).expect("deserialization failed");
