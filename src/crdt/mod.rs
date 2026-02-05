@@ -29,6 +29,7 @@
 
 pub mod checkbox;
 pub mod delta;
+pub mod encrypted;
 pub mod error;
 pub mod persistence;
 pub mod sync;
@@ -39,6 +40,7 @@ pub mod task_list;
 // Re-export commonly used types
 pub use checkbox::{CheckboxError, CheckboxState};
 pub use delta::TaskListDelta;
+pub use encrypted::EncryptedTaskListDelta;
 pub use error::{CrdtError, Result};
 pub use persistence::TaskListStorage;
 pub use sync::TaskListSync;
