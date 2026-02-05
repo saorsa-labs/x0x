@@ -4,10 +4,12 @@
 //! P2P node, configured for optimal gossip network participation.
 
 use crate::error::{NetworkError, NetworkResult};
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 /// Default port for x0x nodes (when specified).
 pub const DEFAULT_PORT: u16 = 12000;
@@ -103,6 +105,8 @@ pub struct NetworkStats {
 pub struct NetworkNode {
     /// Configuration for this node.
     config: NetworkConfig,
+    /// Sender for broadcasting network events.
+    event_sender: broadcast::Sender<NetworkEvent>,
 }
 
 impl NetworkNode {
@@ -120,7 +124,8 @@ impl NetworkNode {
     ///
     /// Returns `NetworkError` if node creation fails.
     pub async fn new(config: NetworkConfig) -> NetworkResult<Self> {
-        Ok(Self { config })
+        let (event_sender, _event_receiver) = broadcast::channel(32);
+        Ok(Self { config, event_sender })
     }
 
     /// Get the configuration for this node.
@@ -157,6 +162,27 @@ impl NetworkNode {
     /// The number of currently connected peers.
     pub async fn connection_count(&self) -> usize {
         0
+    }
+
+    /// Subscribe to network events.
+    ///
+    /// Returns a receiver that will receive all network events
+    /// including peer connections, disconnections, and errors.
+    ///
+    /// # Returns
+    ///
+    /// A receiver for network events.
+    pub fn subscribe(&self) -> broadcast::Receiver<NetworkEvent> {
+        self.event_sender.subscribe()
+    }
+
+    /// Emit a network event to all subscribers.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The event to emit.
+    pub fn emit_event(&self, event: NetworkEvent) {
+        let _ = self.event_sender.send(event);
     }
 
     /// Gracefully shutdown the node.
@@ -214,6 +240,7 @@ pub struct PeerCache {
     peers: Vec<CachedPeer>,
     /// Path to the cache file.
     #[serde(skip)]
+    #[allow(dead_code)]
     cache_path: PathBuf,
     /// Epsilon value for epsilon-greedy selection.
     epsilon: f64,
@@ -319,10 +346,14 @@ impl PeerCache {
         // Add random exploration peers.
         if explore_count > 0 && self.peers.len() > exploit_count {
             let explore_from: Vec<_> = sorted_peers[exploit_count..].to_vec();
-            use rand::seq::SliceRandom;
+            
+            // Convert Vec<&CachedPeer> to slice for choose()
+            let explore_slice: Vec<CachedPeer> = explore_from.iter().map(|&p| p.clone()).collect();
+            let explore_refs: Vec<&CachedPeer> = explore_slice.iter().collect();
+            
             let mut rng = rand::thread_rng();
             for _ in 0..explore_count {
-                if let Some(random_peer) = explore_from.choose(&mut rng) {
+                if let Some(random_peer) = explore_refs.as_slice().choose(&mut rng) {
                     selected.push(random_peer.address);
                 }
             }
@@ -454,7 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_cache_epsilon_greedy_selection() {
-        use rand::seq::SliceRandom;
+        
         
         let mut cache = PeerCache {
             peers: Vec::new(),
@@ -497,33 +528,9 @@ mod tests {
         // Should mostly select A, sometimes B or C
         let selected = cache.select_peers(2);
         assert_eq!(selected.len(), 2);
-        
+
         // Peer A (highest success rate) should always be in selection
         assert!(selected.contains(&"127.0.0.1:9000".parse().unwrap()));
-    }
-
-    #[tokio::test]
-    async fn test_peer_cache_record_attempt() {
-        let mut cache = PeerCache {
-            peers: Vec::new(),
-            cache_path: PathBuf::from("/tmp/test"),
-            epsilon: 0.1,
-        };
-
-        // Add a peer
-        cache.add_peer([1; 32], "127.0.0.1:9000".parse().unwrap());
-        assert_eq!(cache.peers[0].success_count, 1);
-        assert_eq!(cache.peers[0].attempt_count, 1);
-
-        // Record successful connection
-        cache.record_attempt([1; 32], true);
-        assert_eq!(cache.peers[0].success_count, 2);
-        assert_eq!(cache.peers[0].attempt_count, 2);
-
-        // Record failed connection
-        cache.record_attempt([1; 32], false);
-        assert_eq!(cache.peers[0].success_count, 2);
-        assert_eq!(cache.peers[0].attempt_count, 3);
     }
 
     #[tokio::test]

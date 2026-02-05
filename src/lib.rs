@@ -54,6 +54,9 @@ pub mod identity;
 /// persistent storage of MachineKeypair and AgentKeypair.
 pub mod storage;
 
+/// Network transport layer for x0x.
+pub mod network;
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -137,6 +140,8 @@ impl Subscription {
 pub struct AgentBuilder {
     machine_key_path: Option<std::path::PathBuf>,
     agent_keypair: Option<identity::AgentKeypair>,
+    #[allow(dead_code)]
+    network_config: Option<network::NetworkConfig>,
 }
 
 impl Agent {
@@ -159,6 +164,7 @@ impl Agent {
         AgentBuilder {
             machine_key_path: None,
             agent_keypair: None,
+            network_config: None,
         }
     }
 
