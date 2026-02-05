@@ -100,8 +100,7 @@ impl TaskListStorage {
 
         let serialized = fs::read(&file_path).await?;
 
-        bincode::deserialize(&serialized)
-            .map_err(crate::crdt::error::CrdtError::Serialization)
+        bincode::deserialize(&serialized).map_err(crate::crdt::error::CrdtError::Serialization)
     }
 
     /// List all stored task lists.
@@ -152,10 +151,7 @@ impl TaskListStorage {
     /// # Errors
     ///
     /// Returns an error if the delete operation fails.
-    pub async fn delete_task_list(
-        &self,
-        list_id: &TaskListId,
-    ) -> crate::crdt::error::Result<()> {
+    pub async fn delete_task_list(&self, list_id: &TaskListId) -> crate::crdt::error::Result<()> {
         let file_path = self.list_file_path(list_id);
 
         fs::remove_file(file_path).await?;
