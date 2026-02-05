@@ -23,3 +23,4 @@ tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+bincode = "1.3"
