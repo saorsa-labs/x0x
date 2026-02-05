@@ -6,7 +6,7 @@
 
 use crate::error::{IdentityError, Result};
 use crate::identity::{AgentKeypair, MachineKeypair};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::fs;
 
@@ -35,8 +35,7 @@ pub fn serialize_machine_keypair(kp: &MachineKeypair) -> Result<Vec<u8>> {
         public_key: kp.public_key().as_bytes().to_vec(),
         secret_key: kp.secret_key().as_bytes().to_vec(),
     };
-    bincode::serialize(&data)
-        .map_err(|e| IdentityError::Serialization(e.to_string()))
+    bincode::serialize(&data).map_err(|e| IdentityError::Serialization(e.to_string()))
 }
 
 /// Deserialize a MachineKeypair from bytes.
@@ -49,8 +48,8 @@ pub fn serialize_machine_keypair(kp: &MachineKeypair) -> Result<Vec<u8>> {
 ///
 /// A deserialized MachineKeypair
 pub fn deserialize_machine_keypair(bytes: &[u8]) -> Result<MachineKeypair> {
-    let data: SerializedKeypair = bincode::deserialize(bytes)
-        .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+    let data: SerializedKeypair =
+        bincode::deserialize(bytes).map_err(|e| IdentityError::Serialization(e.to_string()))?;
     MachineKeypair::from_bytes(&data.public_key, &data.secret_key)
 }
 
@@ -68,8 +67,7 @@ pub fn serialize_agent_keypair(kp: &AgentKeypair) -> Result<Vec<u8>> {
         public_key: kp.public_key().as_bytes().to_vec(),
         secret_key: kp.secret_key().as_bytes().to_vec(),
     };
-    bincode::serialize(&data)
-        .map_err(|e| IdentityError::Serialization(e.to_string()))
+    bincode::serialize(&data).map_err(|e| IdentityError::Serialization(e.to_string()))
 }
 
 /// Deserialize an AgentKeypair from bytes.
@@ -82,8 +80,8 @@ pub fn serialize_agent_keypair(kp: &AgentKeypair) -> Result<Vec<u8>> {
 ///
 /// A deserialized AgentKeypair
 pub fn deserialize_agent_keypair(bytes: &[u8]) -> Result<AgentKeypair> {
-    let data: SerializedKeypair = bincode::deserialize(bytes)
-        .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+    let data: SerializedKeypair =
+        bincode::deserialize(bytes).map_err(|e| IdentityError::Serialization(e.to_string()))?;
     AgentKeypair::from_bytes(&data.public_key, &data.secret_key)
 }
 
@@ -99,11 +97,12 @@ const MACHINE_KEY_FILE: &str = "machine.key";
 ///
 /// The path to the .x0x directory in the user's home directory
 async fn x0x_dir() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| IdentityError::Storage(std::io::Error::new(
+    let home = dirs::home_dir().ok_or_else(|| {
+        IdentityError::from(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "home directory not found"
-        )))?;
+            "home directory not found",
+        ))
+    })?;
     Ok(home.join(X0X_DIR))
 }
 
@@ -121,12 +120,12 @@ async fn x0x_dir() -> Result<std::path::PathBuf> {
 /// Ok(()) on success, or an error if the operation fails
 pub async fn save_machine_keypair(kp: &MachineKeypair) -> Result<()> {
     let dir = x0x_dir().await?;
-    fs::create_dir_all(&dir).await
-        .map_err(|e| IdentityError::Storage(e))?;
+    fs::create_dir_all(&dir)
+        .await
+        .map_err(IdentityError::from)?;
     let path = dir.join(MACHINE_KEY_FILE);
     let bytes = serialize_machine_keypair(kp)?;
-    fs::write(&path, bytes).await
-        .map_err(|e| IdentityError::Storage(e))?;
+    fs::write(&path, bytes).await.map_err(IdentityError::from)?;
     Ok(())
 }
 
@@ -137,8 +136,7 @@ pub async fn save_machine_keypair(kp: &MachineKeypair) -> Result<()> {
 /// The loaded MachineKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_machine_keypair() -> Result<MachineKeypair> {
     let path = x0x_dir().await?.join(MACHINE_KEY_FILE);
-    let bytes = fs::read(&path).await
-        .map_err(|e| IdentityError::Storage(e))?;
+    let bytes = fs::read(&path).await.map_err(IdentityError::from)?;
     deserialize_machine_keypair(&bytes)
 }
 
@@ -148,7 +146,9 @@ pub async fn load_machine_keypair() -> Result<MachineKeypair> {
 ///
 /// true if the machine key file exists, false otherwise
 pub async fn machine_keypair_exists() -> bool {
-    let Ok(path) = x0x_dir().await else { return false };
+    let Ok(path) = x0x_dir().await else {
+        return false;
+    };
     path.join(MACHINE_KEY_FILE).exists()
 }
 
@@ -164,15 +164,16 @@ pub async fn machine_keypair_exists() -> bool {
 /// Ok(()) on success, or an error if the operation fails
 pub async fn save_agent_keypair<P: AsRef<Path>>(kp: &AgentKeypair, path: P) -> Result<()> {
     let bytes = serialize_agent_keypair(kp)?;
-    let parent = path.as_ref().parent()
-        .ok_or_else(|| IdentityError::Storage(std::io::Error::new(
+    let parent = path.as_ref().parent().ok_or_else(|| {
+        IdentityError::from(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "invalid path: missing parent directory"
-        )))?;
-    fs::create_dir_all(parent).await
-        .map_err(|e| IdentityError::Storage(e))?;
-    fs::write(path, bytes).await
-        .map_err(|e| IdentityError::Storage(e))?;
+            "invalid path: missing parent directory",
+        ))
+    })?;
+    fs::create_dir_all(parent)
+        .await
+        .map_err(IdentityError::from)?;
+    fs::write(path, bytes).await.map_err(IdentityError::from)?;
     Ok(())
 }
 
@@ -195,12 +196,12 @@ pub async fn save_machine_keypair_to<P: AsRef<Path>>(kp: &MachineKeypair, path: 
     if let Some(parent) = path.as_ref().parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(IdentityError::Storage)?;
+            .map_err(IdentityError::from)?;
     }
 
     tokio::fs::write(path, bytes)
         .await
-        .map_err(IdentityError::Storage)?;
+        .map_err(IdentityError::from)?;
 
     Ok(())
 }
@@ -215,8 +216,7 @@ pub async fn save_machine_keypair_to<P: AsRef<Path>>(kp: &MachineKeypair, path: 
 ///
 /// The loaded MachineKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<MachineKeypair> {
-    let bytes = tokio::fs::read(path).await
-        .map_err(IdentityError::Storage)?;
+    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_machine_keypair(&bytes)
 }
 
@@ -230,18 +230,15 @@ pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<Machin
 ///
 /// The loaded AgentKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_agent_keypair<P: AsRef<Path>>(path: P) -> Result<AgentKeypair> {
-    let bytes = tokio::fs::read(path).await
-        .map_err(IdentityError::Storage)?;
+    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_agent_keypair(&bytes)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     #![allow(clippy::unwrap_used)]
-    #![allow(clippy::expect_used)]
-    #![allow(clippy::redundant_closure)]
-    #![allow(clippy::needless_borrow)]
+    use super::*;
+    use crate::identity::{AgentKeypair, MachineKeypair};
 
     #[tokio::test]
     async fn test_keypair_serialization_roundtrip() {
@@ -249,28 +246,34 @@ mod tests {
         let original = MachineKeypair::generate().unwrap();
         let serialized = serialize_machine_keypair(&original).unwrap();
         let deserialized = deserialize_machine_keypair(&serialized).unwrap();
-        
+
         assert_eq!(original.machine_id(), deserialized.machine_id());
-        assert_eq!(original.public_key().as_bytes(), deserialized.public_key().as_bytes());
+        assert_eq!(
+            original.public_key().as_bytes(),
+            deserialized.public_key().as_bytes()
+        );
 
         // Test AgentKeypair
         let original_agent = AgentKeypair::generate().unwrap();
         let serialized_agent = serialize_agent_keypair(&original_agent).unwrap();
         let deserialized_agent = deserialize_agent_keypair(&serialized_agent).unwrap();
-        
+
         assert_eq!(original_agent.agent_id(), deserialized_agent.agent_id());
-        assert_eq!(original_agent.public_key().as_bytes(), deserialized_agent.public_key().as_bytes());
+        assert_eq!(
+            original_agent.public_key().as_bytes(),
+            deserialized_agent.public_key().as_bytes()
+        );
     }
 
     #[tokio::test]
     async fn test_save_and_load_machine_keypair() {
         let keypair = MachineKeypair::generate().unwrap();
-        
+
         // Save to temp file
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("test_machine.key");
         save_machine_keypair_to_path(&keypair, &path).await.unwrap();
-        
+
         // Load and verify
         let loaded = load_machine_keypair_from_path(&path).await.unwrap();
         assert_eq!(keypair.machine_id(), loaded.machine_id());
@@ -279,17 +282,17 @@ mod tests {
     #[tokio::test]
     async fn test_machine_keypair_exists() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("test_machine.key");
-        
+        let path = temp_dir.path().join(MACHINE_KEY_FILE);
+
         // Initially should not exist
-        assert!(!machine_keypair_exists_in_dir(&temp_dir.path()).await);
-        
+        assert!(!machine_keypair_exists_in_dir(temp_dir.path()).await);
+
         // Create a key file
         let keypair = MachineKeypair::generate().unwrap();
         save_machine_keypair_to_path(&keypair, &path).await.unwrap();
-        
+
         // Should now exist
-        assert!(machine_keypair_exists_in_dir(&temp_dir.path()).await);
+        assert!(machine_keypair_exists_in_dir(temp_dir.path()).await);
     }
 
     #[tokio::test]
@@ -303,13 +306,15 @@ mod tests {
     async fn save_machine_keypair_to_path(kp: &MachineKeypair, path: &Path) -> Result<()> {
         let bytes = serialize_machine_keypair(kp)?;
         let parent = path.parent().unwrap();
-        fs::create_dir_all(parent).await.map_err(|e| IdentityError::Storage(e))?;
-        fs::write(path, bytes).await.map_err(|e| IdentityError::Storage(e))?;
+        fs::create_dir_all(parent)
+            .await
+            .map_err(IdentityError::from)?;
+        fs::write(path, bytes).await.map_err(IdentityError::from)?;
         Ok(())
     }
 
     async fn load_machine_keypair_from_path(path: &Path) -> Result<MachineKeypair> {
-        let bytes = fs::read(path).await.map_err(|e| IdentityError::Storage(e))?;
+        let bytes = fs::read(path).await.map_err(IdentityError::from)?;
         deserialize_machine_keypair(&bytes)
     }
 

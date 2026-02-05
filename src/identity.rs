@@ -23,7 +23,9 @@
 //! Both identities derive their PeerIds from ML-DSA-65 public keys via
 //! SHA-256 hashing, providing post-quantum security.
 
-use ant_quic::{derive_peer_id_from_public_key, MlDsaPublicKey, MlDsaSecretKey};
+use ant_quic::{
+    derive_peer_id_from_public_key, MlDsaPublicKey, MlDsaSecretKey, PeerId as AntQuicPeerId,
+};
 use serde::{Deserialize, Serialize};
 use zeroize::ZeroizeOnDrop;
 // Used for Display impl to show hex fingerprints
@@ -31,6 +33,12 @@ use hex;
 
 /// Length of a PeerId in bytes (SHA-256 hash output).
 pub const PEER_ID_LENGTH: usize = 32;
+
+/// PeerId type from ant-quic.
+///
+/// A PeerId is a 32-byte identifier derived from a public key via SHA-256 hashing.
+/// This is re-exported from ant-quic for convenience.
+pub type PeerId = AntQuicPeerId;
 
 /// Machine-pinned identity derived from ML-DSA-65 keypair.
 ///
@@ -235,7 +243,7 @@ impl std::fmt::Display for AgentId {
 ///
 /// The secret key is never exposed directly - accessors return references
 /// to prevent cloning.
-#[ZeroizeOnDrop]
+#[derive(ZeroizeOnDrop)]
 pub struct MachineKeypair {
     /// The public key component.
     public_key: MlDsaPublicKey,
@@ -359,7 +367,7 @@ impl MachineKeypair {
 ///
 /// The secret key is never exposed directly - accessors return references
 /// to prevent cloning.
-#[ZeroizeOnDrop]
+#[derive(ZeroizeOnDrop)]
 pub struct AgentKeypair {
     /// The public key component.
     public_key: MlDsaPublicKey,

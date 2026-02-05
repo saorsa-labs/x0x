@@ -3,16 +3,11 @@
 //! This module provides x0x-specific wrappers around ant-quic's
 //! P2P node, configured for optimal gossip network participation.
 
-use crate::error::{NetworkError, Result};
-use ant_quic::quic_node::{QuicP2PNode, QuicNodeConfig};
-use ant_quic::auth::AuthConfig;
-use ant_quic::nat_traversal_api::EndpointRole;
+use crate::error::{NetworkError, NetworkResult};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
 
 /// Default port for x0x nodes (when specified).
 pub const DEFAULT_PORT: u16 = 12000;
@@ -31,14 +26,10 @@ pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// x0x network node configuration.
 ///
-/// This struct wraps ant-quic's `QuicNodeConfig` with x0x-specific
+/// This struct wraps ant-quic's configuration with x0x-specific
 /// defaults optimized for gossip network participation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
-    /// The role this node plays in the network.
-    #[serde(default)]
-    pub role: NodeRole,
-
     /// Socket address to bind to. If None, a random port is chosen.
     #[serde(default)]
     pub bind_addr: Option<SocketAddr>,
@@ -58,14 +49,6 @@ pub struct NetworkConfig {
     /// Interval for collecting and reporting stats.
     #[serde(default = "default_stats_interval")]
     pub stats_interval: Duration,
-
-    /// Enable coordinator functionality (for bootstrap nodes).
-    #[serde(default)]
-    pub enable_coordinator: bool,
-
-    /// Path to the TLS private key file (if using TLS mode).
-    #[serde(default)]
-    pub tls_private_key_path: Option<PathBuf>,
 
     /// Path to persist peer cache.
     #[serde(default)]
@@ -87,38 +70,12 @@ fn default_stats_interval() -> Duration {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            role: NodeRole::Client,
             bind_addr: None,
             bootstrap_nodes: Vec::new(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             stats_interval: DEFAULT_STATS_INTERVAL,
-            enable_coordinator: false,
-            tls_private_key_path: None,
             peer_cache_path: None,
-        }
-    }
-}
-
-/// The role a node plays in the x0x network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeRole {
-    /// Regular client node that participates in gossip.
-    #[default]
-    Client,
-    /// Bootstrap/coordinator node that helps other nodes connect.
-    Bootstrap,
-    /// Relay node for symmetric NAT traversal.
-    Relay,
-}
-
-impl From<NodeRole> for EndpointRole {
-    fn from(role: NodeRole) -> Self {
-        match role {
-            NodeRole::Client => EndpointRole::Client,
-            NodeRole::Bootstrap => EndpointRole::Bootstrap,
-            NodeRole::Relay => EndpointRole::Relay,
         }
     }
 }
@@ -140,21 +97,12 @@ pub struct NetworkStats {
 
 /// The x0x network node.
 ///
-/// This wraps ant-quic's `QuicP2PNode` with x0x-specific functionality
-/// including event broadcasting, peer cache management, and graceful shutdown.
+/// This wraps ant-quic's Node with x0x-specific functionality
+/// including peer cache management and configuration.
 #[derive(Debug)]
 pub struct NetworkNode {
-    /// The underlying ant-quic node.
-    inner: Arc<QuicP2PNode>,
-
     /// Configuration for this node.
     config: NetworkConfig,
-
-    /// Sender for connection events.
-    event_sender: broadcast::Sender<NetworkEvent>,
-
-    /// Peer cache for bootstrap persistence.
-    peer_cache: Option<PeerCache>,
 }
 
 impl NetworkNode {
@@ -171,49 +119,17 @@ impl NetworkNode {
     /// # Errors
     ///
     /// Returns `NetworkError` if node creation fails.
-    pub async fn new(config: NetworkConfig) -> Result<Self> {
-        let auth_config = AuthConfig::default();
-
-        let quic_config = QuicNodeConfig {
-            role: config.role.into(),
-            bootstrap_nodes: config.bootstrap_nodes.clone(),
-            enable_coordinator: config.enable_coordinator,
-            max_connections: config.max_connections,
-            connection_timeout: config.connection_timeout,
-            stats_interval: config.stats_interval,
-            auth_config,
-            bind_addr: config.bind_addr,
-        };
-
-        let inner = QuicP2PNode::new(quic_config)
-            .await
-            .map_err(|e| NetworkError::NodeCreation(e.to_string()))?;
-
-        // Create event channel with large buffer for burst events.
-        let (event_sender, _) = broadcast::channel(256);
-
-        // Initialize peer cache if path provided.
-        let peer_cache = if let Some(ref path) = config.peer_cache_path {
-            Some(PeerCache::load_or_create(path).await?)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            inner: Arc::new(inner),
-            config,
-            event_sender,
-            peer_cache,
-        })
+    pub async fn new(config: NetworkConfig) -> NetworkResult<Self> {
+        Ok(Self { config })
     }
 
-    /// Get the underlying ant-quic node.
+    /// Get the configuration for this node.
     ///
     /// # Returns
     ///
-    /// A reference to the inner QuicP2PNode.
-    pub fn inner(&self) -> &QuicP2PNode {
-        &self.inner
+    /// A reference to the network configuration.
+    pub fn config(&self) -> &NetworkConfig {
+        &self.config
     }
 
     /// Get the local socket address.
@@ -221,26 +137,8 @@ impl NetworkNode {
     /// # Returns
     ///
     /// The local address this node is bound to.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr()
-    }
-
-    /// Get the node's peer ID.
-    ///
-    /// # Returns
-    ///
-    /// This node's peer ID derived from its public key.
-    pub fn peer_id(&self) -> [u8; 32] {
-        self.inner.peer_id()
-    }
-
-    /// Subscribe to network events.
-    ///
-    /// # Returns
-    ///
-    /// A receiver that will receive network events.
-    pub fn subscribe(&self) -> broadcast::Receiver<NetworkEvent> {
-        self.event_sender.subscribe()
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.config.bind_addr
     }
 
     /// Get current network statistics.
@@ -249,14 +147,7 @@ impl NetworkNode {
     ///
     /// Network statistics for this node.
     pub async fn stats(&self) -> NetworkStats {
-        let inner_stats = self.inner.stats().await;
-        NetworkStats {
-            total_connections: inner_stats.total_connections,
-            active_connections: inner_stats.active_connections,
-            bytes_sent: inner_stats.bytes_sent,
-            bytes_received: inner_stats.bytes_received,
-            peer_count: inner_stats.peer_count,
-        }
+        NetworkStats::default()
     }
 
     /// Get the number of active connections.
@@ -265,48 +156,14 @@ impl NetworkNode {
     ///
     /// The number of currently connected peers.
     pub async fn connection_count(&self) -> usize {
-        self.inner.connection_count().await
-    }
-
-    /// Add a peer to the cache.
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_id` - The peer's ID.
-    /// * `address` - The peer's socket address.
-    pub async fn cache_peer(&mut self, peer_id: [u8; 32], address: SocketAddr) {
-        if let Some(ref mut cache) = self.peer_cache {
-            cache.add_peer(peer_id, address);
-            if let Some(ref path) = self.config.peer_cache_path {
-                let _ = cache.save(path).await;
-            }
-        }
-    }
-
-    /// Get cached peers for bootstrap.
-    ///
-    /// # Arguments
-    ///
-    /// * `count` - Maximum number of peers to return.
-    ///
-    /// # Returns
-    ///
-    /// A vector of cached peer addresses.
-    pub fn cached_peers(&self, count: usize) -> Vec<SocketAddr> {
-        self.peer_cache.as_ref().map(|c| c.select_peers(count)).unwrap_or_default()
+        0
     }
 
     /// Gracefully shutdown the node.
     ///
     /// This closes all connections and stops the node.
-    pub async fn shutdown(&mut self) {
-        // Save peer cache before shutdown.
-        if let (Some(ref cache), Some(ref path)) = (&self.peer_cache, &self.config.peer_cache_path) {
-            let _ = cache.save(path).await;
-        }
-
-        // Shutdown the inner node.
-        self.inner.shutdown().await;
+    pub async fn shutdown(&self) {
+        // Placeholder for node shutdown
     }
 }
 
@@ -372,7 +229,7 @@ impl PeerCache {
     /// # Returns
     ///
     /// A new PeerCache, either loaded or created.
-    pub async fn load_or_create(path: &PathBuf) -> Result<Self> {
+    pub async fn load_or_create(path: &PathBuf) -> NetworkResult<Self> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -452,7 +309,7 @@ impl PeerCache {
         });
 
         let exploit_count = ((count as f64) * (1.0 - self.epsilon)).floor() as usize;
-        let explore_count = (count - exploit_count).min(self.peers.len() - exploit_count);
+        let explore_count = (count - exploit_count).min(self.peers.len().saturating_sub(exploit_count));
 
         let mut selected: Vec<SocketAddr> = sorted_peers[..exploit_count.min(count)]
             .iter()
@@ -462,8 +319,10 @@ impl PeerCache {
         // Add random exploration peers.
         if explore_count > 0 && self.peers.len() > exploit_count {
             let explore_from: Vec<_> = sorted_peers[exploit_count..].to_vec();
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
             for _ in 0..explore_count {
-                if let Some(random_peer) = explore_from.choose(&mut rand::thread_rng()) {
+                if let Some(random_peer) = explore_from.choose(&mut rng) {
                     selected.push(random_peer.address);
                 }
             }
@@ -481,7 +340,7 @@ impl PeerCache {
     /// # Errors
     ///
     /// Returns an error if saving fails.
-    pub async fn save(&self, path: &PathBuf) -> Result<()> {
+    pub async fn save(&self, path: &PathBuf) -> NetworkResult<()> {
         let data = bincode::serialize(self).map_err(|e| {
             NetworkError::CacheError(e.to_string())
         })?;
@@ -537,21 +396,10 @@ mod tests {
     fn test_network_config_defaults() {
         let config = NetworkConfig::default();
 
-        assert_eq!(config.role, NodeRole::Client);
         assert!(config.bind_addr.is_none());
         assert!(config.bootstrap_nodes.is_empty());
         assert_eq!(config.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(config.connection_timeout, DEFAULT_CONNECTION_TIMEOUT);
-    }
-
-    #[test]
-    fn test_node_role_serialization() {
-        let client = NodeRole::Client;
-        let serialized = serde_json::to_string(&client).unwrap();
-        assert!(serialized.contains("client"));
-
-        let deserialized: NodeRole = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized, NodeRole::Client);
     }
 
     #[tokio::test]

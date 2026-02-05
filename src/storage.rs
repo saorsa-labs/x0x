@@ -7,6 +7,8 @@
 use crate::error::{IdentityError, Result};
 use crate::identity::{AgentKeypair, MachineKeypair};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::fs;
 
@@ -126,6 +128,18 @@ pub async fn save_machine_keypair(kp: &MachineKeypair) -> Result<()> {
     let path = dir.join(MACHINE_KEY_FILE);
     let bytes = serialize_machine_keypair(kp)?;
     fs::write(&path, bytes).await.map_err(IdentityError::from)?;
+
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&path)
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms)
+            .await
+            .map_err(IdentityError::from)?;
+    }
     Ok(())
 }
 
@@ -149,7 +163,9 @@ pub async fn machine_keypair_exists() -> bool {
     let Ok(path) = x0x_dir().await else {
         return false;
     };
-    path.join(MACHINE_KEY_FILE).exists()
+    tokio::fs::try_exists(path.join(MACHINE_KEY_FILE))
+        .await
+        .unwrap_or(false)
 }
 
 /// Save an AgentKeypair to the specified file path.
@@ -203,6 +219,18 @@ pub async fn save_machine_keypair_to<P: AsRef<Path>>(kp: &MachineKeypair, path: 
         .await
         .map_err(IdentityError::from)?;
 
+    #[cfg(unix)]
+    {
+        let mut perms = tokio::fs::metadata(path.as_ref())
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        tokio::fs::set_permissions(path.as_ref(), perms)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+
     Ok(())
 }
 
@@ -236,6 +264,7 @@ pub async fn load_agent_keypair<P: AsRef<Path>>(path: P) -> Result<AgentKeypair>
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::identity::{AgentKeypair, MachineKeypair};
