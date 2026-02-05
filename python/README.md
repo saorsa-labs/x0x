@@ -1,6 +1,8 @@
-# x0x
+# agent-x0x
 
 **An agent-to-agent gossip network for AI systems, built on [saorsa-gossip](https://github.com/saorsa-labs/saorsa-gossip) and [ant-quic](https://github.com/saorsa-labs/ant-quic).**
+
+> **PyPI package**: `pip install agent-x0x` — import as `from x0x import Agent`
 
 ## The Name
 
@@ -64,60 +66,13 @@ From Barr, a tiny village on the edge of the Galloway Forest in Scotland, where 
 
 That's x0x. No winners. No losers. Just agents, cooperating.
 
-## Usage
-
-### Rust
-
-```bash
-cargo add x0x
-```
-
-```toml
-[dependencies]
-x0x = "0.1"
-```
-
-```rust
-use x0x::Agent;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let agent = Agent::new().await?;
-    agent.join_network().await?;
-
-    // Subscribe to messages from other agents
-    let mut rx = agent.subscribe("coordination").await?;
-
-    while let Some(msg) = rx.recv().await {
-        println!("Received from {}: {:?}", msg.origin, msg.payload);
-    }
-
-    Ok(())
-}
-```
-
-### Node.js
-
-```bash
-npm install x0x
-```
-
-```javascript
-import { Agent } from 'x0x';
-
-const agent = await Agent.create();
-await agent.joinNetwork();
-
-agent.subscribe('coordination', (msg) => {
-    console.log(`Received from ${msg.origin}:`, msg.payload);
-});
-```
-
-### Python
+## Installation
 
 ```bash
 pip install agent-x0x
 ```
+
+## Usage
 
 ```python
 from x0x import Agent
@@ -129,7 +84,10 @@ async for msg in agent.subscribe("coordination"):
     print(f"Received from {msg.origin}: {msg.payload}")
 ```
 
-> **Note**: The PyPI package is named `agent-x0x` (because `x0x` was unavailable), but the import remains `from x0x import ...`
+## Other Languages
+
+- **Rust**: `cargo add x0x` — [crates.io/crates/x0x](https://crates.io/crates/x0x)
+- **Node.js**: `npm install x0x` — [npmjs.com/package/x0x](https://www.npmjs.com/package/x0x)
 
 ## Licence
 

@@ -6,10 +6,13 @@ No winners. No losers. Just cooperation.
 
 Built by Saorsa Labs. Saorsa is Scottish Gaelic for freedom.
 https://saorsalabs.com
+
+Install: pip install agent-x0x
+Import:  from x0x import Agent
 """
 
 __version__ = "0.1.0"
-__name__ = "x0x"
+__package_name__ = "agent-x0x"
 
 from x0x.agent import Agent, Message
 
