@@ -1,7 +1,7 @@
 # Build Validation Report
-**Date**: 2026-02-05 22:24:40 GMT
+**Date**: 2026-02-05 22:36:00 GMT
 **Mode**: gsd-task
-**Task**: Task 2 - MLS Group Context
+**Task**: Task 3 - MLS Key Derivation
 
 ## Results
 
@@ -15,18 +15,19 @@ Finished `dev` profile
 ### cargo clippy:
 ✓ PASS (with -D warnings)
 ```
+Checking x0x v0.1.0
 Finished `dev` profile
 No warnings
 ```
 
 ### cargo nextest run:
-✓ PASS (210/210 tests)
+✓ PASS (219/219 tests)
 ```
-Summary [0.281s] 210 tests run: 210 passed, 0 skipped
+Summary [0.281s] 219 tests run: 219 passed, 0 skipped
 ```
 
 ### cargo fmt:
-✓ PASS (after auto-format)
+✓ PASS
 ```
 All files formatted correctly
 ```
@@ -36,11 +37,11 @@ All files formatted correctly
 |-------|--------|
 | cargo check | PASS |
 | cargo clippy | PASS |
-| cargo nextest run | PASS (210/210) |
+| cargo nextest run | PASS (219/219) |
 | cargo fmt | PASS |
 
 ## Errors/Warnings
-None (after formatting)
+None
 
 ## Grade: A
 All build validations pass. Zero errors, zero warnings.

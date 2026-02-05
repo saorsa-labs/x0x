@@ -1,36 +1,37 @@
 # Codex External Review
-**Date**: 2026-02-05 22:24:40 GMT
-**Task**: Task 2 - MLS Group Context
+**Date**: 2026-02-05 22:36:00 GMT
+**Task**: Task 3 - MLS Key Derivation
 
 ## Review Summary
 
-Task 2 implements MLS group context management structures. Review of src/mls/group.rs:
+Task 3 implements MLS key schedule for deriving encryption keys. Review of src/mls/keys.rs:
+
+### Cryptographic Quality:
+- BLAKE3 used appropriately for key derivation
+- Proper domain separation (key vs nonce derivation)
+- Forward secrecy through epoch-based derivation
+- Correct key and nonce sizes for ChaCha20-Poly1305
+
+### Security:
+- Critical nonce reuse warning documented
+- Deterministic derivation (no randomness pitfalls)
+- Multiple entropy sources (group_id, hashes, epoch)
+- No key material leakage
 
 ### Code Quality:
-- Well-structured type hierarchy
-- Clear separation of concerns (context, members, commits)
-- Proper Rust idioms throughout
-
-### Documentation:
-- Comprehensive doc comments on all public items
-- Clear explanations of MLS concepts
-
-### Testing:
-- 16 tests covering core functionality and edge cases
-- Good test organization with helper functions
-
-### Error Handling:
-- Proper use of Result types
-- Descriptive error messages
-- No unwrap/expect in production code
+- Clean, readable crypto code
+- Well-commented derivation steps
+- Comprehensive test coverage (9 tests)
+- Proper error handling with Result
 
 ### Notable Strengths:
-- Strong type safety with newtype wrappers
-- Proper encapsulation (private fields, public accessors)
-- Forward-thinking design (pending_commits for async operations)
+- Excellent security documentation
+- Deterministic for testing and reproducibility
+- Epoch isolation provides forward secrecy
+- Group isolation prevents key reuse across groups
 
 ### Suggestions:
-None - implementation is solid for current requirements
+None - implementation is cryptographically sound
 
 ## Grade: A
-High-quality implementation following Rust best practices. No issues identified.
+High-quality cryptographic implementation. No issues identified.

@@ -1,36 +1,36 @@
 # Documentation Review
-**Date**: 2026-02-05 22:24:40 GMT
+**Date**: 2026-02-05 22:36:00 GMT
 **Mode**: gsd-task
-**Task**: Task 2 - MLS Group Context
+**Task**: Task 3 - MLS Key Derivation
 
 ## Documentation Coverage
 
 ### Module documentation:
-- [OK] Module-level docs present in src/mls/group.rs
-- [OK] Clear description of MLS group management
+- [OK] Clear module-level docs explaining purpose
+- [OK] Describes key schedule and deterministic derivation
 
-### Public types documented:
-- [OK] MlsGroupContext - fully documented with field descriptions
-- [OK] MlsMemberInfo - documented
-- [OK] CommitOperation - documented enum variants
-- [OK] MlsCommit - fully documented
-- [OK] MlsGroup - comprehensive docs with usage examples
+### Type documentation:
+- [OK] MlsKeySchedule fully documented
+- [OK] All fields explained
+- [OK] Purpose and security properties described
 
-### Public methods documented:
-- [OK] All 24 public methods have /// doc comments
-- [OK] Arguments documented with # Arguments sections
-- [OK] Return values documented with # Returns sections
-- [OK] Error conditions documented with # Errors sections
+### Method documentation:
+- [OK] from_group() - comprehensive docs with security notes
+- [OK] encryption_key() - clear return description
+- [OK] base_nonce() - explains XOR usage
+- [OK] derive_nonce() - **CRITICAL** security warning about nonce reuse
+- [OK] All accessor methods documented
 
-### Cargo doc:
-Builds successfully with no warnings
+### Security documentation:
+- [OK] **CRITICAL** nonce reuse warning in derive_nonce()
+- [OK] Forward secrecy explanation in from_group()
+- [OK] Key uniqueness guarantees documented
 
 ## Findings
-- [OK] 100% public API documentation coverage
-- [OK] Clear, concise descriptions
-- [OK] Proper rustdoc formatting
-- [OK] Examples in key methods
-- [OK] Error cases well-documented
+- [OK] 100% public API documentation
+- [OK] Security-critical information prominently documented
+- [OK] Clear explanations of cryptographic operations
+- [OK] Proper use of # Security sections
 
 ## Grade: A
-Documentation is comprehensive and well-written. Excellent API documentation.
+Documentation is excellent with critical security warnings.

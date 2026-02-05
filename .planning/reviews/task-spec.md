@@ -1,62 +1,53 @@
 # Task Specification Review
-**Date**: 2026-02-05 22:24:40 GMT
-**Task**: Phase 1.5, Task 2 - Implement MLS Group Context
+**Date**: 2026-02-05 22:36:00 GMT
+**Task**: Phase 1.5, Task 3 - Implement MLS Key Derivation
 **Mode**: gsd-task
 
 ## Task Specification
 
 From `.planning/PLAN-phase-1.5.md`:
-- File: `src/mls/group.rs`
-- Implement MLS group data structures
-- Required structures: MlsGroupContext, MlsGroup, MlsMemberInfo, MlsCommit
-- Required methods: new, add_member, remove_member, commit, apply_commit, current_epoch
-- Requirements: Track group membership, manage epochs, proper error handling
-- Tests: Group creation, member addition/removal, epoch increment
+- File: `src/mls/keys.rs`
+- Implement MlsKeySchedule struct
+- Required methods: from_group, encryption_key, base_nonce, derive_nonce
+- Requirements: Derive keys from group secrets, nonce generation, key rotation support
+- Tests: Deterministic derivation, different epochs→different keys, unique nonces
 
 ## Spec Compliance
 
-### Data Structures:
-- [x] MlsGroupContext implemented with all required fields
-- [x] MlsGroup implemented with context, members, pending_commits
-- [x] MlsMemberInfo defined
-- [x] MlsCommit defined
-- [x] CommitOperation enum for operations
+### Data Structure:
+- [x] MlsKeySchedule implemented
+- [x] Fields: epoch, psk_id_hash, secret, key, base_nonce
 
 ### Required Methods:
-- [x] new(group_id, initiator) -> Result<Self>
-- [x] add_member(&mut self, member) -> Result<MlsCommit>
-- [x] remove_member(&mut self, member) -> Result<MlsCommit>
-- [x] commit(&mut self) -> Result<MlsCommit>
-- [x] apply_commit(&mut self, commit) -> Result<()>
-- [x] current_epoch(&self) -> u64
+- [x] from_group(group: &MlsGroup) -> Result<Self>
+- [x] encryption_key(&self) -> &[u8]
+- [x] base_nonce(&self) -> &[u8]
+- [x] derive_nonce(&self, counter: u64) -> Vec<u8>
 
 ### Requirements:
-- [x] Track group membership (HashMap<AgentId, MlsMemberInfo>)
-- [x] Manage epochs (increment on apply_commit)
-- [x] Key rotation (commit() for UpdateKeys operation)
-- [x] Proper error handling (MlsError::MemberNotInGroup, EpochMismatch, etc.)
+- [x] Derive keys from group secrets (BLAKE3 from group_id, hashes, epoch)
+- [x] Support nonce generation for each message (XOR counter with base_nonce)
+- [x] Support key rotation on epoch change (different epoch→different keys)
 
 ### Tests:
-- [x] Group creation (test_group_creation)
-- [x] Member addition (test_add_member, test_add_duplicate_member)
-- [x] Member removal (test_remove_member, test_remove_nonexistent_member)
-- [x] Epoch increment (test_epoch_increment_on_commits)
-- [x] Additional tests: key rotation, epoch mismatch, context updates
+- [x] Key derivation is deterministic (test_key_derivation_is_deterministic)
+- [x] Different epochs produce different keys (test_different_epochs_produce_different_keys)
+- [x] Nonce is unique per counter (test_nonce_unique_per_counter)
+- [x] Additional tests: group uniqueness, XOR behavior, accessors, clone
 
-### Beyond Spec (Good Additions):
-- [+] Additional accessor methods for encapsulation
+## Beyond Spec (Good Additions):
+- [+] Security warning about nonce reuse
+- [+] Additional accessor methods (epoch, psk_id_hash, secret)
+- [+] PartialEq for testing
 - [+] Comprehensive documentation (100% coverage)
-- [+] More edge case tests (16 total vs 3 required)
-- [+] Proper serialization support (Serialize/Deserialize)
-- [+] #[must_use] attributes for safety
+- [+] 9 tests vs 3 required
 
 ## Findings
 - [OK] All specification requirements met
 - [OK] Implementation matches task description exactly
-- [OK] No scope creep - focused on group management only
-- [OK] Acceptance criteria exceeded (16 tests vs 3 required)
-- [OK] Error handling comprehensive
-- [OK] No missing functionality
+- [OK] Cryptographic quality exceeds basic requirements
+- [OK] Security documentation excellent
+- [OK] No scope creep
 
 ## Grade: A
-Task specification fully implemented with excellent quality. All requirements met and exceeded.
+Task specification fully implemented with excellent quality and security practices.

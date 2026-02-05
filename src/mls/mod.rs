@@ -5,6 +5,8 @@
 
 pub mod error;
 pub mod group;
+pub mod keys;
 
 pub use error::{MlsError, Result};
 pub use group::{CommitOperation, MlsCommit, MlsGroup, MlsGroupContext, MlsMemberInfo};
+pub use keys::MlsKeySchedule;
