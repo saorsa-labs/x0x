@@ -81,6 +81,9 @@ pub mod network;
 #[derive(Debug)]
 pub struct Agent {
     identity: identity::Identity,
+    /// The network node for P2P communication.
+    #[allow(dead_code)]
+    network: Option<network::NetworkNode>,
 }
 
 /// A message received from the gossip network.
@@ -322,7 +325,19 @@ impl AgentBuilder {
         // Combine into unified Identity
         let identity = identity::Identity::new(machine_keypair, agent_keypair);
 
-        Ok(Agent { identity })
+        // Create network node if configured
+        let network = if let Some(config) = self.network_config {
+            Some(network::NetworkNode::new(config).await.map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("network initialization failed: {}", e),
+                ))
+            })?)
+        } else {
+            None
+        };
+
+        Ok(Agent { identity, network })
     }
 }
 
