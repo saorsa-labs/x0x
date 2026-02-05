@@ -258,6 +258,62 @@ impl Agent {
         // Placeholder — will use saorsa-gossip pubsub
         Ok(())
     }
+
+    /// Create a new collaborative task list bound to a topic.
+    ///
+    /// Creates a new `TaskList` and binds it to the specified gossip topic
+    /// for automatic synchronization with other agents on the same topic.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Human-readable name for the task list
+    /// * `topic` - Gossip topic for synchronization
+    ///
+    /// # Returns
+    ///
+    /// A `TaskListHandle` for interacting with the task list.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let list = agent.create_task_list("Sprint Planning", "team-sprint").await?;
+    /// ```
+    pub async fn create_task_list(&self, _name: &str, _topic: &str) -> error::Result<TaskListHandle> {
+        // TODO: Implement task list creation when gossip runtime is available
+        // This would:
+        // 1. Create a new TaskList with TaskListId::from_content(name, agent_id, timestamp)
+        // 2. Wrap it in TaskListSync with the gossip runtime
+        // 3. Return a TaskListHandle
+        Err(error::IdentityError::Storage(std::io::Error::other("TaskList creation not yet implemented")))
+    }
+
+    /// Join an existing task list by topic.
+    ///
+    /// Connects to a task list that was created by another agent on the
+    /// specified topic. The local replica will sync with peers automatically.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - Gossip topic for the task list
+    ///
+    /// # Returns
+    ///
+    /// A `TaskListHandle` for interacting with the task list.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let list = agent.join_task_list("team-sprint").await?;
+    /// ```
+    pub async fn join_task_list(&self, _topic: &str) -> error::Result<TaskListHandle> {
+        // TODO: Implement task list joining when gossip runtime is available
+        // This would:
+        // 1. Create an empty TaskList (or load from persistence if exists)
+        // 2. Subscribe to the topic to receive updates
+        // 3. Start anti-entropy sync
+        // 4. Return a TaskListHandle
+        Err(error::IdentityError::Storage(std::io::Error::other("TaskList joining not yet implemented")))
+    }
 }
 
 impl AgentBuilder {
@@ -376,6 +432,101 @@ impl AgentBuilder {
 
         Ok(Agent { identity, network })
     }
+}
+
+/// Handle for interacting with a collaborative task list.
+///
+/// Provides a safe, concurrent interface to a TaskList backed by
+/// CRDT synchronization. All operations are async and return Results.
+///
+/// # Example
+///
+/// ```ignore
+/// let handle = agent.create_task_list("My List", "topic").await?;
+/// let task_id = handle.add_task("Write docs".to_string(), "API docs".to_string()).await?;
+/// handle.claim_task(task_id).await?;
+/// handle.complete_task(task_id).await?;
+/// ```
+#[derive(Debug, Clone)]
+pub struct TaskListHandle {
+    _sync: std::sync::Arc<()>, // Placeholder for Arc<TaskListSync>
+}
+
+impl TaskListHandle {
+    /// Add a new task to the list.
+    ///
+    /// # Arguments
+    ///
+    /// * `title` - Task title
+    /// * `description` - Task description
+    ///
+    /// # Returns
+    ///
+    /// The TaskId of the created task.
+    pub async fn add_task(&self, _title: String, _description: String) -> error::Result<crdt::TaskId> {
+        // TODO: Implement when TaskListSync is available
+        Err(error::IdentityError::Storage(std::io::Error::other("TaskListHandle not yet implemented")))
+    }
+
+    /// Claim a task in the list.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - ID of the task to claim
+    pub async fn claim_task(&self, _task_id: crdt::TaskId) -> error::Result<()> {
+        // TODO: Implement when TaskListSync is available
+        Err(error::IdentityError::Storage(std::io::Error::other("TaskListHandle not yet implemented")))
+    }
+
+    /// Complete a task in the list.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - ID of the task to complete
+    pub async fn complete_task(&self, _task_id: crdt::TaskId) -> error::Result<()> {
+        // TODO: Implement when TaskListSync is available
+        Err(error::IdentityError::Storage(std::io::Error::other("TaskListHandle not yet implemented")))
+    }
+
+    /// List all tasks in their current order.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `TaskSnapshot` representing the current state.
+    pub async fn list_tasks(&self) -> error::Result<Vec<TaskSnapshot>> {
+        // TODO: Implement when TaskListSync is available
+        Err(error::IdentityError::Storage(std::io::Error::other("TaskListHandle not yet implemented")))
+    }
+
+    /// Reorder tasks in the list.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_ids` - New ordering of task IDs
+    pub async fn reorder(&self, _task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
+        // TODO: Implement when TaskListSync is available
+        Err(error::IdentityError::Storage(std::io::Error::other("TaskListHandle not yet implemented")))
+    }
+}
+
+/// Read-only snapshot of a task's current state.
+///
+/// This is returned by `TaskListHandle::list_tasks()` and hides CRDT
+/// internals, providing a clean API surface.
+#[derive(Debug, Clone)]
+pub struct TaskSnapshot {
+    /// Unique task identifier.
+    pub id: crdt::TaskId,
+    /// Task title.
+    pub title: String,
+    /// Task description.
+    pub description: String,
+    /// Current checkbox state (Empty, Claimed, or Done).
+    pub state: crdt::CheckboxState,
+    /// Agent assigned to this task (if any).
+    pub assignee: Option<identity::AgentId>,
+    /// Task priority (0-255, higher = more important).
+    pub priority: u8,
 }
 
 /// The x0x protocol version.
