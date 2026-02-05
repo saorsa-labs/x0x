@@ -1,73 +1,131 @@
-// Copyright 2024 Saorsa Labs Ltd.
-//!
 //! Integration tests for x0x agent network lifecycle.
+//!
+//! These tests verify the complete workflow of creating agents,
+//! configuring network settings, and participating in the gossip network.
 
-use x0x::{Agent, Message};
+use tempfile::TempDir;
+use x0x::{network, Agent};
 
-/// Test that an agent can be created with default configuration.
+/// Test agent creation with default network configuration.
 #[tokio::test]
 async fn test_agent_creation() {
     let agent = Agent::new().await;
-    assert!(agent.is_ok(), "Agent creation should succeed");
+    assert!(agent.is_ok());
+    
     let agent = agent.unwrap();
-    assert!(agent.agent_id().as_bytes().len() == 32);
-    assert!(agent.machine_id().as_bytes().len() == 32);
+    assert!(agent.identity().machine_id().as_bytes() != &[0u8; 32]);
+    assert!(agent.identity().agent_id().as_bytes() != &[0u8; 32]);
 }
 
-/// Test that an agent can join the network.
+/// Test agent creation with custom network configuration.
+#[tokio::test]
+async fn test_agent_with_network_config() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    
+    let builder = Agent::builder();
+    let builder = builder.with_machine_key(temp_dir.path().join("machine.key"));
+    let builder = builder.with_network_config(network::NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+        bootstrap_nodes: vec!["127.0.0.1:12000".parse().unwrap()],
+        ..Default::default()
+    });
+    
+    let agent = builder.build().await.expect("Failed to build agent");
+    assert!(agent.network().is_some());
+}
+
+/// Test agent joining network with configuration.
 #[tokio::test]
 async fn test_agent_join_network() {
-    let agent = Agent::new().await.unwrap();
+    let agent = Agent::new().await.expect("Failed to create agent");
+    
     let result = agent.join_network().await;
-    // Either succeeds or fails gracefully - both are acceptable
-    assert!(result.is_ok() || result.is_err());
+    assert!(result.is_ok());
 }
 
-/// Test that an agent can subscribe to a topic.
+/// Test agent subscribe functionality.
 #[tokio::test]
 async fn test_agent_subscribe() {
-    let agent = Agent::new().await.unwrap();
+    let agent = Agent::new().await.expect("Failed to create agent");
+    
     let result = agent.subscribe("test-topic").await;
-    assert!(result.is_ok() || result.is_err());
+    assert!(result.is_ok());
+    
+    let mut subscription = result.unwrap();
+    // No messages yet, so recv should return None
+    assert!(subscription.recv().await.is_none());
 }
 
-/// Test that agent identity is stable.
+/// Test agent publish functionality.
+#[tokio::test]
+async fn test_agent_publish() {
+    let agent = Agent::new().await.expect("Failed to create agent");
+    
+    let result = agent.publish("test-topic", b"hello world".to_vec()).await;
+    assert!(result.is_ok());
+}
+
+/// Test agent identity stability across operations.
 #[tokio::test]
 async fn test_identity_stability() {
-    let agent = Agent::new().await.unwrap();
-    let agent_id = agent.agent_id();
+    let agent = Agent::new().await.expect("Failed to create agent");
+    
     let machine_id = agent.machine_id();
-    // IDs should be stable across calls
-    assert_eq!(agent.agent_id().as_bytes(), agent_id.as_bytes());
-    assert_eq!(agent.machine_id().as_bytes(), machine_id.as_bytes());
+    let agent_id = agent.agent_id();
+    
+    // Perform network operations
+    let _ = agent.join_network().await;
+    let _ = agent.subscribe("test-topic").await;
+    let _ = agent.publish("test-topic", vec![]).await;
+    
+    // Verify IDs are stable
+    assert_eq!(agent.machine_id(), machine_id);
+    assert_eq!(agent.agent_id(), agent_id);
 }
 
 /// Test agent builder with custom machine key path.
 #[tokio::test]
 async fn test_builder_custom_machine_key() {
-    let agent = Agent::builder()
-        .with_machine_key("/tmp/test-machine-key.key")
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let key_path = temp_dir.path().join("custom_machine.key");
+    
+    // Create first agent with custom key
+    let agent1 = Agent::builder()
+        .with_machine_key(&key_path)
         .build()
-        .await;
-    assert!(agent.is_ok(), "Builder with custom key path should work");
+        .await
+        .expect("Failed to create agent1");
+    
+    let machine_id1 = agent1.machine_id();
+    
+    // Create second agent with same key - should reuse
+    let agent2 = Agent::builder()
+        .with_machine_key(&key_path)
+        .build()
+        .await
+        .expect("Failed to create agent2");
+    
+    let machine_id2 = agent2.machine_id();
+    
+    // Machine IDs should be the same (same machine key)
+    assert_eq!(machine_id1, machine_id2);
+    
+    // Agent IDs should be different (different agent keys)
+    assert_ne!(agent1.agent_id(), agent2.agent_id());
 }
 
-/// Test Message struct creation and fields.
+/// Test message format and structure.
 #[tokio::test]
 async fn test_message_format() {
+    use x0x::Message;
+    
     let msg = Message {
         origin: "test-agent".to_string(),
-        payload: vec![1, 2, 3],
+        payload: b"test payload".to_vec(),
         topic: "test-topic".to_string(),
     };
-    assert_eq!(msg.payload.len(), 3);
+    
+    assert_eq!(msg.origin, "test-agent");
+    assert_eq!(msg.payload, b"test payload");
     assert_eq!(msg.topic, "test-topic");
-}
-
-/// Test that agent can publish to a topic.
-#[tokio::test]
-async fn test_agent_publish() {
-    let agent = Agent::new().await.unwrap();
-    let result = agent.publish("test-topic", vec![1, 2, 3]).await;
-    assert!(result.is_ok());
 }

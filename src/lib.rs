@@ -211,6 +211,18 @@ impl Agent {
         self.identity.agent_id()
     }
 
+    /// Get the network node, if initialized.
+    #[must_use]
+    pub fn network(&self) -> Option<&network::NetworkNode> {
+        self.network.as_ref()
+    }
+
+    /// Get mutable access to the network node.
+    #[must_use]
+    pub fn network_mut(&mut self) -> Option<&mut network::NetworkNode> {
+        self.network.as_mut()
+    }
+
     /// Join the x0x gossip network.
     ///
     /// This begins the gossip protocol, discovering peers and
@@ -272,6 +284,22 @@ impl AgentBuilder {
     /// Self for chaining.
     pub fn with_agent_key(mut self, keypair: identity::AgentKeypair) -> Self {
         self.agent_keypair = Some(keypair);
+        self
+    }
+
+    /// Set network configuration for P2P communication.
+    ///
+    /// If not set, default network configuration is used.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The network configuration to use.
+    ///
+    /// # Returns
+    ///
+    /// Self for chaining.
+    pub fn with_network_config(mut self, config: network::NetworkConfig) -> Self {
+        self.network_config = Some(config);
         self
     }
 
