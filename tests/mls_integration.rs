@@ -18,7 +18,7 @@ async fn test_group_creation() {
 
     assert_eq!(group.context().group_id(), &group_id);
     assert_eq!(group.current_epoch(), 0);
-    assert!(group.members().contains(&agent_id));
+    assert!(group.members().contains_key(&agent_id));
     assert_eq!(group.members().len(), 1);
 }
 
@@ -48,7 +48,7 @@ async fn test_member_addition() {
     let _commit = group
         .add_member(invitee_id)
         .expect("member addition failed");
-    assert!(group.members().contains(&invitee_id));
+    assert!(group.members().contains_key(&invitee_id));
     assert_eq!(group.members().len(), 2);
 }
 
@@ -72,7 +72,7 @@ async fn test_member_removal() {
         .remove_member(member_id)
         .expect("remove member failed");
 
-    assert!(!group.members().contains(&member_id));
+    assert!(!group.members().contains_key(&member_id));
     assert_eq!(group.members().len(), 1);
 }
 
@@ -182,9 +182,9 @@ async fn test_multi_agent_group_operations() {
 
     // Verify all members present
     assert_eq!(group.members().len(), 3);
-    assert!(group.members().contains(&initiator_id));
-    assert!(group.members().contains(&agent2_id));
-    assert!(group.members().contains(&agent3_id));
+    assert!(group.members().contains_key(&initiator_id));
+    assert!(group.members().contains_key(&agent2_id));
+    assert!(group.members().contains_key(&agent3_id));
 
     // Each member can encrypt/decrypt with group keys
     let delta = TaskListDelta::new(1);
@@ -252,7 +252,7 @@ async fn test_encryption_authentication() {
     let group = MlsGroup::new(group_id, agent_id).expect("group creation failed");
 
     let delta = TaskListDelta::new(1);
-    let mut encrypted =
+    let encrypted =
         EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
 
     // Tamper with ciphertext
@@ -261,7 +261,7 @@ async fn test_encryption_authentication() {
     tampered[0] ^= 1; // Flip one bit
 
     // Create new encrypted delta with tampered ciphertext (simulate network attack)
-    let tampered_encrypted =
+    let _tampered_encrypted =
         EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
     // In real scenario, attacker would modify the serialized bytes
 
