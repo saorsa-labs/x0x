@@ -28,6 +28,7 @@
 //! ```
 
 pub mod checkbox;
+pub mod delta;
 pub mod error;
 pub mod task;
 pub mod task_item;
@@ -35,6 +36,7 @@ pub mod task_list;
 
 // Re-export commonly used types
 pub use checkbox::{CheckboxError, CheckboxState};
+pub use delta::TaskListDelta;
 pub use error::{CrdtError, Result};
 pub use task::{TaskId, TaskMetadata};
 pub use task_item::TaskItem;
