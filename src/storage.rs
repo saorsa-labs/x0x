@@ -176,6 +176,47 @@ pub async fn save_agent_keypair<P: AsRef<Path>>(kp: &AgentKeypair, path: P) -> R
     Ok(())
 }
 
+/// Save a MachineKeypair to the specified file path.
+///
+/// Creates the parent directory if it doesn't exist.
+///
+/// # Arguments
+///
+/// * `kp` - The MachineKeypair to save
+/// * `path` - The file path to save to
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error if file I/O fails
+pub async fn save_machine_keypair_to<P: AsRef<Path>>(kp: &MachineKeypair, path: P) -> Result<()> {
+    let bytes = serialize_machine_keypair(kp)?;
+    let parent = path.as_ref().parent()
+        .ok_or_else(|| IdentityError::Storage(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid path: missing parent directory"
+        )))?;
+    tokio::fs::create_dir_all(parent).await
+        .map_err(IdentityError::Storage)?;
+    tokio::fs::write(path, bytes).await
+        .map_err(IdentityError::Storage)?;
+    Ok(())
+}
+
+/// Load a MachineKeypair from the specified file path.
+///
+/// # Arguments
+///
+/// * `path` - The file path to load from
+///
+/// # Returns
+///
+/// The loaded MachineKeypair, or an error if the file doesn't exist or is invalid
+pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<MachineKeypair> {
+    let bytes = tokio::fs::read(path).await
+        .map_err(IdentityError::Storage)?;
+    deserialize_machine_keypair(&bytes)
+}
+
 /// Load an AgentKeypair from the specified file path.
 ///
 /// # Arguments
@@ -186,8 +227,8 @@ pub async fn save_agent_keypair<P: AsRef<Path>>(kp: &AgentKeypair, path: P) -> R
 ///
 /// The loaded AgentKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_agent_keypair<P: AsRef<Path>>(path: P) -> Result<AgentKeypair> {
-    let bytes = fs::read(path).await
-        .map_err(|e| IdentityError::Storage(e))?;
+    let bytes = tokio::fs::read(path).await
+        .map_err(IdentityError::Storage)?;
     deserialize_agent_keypair(&bytes)
 }
 
@@ -269,4 +310,60 @@ mod tests {
     async fn machine_keypair_exists_in_dir(dir: &Path) -> bool {
         dir.join(MACHINE_KEY_FILE).exists()
     }
+}
+
+/// Load a MachineKeypair from a specific path.
+///
+/// Used for loading machine keys from custom locations.
+///
+/// # Arguments
+///
+/// * `path` - The source file path.
+///
+/// # Returns
+///
+/// The loaded MachineKeypair.
+///
+/// # Errors
+///
+/// Returns `IdentityError::Storage` if file I/O fails, or
+/// `IdentityError::Serialization` if the file is corrupted.
+pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<MachineKeypair> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(IdentityError::Storage)?;
+
+    deserialize_machine_keypair(&bytes)
+}
+
+/// Save a MachineKeypair to a specific path.
+///
+/// Used for saving machine keys to custom locations.
+///
+/// # Arguments
+///
+/// * `kp` - The MachineKeypair to save.
+/// * `path` - The destination file path.
+///
+/// # Errors
+///
+/// Returns `IdentityError::Storage` if file I/O fails.
+pub async fn save_machine_keypair_to<P: AsRef<Path>>(
+    kp: &MachineKeypair,
+    path: P,
+) -> Result<()> {
+    let bytes = serialize_machine_keypair(kp)?;
+
+    // Ensure parent directory exists
+    if let Some(parent) = path.as_ref().parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(IdentityError::Storage)?;
+    }
+
+    tokio::fs::write(path, bytes)
+        .await
+        .map_err(IdentityError::Storage)?;
+
+    Ok(())
 }
