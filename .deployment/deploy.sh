@@ -6,8 +6,8 @@
 set -euo pipefail
 
 # Configuration
-BINARY_PATH="../../target/x86_64-unknown-linux-gnu/release/x0x-bootstrap"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BINARY_PATH="$SCRIPT_DIR/../target/release/x0x-bootstrap"
 
 # Node definitions
 declare -A NODES=(

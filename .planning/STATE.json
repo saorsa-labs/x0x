@@ -9,17 +9,17 @@
     "total_phases": 4
   },
   "phase": {
-    "number": "3.2",
-    "name": "Integration Testing",
-    "plan": "PLAN-phase-3.2.md",
+    "number": "3.1",
+    "name": "Testnet Deployment",
+    "plan": "PLAN-phase-3.1.md",
     "status": "blocked"
   },
   "progress": {
     "total_tasks": 10,
-    "completed_tasks": 0,
-    "current_task": 0,
+    "completed_tasks": 10,
+    "current_task": 10,
     "blocked_tasks": [],
-    "blocking_reason": "Phase 3.1 Tasks 5-8 and Phase 3.2 (all tasks) blocked on x0x-bootstrap binary. Must trigger CI workflow (.github/workflows/build-bootstrap.yml) or build on Linux. Phase 3.3 can partially proceed but publishing requires testnet verification."
+    "blocking_reason": "Bootstrap nodes deployed successfully to all 6 VPS nodes but not forming mesh connections. QUIC transport (port 12000/UDP) not binding. Investigation needed: nodes only listen on health port (12600/TCP). All services active and healthy but peer count remains 0. Likely issue in Agent::join_network() or Network initialization."
   },
   "milestones_overview": [
     {
@@ -86,7 +86,7 @@
         {
           "number": "3.1",
           "name": "Testnet Deployment",
-          "status": "complete"
+          "status": "blocked"
         },
         {
           "number": "3.2",
@@ -126,5 +126,5 @@
     "name": ""
   },
   "phase_1_4_summary": "Phase 1.4 Complete - CRDT Task Lists implemented with all 10 tasks: error types, CheckboxState, TaskId/Metadata, TaskItem CRDT (OR-Set + LWW), TaskList CRDT with ordering, Delta-CRDT for bandwidth efficiency, anti-entropy sync, Agent API integration, persistence layer, comprehensive integration tests. 264/264 tests passing, zero warnings.",
-  "phase_3_1_summary": "Phase 3.1 Partial Complete - 6/10 tasks finished. Completed: Tasks 1-4 (bootstrap infrastructure), Task 9 (mesh verification script), Task 10 (bootstrap addresses in SDK). BLOCKED: Tasks 5-8 (VPS deployments) await x0x-bootstrap binary from CI/CD. Infrastructure ready: configs, scripts, systemd units, CI workflow. 265/265 tests passing, zero warnings."
+  "phase_3_1_summary": "Phase 3.1 BLOCKED - 10/10 tasks completed but mesh not forming. CI builds successful (2.5MB binary), all 6 VPS nodes deployed with systemd services active. Health endpoints responding but QUIC transport (port 12000/UDP) not binding - nodes show 0 peers. Root cause: Agent::join_network() or Network initialization not starting QUIC listener. Config files corrected to flat TOML format. Requires investigation of Network/QUIC binding logic."
 }

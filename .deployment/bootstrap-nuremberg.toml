@@ -2,15 +2,22 @@
 # Location: Nuremberg, Germany (Hetzner)
 # Public IP: 116.203.101.172
 
-[node]
-# Identity and storage
-machine_key_path = "/var/lib/x0x/machine.key"
-data_directory = "/var/lib/x0x/data"
-
-[network]
-# QUIC transport
+# QUIC transport bind address
 bind_address = "116.203.101.172:12000"
-enable_nat_traversal = true
+
+# Health/metrics endpoint (localhost only)
+health_address = "127.0.0.1:12600"
+
+# Machine identity key
+machine_key_path = "/var/lib/x0x/machine.key"
+
+# Data directory
+data_dir = "/var/lib/x0x/data"
+
+# Bootstrap roles
+coordinator = true
+reflector = true
+relay = true
 
 # Known peers (other 5 bootstrap nodes)
 known_peers = [
@@ -21,9 +28,5 @@ known_peers = [
     "45.77.176.184:12000",      # saorsa-9 (Tokyo)
 ]
 
-[health]
-# Health and metrics endpoint (localhost only)
-bind_address = "127.0.0.1:12600"
-
-[logging]
-level = "info"
+# Logging
+log_level = "info"
