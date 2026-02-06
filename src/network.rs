@@ -194,9 +194,9 @@ impl NetworkNode {
         let node_config = builder.build();
 
         // Create ant-quic Node (this binds QUIC transport)
-        let node = Node::with_config(node_config)
-            .await
-            .map_err(|e| NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e)))?;
+        let node = Node::with_config(node_config).await.map_err(|e| {
+            NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e))
+        })?;
 
         let (event_sender, _event_receiver) = broadcast::channel(32);
 
@@ -237,8 +237,8 @@ impl NetworkNode {
             NetworkStats {
                 total_connections: status.direct_connections + status.relayed_connections,
                 active_connections: status.active_connections as u32,
-                bytes_sent: status.relay_bytes_forwarded,  // Approximate with relay bytes
-                bytes_received: 0,  // TODO: Track in future
+                bytes_sent: status.relay_bytes_forwarded, // Approximate with relay bytes
+                bytes_received: 0,                        // TODO: Track in future
                 peer_count: status.connected_peers,
             }
         } else {
