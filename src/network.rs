@@ -23,12 +23,14 @@
 //! - `45.77.176.184:12000` - Tokyo, JP
 
 use crate::error::{NetworkError, NetworkResult};
+use ant_quic::{Node, NodeConfig};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 
 /// Default port for x0x nodes (when specified).
 pub const DEFAULT_PORT: u16 = 12000;
@@ -153,6 +155,8 @@ pub struct NetworkStats {
 /// including peer cache management and configuration.
 #[derive(Debug, Clone)]
 pub struct NetworkNode {
+    /// ant-quic P2P node (wrapped in Arc<RwLock> for shared async access).
+    node: Arc<RwLock<Option<Node>>>,
     /// Configuration for this node.
     config: NetworkConfig,
     /// Sender for broadcasting network events.
@@ -174,8 +178,30 @@ impl NetworkNode {
     ///
     /// Returns `NetworkError` if node creation fails.
     pub async fn new(config: NetworkConfig) -> NetworkResult<Self> {
+        // Create ant-quic NodeConfig using builder
+        let mut builder = NodeConfig::builder();
+
+        // Set bind address if specified
+        if let Some(bind_addr) = config.bind_addr {
+            builder = builder.bind_addr(bind_addr);
+        }
+
+        // Add bootstrap peers
+        for peer_addr in &config.bootstrap_nodes {
+            builder = builder.known_peer(*peer_addr);
+        }
+
+        let node_config = builder.build();
+
+        // Create ant-quic Node (this binds QUIC transport)
+        let node = Node::with_config(node_config)
+            .await
+            .map_err(|e| NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e)))?;
+
         let (event_sender, _event_receiver) = broadcast::channel(32);
+
         Ok(Self {
+            node: Arc::new(RwLock::new(Some(node))),
             config,
             event_sender,
         })
@@ -205,7 +231,19 @@ impl NetworkNode {
     ///
     /// Network statistics for this node.
     pub async fn stats(&self) -> NetworkStats {
-        NetworkStats::default()
+        let node_guard = self.node.read().await;
+        if let Some(node) = node_guard.as_ref() {
+            let status = node.status().await;
+            NetworkStats {
+                total_connections: status.direct_connections + status.relayed_connections,
+                active_connections: status.active_connections as u32,
+                bytes_sent: status.relay_bytes_forwarded,  // Approximate with relay bytes
+                bytes_received: 0,  // TODO: Track in future
+                peer_count: status.connected_peers,
+            }
+        } else {
+            NetworkStats::default()
+        }
     }
 
     /// Get the number of active connections.
@@ -214,7 +252,13 @@ impl NetworkNode {
     ///
     /// The number of currently connected peers.
     pub async fn connection_count(&self) -> usize {
-        0
+        let node_guard = self.node.read().await;
+        if let Some(node) = node_guard.as_ref() {
+            let status = node.status().await;
+            status.connected_peers
+        } else {
+            0
+        }
     }
 
     /// Subscribe to network events.
