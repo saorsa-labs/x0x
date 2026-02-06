@@ -1,23 +1,20 @@
 # Task Specification Review
-**Date**: $(date +"%Y-%m-%d %H:%M:%S")
-**Task**: Task 2 - Add Comprehensive Test Job to CI
+**Date**: 2026-02-06 09:02:30
+**Task**: Task 3 - Add Documentation Build to CI
 
 ## Spec Compliance
-From .planning/PLAN-phase-2.3.md Task 2 acceptance criteria:
+From .planning/PLAN-phase-2.3.md Task 3:
 
-- [x] cargo nextest run executes for all workspace members ✓
-- [x] Uses latest stable Rust ✓ (dtolnay/rust-toolchain@stable)
-- [x] Test results are uploaded as artifacts ✓ (actions/upload-artifact@v4)
-- [x] Job runs on ubuntu-latest ✓
-- [x] Properly cached for speed ✓ (3 cache layers: registry, git, target)
+- [x] cargo doc --all-features --no-deps passes ✓
+- [x] Documentation warnings treated as errors ✓ (RUSTDOCFLAGS=-D warnings)
+- [x] Runs on Linux (fast) ✓ (ubuntu-latest)
 
-## Implementation Review
-- Added "test" job to .github/workflows/ci.yml
-- Uses taiki-e/install-action@nextest for nextest installation
-- Runs: cargo nextest run --all-features --workspace
-- Uploads target/nextest/ directory as artifact
-- Proper if: always() condition for upload (runs even on failure)
+## Implementation
+- Added "doc" job to .github/workflows/ci.yml
+- Uses RUSTDOCFLAGS=-D warnings
+- Runs: cargo doc --all-features --no-deps
+- Proper caching (registry, git, target-doc)
 
 ## Grade: A
 
-**Verdict**: PASS - All acceptance criteria met, implementation matches spec exactly.
+**Verdict**: PASS - All acceptance criteria met.
