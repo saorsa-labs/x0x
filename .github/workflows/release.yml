@@ -264,13 +264,13 @@ jobs:
       
       - name: Import GPG key
         env:
-          GPG_PRIVATE_KEY: ${{ secrets.SAORSA_GPG_PRIVATE_KEY }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
           echo "$GPG_PRIVATE_KEY" | gpg --import --batch --yes
-          
+
       - name: Sign SKILL.md
         env:
-          GPG_PASSPHRASE: ${{ secrets.SAORSA_GPG_PASSPHRASE }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           gpg --batch --pinentry-mode loopback --passphrase-fd 0 --detach-sign --armor --output SKILL.md.sig SKILL.md <<< "$GPG_PASSPHRASE"
           gpg --verify SKILL.md.sig SKILL.md
