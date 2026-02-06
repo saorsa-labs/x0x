@@ -78,6 +78,44 @@ sfo             147.182.234.192   OK - healthy
 helsinki        65.21.157.229     OK - healthy
 ```
 
+### scripts/check-mesh.sh
+Verify full mesh connectivity across all bootstrap nodes.
+
+```bash
+# Check mesh connectivity
+./scripts/check-mesh.sh
+```
+
+**What it does:**
+1. Queries health endpoint on all 6 nodes
+2. Verifies each node reports correct peer count (5 peers each)
+3. Checks service status if unhealthy
+4. Shows recent logs for troubleshooting
+5. Returns exit code 0 if all healthy, 1 if any issues
+
+**Output example:**
+```
+=========================================
+x0x Bootstrap Mesh Health Check
+=========================================
+
+Checking saorsa-2 (142.93.199.50)... HEALTHY (peers: 5)
+Checking saorsa-3 (147.182.234.192)... HEALTHY (peers: 5)
+Checking saorsa-6 (65.21.157.229)... HEALTHY (peers: 5)
+Checking saorsa-7 (116.203.101.172)... HEALTHY (peers: 5)
+Checking saorsa-8 (149.28.156.231)... HEALTHY (peers: 5)
+Checking saorsa-9 (45.77.176.184)... HEALTHY (peers: 5)
+
+=========================================
+Summary
+=========================================
+Total nodes: 6
+Healthy: 6
+Unhealthy: 0
+
+✓ All bootstrap nodes are healthy!
+```
+
 ### logs.sh
 View logs from a node.
 
