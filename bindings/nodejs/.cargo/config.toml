@@ -1,0 +1,21 @@
+# WASM Target Configuration
+# Configures wasm32-wasip1-threads target for x0x Node.js bindings
+
+[build]
+# Use the WASI target when building for WASM
+# target = "wasm32-wasip1-threads"  # Can be set via --target flag at build time
+
+[target.wasm32-wasip1-threads]
+# WASI linker configuration for thread-aware WASM builds
+# The wasm32-wasip1-threads target uses the wasi-libc linker with thread support
+# No special linker configuration needed - cargo handles this automatically
+
+# Rustflags for WASM target
+# -C target-feature=+bulk-memory: Enable bulk memory operations
+# -C target-feature=+mutable-globals: Enable mutable global variables (needed for thread locals)
+# -C target-feature=+reference-types: Enable reference types
+rustflags = [
+    "-C", "target-feature=+bulk-memory",
+    "-C", "target-feature=+mutable-globals",
+    "-C", "target-feature=+reference-types"
+]

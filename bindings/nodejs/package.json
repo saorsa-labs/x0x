@@ -12,6 +12,7 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
+    "build:wasm": "cargo build --release --target wasm32-wasip1-threads",
     "prepublishOnly": "napi prepublish -t npm",
     "test": "vitest",
     "version": "napi version"

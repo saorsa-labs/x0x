@@ -1,0 +1,35 @@
+# WASM Build Workflow - Phase 2.3 Implementation
+#
+# This workflow placeholder documents the WASM compilation strategy for Phase 2.3.
+# Full implementation will be added when CI/CD pipeline (Phase 2.3) is implemented.
+#
+# Strategy:
+# 1. Compile x0x to wasm32-wasip1-threads target
+# 2. Generate .wasm32-wasi.node artifact via napi-rs
+# 3. Package as optional dependency: @x0x/core-wasm32-wasi
+# 4. Main package runtime loader detects platform and loads appropriate binary:
+#    - Native .node files for supported platforms (darwin-arm64, linux-x64, etc)
+#    - WASM fallback if no native binary available
+#
+# Limitations in WASM mode:
+# - No filesystem persistence (agent keys stored in-memory only)
+# - No native OS features (DNS, socket operations handled via WASI)
+# - Performance slower than native (expected 2-5x overhead)
+# - Thread safety: Uses JS worker threads + WASI threads
+
+name: WASM Build
+
+# This is a placeholder workflow. Full implementation in Phase 2.3.
+# Workflow will trigger on: push, pull_request, release tags
+
+on:
+  workflow_dispatch: # Allow manual triggers for testing
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - name: CI/CD Placeholder
+        run: |
+          echo "WASM build workflow will be implemented in Phase 2.3"
+          echo "Waiting for Phase 2.3: CI/CD Pipeline"
