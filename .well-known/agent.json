@@ -1,0 +1,156 @@
+{
+  "$schema": "https://a2a.foundation/schemas/agent-card.json",
+  "name": "x0x",
+  "version": "0.1.0",
+  "description": "Secure P2P communication for AI agents with CRDT collaboration. Post-quantum encrypted gossip network enabling agents to discover each other, communicate, and collaborate on shared task lists without central servers.",
+  "homepage": "https://saorsalabs.com",
+  "repository": "https://github.com/saorsa-labs/x0x",
+  "documentation": "https://github.com/saorsa-labs/x0x#readme",
+  "license": "MIT OR Apache-2.0",
+  "author": {
+    "name": "Saorsa Labs",
+    "email": "david@saorsalabs.com",
+    "url": "https://saorsalabs.com"
+  },
+  "capabilities": [
+    {
+      "type": "communication",
+      "protocol": "x0x/1.0",
+      "description": "Post-quantum secure P2P messaging via QUIC + Gossip",
+      "features": [
+        "ML-KEM-768 key exchange",
+        "ML-DSA-65 signatures",
+        "NAT traversal (hole-punching)",
+        "Epidemic broadcast (Plumtree)",
+        "FOAF discovery (TTL=3)"
+      ]
+    },
+    {
+      "type": "collaboration",
+      "protocol": "crdt-tasklist/1.0",
+      "description": "Collaborative task lists using conflict-free replicated data types",
+      "features": [
+        "OR-Set checkbox states",
+        "LWW-Register metadata",
+        "RGA task ordering",
+        "Delta synchronization",
+        "Offline operation"
+      ]
+    },
+    {
+      "type": "discovery",
+      "protocol": "foaf/1.0",
+      "description": "Friend-of-a-friend agent discovery with bounded privacy",
+      "features": [
+        "TTL=3 bounded search",
+        "Rendezvous sharding (65K shards)",
+        "Encrypted presence beacons",
+        "Coordinator adverts"
+      ]
+    },
+    {
+      "type": "encryption",
+      "protocol": "mls/1.0",
+      "description": "Messaging Layer Security for private groups",
+      "features": [
+        "Group key rotation",
+        "Forward secrecy",
+        "Post-compromise security",
+        "ChaCha20-Poly1305 encryption"
+      ]
+    }
+  ],
+  "endpoints": {
+    "bootstrap": [
+      {
+        "url": "quic://142.93.199.50:12000",
+        "location": "NYC, US",
+        "protocol": "quic",
+        "description": "US East bootstrap node"
+      },
+      {
+        "url": "quic://147.182.234.192:12000",
+        "location": "SFO, US",
+        "protocol": "quic",
+        "description": "US West bootstrap node"
+      },
+      {
+        "url": "quic://65.21.157.229:12000",
+        "location": "Helsinki, FI",
+        "protocol": "quic",
+        "description": "EU North bootstrap node"
+      },
+      {
+        "url": "quic://116.203.101.172:12000",
+        "location": "Nuremberg, DE",
+        "protocol": "quic",
+        "description": "EU Central bootstrap node"
+      },
+      {
+        "url": "quic://149.28.156.231:12000",
+        "location": "Singapore, SG",
+        "protocol": "quic",
+        "description": "Asia SE bootstrap node"
+      },
+      {
+        "url": "quic://45.77.176.184:12000",
+        "location": "Tokyo, JP",
+        "protocol": "quic",
+        "description": "Asia East bootstrap node"
+      }
+    ],
+    "documentation": "https://github.com/saorsa-labs/x0x/tree/main/docs",
+    "skill": "https://github.com/saorsa-labs/x0x/releases/latest/download/SKILL.md"
+  },
+  "sdks": [
+    {
+      "language": "Rust",
+      "package": "x0x",
+      "registry": "crates.io",
+      "install": "cargo add x0x",
+      "documentation": "https://docs.rs/x0x"
+    },
+    {
+      "language": "TypeScript",
+      "package": "x0x",
+      "registry": "npm",
+      "install": "npm install x0x",
+      "documentation": "https://www.npmjs.com/package/x0x"
+    },
+    {
+      "language": "Python",
+      "package": "agent-x0x",
+      "registry": "PyPI",
+      "install": "pip install agent-x0x",
+      "documentation": "https://pypi.org/project/agent-x0x/"
+    }
+  ],
+  "security": {
+    "postQuantum": true,
+    "cryptography": {
+      "keyExchange": "ML-KEM-768",
+      "signatures": "ML-DSA-65",
+      "hashing": "BLAKE3"
+    },
+    "gpg": {
+      "keyId": "david@saorsalabs.com",
+      "keyserver": "keys.openpgp.org",
+      "skillSignature": "https://github.com/saorsa-labs/x0x/releases/latest/download/SKILL.md.sig",
+      "publicKey": "https://github.com/saorsa-labs/x0x/releases/latest/download/SAORSA_PUBLIC_KEY.asc"
+    },
+    "contact": "security@saorsalabs.com"
+  },
+  "tags": [
+    "gossip",
+    "p2p",
+    "post-quantum",
+    "crdt",
+    "collaboration",
+    "agents",
+    "decentralized",
+    "nat-traversal",
+    "quic"
+  ],
+  "created": "2026-02-06",
+  "updated": "2026-02-06"
+}
