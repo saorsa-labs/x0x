@@ -256,8 +256,35 @@ impl Agent {
     ///
     /// This begins the gossip protocol, discovering peers and
     /// participating in epidemic broadcast.
+    ///
+    /// If the agent was not configured with a network, this method
+    /// succeeds gracefully (nothing to join).
     pub async fn join_network(&self) -> error::Result<()> {
-        // Placeholder — will connect via ant-quic and join saorsa-gossip overlay
+        let Some(network) = self.network.as_ref() else {
+            // No network configured - nothing to join
+            tracing::debug!("join_network called but no network configured");
+            return Ok(());
+        };
+
+        // Connect to bootstrap peers
+        for peer_addr in &network.config().bootstrap_nodes {
+            tracing::debug!("Connecting to bootstrap peer: {}", peer_addr);
+            match network.connect_addr(*peer_addr).await {
+                Ok(_) => {
+                    tracing::info!("Connected to bootstrap peer: {}", peer_addr);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to connect to {}: {}", peer_addr, e);
+                    // Continue with other peers - some may be temporarily unavailable
+                }
+            }
+        }
+
+        tracing::info!(
+            "Network join complete. Attempted {} bootstrap peers.",
+            network.config().bootstrap_nodes.len()
+        );
+
         Ok(())
     }
 
