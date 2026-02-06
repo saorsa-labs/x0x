@@ -24,8 +24,10 @@ jobs:
           echo "$GPG_PRIVATE_KEY" | gpg --import --batch --yes
           
       - name: Sign SKILL.md
+        env:
+          GPG_PASSPHRASE: ${{ secrets.SAORSA_GPG_PASSPHRASE }}
         run: |
-          gpg --detach-sign --armor --output SKILL.md.sig SKILL.md
+          gpg --batch --pinentry-mode loopback --passphrase-fd 0 --detach-sign --armor --output SKILL.md.sig SKILL.md <<< "$GPG_PASSPHRASE"
           
       - name: Verify signature
         run: |
@@ -33,7 +35,12 @@ jobs:
           
       - name: Export public key
         run: |
+          # Export public key using email identifier (key ID)
           gpg --armor --export david@saorsalabs.com > SAORSA_PUBLIC_KEY.asc
+          if [ ! -s SAORSA_PUBLIC_KEY.asc ]; then
+            echo "Error: Failed to export public key"
+            exit 1
+          fi
           
       - name: Upload signature artifact
         uses: actions/upload-artifact@v4

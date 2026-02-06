@@ -114,8 +114,9 @@ verify_signature() {
     info "Verifying signature..."
     [ -f "$SKILL_FILE" ] || { error "SKILL.md not found"; return 1; }
     [ -f "$SIG_FILE" ] || { error "Signature file not found"; return 1; }
-    
-    if gpg --verify "$SIG_FILE" "$SKILL_FILE" 2>&1 | grep -q "Good signature"; then
+
+    # Use exit code for verification (locale-independent)
+    if gpg --verify "$SIG_FILE" "$SKILL_FILE" 2>/dev/null; then
         success "✓ Signature is valid"
         return 0
     else
@@ -152,7 +153,7 @@ main() {
     
     echo ""
     echo "=== Signature Details ==="
-    gpg --verify "$SIG_FILE" "$SKILL_FILE" 2>&1 | grep -E "(Good signature|Primary key fingerprint)" || true
+    LANG=C gpg --verify "$SIG_FILE" "$SKILL_FILE" 2>&1 | grep -E "(Good signature|Primary key fingerprint)" || true
     echo ""
     echo "✓ Verification successful!"
     exit 0

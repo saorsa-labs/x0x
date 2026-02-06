@@ -18,7 +18,15 @@ Every release of x0x includes:
 ./scripts/sign-skill.sh
 
 # This creates SKILL.md.sig
+
+# To sign with a specific key (if you have multiple GPG keys):
+SIGNING_KEY="david@saorsalabs.com" ./scripts/sign-skill.sh
 ```
+
+**Requirements:**
+- GPG must be installed
+- The Saorsa Labs private key must be imported: `gpg --list-keys david@saorsalabs.com`
+- If the key is passphrase-protected, you'll be prompted for the passphrase
 
 ### Automated Signing (CI)
 
@@ -30,8 +38,14 @@ git push origin v0.1.0
 
 The GitHub Actions workflow (`sign-skill.yml`) automatically:
 1. Imports the GPG private key from secrets
-2. Signs SKILL.md
-3. Creates a GitHub release with signed files
+2. Signs SKILL.md (with passphrase if needed)
+3. Verifies the signature
+4. Exports the public key
+5. Creates a GitHub release with signed files
+
+**GitHub Secrets Required:**
+- `SAORSA_GPG_PRIVATE_KEY` - Private key in ASCII-armor format (or base64-encoded)
+- `SAORSA_GPG_PASSPHRASE` - Passphrase for the private key (can be empty string if key is unencrypted)
 
 ## Verification Process (Users)
 

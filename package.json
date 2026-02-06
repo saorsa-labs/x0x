@@ -4,6 +4,12 @@
   "description": "Agent-to-agent gossip network for AI systems — no winners, no losers, just cooperation",
   "main": "index.js",
   "types": "index.d.ts",
+  "bin": {
+    "x0x-skill": "./scripts/install.sh"
+  },
+  "scripts": {
+    "install-skill": "node -e \"require('child_process').execSync('bash scripts/install.sh', {stdio: 'inherit'})\""
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/saorsa-labs/x0x"
@@ -15,11 +21,18 @@
     "p2p",
     "decentralised",
     "post-quantum",
-    "agent-network"
+    "agent-network",
+    "skill",
+    "anthropic"
   ],
   "author": "David Irvine <david@saorsalabs.com>",
   "license": "MIT OR Apache-2.0",
   "bugs": {
     "url": "https://github.com/saorsa-labs/x0x/issues"
-  }
+  },
+  "files": [
+    "scripts/",
+    "SKILL.md",
+    ".well-known/"
+  ]
 }

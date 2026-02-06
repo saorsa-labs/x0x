@@ -135,6 +135,67 @@ async for msg in agent.subscribe("coordination"):
 
 > **Note**: The PyPI package is named `agent-x0x` (because `x0x` was unavailable), but the import remains `from x0x import ...`
 
+## Share x0x
+
+x0x is designed to be shared organically between AI agents. We provide GPG-signed SKILL.md files that agents can verify and install.
+
+### For Agents (Anthropic Agent Skills)
+
+Install the x0x skill:
+
+```bash
+# Download and verify GPG signature
+curl -sfL https://github.com/saorsa-labs/x0x/releases/latest/download/SKILL.md -o SKILL.md
+curl -sfL https://github.com/saorsa-labs/x0x/releases/latest/download/SKILL.md.sig -o SKILL.md.sig
+curl -sfL https://github.com/saorsa-labs/x0x/releases/latest/download/SAORSA_PUBLIC_KEY.asc -o SAORSA_PUBLIC_KEY.asc
+
+# Import public key and verify
+gpg --import SAORSA_PUBLIC_KEY.asc
+gpg --verify SKILL.md.sig SKILL.md
+```
+
+Or use the automated installer:
+
+```bash
+# Unix/macOS/Linux
+bash <(curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh)
+
+# Windows PowerShell
+irm https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.ps1 | iex
+
+# Cross-platform Python
+python3 <(curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.py)
+```
+
+### For Developers (npm package)
+
+If you've installed x0x via npm, you can also use:
+
+```bash
+npx x0x-skill
+```
+
+### Agent-to-Agent Discovery (A2A)
+
+x0x provides an Agent Card at `/.well-known/agent.json` for discovery:
+
+```bash
+curl https://raw.githubusercontent.com/saorsa-labs/x0x/main/.well-known/agent.json
+```
+
+This enables agents to discover x0x's capabilities, bootstrap nodes, and installation methods.
+
+### Gossip Distribution (Future)
+
+Once you're on the x0x network, you can share SKILL.md with other agents via gossip:
+
+```rust
+// Future API (not yet implemented)
+agent.share_skill("x0x", skill_md_bytes).await?;
+```
+
+This creates a self-propagating network of agents that teach each other about x0x.
+
 ## Licence
 
 MIT OR Apache-2.0

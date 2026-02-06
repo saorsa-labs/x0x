@@ -185,3 +185,117 @@ jobs:
         run: |
           cd bindings/python
           maturin publish
+
+  create-github-release:
+    name: Create GitHub Release
+    needs: [publish-npm, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Import GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.SAORSA_GPG_PRIVATE_KEY }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --import --batch --yes
+          
+      - name: Sign SKILL.md
+        env:
+          GPG_PASSPHRASE: ${{ secrets.SAORSA_GPG_PASSPHRASE }}
+        run: |
+          gpg --batch --pinentry-mode loopback --passphrase-fd 0 --detach-sign --armor --output SKILL.md.sig SKILL.md <<< "$GPG_PASSPHRASE"
+          gpg --verify SKILL.md.sig SKILL.md
+          
+      - name: Export public key
+        run: |
+          gpg --armor --export david@saorsalabs.com > SAORSA_PUBLIC_KEY.asc
+          if [ ! -s SAORSA_PUBLIC_KEY.asc ]; then
+            echo "Error: Failed to export public key"
+            exit 1
+          fi
+          
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            SKILL.md
+            SKILL.md.sig
+            SAORSA_PUBLIC_KEY.asc
+            .well-known/agent.json
+          body: |
+            ## x0x ${{ github.ref_name }}
+            
+            **Agent-to-Agent Secure Communication Network**
+            
+            Post-quantum encrypted P2P gossip network for AI agents. Enable agents to discover each other, communicate securely, and collaborate on shared task lists without central servers.
+            
+            ### Installation
+            
+            **Rust:**
+            ```bash
+            cargo add x0x
+            ```
+            
+            **TypeScript/Node.js:**
+            ```bash
+            npm install x0x
+            ```
+            
+            **Python:**
+            ```bash
+            pip install agent-x0x
+            ```
+            
+            ### SKILL.md (GPG-Signed)
+            
+            This release includes the GPG-signed SKILL.md file for Anthropic Agent Skills.
+            
+            **Verify signature:**
+            ```bash
+            # Import Saorsa Labs public key
+            gpg --import SAORSA_PUBLIC_KEY.asc
+            
+            # Verify signature
+            gpg --verify SKILL.md.sig SKILL.md
+            ```
+            
+            Expected output:
+            ```
+            gpg: Good signature from "Saorsa Labs <david@saorsalabs.com>"
+            ```
+            
+            **Install SKILL.md:**
+            ```bash
+            # Unix/macOS/Linux
+            bash <(curl -sfL https://github.com/saorsa-labs/x0x/releases/latest/download/install.sh)
+            
+            # Windows PowerShell
+            irm https://github.com/saorsa-labs/x0x/releases/latest/download/install.ps1 | iex
+            
+            # Cross-platform Python
+            python3 <(curl -sfL https://github.com/saorsa-labs/x0x/releases/latest/download/install.py)
+            ```
+            
+            ### A2A Agent Card
+            
+            The `agent.json` file provides Agent-to-Agent (A2A) discovery metadata compatible with Google's A2A spec.
+            
+            ### What's Changed
+            
+            See [CHANGELOG.md](https://github.com/saorsa-labs/x0x/blob/main/CHANGELOG.md) for full details.
+            
+            ### Bootstrap Nodes
+            
+            - NYC, US: `quic://142.93.199.50:12000`
+            - SFO, US: `quic://147.182.234.192:12000`
+            - Helsinki, FI: `quic://65.21.157.229:12000`
+            - Nuremberg, DE: `quic://116.203.101.172:12000`
+            - Singapore, SG: `quic://149.28.156.231:12000`
+            - Tokyo, JP: `quic://45.77.176.184:12000`
+            
+            ---
+            
+            **x0x** - A gift to the AI agent ecosystem from [Saorsa Labs](https://saorsalabs.com).  
+            No winners, no losers — just cooperation.

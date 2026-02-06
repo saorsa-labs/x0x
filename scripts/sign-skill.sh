@@ -18,19 +18,20 @@ if ! command -v gpg &> /dev/null; then
     exit 1
 fi
 
-# Sign the file
+# Sign the file with Saorsa Labs key
 echo "Signing $SKILL_FILE..."
-gpg --detach-sign --armor --output "$SIG_FILE" "$SKILL_FILE"
+SIGNING_KEY="${SIGNING_KEY:-david@saorsalabs.com}"
+gpg --detach-sign --armor --local-user "$SIGNING_KEY" --output "$SIG_FILE" "$SKILL_FILE"
 
-# Verify the signature
+# Verify the signature using exit code (works in any locale)
 echo "Verifying signature..."
-if gpg --verify "$SIG_FILE" "$SKILL_FILE" 2>&1 | grep -q "Good signature"; then
+if gpg --verify "$SIG_FILE" "$SKILL_FILE" 2>/dev/null; then
     echo "✓ Signature created and verified: $SIG_FILE"
-    
-    # Show signature info
+
+    # Show signature info (use LANG=C to ensure consistent output)
     echo ""
     echo "Signature details:"
-    gpg --verify "$SIG_FILE" "$SKILL_FILE" 2>&1 | grep -E "(Good signature|Primary key fingerprint)"
+    LANG=C gpg --verify "$SIG_FILE" "$SKILL_FILE" 2>&1 | grep -E "(Good signature|Primary key fingerprint)" || true
 else
     echo "✗ Signature verification failed"
     exit 1
