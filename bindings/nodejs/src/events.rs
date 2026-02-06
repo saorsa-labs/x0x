@@ -22,6 +22,7 @@ pub struct PeerDisconnectedEvent {
 
 /// Event payload for message events.
 #[napi(object)]
+#[allow(dead_code)]
 pub struct MessageEvent {
     /// Topic the message was received on
     pub topic: String,
@@ -33,6 +34,7 @@ pub struct MessageEvent {
 
 /// Event payload for task update events.
 #[napi(object)]
+#[allow(dead_code)]
 pub struct TaskUpdatedEvent {
     /// Task ID that was updated
     pub task_id: String,
