@@ -72,3 +72,11 @@
 
 **Next**: Phase 1.5 - MLS Group Encryption
 
+
+### Phase 1.4 Complete - Fri  6 Feb 2026 18:27:59 GMT
+- All 10 tasks completed with critical CRDT bug fixes
+- Fixed: Unix timestamps (not sequence numbers) for conflict resolution
+- Fixed: add_task() merges instead of overwrites
+- Fixed: tasks_ordered() filters by OR-Set membership
+- 281/281 tests passing, zero warnings
+- Ready for Phase 1.5 (MLS Group Encryption)
