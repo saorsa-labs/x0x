@@ -1,4 +1,4 @@
 # Codex Review (External)
-**Status**: UNAVAILABLE - Workflow config
+**Status**: UNAVAILABLE
 
 ## Grade: N/A

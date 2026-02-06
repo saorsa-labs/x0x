@@ -292,23 +292,22 @@ impl PeerCache {
     /// * `address` - The peer's address.
     pub fn add_peer(&mut self, peer_id: [u8; 32], address: SocketAddr) {
         // Update existing peer or add new one.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0); // Fallback to 0 if system time is invalid (extremely unlikely)
+
         if let Some(existing) = self.peers.iter_mut().find(|p| p.peer_id == peer_id) {
             existing.address = address;
             existing.success_count += 1;
-            existing.last_seen = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+            existing.last_seen = now;
         } else {
             self.peers.push(CachedPeer {
                 peer_id,
                 address,
                 success_count: 1,
                 attempt_count: 0,
-                last_seen: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                last_seen: now,
                 last_attempt: 0,
             });
         }
