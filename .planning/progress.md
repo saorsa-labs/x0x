@@ -9,3 +9,5 @@
 - Python Bindings (PyO3)
 - No blocking dependencies
 - [x] Task 1: Add saorsa-gossip Dependencies (commit: 8b13187)
+- [x] Task 2: Create Gossip Module Structure (commit: 2765067)
+- [x] Task 3: Implement GossipConfig (completed in Task 2)
