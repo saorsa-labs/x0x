@@ -105,7 +105,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: x0x-bootstrap-linux-x64
-          path: target/release/x0x-bootstrap
+          path: x0x/target/release/x0x-bootstrap
           retention-days: 30
 
       - name: Summary
