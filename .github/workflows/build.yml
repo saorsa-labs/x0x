@@ -54,6 +54,12 @@ jobs:
             target: x86_64-pc-windows-msvc
             cross: false
 
+          # WASM (WebAssembly with WASI threads)
+          - platform: wasm32-wasi
+            os: ubuntu-latest
+            target: wasm32-wasip1-threads
+            cross: false
+
     steps:
       - uses: actions/checkout@v4
 

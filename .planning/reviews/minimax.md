@@ -1,4 +1,4 @@
-# MiniMax Review (External)
+# MINIMAX Review (External)
 **Status**: UNAVAILABLE
 
 ## Grade: N/A

@@ -1,23 +1,18 @@
 # Task Specification Review
-**Date**: 2026-02-06 09:07:00
-**Task**: Task 5 - Create Multi-Platform Build Matrix Workflow
+**Date**: 2026-02-06 09:09:00
+**Task**: Task 6 - Add WASM Build to Build Matrix
 
 ## Spec Compliance
-From .planning/PLAN-phase-2.3.md Task 5:
+From PLAN-phase-2.3.md Task 6:
 
-- [x] Matrix includes ubuntu (x64-gnu, x64-musl, arm64) ✓
-- [x] Matrix includes macos (x64, arm64) ✓
-- [x] Matrix includes windows (x64) ✓
-- [x] Uses cross-compilation where needed ✓ (cross for musl, arm64)
-- [x] Artifacts uploaded for each platform ✓
+- [x] wasm32-wasip1-threads target builds successfully ✓
+- [x] WASM artifact uploaded ✓
+- [x] Existing WASM workflow consolidated ✓
 
 ## Implementation
-- Created .github/workflows/build.yml
-- 6 platform matrix (all required platforms covered)
-- Conditional cross compilation (matrix.cross flag)
-- Per-platform artifact uploads with clear naming
-- Proper caching strategy per target
+- Added wasm32-wasi to build.yml matrix
+- Target: wasm32-wasip1-threads
+- Deprecated build-wasm.yml with clear notice
 
 ## Grade: A
-
-**Verdict**: PASS - All acceptance criteria met perfectly.
+**Verdict**: PASS - All acceptance criteria met.
