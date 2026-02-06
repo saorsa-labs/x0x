@@ -209,9 +209,9 @@ impl TaskItem {
         // Add the claimed state to the OR-Set with Unix timestamp for LWW
         let claimed_state = CheckboxState::Claimed {
             agent_id,
-            timestamp,  // Unix timestamp in milliseconds (globally comparable)
+            timestamp, // Unix timestamp in milliseconds (globally comparable)
         };
-        let tag = (peer_id, seq);  // seq used for OR-Set uniqueness
+        let tag = (peer_id, seq); // seq used for OR-Set uniqueness
         self.checkbox
             .add(claimed_state, tag)
             .map_err(|e| CrdtError::Merge(format!("Failed to add claimed state: {}", e)))?;
@@ -281,9 +281,9 @@ impl TaskItem {
         // Add the done state to the OR-Set with Unix timestamp for LWW
         let done_state = CheckboxState::Done {
             agent_id,
-            timestamp,  // Unix timestamp in milliseconds (globally comparable)
+            timestamp, // Unix timestamp in milliseconds (globally comparable)
         };
-        let tag = (peer_id, seq);  // seq used for OR-Set uniqueness
+        let tag = (peer_id, seq); // seq used for OR-Set uniqueness
         self.checkbox
             .add(done_state, tag)
             .map_err(|e| CrdtError::Merge(format!("Failed to add done state: {}", e)))?;

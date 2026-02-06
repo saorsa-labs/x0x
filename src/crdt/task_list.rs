@@ -310,7 +310,7 @@ impl TaskList {
         // Start with tasks in the ordering vector, but only if they're in the OR-Set
         let mut ordered: Vec<&TaskItem> = current_order
             .iter()
-            .filter(|id| or_set_tasks.contains(id))  // Filter by OR-Set membership first!
+            .filter(|id| or_set_tasks.contains(id)) // Filter by OR-Set membership first!
             .filter_map(|id| self.task_data.get(id))
             .collect();
 
