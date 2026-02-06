@@ -63,6 +63,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout ant-quic
+        uses: actions/checkout@v4
+        with:
+          repository: saorsa-labs/ant-quic
+          path: ../ant-quic
+
+      - name: Checkout saorsa-gossip
+        uses: actions/checkout@v4
+        with:
+          repository: saorsa-labs/saorsa-gossip
+          path: ../saorsa-gossip
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
