@@ -155,7 +155,7 @@ pub struct NetworkStats {
 /// including peer cache management and configuration.
 #[derive(Debug, Clone)]
 pub struct NetworkNode {
-    /// ant-quic P2P node (wrapped in Arc<RwLock> for shared async access).
+    /// ant-quic P2P node (wrapped in `Arc<RwLock>` for shared async access).
     node: Arc<RwLock<Option<Node>>>,
     /// Configuration for this node.
     config: NetworkConfig,
