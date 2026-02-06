@@ -66,13 +66,13 @@ pub mod identity;
 /// persistent storage of MachineKeypair and AgentKeypair.
 pub mod storage;
 
-/// Network transport layer for x0x.
-pub mod network;
 /// Bootstrap node discovery and connection.
 ///
 /// This module handles initial connection to bootstrap nodes with
 /// exponential backoff retry logic and peer cache integration.
 pub mod bootstrap;
+/// Network transport layer for x0x.
+pub mod network;
 
 /// Gossip overlay networking for x0x.
 pub mod gossip;

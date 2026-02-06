@@ -862,7 +862,6 @@ async fn test_network_node_multiple_subscribers() {
     assert!(rx1.recv().await.is_ok());
     assert!(rx2.recv().await.is_ok());
 }
-
 /// A message transmitted through the x0x network.
 ///
 /// Messages are the basic unit of communication in the x0x gossip network.
@@ -1059,9 +1058,7 @@ fn current_timestamp() -> NetworkResult<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .map_err(|_| {
-            NetworkError::TimestampError("System time before UNIX_EPOCH".to_string())
-        })
+        .map_err(|_| NetworkError::TimestampError("System time before UNIX_EPOCH".to_string()))
 }
 
 /// Generate a unique message ID using BLAKE3 hash.
@@ -1078,12 +1075,7 @@ fn current_timestamp() -> NetworkResult<u64> {
 /// # Returns
 ///
 /// A 32-byte BLAKE3 hash as the message ID.
-fn generate_message_id(
-    sender: &[u8; 32],
-    topic: &str,
-    payload: &[u8],
-    timestamp: u64,
-) -> [u8; 32] {
+fn generate_message_id(sender: &[u8; 32], topic: &str, payload: &[u8], timestamp: u64) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(sender);
     hasher.update(topic.as_bytes());

@@ -133,7 +133,9 @@ impl BootstrapConnector {
                     // Apply exponential backoff
                     sleep(backoff).await;
                     backoff = std::cmp::min(
-                        Duration::from_secs_f64(backoff.as_secs_f64() * self.config.backoff_multiplier),
+                        Duration::from_secs_f64(
+                            backoff.as_secs_f64() * self.config.backoff_multiplier,
+                        ),
                         self.config.max_backoff,
                     );
                 }
@@ -151,11 +153,7 @@ impl BootstrapConnector {
     /// # Returns
     ///
     /// Number of successful connections.
-    pub async fn connect_multiple(
-        &self,
-        node: &NetworkNode,
-        addrs: &[SocketAddr],
-    ) -> usize {
+    pub async fn connect_multiple(&self, node: &NetworkNode, addrs: &[SocketAddr]) -> usize {
         let mut handles = Vec::new();
 
         for &addr in addrs {
@@ -163,7 +161,10 @@ impl BootstrapConnector {
             let config = self.config.clone();
             let handle = tokio::spawn(async move {
                 let connector = BootstrapConnector::with_config(config);
-                connector.connect_with_retry(&node_clone, addr).await.is_ok()
+                connector
+                    .connect_with_retry(&node_clone, addr)
+                    .await
+                    .is_ok()
             });
             handles.push(handle);
         }
