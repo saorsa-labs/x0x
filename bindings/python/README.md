@@ -63,9 +63,12 @@ if __name__ == "__main__":
 See the [examples](examples/) directory for complete usage examples:
 - `basic_agent.py` - Agent creation and network joining
 - `pubsub_messaging.py` - Publish/subscribe messaging between agents
+- `task_collaboration.py` - Collaborative task management with CRDTs
 - `event_callbacks.py` - Event handling with callbacks
 
 For API reference, see [API.md](API.md).
+
+**Note**: Package name on PyPI is `agent-x0x` (because `x0x` was taken), but you import it as `from x0x import Agent`.
 
 ## Requirements
 

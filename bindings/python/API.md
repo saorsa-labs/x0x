@@ -532,6 +532,7 @@ See the [examples](examples/) directory for complete working examples:
 
 - `basic_agent.py` - Agent creation and network operations
 - `pubsub_messaging.py` - Publish/subscribe messaging
+- `task_collaboration.py` - Collaborative task management with CRDTs
 - `event_callbacks.py` - Event handling with callbacks
 
 ---
