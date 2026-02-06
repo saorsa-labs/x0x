@@ -35,3 +35,5 @@ Issues = "https://github.com/saorsa-labs/x0x/issues"
 
 [tool.maturin]
 module-name = "x0x"
+binding = "pyo3"
+features = ["pyo3/extension-module"]

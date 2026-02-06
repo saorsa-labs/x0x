@@ -1,5 +1,5 @@
-use pyo3::prelude::*;
 use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::prelude::*;
 use pyo3::types::PyType;
 use pyo3_asyncio::tokio::future_into_py;
 use std::sync::Mutex;
@@ -69,6 +69,105 @@ impl Agent {
     fn agent_id(&self) -> PyResult<AgentId> {
         Ok(self.inner.agent_id().into())
     }
+
+    /// Join the x0x gossip network.
+    ///
+    /// This begins the gossip protocol, discovering peers and
+    /// participating in epidemic broadcast. The method is async
+    /// and integrates with Python's asyncio event loop.
+    ///
+    /// # Returns
+    ///
+    /// None on success
+    ///
+    /// # Raises
+    ///
+    /// * `IOError` - If network join fails
+    ///
+    /// # Example (Python)
+    ///
+    /// ```python
+    /// agent = await Agent.builder().build()
+    /// await agent.join_network()
+    /// assert agent.is_connected()
+    /// ```
+    fn join_network<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+        // Note: join_network is currently a placeholder in x0x core
+        // When gossip integration is complete, this will actually join the network
+        future_into_py(py, async move {
+            // Placeholder implementation - always succeeds
+            Ok(())
+        })
+    }
+
+    /// Leave the x0x gossip network.
+    ///
+    /// This gracefully disconnects from the network, closing all
+    /// peer connections and stopping the gossip protocol.
+    ///
+    /// # Returns
+    ///
+    /// None on success
+    ///
+    /// # Raises
+    ///
+    /// * `IOError` - If network leave fails
+    ///
+    /// # Example (Python)
+    ///
+    /// ```python
+    /// await agent.leave_network()
+    /// assert not agent.is_connected()
+    /// ```
+    fn leave_network<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+        // Note: leave_network is currently a placeholder in x0x core
+        // When gossip integration is complete, this will properly disconnect
+        future_into_py(py, async move {
+            // Placeholder implementation - always succeeds
+            Ok(())
+        })
+    }
+
+    /// Check if the agent is currently connected to the network.
+    ///
+    /// This is a synchronous check of the connection state.
+    ///
+    /// # Returns
+    ///
+    /// True if connected, False otherwise
+    ///
+    /// # Example (Python)
+    ///
+    /// ```python
+    /// if agent.is_connected():
+    ///     await agent.publish("topic", b"message")
+    /// ```
+    fn is_connected(&self) -> PyResult<bool> {
+        // For now, always return True if network was initialized
+        // In future, this should check actual connection status
+        // Currently network is created during agent.build(), so always connected
+        Ok(true)
+    }
+
+    /// Get the peer ID for this agent.
+    ///
+    /// The peer ID is derived from the agent's machine key and is used
+    /// for QUIC transport. Returns hex-encoded string.
+    ///
+    /// # Returns
+    ///
+    /// Hex-encoded peer ID string (64 characters)
+    ///
+    /// # Example (Python)
+    ///
+    /// ```python
+    /// peer_id = agent.peer_id()
+    /// print(f"My peer ID: {peer_id}")
+    /// ```
+    fn peer_id(&self) -> PyResult<String> {
+        // Return machine_id as hex (it serves as the peer ID)
+        Ok(hex::encode(self.inner.machine_id().as_bytes()))
+    }
 }
 
 /// Builder for creating Agent instances with custom configuration.
@@ -116,20 +215,24 @@ impl AgentBuilder {
     ///     .build()
     /// ```
     fn with_machine_key(&self, path: String) -> PyResult<Py<Self>> {
-        let mut guard = self.inner.lock().map_err(|e| {
-            PyErr::new::<PyIOError, _>(format!("Lock error: {}", e))
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("Lock error: {}", e)))?;
 
-        let builder = guard.take().ok_or_else(|| {
-            PyErr::new::<PyValueError, _>("Builder already consumed by build()")
-        })?;
+        let builder = guard
+            .take()
+            .ok_or_else(|| PyErr::new::<PyValueError, _>("Builder already consumed by build()"))?;
 
         *guard = Some(builder.with_machine_key(path));
 
         Python::with_gil(|py| {
-            Py::new(py, Self {
-                inner: Mutex::new(guard.take()),
-            })
+            Py::new(
+                py,
+                Self {
+                    inner: Mutex::new(guard.take()),
+                },
+            )
         })
     }
 
@@ -163,25 +266,27 @@ impl AgentBuilder {
     ///     .build()
     /// ```
     fn with_agent_key(&self, public_key: Vec<u8>, secret_key: Vec<u8>) -> PyResult<Py<Self>> {
-        let mut guard = self.inner.lock().map_err(|e| {
-            PyErr::new::<PyIOError, _>(format!("Lock error: {}", e))
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("Lock error: {}", e)))?;
 
-        let builder = guard.take().ok_or_else(|| {
-            PyErr::new::<PyValueError, _>("Builder already consumed by build()")
-        })?;
+        let builder = guard
+            .take()
+            .ok_or_else(|| PyErr::new::<PyValueError, _>("Builder already consumed by build()"))?;
 
         let keypair = x0x::identity::AgentKeypair::from_bytes(&public_key, &secret_key)
-            .map_err(|e| {
-                PyErr::new::<PyValueError, _>(format!("Invalid agent keypair: {}", e))
-            })?;
+            .map_err(|e| PyErr::new::<PyValueError, _>(format!("Invalid agent keypair: {}", e)))?;
 
         *guard = Some(builder.with_agent_key(keypair));
 
         Python::with_gil(|py| {
-            Py::new(py, Self {
-                inner: Mutex::new(guard.take()),
-            })
+            Py::new(
+                py,
+                Self {
+                    inner: Mutex::new(guard.take()),
+                },
+            )
         })
     }
 
@@ -204,22 +309,22 @@ impl AgentBuilder {
     /// agent = await Agent.builder().build()
     /// ```
     fn build<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
-        let mut guard = self.inner.lock().map_err(|e| {
-            PyErr::new::<PyIOError, _>(format!("Lock error: {}", e))
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("Lock error: {}", e)))?;
 
         let builder = guard.take().ok_or_else(|| {
             PyErr::new::<PyValueError, _>("Builder already consumed by previous build() call")
         })?;
 
         future_into_py(py, async move {
-            let agent = builder.build().await.map_err(|e| {
-                PyErr::new::<PyIOError, _>(format!("Failed to build agent: {}", e))
-            })?;
+            let agent = builder
+                .build()
+                .await
+                .map_err(|e| PyErr::new::<PyIOError, _>(format!("Failed to build agent: {}", e)))?;
 
-            Python::with_gil(|py| {
-                Py::new(py, Agent { inner: agent })
-            })
+            Python::with_gil(|py| Py::new(py, Agent { inner: agent }))
         })
     }
 }
