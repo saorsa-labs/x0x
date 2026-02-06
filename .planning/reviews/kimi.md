@@ -1,1 +1,0 @@
-KIMI_TIMEOUT
