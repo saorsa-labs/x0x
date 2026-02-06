@@ -36,11 +36,11 @@ jobs:
           #   target: aarch64-unknown-linux-gnu
           #   cross: true
 
-          # macOS x86_64
-          - platform: macos-x64
-            os: macos-13
-            target: x86_64-apple-darwin
-            cross: false
+          # TODO: macOS x86_64 - temporarily disabled (runner availability issues)
+          # - platform: macos-x64
+          #   os: macos-13
+          #   target: x86_64-apple-darwin
+          #   cross: false
 
           # macOS ARM64
           - platform: macos-arm64
