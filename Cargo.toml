@@ -22,6 +22,7 @@ bytes = "1.11"
 chacha20poly1305 = "0.10"
 dirs = "5.0"
 hex = "0.4"
+hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 rand = "0.8"
 saorsa-gossip-coordinator = { path = "../saorsa-gossip/crates/coordinator" }
 saorsa-gossip-crdt-sync = { path = "../saorsa-gossip/crates/crdt-sync" }
@@ -34,13 +35,21 @@ saorsa-gossip-transport = { path = "../saorsa-gossip/crates/transport" }
 saorsa-gossip-types = { path = "../saorsa-gossip/crates/types" }
 saorsa-pqc = "0.4"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 zeroize = "1.8.2"
 
 [dev-dependencies]
 serde_json = "1.0"
 tempfile = "3.14"
+
+[[bin]]
+name = "x0x-bootstrap"
+path = "src/bin/x0x-bootstrap.rs"
 
 [workspace]
 members = [

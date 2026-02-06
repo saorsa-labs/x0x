@@ -101,7 +101,7 @@ pub struct NetworkStats {
 ///
 /// This wraps ant-quic's Node with x0x-specific functionality
 /// including peer cache management and configuration.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NetworkNode {
     /// Configuration for this node.
     config: NetworkConfig,
