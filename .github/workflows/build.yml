@@ -127,5 +127,6 @@ jobs:
           name: x0x-${{ matrix.platform }}
           path: |
             target/${{ matrix.target }}/release/x0x*
-            !target/${{ matrix.target }}/release/x0x.d
+            !target/${{ matrix.target }}/release/*.d
+            !target/${{ matrix.target }}/release/*.pdb
           if-no-files-found: error
