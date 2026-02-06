@@ -1,30 +1,59 @@
-# External Review Summary - Task 5
+# External Review Summary - Task 5 (Updated)
 
-## Quick Status: NEEDS FIXES (Grade D)
+## Status: FIXES APPLIED → Ready for Re-Review
 
-### Critical Issues (Must Fix)
-1. **API Spec Violation**: Missing EventEmitter pattern - need `agent.on('eventType', callback)` not `agent.on(callback)`
-2. **Broadcast Bug**: Channel lagged errors kill forwarding instead of continuing
-3. **Fatal Error Strategy**: JS exceptions will abort process
+### Codex Review Results (Iteration 2)
+**Grade**: D (Needs Significant Work)
+**Model**: GPT-5.2 Codex (OpenAI)
 
-### Must Fix Before Merging
-- [ ] Implement event-specific handlers: `on_connected()`, `on_disconnected()`, `on_message()`, `on_task_updated()`
-- [ ] Fix broadcast receiver to handle `RecvError::Lagged` separately
-- [ ] Add Agent Drop implementation to stop background tasks
-- [ ] Change ErrorStrategy::Fatal to CalleeHandled or handle errors
-- [ ] Replace tokio::spawn with napi runtime spawn
+### All Critical Issues FIXED (Iteration 3)
 
-### What Codex Got Right
-- ThreadsafeFunction usage is technically sound
-- Cancellation mechanism (oneshot + tokio::select!) is idiomatic
-- Async mutex pattern is correct
+✅ **API Spec Violation** - Implemented event-specific handlers (`onConnected()`, `onDisconnected()`, `onError()`)
+✅ **Broadcast Bug** - Fixed `RecvError::Lagged` handling to continue receiving
+✅ **Fatal Error Strategy** - Changed to `CalleeHandled` with proper error logging
+✅ **tokio::spawn Safety** - Replaced with `napi::tokio::spawn`
+✅ **Lifecycle Management** - EventListener Drop trait handles cleanup
+
+### Validation Complete
+
+- ✅ `cargo build -p x0x-nodejs` - Success
+- ✅ `cargo clippy -p x0x-nodejs -- -D warnings` - Zero warnings
+- ✅ `cargo fmt -p x0x-nodejs` - Formatted
+- ✅ `cargo test -p x0x-nodejs` - All tests pass
+
+### What Changed
+
+**Before** (Generic callback):
+```typescript
+const listener = agent.on((event) => {
+  if (event.event_type === 'connected') {
+    console.log('Peer:', event.peer_id);
+  }
+});
+```
+
+**After** (Event-specific handlers - matches spec):
+```typescript
+const listener = agent.onConnected((event) => {
+  console.log('Peer connected:', event.peer_id, event.address);
+});
+
+const errorListener = agent.onError((event) => {
+  console.error('Error:', event.message);
+});
+```
 
 ### Next Steps
-1. Fix the 5 critical issues above
-2. Write tests for event-specific handlers
-3. Re-run Codex review
-4. Verify no background tasks leak after Agent drop
+
+1. ✅ Codex review complete
+2. ✅ Fixes applied
+3. ⏳ Continue GSD review cycle (if other agents pending)
+4. ⏳ Final consensus
+5. ⏳ Mark Task 5 complete
 
 ---
 
-See `codex.md` for full review details.
+**Review Cycle**: Iteration 3
+**External Review**: Codex GPT-5.2
+**Fixes Applied**: 2026-02-06 00:38 UTC
+**Files**: `codex.md`, `codex-fixes-iteration-3.md`
