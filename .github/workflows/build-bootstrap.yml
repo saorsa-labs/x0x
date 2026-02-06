@@ -1,0 +1,111 @@
+name: Build Bootstrap Binary
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/x0x-bootstrap/**'
+      - '.github/workflows/build-bootstrap.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/x0x-bootstrap/**'
+      - '.github/workflows/build-bootstrap.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-linux:
+    name: Build Linux x64 Binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-binstall
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+
+      - name: Install cargo-zigbuild
+        run: |
+          cargo binstall --no-confirm cargo-zigbuild
+
+      - name: Install zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.11.0
+
+      - name: Build x0x-bootstrap
+        run: |
+          cargo zigbuild \
+            --target x86_64-unknown-linux-gnu \
+            --release \
+            -p x0x-bootstrap
+
+      - name: Strip binary
+        run: |
+          strip target/x86_64-unknown-linux-gnu/release/x0x-bootstrap
+
+      - name: Verify binary
+        run: |
+          file target/x86_64-unknown-linux-gnu/release/x0x-bootstrap
+          ls -lh target/x86_64-unknown-linux-gnu/release/x0x-bootstrap
+
+      - name: Check binary size
+        run: |
+          SIZE=$(stat -c%s target/x86_64-unknown-linux-gnu/release/x0x-bootstrap)
+          SIZE_MB=$((SIZE / 1024 / 1024))
+          echo "Binary size: ${SIZE_MB}MB"
+          if [ $SIZE_MB -gt 30 ]; then
+            echo "⚠️  Binary size exceeds 30MB"
+          else
+            echo "✅ Binary size OK"
+          fi
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x0x-bootstrap-linux-x64
+          path: target/x86_64-unknown-linux-gnu/release/x0x-bootstrap
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "### Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ x0x-bootstrap built for Linux x64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Binary Info:**" >> $GITHUB_STEP_SUMMARY
+          file target/x86_64-unknown-linux-gnu/release/x0x-bootstrap >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Size:**" >> $GITHUB_STEP_SUMMARY
+          ls -lh target/x86_64-unknown-linux-gnu/release/x0x-bootstrap >> $GITHUB_STEP_SUMMARY
