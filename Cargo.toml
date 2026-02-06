@@ -44,7 +44,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 zeroize = "1.8.2"
 
 [dev-dependencies]
+criterion = "0.5"
 futures = "0.3"
+proptest = "1.4"
 serde_json = "1.0"
 tempfile = "3.14"
 

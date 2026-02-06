@@ -43,7 +43,9 @@ impl Metrics {
         self.convergence_times_ms.write().await.push(time_ms);
     }
 
-    #[allow(dead_code)] #[allow(dead_code)] async fn record_latency(&self, latency_ms: u64) {
+    #[allow(dead_code)]
+    #[allow(dead_code)]
+    async fn record_latency(&self, latency_ms: u64) {
         self.latencies_ms.write().await.push(latency_ms);
     }
 
@@ -131,7 +133,11 @@ async fn test_crdt_convergence_10_agents_50_tasks() {
                 saorsa_gossip_types::PeerId::new([i as u8; 32]),
             );
             replica
-                .add_task(task, saorsa_gossip_types::PeerId::new([i as u8; 32]), (i * 10 + j) as u64)
+                .add_task(
+                    task,
+                    saorsa_gossip_types::PeerId::new([i as u8; 32]),
+                    (i * 10 + j) as u64,
+                )
                 .expect("Failed to add task");
             metrics.record_sent();
         }
@@ -147,7 +153,9 @@ async fn test_crdt_convergence_10_agents_50_tasks() {
     }
 
     let convergence_time = start.elapsed();
-    metrics.record_convergence(convergence_time.as_millis() as u64).await;
+    metrics
+        .record_convergence(convergence_time.as_millis() as u64)
+        .await;
 
     // Verify convergence
     let expected_tasks = num_agents * tasks_per_agent;
@@ -155,7 +163,8 @@ async fn test_crdt_convergence_10_agents_50_tasks() {
         assert_eq!(
             replica.tasks_ordered().len(),
             expected_tasks,
-            "All replicas should have {} tasks", expected_tasks
+            "All replicas should have {} tasks",
+            expected_tasks
         );
     }
 
@@ -251,7 +260,11 @@ async fn test_convergence_with_partitions() {
             saorsa_gossip_types::PeerId::new([i as u8; 32]),
         );
         replica
-            .add_task(task, saorsa_gossip_types::PeerId::new([i as u8; 32]), i as u64)
+            .add_task(
+                task,
+                saorsa_gossip_types::PeerId::new([i as u8; 32]),
+                i as u64,
+            )
             .expect("Add failed");
     }
 
@@ -272,7 +285,11 @@ async fn test_convergence_with_partitions() {
             saorsa_gossip_types::PeerId::new([(i + 5) as u8; 32]),
         );
         replica
-            .add_task(task, saorsa_gossip_types::PeerId::new([(i + 5) as u8; 32]), (i + 5) as u64)
+            .add_task(
+                task,
+                saorsa_gossip_types::PeerId::new([(i + 5) as u8; 32]),
+                (i + 5) as u64,
+            )
             .expect("Add failed");
     }
 
@@ -295,7 +312,11 @@ async fn test_convergence_with_partitions() {
 
     // Verify all replicas have 10 tasks
     for replica in group_a.iter().chain(group_b.iter()) {
-        assert_eq!(replica.tasks_ordered().len(), 10, "Should have 10 tasks after heal");
+        assert_eq!(
+            replica.tasks_ordered().len(),
+            10,
+            "Should have 10 tasks after heal"
+        );
     }
 
     println!("Partition heal time: {:?}", heal_time);

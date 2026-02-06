@@ -24,10 +24,7 @@ const VPS_NODES: &[&str] = &[
 /// Helper to create agent with VPS bootstrap
 async fn create_agent_with_vps() -> Result<Agent, Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
-    let bootstrap_addrs = VPS_NODES
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let bootstrap_addrs = VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
 
     let agent = Agent::builder()
         .with_machine_key(temp_dir.path().join("machine.key"))
@@ -252,10 +249,7 @@ async fn test_concurrent_presence_beacons() {
     for i in 0..num_agents {
         let handle = tokio::spawn(async move {
             let temp_dir = TempDir::new().expect("Failed to create temp dir");
-            let bootstrap_addrs = VPS_NODES
-                .iter()
-                .filter_map(|s| s.parse().ok())
-                .collect();
+            let bootstrap_addrs = VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
 
             let agent = Agent::builder()
                 .with_machine_key(temp_dir.path().join(format!("machine-{}.key", i)))
