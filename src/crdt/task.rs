@@ -83,6 +83,43 @@ impl TaskId {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    /// Create a TaskId from a hex-encoded string.
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - Hex-encoded string (64 characters)
+    ///
+    /// # Returns
+    ///
+    /// A TaskId if parsing succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the string is not valid hex or not 64 characters.
+    pub fn from_string(s: &str) -> Result<Self, String> {
+        if s.len() != 64 {
+            return Err(format!(
+                "Invalid TaskId length: expected 64 hex chars, got {}",
+                s.len()
+            ));
+        }
+
+        let bytes = hex::decode(s)
+            .map_err(|e| format!("Invalid hex encoding: {}", e))?;
+
+        if bytes.len() != 32 {
+            return Err(format!(
+                "Invalid TaskId bytes: expected 32 bytes, got {}",
+                bytes.len()
+            ));
+        }
+
+        let mut array = [0u8; 32];
+        array.copy_from_slice(&bytes);
+        Ok(Self(array))
+    }
+
 }
 
 impl fmt::Display for TaskId {

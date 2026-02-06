@@ -214,6 +214,80 @@ impl Agent {
 
         Ok(start_error_forwarding(network, callback))
     }
+
+    /// Create a new collaborative task list.
+    ///
+    /// This creates a task list that will be synchronized across all agents
+    /// subscribed to the given topic via gossip.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Human-readable name for the task list
+    /// * `topic` - Gossip topic for synchronization
+    ///
+    /// # Returns
+    ///
+    /// Promise resolving to a TaskList handle
+    ///
+    /// # Example (JavaScript)
+    ///
+    /// ```javascript
+    /// const taskList = await agent.createTaskList(
+    ///   "Sprint 42 Tasks",
+    ///   "team/sprint42"
+    /// );
+    /// ```
+    #[napi]
+    pub async fn create_task_list(&self, name: String, topic: String) -> Result<crate::task_list::TaskList> {
+        let handle = self
+            .inner
+            .create_task_list(&name, &topic)
+            .await
+            .map_err(|e| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("Failed to create task list: {}", e),
+                )
+            })?;
+
+        Ok(crate::task_list::TaskList::from_handle(handle))
+    }
+
+    /// Join an existing collaborative task list.
+    ///
+    /// Subscribe to an existing task list by its gossip topic. The agent
+    /// will sync all tasks and updates via epidemic broadcast.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - Gossip topic of the task list to join
+    ///
+    /// # Returns
+    ///
+    /// Promise resolving to a TaskList handle
+    ///
+    /// # Example (JavaScript)
+    ///
+    /// ```javascript
+    /// const taskList = await agent.joinTaskList("team/sprint42");
+    /// const tasks = await taskList.listTasks();
+    /// console.log(`Joined list with ${tasks.length} tasks`);
+    /// ```
+    #[napi]
+    pub async fn join_task_list(&self, topic: String) -> Result<crate::task_list::TaskList> {
+        let handle = self
+            .inner
+            .join_task_list(&topic)
+            .await
+            .map_err(|e| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("Failed to join task list: {}", e),
+                )
+            })?;
+
+        Ok(crate::task_list::TaskList::from_handle(handle))
+    }
 }
 
 /// Builder for configuring an Agent before connecting to the network.
