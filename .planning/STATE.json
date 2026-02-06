@@ -22,7 +22,7 @@
     "blocking_reason": ""
   },
   "status": "task_complete",
-  "last_updated": $(date +%s).000000,
+  "last_updated": 1770396215,
   "last_action": "task_6_complete",
   "task": {
     "current": 8,
