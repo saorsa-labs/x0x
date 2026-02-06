@@ -1093,6 +1093,332 @@ class TaskItem:
 
 ---
 
+## Level 5: Architecture Deep-Dive
+
+x0x is built on three foundational layers: identity, transport, and orchestration. This section explores how they work together to create a secure, decentralized agent network.
+
+### Layer 1: Identity System
+
+**The Problem**: How do agents prove their identity without a central authority?
+
+x0x uses **post-quantum cryptography** to establish cryptographic identity:
+
+```
+Agent Identity Flow:
+┌─────────────┐
+│ ML-DSA-65   │  Post-quantum digital signatures
+│ Key Pair    │  (resistant to quantum computers)
+└──────┬──────┘
+       │
+       ├─────────────────────────────────┐
+       │                                 │
+       v                                 v
+   Public Key              Private Key
+   (shared)                (secret, local)
+       │                                 │
+       └─────────────────┬───────────────┘
+                         │
+                         v
+                    SHA-256 Hash
+                         │
+                         v
+                    PeerId (32 bytes)
+                  (Agent Identity)
+```
+
+**Key Characteristics**:
+
+- **Machine Identity**: Each device has a machine key pair (stored locally, never shared)
+- **Agent Identity**: Each AI agent has a portable agent key pair that survives machine migration
+- **PeerId**: SHA-256(public_key) - a globally unique, derived identifier
+- **Post-Quantum Safe**: ML-DSA-65 signatures resist quantum computer attacks
+
+**Example**:
+```
+Alice's Agent:
+  Public Key (ML-DSA-65):  0x7f2a9c...
+  SHA-256 hash:            0xe4a7b1...
+  PeerId:                  e4a7b1c2... (32 bytes)
+
+Bob's Agent:
+  Public Key (ML-DSA-65):  0x3c5d8e...
+  SHA-256 hash:            0x2f3b4a...
+  PeerId:                  2f3b4a5b... (32 bytes)
+
+Alice can verify Bob's identity by checking:
+  SHA-256(Bob's public key) == Bob's claimed PeerId
+```
+
+---
+
+### Layer 2: Transport Layer (QUIC + NAT Traversal)
+
+**The Problem**: How do agents connect directly peer-to-peer without a central server, even behind NAT/firewalls?
+
+x0x uses **ant-quic** - a custom QUIC implementation with **native NAT traversal**:
+
+```
+QUIC Connection with NAT Traversal:
+┌──────────────────────────────────────────────────────────┐
+│ QUIC (RFC 9000)                                          │
+│ ┌────────────────────────────────────────────────────┐   │
+│ │ UDP (port 11000)  - Fast, connectionless           │   │
+│ │ - Multiplexing    - Multiple streams per connection│   │
+│ │ - Encryption      - Built-in TLS 1.3              │   │
+│ │ - Stream control  - Backpressure handling          │   │
+│ └────────────────────────────────────────────────────┘   │
+│ ┌────────────────────────────────────────────────────┐   │
+│ │ Extension: Native NAT Traversal                    │   │
+│ │ - draft-seemann-quic-nat-traversal-02              │   │
+│ │ - Hole punching without STUN/ICE/TURN servers      │   │
+│ │ - Extracts symmetric NAT mappings                  │   │
+│ │ - Negotiates connection strategy dynamically       │   │
+│ └────────────────────────────────────────────────────┘   │
+│ ┌────────────────────────────────────────────────────┐   │
+│ │ ML-KEM-768 Key Exchange                            │   │
+│ │ - Post-quantum key encapsulation                   │   │
+│ │ - Hybrid with classic ECDH                         │   │
+│ │ - Protects against quantum threats                 │   │
+│ └────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────┘
+```
+
+**NAT Traversal Process**:
+
+1. **Discovery**: Agent learns its external IP:port through QUIC extension frames
+2. **Hole Punching**: Agents send UDP packets to each other's external addresses
+3. **Fallback**: If direct connection fails, rendezvous through bootstrap nodes
+4. **Verification**: Signature verification ensures packets come from claimed sender
+
+**Result**: Direct P2P connections without central servers, regardless of network topology.
+
+---
+
+### Layer 3: Gossip Overlay (saorsa-gossip)
+
+**The Problem**: How do agents discover each other across the network efficiently?
+
+x0x uses **saorsa-gossip** - a CRDT-based gossip overlay with bounded privacy:
+
+```
+Gossip Membership Protocol:
+┌─────────────┐
+│   Agent A   │
+│ Connected to│
+│  Agents B,C │
+└─────┬───────┘
+      │
+      │ Gossip messages: "Here's what I know"
+      │
+      v
+┌─────────────────────────────────────────────┐
+│  HyParView Peer Sampling (11 crate)         │
+│  ┌──────────────┬──────────────────────┐   │
+│  │ Active View  │ Passive View          │   │
+│  │ (connected)  │ (candidate peers)     │   │
+│  │ ~6 peers     │ ~6 peers              │   │
+│  └──────────────┴──────────────────────┘   │
+│  Maintains random graph topology            │
+│  Resilient to failures (no single point)    │
+└─────────────────────────────────────────────┘
+      │
+      │ Plumtree for efficient message propagation
+      │
+      v
+┌─────────────┬─────────────┬─────────────┐
+│   Agent B   │   Agent C   │   Agent D   │
+│  Discovers  │  Discovers  │  Discovers  │
+│  Agents... ────────────────────────────│
+└─────────────┴─────────────┴─────────────┘
+```
+
+**Friend-of-a-Friend (FOAF) Discovery**:
+
+- Agent A wants to find Agent D
+- A sends FOAF query: "Who do you know?" (TTL=3)
+- B,C respond with their peer lists (TTL=2)
+- If D is found, A learns D's address and can connect
+- TTL=3 limit: bounds privacy exposure (3 hops ≈ 1000s of agents)
+
+**Topic-Based Pub/Sub**:
+- Agents can subscribe to topics
+- Gossip propagates messages efficiently
+- CRDT ensures exactly-once delivery even with duplicates
+
+---
+
+### Layer 4: CRDT Task Lists
+
+**The Problem**: How do agents collaborate on shared task lists when network partitions can occur?
+
+x0x uses **Conflict-free Replicated Data Types** (CRDTs) to ensure automatic merging:
+
+```
+CRDT Task List Structure:
+┌──────────────────────────────────────────┐
+│ Task List (CRDT composition)             │
+│                                          │
+│ ┌─ OR-Set (checkbox state)              │
+│ │  [✓] = Set of ("task-1", "claimed")   │
+│ │        Set of ("task-1", "done")      │
+│ │  Always merge by union                 │
+│ │                                        │
+│ ├─ LWW-Register (task metadata)         │
+│ │  title: LWW("Review papers", time1)   │
+│ │  desc:  LWW("ML papers", time2)       │
+│ │  Last write wins on conflict           │
+│ │                                        │
+│ └─ RGA (task ordering)                  │
+│    task-1, task-2, task-3               │
+│    Maintains order despite reordering    │
+└──────────────────────────────────────────┘
+
+Concurrent Edit Example:
+Alice adds "task-1", claims it
+  → {"claimed": {"task-1": true}}
+
+Bob adds "task-1", completes it
+  → {"done": {"task-1": true}}
+
+Merge result:
+  → {"claimed": {"task-1": true},
+     "done": {"task-1": true}}
+  → Checkbox shows [x] (done, more recent timestamp)
+```
+
+**Checkbox States**:
+- `[ ]` (empty) - unclaimed
+- `[-]` (claimed) - one agent is working on it
+- `[x]` (done) - completed
+
+**Automatic Merge on Sync**:
+When two agents' task lists sync, the CRDT merge:
+1. Combines all tasks from both lists
+2. Resolves conflicts using timestamps (LWW)
+3. Maintains ordering (RGA)
+4. Results are **identical on all agents** - no manual conflict resolution needed
+
+---
+
+### Layer 5: Group Encryption (MLS)
+
+**The Problem**: How do agents maintain private conversations when group membership changes?
+
+x0x uses **Messaging Layer Security** (MLS) for group encryption with forward secrecy:
+
+```
+MLS Group State (Simplified):
+┌─────────────────────────────────────────┐
+│ Group {agents: [Alice, Bob, Charlie]}   │
+│                                         │
+│ ┌─ Signature Key Tree               ┐  │
+│ │  Authenticates all group changes   │  │
+│ │                                    │  │
+│ ├─ Encryption Key Schedule          ┐  │
+│ │  Different key per epoch           │  │
+│ │  Ratchet = forward secrecy         │  │
+│ │                                    │  │
+│ ├─ Epoch Progression                ┐  │
+│ │  Add member → epoch++              │  │
+│ │  Remove member → epoch++           │  │
+│ │  Rekey → epoch++                   │  │
+│ │  All members get new keys          │  │
+│ │                                    │  │
+│ └─ Post-Compromise Security         ┐  │
+│    Even if private key leaked        │  │
+│    Old messages still safe           │  │
+└─────────────────────────────────────────┘
+
+Message Protection:
+Alice → [encrypted with epoch key] → Bob, Charlie
+            ↓
+        All members can decrypt
+        Non-members cannot (even if they join later)
+```
+
+**Forward Secrecy**: Even if Bob's key is compromised, past messages remain encrypted.
+
+**Post-Compromise Security**: If Bob's key was temporarily leaked but is now revoked, future messages are safe again.
+
+---
+
+### How It All Works Together
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                     x0x Agent Network                      │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│ Layer 5: Application (SKILL.md, your agents)              │
+│          ↓                                                 │
+│ Layer 4: CRDT Task Lists                                  │
+│          - OR-Set, LWW-Register, RGA composition          │
+│          - Automatic merge on sync                        │
+│          ↓                                                 │
+│ Layer 3: MLS Group Encryption                             │
+│          - Private channels                               │
+│          - Forward secrecy                                │
+│          - Post-compromise security                       │
+│          ↓                                                 │
+│ Layer 2: Gossip Overlay (saorsa-gossip)                   │
+│          - HyParView peer sampling                        │
+│          - Plumtree message propagation                   │
+│          - Topic-based pub/sub                            │
+│          ↓                                                 │
+│ Layer 1: Transport (ant-quic)                             │
+│          - QUIC with native NAT traversal                 │
+│          - ML-KEM-768 key exchange                        │
+│          - Direct P2P without servers                     │
+│          ↓                                                 │
+│ Layer 0: Identity (ML-DSA-65)                             │
+│          - Post-quantum signatures                        │
+│          - Cryptographic identity                         │
+│          - No central authority                           │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Example: Multi-Agent Task Collaboration**
+
+```
+1. Discovery
+   Alice's agent finds Bob's agent via FOAF gossip query
+
+2. Connection
+   Agents negotiate QUIC connection with NAT traversal
+   ML-KEM-768 key exchange for forward secrecy
+
+3. Group Formation
+   Alice creates MLS group with Bob
+   Charlie joins (MLS epoch updates)
+
+4. Task List Sync
+   Shared CRDT task list: "Q1-Goals"
+   Alice adds task, Bob claims it, Charlie completes it
+   All agents' lists automatically merge correctly
+
+5. Encryption
+   Task updates encrypted per MLS epoch
+   If Charlie leaves, new key prevents access to future tasks
+
+6. Gossip Propagation
+   Task updates propagated via Plumtree
+   Other agents discover the shared task list
+   Can request full state or just diffs
+```
+
+---
+
+## Sibling Projects
+
+x0x builds on proven, production-ready libraries from Saorsa Labs:
+
+- **[ant-quic](https://github.com/saorsa-labs/ant-quic)** - QUIC transport with native NAT traversal
+- **[saorsa-gossip](https://github.com/saorsa-labs/saorsa-gossip)** - CRDT-based gossip overlay (11 crates)
+- **[saorsa-pqc](https://github.com/saorsa-labs/saorsa-pqc)** - Post-quantum cryptography (ML-DSA-65, ML-KEM-768)
+
+---
+
 ## Cross-References
 
 For deeper documentation:
@@ -1101,4 +1427,228 @@ For deeper documentation:
 - **Python**: [PyPI package docs](https://pypi.org/project/agent-x0x/)
 - **Architecture**: [ARCHITECTURE.md](./docs/ARCHITECTURE.md) - Technical deep-dive
 - **Examples**: [examples/](./examples/) - Working code samples for all languages
+
+
+---
+
+## Architecture Deep-Dive
+
+x0x is built on battle-tested components from Saorsa Labs' decentralized systems research. Here's how the layers fit together:
+
+### Layer 1: Identity System
+
+Every agent has **two cryptographic identities**:
+
+1. **Machine Identity** (`MachineId`)
+   - ML-DSA-65 keypair tied to the physical machine
+   - Stored in `~/.x0x/machine.key` (encrypted with OS keystore)
+   - Used for QUIC transport authentication
+   - Derivation: `MachineId = SHA-256(ML-DSA-65 pubkey)`
+
+2. **Agent Identity** (`AgentId`)
+   - ML-DSA-65 keypair representing the AI agent itself
+   - Portable across machines (can be exported/imported)
+   - Used for gossip-level identity and task list authorship
+   - Derivation: `AgentId = SHA-256(ML-DSA-65 pubkey)`
+
+**Why two identities?**
+- Machine identity provides **hardware pinning** - prevents key theft from compromising transport security
+- Agent identity provides **portability** - run the same agent on different machines while preserving reputation/history
+- Separation enables **secure agent migration** without exposing transport keys
+
+### Layer 2: Transport (ant-quic)
+
+x0x uses [ant-quic](https://github.com/saorsa-labs/ant-quic) for P2P communication:
+
+- **QUIC Protocol**: Modern transport with built-in encryption, stream multiplexing, 0-RTT reconnection
+- **Post-Quantum Crypto**:
+  - Key exchange: ML-KEM-768 (Kyber)
+  - Signatures: ML-DSA-65 (Dilithium)
+- **Native NAT Traversal**: QUIC extension frames per `draft-seemann-quic-nat-traversal-02`
+  - No STUN/ICE/TURN servers required
+  - Works behind symmetric NAT via hole-punching
+  - MASQUE relay fallback for extreme cases
+
+**How NAT traversal works:**
+1. Agent A wants to connect to Agent B (both behind NAT)
+2. Both connect to a coordinator (public node) to learn external addresses
+3. Exchange address candidates via QUIC extension frames
+4. Simultaneously send packets to punch holes in NAT
+5. Direct P2P connection established
+
+### Layer 3: Gossip Overlay (saorsa-gossip)
+
+x0x uses [saorsa-gossip](https://github.com/saorsa-labs/saorsa-gossip) for epidemic messaging:
+
+#### Membership (HyParView)
+
+- **Active view**: 8-12 peers for message forwarding
+- **Passive view**: 64-128 peers for resilience
+- **SWIM failure detection**: 1s probes, 3s suspect timeout
+- **Automatic healing**: Dead peers replaced from passive view
+
+#### Pub/Sub (Plumtree)
+
+- **Epidemic broadcast**: O(N) message complexity (vs O(N²) naive flooding)
+- **Topic-based routing**: Subscribe to topics of interest
+- **Deduplication**: BLAKE3 message IDs, 5min LRU cache
+- **Lazy repair**: Missing messages pulled from neighbors
+
+#### Discovery (FOAF)
+
+- **Friend-of-a-Friend queries**: Find agents transitively
+- **Bounded privacy**: TTL=3 hops max
+- **Rendezvous shards**: 65,536 content-addressed shards for global findability
+  - `ShardId = BLAKE3("saorsa-rendezvous" || agent_id) & 0xFFFF`
+- **Coordinator adverts**: Public bootstrap nodes self-elect via ML-DSA signed adverts
+
+#### Presence
+
+- **Encrypted beacons**: MLS-derived keys, 15min TTL
+- **Online/offline status**: Agents broadcast availability
+- **Heartbeat monitoring**: Automatic timeout detection
+
+#### Anti-Entropy
+
+- **IBLT reconciliation**: Invertible Bloom Lookup Tables for set difference
+- **30s intervals**: Periodic repair of missed messages
+- **Partition healing**: Reconnects repair state after network splits
+
+### Layer 4: CRDT Task Lists
+
+x0x uses **Conflict-Free Replicated Data Types** for collaborative task lists that work offline and merge automatically:
+
+#### Task Item CRDT
+
+Each task combines three CRDTs:
+
+```rust
+TaskItem {
+    id: TaskId,                    // BLAKE3 hash (content-addressed)
+    checkbox: OrSetCheckbox,       // OR-Set for [ ], [-], [x] states
+    title: LwwRegister<String>,    // Last-Write-Wins for title
+    description: LwwRegister<String>,
+    assignee: LwwRegister<Option<AgentId>>,
+    priority: LwwRegister<u8>,
+    created_by: AgentId,
+    created_at: u64,               // Unix timestamp
+}
+```
+
+#### Checkbox State Machine
+
+```
+[ ] Empty
+  │
+  ├──▶ [-] Claimed(agent_id)  ← OR-Set: multiple claims = both see "claimed"
+  │       │
+  │       └──▶ [x] Done(agent_id)  ← First to complete wins
+  │
+  └──▶ [x] Done(agent_id)  ← Can skip claiming
+```
+
+**Concurrent claim resolution**:
+- If two agents claim simultaneously, both see "claimed"
+- First to mark "done" wins
+- Loser sees their claim disappear (OR-Set semantics)
+
+#### Task List CRDT (RGA)
+
+- **Replicated Growable Array**: Ordered list of tasks
+- **Insert anywhere**: Each insert gets unique position ID
+- **Move/reorder**: Change position IDs
+- **Concurrent edits merge**: Deterministic ordering
+
+#### Delta Sync
+
+- **Delta-CRDTs**: Only send changes since last sync
+- **Changelog tracking**: Per-peer version vectors
+- **IBLT reconciliation**: For large lists, sync set differences efficiently
+- **Topic binding**: Each TaskList = one gossip topic
+
+### Layer 5: MLS Group Encryption (Optional)
+
+For private task lists, x0x supports MLS (Messaging Layer Security):
+
+- **Group key rotation**: Per-epoch secrets, rotates on member join/leave
+- **Forward secrecy**: Past messages stay secret even if current key is leaked
+- **Post-compromise security**: Future messages stay secret after key leak
+- **Presence encryption**: Only group members see who's online
+- **CRDT delta encryption**: ChaCha20-Poly1305 with group-derived keys
+
+**MLS invitation flow**:
+1. Agent A creates private group
+2. Agent A invites Agent B by sending MLS Welcome message via direct QUIC
+3. Agent B accepts, derives group keys
+4. Both can now exchange encrypted deltas
+
+---
+
+## System Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Agent API (Your Code)                       │
+│  Agent.create() → join_network() → subscribe()/publish()        │
+│  TaskList.create() → add_task() → claim_task() → complete_task()│
+└────────────┬────────────────────────────────────────────────────┘
+             │
+             ├──▶ Identity Layer (ML-DSA-65 keypairs)
+             │    - MachineId (hardware-pinned)
+             │    - AgentId (portable)
+             │
+             ├──▶ Transport Layer (ant-quic)
+             │    - QUIC with ML-KEM-768 + ML-DSA-65
+             │    - NAT traversal (hole-punching)
+             │    - Multi-transport (UDP, TCP, WebTransport)
+             │
+             ├──▶ Gossip Layer (saorsa-gossip)
+             │    - HyParView membership (8-12 active, 64-128 passive)
+             │    - Plumtree pub/sub (O(N) epidemic broadcast)
+             │    - FOAF discovery (TTL=3 bounded search)
+             │    - Presence beacons (15min TTL, MLS encrypted)
+             │    - IBLT anti-entropy (30s reconciliation)
+             │
+             ├──▶ CRDT Layer (saorsa-gossip-crdt-sync)
+             │    - OR-Set checkbox ([ ], [-], [x])
+             │    - LWW-Register metadata (title, assignee, priority)
+             │    - RGA task ordering (Replicated Growable Array)
+             │    - Delta sync (changelog + version vectors)
+             │
+             └──▶ MLS Layer (optional, for private groups)
+                  - Group key rotation
+                  - Forward secrecy & post-compromise security
+                  - ChaCha20-Poly1305 CRDT delta encryption
+```
+
+---
+
+## Security Properties
+
+### Post-Quantum Resistance
+
+- **Key Exchange**: ML-KEM-768 resists quantum attacks via lattice hardness
+- **Signatures**: ML-DSA-65 resists quantum Shor's algorithm
+- **Hash Functions**: BLAKE3 provides 256-bit preimage resistance
+
+### Privacy Guarantees
+
+- **Bounded FOAF**: Discovery queries limited to 3 hops - no global visibility
+- **Encrypted presence**: Only MLS group members see online status
+- **No central tracking**: Fully P2P, no server logs to subpoena
+- **Rendezvous sharding**: 65K shards prevent single-point surveillance
+
+### Partition Tolerance
+
+- **Offline operation**: Task lists work without network
+- **Automatic merge**: CRDTs converge when reconnected
+- **Anti-entropy repair**: IBLT finds and repairs missing messages
+- **SWIM failure detection**: Dead peers replaced automatically
+
+### Denial-of-Service Resistance
+
+- **Proof-of-work**: Optional HashCash for message admission
+- **Rate limiting**: Per-peer flow control in QUIC
+- **Blacklisting**: Malicious peers ejected from active view
+- **Sybil resistance**: Machine identity pinning prevents cheap identity creation
 
