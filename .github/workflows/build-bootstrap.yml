@@ -75,38 +75,24 @@ jobs:
           path: target
           key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install cargo-binstall
-        run: |
-          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-
-      - name: Install cargo-zigbuild
-        run: |
-          cargo binstall --no-confirm cargo-zigbuild
-
-      - name: Install zig
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.11.0
-
       - name: Build x0x-bootstrap
         run: |
-          cargo zigbuild \
-            --target x86_64-unknown-linux-gnu \
+          cargo build \
             --release \
             --bin x0x-bootstrap
 
       - name: Strip binary
         run: |
-          strip target/x86_64-unknown-linux-gnu/release/x0x-bootstrap
+          strip target/release/x0x-bootstrap
 
       - name: Verify binary
         run: |
-          file target/x86_64-unknown-linux-gnu/release/x0x-bootstrap
-          ls -lh target/x86_64-unknown-linux-gnu/release/x0x-bootstrap
+          file target/release/x0x-bootstrap
+          ls -lh target/release/x0x-bootstrap
 
       - name: Check binary size
         run: |
-          SIZE=$(stat -c%s target/x86_64-unknown-linux-gnu/release/x0x-bootstrap)
+          SIZE=$(stat -c%s target/release/x0x-bootstrap)
           SIZE_MB=$((SIZE / 1024 / 1024))
           echo "Binary size: ${SIZE_MB}MB"
           if [ $SIZE_MB -gt 30 ]; then
@@ -119,7 +105,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: x0x-bootstrap-linux-x64
-          path: target/x86_64-unknown-linux-gnu/release/x0x-bootstrap
+          path: target/release/x0x-bootstrap
           retention-days: 30
 
       - name: Summary
@@ -129,7 +115,7 @@ jobs:
           echo "✅ x0x-bootstrap built for Linux x64" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Binary Info:**" >> $GITHUB_STEP_SUMMARY
-          file target/x86_64-unknown-linux-gnu/release/x0x-bootstrap >> $GITHUB_STEP_SUMMARY
+          file target/release/x0x-bootstrap >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Size:**" >> $GITHUB_STEP_SUMMARY
-          ls -lh target/x86_64-unknown-linux-gnu/release/x0x-bootstrap >> $GITHUB_STEP_SUMMARY
+          ls -lh target/release/x0x-bootstrap >> $GITHUB_STEP_SUMMARY
