@@ -8,3 +8,4 @@
 ### Phase 2.2 Starting - Fri  6 Feb 2026 01:04:55 GMT
 - Python Bindings (PyO3)
 - No blocking dependencies
+- [x] Task 1: Add saorsa-gossip Dependencies (commit: 8b13187)
