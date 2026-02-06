@@ -36,17 +36,16 @@ if ! command -v strip >/dev/null 2>&1; then
 fi
 
 TARGET="x86_64-unknown-linux-gnu"
-PACKAGE="x0x-bootstrap"
 BINARY_NAME="x0x-bootstrap"
 
-log_info "Building $PACKAGE for $TARGET..."
+log_info "Building $BINARY_NAME for $TARGET..."
 
 # Build with cargo-zigbuild
 log_info "Running cargo zigbuild..."
 cargo zigbuild \
     --target "$TARGET" \
     --release \
-    -p "$PACKAGE" \
+    --bin "$BINARY_NAME" \
     2>&1 | tee /tmp/build-linux.log
 
 if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
