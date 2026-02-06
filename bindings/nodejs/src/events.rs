@@ -57,24 +57,6 @@ pub struct EventListener {
     cancel_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
-impl Drop for EventListener {
-    fn drop(&mut self) {
-        // Cancel the background task when EventListener is dropped
-        // Only if this is the last reference (Arc strong count == 1)
-        if Arc::strong_count(&self.cancel_tx) == 1 {
-            let tx = self.cancel_tx.clone();
-            // Spawn task to send cancellation signal
-            // Use napi tokio runtime
-            napi::tokio::spawn(async move {
-                let mut guard = tx.lock().await;
-                if let Some(sender) = guard.take() {
-                    let _ = sender.send(());
-                }
-            });
-        }
-    }
-}
-
 #[napi]
 impl EventListener {
     /// Stop listening to events.
@@ -110,9 +92,10 @@ pub fn start_connected_forwarding(
                                     address: address.to_string(),
                                 };
 
-                                // Handle errors from callback (CalleeHandled strategy)
-                                let status = callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking) {
-                                    if status != napi::Status::Ok { eprintln!("Error forwarding connected event: status={:?}", status); }
+                                // Forward to JavaScript callback - call() returns Status
+                                let status = callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
+                                if status != napi::Status::Ok {
+                                    eprintln!("Error forwarding connected event: {:?}", status);
                                 }
                             }
                         }
@@ -159,8 +142,9 @@ pub fn start_disconnected_forwarding(
                                     peer_id: hex::encode(peer_id),
                                 };
 
-                                let status = callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking) {
-                                    if status != napi::Status::Ok { eprintln!("Error forwarding disconnected event: status={:?}", status); }
+                                let status = callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
+                                if status != napi::Status::Ok {
+                                    eprintln!("Error forwarding disconnected event: {:?}", status);
                                 }
                             }
                         }
@@ -206,8 +190,9 @@ pub fn start_error_forwarding(
                                     peer_id: peer_id.map(hex::encode),
                                 };
 
-                                let status = callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking) {
-                                    if status != napi::Status::Ok { eprintln!("Error forwarding error event: status={:?}", status); }
+                                let status = callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
+                                if status != napi::Status::Ok {
+                                    eprintln!("Error forwarding error event: {:?}", status);
                                 }
                             }
                         }

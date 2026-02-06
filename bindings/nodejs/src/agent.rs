@@ -1,11 +1,11 @@
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
 use napi_derive::napi;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::events::{
-    start_connected_forwarding, start_disconnected_forwarding, start_error_forwarding,
-    ErrorEvent, EventListener, PeerConnectedEvent, PeerDisconnectedEvent,
+    start_connected_forwarding, start_disconnected_forwarding, start_error_forwarding, ErrorEvent,
+    EventListener, PeerConnectedEvent, PeerDisconnectedEvent,
 };
 use crate::identity::{AgentId, MachineId};
 
@@ -17,8 +17,6 @@ use crate::identity::{AgentId, MachineId};
 #[napi]
 pub struct Agent {
     inner: x0x::Agent,
-    /// Track event listeners for cleanup on Drop
-    listeners: Arc<Mutex<Vec<EventListener>>>,
 }
 
 #[napi]
@@ -36,17 +34,14 @@ impl Agent {
             )
         })?;
 
-        Ok(Agent {
-            inner,
-            listeners: Arc::new(Mutex::new(Vec::new())),
-        })
+        Ok(Agent { inner })
     }
 
     /// Create an AgentBuilder for fine-grained configuration.
     #[napi(factory)]
     pub fn builder() -> AgentBuilder {
         AgentBuilder {
-            inner: std::sync::Mutex::new(Some(x0x::Agent::builder())),
+            inner: Mutex::new(Some(x0x::Agent::builder())),
         }
     }
 
@@ -159,19 +154,14 @@ impl Agent {
         &self,
         callback: ThreadsafeFunction<PeerConnectedEvent, ErrorStrategy::CalleeHandled>,
     ) -> Result<EventListener> {
-        let network = self
-            .inner
-            .network()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Network not initialized - call joinNetwork() first"))?;
+        let network = self.inner.network().ok_or_else(|| {
+            Error::new(
+                Status::GenericFailure,
+                "Network not initialized - call joinNetwork() first",
+            )
+        })?;
 
-        let listener = start_connected_forwarding(network, callback);
-
-        // Track listener for cleanup
-        if let Ok(mut listeners) = self.listeners.lock() {
-            listeners.push(listener.clone());
-        }
-
-        Ok(listener)
+        Ok(start_connected_forwarding(network, callback))
     }
 
     /// Register an event listener for peer disconnected events.
@@ -188,19 +178,14 @@ impl Agent {
         &self,
         callback: ThreadsafeFunction<PeerDisconnectedEvent, ErrorStrategy::CalleeHandled>,
     ) -> Result<EventListener> {
-        let network = self
-            .inner
-            .network()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Network not initialized - call joinNetwork() first"))?;
+        let network = self.inner.network().ok_or_else(|| {
+            Error::new(
+                Status::GenericFailure,
+                "Network not initialized - call joinNetwork() first",
+            )
+        })?;
 
-        let listener = start_disconnected_forwarding(network, callback);
-
-        // Track listener for cleanup
-        if let Ok(mut listeners) = self.listeners.lock() {
-            listeners.push(listener.clone());
-        }
-
-        Ok(listener)
+        Ok(start_disconnected_forwarding(network, callback))
     }
 
     /// Register an event listener for connection error events.
@@ -220,33 +205,14 @@ impl Agent {
         &self,
         callback: ThreadsafeFunction<ErrorEvent, ErrorStrategy::CalleeHandled>,
     ) -> Result<EventListener> {
-        let network = self
-            .inner
-            .network()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Network not initialized - call joinNetwork() first"))?;
+        let network = self.inner.network().ok_or_else(|| {
+            Error::new(
+                Status::GenericFailure,
+                "Network not initialized - call joinNetwork() first",
+            )
+        })?;
 
-        let listener = start_error_forwarding(network, callback);
-
-        // Track listener for cleanup
-        if let Ok(mut listeners) = self.listeners.lock() {
-            listeners.push(listener.clone());
-        }
-
-        Ok(listener)
-    }
-}
-
-/// Implement Drop to cleanup event listeners when Agent is dropped
-impl Drop for Agent {
-    fn drop(&mut self) {
-        // Stop all event listeners
-        if let Ok(mut listeners) = self.listeners.lock() {
-            for listener in listeners.drain(..) {
-                // Dropping each listener will trigger their Drop impl,
-                // which cancels the background tasks
-                drop(listener);
-            }
-        }
+        Ok(start_error_forwarding(network, callback))
     }
 }
 
@@ -264,7 +230,7 @@ impl Drop for Agent {
 /// This design follows Rust's ownership model where `build()` consumes the builder.
 #[napi]
 pub struct AgentBuilder {
-    inner: std::sync::Mutex<Option<x0x::AgentBuilder>>,
+    inner: Mutex<Option<x0x::AgentBuilder>>,
 }
 
 #[napi]
@@ -343,10 +309,7 @@ impl AgentBuilder {
             )
         })?;
 
-        Ok(Agent {
-            inner,
-            listeners: Arc::new(Mutex::new(Vec::new())),
-        })
+        Ok(Agent { inner })
     }
 }
 
