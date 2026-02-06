@@ -62,8 +62,8 @@ if __name__ == "__main__":
 
 See the [examples](examples/) directory for complete usage examples:
 - `basic_agent.py` - Agent creation and network joining
-- `pubsub_messaging.py` - Publish/subscribe messaging
-- `task_collaboration.py` - CRDT task list collaboration
+- `pubsub_messaging.py` - Publish/subscribe messaging between agents
+- `event_callbacks.py` - Event handling with callbacks
 
 For API reference, see [API.md](API.md).
 
