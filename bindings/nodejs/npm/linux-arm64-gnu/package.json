@@ -1,0 +1,27 @@
+{
+  "name": "@x0x/core-linux-arm64-gnu",
+  "version": "0.1.0",
+  "description": "x0x Node.js bindings for Linux ARM64 with glibc",
+  "main": "x0x.linux-arm64-gnu.node",
+  "license": "AGPL-3.0-or-later",
+  "author": "Saorsa Labs <david@saorsalabs.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saorsa-labs/x0x"
+  },
+  "files": [
+    "x0x.linux-arm64-gnu.node"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

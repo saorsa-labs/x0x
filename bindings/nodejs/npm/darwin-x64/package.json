@@ -1,0 +1,24 @@
+{
+  "name": "@x0x/core-darwin-x64",
+  "version": "0.1.0",
+  "description": "x0x Node.js bindings for Intel macOS (darwin-x64)",
+  "main": "x0x.darwin-x64.node",
+  "license": "AGPL-3.0-or-later",
+  "author": "Saorsa Labs <david@saorsalabs.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saorsa-labs/x0x"
+  },
+  "files": [
+    "x0x.darwin-x64.node"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

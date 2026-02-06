@@ -1,0 +1,18 @@
+{
+  "name": "@x0x/core-wasm32-wasi",
+  "version": "0.1.0",
+  "description": "x0x Node.js bindings for WebAssembly with WASI (fallback)",
+  "main": "x0x.wasm32-wasi.node",
+  "license": "AGPL-3.0-or-later",
+  "author": "Saorsa Labs <david@saorsalabs.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saorsa-labs/x0x"
+  },
+  "files": [
+    "x0x.wasm32-wasi.node"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
