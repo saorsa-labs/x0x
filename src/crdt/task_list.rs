@@ -147,8 +147,14 @@ impl TaskList {
             .add(task_id, tag)
             .map_err(|e| CrdtError::Merge(format!("Failed to add task to OR-Set: {}", e)))?;
 
-        // Store task data
-        self.task_data.insert(task_id, task);
+        // Store or merge task data
+        if let Some(existing) = self.task_data.get_mut(&task_id) {
+            // Task already exists - merge CRDT state instead of overwriting
+            existing.merge(&task)?;
+        } else {
+            // New task - insert
+            self.task_data.insert(task_id, task);
+        }
 
         // Add to ordering (append to end)
         let mut current_order = self.ordering.get().clone();
@@ -296,12 +302,15 @@ impl TaskList {
     /// Vector of task references in display order.
     #[must_use]
     pub fn tasks_ordered(&self) -> Vec<&TaskItem> {
-        let current_order = self.ordering.get();
-        let or_set_tasks: Vec<TaskId> = self.tasks.elements().into_iter().copied().collect();
+        use std::collections::HashSet;
 
-        // Start with tasks in the ordering vector
+        let current_order = self.ordering.get();
+        let or_set_tasks: HashSet<TaskId> = self.tasks.elements().into_iter().copied().collect();
+
+        // Start with tasks in the ordering vector, but only if they're in the OR-Set
         let mut ordered: Vec<&TaskItem> = current_order
             .iter()
+            .filter(|id| or_set_tasks.contains(id))  // Filter by OR-Set membership first!
             .filter_map(|id| self.task_data.get(id))
             .collect();
 
