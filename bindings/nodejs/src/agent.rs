@@ -1,7 +1,12 @@
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
 use napi_derive::napi;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::events::{
+    start_connected_forwarding, start_disconnected_forwarding, start_error_forwarding,
+    ErrorEvent, EventListener, PeerConnectedEvent, PeerDisconnectedEvent,
+};
 use crate::identity::{AgentId, MachineId};
 
 /// The core agent that participates in the x0x gossip network.
@@ -12,6 +17,8 @@ use crate::identity::{AgentId, MachineId};
 #[napi]
 pub struct Agent {
     inner: x0x::Agent,
+    /// Track event listeners for cleanup on Drop
+    listeners: Arc<Mutex<Vec<EventListener>>>,
 }
 
 #[napi]
@@ -29,14 +36,17 @@ impl Agent {
             )
         })?;
 
-        Ok(Agent { inner })
+        Ok(Agent {
+            inner,
+            listeners: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     /// Create an AgentBuilder for fine-grained configuration.
     #[napi(factory)]
     pub fn builder() -> AgentBuilder {
         AgentBuilder {
-            inner: Mutex::new(Some(x0x::Agent::builder())),
+            inner: std::sync::Mutex::new(Some(x0x::Agent::builder())),
         }
     }
 
@@ -121,6 +131,123 @@ impl Agent {
             .await
             .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to publish: {}", e)))
     }
+
+    /// Register an event listener for peer connected events.
+    ///
+    /// This follows the EventEmitter pattern with event-specific handlers.
+    ///
+    /// # Example (JavaScript)
+    ///
+    /// ```javascript
+    /// const listener = agent.onConnected((event) => {
+    ///   console.log('Peer connected:', event.peer_id, event.address);
+    /// });
+    ///
+    /// // Later, stop listening:
+    /// await listener.stop();
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `callback` - Function that receives `PeerConnectedEvent` objects
+    ///
+    /// # Returns
+    ///
+    /// An `EventListener` handle that can be used to stop listening via `listener.stop()`
+    #[napi]
+    pub fn on_connected(
+        &self,
+        callback: ThreadsafeFunction<PeerConnectedEvent, ErrorStrategy::CalleeHandled>,
+    ) -> Result<EventListener> {
+        let network = self
+            .inner
+            .network()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Network not initialized - call joinNetwork() first"))?;
+
+        let listener = start_connected_forwarding(network, callback);
+
+        // Track listener for cleanup
+        if let Ok(mut listeners) = self.listeners.lock() {
+            listeners.push(listener.clone());
+        }
+
+        Ok(listener)
+    }
+
+    /// Register an event listener for peer disconnected events.
+    ///
+    /// # Example (JavaScript)
+    ///
+    /// ```javascript
+    /// const listener = agent.onDisconnected((event) => {
+    ///   console.log('Peer disconnected:', event.peer_id);
+    /// });
+    /// ```
+    #[napi]
+    pub fn on_disconnected(
+        &self,
+        callback: ThreadsafeFunction<PeerDisconnectedEvent, ErrorStrategy::CalleeHandled>,
+    ) -> Result<EventListener> {
+        let network = self
+            .inner
+            .network()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Network not initialized - call joinNetwork() first"))?;
+
+        let listener = start_disconnected_forwarding(network, callback);
+
+        // Track listener for cleanup
+        if let Ok(mut listeners) = self.listeners.lock() {
+            listeners.push(listener.clone());
+        }
+
+        Ok(listener)
+    }
+
+    /// Register an event listener for connection error events.
+    ///
+    /// # Example (JavaScript)
+    ///
+    /// ```javascript
+    /// const listener = agent.onError((event) => {
+    ///   console.error('Connection error:', event.message);
+    ///   if (event.peer_id) {
+    ///     console.error('  Peer:', event.peer_id);
+    ///   }
+    /// });
+    /// ```
+    #[napi]
+    pub fn on_error(
+        &self,
+        callback: ThreadsafeFunction<ErrorEvent, ErrorStrategy::CalleeHandled>,
+    ) -> Result<EventListener> {
+        let network = self
+            .inner
+            .network()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Network not initialized - call joinNetwork() first"))?;
+
+        let listener = start_error_forwarding(network, callback);
+
+        // Track listener for cleanup
+        if let Ok(mut listeners) = self.listeners.lock() {
+            listeners.push(listener.clone());
+        }
+
+        Ok(listener)
+    }
+}
+
+/// Implement Drop to cleanup event listeners when Agent is dropped
+impl Drop for Agent {
+    fn drop(&mut self) {
+        // Stop all event listeners
+        if let Ok(mut listeners) = self.listeners.lock() {
+            for listener in listeners.drain(..) {
+                // Dropping each listener will trigger their Drop impl,
+                // which cancels the background tasks
+                drop(listener);
+            }
+        }
+    }
 }
 
 /// Builder for configuring an Agent before connecting to the network.
@@ -137,7 +264,7 @@ impl Agent {
 /// This design follows Rust's ownership model where `build()` consumes the builder.
 #[napi]
 pub struct AgentBuilder {
-    inner: Mutex<Option<x0x::AgentBuilder>>,
+    inner: std::sync::Mutex<Option<x0x::AgentBuilder>>,
 }
 
 #[napi]
@@ -216,7 +343,10 @@ impl AgentBuilder {
             )
         })?;
 
-        Ok(Agent { inner })
+        Ok(Agent {
+            inner,
+            listeners: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 }
 
