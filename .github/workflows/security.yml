@@ -24,13 +24,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: saorsa-labs/ant-quic
-          path: ../ant-quic
+          path: .deps/ant-quic
 
       - name: Checkout saorsa-gossip
         uses: actions/checkout@v4
         with:
           repository: saorsa-labs/saorsa-gossip
-          path: ../saorsa-gossip
+          path: .deps/saorsa-gossip
+
+      - name: Setup dependency symlinks
+        run: |
+          ln -s "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -s "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
