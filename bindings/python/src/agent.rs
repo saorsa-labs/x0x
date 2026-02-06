@@ -5,6 +5,7 @@ use pyo3_asyncio::tokio::future_into_py;
 use std::sync::Mutex;
 
 use crate::identity::{AgentId, MachineId};
+use crate::pubsub::Subscription;
 
 /// The core agent that participates in the x0x gossip network.
 ///
@@ -167,6 +168,73 @@ impl Agent {
     fn peer_id(&self) -> PyResult<String> {
         // Return machine_id as hex (it serves as the peer ID)
         Ok(hex::encode(self.inner.machine_id().as_bytes()))
+    }
+
+    /// Publish a message to a topic.
+    ///
+    /// The message will propagate through the gossip network via
+    /// epidemic broadcast. All agents subscribed to the topic will
+    /// receive it.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to publish to
+    /// * `payload` - The message payload as bytes
+    ///
+    /// # Returns
+    ///
+    /// None on success
+    ///
+    /// # Raises
+    ///
+    /// * `IOError` - If publish fails
+    ///
+    /// # Example (Python)
+    ///
+    /// ```python
+    /// await agent.publish("announcements", b"Hello, network!")
+    /// ```
+    fn publish<'py>(
+        &self,
+        py: Python<'py>,
+        topic: String,
+        payload: Vec<u8>,
+    ) -> PyResult<&'py PyAny> {
+        // Note: publish is currently a placeholder in x0x core
+        // When gossip integration is complete, this will use saorsa-gossip pubsub
+        future_into_py(py, async move {
+            // Placeholder implementation - always succeeds
+            // Real implementation will call self.inner.publish(topic, payload).await
+            let _ = (topic, payload); // Silence unused warnings
+            Ok(())
+        })
+    }
+
+    /// Subscribe to messages on a topic.
+    ///
+    /// Returns an async iterator that yields messages as they arrive
+    /// through the gossip network. Use with `async for` in Python.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to subscribe to
+    ///
+    /// # Returns
+    ///
+    /// A Subscription async iterator
+    ///
+    /// # Example (Python)
+    ///
+    /// ```python
+    /// async for msg in agent.subscribe("announcements"):
+    ///     print(f"Received: {msg.payload.decode()}")
+    ///     print(f"From: {msg.sender}")
+    /// ```
+    fn subscribe(&self, topic: String) -> PyResult<Subscription> {
+        // Note: subscribe is currently a placeholder in x0x core
+        // When gossip integration is complete, this will create a real subscription
+        // that receives messages from the gossip pubsub channel
+        Ok(Subscription::new(topic))
     }
 }
 

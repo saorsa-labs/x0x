@@ -7,6 +7,8 @@
 
 mod agent;
 mod identity;
+mod pubsub;
+mod task_list;
 
 use pyo3::prelude::*;
 
@@ -16,7 +18,7 @@ use pyo3::prelude::*;
 /// with CRDT-based task collaboration for AI agent networks.
 ///
 /// Example:
-///     >>> from x0x import MachineId, AgentId
+///     >>> from x0x import Agent, TaskList, MachineId, AgentId
 ///     >>> machine_id = MachineId.from_hex("a" * 64)
 ///     >>> print(machine_id.to_hex())
 #[pymodule]
@@ -30,5 +32,10 @@ fn x0x(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<identity::AgentId>()?;
     m.add_class::<agent::Agent>()?;
     m.add_class::<agent::AgentBuilder>()?;
+    m.add_class::<pubsub::Message>()?;
+    m.add_class::<pubsub::Subscription>()?;
+    m.add_class::<task_list::TaskId>()?;
+    m.add_class::<task_list::TaskItem>()?;
+    m.add_class::<task_list::TaskList>()?;
     Ok(())
 }
