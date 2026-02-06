@@ -1,0 +1,43 @@
+[Unit]
+Description=x0x Bootstrap Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+
+# Binary and configuration
+ExecStart=/opt/x0x/x0x-bootstrap --config /etc/x0x/bootstrap.toml
+
+# Working directory
+WorkingDirectory=/var/lib/x0x
+
+# Create directories if they don't exist
+ExecStartPre=/bin/mkdir -p /var/lib/x0x/data
+ExecStartPre=/bin/mkdir -p /var/log/x0x
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=x0x-bootstrap
+
+# Restart policy
+Restart=on-failure
+RestartSec=10s
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/x0x
+ReadOnlyPaths=/etc/x0x
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target

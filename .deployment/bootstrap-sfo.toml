@@ -1,0 +1,29 @@
+# x0x Bootstrap Configuration - SFO (saorsa-3)
+# Location: San Francisco, US (DigitalOcean)
+# Public IP: 147.182.234.192
+
+[node]
+# Identity and storage
+machine_key_path = "/var/lib/x0x/machine.key"
+data_directory = "/var/lib/x0x/data"
+
+[network]
+# QUIC transport
+bind_address = "147.182.234.192:12000"
+enable_nat_traversal = true
+
+# Known peers (other 5 bootstrap nodes)
+known_peers = [
+    "142.93.199.50:12000",      # saorsa-2 (NYC)
+    "65.21.157.229:12000",      # saorsa-6 (Helsinki)
+    "116.203.101.172:12000",    # saorsa-7 (Nuremberg)
+    "149.28.156.231:12000",     # saorsa-8 (Singapore)
+    "45.77.176.184:12000",      # saorsa-9 (Tokyo)
+]
+
+[health]
+# Health and metrics endpoint (localhost only)
+bind_address = "127.0.0.1:12600"
+
+[logging]
+level = "info"
