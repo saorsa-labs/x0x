@@ -1,343 +1,497 @@
 /**
- * x0x - Secure P2P Communication for AI Agents with CRDT Collaboration
+ * x0x - Agent-to-Agent Secure Communication Network
  *
- * Post-quantum secure P2P gossip network for AI agents with CRDT-based
- * collaborative task lists. Built on ant-quic (QUIC transport with native
- * NAT traversal and post-quantum cryptography) and saorsa-gossip overlay.
- *
- * @module x0x
+ * TypeScript type definitions for x0x Node.js bindings.
+ * These types provide full IDE autocomplete and type safety for the x0x SDK.
  */
 
-/**
- * Checkbox state in CRDT task list
- * - Empty: Task not claimed by anyone
- * - Claimed: Task claimed by an agent
- * - Done: Task completed by an agent
- */
-export type CheckboxState = 'empty' | 'claimed' | 'done';
+// ============================================================================
+// Identity Types
+// ============================================================================
 
 /**
- * Machine identity derived from ML-DSA-65 keypair tied to this machine
+ * Machine-level cryptographic identity.
+ * A MachineId represents a unique machine/device that can run agents.
  */
-export class MachineId {
+declare class MachineId {
   /**
-   * Get the machine ID as a hex-encoded string
+   * Convert the MachineId to a hex-encoded string.
    */
   toString(): string;
 
   /**
-   * Create a MachineId from a hex-encoded string
+   * Create a MachineId from a hex-encoded string.
    */
-  static fromString(id: string): MachineId;
+  static fromString(hex: string): MachineId;
 }
 
 /**
- * Agent identity - persistent across machines, derived from ML-DSA-65 keypair
+ * Agent-level cryptographic identity.
+ * An AgentId uniquely identifies an individual AI agent.
  */
-export class AgentId {
+declare class AgentId {
   /**
-   * Get the agent ID as a hex-encoded string
+   * Convert the AgentId to a hex-encoded string.
    */
   toString(): string;
 
   /**
-   * Create an AgentId from a hex-encoded string
+   * Create an AgentId from a hex-encoded string.
    */
-  static fromString(id: string): AgentId;
+  static fromString(hex: string): AgentId;
 }
 
-/**
- * Agent identity with both machine and agent keys
- */
-export interface Identity {
-  /** Machine-specific identity */
-  machineId: MachineId;
-  /** Portable agent identity */
-  agentId: AgentId;
-}
+// ============================================================================
+// Agent and Network Types
+// ============================================================================
 
 /**
- * Event listener callback type
+ * Message received from the network.
  */
-export type EventListener<T> = (event: T) => void;
-
-/**
- * Peer connection event - fired when an agent connects
- */
-export interface PeerConnectedEvent {
-  /** PeerId of the connected agent */
-  peerId: string;
-  /** Timestamp when connection established */
-  timestamp: number;
-}
-
-/**
- * Peer disconnection event - fired when an agent disconnects
- */
-export interface PeerDisconnectedEvent {
-  /** PeerId of the disconnected agent */
-  peerId: string;
-  /** Timestamp when disconnection detected */
-  timestamp: number;
-}
-
-/**
- * Message event - fired when a message is received
- */
-export interface MessageEvent {
-  /** Topic the message was received on */
-  topic: string;
-  /** Message payload as Buffer */
-  payload: Buffer;
-  /** PeerId of the message origin */
-  origin: string;
-  /** Timestamp when message was received */
-  timestamp: number;
-}
-
-/**
- * Task updated event - fired when a task list is updated
- */
-export interface TaskUpdatedEvent {
-  /** Task ID that was updated */
-  taskId: string;
-  /** Type of update: 'added', 'claimed', 'completed', 'removed', 'reordered' */
-  updateType: string;
-  /** Timestamp of the update */
-  timestamp: number;
-}
-
-/**
- * Error event - fired when an error occurs
- */
-export interface ErrorEvent {
-  /** Error message */
-  message: string;
-  /** Error code if applicable */
-  code?: string;
-  /** Original error if wrapped */
-  cause?: Error;
-}
-
-/**
- * Message sent or received on a topic
- */
-export interface Message {
-  /** The message topic */
-  topic: string;
-  /** Message payload */
-  payload: Buffer;
-  /** PeerId of message origin */
-  origin: string;
-}
-
-/**
- * Subscription handle for topic messages
- */
-export class Subscription {
+interface Message {
   /**
-   * Unsubscribe from the topic and stop receiving messages
+   * Topic this message was received on
+   */
+  topic: string;
+  /**
+   * Sender's peer ID (hex-encoded)
+   */
+  origin: string;
+  /**
+   * Message payload (binary data)
+   */
+  payload: Buffer;
+}
+
+/**
+ * Handle for managing a pub/sub subscription.
+ */
+interface Subscription {
+  /**
+   * Stop listening to new messages on this subscription.
    */
   unsubscribe(): Promise<void>;
 }
 
 /**
- * Builder for creating agents with custom configuration
+ * Configuration for Agent creation.
  */
-export class AgentBuilder {
+interface AgentConfig {
   /**
-   * Set the path to the machine key file
-   * @param path Path to machine.key file
+   * Optional path to machine key file (defaults to ~/.x0x/machine.key)
    */
-  withMachineKey(path: string): AgentBuilder;
+  machineKeyPath?: string;
 
   /**
-   * Set the agent keypair (internal - for advanced use)
-   * @param keypair Agent keypair bytes
+   * Optional custom machine keypair (overrides machineKeyPath)
    */
-  withAgentKey(keypair: Buffer): AgentBuilder;
+  machineKey?: Buffer;
 
   /**
-   * Build and create the agent
+   * Optional custom agent keypair
    */
-  build(): Promise<Agent>;
+  agentKey?: Buffer;
 }
 
 /**
- * x0x Agent - the primary interface for P2P communication
+ * Main agent interface for x0x network operations.
+ *
+ * The Agent is the primary interface for:
+ * - Joining the network
+ * - Publishing and subscribing to messages
+ * - Creating and joining collaborative task lists
+ * - Listening to network events (connected, disconnected, etc.)
  */
-export class Agent {
+declare class Agent {
   /**
-   * Create a new agent with default configuration
-   * Automatically generates machine identity and agent identity
+   * Create a new agent with default configuration.
+   *
+   * @returns Promise resolving to a new Agent instance
+   *
+   * @example
+   * const agent = await Agent.create();
+   * await agent.joinNetwork();
    */
   static create(): Promise<Agent>;
 
   /**
-   * Create an agent builder for custom configuration
+   * Create a new agent builder for custom configuration.
+   *
+   * @returns AgentBuilder instance for chainable configuration
+   *
+   * @example
+   * const agent = await Agent.builder()
+   *   .withMachineKey('/path/to/key')
+   *   .build();
    */
   static builder(): AgentBuilder;
 
   /**
-   * Get the agent's identity information
-   */
-  identity(): Identity;
-
-  /**
-   * Get the agent's peer ID (derived from public key)
-   */
-  peerId(): string;
-
-  /**
-   * Join the x0x network
-   * Initiates connections to known peers and begins gossip participation
+   * Join the x0x gossip network.
+   *
+   * @returns Promise that resolves when the agent is connected
+   *
+   * @example
+   * await agent.joinNetwork();
+   * console.log('Connected to network');
    */
   joinNetwork(): Promise<void>;
 
   /**
-   * Subscribe to messages on a topic
-   * @param topic Topic name to subscribe to
-   * @param callback Function called when messages arrive
-   * @returns Subscription handle for unsubscribing
+   * Subscribe to messages on a topic.
+   *
+   * @param topic - Topic name to subscribe to
+   * @param callback - Function called when a message is received
+   * @returns Subscription handle for cleanup
+   *
+   * @example
+   * const sub = agent.subscribe('chat', (msg) => {
+   *   console.log('Message:', msg.payload.toString());
+   * });
+   *
+   * // Later:
+   * await sub.unsubscribe();
    */
-  subscribe(topic: string, callback: (message: Message) => void): Subscription;
+  subscribe(topic: string, callback: (msg: Message) => void): Subscription;
 
   /**
-   * Publish a message to a topic
-   * @param topic Topic name
-   * @param payload Message payload as Buffer
+   * Publish a message to a topic.
+   *
+   * @param topic - Topic name to publish to
+   * @param payload - Binary message data
+   * @returns Promise that resolves when the message is published
+   *
+   * @example
+   * await agent.publish('chat', Buffer.from('Hello!'));
    */
   publish(topic: string, payload: Buffer): Promise<void>;
 
   /**
-   * Register an event listener
-   * @param event Event type: 'connected', 'disconnected', 'message', 'taskUpdated', 'error'
-   * @param listener Event callback function
-   */
-  on<T extends AgentEvent>(event: T, listener: EventListener<AgentEventMap[T]>): void;
-
-  /**
-   * Unregister an event listener
-   * @param event Event type
-   * @param listener Event callback function
-   */
-  off<T extends AgentEvent>(event: T, listener: EventListener<AgentEventMap[T]>): void;
-
-  /**
-   * Create a new task list
-   * @param name Task list name
-   * @param topic Gossip topic for synchronization
+   * Create a new collaborative task list.
+   *
+   * @param name - Human-readable list name
+   * @param topic - Unique topic identifier for synchronization
+   * @returns Promise resolving to a TaskList instance
+   *
+   * @example
+   * const tasks = await agent.createTaskList('Sprint 1', 'sprint-1-tasks');
+   * const taskId = await tasks.addTask('Design API', 'RESTful endpoints');
    */
   createTaskList(name: string, topic: string): Promise<TaskList>;
 
   /**
-   * Join an existing task list
-   * @param topic Gossip topic of the task list
+   * Join an existing collaborative task list.
+   *
+   * @param topic - Topic identifier of the task list to join
+   * @returns Promise resolving to a TaskList instance
+   *
+   * @example
+   * const tasks = await agent.joinTaskList('sprint-1-tasks');
+   * const snapshot = await tasks.listTasks();
    */
   joinTaskList(topic: string): Promise<TaskList>;
-}
 
-/** Event type names for agent */
-export type AgentEvent = 'connected' | 'disconnected' | 'message' | 'taskUpdated' | 'error';
+  /**
+   * Register event listener for 'connected' events.
+   * Fires when the agent successfully joins the network.
+   *
+   * @param event - Event type ('connected')
+   * @param callback - Called with PeerConnectedEvent
+   */
+  on(event: 'connected', callback: (e: PeerConnectedEvent) => void): EventListener;
 
-/** Event type mapping */
-export interface AgentEventMap {
-  'connected': PeerConnectedEvent;
-  'disconnected': PeerDisconnectedEvent;
-  'message': MessageEvent;
-  'taskUpdated': TaskUpdatedEvent;
-  'error': ErrorEvent;
+  /**
+   * Register event listener for 'disconnected' events.
+   * Fires when a peer disconnects from the network.
+   */
+  on(event: 'disconnected', callback: (e: PeerDisconnectedEvent) => void): EventListener;
+
+  /**
+   * Register event listener for 'message' events.
+   * Fires when a broadcast message is received.
+   */
+  on(event: 'message', callback: (e: Message) => void): EventListener;
+
+  /**
+   * Register event listener for 'taskUpdated' events.
+   * Fires when a task list is synchronized.
+   */
+  on(event: 'taskUpdated', callback: (taskId: string) => void): EventListener;
+
+  /**
+   * Register event listener for 'error' events.
+   * Fires when a network error occurs.
+   */
+  on(event: 'error', callback: (e: ErrorEvent) => void): EventListener;
+
+  /**
+   * Register a one-time event listener (fires once then unregisters).
+   */
+  once(event: string, callback: (e: any) => void): EventListener;
+
+  /**
+   * Remove all listeners for an event type.
+   *
+   * @param event - Event type to remove listeners from
+   */
+  off(event: string): void;
+
+  /**
+   * Get the count of listeners for an event type.
+   *
+   * @param event - Event type to count
+   * @returns Number of registered listeners
+   */
+  listenerCount(event: string): number;
 }
 
 /**
- * Snapshot of a task item for viewing
+ * Builder for configuring Agent creation.
  */
-export interface TaskSnapshot {
-  /** Unique task ID (hex-encoded) */
+declare class AgentBuilder {
+  /**
+   * Set the machine key file path.
+   *
+   * @param path - Path to machine key file
+   * @returns This builder for chaining
+   */
+  withMachineKey(path: string): AgentBuilder;
+
+  /**
+   * Set a custom machine keypair.
+   *
+   * @param keypair - Binary keypair data
+   * @returns This builder for chaining
+   */
+  withMachineKeypair(keypair: Buffer): AgentBuilder;
+
+  /**
+   * Set a custom agent keypair.
+   *
+   * @param keypair - Binary keypair data
+   * @returns This builder for chaining
+   */
+  withAgentKeypair(keypair: Buffer): AgentBuilder;
+
+  /**
+   * Build the Agent with the current configuration.
+   *
+   * @returns Promise resolving to a configured Agent
+   */
+  build(): Promise<Agent>;
+}
+
+// ============================================================================
+// Task List Types
+// ============================================================================
+
+/**
+ * Checkbox state for a task.
+ */
+type CheckboxState = 'empty' | 'claimed' | 'done';
+
+/**
+ * Snapshot of a task's current state.
+ */
+interface TaskSnapshot {
+  /**
+   * Task ID (hex-encoded)
+   */
   id: string;
-  /** Task title */
+
+  /**
+   * Task title
+   */
   title: string;
-  /** Task description */
+
+  /**
+   * Detailed description
+   */
   description: string;
-  /** Current checkbox state */
+
+  /**
+   * Current state: 'empty', 'claimed', or 'done'
+   */
   state: CheckboxState;
-  /** Agent ID of task assignee (if claimed/done) */
+
+  /**
+   * Agent ID of the assignee (if claimed or done)
+   */
   assignee?: string;
-  /** Task priority (0-100) */
+
+  /**
+   * Display priority (0-255, higher = more important)
+   */
   priority: number;
 }
 
 /**
- * Collaborative task list with CRDT synchronization
+ * Collaborative CRDT-based task list.
+ *
+ * TaskList provides conflict-free task management with automatic
+ * synchronization across agents via the gossip network.
+ *
+ * Each task has three states:
+ * - empty ([ ]) - Available to be claimed
+ * - claimed ([-]) - Assigned to an agent
+ * - done ([x]) - Completed
  */
-export class TaskList {
+declare class TaskList {
   /**
-   * Add a new task to the list
-   * @param title Task title
-   * @param description Task description
-   * @returns Promise resolving to the new task's ID
+   * Add a new task to the list.
+   *
+   * The task starts in the empty state and can be claimed by any agent.
+   *
+   * @param title - Task title (e.g., "Implement feature X")
+   * @param description - Detailed description of the task
+   * @returns Promise resolving to the task ID (hex-encoded string)
+   *
+   * @example
+   * const taskId = await taskList.addTask(
+   *   "Fix bug in network layer",
+   *   "The connection timeout is too aggressive"
+   * );
+   * console.log(`Created task: ${taskId}`);
    */
   addTask(title: string, description: string): Promise<string>;
 
   /**
-   * Claim a task (mark as in-progress)
-   * @param taskId Task ID (hex-encoded)
+   * Claim a task for yourself.
+   *
+   * Changes the task state from empty [ ] to claimed [-] and assigns
+   * it to your agent ID. If multiple agents claim simultaneously, the
+   * CRDT resolves the conflict deterministically.
+   *
+   * @param taskId - ID of the task to claim (hex-encoded string)
+   * @returns Promise that resolves when the claim is applied locally
+   *
+   * @example
+   * await taskList.claimTask(taskId);
+   * console.log("Task claimed!");
    */
   claimTask(taskId: string): Promise<void>;
 
   /**
-   * Complete a task
-   * @param taskId Task ID (hex-encoded)
+   * Mark a task as complete.
+   *
+   * Changes the task state to done [x]. Only the agent that claimed
+   * the task can complete it (enforced by CRDT rules).
+   *
+   * @param taskId - ID of the task to complete (hex-encoded string)
+   * @returns Promise that resolves when the completion is applied locally
+   *
+   * @example
+   * await taskList.completeTask(taskId);
+   * console.log("Task completed!");
    */
   completeTask(taskId: string): Promise<void>;
 
   /**
-   * Get a snapshot of all tasks in current state
-   * @returns Promise resolving to array of task snapshots
+   * Get a snapshot of all tasks in the list.
+   *
+   * Returns the current state of all tasks with their metadata.
+   *
+   * @returns Promise resolving to an array of TaskSnapshot objects
+   *
+   * @example
+   * const tasks = await taskList.listTasks();
+   * for (const task of tasks) {
+   *   console.log(`[${task.state}] ${task.title}`);
+   * }
    */
   listTasks(): Promise<TaskSnapshot[]>;
 
   /**
-   * Reorder tasks in the list
-   * @param taskIds Array of task IDs in desired order
+   * Reorder tasks in the list.
+   *
+   * Changes the display order of tasks. The CRDT uses Last-Write-Wins
+   * semantics for ordering.
+   *
+   * @param taskIds - Array of task IDs in the desired order
+   * @returns Promise that resolves when the reordering is applied locally
+   *
+   * @example
+   * await taskList.reorder([taskId1, taskId2, taskId3]);
    */
   reorder(taskIds: string[]): Promise<void>;
+}
+
+// ============================================================================
+// Event Types
+// ============================================================================
+
+/**
+ * Fired when a peer connects to the network.
+ */
+interface PeerConnectedEvent {
+  /**
+   * Peer ID (hex-encoded)
+   */
+  peer_id: string;
 
   /**
-   * Manually synchronize this task list with the network
-   * Used to force reconciliation with peers
+   * Peer network address (multiaddr format)
    */
-  sync(): Promise<void>;
+  address: string;
 }
 
 /**
- * Platform detection information
+ * Fired when a peer disconnects from the network.
  */
-export interface PlatformInfo {
-  /** Platform string (e.g., 'darwin-arm64', 'linux-x64-gnu') */
-  platform: string;
-  /** NAPI-RS triplet if known */
-  triplet: string | null;
+interface PeerDisconnectedEvent {
+  /**
+   * Peer ID (hex-encoded)
+   */
+  peer_id: string;
 }
 
 /**
- * Load a native binding for the current platform
+ * Fired when a network error occurs.
  */
-export function __loadNative__(): any;
+interface ErrorEvent {
+  /**
+   * Error message
+   */
+  message: string;
+
+  /**
+   * Optional peer ID if error is peer-specific
+   */
+  peer_id?: string;
+}
 
 /**
- * Load the WASM fallback binding
+ * Handle for managing event listeners.
+ * Call stop() to unregister the listener.
  */
-export function __loadWasm__(): any;
+interface EventListener {
+  /**
+   * Stop listening to events and unregister the listener.
+   */
+  stop(): void;
+}
 
-/**
- * Platform information for the current runtime
- */
-export const __platform__: PlatformInfo;
+// ============================================================================
+// Module Exports
+// ============================================================================
 
-/**
- * Re-export all public types for namespace convenience
- */
-export { CheckboxState, Agent, AgentBuilder, TaskList, TaskSnapshot, Message, Subscription };
-export { MachineId, AgentId, Identity };
-export { PeerConnectedEvent, PeerDisconnectedEvent, MessageEvent, TaskUpdatedEvent, ErrorEvent };
+export {
+  // Identity types
+  MachineId,
+  AgentId,
+  // Agent types
+  Agent,
+  AgentBuilder,
+  Message,
+  Subscription,
+  AgentConfig,
+  // Task list types
+  TaskList,
+  TaskSnapshot,
+  CheckboxState,
+  // Event types
+  PeerConnectedEvent,
+  PeerDisconnectedEvent,
+  ErrorEvent,
+  EventListener,
+};
