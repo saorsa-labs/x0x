@@ -24,12 +24,16 @@
 //! use x0x::Agent;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create an agent with default configuration
+//! // This automatically connects to 6 global bootstrap nodes
 //! let agent = Agent::builder()
 //!     .build()
 //!     .await?;
 //!
+//! // Join the x0x network
 //! agent.join_network().await?;
 //!
+//! // Subscribe to a topic and receive messages
 //! let mut rx = agent.subscribe("coordination").await?;
 //! while let Some(msg) = rx.recv().await {
 //!     println!("{}: {:?}", msg.origin, msg.payload);
@@ -37,6 +41,14 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Bootstrap Nodes
+//!
+//! Agents automatically connect to Saorsa Labs' global bootstrap network:
+//! - NYC, US · SFO, US · Helsinki, FI
+//! - Nuremberg, DE · Singapore, SG · Tokyo, JP
+//!
+//! These nodes provide initial peer discovery and NAT traversal.
 
 /// Error types for x0x identity and network operations.
 pub mod error;
@@ -91,7 +103,6 @@ pub use gossip::{GossipConfig, GossipRuntime};
 /// println!("Agent ID: {}", agent.agent_id());
 /// ```
 #[derive(Debug)]
-#[derive(Clone)]
 pub struct Agent {
     identity: identity::Identity,
     /// The network node for P2P communication.
@@ -153,7 +164,6 @@ impl Subscription {
 ///     .await?;
 /// ```
 #[derive(Debug)]
-#[derive(Clone)]
 pub struct AgentBuilder {
     machine_key_path: Option<std::path::PathBuf>,
     agent_keypair: Option<identity::AgentKeypair>,

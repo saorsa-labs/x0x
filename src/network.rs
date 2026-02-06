@@ -862,3 +862,360 @@ async fn test_network_node_multiple_subscribers() {
     assert!(rx1.recv().await.is_ok());
     assert!(rx2.recv().await.is_ok());
 }
+
+/// A message transmitted through the x0x network.
+///
+/// Messages are the basic unit of communication in the x0x gossip network.
+/// Each message includes a unique ID, sender information, topic, payload,
+/// timestamp, and sequence number for ordering.
+///
+/// # Examples
+///
+/// ```no_run
+/// use x0x::network::Message;
+///
+/// let message = Message::new(
+///     [1; 32],  // sender peer_id
+///     "chat".to_string(),
+///     b"Hello, world!".to_vec(),
+/// ).expect("Failed to create message");
+///
+/// assert_eq!(message.topic, "chat");
+/// assert_eq!(message.payload, b"Hello, world!".to_vec());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Message {
+    /// Unique message identifier (BLAKE3 hash of content).
+    pub id: [u8; 32],
+
+    /// Sender's peer ID.
+    pub sender: [u8; 32],
+
+    /// Topic for gossip pub/sub routing.
+    pub topic: String,
+
+    /// Binary message payload.
+    pub payload: Vec<u8>,
+
+    /// Unix timestamp in seconds when message was created.
+    pub timestamp: u64,
+
+    /// Sequence number for total ordering of messages from a sender.
+    pub sequence: u64,
+}
+
+impl Message {
+    /// Create a new message with automatic timestamp and ID generation.
+    ///
+    /// # Arguments
+    ///
+    /// * `sender` - The peer ID of the message sender.
+    /// * `topic` - The topic string for routing.
+    /// * `payload` - The message payload bytes.
+    ///
+    /// # Returns
+    ///
+    /// A new Message with generated ID and timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if timestamp generation fails.
+    pub fn new(sender: [u8; 32], topic: String, payload: Vec<u8>) -> NetworkResult<Self> {
+        let timestamp = current_timestamp()?;
+        let id = generate_message_id(&sender, &topic, &payload, timestamp);
+
+        Ok(Self {
+            id,
+            sender,
+            topic,
+            payload,
+            timestamp,
+            sequence: 0,
+        })
+    }
+
+    /// Create a message with an explicit sequence number.
+    ///
+    /// # Arguments
+    ///
+    /// * `sender` - The peer ID of the message sender.
+    /// * `topic` - The topic string for routing.
+    /// * `payload` - The message payload bytes.
+    /// * `sequence` - The sequence number for ordering.
+    ///
+    /// # Returns
+    ///
+    /// A new Message with generated ID and timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if timestamp generation fails.
+    pub fn with_sequence(
+        sender: [u8; 32],
+        topic: String,
+        payload: Vec<u8>,
+        sequence: u64,
+    ) -> NetworkResult<Self> {
+        let mut msg = Self::new(sender, topic, payload)?;
+        msg.sequence = sequence;
+        Ok(msg)
+    }
+
+    /// Serialize message to JSON format.
+    ///
+    /// # Returns
+    ///
+    /// JSON-encoded message bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if JSON serialization fails.
+    pub fn to_json(&self) -> NetworkResult<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| NetworkError::SerializationError(format!("JSON encode failed: {}", e)))
+    }
+
+    /// Deserialize message from JSON format.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - JSON-encoded message bytes.
+    ///
+    /// # Returns
+    ///
+    /// Deserialized Message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if JSON deserialization fails.
+    pub fn from_json(data: &[u8]) -> NetworkResult<Self> {
+        serde_json::from_slice(data)
+            .map_err(|e| NetworkError::SerializationError(format!("JSON decode failed: {}", e)))
+    }
+
+    /// Serialize message to binary format (bincode).
+    ///
+    /// # Returns
+    ///
+    /// Binary-encoded message bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if binary serialization fails.
+    pub fn to_binary(&self) -> NetworkResult<Vec<u8>> {
+        bincode::serialize(self)
+            .map_err(|e| NetworkError::SerializationError(format!("Binary encode failed: {}", e)))
+    }
+
+    /// Deserialize message from binary format (bincode).
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Binary-encoded message bytes.
+    ///
+    /// # Returns
+    ///
+    /// Deserialized Message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if binary deserialization fails.
+    pub fn from_binary(data: &[u8]) -> NetworkResult<Self> {
+        bincode::deserialize(data)
+            .map_err(|e| NetworkError::SerializationError(format!("Binary decode failed: {}", e)))
+    }
+
+    /// Get the size of this message when serialized to binary.
+    ///
+    /// # Returns
+    ///
+    /// The binary size in bytes.
+    pub fn binary_size(&self) -> NetworkResult<usize> {
+        self.to_binary().map(|b| b.len())
+    }
+
+    /// Get the size of this message when serialized to JSON.
+    ///
+    /// # Returns
+    ///
+    /// The JSON size in bytes.
+    pub fn json_size(&self) -> NetworkResult<usize> {
+        self.to_json().map(|j| j.len())
+    }
+}
+
+/// Get the current Unix timestamp in seconds.
+///
+/// # Returns
+///
+/// Current Unix timestamp.
+///
+/// # Errors
+///
+/// Returns `NetworkError` if system time is before UNIX_EPOCH.
+fn current_timestamp() -> NetworkResult<u64> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| {
+            NetworkError::TimestampError("System time before UNIX_EPOCH".to_string())
+        })
+}
+
+/// Generate a unique message ID using BLAKE3 hash.
+///
+/// The ID is a deterministic hash of sender, topic, payload, and timestamp.
+///
+/// # Arguments
+///
+/// * `sender` - The sender's peer ID.
+/// * `topic` - The message topic.
+/// * `payload` - The message payload.
+/// * `timestamp` - The message timestamp.
+///
+/// # Returns
+///
+/// A 32-byte BLAKE3 hash as the message ID.
+fn generate_message_id(
+    sender: &[u8; 32],
+    topic: &str,
+    payload: &[u8],
+    timestamp: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(sender);
+    hasher.update(topic.as_bytes());
+    hasher.update(payload);
+    hasher.update(&timestamp.to_le_bytes());
+    let hash = hasher.finalize();
+    *hash.as_bytes()
+}
+
+#[cfg(test)]
+mod message_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn test_message_creation() {
+        let sender = [1; 32];
+        let topic = "test".to_string();
+        let payload = b"Hello".to_vec();
+
+        let msg = Message::new(sender, topic.clone(), payload.clone()).unwrap();
+
+        assert_eq!(msg.sender, sender);
+        assert_eq!(msg.topic, topic);
+        assert_eq!(msg.payload, payload);
+        assert!(msg.timestamp > 0);
+        assert_eq!(msg.sequence, 0);
+        assert_ne!(msg.id, [0; 32]);
+    }
+
+    #[test]
+    fn test_message_with_sequence() {
+        let sender = [2; 32];
+        let topic = "ordered".to_string();
+        let payload = b"Message 42".to_vec();
+        let sequence = 42u64;
+
+        let msg = Message::with_sequence(sender, topic, payload, sequence).unwrap();
+
+        assert_eq!(msg.sequence, 42);
+        assert_eq!(msg.sender, sender);
+    }
+
+    #[test]
+    fn test_message_json_roundtrip() {
+        let sender = [3; 32];
+        let topic = "json".to_string();
+        let payload = b"Test payload".to_vec();
+
+        let original = Message::new(sender, topic, payload).unwrap();
+
+        let json = original.to_json().unwrap();
+        let deserialized = Message::from_json(&json).unwrap();
+
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_message_binary_roundtrip() {
+        let sender = [4; 32];
+        let topic = "binary".to_string();
+        let payload = b"Binary test".to_vec();
+
+        let original = Message::new(sender, topic, payload).unwrap();
+
+        let binary = original.to_binary().unwrap();
+        let deserialized = Message::from_binary(&binary).unwrap();
+
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_message_binary_size() {
+        let sender = [6; 32];
+        let topic = "sizing".to_string();
+        let payload = b"Payload for size test".to_vec();
+
+        let msg = Message::new(sender, topic, payload).unwrap();
+
+        let binary_size = msg.binary_size().unwrap();
+        assert!(binary_size > 0);
+
+        let json_size = msg.json_size().unwrap();
+        assert!(json_size > 0);
+
+        assert!(json_size > binary_size);
+    }
+
+    #[test]
+    fn test_message_empty_payload() {
+        let sender = [7; 32];
+        let topic = "empty".to_string();
+        let payload = Vec::new();
+
+        let msg = Message::new(sender, topic, payload).unwrap();
+
+        assert_eq!(msg.payload.len(), 0);
+        assert_ne!(msg.id, [0; 32]);
+    }
+
+    #[test]
+    fn test_message_large_payload() {
+        let sender = [8; 32];
+        let topic = "large".to_string();
+        let payload = vec![42u8; 10000];
+
+        let msg = Message::new(sender, topic, payload.clone()).unwrap();
+
+        assert_eq!(msg.payload.len(), 10000);
+        assert_eq!(msg.payload, payload);
+    }
+
+    #[test]
+    fn test_message_unicode_topic() {
+        let sender = [10; 32];
+        let topic = "тема/главная/система".to_string();
+        let payload = b"Unicode test".to_vec();
+
+        let msg = Message::new(sender, topic.clone(), payload).unwrap();
+
+        assert_eq!(msg.topic, topic);
+
+        let json = msg.to_json().unwrap();
+        let deserialized = Message::from_json(&json).unwrap();
+        assert_eq!(deserialized.topic, topic);
+    }
+
+    #[test]
+    fn test_current_timestamp_positive() {
+        let ts = current_timestamp().unwrap();
+        assert!(ts > 1600000000);
+        assert!(ts < 2000000000);
+    }
+}

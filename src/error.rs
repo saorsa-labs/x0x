@@ -277,6 +277,14 @@ pub enum NetworkError {
     /// Connection error from underlying ant-quic.
     #[error("connection error: {0}")]
     ConnectionError(String),
+
+    /// Serialization/deserialization error.
+    #[error("serialization error: {0}")]
+    SerializationError(String),
+
+    /// Timestamp generation error.
+    #[error("timestamp error: {0}")]
+    TimestampError(String),
 }
 
 /// Standard Result type for x0x network operations.
