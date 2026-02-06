@@ -238,7 +238,11 @@ impl Agent {
     /// );
     /// ```
     #[napi]
-    pub async fn create_task_list(&self, name: String, topic: String) -> Result<crate::task_list::TaskList> {
+    pub async fn create_task_list(
+        &self,
+        name: String,
+        topic: String,
+    ) -> Result<crate::task_list::TaskList> {
         let handle = self
             .inner
             .create_task_list(&name, &topic)
@@ -275,16 +279,12 @@ impl Agent {
     /// ```
     #[napi]
     pub async fn join_task_list(&self, topic: String) -> Result<crate::task_list::TaskList> {
-        let handle = self
-            .inner
-            .join_task_list(&topic)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    Status::GenericFailure,
-                    format!("Failed to join task list: {}", e),
-                )
-            })?;
+        let handle = self.inner.join_task_list(&topic).await.map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to join task list: {}", e),
+            )
+        })?;
 
         Ok(crate::task_list::TaskList::from_handle(handle))
     }

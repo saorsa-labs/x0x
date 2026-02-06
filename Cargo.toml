@@ -46,4 +46,5 @@ tempfile = "3.14"
 members = [
     ".",
     "bindings/nodejs",
+    "bindings/python",
 ]

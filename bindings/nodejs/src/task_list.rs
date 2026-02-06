@@ -73,7 +73,9 @@ impl TaskList {
         let bytes = hex::decode(&task_id)
             .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid task ID hex: {}", e)))?;
         let task_id = x0x::crdt::TaskId::from_bytes(
-            bytes.try_into().map_err(|_| Error::new(Status::InvalidArg, "Task ID must be 32 bytes"))?
+            bytes
+                .try_into()
+                .map_err(|_| Error::new(Status::InvalidArg, "Task ID must be 32 bytes"))?,
         );
 
         self.inner.claim_task(task_id).await.map_err(|e| {
@@ -108,7 +110,9 @@ impl TaskList {
         let bytes = hex::decode(&task_id)
             .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid task ID hex: {}", e)))?;
         let task_id = x0x::crdt::TaskId::from_bytes(
-            bytes.try_into().map_err(|_| Error::new(Status::InvalidArg, "Task ID must be 32 bytes"))?
+            bytes
+                .try_into()
+                .map_err(|_| Error::new(Status::InvalidArg, "Task ID must be 32 bytes"))?,
         );
 
         self.inner.complete_task(task_id).await.map_err(|e| {
@@ -169,9 +173,11 @@ impl TaskList {
     pub async fn reorder(&self, task_ids: Vec<String>) -> Result<()> {
         let mut task_id_list = Vec::with_capacity(task_ids.len());
         for id in task_ids {
-            let bytes = hex::decode(&id)
-                .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid task ID hex: {}", e)))?;
-            let bytes: [u8; 32] = bytes.try_into()
+            let bytes = hex::decode(&id).map_err(|e| {
+                Error::new(Status::InvalidArg, format!("Invalid task ID hex: {}", e))
+            })?;
+            let bytes: [u8; 32] = bytes
+                .try_into()
                 .map_err(|_| Error::new(Status::InvalidArg, "Task ID must be 32 bytes"))?;
             task_id_list.push(x0x::crdt::TaskId::from_bytes(bytes));
         }

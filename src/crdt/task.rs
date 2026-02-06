@@ -105,8 +105,7 @@ impl TaskId {
             ));
         }
 
-        let bytes = hex::decode(s)
-            .map_err(|e| format!("Invalid hex encoding: {}", e))?;
+        let bytes = hex::decode(s).map_err(|e| format!("Invalid hex encoding: {}", e))?;
 
         if bytes.len() != 32 {
             return Err(format!(
@@ -119,7 +118,6 @@ impl TaskId {
         array.copy_from_slice(&bytes);
         Ok(Self(array))
     }
-
 }
 
 impl fmt::Display for TaskId {

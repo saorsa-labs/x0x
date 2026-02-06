@@ -1,0 +1,18 @@
+[package]
+name = "x0x-python"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later OR Commercial"
+description = "Python bindings for x0x - Secure P2P communication for AI agents"
+repository = "https://github.com/saorsa-labs/x0x"
+
+[lib]
+name = "x0x"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+x0x = { path = "../.." }
+
+[build-dependencies]
+pyo3-build-config = "0.23"
