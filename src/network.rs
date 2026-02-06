@@ -2,6 +2,25 @@
 //!
 //! This module provides x0x-specific wrappers around ant-quic's
 //! P2P node, configured for optimal gossip network participation.
+//!
+//! ## Bootstrap Nodes
+//!
+//! The x0x network includes 6 default bootstrap nodes operated by Saorsa Labs.
+//! These nodes provide:
+//! - Initial peer discovery when joining the network
+//! - NAT traversal assistance (coordinator/reflector roles)
+//! - Rendezvous services for agent-to-agent connections
+//!
+//! Agents automatically connect to these bootstrap nodes
+//! unless overridden with `AgentBuilder::with_network_config`.
+//!
+//! Default bootstrap nodes:
+//! - `142.93.199.50:12000` - NYC, US
+//! - `147.182.234.192:12000` - SFO, US
+//! - `65.21.157.229:12000` - Helsinki, FI
+//! - `116.203.101.172:12000` - Nuremberg, DE
+//! - `149.28.156.231:12000` - Singapore, SG
+//! - `45.77.176.184:12000` - Tokyo, JP
 
 use crate::error::{NetworkError, NetworkResult};
 use rand::seq::SliceRandom;
@@ -25,6 +44,31 @@ pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default stats collection interval.
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default bootstrap nodes for the x0x network.
+///
+/// These are Saorsa Labs VPS nodes running x0x-bootstrap with coordinator/reflector
+/// roles. They form a globally distributed mesh providing bootstrap, NAT traversal,
+/// and rendezvous services.
+///
+/// Locations:
+/// - `142.93.199.50` - NYC, US (DigitalOcean)
+/// - `147.182.234.192` - SFO, US (DigitalOcean)
+/// - `65.21.157.229` - Helsinki, FI (Hetzner)
+/// - `116.203.101.172` - Nuremberg, DE (Hetzner)
+/// - `149.28.156.231` - Singapore, SG (Vultr)
+/// - `45.77.176.184` - Tokyo, JP (Vultr)
+///
+/// Agents can override these by calling `AgentBuilder::with_network_config`
+/// with a custom [`NetworkConfig`] containing different bootstrap nodes.
+pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
+    "142.93.199.50:12000",   // NYC
+    "147.182.234.192:12000", // SFO
+    "65.21.157.229:12000",   // Helsinki
+    "116.203.101.172:12000", // Nuremberg
+    "149.28.156.231:12000",  // Singapore
+    "45.77.176.184:12000",   // Tokyo
+];
 
 /// x0x network node configuration.
 ///
@@ -71,9 +115,15 @@ fn default_stats_interval() -> Duration {
 
 impl Default for NetworkConfig {
     fn default() -> Self {
+        // Parse default bootstrap peers
+        let bootstrap_nodes = DEFAULT_BOOTSTRAP_PEERS
+            .iter()
+            .filter_map(|addr| addr.parse().ok())
+            .collect();
+
         Self {
             bind_addr: None,
-            bootstrap_nodes: Vec::new(),
+            bootstrap_nodes,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             stats_interval: DEFAULT_STATS_INTERVAL,
@@ -430,9 +480,39 @@ mod tests {
         let config = NetworkConfig::default();
 
         assert!(config.bind_addr.is_none());
-        assert!(config.bootstrap_nodes.is_empty());
+
+        // Verify default bootstrap nodes are included
+        assert_eq!(
+            config.bootstrap_nodes.len(),
+            6,
+            "Should have 6 default bootstrap nodes"
+        );
+
+        // Verify specific bootstrap addresses
+        let expected_addrs: Vec<SocketAddr> = DEFAULT_BOOTSTRAP_PEERS
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+
+        for expected in &expected_addrs {
+            assert!(
+                config.bootstrap_nodes.contains(expected),
+                "Bootstrap nodes should include {}",
+                expected
+            );
+        }
+
         assert_eq!(config.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(config.connection_timeout, DEFAULT_CONNECTION_TIMEOUT);
+    }
+
+    #[test]
+    fn test_default_bootstrap_peers_parseable() {
+        // Verify all bootstrap peer strings are valid SocketAddrs
+        for peer in DEFAULT_BOOTSTRAP_PEERS {
+            peer.parse::<SocketAddr>()
+                .unwrap_or_else(|_| panic!("Bootstrap peer '{}' is not a valid SocketAddr", peer));
+        }
     }
 
     #[tokio::test]
