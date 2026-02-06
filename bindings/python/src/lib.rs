@@ -3,6 +3,9 @@
 //! This module provides Python bindings to the x0x Rust library using PyO3.
 //! Import as: `from x0x import Agent, TaskList, Message`
 
+#![allow(non_local_definitions)] // False positive with pyo3 0.20 macros
+
+mod agent;
 mod identity;
 
 use pyo3::prelude::*;
@@ -17,7 +20,7 @@ use pyo3::prelude::*;
 ///     >>> machine_id = MachineId.from_hex("a" * 64)
 ///     >>> print(machine_id.to_hex())
 #[pymodule]
-fn x0x(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn x0x(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add(
         "__doc__",
@@ -25,5 +28,7 @@ fn x0x(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add_class::<identity::MachineId>()?;
     m.add_class::<identity::AgentId>()?;
+    m.add_class::<agent::Agent>()?;
+    m.add_class::<agent::AgentBuilder>()?;
     Ok(())
 }

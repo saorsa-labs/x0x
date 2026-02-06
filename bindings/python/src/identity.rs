@@ -29,7 +29,7 @@ impl MachineId {
     /// Raises:
     ///     ValueError: If hex string is invalid or not 32 bytes
     #[classmethod]
-    fn from_hex(_cls: &Bound<'_, PyType>, hex_str: &str) -> PyResult<Self> {
+    fn from_hex(_cls: &PyType, hex_str: &str) -> PyResult<Self> {
         let bytes = hex::decode(hex_str)
             .map_err(|e| PyValueError::new_err(format!("Invalid hex encoding: {}", e)))?;
 
@@ -74,6 +74,12 @@ impl MachineId {
     }
 }
 
+impl From<CoreMachineId> for MachineId {
+    fn from(inner: CoreMachineId) -> Self {
+        Self { inner }
+    }
+}
+
 /// Portable agent identity derived from ML-DSA-65 keypair.
 ///
 /// An AgentId is a 32-byte identifier that represents an agent's persistent identity
@@ -97,7 +103,7 @@ impl AgentId {
     /// Raises:
     ///     ValueError: If hex string is invalid or not 32 bytes
     #[classmethod]
-    fn from_hex(_cls: &Bound<'_, PyType>, hex_str: &str) -> PyResult<Self> {
+    fn from_hex(_cls: &PyType, hex_str: &str) -> PyResult<Self> {
         let bytes = hex::decode(hex_str)
             .map_err(|e| PyValueError::new_err(format!("Invalid hex encoding: {}", e)))?;
 
@@ -139,5 +145,11 @@ impl AgentId {
 
     fn __eq__(&self, other: &Self) -> bool {
         self.inner == other.inner
+    }
+}
+
+impl From<CoreAgentId> for AgentId {
+    fn from(inner: CoreAgentId) -> Self {
+        Self { inner }
     }
 }
