@@ -4,6 +4,7 @@ use pyo3::types::PyType;
 use pyo3_asyncio::tokio::future_into_py;
 use std::sync::Mutex;
 
+use crate::events::EventCallbacks;
 use crate::identity::{AgentId, MachineId};
 use crate::pubsub::Subscription;
 
@@ -22,6 +23,7 @@ use crate::pubsub::Subscription;
 #[pyclass]
 pub struct Agent {
     inner: x0x::Agent,
+    callbacks: EventCallbacks,
 }
 
 #[pymethods]
@@ -236,6 +238,49 @@ impl Agent {
         // that receives messages from the gossip pubsub channel
         Ok(Subscription::new(topic))
     }
+
+    /// Register a callback for an event.
+    ///
+    /// The callback will be invoked whenever the specified event occurs.
+    /// Multiple callbacks can be registered for the same event.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - Event name (e.g., "connected", "disconnected", "peer_joined", "task_updated")
+    /// * `callback` - Python callable that receives event data dict
+    ///
+    /// # Example (Python)
+    ///
+    /// ```python
+    /// def on_connected(event_data):
+    ///     print(f"Connected! Peer ID: {event_data['peer_id']}")
+    ///
+    /// agent.on("connected", on_connected)
+    /// ```
+    fn on(&self, event: String, callback: PyObject) -> PyResult<()> {
+        self.callbacks.register(event, callback);
+        Ok(())
+    }
+
+    /// Remove a callback for an event.
+    ///
+    /// If the callback was registered multiple times, only the first
+    /// occurrence is removed.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - Event name
+    /// * `callback` - Python callable to remove
+    ///
+    /// # Example (Python)
+    ///
+    /// ```python
+    /// agent.off("connected", on_connected)
+    /// ```
+    fn off(&self, py: Python<'_>, event: String, callback: PyObject) -> PyResult<()> {
+        self.callbacks.remove(py, &event, &callback);
+        Ok(())
+    }
 }
 
 /// Builder for creating Agent instances with custom configuration.
@@ -392,7 +437,15 @@ impl AgentBuilder {
                 .await
                 .map_err(|e| PyErr::new::<PyIOError, _>(format!("Failed to build agent: {}", e)))?;
 
-            Python::with_gil(|py| Py::new(py, Agent { inner: agent }))
+            Python::with_gil(|py| {
+                Py::new(
+                    py,
+                    Agent {
+                        inner: agent,
+                        callbacks: EventCallbacks::new(),
+                    },
+                )
+            })
         })
     }
 }
