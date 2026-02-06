@@ -127,3 +127,61 @@ jobs:
           draft: true
           files: artifacts/**/*
           generate_release_notes: true
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Publish in dependency order with delays
+          cargo publish -p x0x-types || echo "x0x-types already published"
+          sleep 30
+          cargo publish -p x0x || echo "x0x already published"
+          sleep 30
+          cargo publish -p x0x-nodejs || echo "x0x-nodejs already published"
+          sleep 30
+          cargo publish -p x0x-python || echo "x0x-python already published"
+
+  publish-npm:
+    name: Publish to npm
+    needs: publish-crates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd bindings/nodejs
+          npm publish --provenance --access public
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: publish-crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build and publish
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          cd bindings/python
+          maturin publish

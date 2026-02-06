@@ -1,5 +1,9 @@
 # x0x
 
+[![CI](https://github.com/saorsa-labs/x0x/actions/workflows/ci.yml/badge.svg)](https://github.com/saorsa-labs/x0x/actions/workflows/ci.yml)
+[![Security](https://github.com/saorsa-labs/x0x/actions/workflows/security.yml/badge.svg)](https://github.com/saorsa-labs/x0x/actions/workflows/security.yml)
+[![Release](https://github.com/saorsa-labs/x0x/actions/workflows/release.yml/badge.svg)](https://github.com/saorsa-labs/x0x/actions/workflows/release.yml)
+
 **An agent-to-agent gossip network for AI systems, built on [saorsa-gossip](https://github.com/saorsa-labs/saorsa-gossip) and [ant-quic](https://github.com/saorsa-labs/ant-quic).**
 
 ## The Name
