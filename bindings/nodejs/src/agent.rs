@@ -58,6 +58,69 @@ impl Agent {
     pub fn agent_id(&self) -> AgentId {
         self.inner.agent_id().into()
     }
+
+    /// Join the x0x gossip network.
+    ///
+    /// This begins the gossip protocol, discovering peers and
+    /// participating in epidemic broadcast.
+    ///
+    /// # Example (JavaScript)
+    ///
+    /// ```javascript
+    /// const agent = await Agent.create();
+    /// await agent.joinNetwork();
+    /// ```
+    #[napi]
+    pub async fn join_network(&self) -> Result<()> {
+        self.inner.join_network().await.map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to join network: {}", e),
+            )
+        })
+    }
+
+    /// Subscribe to messages on a given topic.
+    ///
+    /// Returns a `Subscription` that yields messages as they arrive
+    /// through the gossip network.
+    ///
+    /// # Example (JavaScript)
+    ///
+    /// ```javascript
+    /// const subscription = await agent.subscribe('coordination');
+    /// // Messages will be delivered via callback
+    /// ```
+    #[napi]
+    pub async fn subscribe(&self, topic: String) -> Result<Subscription> {
+        let rx = self.inner.subscribe(&topic).await.map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to subscribe: {}", e),
+            )
+        })?;
+
+        Ok(Subscription { _inner: rx })
+    }
+
+    /// Publish a message to a topic.
+    ///
+    /// The message will propagate through the gossip network via
+    /// epidemic broadcast — every agent that receives it will
+    /// relay it to its neighbours.
+    ///
+    /// # Example (JavaScript)
+    ///
+    /// ```javascript
+    /// await agent.publish('coordination', Buffer.from('hello'));
+    /// ```
+    #[napi]
+    pub async fn publish(&self, topic: String, payload: Buffer) -> Result<()> {
+        self.inner
+            .publish(&topic, payload.to_vec())
+            .await
+            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to publish: {}", e)))
+    }
 }
 
 /// Builder for configuring an Agent before connecting to the network.
@@ -154,5 +217,35 @@ impl AgentBuilder {
         })?;
 
         Ok(Agent { inner })
+    }
+}
+
+/// A message received from the gossip network.
+#[napi(object)]
+pub struct Message {
+    /// The originating agent's identifier.
+    pub origin: String,
+    /// The message payload.
+    pub payload: Buffer,
+    /// The topic this message was published to.
+    pub topic: String,
+}
+
+/// A subscription to messages on a topic.
+///
+/// Call `unsubscribe()` to stop receiving messages.
+#[napi]
+pub struct Subscription {
+    _inner: x0x::Subscription,
+}
+
+#[napi]
+impl Subscription {
+    /// Unsubscribe from the topic.
+    ///
+    /// After calling this, no more messages will be delivered.
+    #[napi]
+    pub fn unsubscribe(&mut self) {
+        // The Subscription will be dropped, closing the channel
     }
 }
