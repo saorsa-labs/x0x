@@ -23,7 +23,7 @@
 //! - `45.77.176.184:12000` - Tokyo, JP
 
 use crate::error::{NetworkError, NetworkResult};
-use ant_quic::{Node, NodeConfig};
+use ant_quic::{Node, NodeConfig, PeerId, TransportAddr};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -285,6 +285,151 @@ impl NetworkNode {
     /// Gracefully shutdown the node.
     ///
     /// This closes all connections and stops the node.
+    /// Connect to a peer by address.
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - Socket address of the peer to connect to.
+    ///
+    /// # Returns
+    ///
+    /// Returns the peer's ID on successful connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if connection fails.
+    pub async fn connect_addr(&self, addr: SocketAddr) -> NetworkResult<PeerId> {
+        let node_guard = self.node.read().await;
+        if let Some(node) = node_guard.as_ref() {
+            let peer_conn = node
+                .connect_addr(addr)
+                .await
+                .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+
+            // Emit connection event with actual peer_id
+            self.emit_event(NetworkEvent::PeerConnected {
+                peer_id: peer_conn.peer_id.0,
+                address: addr,
+            });
+
+            Ok(peer_conn.peer_id)
+        } else {
+            Err(NetworkError::NodeCreation(
+                "Node not initialized".to_string(),
+            ))
+        }
+    }
+
+    /// Connect to a specific peer by ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer_id` - The peer's ID.
+    ///
+    /// # Returns
+    ///
+    /// Returns the peer's address on successful connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if connection fails.
+    pub async fn connect_peer(&self, peer_id: PeerId) -> NetworkResult<SocketAddr> {
+        let node_guard = self.node.read().await;
+        if let Some(node) = node_guard.as_ref() {
+            let peer_conn = node
+                .connect(peer_id)
+                .await
+                .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+
+            // Extract address from TransportAddr
+            let addr = match peer_conn.remote_addr {
+                TransportAddr::Udp(socket_addr) => socket_addr,
+                _ => {
+                    return Err(NetworkError::ConnectionFailed(
+                        "Unsupported transport type".to_string(),
+                    ))
+                }
+            };
+
+            self.emit_event(NetworkEvent::PeerConnected {
+                peer_id: peer_conn.peer_id.0,
+                address: addr,
+            });
+
+            Ok(addr)
+        } else {
+            Err(NetworkError::NodeCreation(
+                "Node not initialized".to_string(),
+            ))
+        }
+    }
+
+    /// Disconnect from a peer.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer_id` - The peer's ID.
+    ///
+    /// # Returns
+    ///
+    /// Ok on successful disconnection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if disconnection fails.
+    pub async fn disconnect(&self, peer_id: &PeerId) -> NetworkResult<()> {
+        let node_guard = self.node.read().await;
+        if let Some(node) = node_guard.as_ref() {
+            node.disconnect(peer_id)
+                .await
+                .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+
+            self.emit_event(NetworkEvent::PeerDisconnected { peer_id: peer_id.0 });
+
+            Ok(())
+        } else {
+            Err(NetworkError::NodeCreation(
+                "Node not initialized".to_string(),
+            ))
+        }
+    }
+
+    /// Get list of connected peer IDs.
+    ///
+    /// # Returns
+    ///
+    /// Vector of connected peer IDs.
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
+        let node_guard = self.node.read().await;
+        if let Some(node) = node_guard.as_ref() {
+            node.connected_peers()
+                .await
+                .iter()
+                .map(|conn| conn.peer_id)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Check if connected to a specific peer.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer_id` - The peer's ID to check.
+    ///
+    /// # Returns
+    ///
+    /// True if connected to the peer.
+    pub async fn is_connected(&self, peer_id: &PeerId) -> bool {
+        let node_guard = self.node.read().await;
+        if let Some(node) = node_guard.as_ref() {
+            node.is_connected(peer_id).await
+        } else {
+            false
+        }
+    }
+
     pub async fn shutdown(&self) {
         // Placeholder for node shutdown
     }
