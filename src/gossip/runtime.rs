@@ -1,8 +1,8 @@
 //! Gossip runtime orchestration.
 
 use super::config::GossipConfig;
-use super::transport::QuicTransportAdapter;
 use crate::error::NetworkResult;
+use crate::network::NetworkNode;
 use std::sync::Arc;
 
 /// The gossip runtime that manages all gossip components.
@@ -10,15 +10,13 @@ use std::sync::Arc;
 /// This orchestrates HyParView membership, Plumtree pub/sub, presence beacons,
 /// FOAF discovery, rendezvous sharding, coordinator advertisements, and
 /// anti-entropy reconciliation.
-#[derive(Debug)]
 pub struct GossipRuntime {
     config: GossipConfig,
-    transport: Arc<QuicTransportAdapter>,
-    running: Arc<tokio::sync::RwLock<bool>>,
+    network: Arc<NetworkNode>,
 }
 
 impl GossipRuntime {
-    /// Create a new gossip runtime with the given configuration and transport.
+    /// Create a new gossip runtime with the given configuration and network node.
     ///
     /// This initializes the runtime but does not start it. Call `start()`
     /// to begin gossip protocol operations.
@@ -26,50 +24,28 @@ impl GossipRuntime {
     /// # Arguments
     ///
     /// * `config` - The gossip configuration
-    /// * `transport` - The QUIC transport adapter
+    /// * `network` - The network node (implements GossipTransport)
     ///
     /// # Returns
     ///
     /// A new `GossipRuntime` instance
-    pub fn new(config: GossipConfig, transport: Arc<QuicTransportAdapter>) -> Self {
-        Self {
-            config,
-            transport,
-            running: Arc::new(tokio::sync::RwLock::new(false)),
-        }
+    pub fn new(config: GossipConfig, network: Arc<NetworkNode>) -> Self {
+        Self { config, network }
     }
 
     /// Start the gossip runtime.
     ///
-    /// This initializes all gossip components and begins protocol operations:
-    /// - HyParView membership management
-    /// - SWIM failure detection
-    /// - Plumtree pub/sub
-    /// - Presence beacons
-    /// - Anti-entropy reconciliation
+    /// This initializes all gossip components and begins protocol operations.
     ///
     /// # Errors
     ///
-    /// Returns an error if the runtime is already running or if initialization fails.
+    /// Returns an error if initialization fails.
     pub async fn start(&self) -> NetworkResult<()> {
-        let mut running = self.running.write().await;
-        if *running {
-            return Err(crate::error::NetworkError::NodeCreation(
-                "gossip runtime already running".to_string(),
-            ));
-        }
-
-        // Mark as running
-        *running = true;
-
-        // TODO: Initialize gossip components in subsequent tasks:
-        // - Task 6: HyParView membership
-        // - Task 7: Plumtree pub/sub
-        // - Task 8: Presence beacons
-        // - Task 9: FOAF discovery
-        // - Task 10: Rendezvous shards
-        // - Task 11: Coordinator adverts
-        // - Task 12: Anti-entropy
+        // TODO: Phase 1.6 Tasks 2-12 will implement actual gossip components here
+        // For now, this is a placeholder that validates config
+        self.config.validate().map_err(|e| {
+            crate::error::NetworkError::NodeCreation(format!("invalid gossip config: {}", e))
+        })?;
 
         Ok(())
     }
@@ -82,26 +58,8 @@ impl GossipRuntime {
     ///
     /// Returns an error if shutdown fails.
     pub async fn shutdown(&self) -> NetworkResult<()> {
-        let mut running = self.running.write().await;
-        if !*running {
-            return Ok(()); // Already stopped, no-op
-        }
-
-        // TODO: Shutdown gossip components in reverse order
-
-        // Mark as stopped
-        *running = false;
-
+        // TODO: Phase 1.6 Tasks 2-12 will implement actual shutdown logic
         Ok(())
-    }
-
-    /// Check if the runtime is currently running.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the runtime is running, `false` otherwise.
-    pub async fn is_running(&self) -> bool {
-        *self.running.read().await
     }
 
     /// Get the runtime configuration.
@@ -110,17 +68,17 @@ impl GossipRuntime {
         &self.config
     }
 
-    /// Get the transport adapter.
+    /// Get the network node.
     #[must_use]
-    pub fn transport(&self) -> &Arc<QuicTransportAdapter> {
-        &self.transport
+    pub fn network(&self) -> &Arc<NetworkNode> {
+        &self.network
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::{NetworkConfig, NetworkNode};
+    use crate::network::NetworkConfig;
 
     #[tokio::test]
     async fn test_runtime_creation() {
@@ -128,10 +86,12 @@ mod tests {
         let network = NetworkNode::new(NetworkConfig::default())
             .await
             .expect("Failed to create network");
-        let transport = Arc::new(QuicTransportAdapter::new(Arc::new(network)));
-        let runtime = GossipRuntime::new(config, transport);
+        let runtime = GossipRuntime::new(config, Arc::new(network));
 
-        assert!(!runtime.is_running().await);
+        assert_eq!(
+            runtime.config().active_view_size,
+            GossipConfig::default().active_view_size
+        );
     }
 
     #[tokio::test]
@@ -140,52 +100,12 @@ mod tests {
         let network = NetworkNode::new(NetworkConfig::default())
             .await
             .expect("Failed to create network");
-        let transport = Arc::new(QuicTransportAdapter::new(Arc::new(network)));
-        let runtime = GossipRuntime::new(config, transport);
+        let runtime = GossipRuntime::new(config, Arc::new(network));
 
-        // Start runtime
-        assert!(runtime.start().await.is_ok());
-        assert!(runtime.is_running().await);
-
-        // Shutdown runtime
-        assert!(runtime.shutdown().await.is_ok());
-        assert!(!runtime.is_running().await);
-    }
-
-    #[tokio::test]
-    async fn test_runtime_double_start() {
-        let config = GossipConfig::default();
-        let network = NetworkNode::new(NetworkConfig::default())
-            .await
-            .expect("Failed to create network");
-        let transport = Arc::new(QuicTransportAdapter::new(Arc::new(network)));
-        let runtime = GossipRuntime::new(config, transport);
-
-        // First start should succeed
+        // Start runtime (placeholder - just validates config)
         assert!(runtime.start().await.is_ok());
 
-        // Second start should fail
-        assert!(runtime.start().await.is_err());
-
-        // Cleanup
-        runtime.shutdown().await.ok();
-    }
-
-    #[tokio::test]
-    async fn test_runtime_double_shutdown() {
-        let config = GossipConfig::default();
-        let network = NetworkNode::new(NetworkConfig::default())
-            .await
-            .expect("Failed to create network");
-        let transport = Arc::new(QuicTransportAdapter::new(Arc::new(network)));
-        let runtime = GossipRuntime::new(config, transport);
-
-        runtime.start().await.ok();
-
-        // First shutdown should succeed
-        assert!(runtime.shutdown().await.is_ok());
-
-        // Second shutdown should also succeed (idempotent)
+        // Shutdown runtime (placeholder - no-op)
         assert!(runtime.shutdown().await.is_ok());
     }
 
@@ -195,10 +115,10 @@ mod tests {
         let network = NetworkNode::new(NetworkConfig::default())
             .await
             .expect("Failed to create network");
-        let transport = Arc::new(QuicTransportAdapter::new(Arc::new(network)));
-        let runtime = GossipRuntime::new(config.clone(), transport.clone());
+        let network_arc = Arc::new(network);
+        let runtime = GossipRuntime::new(config.clone(), network_arc.clone());
 
         assert_eq!(runtime.config().active_view_size, config.active_view_size);
-        assert!(Arc::ptr_eq(runtime.transport(), &transport));
+        assert!(Arc::ptr_eq(runtime.network(), &network_arc));
     }
 }

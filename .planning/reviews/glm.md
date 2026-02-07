@@ -1,362 +1,343 @@
-# GLM-4.7 External Review - Phase 2.3 CI/CD Pipeline
+# GLM-4.7 External Code Review - x0x Phase 1.6 Task 1
 
-**Model**: GLM-4.7 (Z.AI/Zhipu)  
-**Phase**: 2.3 CI/CD Pipeline  
-**Review Date**: 2026-02-06  
-**Status**: Phase Complete
-
----
-
-## Executive Summary
-
-The CI/CD workflows are **functional and well-structured**, but have **several important gaps** and inconsistencies that prevent a production-ready grade. The workflows demonstrate good understanding of GitHub Actions patterns but miss some critical requirements from the Phase 2.3 specification, particularly around npm and PyPI publishing.
-
-**Grade: B-**
+**Timestamp**: 2026-02-07
+**Reviewed**: Commit 8b13187 - "docs: Phase 1.2 complete, transition to Phase 1.3"
+**Phase**: 1.6 - Gossip Integration
+**Task**: Initialize saorsa-gossip Runtime
+**Reviewer**: GLM-4.7 (Z.AI/Zhipu)
 
 ---
 
-## Workflow-by-Workflow Analysis
+## EXECUTIVE SUMMARY
 
-### ✅ `.github/workflows/ci.yml` (Grade: A)
-**Status: EXCELLENT**
+The code changes introduce **7 compilation errors** that completely block the build. The root cause is incorrect API usage for the saorsa-gossip-runtime crate. While the architectural approach (simplified config + saorsa-gossip integration) is sound, the implementation has fundamental mismatches with the actual saorsa-gossip-runtime API.
 
-What's working:
-- ✅ All 4 required jobs: fmt, clippy, test, doc
-- ✅ Proper triggers (push to main, PRs)
-- ✅ Uses dtolnay/rust-toolchain@stable (best practice)
-- ✅ Comprehensive caching (registry, index, target)
-- ✅ Uses nextest for test execution
-- ✅ Test results uploaded as artifacts
-- ✅ Documentation warnings treated as errors (`RUSTDOCFLAGS: -D warnings`)
-- ✅ Proper clippy flags (`--all-targets --all-features -- -D warnings`)
-- ✅ `RUST_BACKTRACE: 1` for better debugging
-
-**No issues found.**
+**VERDICT: FAIL - Major compilation blockers**
+**GRADE: D**
 
 ---
 
-### ✅ `.github/workflows/security.yml` (Grade: A-)
-**Status: VERY GOOD**
+## DETAILED FINDINGS
 
-What's working:
-- ✅ Both cargo audit and panic scanner present
-- ✅ Runs on schedule (daily) + push + PR
-- ✅ Uses dedicated script for panic scanning
-- ✅ Panic scanner has proper test code detection (cfg(test), #[test])
-- ✅ Checks for unwrap(), expect(), panic!, todo!, unimplemented!
+### Critical Issues (Blocking Compilation)
 
-**Minor issue:**
-- ⚠️ **MINOR**: cargo-audit install is slow - could use pre-built binary action
-
----
-
-### ⚠️ `.github/workflows/build.yml` (Grade: B)
-**Status: GOOD WITH GAPS**
-
-What's working:
-- ✅ 7-platform build matrix (darwin-arm64/x64, linux-x64-gnu/arm64-gnu/x64-musl, win32-x64, wasm32-wasi)
-- ✅ Proper cross-compilation setup (cross crate)
-- ✅ Caching for all platforms
-- ✅ Artifacts uploaded with `if-no-files-found: error`
-
-**Issues found:**
-
-**IMPORTANT:**
-1. ❌ Missing platform: **linux-arm64-musl** (common for Alpine containers)
-2. ❌ **No separate napi build step** - workflow builds Rust binaries but not the npm platform-specific packages that napi-rs requires
-3. ❌ No build verification (binaries are uploaded but never tested/executed)
-
-**MINOR:**
-4. ⚠️ Cache key inconsistency: uses `${{ runner.os }}` but restore-keys use `${{ runner.os }}` (works but inelegant)
-5. ⚠️ Artifact pattern `!target/${{ matrix.target }}/release/x0x.d` excludes debug file - good, but no explicit verification
-
----
-
-### ⚠️ `.github/workflows/build-wasm.yml` (Grade: Incomplete)
-**Status: DEPRECATED**
-
-What's working:
-- ✅ Properly marked as deprecated with explanation
-- ✅ References consolidated build.yml
-
-**Issues found:**
-- **MINOR**: File should be deleted - deprecated files create confusion
-
----
-
-### ❌ `.github/workflows/sign-skill.yml` (Grade: D)
-**Status: REDUNDANT**
-
-What's working:
-- ✅ GPG signing works
-- ✅ Signature verification present
-- ✅ Public key export included
-
-**CRITICAL issue:**
-1. ❌ **DUPLICATE FUNCTIONALITY** - This workflow duplicates GPG signing that's already in release.yml (lines 198-218)
-2. ❌ Creates race conditions - both workflows trigger on tags
-3. ❌ Creates duplicate releases
-
-**IMPORTANT issue:**
-4. ⚠️ The `if: startsWith(github.ref, 'refs/tags/v')` check doesn't prevent creation of a separate release from the main release.yml workflow
-
-**Recommendation**: DELETE this workflow - signing is already in release.yml
-
----
-
-### ⚠️ `.github/workflows/release.yml` (Grade: B-)
-**STATUS: FUNCTIONAL WITH GAPS**
-
-What's working:
-- ✅ Triggers on v* tags
-- ✅ Full 7-platform build matrix
-- ✅ Creates GitHub release with softprops/action-gh-release
-- ✅ Draft releases (good practice)
-- ✅ GPG signing integrated
-- ✅ crates.io, npm, PyPI publishing all present
-- ✅ Dependencies ordered correctly (crates.io → npm → PyPI)
-
-**CRITICAL issues:**
-1. ❌ **Duplicate release creation**: Lines 110-130 create "create-release" job, then lines 189-302 create "create-github-release" job - **TWO RELEASES CREATED**
-2. ❌ **npm publishing uses WRONG directory** (line 168): `cd bindings/nodejs` but should use napi build artifacts from build matrix
-3. ❌ **npm publishing doesn't build platform packages** - `npm publish --provenance` publishes only the package.json, not the pre-built binaries
-4. ❌ **PyPI publishing doesn't build wheels** - `maturin publish` without --builds doesn't create platform-specific wheels
-
-**IMPORTANT issues:**
-5. ❌ **Missing "agent.json" file reference** - release body mentions `.well-known/agent.json` but file doesn't exist
-6. ❌ **SKILL.md doesn't exist** - release workflow tries to sign SKILL.md but file hasn't been created (Phase 2.4)
-7. ⚠️ **No semantic release versioning** - versions are manual
-8. ⚠️ **30-second sleep** between publishes is arbitrary - could use polling
-
-**MINOR issues:**
-9. ⚠️ Release body is hardcoded in workflow - should use release notes generation
-10. ⚠️ No rollback mechanism if publishing fails mid-release
-
----
-
-### ⚠️ `.github/workflows/build-bootstrap.yml` (Grade: B-)
-**Status: EXTRA WORKFLOW**
-
-What's working:
-- ✅ Builds only bootstrap binary
-- ✅ Path filters to avoid unnecessary runs
-- ✅ Binary size check (30MB limit)
-- ✅ Strips binary for smaller size
-
-**Issues found:**
-
-**IMPORTANT:**
-1. ⚠️ **Inconsistent with build.yml** - separate workflow means bootstrap binary isn't part of release artifacts
-2. ⚠️ **working-directory: x0x** (line 30) but path is relative - breaks in CI
-3. ⚠️ Sibling dependencies (ant-quic, saorsa-gossip) checked out but not used in build (Cargo.toml uses path dependencies)
-
-**MINOR:**
-4. ⚠️ No caching
-
----
-
-## Issue Summary by Severity
-
-### CRITICAL (Must Fix Before Production)
-
-1. **[release.yml] Duplicate release creation** (lines 110-130, 189-302)
-   - Impact: Creates TWO GitHub releases on tag push
-   - Fix: Remove lines 110-130 (`create-release` job), keep only `create-github-release`
-
-2. **[release.yml] npm publishing doesn't build platform packages** (lines 151-169)
-   - Impact: npm users get package.json but no native binaries - **BROKEN NPM PACKAGE**
-   - Fix: Need to use napi's `npm run build` or integrate napi build step before publishing
-
-3. **[release.yml] PyPI publishing doesn't build wheels** (lines 171-187)
-   - Impact: PyPI users get source-only package - **SLOW/BROKEN PYTHON EXPERIENCE**
-   - Fix: Add `maturin build --release --strip` before `maturin publish`
-
-4. **[sign-skill.yml] Entire workflow is duplicate** 
-   - Impact: Race conditions, duplicate releases, confusion
-   - Fix: DELETE this file
-
-5. **[release.yml] SKILL.md doesn't exist** (line 204)
-   - Impact: Release workflow fails
-   - Fix: Add conditional check or create placeholder file
-
-### IMPORTANT (Should Fix)
-
-6. **[build.yml] Missing linux-arm64-musl target**
-   - Impact: No support for Alpine Linux containers (common in Docker)
-   - Fix: Add to matrix: `{ platform: linux-arm64-musl, target: aarch64-unknown-linux-musl, cross: true }`
-
-7. **[build.yml] No napi build artifacts**
-   - Impact: npm package has no pre-built binaries, users must compile
-   - Fix: Add napi build step that creates npm/platform-*.tar.gz artifacts
-
-8. **[build-bootstrap.yml] working-directory breaks in CI**
-   - Impact: Build fails - path `x0x/` doesn't exist at checkout root
-   - Fix: Remove `working-directory: x0x` or adjust paths
-
-9. **[release.yml] agent.json doesn't exist** (line 226)
-   - Impact: Release upload fails
-   - Fix: Remove from file list or create the file
-
-10. **[release.yml] No binary verification before publishing**
-    - Impact: Could publish broken binaries
-    - Fix: Add smoke test that executes each binary
-
-### MINOR (Nice to Have)
-
-11. **[build-wasm.yml] Delete deprecated file**
-12. **[All workflows] Inconsistent cache keys**
-13. **[release.yml] Hardcoded release body**
-14. **[security.yml] Use faster cargo-audit action**
-15. **[All workflows] No status badges in README** (Task 12 not done)
-
----
-
-## Comparison with Phase 2.3 Requirements
-
-| Requirement | Status | Notes |
-|------------|--------|-------|
-| Task 1: Basic CI (fmt/clippy) | ✅ COMPLETE | Excellent |
-| Task 2: Nextest tests | ✅ COMPLETE | With artifact upload |
-| Task 3: Documentation build | ✅ COMPLETE | With -D warnings |
-| Task 4: Security audit + panic scan | ✅ COMPLETE | Good script |
-| Task 5: 7-platform build matrix | ⚠️ PARTIAL | Missing linux-arm64-musl |
-| Task 6: WASM integration | ✅ COMPLETE | Consolidated from build-wasm.yml |
-| Task 7: Release structure | ❌ INCOMPLETE | Duplicate release creation |
-| Task 8: crates.io publishing | ✅ COMPLETE | Good layering |
-| Task 9: npm publishing with provenance | ❌ BROKEN | No platform binaries built |
-| Task 10: PyPI publishing | ❌ BROKEN | No wheels built |
-| Task 11: GPG signing | ⚠️ DUPLICATE | Works but duplicated |
-| Task 12: README badges | ❌ NOT DONE | No badges found |
-
-**Tasks Complete: 7/12 (58%)**
-
----
-
-## Security Assessment
-
-### Secret Handling: GOOD
-
-All required secrets properly referenced:
-- ✅ `CARGO_REGISTRY_TOKEN` - Used in publish-crates job
-- ✅ `NPM_TOKEN` - Used in publish-npm job  
-- ✅ `PYPI_TOKEN` - Used as MATURIN_PYPI_TOKEN
-- ✅ `SAORSA_GPG_PRIVATE_KEY` - Imported via gpg --import
-- ✅ `SAORSA_GPG_PASSPHRASE` - Used with --passphrase-fd
-
-### Permissions Scoping: GOOD
-
-- ✅ `contents: write` only where needed (release creation)
-- ✅ `id-token: write` correctly set for npm provenance (Sigstore)
-- ✅ `contents: read` default elsewhere
-
-### Attack Surface: LOW
-
-- ✅ No external script execution
-- ✅ GPG key imported from secrets, not committed
-- ✅ Public key exported safely
-- ✅ Signature verification before upload
-
-**No security vulnerabilities identified.**
-
----
-
-## Recommended Fixes (Priority Order)
-
-### 1. Delete sign-skill.yml (CRITICAL)
-```bash
-rm .github/workflows/sign-skill.yml
+#### 1. RuntimeConfig Not Found
+**Severity**: CRITICAL
+**File**: `src/gossip/runtime.rs:6`
+**Error**:
+```rust
+use saorsa_gossip_runtime::{GossipRuntime as SaorsaRuntime, RuntimeConfig};
+//                                                          ^^^^^^^^^^^^^ no `RuntimeConfig`
 ```
 
-### 2. Fix duplicate release in release.yml (CRITICAL)
-Remove lines 110-130 (`create-release` job). The `create-github-release` job (lines 189-302) is the correct one.
+**Root Cause**: The saorsa-gossip-runtime crate exports `GossipRuntimeConfig`, not `RuntimeConfig`.
 
-### 3. Fix npm publishing (CRITICAL)
-Replace npm publish job with proper napi build:
-```yaml
-publish-npm:
-  needs: build-release
-  runs-on: ubuntu-latest
-  permissions:
-    contents: read
-    id-token: write
-  steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-node@v4
-      with:
-        node-version: '20'
-        registry-url: 'https://registry.npmjs.org'
-        cache: 'npm'
-        cache-dependency-path: bindings/nodejs/package-lock.json
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: bindings/nodejs/npm
-    - name: Install dependencies
-      working-directory: bindings/nodejs
-      run: npm ci
-    - name: Publish to npm
-      working-directory: bindings/nodejs
-      env:
-        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      run: npm publish --provenance --access public
+**Fix**: Replace with:
+```rust
+use saorsa_gossip_runtime::{GossipRuntime as SaorsaRuntime, GossipRuntimeConfig};
 ```
-
-### 4. Fix PyPI publishing (CRITICAL)
-Add wheel building before publishing:
-```yaml
-publish-pypi:
-  needs: build-release
-  runs-on: ${{ matrix.os }}
-  strategy:
-    matrix:
-      include:
-        - os: ubuntu-latest
-          target: x86_64-unknown-linux-gnu
-        - os: macos-latest
-          target: x86_64-apple-darwin
-        - os: macos-14
-          target: aarch64-apple-darwin
-  steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-    - name: Install maturin
-      run: pip install maturin
-    - name: Build wheels
-      run: cd bindings/python && maturin build --release --strip --target ${{ matrix.target }}
-    - name: Publish to PyPI
-      env:
-        MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-      run: cd bindings/python && maturin publish --skip-existing
-```
-
-### 5. Add linux-arm64-musl to build matrix (IMPORTANT)
-
-### 6. Fix build-bootstrap.yml working-directory (IMPORTANT)
-
-### 7. Remove SKILL.md and agent.json from release until they exist (IMPORTANT)
-
-### 8. Add README status badges (Task 12)
 
 ---
 
-## Final Verdict
+#### 2. QuicTransportAdapter Missing node() Method
+**Severity**: CRITICAL
+**File**: `src/gossip/runtime.rs:72`
+**Error**:
+```rust
+peer_id: self.transport.node().peer_id(),
+//                       ^^^^ method not found
+```
 
-**Grade: B-**
+**Root Cause**: QuicTransportAdapter doesn't expose a `node()` method. This suggests a design gap in how the QUIC transport is wrapped.
 
-The CI/CD workflows show **solid understanding of GitHub Actions** and **good Rust practices**, but have **critical gaps in npm/PyPI publishing** and **duplicate release creation** that must be fixed before production use.
+**Options**:
+1. Add `pub fn node(&self) -> &Node` method to QuicTransportAdapter
+2. Cache peer_id at QuicTransportAdapter creation time and expose it
+3. Get peer_id from the transport's identity instead
 
-The foundation is good - the issues are primarily around:
-1. Incomplete integration of multi-language bindings (npm/PyPI not building platform artifacts)
-2. Workflow duplication (sign-skill.yml vs release.yml)
-3. References to files that don't exist yet (SKILL.md, agent.json)
-
-**Recommendation**: Fix CRITICAL issues #1-5 before any production release. IMPORTANT issues #6-10 should be addressed before Phase 2.3 can be marked truly complete.
-
-**Acceptance**: This grade (B-) is **NOT acceptable** per project standards (only A is acceptable). Phase 2.3 requires rework.
+**Recommendation**: Option 2 or 3 (don't expose internal Node; expose high-level API).
 
 ---
 
-*External review by GLM-4.7 (Z.AI/Zhipu)*  
-*Model: glm-4.7 | API: api.z.ai | Date: 2026-02-06*
+#### 3. GossipRuntime Constructor Pattern Mismatch
+**Severity**: CRITICAL
+**File**: `src/gossip/runtime.rs:80-81`
+**Error**:
+```rust
+let runtime = SaorsaRuntime::new(saorsa_config, self.transport.clone())
+    .await
+//  ^^^^ no `new` function, cannot infer type
+```
+
+**Root Cause**: saorsa-gossip-runtime uses builder pattern, not direct construction:
+```rust
+// ACTUAL API
+let runtime = GossipRuntimeBuilder::new()
+    .bind_addr(addr)
+    .with_transport(transport)
+    .build()
+    .await?;
+```
+
+**Fix**: Rewrite to use builder:
+```rust
+let runtime = saorsa_gossip_runtime::GossipRuntimeBuilder::new()
+    .with_transport(self.transport.clone())
+    .build()
+    .await
+    .map_err(|e| NetworkError::NodeCreation(format!("runtime creation failed: {}", e)))?;
+```
+
+---
+
+#### 4. Invalid start() and stop() Methods
+**Severity**: CRITICAL
+**File**: `src/gossip/runtime.rs:86, 111`
+**Error**:
+```rust
+runtime.start().await.map_err(|e| { ... })?;  // Line 86
+runtime.stop().await.map_err(|e| { ... })?;   // Line 111
+```
+
+**Root Cause**: GossipRuntime doesn't have `start()` or `stop()` methods. The runtime is fully initialized upon builder completion.
+
+**Fix**: 
+- Remove `.start().await` call (runtime is ready after `.build()`)
+- For shutdown, simply drop the runtime or implement Drop trait cleanup
+
+---
+
+#### 5. Missing spawn_receiver() Implementation
+**Severity**: CRITICAL
+**File**: `src/network.rs:219`
+**Error**:
+```rust
+network_node.spawn_receiver();  // Method doesn't exist
+```
+
+**Root Cause**: NetworkNode calls an unimplemented method.
+
+**Fix**: Implement the method in NetworkNode:
+```rust
+fn spawn_receiver(&self) {
+    // Spawn task to receive gossip messages and parse stream types
+    let recv_tx = self.recv_tx.clone();
+    
+    // TODO: Subscribe to ant-quic node messages and route to recv_tx
+}
+```
+
+---
+
+### Important Issues (Architectural)
+
+#### 6. Configuration Mapping Gap
+**Severity**: IMPORTANT
+**File**: `src/gossip/runtime.rs:71-77`
+
+The code assumes a direct mapping between x0x::GossipConfig and saorsa-gossip's RuntimeConfig:
+```rust
+let saorsa_config = RuntimeConfig {  // This type doesn't exist
+    peer_id: self.transport.node().peer_id(),
+    active_view_size: self.config.active_view_size,
+    passive_view_size: self.config.passive_view_size,
+    arwl: self.config.arwl,
+    prwl: self.config.prwl,
+};
+```
+
+**Issue**: GossipRuntimeConfig expects:
+- `bind_addr: SocketAddr`
+- `known_peers: Vec<SocketAddr>`
+
+It doesn't directly accept HyParView parameters. Those are handled internally by HyParViewMembership.
+
+**Fix**: Adjust approach:
+```rust
+let saorsa_config = GossipRuntimeConfig {
+    bind_addr: self.transport.local_addr()?,  // Get from transport
+    known_peers: self.config.known_peers.clone(),  // Add to x0x config
+};
+```
+
+Then configure membership parameters separately:
+```rust
+// HyParView params are set via MembershipConfig in saorsa-gossip-runtime
+// Access membership after building:
+if let Ok(membership) = runtime.membership.read().await {
+    // Configure active/passive view sizes if needed
+}
+```
+
+---
+
+#### 7. Missing Transport Bridge
+**Severity**: IMPORTANT
+**File**: `src/gossip/transport.rs` (not shown)
+
+The QuicTransportAdapter needs to implement (or wrap) the GossipTransport trait from saorsa-gossip. The code references:
+```rust
+use saorsa_gossip_transport::GossipStreamType;
+```
+
+But doesn't show how QUIC messages map to gossip messages.
+
+**Fix Required**:
+1. Ensure QuicTransportAdapter implements GossipTransport
+2. Document stream type mapping (e.g., stream 0 = membership, stream 1 = pubsub)
+3. Implement message parsing logic
+
+---
+
+### Minor Issues (Code Quality)
+
+#### 8. Missing Tracing Imports
+**Severity**: MINOR
+**File**: `src/network.rs`
+
+The code uses `debug!`, `error!`, `warn!` macros but doesn't verify tracing crate is available:
+```rust
+use tracing::{debug, error, warn};
+```
+
+**Action**: Verify `tracing` is in Cargo.toml dependencies.
+
+---
+
+#### 9. Undefined peer_id Caching
+**Severity**: MINOR
+**File**: `src/network.rs:168-169`
+
+```rust
+/// Cached local peer ID (ant-quic PeerId).
+peer_id: AntPeerId,
+```
+
+This caches the ant-quic PeerId but the gossip layer may need a different PeerId (gossip_types::PeerId). The type aliases help but the semantic distinction should be documented.
+
+---
+
+## TESTING GAPS
+
+### Missing Test Coverage
+1. **GossipRuntime initialization tests**: No tests verify the runtime starts correctly
+2. **Config validation tests**: Only basic validation tested; edge cases missing
+3. **Integration tests**: No tests verify QUIC↔gossip bridge works end-to-end
+4. **Shutdown tests**: No cleanup/resource leakage tests
+
+### Suggested Tests
+```rust
+#[tokio::test]
+async fn test_gossip_runtime_initialization() {
+    let config = GossipConfig::default();
+    let transport = create_test_transport().await;
+    
+    let runtime = GossipRuntime::new(config, transport);
+    assert!(runtime.start().await.is_ok());
+    assert!(runtime.is_running().await);
+}
+
+#[test]
+fn test_gossip_config_validation() {
+    let invalid = GossipConfig { active_view_size: 0, ..Default::default() };
+    assert!(invalid.validate().is_err());
+}
+```
+
+---
+
+## ARCHITECTURE ASSESSMENT
+
+### What's Good
+1. **Clear separation of concerns**: GossipConfig, GossipRuntime, NetworkNode are distinct responsibilities
+2. **Sensible simplification**: Removed unnecessary Duration fields (probe_interval, etc.)
+3. **Channel-based message passing**: Using mpsc for gossip messages is appropriate
+4. **Type disambiguation**: AntPeerId vs GossipPeerId aliases prevent confusion
+
+### What's Missing
+1. **API contract documentation**: How does QUIC transport layer map to gossip messages?
+2. **Lifecycle management**: Unclear shutdown semantics for GossipRuntime
+3. **Error recovery**: No retry logic or error handling for gossip initialization failures
+4. **Configuration completeness**: GossipConfig missing bootstrap peer list, bind address info
+
+---
+
+## RECOMMENDATIONS
+
+### CRITICAL (Blocking Merge)
+- [ ] Fix RuntimeConfig → GossipRuntimeConfig import
+- [ ] Implement GossipRuntimeBuilder pattern (no direct new())
+- [ ] Remove start()/stop() calls (builder.build() is complete)
+- [ ] Implement spawn_receiver() method
+- [ ] Fix QuicTransportAdapter peer_id exposure
+- [ ] Run `cargo check --all-features` - must pass with zero errors
+- [ ] Run `cargo test --all` - must achieve 100% pass rate
+
+### IMPORTANT (Before Release)
+- [ ] Document QUIC↔gossip stream mapping in code comments
+- [ ] Add configuration mapping explanation (x0x::GossipConfig → saorsa-gossip)
+- [ ] Implement GossipTransport trait on QuicTransportAdapter properly
+- [ ] Add integration tests for gossip runtime initialization
+- [ ] Document shutdown/cleanup protocol in GossipRuntime
+
+### NICE-TO-HAVE (Code Quality)
+- [ ] Add logging for gossip runtime lifecycle events
+- [ ] Consider extracting runtime builder logic to separate module
+- [ ] Add benchmarks for message routing latency
+- [ ] Document bootstrap peer selection strategy
+
+---
+
+## COMPILATION STATUS
+
+```
+Current: FAILED
+Total Errors: 7
+Total Warnings: 0 (after errors fixed)
+
+Blockers:
+1. RuntimeConfig not found (import error)
+2. node() method missing (API gap)
+3. GossipRuntime::new() doesn't exist (API pattern)
+4. start() method missing (API mismatch)
+5. stop() method missing (API mismatch)
+6. spawn_receiver() undefined (incomplete implementation)
+7. Type inference failures (cascading from above)
+```
+
+**Estimated Fix Time**: 2-3 hours
+**Risk**: Low (straightforward API fixes)
+
+---
+
+## FINAL VERDICT
+
+### Code Quality: C
+- Good separation of concerns
+- Sensible simplification of GossipConfig
+- But: fundamental API mismatches block compilation
+
+### Architecture: B
+- Sound design (gossip overlay over QUIC transport)
+- But: missing transport bridge documentation
+- But: unclear lifecycle management
+
+### Overall Grade: D
+**Cannot merge until compilation errors fixed. The approach is reasonable but implementation doesn't match saorsa-gossip-runtime API.**
+
+### Next Steps
+1. Developer fixes 7 compilation errors
+2. Rerun full test suite to 100% pass
+3. Implement spawn_receiver() with tests
+4. Add integration test for gossip initialization
+5. Resubmit for review
+
+---
+
+**Review Summary**
+- Task: Initialize saorsa-gossip Runtime
+- Status: BLOCKED by compilation errors
+- Grade: D (major fixes needed)
+- Recommendation: Return to developer for fixes before merging
+
+*External review by GLM-4.7 (Z.AI/Zhipu) - 2026-02-07*

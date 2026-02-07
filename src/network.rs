@@ -653,8 +653,11 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
 
     async fn receive_message(
         &self,
-    ) -> anyhow::Result<(GossipPeerId, saorsa_gossip_transport::GossipStreamType, bytes::Bytes)>
-    {
+    ) -> anyhow::Result<(
+        GossipPeerId,
+        saorsa_gossip_transport::GossipStreamType,
+        bytes::Bytes,
+    )> {
         let mut recv_rx = self.recv_rx.lock().await;
 
         let (ant_peer, stream_type, data) = recv_rx
