@@ -63,19 +63,14 @@ impl Drop for Subscription {
         let topic = self.topic.clone();
         let subscriptions = self.subscriptions.clone();
 
-        // Spawn a task to clean up dead senders from this topic
-        // This avoids blocking on synchronous locks in drop
+        // Spawn a task to clean up dead senders from this topic.
+        // This avoids blocking on synchronous locks in drop.
         tokio::spawn(async move {
-            // Do cleanup on the topic's senders
             let mut subs_map = subscriptions.write().await;
             if let Some(senders) = subs_map.get_mut(&topic) {
-                // Remove all disconnected senders (where is_closed() returns true)
                 senders.retain(|sender| !sender.is_closed());
-
-                // If no senders remain, remove the topic entirely
                 if senders.is_empty() {
-                    drop(subs_map);
-                    subscriptions.write().await.remove(&topic);
+                    subs_map.remove(&topic);
                 }
             }
         });
@@ -171,51 +166,10 @@ impl PubSubManager {
     /// - Peer communication fails
     /// - Message encoding fails
     pub async fn publish(&self, topic: String, payload: Bytes) -> NetworkResult<()> {
-        // 1. Deliver to local subscribers
-        if let Some(subs) = self.subscriptions.read().await.get(&topic) {
-            let message = PubSubMessage {
-                topic: topic.clone(),
-                payload: payload.clone(),
-            };
+        self.deliver_to_local_subscribers(&topic, &payload).await;
 
-            for tx in subs {
-                // Ignore errors: subscriber may have dropped the receiver
-                let _ = tx.send(message.clone()).await;
-            }
-        }
-
-        // 2. Broadcast to all connected peers via GossipTransport (in parallel)
         let encoded = encode_pubsub_message(&topic, &payload)?;
-
-        // Get connected peers and broadcast to each
-        let connected_peers = {
-            let ant_peers = self.network.connected_peers().await;
-            // Convert ant-quic PeerIds to saorsa-gossip PeerIds
-            ant_peers
-                .into_iter()
-                .map(|p| {
-                    // Convert ant-quic PeerId (32 bytes) to saorsa-gossip PeerId
-                    PeerId::new(p.0)
-                })
-                .collect::<Vec<_>>()
-        };
-
-        // Parallelize peer sends using join_all
-        let send_futures: Vec<_> = connected_peers
-            .into_iter()
-            .map(|peer| {
-                let network = self.network.clone();
-                let encoded = encoded.clone();
-                async move {
-                    // Ignore errors: individual peer failures shouldn't fail entire publish
-                    let _ = network
-                        .send_to_peer(peer, GossipStreamType::PubSub, encoded)
-                        .await;
-                }
-            })
-            .collect();
-
-        future::join_all(send_futures).await;
+        self.broadcast_to_peers(encoded, None).await;
 
         Ok(())
     }
@@ -228,10 +182,9 @@ impl PubSubManager {
     ///
     /// # Arguments
     ///
-    /// * `peer` - The peer that sent this message (for logging/debugging)
+    /// * `peer` - The peer that sent this message (excluded from rebroadcast)
     /// * `data` - The encoded message data
     pub async fn handle_incoming(&self, peer: PeerId, data: Bytes) {
-        // Decode the message
         let (topic, payload) = match decode_pubsub_message(data) {
             Ok(msg) => msg,
             Err(e) => {
@@ -244,18 +197,7 @@ impl PubSubManager {
             }
         };
 
-        // Deliver to local subscribers
-        if let Some(subs) = self.subscriptions.read().await.get(&topic) {
-            let message = PubSubMessage {
-                topic: topic.clone(),
-                payload: payload.clone(),
-            };
-
-            for tx in subs {
-                // Ignore errors: subscriber may have dropped the receiver
-                let _ = tx.send(message.clone()).await;
-            }
-        }
+        self.deliver_to_local_subscribers(&topic, &payload).await;
 
         // Re-broadcast to other peers (epidemic broadcast)
         // TODO: Task 5 - Add seen-message tracking to prevent loops
@@ -267,31 +209,53 @@ impl PubSubManager {
             }
         };
 
-        // Get connected peers and re-broadcast (excluding sender if possible)
-        let connected_peers = {
-            let ant_peers = self.network.connected_peers().await;
-            ant_peers
-                .into_iter()
-                .map(|p| PeerId::new(p.0))
-                .collect::<Vec<_>>()
-        };
+        self.broadcast_to_peers(encoded, Some(&peer)).await;
+    }
 
-        // Parallelize re-broadcasts using join_all
-        let rebroadcast_futures: Vec<_> = connected_peers
+    /// Deliver a message to all local subscribers for a given topic.
+    async fn deliver_to_local_subscribers(&self, topic: &str, payload: &Bytes) {
+        if let Some(subs) = self.subscriptions.read().await.get(topic) {
+            let message = PubSubMessage {
+                topic: topic.to_string(),
+                payload: payload.clone(),
+            };
+
+            for tx in subs {
+                // Ignore errors: subscriber may have dropped the receiver
+                let _ = tx.send(message.clone()).await;
+            }
+        }
+    }
+
+    /// Broadcast encoded data to all connected peers, optionally excluding one.
+    ///
+    /// Sends are parallelized using `join_all`. Individual peer failures
+    /// are silently ignored so that one unreachable peer does not block
+    /// delivery to the rest.
+    async fn broadcast_to_peers(&self, encoded: Bytes, exclude: Option<&PeerId>) {
+        let connected_peers: Vec<_> = self
+            .network
+            .connected_peers()
+            .await
             .into_iter()
-            .filter(|other_peer| other_peer != &peer) // Exclude sender
-            .map(|other_peer| {
+            .map(|p| PeerId::new(p.0))
+            .collect();
+
+        let futures: Vec<_> = connected_peers
+            .into_iter()
+            .filter(|p| exclude != Some(p))
+            .map(|peer| {
                 let network = self.network.clone();
                 let encoded = encoded.clone();
                 async move {
                     let _ = network
-                        .send_to_peer(other_peer, GossipStreamType::PubSub, encoded)
+                        .send_to_peer(peer, GossipStreamType::PubSub, encoded)
                         .await;
                 }
             })
             .collect();
 
-        future::join_all(rebroadcast_futures).await;
+        future::join_all(futures).await;
     }
 
     /// Get the number of active subscriptions.

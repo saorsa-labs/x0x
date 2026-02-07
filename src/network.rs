@@ -192,29 +192,21 @@ impl NetworkNode {
     ///
     /// Returns `NetworkError` if node creation fails.
     pub async fn new(config: NetworkConfig) -> NetworkResult<Self> {
-        // Create ant-quic NodeConfig using builder
         let mut builder = NodeConfig::builder();
 
-        // Set bind address if specified
         if let Some(bind_addr) = config.bind_addr {
             builder = builder.bind_addr(bind_addr);
         }
 
-        // Add bootstrap peers
         for peer_addr in &config.bootstrap_nodes {
             builder = builder.known_peer(*peer_addr);
         }
 
-        let node_config = builder.build();
-
-        // Create ant-quic Node (this binds QUIC transport)
-        let node = Node::with_config(node_config).await.map_err(|e| {
+        let node = Node::with_config(builder.build()).await.map_err(|e| {
             NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e))
         })?;
 
-        // Get peer ID from the node before wrapping
         let peer_id = node.peer_id();
-
         let (event_sender, _event_receiver) = broadcast::channel(32);
         let (recv_tx, recv_rx) = mpsc::channel(128);
 
@@ -227,7 +219,6 @@ impl NetworkNode {
             peer_id,
         };
 
-        // Spawn receiver task for parsing gossip stream types
         network_node.spawn_receiver();
 
         Ok(network_node)
@@ -257,18 +248,16 @@ impl NetworkNode {
     ///
     /// Network statistics for this node.
     pub async fn stats(&self) -> NetworkStats {
-        let node_guard = self.node.read().await;
-        if let Some(node) = node_guard.as_ref() {
-            let status = node.status().await;
-            NetworkStats {
-                total_connections: status.direct_connections + status.relayed_connections,
-                active_connections: status.active_connections as u32,
-                bytes_sent: status.relay_bytes_forwarded, // Approximate with relay bytes
-                bytes_received: 0,                        // TODO: Track in future
-                peer_count: status.connected_peers,
-            }
-        } else {
-            NetworkStats::default()
+        let Some(node) = self.node.read().await.as_ref().cloned() else {
+            return NetworkStats::default();
+        };
+        let status = node.status().await;
+        NetworkStats {
+            total_connections: status.direct_connections + status.relayed_connections,
+            active_connections: status.active_connections as u32,
+            bytes_sent: status.relay_bytes_forwarded,
+            bytes_received: 0, // TODO: Track in future
+            peer_count: status.connected_peers,
         }
     }
 
@@ -278,13 +267,10 @@ impl NetworkNode {
     ///
     /// The number of currently connected peers.
     pub async fn connection_count(&self) -> usize {
-        let node_guard = self.node.read().await;
-        if let Some(node) = node_guard.as_ref() {
-            let status = node.status().await;
-            status.connected_peers
-        } else {
-            0
-        }
+        let Some(node) = self.node.read().await.as_ref().cloned() else {
+            return 0;
+        };
+        node.status().await.connected_peers
     }
 
     /// Subscribe to network events.
@@ -308,9 +294,6 @@ impl NetworkNode {
         let _ = self.event_sender.send(event);
     }
 
-    /// Gracefully shutdown the node.
-    ///
-    /// This closes all connections and stops the node.
     /// Connect to a peer by address.
     ///
     /// # Arguments
@@ -323,27 +306,20 @@ impl NetworkNode {
     ///
     /// # Errors
     ///
-    /// Returns `NetworkError` if connection fails.
+    /// Returns `NetworkError` if connection fails or node is not initialized.
     pub async fn connect_addr(&self, addr: SocketAddr) -> NetworkResult<AntPeerId> {
-        let node_guard = self.node.read().await;
-        if let Some(node) = node_guard.as_ref() {
-            let peer_conn = node
-                .connect_addr(addr)
-                .await
-                .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        let node = self.require_node().await?;
+        let peer_conn = node
+            .connect_addr(addr)
+            .await
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 
-            // Emit connection event with actual peer_id
-            self.emit_event(NetworkEvent::PeerConnected {
-                peer_id: peer_conn.peer_id.0,
-                address: addr,
-            });
+        self.emit_event(NetworkEvent::PeerConnected {
+            peer_id: peer_conn.peer_id.0,
+            address: addr,
+        });
 
-            Ok(peer_conn.peer_id)
-        } else {
-            Err(NetworkError::NodeCreation(
-                "Node not initialized".to_string(),
-            ))
-        }
+        Ok(peer_conn.peer_id)
     }
 
     /// Connect to a specific peer by ID.
@@ -360,34 +336,27 @@ impl NetworkNode {
     ///
     /// Returns `NetworkError` if connection fails.
     pub async fn connect_peer(&self, peer_id: AntPeerId) -> NetworkResult<SocketAddr> {
-        let node_guard = self.node.read().await;
-        if let Some(node) = node_guard.as_ref() {
-            let peer_conn = node
-                .connect(peer_id)
-                .await
-                .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        let node = self.require_node().await?;
+        let peer_conn = node
+            .connect(peer_id)
+            .await
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 
-            // Extract address from TransportAddr
-            let addr = match peer_conn.remote_addr {
-                TransportAddr::Udp(socket_addr) => socket_addr,
-                _ => {
-                    return Err(NetworkError::ConnectionFailed(
-                        "Unsupported transport type".to_string(),
-                    ))
-                }
-            };
+        let addr = match peer_conn.remote_addr {
+            TransportAddr::Udp(socket_addr) => socket_addr,
+            _ => {
+                return Err(NetworkError::ConnectionFailed(
+                    "Unsupported transport type".to_string(),
+                ))
+            }
+        };
 
-            self.emit_event(NetworkEvent::PeerConnected {
-                peer_id: peer_conn.peer_id.0,
-                address: addr,
-            });
+        self.emit_event(NetworkEvent::PeerConnected {
+            peer_id: peer_conn.peer_id.0,
+            address: addr,
+        });
 
-            Ok(addr)
-        } else {
-            Err(NetworkError::NodeCreation(
-                "Node not initialized".to_string(),
-            ))
-        }
+        Ok(addr)
     }
 
     /// Disconnect from a peer.
@@ -404,20 +373,14 @@ impl NetworkNode {
     ///
     /// Returns `NetworkError` if disconnection fails.
     pub async fn disconnect(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
-        let node_guard = self.node.read().await;
-        if let Some(node) = node_guard.as_ref() {
-            node.disconnect(peer_id)
-                .await
-                .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        let node = self.require_node().await?;
+        node.disconnect(peer_id)
+            .await
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 
-            self.emit_event(NetworkEvent::PeerDisconnected { peer_id: peer_id.0 });
+        self.emit_event(NetworkEvent::PeerDisconnected { peer_id: peer_id.0 });
 
-            Ok(())
-        } else {
-            Err(NetworkError::NodeCreation(
-                "Node not initialized".to_string(),
-            ))
-        }
+        Ok(())
     }
 
     /// Get list of connected peer IDs.
@@ -427,14 +390,14 @@ impl NetworkNode {
     /// Vector of connected peer IDs.
     pub async fn connected_peers(&self) -> Vec<AntPeerId> {
         let node_guard = self.node.read().await;
-        if let Some(node) = node_guard.as_ref() {
-            node.connected_peers()
+        match node_guard.as_ref() {
+            Some(node) => node
+                .connected_peers()
                 .await
                 .iter()
                 .map(|conn| conn.peer_id)
-                .collect()
-        } else {
-            Vec::new()
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -449,19 +412,32 @@ impl NetworkNode {
     /// True if connected to the peer.
     pub async fn is_connected(&self, peer_id: &AntPeerId) -> bool {
         let node_guard = self.node.read().await;
-        if let Some(node) = node_guard.as_ref() {
-            node.is_connected(peer_id).await
-        } else {
-            false
+        match node_guard.as_ref() {
+            Some(node) => node.is_connected(peer_id).await,
+            None => false,
         }
     }
 
+    /// Gracefully shutdown the node.
+    ///
+    /// Drops the inner node, closing all connections.
     pub async fn shutdown(&self) {
-        // Shutdown the node
         let mut node_guard = self.node.write().await;
-        if let Some(_node) = node_guard.take() {
-            // Node will be dropped and cleaned up
-        }
+        // Taking the node drops it, closing all connections
+        let _ = node_guard.take();
+    }
+
+    /// Get a clone of the inner node, returning an error if not initialized.
+    ///
+    /// This helper reduces boilerplate in methods that need exclusive
+    /// access to the node after releasing the read lock.
+    async fn require_node(&self) -> NetworkResult<Node> {
+        self.node
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| NetworkError::NodeCreation("Node not initialized".to_string()))
     }
 
     /// Get the local peer ID.
@@ -496,33 +472,25 @@ impl NetworkNode {
                     }
                 };
 
-                // Receive message from ant-quic
                 match node_ref.recv().await {
                     Ok((peer_id, data)) => {
                         if data.is_empty() {
                             continue;
                         }
 
-                        // Parse stream type from first byte
-                        let stream_type =
-                            match data.first().and_then(|&b| GossipStreamType::from_byte(b)) {
-                                Some(st) => st,
-                                None => {
-                                    if let Some(&b) = data.first() {
-                                        warn!("Unknown stream type byte: {}", b);
-                                    }
-                                    continue;
-                                }
-                            };
-
-                        // Extract payload (skip first byte)
-                        let payload = if data.len() > 1 {
-                            Bytes::copy_from_slice(&data[1..])
-                        } else {
-                            Bytes::new()
+                        // Parse stream type from first byte (safe: data is non-empty)
+                        let type_byte = data[0];
+                        let stream_type = match GossipStreamType::from_byte(type_byte) {
+                            Some(st) => st,
+                            None => {
+                                warn!("Unknown stream type byte: {}", type_byte);
+                                continue;
+                            }
                         };
 
-                        // Forward to recv channel
+                        // Extract payload (everything after the type byte)
+                        let payload = Bytes::copy_from_slice(&data[1..]);
+
                         if let Err(e) = recv_tx.send((peer_id, stream_type, payload)).await {
                             error!("Failed to forward message: {}", e);
                             break;
@@ -537,7 +505,6 @@ impl NetworkNode {
                     }
                     Err(e) => {
                         debug!("Receive error: {}", e);
-                        // Continue on errors (timeouts expected)
                     }
                 }
             }
@@ -583,11 +550,11 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             .map_err(|e| anyhow::anyhow!("dial failed: {}", e))?;
 
         // Verify we connected to the expected peer
-        warn!(
-            "SECURITY: Peer mismatch - expected {:?}, got {:?}",
-            peer, connected_peer
-        );
         if connected_peer != ant_peer {
+            warn!(
+                "SECURITY: Peer mismatch - expected {:?}, got {:?}",
+                peer, connected_peer
+            );
             return Err(anyhow::anyhow!(
                 "Connected to unexpected peer {:?} when dialing {:?}",
                 connected_peer,
@@ -607,9 +574,8 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     }
 
     async fn listen(&self, _bind: SocketAddr) -> anyhow::Result<()> {
+        // No-op: NetworkNode binds its QUIC transport during construction
         debug!("listen() no-op - NetworkNode already bound");
-        // NetworkNode is already listening (created with bind in new())
-        // This is a no-op for x0x
         Ok(())
     }
 
@@ -829,17 +795,12 @@ impl PeerCache {
             .map(|p| p.address)
             .collect();
 
-        // Add random exploration peers.
-        if explore_count > 0 && self.peers.len() > exploit_count {
-            let explore_from: Vec<_> = sorted_peers[exploit_count..].to_vec();
-
-            // Convert Vec<&CachedPeer> to slice for choose()
-            let explore_slice: Vec<CachedPeer> = explore_from.iter().map(|&p| p.clone()).collect();
-            let explore_refs: Vec<&CachedPeer> = explore_slice.iter().collect();
-
+        // Add random exploration peers from the remaining pool.
+        let explore_pool = &sorted_peers[exploit_count..];
+        if !explore_pool.is_empty() {
             let mut rng = rand::thread_rng();
             for _ in 0..explore_count {
-                if let Some(random_peer) = explore_refs.as_slice().choose(&mut rng) {
+                if let Some(random_peer) = explore_pool.choose(&mut rng) {
                     selected.push(random_peer.address);
                 }
             }

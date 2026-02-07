@@ -473,14 +473,10 @@ impl AgentBuilder {
             kp
         };
 
-        // Determine agent keypair source
-        let agent_keypair = if let Some(kp) = self.agent_keypair {
-            // Use provided keypair
-            kp
-        } else {
-            // Generate fresh keypair
-            identity::AgentKeypair::generate()?
-        };
+        // Use provided agent keypair or generate a fresh one
+        let agent_keypair = self
+            .agent_keypair
+            .map_or_else(identity::AgentKeypair::generate, Ok)?;
 
         // Combine into unified Identity
         let identity = identity::Identity::new(machine_keypair, agent_keypair);

@@ -154,31 +154,26 @@ impl BootstrapConnector {
     ///
     /// Number of successful connections.
     pub async fn connect_multiple(&self, node: &NetworkNode, addrs: &[SocketAddr]) -> usize {
-        let mut handles = Vec::new();
+        let handles: Vec<_> = addrs
+            .iter()
+            .map(|&addr| {
+                let node_clone = node.clone();
+                let config = self.config.clone();
+                tokio::spawn(async move {
+                    let connector = BootstrapConnector::with_config(config);
+                    connector
+                        .connect_with_retry(&node_clone, addr)
+                        .await
+                        .is_ok()
+                })
+            })
+            .collect();
 
-        for &addr in addrs {
-            let node_clone = node.clone();
-            let config = self.config.clone();
-            let handle = tokio::spawn(async move {
-                let connector = BootstrapConnector::with_config(config);
-                connector
-                    .connect_with_retry(&node_clone, addr)
-                    .await
-                    .is_ok()
-            });
-            handles.push(handle);
-        }
-
-        let mut success_count = 0;
-        for handle in handles {
-            if let Ok(success) = handle.await {
-                if success {
-                    success_count += 1;
-                }
-            }
-        }
-
-        success_count
+        futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .filter(|r| matches!(r, Ok(true)))
+            .count()
     }
 }
 
