@@ -237,38 +237,111 @@ impl Agent {
 
     /// Join the x0x gossip network.
     ///
-    /// This begins the gossip protocol, discovering peers and
-    /// participating in epidemic broadcast.
+    /// Connects to bootstrap peers in parallel with automatic retries.
+    /// Failed connections are retried after a delay to allow stale
+    /// connections on remote nodes to expire.
     ///
     /// If the agent was not configured with a network, this method
     /// succeeds gracefully (nothing to join).
     pub async fn join_network(&self) -> error::Result<()> {
         let Some(network) = self.network.as_ref() else {
-            // No network configured - nothing to join
             tracing::debug!("join_network called but no network configured");
             return Ok(());
         };
 
-        // Connect to bootstrap peers
-        for peer_addr in &network.config().bootstrap_nodes {
-            tracing::debug!("Connecting to bootstrap peer: {}", peer_addr);
-            match network.connect_addr(*peer_addr).await {
-                Ok(_) => {
-                    tracing::info!("Connected to bootstrap peer: {}", peer_addr);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to connect to {}: {}", peer_addr, e);
-                    // Continue with other peers - some may be temporarily unavailable
-                }
+        let bootstrap_nodes = network.config().bootstrap_nodes.clone();
+        if bootstrap_nodes.is_empty() {
+            tracing::debug!("No bootstrap peers configured");
+            return Ok(());
+        }
+
+        // Round 1: Connect to all bootstrap peers in parallel
+        let mut failed = self.connect_peers_parallel(network, &bootstrap_nodes).await;
+        let connected = bootstrap_nodes.len() - failed.len();
+        tracing::info!(
+            "Bootstrap round 1: {}/{} peers connected",
+            connected,
+            bootstrap_nodes.len()
+        );
+
+        // Retry rounds for failed peers
+        for round in 2..=3 {
+            if failed.is_empty() {
+                break;
             }
+            // Wait for stale connections on remote nodes to expire
+            let delay = std::time::Duration::from_secs(if round == 2 { 10 } else { 15 });
+            tracing::info!(
+                "Retrying {} failed peers in {}s (round {})",
+                failed.len(),
+                delay.as_secs(),
+                round
+            );
+            tokio::time::sleep(delay).await;
+
+            failed = self.connect_peers_parallel(network, &failed).await;
+            let total_connected = bootstrap_nodes.len() - failed.len();
+            tracing::info!(
+                "Bootstrap round {}: {}/{} peers connected",
+                round,
+                total_connected,
+                bootstrap_nodes.len()
+            );
+        }
+
+        if !failed.is_empty() {
+            tracing::warn!(
+                "Could not connect to {} bootstrap peers: {:?}",
+                failed.len(),
+                failed
+            );
         }
 
         tracing::info!(
-            "Network join complete. Attempted {} bootstrap peers.",
-            network.config().bootstrap_nodes.len()
+            "Network join complete. Connected to {}/{} bootstrap peers.",
+            bootstrap_nodes.len() - failed.len(),
+            bootstrap_nodes.len()
         );
 
         Ok(())
+    }
+
+    /// Connect to multiple peers in parallel, returning the list of failed addresses.
+    async fn connect_peers_parallel(
+        &self,
+        network: &std::sync::Arc<network::NetworkNode>,
+        addrs: &[std::net::SocketAddr],
+    ) -> Vec<std::net::SocketAddr> {
+        let handles: Vec<_> = addrs
+            .iter()
+            .map(|addr| {
+                let net = network.clone();
+                let addr = *addr;
+                tokio::spawn(async move {
+                    tracing::debug!("Connecting to bootstrap peer: {}", addr);
+                    match net.connect_addr(addr).await {
+                        Ok(_) => {
+                            tracing::info!("Connected to bootstrap peer: {}", addr);
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to connect to {}: {}", addr, e);
+                            Some(addr)
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let mut failed = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(Some(addr)) => failed.push(addr),
+                Ok(None) => {}
+                Err(e) => tracing::error!("Connection task panicked: {}", e),
+            }
+        }
+        failed
     }
 
     /// Subscribe to messages on a given topic.

@@ -181,6 +181,12 @@ async fn main() -> Result<()> {
         agent.network().cloned(),
     ));
 
+    // Start background reconnect task for bootstrap mesh maintenance
+    let reconnect_handle = tokio::spawn(maintain_bootstrap_mesh(
+        agent.network().cloned(),
+        config.known_peers.clone(),
+    ));
+
     // Wait for shutdown signal
     tracing::info!("Bootstrap node running. Press Ctrl+C to stop.");
     match signal::ctrl_c().await {
@@ -194,9 +200,59 @@ async fn main() -> Result<()> {
 
     // Graceful shutdown
     health_handle.abort();
+    reconnect_handle.abort();
     tracing::info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Background task that periodically reconnects to missing bootstrap peers.
+///
+/// Bootstrap nodes should maintain a full mesh with all other bootstrap nodes.
+/// This task runs every 60 seconds, checks which peers are missing, and
+/// attempts to reconnect to them.
+async fn maintain_bootstrap_mesh(
+    network: Option<std::sync::Arc<x0x::network::NetworkNode>>,
+    known_peers: Vec<SocketAddr>,
+) -> Result<()> {
+    let Some(network) = network else {
+        return Ok(());
+    };
+
+    let expected = known_peers.len();
+    // Initial delay: let join_network() finish first
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+    loop {
+        let connected = network.connection_count().await;
+        if connected < expected {
+            tracing::info!(
+                "Mesh incomplete: {}/{} peers connected, reconnecting...",
+                connected,
+                expected
+            );
+
+            for peer_addr in &known_peers {
+                match network.connect_addr(*peer_addr).await {
+                    Ok(_) => {
+                        tracing::info!("Reconnected to bootstrap peer: {}", peer_addr);
+                    }
+                    Err(e) => {
+                        tracing::debug!("Reconnect to {} failed: {}", peer_addr, e);
+                    }
+                }
+            }
+
+            let new_count = network.connection_count().await;
+            tracing::info!(
+                "Reconnect cycle complete: {}/{} peers connected",
+                new_count,
+                expected
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
 }
 
 /// Load configuration from TOML file
