@@ -1,9 +1,8 @@
 name: Sign SKILL.md
 
+# Manual-only: GPG signing on release is handled by release.yml.
+# Use this for ad-hoc SKILL.md signing outside of releases.
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
 
 jobs:
@@ -11,12 +10,12 @@ jobs:
     name: GPG Sign SKILL.md
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      
+      contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        
+
       - name: Import GPG key
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
@@ -28,20 +27,19 @@ jobs:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           gpg --batch --pinentry-mode loopback --passphrase-fd 0 --detach-sign --armor --output SKILL.md.sig SKILL.md <<< "$GPG_PASSPHRASE"
-          
+
       - name: Verify signature
         run: |
           gpg --verify SKILL.md.sig SKILL.md
-          
+
       - name: Export public key
         run: |
-          # Export public key using email identifier (key ID)
           gpg --armor --export david@saorsalabs.com > SAORSA_PUBLIC_KEY.asc
           if [ ! -s SAORSA_PUBLIC_KEY.asc ]; then
             echo "Error: Failed to export public key"
             exit 1
           fi
-          
+
       - name: Upload signature artifact
         uses: actions/upload-artifact@v4
         with:
@@ -49,31 +47,3 @@ jobs:
           path: |
             SKILL.md.sig
             SAORSA_PUBLIC_KEY.asc
-            
-      - name: Create Release (if tag)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            SKILL.md
-            SKILL.md.sig
-            SAORSA_PUBLIC_KEY.asc
-          body: |
-            ## GPG-Signed SKILL.md
-            
-            This release includes the GPG-signed SKILL.md file for x0x.
-            
-            ### Verification
-            
-            ```bash
-            # Import Saorsa Labs public key
-            gpg --import SAORSA_PUBLIC_KEY.asc
-            
-            # Verify signature
-            gpg --verify SKILL.md.sig SKILL.md
-            ```
-            
-            Expected output:
-            ```
-            gpg: Good signature from "Saorsa Labs <david@saorsalabs.com>"
-            ```

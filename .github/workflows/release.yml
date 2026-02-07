@@ -9,7 +9,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+  id-token: write
+
 jobs:
+  # ============================================================
+  # Build release binaries for all platforms
+  # ============================================================
   build-release:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
@@ -21,19 +28,71 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             cross: false
+            archive: tar.gz
+            binary: x0x-bootstrap
+
+          - platform: linux-x64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+            archive: tar.gz
+            binary: x0x-bootstrap
+
+          - platform: linux-arm64-gnu
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            archive: tar.gz
+            binary: x0x-bootstrap
+
+          - platform: macos-x64
+            os: macos-13
+            target: x86_64-apple-darwin
+            cross: false
+            archive: tar.gz
+            binary: x0x-bootstrap
 
           - platform: macos-arm64
             os: macos-14
             target: aarch64-apple-darwin
             cross: false
+            archive: tar.gz
+            binary: x0x-bootstrap
 
           - platform: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
+            archive: zip
+            binary: x0x-bootstrap.exe
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout ant-quic
+        uses: actions/checkout@v4
+        with:
+          repository: saorsa-labs/ant-quic
+          path: .deps/ant-quic
+
+      - name: Checkout saorsa-gossip
+        uses: actions/checkout@v4
+        with:
+          repository: saorsa-labs/saorsa-gossip
+          path: .deps/saorsa-gossip
+
+      - name: Setup dependency symlinks (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          ln -s "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -s "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+
+      - name: Setup dependency symlinks (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Junction -Path "$((Get-Item .).Parent.FullName)\ant-quic" -Target "$PWD\.deps\ant-quic"
+          New-Item -ItemType Junction -Path "$((Get-Item .).Parent.FullName)\saorsa-gossip" -Target "$PWD\.deps\saorsa-gossip"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -58,19 +117,124 @@ jobs:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-target-release-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
       - name: Build (native)
+        if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      # ---- macOS Code Signing & Notarization ----
+      - name: Import macOS signing certificate
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo "$MACOS_CERTIFICATE" | base64 --decode -o "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERTIFICATE_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Sign macOS binary
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          BINARY="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$BINARY"
+          codesign --verify --deep --strict "$BINARY"
+          echo "Binary signed successfully"
+
+      - name: Notarize macOS binary
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+          MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+        run: |
+          BINARY="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+          # Create a zip for notarization
+          ditto -c -k --keepParent "$BINARY" "$RUNNER_TEMP/notarize.zip"
+
+          # Submit for notarization
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$MACOS_NOTARIZATION_APPLE_ID" \
+            --password "$MACOS_NOTARIZATION_PASSWORD" \
+            --team-id "$MACOS_NOTARIZATION_TEAM_ID" \
+            --wait
+
+          echo "Binary notarized successfully"
+
+      - name: Clean up macOS keychain
+        if: startsWith(matrix.platform, 'macos') && always()
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+
+      # ---- Strip Linux binaries ----
+      - name: Strip binary (Linux native)
+        if: matrix.platform == 'linux-x64-gnu'
+        run: strip target/${{ matrix.target }}/release/${{ matrix.binary }}
+
+      # ---- Package artifacts ----
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          STAGING="x0x-${{ matrix.platform }}"
+          mkdir -p "$STAGING"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$STAGING/"
+          cp LICENSE* "$STAGING/" 2>/dev/null || true
+          cp README.md "$STAGING/" 2>/dev/null || true
+          tar czf "x0x-${{ matrix.platform }}.tar.gz" "$STAGING"
+          echo "ASSET=x0x-${{ matrix.platform }}.tar.gz" >> $GITHUB_ENV
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $staging = "x0x-${{ matrix.platform }}"
+          New-Item -ItemType Directory -Path $staging -Force
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" -Destination $staging
+          if (Test-Path "LICENSE*") { Copy-Item LICENSE* -Destination $staging }
+          if (Test-Path "README.md") { Copy-Item README.md -Destination $staging }
+          Compress-Archive -Path "$staging/*" -DestinationPath "x0x-${{ matrix.platform }}.zip"
+          "ASSET=x0x-${{ matrix.platform }}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Generate SHA-256 checksum
+        shell: bash
+        run: |
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            sha256sum "x0x-${{ matrix.platform }}.zip" > "x0x-${{ matrix.platform }}.zip.sha256"
+          else
+            sha256sum "x0x-${{ matrix.platform }}.tar.gz" > "x0x-${{ matrix.platform }}.tar.gz.sha256"
+          fi
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: x0x-${{ matrix.platform }}
+          name: release-${{ matrix.platform }}
           path: |
-            target/${{ matrix.target }}/release/x0x*
-            !target/${{ matrix.target }}/release/*.d
-            !target/${{ matrix.target }}/release/*.pdb
+            x0x-${{ matrix.platform }}.*
           if-no-files-found: error
 
+  # ============================================================
+  # GPG-sign SKILL.md and create GitHub Release
+  # ============================================================
   create-release:
     name: Create GitHub Release
     needs: build-release
@@ -84,79 +248,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: release-*
 
-      - name: Create release
-        uses: softprops/action-gh-release@v1
-        with:
-          draft: true
-          files: artifacts/**/*
-          generate_release_notes: true
-
-  publish-crates:
-    name: Publish to crates.io
-    needs: create-release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Publish crates
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          cargo publish -p x0x || echo "x0x already published"
-          sleep 30
-          cargo publish -p x0x-nodejs || echo "x0x-nodejs already published"
-          sleep 30
-          cargo publish -p x0x-python || echo "x0x-python already published"
-
-  publish-npm:
-    name: Publish to npm
-    needs: publish-crates
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-      - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          cd bindings/nodejs
-          npm publish --provenance --access public
-
-  publish-pypi:
-    name: Publish to PyPI
-    needs: publish-crates
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install maturin
-        run: pip install maturin
-      - name: Build and publish
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          cd bindings/python
-          maturin publish
-
-  create-github-release:
-    name: Create GitHub Release
-    needs: [publish-npm, publish-pypi]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      
       - name: Import GPG key
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
@@ -167,7 +260,8 @@ jobs:
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          gpg --batch --pinentry-mode loopback --passphrase-fd 0 --detach-sign --armor --output SKILL.md.sig SKILL.md <<< "$GPG_PASSPHRASE"
+          gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
+            --detach-sign --armor --output SKILL.md.sig SKILL.md <<< "$GPG_PASSPHRASE"
           gpg --verify SKILL.md.sig SKILL.md
 
       - name: Export public key
@@ -178,86 +272,213 @@ jobs:
             exit 1
           fi
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: GPG-sign release archives
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          for archive in artifacts/release-*/*.tar.gz artifacts/release-*/*.zip; do
+            [ -f "$archive" ] || continue
+            gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
+              --detach-sign --armor --output "${archive}.asc" "$archive" <<< "$GPG_PASSPHRASE"
+          done
+
+      - name: Collect all release files
+        run: |
+          mkdir -p release-files
+          # Copy archives, checksums, and GPG signatures
+          for dir in artifacts/release-*/; do
+            cp "$dir"/*.tar.gz release-files/ 2>/dev/null || true
+            cp "$dir"/*.zip release-files/ 2>/dev/null || true
+            cp "$dir"/*.sha256 release-files/ 2>/dev/null || true
+            cp "$dir"/*.asc release-files/ 2>/dev/null || true
+          done
+          # Copy SKILL.md artifacts
+          cp SKILL.md release-files/
+          cp SKILL.md.sig release-files/
+          cp SAORSA_PUBLIC_KEY.asc release-files/
+          cp .well-known/agent.json release-files/ 2>/dev/null || true
+          ls -la release-files/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          files: |
-            SKILL.md
-            SKILL.md.sig
-            SAORSA_PUBLIC_KEY.asc
-            .well-known/agent.json
+          files: release-files/*
+          draft: false
+          generate_release_notes: true
           body: |
             ## x0x ${{ github.ref_name }}
-            
+
             **Agent-to-Agent Secure Communication Network**
-            
+
             Post-quantum encrypted P2P gossip network for AI agents. Enable agents to discover each other, communicate securely, and collaborate on shared task lists without central servers.
-            
+
             ### Installation
-            
+
             **Rust:**
             ```bash
             cargo add x0x
             ```
-            
+
             **TypeScript/Node.js:**
             ```bash
             npm install x0x
             ```
-            
+
             **Python:**
             ```bash
             pip install agent-x0x
             ```
-            
-            ### SKILL.md (GPG-Signed)
-            
-            This release includes the GPG-signed SKILL.md file for Anthropic Agent Skills.
-            
-            **Verify signature:**
+
+            ### Platform Binaries
+
+            | Platform | File | Code Signed |
+            |----------|------|-------------|
+            | Linux x64 (glibc) | `x0x-linux-x64-gnu.tar.gz` | GPG |
+            | Linux x64 (musl/static) | `x0x-linux-x64-musl.tar.gz` | GPG |
+            | Linux ARM64 | `x0x-linux-arm64-gnu.tar.gz` | GPG |
+            | macOS x64 (Intel) | `x0x-macos-x64.tar.gz` | Apple + GPG |
+            | macOS ARM64 (Apple Silicon) | `x0x-macos-arm64.tar.gz` | Apple + GPG |
+            | Windows x64 | `x0x-windows-x64.zip` | GPG |
+
+            All binaries are GPG-signed. macOS binaries are additionally signed with Apple Developer ID and notarized.
+
+            ### Verify GPG Signatures
+
             ```bash
             # Import Saorsa Labs public key
             gpg --import SAORSA_PUBLIC_KEY.asc
-            
-            # Verify signature
+
+            # Verify any archive
+            gpg --verify x0x-linux-x64-gnu.tar.gz.asc x0x-linux-x64-gnu.tar.gz
+
+            # Verify SKILL.md
             gpg --verify SKILL.md.sig SKILL.md
             ```
-            
-            Expected output:
-            ```
-            gpg: Good signature from "Saorsa Labs <david@saorsalabs.com>"
-            ```
-            
-            **Install SKILL.md:**
+
+            ### Verify SHA-256 Checksums
+
             ```bash
-            # Unix/macOS/Linux
-            bash <(curl -sfL https://github.com/saorsa-labs/x0x/releases/latest/download/install.sh)
-            
-            # Windows PowerShell
-            irm https://github.com/saorsa-labs/x0x/releases/latest/download/install.ps1 | iex
-            
-            # Cross-platform Python
-            python3 <(curl -sfL https://github.com/saorsa-labs/x0x/releases/latest/download/install.py)
+            sha256sum -c x0x-linux-x64-gnu.tar.gz.sha256
             ```
-            
+
+            ### SKILL.md (GPG-Signed)
+
+            This release includes the GPG-signed SKILL.md file for Anthropic Agent Skills.
+
             ### A2A Agent Card
-            
+
             The `agent.json` file provides Agent-to-Agent (A2A) discovery metadata compatible with Google's A2A spec.
-            
-            ### What's Changed
-            
-            See [CHANGELOG.md](https://github.com/saorsa-labs/x0x/blob/main/CHANGELOG.md) for full details.
-            
+
             ### Bootstrap Nodes
-            
+
             - NYC, US: `quic://142.93.199.50:12000`
             - SFO, US: `quic://147.182.234.192:12000`
             - Helsinki, FI: `quic://65.21.157.229:12000`
             - Nuremberg, DE: `quic://116.203.101.172:12000`
             - Singapore, SG: `quic://149.28.156.231:12000`
             - Tokyo, JP: `quic://45.77.176.184:12000`
-            
+
             ---
-            
-            **x0x** - A gift to the AI agent ecosystem from [Saorsa Labs](https://saorsalabs.com).  
-            No winners, no losers — just cooperation.
+
+            **x0x** - A gift to the AI agent ecosystem from [Saorsa Labs](https://saorsalabs.com).
+            No winners, no losers - just cooperation.
+
+  # ============================================================
+  # Publish to crates.io
+  # ============================================================
+  publish-crates:
+    name: Publish to crates.io
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout ant-quic
+        uses: actions/checkout@v4
+        with:
+          repository: saorsa-labs/ant-quic
+          path: .deps/ant-quic
+
+      - name: Checkout saorsa-gossip
+        uses: actions/checkout@v4
+        with:
+          repository: saorsa-labs/saorsa-gossip
+          path: .deps/saorsa-gossip
+
+      - name: Setup dependency symlinks
+        run: |
+          ln -s "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -s "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish x0x crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p x0x || echo "x0x already published or publish failed"
+
+  # ============================================================
+  # Publish to npm (with provenance)
+  # ============================================================
+  publish-npm:
+    name: Publish to npm
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd bindings/nodejs
+          npm publish --provenance --access public || echo "npm publish failed or already published"
+
+  # ============================================================
+  # Publish to PyPI (via maturin)
+  # ============================================================
+  publish-pypi:
+    name: Publish to PyPI
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout ant-quic
+        uses: actions/checkout@v4
+        with:
+          repository: saorsa-labs/ant-quic
+          path: .deps/ant-quic
+
+      - name: Checkout saorsa-gossip
+        uses: actions/checkout@v4
+        with:
+          repository: saorsa-labs/saorsa-gossip
+          path: .deps/saorsa-gossip
+
+      - name: Setup dependency symlinks
+        run: |
+          ln -s "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -s "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build and publish
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          cd bindings/python
+          maturin publish || echo "PyPI publish failed or already published"

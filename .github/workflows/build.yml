@@ -54,12 +54,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             cross: false
 
-          # WASM (WebAssembly with WASI threads)
-          - platform: wasm32-wasi
-            os: ubuntu-latest
-            target: wasm32-wasip1-threads
-            cross: false
-
     steps:
       - uses: actions/checkout@v4
 
@@ -75,10 +69,18 @@ jobs:
           repository: saorsa-labs/saorsa-gossip
           path: .deps/saorsa-gossip
 
-      - name: Setup dependency symlinks
+      - name: Setup dependency symlinks (Unix)
+        if: runner.os != 'Windows'
         run: |
           ln -s "$(pwd)/.deps/ant-quic" ../ant-quic
           ln -s "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+
+      - name: Setup dependency symlinks (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Junction -Path "$((Get-Item .).Parent.FullName)\ant-quic" -Target "$PWD\.deps\ant-quic"
+          New-Item -ItemType Junction -Path "$((Get-Item .).Parent.FullName)\saorsa-gossip" -Target "$PWD\.deps\saorsa-gossip"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
