@@ -23,14 +23,22 @@
 //! - `45.77.176.184:12000` - Tokyo, JP
 
 use crate::error::{NetworkError, NetworkResult};
-use ant_quic::{Node, NodeConfig, PeerId, TransportAddr};
+use ant_quic::{Node, NodeConfig, TransportAddr};
+use bytes::Bytes;
 use rand::seq::SliceRandom;
+use saorsa_gossip_transport::GossipStreamType;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
+use tracing::{debug, error, warn};
+
+/// Ant-quic PeerId type alias
+type AntPeerId = ant_quic::PeerId;
+/// Saorsa gossip PeerId type alias
+type GossipPeerId = saorsa_gossip_types::PeerId;
 
 /// Default port for x0x nodes (when specified).
 pub const DEFAULT_PORT: u16 = 12000;
@@ -161,6 +169,12 @@ pub struct NetworkNode {
     config: NetworkConfig,
     /// Sender for broadcasting network events.
     event_sender: broadcast::Sender<NetworkEvent>,
+    /// Receiver channel for gossip messages (with stream type parsing).
+    /// Used by GossipTransport::receive_message().
+    recv_tx: mpsc::Sender<(AntPeerId, GossipStreamType, Bytes)>,
+    recv_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, GossipStreamType, Bytes)>>>,
+    /// Cached local peer ID (ant-quic PeerId).
+    peer_id: AntPeerId,
 }
 
 impl NetworkNode {
@@ -198,13 +212,25 @@ impl NetworkNode {
             NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e))
         })?;
 
-        let (event_sender, _event_receiver) = broadcast::channel(32);
+        // Get peer ID from the node before wrapping
+        let peer_id = node.peer_id();
 
-        Ok(Self {
+        let (event_sender, _event_receiver) = broadcast::channel(32);
+        let (recv_tx, recv_rx) = mpsc::channel(128);
+
+        let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
             config,
             event_sender,
-        })
+            recv_tx,
+            recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
+            peer_id,
+        };
+
+        // Spawn receiver task for parsing gossip stream types
+        network_node.spawn_receiver();
+
+        Ok(network_node)
     }
 
     /// Get the configuration for this node.
@@ -298,7 +324,7 @@ impl NetworkNode {
     /// # Errors
     ///
     /// Returns `NetworkError` if connection fails.
-    pub async fn connect_addr(&self, addr: SocketAddr) -> NetworkResult<PeerId> {
+    pub async fn connect_addr(&self, addr: SocketAddr) -> NetworkResult<AntPeerId> {
         let node_guard = self.node.read().await;
         if let Some(node) = node_guard.as_ref() {
             let peer_conn = node
@@ -333,7 +359,7 @@ impl NetworkNode {
     /// # Errors
     ///
     /// Returns `NetworkError` if connection fails.
-    pub async fn connect_peer(&self, peer_id: PeerId) -> NetworkResult<SocketAddr> {
+    pub async fn connect_peer(&self, peer_id: AntPeerId) -> NetworkResult<SocketAddr> {
         let node_guard = self.node.read().await;
         if let Some(node) = node_guard.as_ref() {
             let peer_conn = node
@@ -377,7 +403,7 @@ impl NetworkNode {
     /// # Errors
     ///
     /// Returns `NetworkError` if disconnection fails.
-    pub async fn disconnect(&self, peer_id: &PeerId) -> NetworkResult<()> {
+    pub async fn disconnect(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
         let node_guard = self.node.read().await;
         if let Some(node) = node_guard.as_ref() {
             node.disconnect(peer_id)
@@ -399,7 +425,7 @@ impl NetworkNode {
     /// # Returns
     ///
     /// Vector of connected peer IDs.
-    pub async fn connected_peers(&self) -> Vec<PeerId> {
+    pub async fn connected_peers(&self) -> Vec<AntPeerId> {
         let node_guard = self.node.read().await;
         if let Some(node) = node_guard.as_ref() {
             node.connected_peers()
@@ -421,7 +447,7 @@ impl NetworkNode {
     /// # Returns
     ///
     /// True if connected to the peer.
-    pub async fn is_connected(&self, peer_id: &PeerId) -> bool {
+    pub async fn is_connected(&self, peer_id: &AntPeerId) -> bool {
         let node_guard = self.node.read().await;
         if let Some(node) = node_guard.as_ref() {
             node.is_connected(peer_id).await
@@ -431,7 +457,216 @@ impl NetworkNode {
     }
 
     pub async fn shutdown(&self) {
-        // Placeholder for node shutdown
+        // Shutdown the node
+        let mut node_guard = self.node.write().await;
+        if let Some(_node) = node_guard.take() {
+            // Node will be dropped and cleaned up
+        }
+    }
+
+    /// Get the local peer ID.
+    ///
+    /// # Returns
+    ///
+    /// The PeerId for this node.
+    pub fn peer_id(&self) -> AntPeerId {
+        self.peer_id
+    }
+
+    /// Spawn background receiver task that parses gossip stream types.
+    ///
+    /// This task continuously receives messages from ant-quic, parses the
+    /// stream type from the first byte, and forwards parsed messages to
+    /// the internal channel for GossipTransport::receive_message().
+    fn spawn_receiver(&self) {
+        let node = Arc::clone(&self.node);
+        let recv_tx = self.recv_tx.clone();
+
+        tokio::spawn(async move {
+            debug!("NetworkNode receiver task started");
+
+            loop {
+                // Get node read lock
+                let node_guard = node.read().await;
+                let node_ref = match node_guard.as_ref() {
+                    Some(n) => n,
+                    None => {
+                        debug!("Node not initialized, receiver stopping");
+                        break;
+                    }
+                };
+
+                // Receive message from ant-quic
+                match node_ref.recv().await {
+                    Ok((peer_id, data)) => {
+                        if data.is_empty() {
+                            continue;
+                        }
+
+                        // Parse stream type from first byte
+                        let stream_type =
+                            match data.first().and_then(|&b| GossipStreamType::from_byte(b)) {
+                                Some(st) => st,
+                                None => {
+                                    if let Some(&b) = data.first() {
+                                        warn!("Unknown stream type byte: {}", b);
+                                    }
+                                    continue;
+                                }
+                            };
+
+                        // Extract payload (skip first byte)
+                        let payload = if data.len() > 1 {
+                            Bytes::copy_from_slice(&data[1..])
+                        } else {
+                            Bytes::new()
+                        };
+
+                        // Forward to recv channel
+                        if let Err(e) = recv_tx.send((peer_id, stream_type, payload)).await {
+                            error!("Failed to forward message: {}", e);
+                            break;
+                        }
+
+                        debug!(
+                            "Forwarded {} bytes ({:?}) from peer {:?}",
+                            data.len() - 1,
+                            stream_type,
+                            peer_id
+                        );
+                    }
+                    Err(e) => {
+                        debug!("Receive error: {}", e);
+                        // Continue on errors (timeouts expected)
+                    }
+                }
+            }
+
+            debug!("NetworkNode receiver task stopped");
+        });
+    }
+}
+
+// ============================================================================
+// PeerId Conversion Helpers
+// ============================================================================
+
+/// Convert ant-quic PeerId to saorsa-gossip PeerId
+fn ant_to_gossip_peer_id(ant_id: &AntPeerId) -> GossipPeerId {
+    GossipPeerId::new(ant_id.0)
+}
+
+/// Convert saorsa-gossip PeerId to ant-quic PeerId
+fn gossip_to_ant_peer_id(gossip_id: &GossipPeerId) -> AntPeerId {
+    ant_quic::PeerId(gossip_id.to_bytes())
+}
+
+// ============================================================================
+// GossipTransport Implementation
+// ============================================================================
+
+#[async_trait::async_trait]
+impl saorsa_gossip_transport::GossipTransport for NetworkNode {
+    async fn dial(&self, peer: GossipPeerId, addr: SocketAddr) -> anyhow::Result<()> {
+        let ant_peer = gossip_to_ant_peer_id(&peer);
+
+        // Check if already connected
+        if self.is_connected(&ant_peer).await {
+            debug!("Already connected to peer {:?} at {}", peer, addr);
+            return Ok(());
+        }
+
+        // Connect by address
+        let connected_peer = self
+            .connect_addr(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("dial failed: {}", e))?;
+
+        // Verify we connected to the expected peer
+        if connected_peer != ant_peer {
+            return Err(anyhow::anyhow!(
+                "Connected to unexpected peer {:?} when dialing {:?}",
+                connected_peer,
+                peer
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn dial_bootstrap(&self, addr: SocketAddr) -> anyhow::Result<GossipPeerId> {
+        let ant_peer_id = self
+            .connect_addr(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("bootstrap dial failed: {}", e))?;
+        Ok(ant_to_gossip_peer_id(&ant_peer_id))
+    }
+
+    async fn listen(&self, _bind: SocketAddr) -> anyhow::Result<()> {
+        // NetworkNode is already listening (created with bind in new())
+        // This is a no-op for x0x
+        Ok(())
+    }
+
+    async fn close(&self) -> anyhow::Result<()> {
+        self.shutdown().await;
+        Ok(())
+    }
+
+    async fn send_to_peer(
+        &self,
+        peer: GossipPeerId,
+        stream_type: saorsa_gossip_transport::GossipStreamType,
+        data: bytes::Bytes,
+    ) -> anyhow::Result<()> {
+        let ant_peer = gossip_to_ant_peer_id(&peer);
+
+        // Check if connected
+        if !self.is_connected(&ant_peer).await {
+            return Err(anyhow::anyhow!("Peer {:?} not connected", peer));
+        }
+
+        // Prepare message: [stream_type_byte | data]
+        let mut buf = Vec::with_capacity(1 + data.len());
+        buf.push(stream_type.to_byte());
+        buf.extend_from_slice(&data);
+
+        // Send via ant-quic Node
+        let node_guard = self.node.read().await;
+        let node = node_guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+
+        node.send(&ant_peer, &buf)
+            .await
+            .map_err(|e| anyhow::anyhow!("send failed: {}", e))?;
+
+        debug!(
+            "Sent {} bytes ({:?}) to peer {:?}",
+            buf.len(),
+            stream_type,
+            peer
+        );
+
+        Ok(())
+    }
+
+    async fn receive_message(
+        &self,
+    ) -> anyhow::Result<(GossipPeerId, saorsa_gossip_transport::GossipStreamType, bytes::Bytes)>
+    {
+        let mut recv_rx = self.recv_rx.lock().await;
+
+        let (ant_peer, stream_type, data) = recv_rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Receive channel closed"))?;
+
+        Ok((ant_to_gossip_peer_id(&ant_peer), stream_type, data))
+    }
+
+    fn local_peer_id(&self) -> GossipPeerId {
+        ant_to_gossip_peer_id(&self.peer_id())
     }
 }
 
@@ -663,6 +898,35 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use saorsa_gossip_transport::GossipTransport;
+
+    #[tokio::test]
+    async fn test_gossip_transport_trait() {
+        let config = NetworkConfig::default();
+        let node = NetworkNode::new(config).await.unwrap();
+
+        // Test local_peer_id() method
+        let peer_id = node.local_peer_id();
+        assert_eq!(peer_id.to_bytes().len(), 32);
+
+        // Test close() method
+        assert!(node.close().await.is_ok());
+    }
+
+    #[test]
+    fn test_peer_id_conversion() {
+        // Create a test peer ID
+        let bytes = [42u8; 32];
+        let ant_peer = ant_quic::PeerId(bytes);
+        let gossip_peer = ant_to_gossip_peer_id(&ant_peer);
+
+        // Convert back
+        let ant_peer_2 = gossip_to_ant_peer_id(&gossip_peer);
+
+        // Should be identical
+        assert_eq!(ant_peer, ant_peer_2);
+        assert_eq!(gossip_peer.to_bytes(), bytes);
+    }
 
     #[test]
     fn test_network_config_defaults() {
