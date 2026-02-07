@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
     // Start health server
     let health_handle = tokio::spawn(run_health_server(
         config.health_address,
-        agent.network().as_ref().map(|arc| std::sync::Arc::clone(arc)),
+        agent.network().cloned(),
     ));
 
     // Wait for shutdown signal

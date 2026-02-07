@@ -7,6 +7,7 @@
 use crate::network::NetworkNode;
 use crate::error::NetworkResult;
 use bytes::Bytes;
+use futures::future;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::PeerId;
 use std::collections::HashMap;
@@ -27,11 +28,17 @@ pub struct PubSubMessage {
 /// A subscription receives messages published to its topic through
 /// a channel receiver. The subscription can be canceled by dropping
 /// the receiver.
+///
+/// When dropped, the subscription automatically cleans up dead senders
+/// from the PubSubManager's subscription list, preventing memory leaks
+/// and performance degradation from accumulating disconnected channels.
 pub struct Subscription {
     /// The topic this subscription is for.
     topic: String,
     /// Channel receiver for messages on this topic.
     receiver: mpsc::Receiver<PubSubMessage>,
+    /// Reference to subscriptions map for cleanup on drop.
+    subscriptions: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubMessage>>>>>,
 }
 
 impl Subscription {
@@ -48,6 +55,30 @@ impl Subscription {
     /// The next message, or `None` if the subscription has been canceled.
     pub async fn recv(&mut self) -> Option<PubSubMessage> {
         self.receiver.recv().await
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let topic = self.topic.clone();
+        let subscriptions = self.subscriptions.clone();
+
+        // Spawn a task to clean up dead senders from this topic
+        // This avoids blocking on synchronous locks in drop
+        tokio::spawn(async move {
+            // Do cleanup on the topic's senders
+            let mut subs_map = subscriptions.write().await;
+            if let Some(senders) = subs_map.get_mut(&topic) {
+                // Remove all disconnected senders (where is_closed() returns true)
+                senders.retain(|sender| !sender.is_closed());
+
+                // If no senders remain, remove the topic entirely
+                if senders.is_empty() {
+                    drop(subs_map);
+                    subscriptions.write().await.remove(&topic);
+                }
+            }
+        });
     }
 }
 
