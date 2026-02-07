@@ -126,19 +126,6 @@ pub struct Message {
     pub topic: String,
 }
 
-/// A receiver for subscribed messages.
-pub struct Subscription {
-    _private: (),
-}
-
-impl Subscription {
-    /// Receive the next message, or `None` if the subscription is closed.
-    pub async fn recv(&mut self) -> Option<Message> {
-        // Placeholder — will be backed by saorsa-gossip pubsub
-        None
-    }
-}
-
 /// Builder for configuring an [`Agent`] before connecting to the network.
 ///
 /// The builder allows customization of the agent's identity:
@@ -292,8 +279,16 @@ impl Agent {
     ///
     /// Returns a [`Subscription`] that yields messages as they arrive
     /// through the gossip network.
+    ///
+    /// # Note
+    ///
+    /// This is currently a placeholder. Use [`gossip::PubSubManager`] directly
+    /// for the full implementation. Will be fully implemented in Task 3.
     pub async fn subscribe(&self, _topic: &str) -> error::Result<Subscription> {
-        Ok(Subscription { _private: () })
+        // Placeholder - will be implemented in Task 3 when Agent has GossipRuntime with PubSubManager
+        Err(error::IdentityError::Storage(std::io::Error::other(
+            "Agent.subscribe() not yet implemented - use gossip::PubSubManager directly",
+        )))
     }
 
     /// Publish a message to a topic.
@@ -642,6 +637,7 @@ mod tests {
     #[tokio::test]
     async fn agent_subscribes() {
         let agent = Agent::new().await.unwrap();
-        assert!(agent.subscribe("test-topic").await.is_ok());
+        // Currently returns error - will be implemented in Task 3
+        assert!(agent.subscribe("test-topic").await.is_err());
     }
 }
