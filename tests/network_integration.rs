@@ -57,7 +57,12 @@ async fn test_agent_subscribe() {
 /// Test agent publish functionality.
 #[tokio::test]
 async fn test_agent_publish() {
-    let agent = Agent::new().await.expect("Failed to create agent");
+    // Agent needs network to use pub/sub
+    let agent = Agent::builder()
+        .with_network_config(x0x::network::NetworkConfig::default())
+        .build()
+        .await
+        .expect("Failed to create agent");
 
     let result = agent.publish("test-topic", b"hello world".to_vec()).await;
     assert!(result.is_ok());
@@ -66,7 +71,12 @@ async fn test_agent_publish() {
 /// Test agent identity stability across operations.
 #[tokio::test]
 async fn test_identity_stability() {
-    let agent = Agent::new().await.expect("Failed to create agent");
+    // Agent needs network for subscribe/publish operations
+    let agent = Agent::builder()
+        .with_network_config(x0x::network::NetworkConfig::default())
+        .build()
+        .await
+        .expect("Failed to create agent");
 
     let machine_id = agent.machine_id();
     let agent_id = agent.agent_id();

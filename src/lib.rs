@@ -112,7 +112,9 @@ pub struct Agent {
     identity: identity::Identity,
     /// The network node for P2P communication.
     #[allow(dead_code)]
-    network: Option<network::NetworkNode>,
+    network: Option<std::sync::Arc<network::NetworkNode>>,
+    /// The gossip runtime for pub/sub messaging.
+    gossip_runtime: Option<std::sync::Arc<gossip::GossipRuntime>>,
 }
 
 /// A message received from the gossip network.
@@ -229,14 +231,8 @@ impl Agent {
 
     /// Get the network node, if initialized.
     #[must_use]
-    pub fn network(&self) -> Option<&network::NetworkNode> {
+    pub fn network(&self) -> Option<&std::sync::Arc<network::NetworkNode>> {
         self.network.as_ref()
-    }
-
-    /// Get mutable access to the network node.
-    #[must_use]
-    pub fn network_mut(&mut self) -> Option<&mut network::NetworkNode> {
-        self.network.as_mut()
     }
 
     /// Join the x0x gossip network.
@@ -277,18 +273,17 @@ impl Agent {
 
     /// Subscribe to messages on a given topic.
     ///
-    /// Returns a [`Subscription`] that yields messages as they arrive
+    /// Returns a [`gossip::Subscription`] that yields messages as they arrive
     /// through the gossip network.
     ///
-    /// # Note
+    /// # Errors
     ///
-    /// This is currently a placeholder. Use [`gossip::PubSubManager`] directly
-    /// for the full implementation. Will be fully implemented in Task 3.
-    pub async fn subscribe(&self, _topic: &str) -> error::Result<Subscription> {
-        // Placeholder - will be implemented in Task 3 when Agent has GossipRuntime with PubSubManager
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "Agent.subscribe() not yet implemented - use gossip::PubSubManager directly",
-        )))
+    /// Returns an error if:
+    /// - Gossip runtime is not initialized (configure agent with network first)
+    pub async fn subscribe(&self, topic: &str) -> error::Result<Subscription> {
+        let runtime = self.gossip_runtime.as_ref()
+            .ok_or_else(|| error::IdentityError::Storage(std::io::Error::other("gossip runtime not initialized - configure agent with network first")))?;
+        Ok(runtime.pubsub().subscribe(topic.to_string()).await)
     }
 
     /// Publish a message to a topic.
@@ -296,9 +291,18 @@ impl Agent {
     /// The message will propagate through the gossip network via
     /// epidemic broadcast — every agent that receives it will
     /// relay it to its neighbours.
-    pub async fn publish(&self, _topic: &str, _payload: Vec<u8>) -> error::Result<()> {
-        // Placeholder — will use saorsa-gossip pubsub
-        Ok(())
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Gossip runtime is not initialized (configure agent with network first)
+    /// - Message encoding or broadcast fails
+    pub async fn publish(&self, topic: &str, payload: Vec<u8>) -> error::Result<()> {
+        let runtime = self.gossip_runtime.as_ref()
+            .ok_or_else(|| error::IdentityError::Storage(std::io::Error::other("gossip runtime not initialized - configure agent with network first")))?;
+        runtime.pubsub().publish(topic.to_string(), bytes::Bytes::from(payload))
+            .await
+            .map_err(|e| error::IdentityError::Storage(std::io::Error::other(format!("publish failed: {}", e))))
     }
 
     /// Create a new collaborative task list bound to a topic.
@@ -470,17 +474,24 @@ impl AgentBuilder {
 
         // Create network node if configured
         let network = if let Some(config) = self.network_config {
-            Some(network::NetworkNode::new(config).await.map_err(|e| {
+            let node = network::NetworkNode::new(config).await.map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
                     "network initialization failed: {}",
                     e
                 )))
-            })?)
+            })?;
+            Some(std::sync::Arc::new(node))
         } else {
             None
         };
 
-        Ok(Agent { identity, network })
+        // Create gossip runtime if network exists
+        let gossip_runtime = network.as_ref().map(|net| {
+            let net_arc = std::sync::Arc::clone(net);
+            std::sync::Arc::new(gossip::GossipRuntime::new(gossip::GossipConfig::default(), net_arc))
+        });
+
+        Ok(Agent { identity, network, gossip_runtime })
     }
 }
 

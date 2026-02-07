@@ -1,19 +1,22 @@
 //! Gossip runtime orchestration.
 
 use super::config::GossipConfig;
+use super::pubsub::PubSubManager;
 use crate::error::NetworkResult;
 use crate::network::NetworkNode;
 use std::sync::Arc;
 
 /// The gossip runtime that manages all gossip components.
 ///
-/// This orchestrates HyParView membership, Plumtree pub/sub, presence beacons,
+/// This orchestrates pub/sub messaging, and will eventually include
+/// HyParView membership, Plumtree pub/sub, presence beacons,
 /// FOAF discovery, rendezvous sharding, coordinator advertisements, and
 /// anti-entropy reconciliation.
 #[derive(Debug)]
 pub struct GossipRuntime {
     config: GossipConfig,
     network: Arc<NetworkNode>,
+    pubsub: Arc<PubSubManager>,
 }
 
 impl GossipRuntime {
@@ -31,7 +34,18 @@ impl GossipRuntime {
     ///
     /// A new `GossipRuntime` instance
     pub fn new(config: GossipConfig, network: Arc<NetworkNode>) -> Self {
-        Self { config, network }
+        let pubsub = Arc::new(PubSubManager::new(network.clone()));
+        Self { config, network, pubsub }
+    }
+
+    /// Get the PubSubManager for this runtime.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the `PubSubManager`.
+    #[must_use]
+    pub fn pubsub(&self) -> &Arc<PubSubManager> {
+        &self.pubsub
     }
 
     /// Start the gossip runtime.
@@ -42,7 +56,7 @@ impl GossipRuntime {
     ///
     /// Returns an error if initialization fails.
     pub async fn start(&self) -> NetworkResult<()> {
-        // TODO: Phase 1.6 Tasks 2-12 will implement actual gossip components here
+        // TODO: Phase 1.6 Task 4 will start background message handler
         // For now, this is a placeholder that validates config
         self.config.validate().map_err(|e| {
             crate::error::NetworkError::NodeCreation(format!("invalid gossip config: {}", e))

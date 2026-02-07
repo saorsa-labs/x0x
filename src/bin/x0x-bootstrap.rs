@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
     // Start health server
     let health_handle = tokio::spawn(run_health_server(
         config.health_address,
-        agent.network().cloned(),
+        agent.network().as_ref().map(|arc| std::sync::Arc::clone(arc)),
     ));
 
     // Wait for shutdown signal
@@ -219,7 +219,7 @@ fn init_logging(level: &str) -> Result<()> {
 /// Run HTTP health server
 async fn run_health_server(
     addr: SocketAddr,
-    _network: Option<x0x::network::NetworkNode>,
+    _network: Option<std::sync::Arc<x0x::network::NetworkNode>>,
 ) -> Result<()> {
     use hyper::service::{make_service_fn, service_fn};
     use hyper::{Body, Request, Response, Server};
