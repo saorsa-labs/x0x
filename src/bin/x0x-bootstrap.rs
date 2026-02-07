@@ -92,6 +92,17 @@ struct HealthResponse {
     peers: usize,
 }
 
+/// Metrics response with detailed stats
+#[derive(Debug, Serialize)]
+struct MetricsResponse {
+    status: String,
+    peers: usize,
+    total_connections: u64,
+    active_connections: u32,
+    bytes_sent: u64,
+    bytes_received: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments
@@ -219,24 +230,52 @@ fn init_logging(level: &str) -> Result<()> {
 /// Run HTTP health server
 async fn run_health_server(
     addr: SocketAddr,
-    _network: Option<std::sync::Arc<x0x::network::NetworkNode>>,
+    network: Option<std::sync::Arc<x0x::network::NetworkNode>>,
 ) -> Result<()> {
     use hyper::service::{make_service_fn, service_fn};
     use hyper::{Body, Request, Response, Server};
     use std::convert::Infallible;
 
-    // Simplified health server - returns static response
-    // TODO: Add actual peer count when NetworkNode has the API
     let make_svc = make_service_fn(move |_conn| {
+        let network = network.clone();
         async move {
+            let network = network;
             Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
+                let network = network.clone();
                 async move {
                     match req.uri().path() {
                         "/health" => {
-                            // Static response for now
+                            let peers = match &network {
+                                Some(net) => net.connection_count().await,
+                                None => 0,
+                            };
+
                             let response = HealthResponse {
                                 status: "healthy".to_string(),
-                                peers: 0,
+                                peers,
+                            };
+
+                            let json = serde_json::to_string(&response)
+                                .unwrap_or_else(|_| r#"{"status":"error"}"#.to_string());
+
+                            Ok::<_, Infallible>(Response::new(Body::from(json)))
+                        }
+                        "/metrics" => {
+                            let (peers, stats) = match &network {
+                                Some(net) => {
+                                    let s = net.stats().await;
+                                    (s.peer_count, s)
+                                }
+                                None => (0, x0x::network::NetworkStats::default()),
+                            };
+
+                            let response = MetricsResponse {
+                                status: "healthy".to_string(),
+                                peers,
+                                total_connections: stats.total_connections,
+                                active_connections: stats.active_connections,
+                                bytes_sent: stats.bytes_sent,
+                                bytes_received: stats.bytes_received,
                             };
 
                             let json = serde_json::to_string(&response)
