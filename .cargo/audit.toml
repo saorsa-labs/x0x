@@ -14,4 +14,15 @@ ignore = [
     # Transitive dependency via ant-quic -> rustls. No security vulnerability.
     # Will be resolved when ant-quic updates its rustls dependency.
     "RUSTSEC-2025-0134",
+
+    # pyo3 0.20.3 - buffer overflow in PyString::from_object (RUSTSEC-2025-0020)
+    # x0x-python does NOT use PyString::from_object (verified: all string handling
+    # uses Rust String params with automatic extraction, no unsafe string APIs).
+    # Upgrade to pyo3 0.24+ requires Bound API migration (separate PR planned).
+    "RUSTSEC-2025-0020",
+
+    # atomic-polyfill 1.0.3 - marked unmaintained (RUSTSEC-2023-0089)
+    # Transitive: saorsa-pqc -> postcard -> heapless -> atomic-polyfill.
+    # Cannot fix directly; will resolve when postcard updates heapless.
+    "RUSTSEC-2023-0089",
 ]
