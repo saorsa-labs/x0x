@@ -4,8 +4,8 @@
 //! agents to publish and subscribe to messages by topic. Messages are
 //! broadcast to all connected peers using epidemic dissemination.
 
-use crate::network::NetworkNode;
 use crate::error::NetworkResult;
+use crate::network::NetworkNode;
 use bytes::Bytes;
 use futures::future;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
@@ -148,7 +148,11 @@ impl PubSubManager {
             .or_default()
             .push(tx);
 
-        Subscription { topic, receiver: rx }
+        Subscription {
+            topic,
+            receiver: rx,
+            subscriptions: self.subscriptions.clone(),
+        }
     }
 
     /// Publish a message to a topic.
@@ -180,7 +184,7 @@ impl PubSubManager {
             }
         }
 
-        // 2. Broadcast to all connected peers via GossipTransport
+        // 2. Broadcast to all connected peers via GossipTransport (in parallel)
         let encoded = encode_pubsub_message(&topic, &payload)?;
 
         // Get connected peers and broadcast to each
@@ -196,13 +200,22 @@ impl PubSubManager {
                 .collect::<Vec<_>>()
         };
 
-        for peer in connected_peers {
-            // Ignore errors: individual peer failures shouldn't fail entire publish
-            let _ = self
-                .network
-                .send_to_peer(peer, GossipStreamType::PubSub, encoded.clone())
-                .await;
-        }
+        // Parallelize peer sends using join_all
+        let send_futures: Vec<_> = connected_peers
+            .into_iter()
+            .map(|peer| {
+                let network = self.network.clone();
+                let encoded = encoded.clone();
+                async move {
+                    // Ignore errors: individual peer failures shouldn't fail entire publish
+                    let _ = network
+                        .send_to_peer(peer, GossipStreamType::PubSub, encoded)
+                        .await;
+                }
+            })
+            .collect();
+
+        future::join_all(send_futures).await;
 
         Ok(())
     }
@@ -222,7 +235,11 @@ impl PubSubManager {
         let (topic, payload) = match decode_pubsub_message(data) {
             Ok(msg) => msg,
             Err(e) => {
-                tracing::warn!("Failed to decode pubsub message from peer {:?}: {}", peer, e);
+                tracing::warn!(
+                    "Failed to decode pubsub message from peer {:?}: {}",
+                    peer,
+                    e
+                );
                 return;
             }
         };
@@ -259,17 +276,22 @@ impl PubSubManager {
                 .collect::<Vec<_>>()
         };
 
-        for other_peer in connected_peers {
-            // Don't re-broadcast to the sender (simple check)
-            if other_peer == peer {
-                continue;
-            }
+        // Parallelize re-broadcasts using join_all
+        let rebroadcast_futures: Vec<_> = connected_peers
+            .into_iter()
+            .filter(|other_peer| other_peer != &peer) // Exclude sender
+            .map(|other_peer| {
+                let network = self.network.clone();
+                let encoded = encoded.clone();
+                async move {
+                    let _ = network
+                        .send_to_peer(other_peer, GossipStreamType::PubSub, encoded)
+                        .await;
+                }
+            })
+            .collect();
 
-            let _ = self
-                .network
-                .send_to_peer(other_peer, GossipStreamType::PubSub, encoded.clone())
-                .await;
-        }
+        future::join_all(rebroadcast_futures).await;
     }
 
     /// Get the number of active subscriptions.
@@ -315,8 +337,9 @@ impl PubSubManager {
 /// - Encoding fails
 fn encode_pubsub_message(topic: &str, payload: &Bytes) -> NetworkResult<Bytes> {
     let topic_bytes = topic.as_bytes();
-    let topic_len = u16::try_from(topic_bytes.len())
-        .map_err(|_| crate::error::NetworkError::SerializationError("Topic too long".to_string()))?;
+    let topic_len = u16::try_from(topic_bytes.len()).map_err(|_| {
+        crate::error::NetworkError::SerializationError("Topic too long".to_string())
+    })?;
 
     let mut buf = Vec::with_capacity(2 + topic_bytes.len() + payload.len());
     buf.extend_from_slice(&topic_len.to_be_bytes());
@@ -357,8 +380,9 @@ fn decode_pubsub_message(data: Bytes) -> NetworkResult<(String, Bytes)> {
     }
 
     let topic_bytes = &data[2..2 + topic_len];
-    let topic = String::from_utf8(topic_bytes.to_vec())
-        .map_err(|e| crate::error::NetworkError::SerializationError(format!("Invalid UTF-8: {}", e)))?;
+    let topic = String::from_utf8(topic_bytes.to_vec()).map_err(|e| {
+        crate::error::NetworkError::SerializationError(format!("Invalid UTF-8: {}", e))
+    })?;
 
     let payload = data.slice(2 + topic_len..);
 
@@ -491,10 +515,7 @@ mod tests {
             .expect("Publish failed");
 
         // Receive message
-        let msg = sub
-            .recv()
-            .await
-            .expect("Failed to receive message");
+        let msg = sub.recv().await.expect("Failed to receive message");
 
         assert_eq!(msg.topic, "chat");
         assert_eq!(msg.payload, Bytes::from("hello"));
@@ -597,8 +618,8 @@ mod tests {
 
         // Simulate incoming message from peer
         let peer = PeerId::new([1; 32]);
-        let encoded =
-            encode_pubsub_message("remote", &Bytes::from("incoming message")).expect("Encoding failed");
+        let encoded = encode_pubsub_message("remote", &Bytes::from("incoming message"))
+            .expect("Encoding failed");
 
         manager.handle_incoming(peer, encoded).await;
 

@@ -35,7 +35,11 @@ impl GossipRuntime {
     /// A new `GossipRuntime` instance
     pub fn new(config: GossipConfig, network: Arc<NetworkNode>) -> Self {
         let pubsub = Arc::new(PubSubManager::new(network.clone()));
-        Self { config, network, pubsub }
+        Self {
+            config,
+            network,
+            pubsub,
+        }
     }
 
     /// Get the PubSubManager for this runtime.

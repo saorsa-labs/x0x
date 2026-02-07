@@ -281,8 +281,11 @@ impl Agent {
     /// Returns an error if:
     /// - Gossip runtime is not initialized (configure agent with network first)
     pub async fn subscribe(&self, topic: &str) -> error::Result<Subscription> {
-        let runtime = self.gossip_runtime.as_ref()
-            .ok_or_else(|| error::IdentityError::Storage(std::io::Error::other("gossip runtime not initialized - configure agent with network first")))?;
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
         Ok(runtime.pubsub().subscribe(topic.to_string()).await)
     }
 
@@ -298,11 +301,21 @@ impl Agent {
     /// - Gossip runtime is not initialized (configure agent with network first)
     /// - Message encoding or broadcast fails
     pub async fn publish(&self, topic: &str, payload: Vec<u8>) -> error::Result<()> {
-        let runtime = self.gossip_runtime.as_ref()
-            .ok_or_else(|| error::IdentityError::Storage(std::io::Error::other("gossip runtime not initialized - configure agent with network first")))?;
-        runtime.pubsub().publish(topic.to_string(), bytes::Bytes::from(payload))
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        runtime
+            .pubsub()
+            .publish(topic.to_string(), bytes::Bytes::from(payload))
             .await
-            .map_err(|e| error::IdentityError::Storage(std::io::Error::other(format!("publish failed: {}", e))))
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "publish failed: {}",
+                    e
+                )))
+            })
     }
 
     /// Create a new collaborative task list bound to a topic.
@@ -488,10 +501,17 @@ impl AgentBuilder {
         // Create gossip runtime if network exists
         let gossip_runtime = network.as_ref().map(|net| {
             let net_arc = std::sync::Arc::clone(net);
-            std::sync::Arc::new(gossip::GossipRuntime::new(gossip::GossipConfig::default(), net_arc))
+            std::sync::Arc::new(gossip::GossipRuntime::new(
+                gossip::GossipConfig::default(),
+                net_arc,
+            ))
         });
 
-        Ok(Agent { identity, network, gossip_runtime })
+        Ok(Agent {
+            identity,
+            network,
+            gossip_runtime,
+        })
     }
 }
 
