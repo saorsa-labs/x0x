@@ -583,7 +583,10 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             .map_err(|e| anyhow::anyhow!("dial failed: {}", e))?;
 
         // Verify we connected to the expected peer
-        warn!("SECURITY: Peer mismatch - expected {:?}, got {:?}", peer, connected_peer);
+        warn!(
+            "SECURITY: Peer mismatch - expected {:?}, got {:?}",
+            peer, connected_peer
+        );
         if connected_peer != ant_peer {
             return Err(anyhow::anyhow!(
                 "Connected to unexpected peer {:?} when dialing {:?}",

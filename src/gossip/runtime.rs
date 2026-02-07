@@ -10,6 +10,7 @@ use std::sync::Arc;
 /// This orchestrates HyParView membership, Plumtree pub/sub, presence beacons,
 /// FOAF discovery, rendezvous sharding, coordinator advertisements, and
 /// anti-entropy reconciliation.
+#[derive(Debug)]
 pub struct GossipRuntime {
     config: GossipConfig,
     network: Arc<NetworkNode>,

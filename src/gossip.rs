@@ -20,6 +20,6 @@ pub use coordinator::{CoordinatorAdvert, CoordinatorManager};
 pub use discovery::DiscoveryManager;
 pub use membership::MembershipManager;
 pub use presence::{PresenceEvent, PresenceManager};
-pub use pubsub::{PubSubManager, PubSubMessage};
+pub use pubsub::{PubSubManager, PubSubMessage, Subscription};
 pub use rendezvous::RendezvousManager;
 pub use runtime::GossipRuntime;

@@ -83,8 +83,8 @@ pub mod crdt;
 /// MLS (Messaging Layer Security) group encryption.
 pub mod mls;
 
-// Re-export key gossip types
-pub use gossip::{GossipConfig, GossipRuntime};
+// Re-export key gossip types (including new pubsub components)
+pub use gossip::{GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, Subscription};
 
 /// The core agent that participates in the x0x gossip network.
 ///
