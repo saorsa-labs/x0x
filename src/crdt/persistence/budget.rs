@@ -54,17 +54,24 @@ mod tests {
     fn budget_thresholds_follow_defaults() {
         let retention = RetentionPolicy::default();
         let budget = retention.storage_budget_bytes;
+        let warning_floor = (budget * u64::from(retention.warning_threshold_percent)).div_ceil(100);
+        let critical_floor =
+            (budget * u64::from(retention.critical_threshold_percent)).div_ceil(100);
 
         assert_eq!(
-            evaluate_budget(&retention, PersistenceMode::Degraded, budget * 79 / 100),
+            evaluate_budget(
+                &retention,
+                PersistenceMode::Degraded,
+                warning_floor.saturating_sub(1)
+            ),
             BudgetDecision::BelowWarning
         );
         assert_eq!(
-            evaluate_budget(&retention, PersistenceMode::Degraded, budget * 80 / 100),
+            evaluate_budget(&retention, PersistenceMode::Degraded, warning_floor),
             BudgetDecision::Warning80
         );
         assert_eq!(
-            evaluate_budget(&retention, PersistenceMode::Degraded, budget * 90 / 100),
+            evaluate_budget(&retention, PersistenceMode::Degraded, critical_floor),
             BudgetDecision::Warning90
         );
     }
