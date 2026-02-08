@@ -1,7 +1,10 @@
 //! Persistent storage contracts and implementations for CRDT task lists.
 
 pub mod backend;
+pub mod manifest;
+pub mod migration;
 pub mod policy;
+pub mod snapshot;
 
 use crate::crdt::{TaskList, TaskListId};
 use std::path::PathBuf;
@@ -11,9 +14,17 @@ pub use backend::{
     CheckpointReason, CheckpointRequest, PersistenceBackend, PersistenceBackendError,
     PersistenceSnapshot,
 };
+pub use manifest::{ManifestError, StoreManifest, MANIFEST_FILE_NAME};
+pub use migration::{
+    resolve_legacy_artifact_outcome, ArtifactLoadOutcome, MigrationError, MigrationResult,
+    CURRENT_SNAPSHOT_SCHEMA_VERSION,
+};
 pub use policy::{
     CheckpointPolicy, PersistenceMode, PersistencePolicy, PersistencePolicyError,
     RetentionPolicy, StrictInitializationPolicy,
+};
+pub use snapshot::{
+    IntegrityMetadata, SnapshotDecodeError, SnapshotEnvelope, CODEC_MARKER_BINC, CODEC_VERSION_V1,
 };
 
 /// Storage backend for task lists with atomic writes and error recovery.
