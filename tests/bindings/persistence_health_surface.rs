@@ -9,6 +9,17 @@ use x0x::runtime::AgentCheckpointApi;
 #[derive(Clone, Default)]
 struct NoopBackend;
 
+#[derive(Clone)]
+struct FixedLoadBackend {
+    response: FixedLoadResponse,
+}
+
+#[derive(Clone)]
+enum FixedLoadResponse {
+    NoLoadable,
+    OperationFailure,
+}
+
 #[async_trait::async_trait]
 impl x0x::crdt::persistence::PersistenceBackend for NoopBackend {
     async fn checkpoint(
@@ -27,6 +38,39 @@ impl x0x::crdt::persistence::PersistenceBackend for NoopBackend {
         Err(x0x::crdt::persistence::PersistenceBackendError::SnapshotNotFound(
             entity_id.to_string(),
         ))
+    }
+
+    async fn delete_entity(
+        &self,
+        _entity_id: &str,
+    ) -> Result<(), x0x::crdt::persistence::PersistenceBackendError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl x0x::crdt::persistence::PersistenceBackend for FixedLoadBackend {
+    async fn checkpoint(
+        &self,
+        _request: &x0x::crdt::persistence::CheckpointRequest,
+        _snapshot: &x0x::crdt::persistence::PersistenceSnapshot,
+    ) -> Result<(), x0x::crdt::persistence::PersistenceBackendError> {
+        Ok(())
+    }
+
+    async fn load_latest(
+        &self,
+        _entity_id: &str,
+    ) -> Result<x0x::crdt::persistence::PersistenceSnapshot, x0x::crdt::persistence::PersistenceBackendError>
+    {
+        match &self.response {
+            FixedLoadResponse::NoLoadable => Err(PersistenceBackendError::NoLoadableSnapshot(
+                "entity-no-valid".to_string(),
+            )),
+            FixedLoadResponse::OperationFailure => {
+                Err(PersistenceBackendError::Operation("simulated io failure".to_string()))
+            }
+        }
     }
 
     async fn delete_entity(
@@ -163,5 +207,131 @@ fn persistence_health_surface_observability_includes_frequency_and_bounds() {
     assert_eq!(
         node.checkpoint_frequency_bounds.max_debounce_floor_secs,
         python.checkpoint_frequency_bounds.max_debounce_floor_secs
+    );
+}
+
+#[tokio::test]
+async fn persistence_health_surface_load_latest_no_valid_snapshot_maps_to_empty_store_contract() {
+    let mut api = AgentCheckpointApi::new_with_mode(
+        FixedLoadBackend {
+            response: FixedLoadResponse::NoLoadable,
+        },
+        "entity-no-valid",
+        2,
+        PersistenceMode::Degraded,
+        x0x::crdt::persistence::CheckpointPolicy::default(),
+    );
+
+    let err = api
+        .load_latest()
+        .await
+        .expect_err("no loadable snapshots should report not found contract");
+    assert!(matches!(
+        err,
+        x0x::runtime::AgentApiError::Backend(PersistenceBackendError::SnapshotNotFound(_))
+    ));
+
+    let health = api.persistence_health();
+    assert_eq!(health.state, x0x::crdt::persistence::PersistenceState::Ready);
+    assert!(!health.degraded);
+    assert_eq!(
+        health.last_recovery_outcome,
+        Some(x0x::crdt::persistence::RecoveryHealthOutcome::EmptyStore)
+    );
+
+    let node = node_health::map_persistence_health(&health);
+    let python = python_health::map_persistence_health(&health);
+    assert_eq!(node.last_recovery_outcome.as_deref(), Some("empty_store"));
+    assert_eq!(python.last_recovery_outcome, node.last_recovery_outcome);
+}
+
+#[tokio::test]
+async fn persistence_health_surface_load_latest_hard_failure_maps_to_degraded_contract() {
+    let mut api = AgentCheckpointApi::new_with_mode(
+        FixedLoadBackend {
+            response: FixedLoadResponse::OperationFailure,
+        },
+        "entity-hard-failure",
+        2,
+        PersistenceMode::Degraded,
+        x0x::crdt::persistence::CheckpointPolicy::default(),
+    );
+
+    let err = api
+        .load_latest()
+        .await
+        .expect_err("hard load failure should surface backend error");
+    assert!(matches!(
+        err,
+        x0x::runtime::AgentApiError::Backend(PersistenceBackendError::Operation(_))
+    ));
+
+    let health = api.persistence_health();
+    assert_eq!(
+        health.state,
+        x0x::crdt::persistence::PersistenceState::Degraded
+    );
+    assert!(health.degraded);
+    assert_eq!(
+        health.last_recovery_outcome,
+        Some(x0x::crdt::persistence::RecoveryHealthOutcome::DegradedFallback)
+    );
+    let node = node_health::map_persistence_health(&health);
+    let python = python_health::map_persistence_health(&health);
+    assert_eq!(node.last_recovery_outcome.as_deref(), Some("degraded_fallback"));
+    assert_eq!(python.last_recovery_outcome, node.last_recovery_outcome);
+}
+
+#[tokio::test]
+async fn persistence_health_surface_load_latest_recoverable_invalid_latest_stays_loaded() {
+    use tokio::fs;
+    use x0x::crdt::persistence::{backends::file_backend::FileSnapshotBackend, PersistenceBackend};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let backend = FileSnapshotBackend::new(temp.path().to_path_buf(), PersistenceMode::Degraded);
+    let entity_id = "entity-recoverable-invalid-latest";
+    let request = x0x::crdt::persistence::CheckpointRequest {
+        entity_id: entity_id.to_string(),
+        mutation_count: 1,
+        reason: x0x::crdt::persistence::CheckpointReason::ExplicitRequest,
+    };
+    let snapshot = x0x::crdt::persistence::PersistenceSnapshot {
+        entity_id: entity_id.to_string(),
+        schema_version: 2,
+        payload: vec![9, 8, 7],
+    };
+    backend
+        .checkpoint(&request, &snapshot)
+        .await
+        .expect("write valid snapshot");
+
+    fs::write(
+        temp.path()
+            .join(entity_id)
+            .join("99999999999999999999.snapshot"),
+        b"not-json",
+    )
+    .await
+    .expect("write corrupt latest snapshot");
+
+    let mut api = AgentCheckpointApi::new_with_mode(
+        backend,
+        entity_id,
+        2,
+        PersistenceMode::Degraded,
+        x0x::crdt::persistence::CheckpointPolicy::default(),
+    );
+    let loaded = api
+        .load_latest()
+        .await
+        .expect("corrupt latest should be skipped when older valid snapshot exists");
+    assert_eq!(loaded.payload, vec![9, 8, 7]);
+
+    let health = api.persistence_health();
+    assert_eq!(health.state, x0x::crdt::persistence::PersistenceState::Ready);
+    assert!(!health.degraded);
+    assert_eq!(
+        health.last_recovery_outcome,
+        Some(x0x::crdt::persistence::RecoveryHealthOutcome::LoadedSnapshot)
     );
 }
