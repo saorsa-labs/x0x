@@ -1,9 +1,19 @@
 use crate::crdt::persistence::{
-    resolve_strict_startup_manifest, CheckpointPolicy, ManifestError, PersistenceBackend,
-    PersistenceBackendError, PersistenceMode, PersistencePolicy, StoreManifest,
+    resolve_strict_startup_manifest,
+    run_checkpoint,
+    CheckpointPolicy,
+    CheckpointReason,
+    CheckpointScheduler,
+    ManifestError,
+    PersistenceBackend,
+    PersistenceBackendError,
+    PersistenceMode,
+    PersistencePolicy,
+    StoreManifest,
 };
 use crate::crdt::TaskList;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
@@ -64,6 +74,15 @@ pub enum OrchestratorError {
     SnapshotDecode(String),
     #[error("network rejoin failed: {0}")]
     Rejoin(String),
+    #[error("checkpoint failed in strict mode: {0}")]
+    Checkpoint(PersistenceBackendError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownCheckpointOutcome {
+    Persisted,
+    SkippedClean,
+    DegradedContinued,
 }
 
 pub async fn recover_task_list_startup<B: PersistenceBackend>(
@@ -101,6 +120,46 @@ pub async fn recover_task_list_startup<B: PersistenceBackend>(
 
 pub fn checkpoint_policy_defaults(policy: &PersistencePolicy) -> CheckpointPolicy {
     policy.checkpoint.clone()
+}
+
+pub async fn run_graceful_shutdown_checkpoint<B: PersistenceBackend>(
+    backend: &B,
+    policy: &PersistencePolicy,
+    scheduler: &mut CheckpointScheduler,
+    recovery_state: &mut RecoveryState,
+    entity_id: &str,
+    schema_version: u32,
+    payload: Vec<u8>,
+    now: Duration,
+) -> Result<ShutdownCheckpointOutcome, OrchestratorError> {
+    if !scheduler.is_dirty() {
+        return Ok(ShutdownCheckpointOutcome::SkippedClean);
+    }
+
+    let mutation_count = scheduler.mutation_count();
+    match run_checkpoint(
+        backend,
+        entity_id,
+        schema_version,
+        mutation_count,
+        CheckpointReason::GracefulShutdown,
+        payload,
+    )
+    .await
+    {
+        Ok(()) => {
+            scheduler.mark_checkpoint(now);
+            Ok(ShutdownCheckpointOutcome::Persisted)
+        }
+        Err(err) if matches!(policy.mode, PersistenceMode::Strict) => {
+            Err(OrchestratorError::Checkpoint(err))
+        }
+        Err(err) => {
+            recovery_state.degraded = true;
+            recovery_state.last_error = Some(err.to_string());
+            Ok(ShutdownCheckpointOutcome::DegradedContinued)
+        }
+    }
 }
 
 fn ensure_manifest_for_mode(

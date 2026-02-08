@@ -31,7 +31,7 @@ pub use migration::{
 };
 pub use orchestrator::{
     checkpoint_policy_defaults, recover_task_list_startup, OrchestratorError, RecoveredTaskList,
-    RecoveryOutcome, RecoveryState,
+    RecoveryOutcome, RecoveryState, ShutdownCheckpointOutcome, run_graceful_shutdown_checkpoint,
 };
 pub use policy::{
     CheckpointPolicy, PersistenceMode, PersistencePolicy, PersistencePolicyError,
