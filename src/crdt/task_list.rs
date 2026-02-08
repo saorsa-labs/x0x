@@ -401,6 +401,16 @@ impl TaskList {
     pub fn get_task_mut(&mut self, task_id: &TaskId) -> Option<&mut TaskItem> {
         self.task_data.get_mut(task_id)
     }
+
+    /// Encode the task list into persistence payload bytes.
+    pub fn to_persistence_payload(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self).map_err(CrdtError::Serialization)
+    }
+
+    /// Decode a task list from persistence payload bytes.
+    pub fn from_persistence_payload(payload: &[u8]) -> Result<Self> {
+        bincode::deserialize(payload).map_err(CrdtError::Serialization)
+    }
 }
 
 #[cfg(test)]

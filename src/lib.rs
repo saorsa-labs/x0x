@@ -322,6 +322,34 @@ impl Agent {
         Ok(())
     }
 
+    /// Recover a task list from local persistence and then rejoin the network.
+    pub async fn recover_task_list_and_join_network<
+        B: crdt::persistence::PersistenceBackend,
+        P: AsRef<std::path::Path>,
+    >(
+        &self,
+        backend: &B,
+        policy: &crdt::persistence::PersistencePolicy,
+        store_root: P,
+        entity_id: &str,
+        empty_task_list: crdt::TaskList,
+    ) -> Result<crdt::persistence::RecoveredTaskList, crdt::persistence::OrchestratorError> {
+        let recovered = crdt::persistence::recover_task_list_startup(
+            backend,
+            policy,
+            store_root.as_ref(),
+            entity_id,
+            empty_task_list,
+        )
+        .await?;
+
+        self.join_network()
+            .await
+            .map_err(|err| crdt::persistence::OrchestratorError::Rejoin(err.to_string()))?;
+
+        Ok(recovered)
+    }
+
     /// Connect to multiple peers in parallel, returning the list of failed addresses.
     async fn connect_peers_parallel(
         &self,

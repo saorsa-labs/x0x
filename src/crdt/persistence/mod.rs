@@ -5,6 +5,7 @@ pub mod backends;
 pub mod budget;
 pub mod manifest;
 pub mod migration;
+pub mod orchestrator;
 pub mod policy;
 pub mod retention;
 pub mod snapshot;
@@ -25,6 +26,10 @@ pub use manifest::{
 pub use migration::{
     resolve_legacy_artifact_outcome, ArtifactLoadOutcome, MigrationError, MigrationResult,
     CURRENT_SNAPSHOT_SCHEMA_VERSION,
+};
+pub use orchestrator::{
+    checkpoint_policy_defaults, recover_task_list_startup, OrchestratorError, RecoveredTaskList,
+    RecoveryOutcome, RecoveryState,
 };
 pub use policy::{
     CheckpointPolicy, PersistenceMode, PersistencePolicy, PersistencePolicyError,
