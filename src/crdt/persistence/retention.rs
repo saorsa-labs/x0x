@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
+const SNAPSHOT_EXT: &str = "snapshot";
+const SNAPSHOT_TIMESTAMP_WIDTH: usize = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionOutcome {
     pub deleted_old_snapshots: usize,
@@ -86,23 +89,32 @@ async fn trim_entity_snapshots(entity_dir: &Path, keep: usize) -> Result<usize, 
 
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        let is_snapshot = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext == "snapshot");
-        if is_snapshot {
-            snapshots.push(path);
+        if let Some(timestamp) = snapshot_timestamp_from_path(&path) {
+            snapshots.push((timestamp, path));
         }
     }
 
-    snapshots.sort();
-    snapshots.reverse();
+    snapshots.sort_by(|left, right| right.0.cmp(&left.0));
 
     let mut deleted = 0usize;
-    for stale in snapshots.iter().skip(keep) {
+    for (_, stale) in snapshots.iter().skip(keep) {
         fs::remove_file(stale).await?;
         deleted += 1;
     }
 
     Ok(deleted)
+}
+
+fn snapshot_timestamp_from_path(path: &Path) -> Option<u128> {
+    let extension = path.extension().and_then(|ext| ext.to_str())?;
+    if extension != SNAPSHOT_EXT {
+        return None;
+    }
+
+    let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+    if stem.len() != SNAPSHOT_TIMESTAMP_WIDTH || !stem.as_bytes().iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+
+    stem.parse::<u128>().ok()
 }

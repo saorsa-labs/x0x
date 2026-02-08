@@ -122,3 +122,37 @@ async fn file_backend_atomicity_legacy_artifacts_are_mode_deterministic() {
         PersistenceBackendError::DegradedSkippedLegacyArtifact { .. }
     ));
 }
+
+#[tokio::test]
+async fn file_backend_atomicity_ignores_malformed_snapshot_names_on_load_latest() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let backend = FileSnapshotBackend::new(temp.path().to_path_buf(), PersistenceMode::Strict);
+    let entity = "entity-malformed";
+    let entity_dir = temp.path().join(entity);
+    fs::create_dir_all(&entity_dir)
+        .await
+        .expect("create entity directory");
+
+    fs::write(entity_dir.join("not-a-timestamp.snapshot"), b"junk")
+        .await
+        .expect("write malformed name");
+    fs::write(entity_dir.join("123.snapshot"), b"junk")
+        .await
+        .expect("write short malformed name");
+
+    backend
+        .checkpoint(&checkpoint_request(entity), &snapshot(entity, b"older"))
+        .await
+        .expect("write first valid snapshot");
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    backend
+        .checkpoint(&checkpoint_request(entity), &snapshot(entity, b"newest"))
+        .await
+        .expect("write second valid snapshot");
+
+    let loaded = backend
+        .load_latest(entity)
+        .await
+        .expect("load latest valid snapshot");
+    assert_eq!(loaded.payload, b"newest");
+}

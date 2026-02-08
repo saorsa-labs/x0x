@@ -15,6 +15,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 const SNAPSHOT_EXT: &str = "snapshot";
+const SNAPSHOT_TIMESTAMP_WIDTH: usize = 20;
 
 #[derive(Debug, Clone)]
 pub struct FileSnapshotBackend {
@@ -69,21 +70,16 @@ impl FileSnapshotBackend {
         }
 
         let mut entries = fs::read_dir(&dir).await?;
-        let mut paths = Vec::new();
+        let mut snapshots = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            let is_snapshot = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e == SNAPSHOT_EXT);
-            if is_snapshot {
-                paths.push(path);
+            if let Some(timestamp) = snapshot_timestamp_from_path(&path) {
+                snapshots.push((timestamp, path));
             }
         }
 
-        paths.sort();
-        paths.reverse();
-        Ok(paths)
+        snapshots.sort_by(|left, right| right.0.cmp(&left.0));
+        Ok(snapshots.into_iter().map(|(_, path)| path).collect())
     }
 
     async fn quarantine(
@@ -110,6 +106,20 @@ impl FileSnapshotBackend {
     ) -> Result<Vec<PathBuf>, PersistenceBackendError> {
         self.sorted_snapshots_newest_first(entity_id).await
     }
+}
+
+fn snapshot_timestamp_from_path(path: &Path) -> Option<u128> {
+    let extension = path.extension().and_then(|ext| ext.to_str())?;
+    if extension != SNAPSHOT_EXT {
+        return None;
+    }
+
+    let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+    if stem.len() != SNAPSHOT_TIMESTAMP_WIDTH || !stem.as_bytes().iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+
+    stem.parse::<u128>().ok()
 }
 
 #[async_trait]

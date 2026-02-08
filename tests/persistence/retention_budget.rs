@@ -75,3 +75,51 @@ async fn retention_budget_removes_orphan_entity_directories_on_cycle() {
             .expect("check orphan existence")
     );
 }
+
+#[tokio::test]
+async fn retention_budget_ignores_malformed_snapshot_names_when_trimming() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let entity = "entity-filename-robustness";
+    let entity_dir = temp.path().join(entity);
+    fs::create_dir_all(&entity_dir)
+        .await
+        .expect("create entity directory");
+
+    for idx in 1..=4 {
+        let path = entity_dir.join(format!("{:020}.snapshot", idx));
+        fs::write(path, format!("snapshot-{idx}").as_bytes())
+            .await
+            .expect("write valid snapshot");
+    }
+
+    fs::write(entity_dir.join("bad.snapshot"), b"invalid")
+        .await
+        .expect("write malformed snapshot name");
+    fs::write(entity_dir.join("123.snapshot"), b"invalid")
+        .await
+        .expect("write short malformed snapshot name");
+
+    let outcome = enforce_retention_cycle(temp.path(), &[entity.to_string()], 2)
+        .await
+        .expect("run retention");
+    assert_eq!(outcome.deleted_old_snapshots, 2);
+
+    let mut entries = fs::read_dir(&entity_dir).await.expect("read entity dir");
+    let mut valid_snapshot_count = 0;
+    let mut malformed_snapshot_count = 0;
+    while let Some(entry) = entries.next_entry().await.expect("next entry") {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".snapshot") {
+            let stem = name.trim_end_matches(".snapshot");
+            if stem.len() == 20 && stem.chars().all(|c| c.is_ascii_digit()) {
+                valid_snapshot_count += 1;
+            } else {
+                malformed_snapshot_count += 1;
+            }
+        }
+    }
+
+    assert_eq!(valid_snapshot_count, 2);
+    assert_eq!(malformed_snapshot_count, 2);
+}
