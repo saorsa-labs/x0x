@@ -4,6 +4,9 @@ use crate::crdt::persistence::{
     CheckpointPolicy, PersistenceMode, PersistencePolicy, PersistencePolicyError, RetentionPolicy,
     StrictInitializationPolicy,
 };
+use crate::runtime::policy_bounds::{
+    ensure_policy_within_envelope, validate_host_envelope, PolicyBoundsError,
+};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -13,6 +16,8 @@ pub enum ConfigError {
     InvalidPersistenceMode(String),
     #[error("invalid persistence policy: {0}")]
     InvalidPersistencePolicy(#[from] PersistencePolicyError),
+    #[error("invalid host policy envelope: {0}")]
+    InvalidHostPolicyEnvelope(#[from] PolicyBoundsError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -153,6 +158,9 @@ impl StartupConfig {
         };
 
         policy.validate()?;
+
+        validate_host_envelope(&self.persistence.host_policy)?;
+        ensure_policy_within_envelope(&policy, &self.persistence.host_policy)?;
 
         Ok(ResolvedPersistenceConfig {
             policy,
