@@ -1,6 +1,7 @@
 //! Persistent storage contracts and implementations for CRDT task lists.
 
 pub mod backend;
+pub mod backends;
 pub mod manifest;
 pub mod migration;
 pub mod policy;
@@ -14,6 +15,7 @@ pub use backend::{
     CheckpointReason, CheckpointRequest, PersistenceBackend, PersistenceBackendError,
     PersistenceSnapshot,
 };
+pub use backends::FileSnapshotBackend;
 pub use manifest::{ManifestError, StoreManifest, MANIFEST_FILE_NAME};
 pub use migration::{
     resolve_legacy_artifact_outcome, ArtifactLoadOutcome, MigrationError, MigrationResult,

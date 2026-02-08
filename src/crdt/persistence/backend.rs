@@ -32,6 +32,14 @@ pub struct PersistenceSnapshot {
 pub enum PersistenceBackendError {
     #[error("snapshot not found for entity: {0}")]
     SnapshotNotFound(String),
+    #[error("snapshot exists but cannot be loaded for entity: {0}")]
+    NoLoadableSnapshot(String),
+    #[error("corrupt snapshot quarantined at {path}: {reason}")]
+    SnapshotCorrupt { path: String, reason: String },
+    #[error("unsupported legacy encrypted snapshot artifact at {path}")]
+    UnsupportedLegacyEncryptedArtifact { path: String },
+    #[error("degraded mode skipped unsupported legacy encrypted snapshot artifact at {path}")]
+    DegradedSkippedLegacyArtifact { path: String },
     #[error("backend I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("backend operation failed: {0}")]
