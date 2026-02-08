@@ -1095,6 +1095,112 @@ async fn test_network_node_multiple_subscribers() {
     assert!(rx1.recv().await.is_ok());
     assert!(rx2.recv().await.is_ok());
 }
+
+/// Test that connections between local nodes are bidirectionally visible.
+///
+/// This reproduces the "phantom connection" bug where `connect_addr()` succeeds
+/// on the initiator side but the acceptor never registers the connection,
+/// resulting in asymmetric peer counts.
+///
+/// See: .planning/ant-quic-phantom-connections.md
+#[tokio::test]
+async fn test_mesh_connections_are_bidirectional() {
+    const NODE_COUNT: usize = 4;
+    let base_port: u16 = 19200;
+
+    // Create N nodes with explicit bind addresses and no bootstrap peers
+    let mut nodes = Vec::with_capacity(NODE_COUNT);
+    let mut addrs = Vec::with_capacity(NODE_COUNT);
+
+    for i in 0..NODE_COUNT {
+        let addr: SocketAddr = format!("127.0.0.1:{}", base_port + i as u16)
+            .parse()
+            .unwrap();
+        addrs.push(addr);
+
+        let config = NetworkConfig {
+            bind_addr: Some(addr),
+            bootstrap_nodes: Vec::new(),
+            max_connections: 100,
+            connection_timeout: std::time::Duration::from_secs(10),
+            stats_interval: std::time::Duration::from_secs(60),
+            peer_cache_path: None,
+        };
+
+        let node = NetworkNode::new(config).await.unwrap();
+        nodes.push(node);
+    }
+
+    // Each node connects to all others in parallel (simulating bootstrap)
+    let mut handles = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        for (j, target_addr) in addrs.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let node = node.clone();
+            let addr = *target_addr;
+            handles.push(tokio::spawn(async move {
+                (i, j, node.connect_addr(addr).await)
+            }));
+        }
+    }
+
+    // Wait for all connections
+    for handle in handles {
+        let (from, to, result) = handle.await.unwrap();
+        if let Err(e) = &result {
+            eprintln!("Connection {}->{} failed: {}", from, to, e);
+        }
+    }
+
+    // Allow connections to stabilize
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // CRITICAL CHECK: Every node must see exactly (NODE_COUNT - 1) peers.
+    // A phantom connection bug would cause asymmetry: one node sees fewer
+    // peers than others because the acceptor side never registered the
+    // connection.
+    let mut counts = Vec::with_capacity(NODE_COUNT);
+    for (i, node) in nodes.iter().enumerate() {
+        let count = node.connection_count().await;
+        eprintln!("Node {} (:{}) has {} peers", i, base_port + i as u16, count);
+        counts.push(count);
+    }
+
+    let expected = NODE_COUNT - 1;
+    for (i, count) in counts.iter().enumerate() {
+        assert_eq!(
+            *count, expected,
+            "Node {} has {} peers, expected {} — possible phantom connection (asymmetric state)",
+            i, count, expected
+        );
+    }
+
+    // BIDIRECTIONALITY CHECK: For every pair (A, B), if A sees B as connected
+    // then B must also see A as connected.
+    for i in 0..NODE_COUNT {
+        let peers_i = nodes[i].connected_peers().await;
+        for j in 0..NODE_COUNT {
+            if i == j {
+                continue;
+            }
+            let peers_j = nodes[j].connected_peers().await;
+            let j_peer_id = nodes[j].peer_id();
+
+            let i_sees_j = peers_i.contains(&j_peer_id);
+            if i_sees_j {
+                let i_peer_id = nodes[i].peer_id();
+                let j_sees_i = peers_j.contains(&i_peer_id);
+                assert!(
+                    j_sees_i,
+                    "Phantom connection: node {} sees node {} but node {} does not see node {} back",
+                    i, j, j, i
+                );
+            }
+        }
+    }
+}
 /// A message transmitted through the x0x network.
 ///
 /// Messages are the basic unit of communication in the x0x gossip network.
