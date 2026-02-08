@@ -4,6 +4,7 @@ pub mod backend;
 pub mod backends;
 pub mod budget;
 pub mod checkpoint;
+pub mod health;
 pub mod manifest;
 pub mod migration;
 pub mod orchestrator;
@@ -22,6 +23,10 @@ pub use backend::{
 pub use backends::FileSnapshotBackend;
 pub use budget::{evaluate_budget, BudgetDecision};
 pub use checkpoint::{run_checkpoint, CheckpointAction, CheckpointScheduler};
+pub use health::{
+    is_legacy_artifact_error, BudgetPressure, PersistenceErrorCode, PersistenceErrorInfo,
+    PersistenceHealth, PersistenceState, RecoveryHealthOutcome,
+};
 pub use manifest::{
     resolve_strict_startup_manifest, ManifestError, StoreManifest, MANIFEST_FILE_NAME,
 };
