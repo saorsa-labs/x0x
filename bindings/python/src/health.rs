@@ -33,6 +33,26 @@ pub struct BindingPersistenceHealth {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingPersistenceObservability {
     pub health: BindingPersistenceHealth,
+    pub checkpoint_frequency: BindingCheckpointFrequency,
+    pub checkpoint_frequency_bounds: BindingCheckpointFrequencyBounds,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingCheckpointFrequency {
+    pub mutation_threshold: u32,
+    pub dirty_time_floor_secs: u64,
+    pub debounce_floor_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingCheckpointFrequencyBounds {
+    pub allow_runtime_checkpoint_frequency_adjustment: bool,
+    pub min_mutation_threshold: u32,
+    pub max_mutation_threshold: u32,
+    pub min_dirty_time_floor_secs: u64,
+    pub max_dirty_time_floor_secs: u64,
+    pub min_debounce_floor_secs: u64,
+    pub max_debounce_floor_secs: u64,
 }
 
 pub fn map_persistence_health(health: &PersistenceHealth) -> BindingPersistenceHealth {
@@ -51,6 +71,26 @@ pub fn map_persistence_observability(
 ) -> BindingPersistenceObservability {
     BindingPersistenceObservability {
         health: map_persistence_health(&contract.health),
+        checkpoint_frequency: BindingCheckpointFrequency {
+            mutation_threshold: contract.checkpoint_frequency.mutation_threshold,
+            dirty_time_floor_secs: contract.checkpoint_frequency.dirty_time_floor_secs,
+            debounce_floor_secs: contract.checkpoint_frequency.debounce_floor_secs,
+        },
+        checkpoint_frequency_bounds: BindingCheckpointFrequencyBounds {
+            allow_runtime_checkpoint_frequency_adjustment: contract
+                .checkpoint_frequency_bounds
+                .allow_runtime_checkpoint_frequency_adjustment,
+            min_mutation_threshold: contract.checkpoint_frequency_bounds.min_mutation_threshold,
+            max_mutation_threshold: contract.checkpoint_frequency_bounds.max_mutation_threshold,
+            min_dirty_time_floor_secs: contract
+                .checkpoint_frequency_bounds
+                .min_dirty_time_floor_secs,
+            max_dirty_time_floor_secs: contract
+                .checkpoint_frequency_bounds
+                .max_dirty_time_floor_secs,
+            min_debounce_floor_secs: contract.checkpoint_frequency_bounds.min_debounce_floor_secs,
+            max_debounce_floor_secs: contract.checkpoint_frequency_bounds.max_debounce_floor_secs,
+        },
     }
 }
 
