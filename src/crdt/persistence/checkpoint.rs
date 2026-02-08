@@ -46,6 +46,10 @@ impl CheckpointScheduler {
         &self.policy
     }
 
+    pub fn set_policy(&mut self, policy: CheckpointPolicy) {
+        self.policy = policy;
+    }
+
     pub fn record_mutation(&mut self, now: Duration) {
         if self.dirty_since.is_none() {
             self.dirty_since = Some(now);

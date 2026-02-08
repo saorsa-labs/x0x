@@ -64,6 +64,38 @@ pub struct PersistenceHealth {
     pub budget_pressure: BudgetPressure,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointFrequencyContract {
+    pub mutation_threshold: u32,
+    pub dirty_time_floor_secs: u64,
+    pub debounce_floor_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointFrequencyUpdateRequest {
+    pub mutation_threshold: Option<u32>,
+    pub dirty_time_floor_secs: Option<u64>,
+    pub debounce_floor_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointFrequencyBounds {
+    pub allow_runtime_checkpoint_frequency_adjustment: bool,
+    pub min_mutation_threshold: u32,
+    pub max_mutation_threshold: u32,
+    pub min_dirty_time_floor_secs: u64,
+    pub max_dirty_time_floor_secs: u64,
+    pub min_debounce_floor_secs: u64,
+    pub max_debounce_floor_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistenceObservabilityContract {
+    pub health: PersistenceHealth,
+    pub checkpoint_frequency: CheckpointFrequencyContract,
+    pub checkpoint_frequency_bounds: CheckpointFrequencyBounds,
+}
+
 impl PersistenceHealth {
     #[must_use]
     pub fn new(mode: PersistenceMode) -> Self {

@@ -24,11 +24,13 @@ pub use backends::FileSnapshotBackend;
 pub use budget::{evaluate_budget, BudgetDecision};
 pub use checkpoint::{run_checkpoint, CheckpointAction, CheckpointScheduler};
 pub use health::{
-    is_legacy_artifact_error, BudgetPressure, PersistenceErrorCode, PersistenceErrorInfo,
-    PersistenceHealth, PersistenceState, RecoveryHealthOutcome, EVENT_BUDGET_THRESHOLD,
-    EVENT_CHECKPOINT_ATTEMPT, EVENT_CHECKPOINT_FAILURE, EVENT_CHECKPOINT_SUCCESS,
-    EVENT_DEGRADED_TRANSITION, EVENT_INIT_EMPTY, EVENT_INIT_FAILURE, EVENT_INIT_LOADED,
-    EVENT_INIT_STARTED, EVENT_LEGACY_ARTIFACT_DETECTED,
+    is_legacy_artifact_error, BudgetPressure, CheckpointFrequencyBounds,
+    CheckpointFrequencyContract, CheckpointFrequencyUpdateRequest, PersistenceErrorCode,
+    PersistenceErrorInfo, PersistenceHealth, PersistenceObservabilityContract, PersistenceState,
+    RecoveryHealthOutcome, EVENT_BUDGET_THRESHOLD, EVENT_CHECKPOINT_ATTEMPT,
+    EVENT_CHECKPOINT_FAILURE, EVENT_CHECKPOINT_SUCCESS, EVENT_DEGRADED_TRANSITION,
+    EVENT_INIT_EMPTY, EVENT_INIT_FAILURE, EVENT_INIT_LOADED, EVENT_INIT_STARTED,
+    EVENT_LEGACY_ARTIFACT_DETECTED,
 };
 pub use manifest::{
     resolve_strict_startup_manifest, ManifestError, StoreManifest, MANIFEST_FILE_NAME,
