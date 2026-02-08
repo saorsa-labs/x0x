@@ -5,6 +5,7 @@ mod config;
 mod events;
 mod health;
 mod identity;
+mod runtime_controls;
 mod task_list;
 
 pub use agent::{Agent, AgentBuilder, Message, Subscription};
@@ -18,4 +19,8 @@ pub use health::{
     BindingPersistenceHealth, BindingPersistenceObservability,
 };
 pub use identity::{AgentId, MachineId};
+pub use runtime_controls::{
+    query_persistence_observability, request_checkpoint_frequency_adjustment,
+    BindingCheckpointFrequencyUpdateRequest, BindingInvalidRequestError,
+};
 pub use task_list::{TaskList, TaskSnapshot};
