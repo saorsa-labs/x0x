@@ -8,6 +8,7 @@
 mod agent;
 mod config;
 mod events;
+mod health;
 mod identity;
 mod pubsub;
 mod task_list;
