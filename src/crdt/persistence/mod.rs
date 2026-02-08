@@ -2,9 +2,11 @@
 
 pub mod backend;
 pub mod backends;
+pub mod budget;
 pub mod manifest;
 pub mod migration;
 pub mod policy;
+pub mod retention;
 pub mod snapshot;
 
 use crate::crdt::{TaskList, TaskListId};
@@ -16,7 +18,10 @@ pub use backend::{
     PersistenceSnapshot,
 };
 pub use backends::FileSnapshotBackend;
-pub use manifest::{ManifestError, StoreManifest, MANIFEST_FILE_NAME};
+pub use budget::{evaluate_budget, BudgetDecision};
+pub use manifest::{
+    resolve_strict_startup_manifest, ManifestError, StoreManifest, MANIFEST_FILE_NAME,
+};
 pub use migration::{
     resolve_legacy_artifact_outcome, ArtifactLoadOutcome, MigrationError, MigrationResult,
     CURRENT_SNAPSHOT_SCHEMA_VERSION,
@@ -28,6 +33,7 @@ pub use policy::{
 pub use snapshot::{
     IntegrityMetadata, SnapshotDecodeError, SnapshotEnvelope, CODEC_MARKER_BINC, CODEC_VERSION_V1,
 };
+pub use retention::{enforce_retention_cycle, storage_usage_bytes, RetentionOutcome};
 
 /// Storage backend for task lists with atomic writes and error recovery.
 #[derive(Debug, Clone)]

@@ -25,6 +25,8 @@ impl StoreManifest {
 pub enum ManifestError {
     #[error("manifest missing at {0}")]
     Missing(PathBuf),
+    #[error("persistence not initialized; manifest missing at {0}")]
+    PersistenceNotInitialized(PathBuf),
     #[error("manifest serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("manifest I/O error: {0}")]
@@ -72,6 +74,25 @@ pub fn read_manifest(store_root: &Path) -> Result<StoreManifest, ManifestError> 
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+pub fn resolve_strict_startup_manifest(
+    store_root: &Path,
+    initialize_if_missing: bool,
+    default_manifest: &StoreManifest,
+) -> Result<StoreManifest, ManifestError> {
+    match read_manifest(store_root) {
+        Ok(manifest) => Ok(manifest),
+        Err(ManifestError::Missing(path)) => {
+            if !initialize_if_missing {
+                return Err(ManifestError::PersistenceNotInitialized(path));
+            }
+
+            ensure_manifest(store_root, default_manifest)?;
+            read_manifest(store_root)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +114,25 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let err = read_manifest(temp.path()).expect_err("should be missing");
         assert!(matches!(err, ManifestError::Missing(_)));
+    }
+
+    #[test]
+    fn strict_startup_requires_manifest_without_init_intent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let manifest = StoreManifest::v1("local-store");
+
+        let err = resolve_strict_startup_manifest(temp.path(), false, &manifest)
+            .expect_err("strict startup should fail when uninitialized");
+        assert!(matches!(err, ManifestError::PersistenceNotInitialized(_)));
+    }
+
+    #[test]
+    fn strict_startup_initializes_when_intent_is_explicit() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let manifest = StoreManifest::v1("local-store");
+
+        let resolved = resolve_strict_startup_manifest(temp.path(), true, &manifest)
+            .expect("strict startup should initialize");
+        assert_eq!(resolved, manifest);
     }
 }
