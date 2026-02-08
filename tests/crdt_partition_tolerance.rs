@@ -43,7 +43,7 @@ fn list_id(n: u8) -> TaskListId {
 fn metadata(title: &str, creator: u8) -> TaskMetadata {
     TaskMetadata {
         title: title.to_string(),
-        description: format!("Task: {}", title),
+        description: format!("Task: {title}"),
         priority: 128,
         created_by: agent_id(creator),
         created_at: unix_timestamp_ms(),

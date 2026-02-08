@@ -101,14 +101,13 @@ async fn test_connection_latency() {
     assert!(recv_result.is_ok(), "Message receive timed out");
 
     let latency = start.elapsed();
-    println!("Message round-trip latency: {:?}", latency);
+    println!("Message round-trip latency: {latency:?}");
 
     // Latency should be reasonable for local → VPS → local
     // Allow up to 2 seconds for global gossip propagation
     assert!(
         latency < Duration::from_secs(2),
-        "Latency too high: {:?}",
-        latency
+        "Latency too high: {latency:?}"
     );
 }
 
@@ -142,7 +141,7 @@ async fn test_connection_stability() {
         agent
             .publish(
                 "stability-test",
-                format!("msg-{}", message_count).into_bytes(),
+                format!("msg-{message_count}").into_bytes(),
             )
             .await
             .expect("Failed to publish");
@@ -168,8 +167,7 @@ async fn test_connection_stability() {
     // We should have sent at least 25 messages (300s / 10s)
     assert!(
         message_count >= 25,
-        "Expected at least 25 messages, sent {}",
-        message_count
+        "Expected at least 25 messages, sent {message_count}"
     );
 
     // We should receive at least some messages back (may not be all due to async timing)
@@ -196,7 +194,7 @@ async fn test_concurrent_connections() {
                 VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
 
             let agent = Agent::builder()
-                .with_machine_key(temp_dir.path().join(format!("machine-{}.key", i)))
+                .with_machine_key(temp_dir.path().join(format!("machine-{i}.key")))
                 .with_network_config(NetworkConfig {
                     bind_addr: Some("0.0.0.0:0".parse().unwrap()),
                     bootstrap_nodes: bootstrap_addrs,

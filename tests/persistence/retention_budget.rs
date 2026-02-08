@@ -55,7 +55,7 @@ async fn retention_budget_truncates_history_to_three_snapshots() {
         .expect("create entity directory");
 
     for idx in 1..=5 {
-        let path = entity_dir.join(format!("{:020}.snapshot", idx));
+        let path = entity_dir.join(format!("{idx:020}.snapshot"));
         fs::write(path, format!("snapshot-{idx}").as_bytes())
             .await
             .expect("write snapshot");
@@ -111,7 +111,7 @@ async fn retention_budget_ignores_malformed_snapshot_names_when_trimming() {
         .expect("create entity directory");
 
     for idx in 1..=4 {
-        let path = entity_dir.join(format!("{:020}.snapshot", idx));
+        let path = entity_dir.join(format!("{idx:020}.snapshot"));
         fs::write(path, format!("snapshot-{idx}").as_bytes())
             .await
             .expect("write valid snapshot");

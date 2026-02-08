@@ -11,6 +11,7 @@ pub enum GracefulShutdownResult {
     ContinuedInDegradedMode,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn graceful_shutdown<B: PersistenceBackend>(
     backend: &B,
     policy: &PersistencePolicy,

@@ -136,7 +136,7 @@ impl PersistenceHealth {
     }
 
     pub fn startup_fallback(&mut self, err: &PersistenceBackendError) {
-        let legacy = is_legacy_artifact_error(&err);
+        let legacy = is_legacy_artifact_error(err);
         self.state = PersistenceState::Degraded;
         self.degraded = true;
         self.last_recovery_outcome = Some(if legacy {

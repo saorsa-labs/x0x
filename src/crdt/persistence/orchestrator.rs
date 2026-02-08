@@ -150,6 +150,7 @@ pub fn checkpoint_policy_defaults(policy: &PersistencePolicy) -> CheckpointPolic
     policy.checkpoint.clone()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_graceful_shutdown_checkpoint<B: PersistenceBackend>(
     backend: &B,
     policy: &PersistencePolicy,

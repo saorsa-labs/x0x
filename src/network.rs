@@ -203,7 +203,7 @@ impl NetworkNode {
         }
 
         let node = Node::with_config(builder.build()).await.map_err(|e| {
-            NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e))
+            NetworkError::NodeCreation(format!("Failed to create ant-quic node: {e}"))
         })?;
 
         let peer_id = node.peer_id();
@@ -547,7 +547,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         let connected_peer = self
             .connect_addr(addr)
             .await
-            .map_err(|e| anyhow::anyhow!("dial failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("dial failed: {e}"))?;
 
         // Verify we connected to the expected peer
         if connected_peer != ant_peer {
@@ -556,9 +556,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                 peer, connected_peer
             );
             return Err(anyhow::anyhow!(
-                "Connected to unexpected peer {:?} when dialing {:?}",
-                connected_peer,
-                peer
+                "Connected to unexpected peer {connected_peer:?} when dialing {peer:?}"
             ));
         }
 
@@ -569,7 +567,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         let ant_peer_id = self
             .connect_addr(addr)
             .await
-            .map_err(|e| anyhow::anyhow!("bootstrap dial failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("bootstrap dial failed: {e}"))?;
         Ok(ant_to_gossip_peer_id(&ant_peer_id))
     }
 
@@ -594,7 +592,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
 
         // Check if connected
         if !self.is_connected(&ant_peer).await {
-            return Err(anyhow::anyhow!("Peer {:?} not connected", peer));
+            return Err(anyhow::anyhow!("Peer {peer:?} not connected"));
         }
 
         // Prepare message: [stream_type_byte | data]
@@ -610,7 +608,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
 
         node.send(&ant_peer, &buf)
             .await
-            .map_err(|e| anyhow::anyhow!("send failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
 
         debug!(
             "Sent {} bytes ({:?}) to peer {:?}",
@@ -919,8 +917,7 @@ mod tests {
         for expected in &expected_addrs {
             assert!(
                 config.bootstrap_nodes.contains(expected),
-                "Bootstrap nodes should include {}",
-                expected
+                "Bootstrap nodes should include {expected}"
             );
         }
 
@@ -933,7 +930,7 @@ mod tests {
         // Verify all bootstrap peer strings are valid SocketAddrs
         for peer in DEFAULT_BOOTSTRAP_PEERS {
             peer.parse::<SocketAddr>()
-                .unwrap_or_else(|_| panic!("Bootstrap peer '{}' is not a valid SocketAddr", peer));
+                .unwrap_or_else(|_| panic!("Bootstrap peer '{peer}' is not a valid SocketAddr"));
         }
     }
 
@@ -1204,7 +1201,7 @@ impl Message {
     /// Returns `NetworkError` if JSON serialization fails.
     pub fn to_json(&self) -> NetworkResult<Vec<u8>> {
         serde_json::to_vec(self)
-            .map_err(|e| NetworkError::SerializationError(format!("JSON encode failed: {}", e)))
+            .map_err(|e| NetworkError::SerializationError(format!("JSON encode failed: {e}")))
     }
 
     /// Deserialize message from JSON format.
@@ -1222,7 +1219,7 @@ impl Message {
     /// Returns `NetworkError` if JSON deserialization fails.
     pub fn from_json(data: &[u8]) -> NetworkResult<Self> {
         serde_json::from_slice(data)
-            .map_err(|e| NetworkError::SerializationError(format!("JSON decode failed: {}", e)))
+            .map_err(|e| NetworkError::SerializationError(format!("JSON decode failed: {e}")))
     }
 
     /// Serialize message to binary format (bincode).
@@ -1236,7 +1233,7 @@ impl Message {
     /// Returns `NetworkError` if binary serialization fails.
     pub fn to_binary(&self) -> NetworkResult<Vec<u8>> {
         bincode::serialize(self)
-            .map_err(|e| NetworkError::SerializationError(format!("Binary encode failed: {}", e)))
+            .map_err(|e| NetworkError::SerializationError(format!("Binary encode failed: {e}")))
     }
 
     /// Deserialize message from binary format (bincode).
@@ -1254,7 +1251,7 @@ impl Message {
     /// Returns `NetworkError` if binary deserialization fails.
     pub fn from_binary(data: &[u8]) -> NetworkResult<Self> {
         bincode::deserialize(data)
-            .map_err(|e| NetworkError::SerializationError(format!("Binary decode failed: {}", e)))
+            .map_err(|e| NetworkError::SerializationError(format!("Binary decode failed: {e}")))
     }
 
     /// Get the size of this message when serialized to binary.

@@ -428,10 +428,7 @@ impl Agent {
             .publish(topic.to_string(), bytes::Bytes::from(payload))
             .await
             .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "publish failed: {}",
-                    e
-                )))
+                error::IdentityError::Storage(std::io::Error::other(format!("publish failed: {e}")))
             })
     }
 
@@ -580,8 +577,7 @@ impl AgentBuilder {
         )
         .map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
-                "invalid startup configuration: {}",
-                e
+                "invalid startup configuration: {e}"
             )))
         })?;
 
@@ -619,8 +615,7 @@ impl AgentBuilder {
         let network = if let Some(config) = self.network_config {
             let node = network::NetworkNode::new(config).await.map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
-                    "network initialization failed: {}",
-                    e
+                    "network initialization failed: {e}"
                 )))
             })?;
             Some(std::sync::Arc::new(node))

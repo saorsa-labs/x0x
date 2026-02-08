@@ -175,11 +175,10 @@ fn health_controls_apply_in_bounds_runtime_updates_and_freeze_contract_shape() {
 
     let contract = api.observability_contract();
     assert_eq!(contract.health.mode, PersistenceMode::Degraded);
-    assert_eq!(
+    assert!(
         contract
             .checkpoint_frequency_bounds
-            .allow_runtime_checkpoint_frequency_adjustment,
-        true
+            .allow_runtime_checkpoint_frequency_adjustment
     );
     assert_eq!(contract.checkpoint_frequency.mutation_threshold, 48);
 }

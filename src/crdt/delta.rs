@@ -223,7 +223,7 @@ impl DeltaCrdt for TaskList {
         // In a real implementation, the peer_id would come from the sync context
         let peer_id = PeerId::new([0u8; 32]);
         self.merge_delta(delta, peer_id)
-            .map_err(|e| anyhow::anyhow!("Failed to merge delta: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to merge delta: {e}"))
     }
 
     fn delta(&self, since_version: u64) -> Option<Self::Delta> {
@@ -257,8 +257,8 @@ mod tests {
         let agent = agent(1);
         let task_id = TaskId::from_bytes([id_byte; 32]);
         let metadata = TaskMetadata::new(
-            format!("Task {}", id_byte),
-            format!("Description {}", id_byte),
+            format!("Task {id_byte}"),
+            format!("Description {id_byte}"),
             128,
             agent,
             1000,

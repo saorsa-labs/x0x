@@ -25,7 +25,7 @@ pub struct StartupConfig {
     pub persistence: PersistenceConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PersistenceConfig {
     pub enabled: bool,
     pub mode: Option<String>,
@@ -38,24 +38,6 @@ pub struct PersistenceConfig {
     pub retention_critical_threshold_percent: Option<u8>,
     pub strict_initialize_if_missing: Option<bool>,
     pub host_policy: HostPolicyEnvelopeConfig,
-}
-
-impl Default for PersistenceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mode: None,
-            checkpoint_mutation_threshold: None,
-            checkpoint_dirty_time_floor_secs: None,
-            checkpoint_debounce_floor_secs: None,
-            retention_checkpoints_to_keep: None,
-            retention_storage_budget_bytes: None,
-            retention_warning_threshold_percent: None,
-            retention_critical_threshold_percent: None,
-            strict_initialize_if_missing: None,
-            host_policy: HostPolicyEnvelopeConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

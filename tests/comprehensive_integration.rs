@@ -257,7 +257,7 @@ fn test_agent_creation_performance() {
     let _agent_id = AgentId([rand::random::<u8>(); 32]);
     let elapsed = start.elapsed();
 
-    println!("Agent creation time: {:?}", elapsed);
+    println!("Agent creation time: {elapsed:?}");
     assert!(
         elapsed.as_millis() < 100,
         "Agent creation should be < 100ms"
@@ -277,7 +277,7 @@ fn test_task_list_add_performance() {
     for i in 0..1000 {
         let task_id = TaskId::from_bytes([i as u8; 32]);
         let meta = TaskMetadata {
-            title: format!("Task {}", i),
+            title: format!("Task {i}"),
             description: String::new(),
             priority: 128,
             created_by: AgentId([i as u8; 32]),
@@ -291,7 +291,7 @@ fn test_task_list_add_performance() {
     let elapsed = start.elapsed();
     let per_task = elapsed.as_micros() / 1000;
 
-    println!("Added 1000 tasks in {:?} ({} μs/task)", elapsed, per_task);
+    println!("Added 1000 tasks in {elapsed:?} ({per_task} μs/task)");
     assert!(per_task < 1000, "add_task should be < 1ms per task");
 }
 
@@ -310,7 +310,7 @@ fn test_crdt_merge_performance() {
     for i in 0..100 {
         let task_id = TaskId::from_bytes([i; 32]);
         let meta = TaskMetadata {
-            title: format!("Task {}", i),
+            title: format!("Task {i}"),
             description: String::new(),
             priority: 128,
             created_by: AgentId([i; 32]),
@@ -327,7 +327,7 @@ fn test_crdt_merge_performance() {
     list1.merge(&list2).unwrap();
     let elapsed = start.elapsed();
 
-    println!("Merged 100 tasks in {:?}", elapsed);
+    println!("Merged 100 tasks in {elapsed:?}");
     assert!(elapsed.as_millis() < 10, "Merge should be < 10ms");
 }
 

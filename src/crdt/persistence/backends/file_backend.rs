@@ -142,7 +142,7 @@ impl FileSnapshotBackend {
             PersistenceBackendError::Operation("invalid snapshot file name".to_string())
         })?;
 
-        let destination = quarantine_dir.join(format!("{}-{}", reason, file_name));
+        let destination = quarantine_dir.join(format!("{reason}-{file_name}"));
         fs::rename(source, destination).await?;
         Ok(())
     }

@@ -45,7 +45,7 @@ pub fn ensure_manifest(store_root: &Path, manifest: &StoreManifest) -> Result<()
         return Ok(());
     }
 
-    let temp_path = store_root.join(format!("{}.tmp", MANIFEST_FILE_NAME));
+    let temp_path = store_root.join(format!("{MANIFEST_FILE_NAME}.tmp"));
     let bytes = serde_json::to_vec_pretty(manifest)?;
 
     let mut file = OpenOptions::new()

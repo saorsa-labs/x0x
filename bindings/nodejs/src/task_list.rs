@@ -41,9 +41,10 @@ impl TaskList {
     /// ```
     #[napi]
     pub async fn add_task(&self, title: String, description: String) -> Result<String> {
-        let task_id = self.inner.add_task(title, description).await.map_err(|e| {
-            Error::new(Status::GenericFailure, format!("Failed to add task: {}", e))
-        })?;
+        let task_id =
+            self.inner.add_task(title, description).await.map_err(|e| {
+                Error::new(Status::GenericFailure, format!("Failed to add task: {e}"))
+            })?;
 
         Ok(task_id.to_string())
     }
@@ -71,19 +72,17 @@ impl TaskList {
     #[napi]
     pub async fn claim_task(&self, task_id: String) -> Result<()> {
         let bytes = hex::decode(&task_id)
-            .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid task ID hex: {}", e)))?;
+            .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid task ID hex: {e}")))?;
         let task_id = x0x::crdt::TaskId::from_bytes(
             bytes
                 .try_into()
                 .map_err(|_| Error::new(Status::InvalidArg, "Task ID must be 32 bytes"))?,
         );
 
-        self.inner.claim_task(task_id).await.map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to claim task: {}", e),
-            )
-        })
+        self.inner
+            .claim_task(task_id)
+            .await
+            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to claim task: {e}")))
     }
 
     /// Mark a task as complete.
@@ -108,7 +107,7 @@ impl TaskList {
     #[napi]
     pub async fn complete_task(&self, task_id: String) -> Result<()> {
         let bytes = hex::decode(&task_id)
-            .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid task ID hex: {}", e)))?;
+            .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid task ID hex: {e}")))?;
         let task_id = x0x::crdt::TaskId::from_bytes(
             bytes
                 .try_into()
@@ -118,7 +117,7 @@ impl TaskList {
         self.inner.complete_task(task_id).await.map_err(|e| {
             Error::new(
                 Status::GenericFailure,
-                format!("Failed to complete task: {}", e),
+                format!("Failed to complete task: {e}"),
             )
         })
     }
@@ -142,10 +141,7 @@ impl TaskList {
     #[napi]
     pub async fn list_tasks(&self) -> Result<Vec<TaskSnapshot>> {
         let snapshots = self.inner.list_tasks().await.map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to list tasks: {}", e),
-            )
+            Error::new(Status::GenericFailure, format!("Failed to list tasks: {e}"))
         })?;
 
         Ok(snapshots.into_iter().map(TaskSnapshot::from_rust).collect())
@@ -173,9 +169,8 @@ impl TaskList {
     pub async fn reorder(&self, task_ids: Vec<String>) -> Result<()> {
         let mut task_id_list = Vec::with_capacity(task_ids.len());
         for id in task_ids {
-            let bytes = hex::decode(&id).map_err(|e| {
-                Error::new(Status::InvalidArg, format!("Invalid task ID hex: {}", e))
-            })?;
+            let bytes = hex::decode(&id)
+                .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid task ID hex: {e}")))?;
             let bytes: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| Error::new(Status::InvalidArg, "Task ID must be 32 bytes"))?;
@@ -185,7 +180,7 @@ impl TaskList {
         self.inner
             .reorder(task_id_list)
             .await
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to reorder: {}", e)))
+            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to reorder: {e}")))
     }
 }
 

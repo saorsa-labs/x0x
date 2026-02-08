@@ -345,7 +345,7 @@ fn decode_pubsub_message(data: Bytes) -> NetworkResult<(String, Bytes)> {
 
     let topic_bytes = &data[2..2 + topic_len];
     let topic = String::from_utf8(topic_bytes.to_vec()).map_err(|e| {
-        crate::error::NetworkError::SerializationError(format!("Invalid UTF-8: {}", e))
+        crate::error::NetworkError::SerializationError(format!("Invalid UTF-8: {e}"))
     })?;
 
     let payload = data.slice(2 + topic_len..);

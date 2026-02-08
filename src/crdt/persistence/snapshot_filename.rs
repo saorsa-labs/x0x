@@ -4,7 +4,7 @@ const SNAPSHOT_EXT: &str = "snapshot";
 const SNAPSHOT_TIMESTAMP_WIDTH: usize = 20;
 
 pub(crate) fn snapshot_file_name(timestamp_millis: u128) -> String {
-    format!("{:020}.{}", timestamp_millis, SNAPSHOT_EXT)
+    format!("{timestamp_millis:020}.{SNAPSHOT_EXT}")
 }
 
 pub(crate) fn snapshot_timestamp_from_path(path: &Path) -> Option<u128> {

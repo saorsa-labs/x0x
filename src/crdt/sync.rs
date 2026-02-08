@@ -252,8 +252,8 @@ mod tests {
         let agent = agent(1);
         let task_id = TaskId::from_bytes([id_byte; 32]);
         let metadata = TaskMetadata::new(
-            format!("Task {}", id_byte),
-            format!("Description {}", id_byte),
+            format!("Task {id_byte}"),
+            format!("Description {id_byte}"),
             128,
             agent,
             1000,

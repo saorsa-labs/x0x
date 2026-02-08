@@ -38,7 +38,7 @@ fn test_task_list_id(n: u8) -> TaskListId {
 fn test_metadata(title: &str, creator: u8) -> TaskMetadata {
     TaskMetadata {
         title: title.to_string(),
-        description: format!("Test task: {}", title),
+        description: format!("Test task: {title}"),
         priority: 128,
         created_by: test_agent_id(creator),
         created_at: 1000 + creator as u64,
@@ -159,7 +159,7 @@ fn test_task_list_reorder() {
     let task_ids: Vec<TaskId> = vec![test_task_id(1), test_task_id(2), test_task_id(3)];
 
     for (i, task_id) in task_ids.iter().enumerate() {
-        let metadata = test_metadata(&format!("Task {}", i), agent_id.as_bytes()[0]);
+        let metadata = test_metadata(&format!("Task {i}"), agent_id.as_bytes()[0]);
         let task = TaskItem::new(*task_id, metadata, peer_id);
         task_list
             .add_task(task, peer_id, (i + 1) as u64)
@@ -414,10 +414,10 @@ fn test_large_task_list() {
             bytes
         });
 
-        let metadata = test_metadata(&format!("Task {}", i), agent_id.as_bytes()[0]);
+        let metadata = test_metadata(&format!("Task {i}"), agent_id.as_bytes()[0]);
         let task = TaskItem::new(task_id, metadata, peer_id);
         let add_result = task_list.add_task(task, peer_id, (i + 1) as u64);
-        assert!(add_result.is_ok(), "Failed to add task {}", i);
+        assert!(add_result.is_ok(), "Failed to add task {i}");
     }
 
     assert_eq!(task_list.tasks_ordered().len(), task_count);

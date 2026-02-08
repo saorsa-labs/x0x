@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
 
     if check_only {
         println!("Configuration is valid");
-        println!("{:#?}", config);
+        println!("{config:#?}");
         return Ok(());
     }
 
@@ -259,9 +259,9 @@ async fn maintain_bootstrap_mesh(
 async fn load_config(path: &str) -> Result<BootstrapConfig> {
     let content = tokio::fs::read_to_string(path)
         .await
-        .with_context(|| format!("failed to read config file: {}", path))?;
+        .with_context(|| format!("failed to read config file: {path}"))?;
 
-    toml::from_str(&content).with_context(|| format!("failed to parse config file: {}", path))
+    toml::from_str(&content).with_context(|| format!("failed to parse config file: {path}"))
 }
 
 /// Initialize logging with structured output

@@ -120,8 +120,8 @@ async fn test_crdt_convergence_10_agents_50_tasks() {
         for j in 0..tasks_per_agent {
             let task_id = TaskId::from_bytes([(i * 10 + j) as u8; 32]);
             let meta = TaskMetadata {
-                title: format!("Task {}-{}", i, j),
-                description: format!("Agent {} task {}", i, j),
+                title: format!("Task {i}-{j}"),
+                description: format!("Agent {i} task {j}"),
                 priority: 128,
                 created_by: AgentId([i as u8; 32]),
                 created_at: 1000 + (i * 10 + j) as u64,
@@ -163,22 +163,20 @@ async fn test_crdt_convergence_10_agents_50_tasks() {
         assert_eq!(
             replica.tasks_ordered().len(),
             expected_tasks,
-            "All replicas should have {} tasks",
-            expected_tasks
+            "All replicas should have {expected_tasks} tasks"
         );
     }
 
     let summary = metrics.summary().await;
     println!("=== CRDT Convergence (10 agents, 50 tasks) ===");
-    println!("Convergence time: {:?}", convergence_time);
+    println!("Convergence time: {convergence_time:?}");
     println!("Messages sent: {}", summary.messages_sent);
     println!("Mean convergence: {:.2}ms", summary.mean_convergence_ms);
 
     // Performance targets
     assert!(
         convergence_time < Duration::from_secs(1),
-        "Convergence should be < 1s, was {:?}",
-        convergence_time
+        "Convergence should be < 1s, was {convergence_time:?}"
     );
 }
 
@@ -251,7 +249,7 @@ async fn test_convergence_with_partitions() {
     for (i, replica) in group_a.iter_mut().enumerate() {
         let task_id = TaskId::from_bytes([i as u8; 32]);
         let meta = TaskMetadata {
-            title: format!("GroupA-{}", i),
+            title: format!("GroupA-{i}"),
             description: String::new(),
             priority: 128,
             created_by: AgentId([i as u8; 32]),
@@ -276,7 +274,7 @@ async fn test_convergence_with_partitions() {
     for (i, replica) in group_b.iter_mut().enumerate() {
         let task_id = TaskId::from_bytes([(i + 5) as u8; 32]);
         let meta = TaskMetadata {
-            title: format!("GroupB-{}", i),
+            title: format!("GroupB-{i}"),
             description: String::new(),
             priority: 128,
             created_by: AgentId([(i + 5) as u8; 32]),
@@ -323,7 +321,7 @@ async fn test_convergence_with_partitions() {
         );
     }
 
-    println!("Partition heal time: {:?}", heal_time);
+    println!("Partition heal time: {heal_time:?}");
     assert!(
         heal_time < Duration::from_millis(100),
         "Partition heal should be < 100ms"

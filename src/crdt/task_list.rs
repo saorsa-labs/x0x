@@ -145,7 +145,7 @@ impl TaskList {
         let tag = (peer_id, seq);
         self.tasks
             .add(task_id, tag)
-            .map_err(|e| CrdtError::Merge(format!("Failed to add task to OR-Set: {}", e)))?;
+            .map_err(|e| CrdtError::Merge(format!("Failed to add task to OR-Set: {e}")))?;
 
         // Store or merge task data
         if let Some(existing) = self.task_data.get_mut(&task_id) {
@@ -187,7 +187,7 @@ impl TaskList {
         // Remove from OR-Set (marks as tombstone)
         self.tasks
             .remove(task_id)
-            .map_err(|e| CrdtError::Merge(format!("Failed to remove task from OR-Set: {}", e)))?;
+            .map_err(|e| CrdtError::Merge(format!("Failed to remove task from OR-Set: {e}")))?;
 
         // Remove from task data
         self.task_data.remove(task_id);
@@ -354,7 +354,7 @@ impl TaskList {
         // Merge OR-Set (task membership)
         self.tasks
             .merge_state(&other.tasks)
-            .map_err(|e| CrdtError::Merge(format!("Failed to merge task OR-Sets: {}", e)))?;
+            .map_err(|e| CrdtError::Merge(format!("Failed to merge task OR-Sets: {e}")))?;
 
         // Merge task data (HashMap)
         // For each task in other, either add it or merge it if it exists
@@ -434,8 +434,8 @@ mod tests {
         let agent = agent(1);
         let task_id = TaskId::from_bytes([id_byte; 32]);
         let metadata = TaskMetadata::new(
-            format!("Task {}", id_byte),
-            format!("Description {}", id_byte),
+            format!("Task {id_byte}"),
+            format!("Description {id_byte}"),
             128,
             agent,
             1000,
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn test_task_list_id_display() {
         let id = TaskListId::new([42u8; 32]);
-        let display = format!("{}", id);
+        let display = format!("{id}");
         assert_eq!(display.len(), 64); // 32 bytes * 2 hex chars
         assert!(display.chars().all(|c| c.is_ascii_hexdigit()));
     }

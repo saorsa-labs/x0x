@@ -61,7 +61,7 @@ impl MlsCipher {
 
         // Create cipher instance
         let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
-            .map_err(|e| MlsError::EncryptionError(format!("invalid key length: {}", e)))?;
+            .map_err(|e| MlsError::EncryptionError(format!("invalid key length: {e}")))?;
 
         // Create nonce
         let nonce_arr = Nonce::from_slice(&nonce[..12]); // ChaCha20-Poly1305 uses 12-byte nonces
@@ -74,7 +74,7 @@ impl MlsCipher {
 
         cipher
             .encrypt(nonce_arr, payload)
-            .map_err(|e| MlsError::EncryptionError(format!("encryption failed: {}", e)))
+            .map_err(|e| MlsError::EncryptionError(format!("encryption failed: {e}")))
     }
 
     /// Decrypts ciphertext with authenticated decryption.
@@ -106,7 +106,7 @@ impl MlsCipher {
 
         // Create cipher instance
         let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
-            .map_err(|e| MlsError::EncryptionError(format!("invalid key length: {}", e)))?;
+            .map_err(|e| MlsError::EncryptionError(format!("invalid key length: {e}")))?;
 
         // Create nonce
         let nonce_arr = Nonce::from_slice(&nonce[..12]);
@@ -119,7 +119,7 @@ impl MlsCipher {
 
         cipher
             .decrypt(nonce_arr, payload)
-            .map_err(|e| MlsError::DecryptionError(format!("decryption failed: {}", e)))
+            .map_err(|e| MlsError::DecryptionError(format!("decryption failed: {e}")))
     }
 
     /// Derives a unique nonce for a specific message counter.
