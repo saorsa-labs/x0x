@@ -23,23 +23,26 @@ pub fn evaluate_budget(
         };
     }
 
-    let percent_used = used_bytes.saturating_mul(100) / budget;
-    if percent_used >= 100 {
+    if used_bytes >= budget {
         return match mode {
             PersistenceMode::Strict => BudgetDecision::StrictFailAtCapacity,
             PersistenceMode::Degraded => BudgetDecision::DegradedSkipAtCapacity,
         };
     }
 
-    if percent_used >= u64::from(retention.critical_threshold_percent) {
+    if reaches_threshold(used_bytes, budget, retention.critical_threshold_percent) {
         return BudgetDecision::Warning90;
     }
 
-    if percent_used >= u64::from(retention.warning_threshold_percent) {
+    if reaches_threshold(used_bytes, budget, retention.warning_threshold_percent) {
         return BudgetDecision::Warning80;
     }
 
     BudgetDecision::BelowWarning
+}
+
+fn reaches_threshold(used_bytes: u64, budget: u64, threshold_percent: u8) -> bool {
+    u128::from(used_bytes) * 100 >= u128::from(budget) * u128::from(threshold_percent)
 }
 
 #[cfg(test)]

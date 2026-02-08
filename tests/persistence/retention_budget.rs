@@ -18,6 +18,33 @@ fn retention_budget_mode_specific_full_budget_behavior() {
     );
 }
 
+#[test]
+fn retention_budget_threshold_boundaries_are_deterministic_for_non_divisible_budget() {
+    let retention = RetentionPolicy {
+        storage_budget_bytes: 101,
+        warning_threshold_percent: 80,
+        critical_threshold_percent: 90,
+        ..RetentionPolicy::default()
+    };
+
+    assert_eq!(
+        evaluate_budget(&retention, PersistenceMode::Degraded, 80),
+        BudgetDecision::BelowWarning
+    );
+    assert_eq!(
+        evaluate_budget(&retention, PersistenceMode::Degraded, 81),
+        BudgetDecision::Warning80
+    );
+    assert_eq!(
+        evaluate_budget(&retention, PersistenceMode::Degraded, 90),
+        BudgetDecision::Warning80
+    );
+    assert_eq!(
+        evaluate_budget(&retention, PersistenceMode::Degraded, 91),
+        BudgetDecision::Warning90
+    );
+}
+
 #[tokio::test]
 async fn retention_budget_truncates_history_to_three_snapshots() {
     let temp = tempfile::tempdir().expect("temp dir");
