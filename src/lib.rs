@@ -53,6 +53,12 @@
 /// Error types for x0x identity and network operations.
 pub mod error;
 
+/// Startup/runtime configuration loading and validation.
+pub mod config;
+
+/// Runtime state containers and policy wiring.
+pub mod runtime;
+
 /// Core identity types for x0x agents.
 ///
 /// This module provides the cryptographic identity foundation for x0x:
@@ -115,6 +121,8 @@ pub struct Agent {
     network: Option<std::sync::Arc<network::NetworkNode>>,
     /// The gossip runtime for pub/sub messaging.
     gossip_runtime: Option<std::sync::Arc<gossip::GossipRuntime>>,
+    /// Resolved persistence runtime policy state.
+    persistence_runtime: runtime::PersistenceRuntime,
 }
 
 /// A message received from the gossip network.
@@ -163,6 +171,7 @@ pub struct AgentBuilder {
     agent_keypair: Option<identity::AgentKeypair>,
     #[allow(dead_code)]
     network_config: Option<network::NetworkConfig>,
+    startup_config: config::StartupConfig,
 }
 
 impl Agent {
@@ -186,6 +195,7 @@ impl Agent {
             machine_key_path: None,
             agent_keypair: None,
             network_config: None,
+            startup_config: config::StartupConfig::default(),
         }
     }
 
@@ -233,6 +243,12 @@ impl Agent {
     #[must_use]
     pub fn network(&self) -> Option<&std::sync::Arc<network::NetworkNode>> {
         self.network.as_ref()
+    }
+
+    /// Get resolved persistence runtime policy state.
+    #[must_use]
+    pub fn persistence_runtime(&self) -> &runtime::PersistenceRuntime {
+        &self.persistence_runtime
     }
 
     /// Join the x0x gossip network.
@@ -508,6 +524,13 @@ impl AgentBuilder {
         self
     }
 
+    /// Set startup configuration, including persistence policy inputs.
+    #[must_use]
+    pub fn with_startup_config(mut self, config: crate::config::StartupConfig) -> Self {
+        self.startup_config = config;
+        self
+    }
+
     /// Build and initialise the agent.
     ///
     /// This performs the following:
@@ -524,6 +547,14 @@ impl AgentBuilder {
     /// - Storage I/O fails
     /// - Keypair deserialization fails
     pub async fn build(self) -> error::Result<Agent> {
+        let persistence_runtime = runtime::PersistenceRuntime::from_startup_config(&self.startup_config)
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "invalid startup configuration: {}",
+                    e
+                )))
+            })?;
+
         // Determine machine keypair source
         let machine_keypair = if let Some(path) = self.machine_key_path {
             // Try to load from custom path
@@ -580,6 +611,7 @@ impl AgentBuilder {
             identity,
             network,
             gossip_runtime,
+            persistence_runtime,
         })
     }
 }
