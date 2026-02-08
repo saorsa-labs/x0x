@@ -98,7 +98,7 @@ async fn failure_mode_corrupt_snapshot_is_quarantined_and_reported() {
         .await
         .expect_err("corrupt snapshot should fail");
 
-    assert!(matches!(err, PersistenceBackendError::SnapshotCorrupt { .. }));
+    assert!(matches!(err, PersistenceBackendError::NoLoadableSnapshot(_)));
     assert!(
         fs::try_exists(entity_dir.join("quarantine"))
             .await
@@ -132,7 +132,7 @@ async fn failure_mode_legacy_encrypted_artifact_is_mode_deterministic() {
         .expect_err("strict mode should fail");
     assert!(matches!(
         strict_err,
-        PersistenceBackendError::UnsupportedLegacyEncryptedArtifact { .. }
+        PersistenceBackendError::NoLoadableSnapshot(_)
     ));
 
     let degraded_temp = tempfile::tempdir().expect("degraded temp");
@@ -158,7 +158,18 @@ async fn failure_mode_legacy_encrypted_artifact_is_mode_deterministic() {
         .expect_err("degraded mode should skip artifact");
     assert!(matches!(
         degraded_err,
-        PersistenceBackendError::DegradedSkippedLegacyArtifact { .. }
+        PersistenceBackendError::NoLoadableSnapshot(_)
+    ));
+}
+
+#[test]
+fn failure_mode_legacy_artifact_detection_helper_is_explicitly_covered() {
+    let legacy_payload = br#"{"ciphertext":"abc","nonce":"123","key_id":"legacy"}"#;
+    assert!(x0x::crdt::persistence::snapshot::looks_like_legacy_encrypted_artifact(
+        legacy_payload
+    ));
+    assert!(!x0x::crdt::persistence::snapshot::looks_like_legacy_encrypted_artifact(
+        b"not-json"
     ));
 }
 

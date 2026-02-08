@@ -60,8 +60,8 @@ async fn file_backend_atomicity_quarantines_corrupt_snapshot() {
     let err = backend
         .load_latest(entity)
         .await
-        .expect_err("corrupt latest should not be accepted");
-    assert!(matches!(err, PersistenceBackendError::SnapshotCorrupt { .. }));
+        .expect("older valid snapshot should load after corrupt latest is quarantined");
+    assert_eq!(err.payload, b"baseline");
 
     let quarantine_dir = entity_dir.join("quarantine");
     assert!(fs::try_exists(&quarantine_dir).await.expect("quarantine dir check"));
@@ -87,13 +87,39 @@ async fn file_backend_atomicity_legacy_artifacts_are_mode_deterministic() {
     .await
     .expect("write strict legacy artifact");
 
-    let strict_err = strict_backend
+    strict_backend
+        .checkpoint(&checkpoint_request(entity), &snapshot(entity, b"strict-valid"))
+        .await
+        .expect("write strict valid snapshot");
+
+    let strict_loaded = strict_backend
         .load_latest(entity)
         .await
-        .expect_err("strict mode should fail");
+        .expect("strict mode should skip legacy and load valid snapshot");
+    assert_eq!(strict_loaded.payload, b"strict-valid");
+
+    let strict_legacy_only_entity = "entity-c-strict-legacy-only";
+    let strict_legacy_only_path = strict_temp
+        .path()
+        .join(strict_legacy_only_entity)
+        .join("00000000000000000001.snapshot");
+    fs::create_dir_all(strict_legacy_only_path.parent().expect("parent"))
+        .await
+        .expect("create strict legacy-only entity dir");
+    fs::write(
+        &strict_legacy_only_path,
+        br#"{"ciphertext":"abc","nonce":"123","key_id":"legacy"}"#,
+    )
+    .await
+    .expect("write strict legacy-only artifact");
+
+    let strict_legacy_only_err = strict_backend
+        .load_latest(strict_legacy_only_entity)
+        .await
+        .expect_err("strict mode with only legacy artifacts should report no loadable snapshot");
     assert!(matches!(
-        strict_err,
-        PersistenceBackendError::UnsupportedLegacyEncryptedArtifact { .. }
+        strict_legacy_only_err,
+        PersistenceBackendError::NoLoadableSnapshot(_) 
     ));
 
     let degraded_temp = tempfile::tempdir().expect("degraded temp dir");
@@ -113,13 +139,39 @@ async fn file_backend_atomicity_legacy_artifacts_are_mode_deterministic() {
     .await
     .expect("write degraded legacy artifact");
 
-    let degraded_err = degraded_backend
+    degraded_backend
+        .checkpoint(&checkpoint_request(entity), &snapshot(entity, b"degraded-valid"))
+        .await
+        .expect("write degraded valid snapshot");
+
+    let degraded_loaded = degraded_backend
         .load_latest(entity)
         .await
-        .expect_err("degraded mode should skip with typed error");
+        .expect("degraded mode should skip legacy and load valid snapshot");
+    assert_eq!(degraded_loaded.payload, b"degraded-valid");
+
+    let degraded_legacy_only_entity = "entity-c-degraded-legacy-only";
+    let degraded_legacy_only_path = degraded_temp
+        .path()
+        .join(degraded_legacy_only_entity)
+        .join("00000000000000000001.snapshot");
+    fs::create_dir_all(degraded_legacy_only_path.parent().expect("parent"))
+        .await
+        .expect("create degraded legacy-only entity dir");
+    fs::write(
+        &degraded_legacy_only_path,
+        br#"{"ciphertext":"abc","nonce":"123","key_id":"legacy"}"#,
+    )
+    .await
+    .expect("write degraded legacy-only artifact");
+
+    let degraded_legacy_only_err = degraded_backend
+        .load_latest(degraded_legacy_only_entity)
+        .await
+        .expect_err("degraded mode with only legacy artifacts should report no loadable snapshot");
     assert!(matches!(
-        degraded_err,
-        PersistenceBackendError::DegradedSkippedLegacyArtifact { .. }
+        degraded_legacy_only_err,
+        PersistenceBackendError::NoLoadableSnapshot(_)
     ));
 }
 

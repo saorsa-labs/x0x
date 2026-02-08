@@ -5,13 +5,14 @@ use crate::crdt::persistence::health::{
     EVENT_CHECKPOINT_ATTEMPT, EVENT_CHECKPOINT_FAILURE, EVENT_CHECKPOINT_SUCCESS,
     EVENT_LEGACY_ARTIFACT_DETECTED,
 };
-use crate::crdt::persistence::migration::{resolve_legacy_artifact_outcome, ArtifactLoadOutcome};
+use crate::crdt::persistence::migration::resolve_legacy_artifact_outcome;
 use crate::crdt::persistence::policy::PersistenceMode;
 use crate::crdt::persistence::snapshot::{SnapshotDecodeError, SnapshotEnvelope};
 use crate::crdt::persistence::snapshot_filename::{
     snapshot_file_name, snapshot_timestamp_from_path,
 };
 use async_trait::async_trait;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
@@ -29,12 +30,60 @@ impl FileSnapshotBackend {
         Self { root, mode }
     }
 
-    fn entity_dir(&self, entity_id: &str) -> PathBuf {
-        self.root.join(entity_id)
+    fn validate_entity_id(entity_id: &str) -> Result<(), PersistenceBackendError> {
+        if entity_id.is_empty() {
+            return Err(PersistenceBackendError::InvalidEntityId {
+                entity_id: entity_id.to_string(),
+                reason: "entity_id must not be empty".to_string(),
+            });
+        }
+
+        if entity_id.contains('/') || entity_id.contains('\\') {
+            return Err(PersistenceBackendError::InvalidEntityId {
+                entity_id: entity_id.to_string(),
+                reason: "path separators are not allowed".to_string(),
+            });
+        }
+
+        if entity_id.contains('%') {
+            return Err(PersistenceBackendError::InvalidEntityId {
+                entity_id: entity_id.to_string(),
+                reason: "percent-encoded path segments are not allowed".to_string(),
+            });
+        }
+
+        let mut components = Path::new(entity_id).components();
+        let Some(component) = components.next() else {
+            return Err(PersistenceBackendError::InvalidEntityId {
+                entity_id: entity_id.to_string(),
+                reason: "entity_id path components are invalid".to_string(),
+            });
+        };
+
+        if components.next().is_some() {
+            return Err(PersistenceBackendError::InvalidEntityId {
+                entity_id: entity_id.to_string(),
+                reason: "nested paths are not allowed".to_string(),
+            });
+        }
+
+        if !matches!(component, Component::Normal(_)) {
+            return Err(PersistenceBackendError::InvalidEntityId {
+                entity_id: entity_id.to_string(),
+                reason: "absolute and traversal paths are not allowed".to_string(),
+            });
+        }
+
+        Ok(())
     }
 
-    fn quarantine_dir(&self, entity_id: &str) -> PathBuf {
-        self.entity_dir(entity_id).join("quarantine")
+    fn entity_dir(&self, entity_id: &str) -> Result<PathBuf, PersistenceBackendError> {
+        Self::validate_entity_id(entity_id)?;
+        Ok(self.root.join(entity_id))
+    }
+
+    fn quarantine_dir(&self, entity_id: &str) -> Result<PathBuf, PersistenceBackendError> {
+        Ok(self.entity_dir(entity_id)?.join("quarantine"))
     }
 
     async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PersistenceBackendError> {
@@ -60,7 +109,7 @@ impl FileSnapshotBackend {
         &self,
         entity_id: &str,
     ) -> Result<Vec<PathBuf>, PersistenceBackendError> {
-        let dir = self.entity_dir(entity_id);
+        let dir = self.entity_dir(entity_id)?;
         if !fs::try_exists(&dir).await? {
             return Ok(Vec::new());
         }
@@ -84,7 +133,7 @@ impl FileSnapshotBackend {
         source: &Path,
         reason: &str,
     ) -> Result<(), PersistenceBackendError> {
-        let quarantine_dir = self.quarantine_dir(entity_id);
+        let quarantine_dir = self.quarantine_dir(entity_id)?;
         fs::create_dir_all(&quarantine_dir).await?;
 
         let file_name = source.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
@@ -129,7 +178,7 @@ impl PersistenceBackend for FileSnapshotBackend {
             .map_err(|e| PersistenceBackendError::Operation(e.to_string()))?;
 
         let path = self
-            .entity_dir(&request.entity_id)
+            .entity_dir(&request.entity_id)?
             .join(snapshot_file_name(timestamp_millis));
         match Self::write_atomic(&path, &encoded).await {
             Ok(()) => {
@@ -182,49 +231,31 @@ impl PersistenceBackend for FileSnapshotBackend {
                 Err(SnapshotDecodeError::Migration(
                     crate::crdt::persistence::migration::MigrationError::UnsupportedLegacyEncryptedArtifact,
                 )) => {
-                    let outcome = resolve_legacy_artifact_outcome(self.mode);
-                    let path_display = path.display().to_string();
                     tracing::warn!(
                         event = EVENT_LEGACY_ARTIFACT_DETECTED,
                         mode = self.mode.as_str(),
-                        path = path_display,
-                        outcome = format!("{:?}", outcome)
+                        path = path.display().to_string(),
+                        outcome = format!("{:?}", resolve_legacy_artifact_outcome(self.mode))
                     );
-                    return match outcome {
-                        ArtifactLoadOutcome::StrictFail(_) => {
-                            Err(PersistenceBackendError::UnsupportedLegacyEncryptedArtifact {
-                                path: path_display,
-                            })
-                        }
-                        ArtifactLoadOutcome::DegradedSkip(_) => {
-                            Err(PersistenceBackendError::DegradedSkippedLegacyArtifact {
-                                path: path_display,
-                            })
-                        }
-                        ArtifactLoadOutcome::Load(_) => {
-                            Err(PersistenceBackendError::Operation(
-                                "invalid artifact outcome for legacy encrypted snapshot".to_string(),
-                            ))
-                        }
-                    };
+                    continue;
                 }
                 Err(err) => {
                     self.quarantine(entity_id, &path, "corrupt").await?;
-                    return Err(PersistenceBackendError::SnapshotCorrupt {
-                        path: path.display().to_string(),
-                        reason: err.to_string(),
-                    });
+                    tracing::warn!(
+                        event = "persistence.snapshot.skipped_corrupt",
+                        mode = self.mode.as_str(),
+                        path = path.display().to_string(),
+                        reason = err.to_string()
+                    );
                 }
             }
         }
 
-        Err(PersistenceBackendError::NoLoadableSnapshot(
-            entity_id.to_string(),
-        ))
+        Err(PersistenceBackendError::NoLoadableSnapshot(entity_id.to_string()))
     }
 
     async fn delete_entity(&self, entity_id: &str) -> Result<(), PersistenceBackendError> {
-        let dir = self.entity_dir(entity_id);
+        let dir = self.entity_dir(entity_id)?;
         if fs::try_exists(&dir).await? {
             fs::remove_dir_all(dir).await?;
         }

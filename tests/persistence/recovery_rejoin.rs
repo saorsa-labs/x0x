@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::fs;
 use x0x::crdt::persistence::{
-    recover_task_list_startup, CheckpointReason, CheckpointRequest, PersistenceBackend,
-    PersistenceBackendError, PersistencePolicy, PersistenceSnapshot, RecoveryOutcome,
+    backends::file_backend::FileSnapshotBackend, recover_task_list_startup, CheckpointReason,
+    CheckpointRequest, PersistenceBackend, PersistenceBackendError, PersistenceMode,
+    PersistencePolicy, PersistenceSnapshot, RecoveryOutcome,
 };
 use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
 use x0x::identity::AgentId;
@@ -187,6 +189,98 @@ async fn startup_recovery_empty_store_is_degraded_mode_safe() {
     )
     .await
     .expect("degraded mode startup should proceed");
+
+    assert_eq!(recovered.recovery.outcome, RecoveryOutcome::EmptyStore);
+    assert_eq!(recovered.task_list.task_count(), 0);
+}
+
+#[tokio::test]
+async fn startup_recovery_scans_newest_to_oldest_until_first_valid_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let backend = FileSnapshotBackend::new(temp.path().to_path_buf(), PersistenceMode::Degraded);
+    let entity_id = "project-recovery-scan";
+    let entity_dir = temp.path().join(entity_id);
+    fs::create_dir_all(&entity_dir)
+        .await
+        .expect("create entity directory");
+
+    let valid_list = TaskList::new(list_id(6), "recovery-scan".to_string(), peer(6));
+    backend
+        .checkpoint(
+            &CheckpointRequest {
+                entity_id: entity_id.to_string(),
+                mutation_count: 1,
+                reason: CheckpointReason::ExplicitRequest,
+            },
+            &PersistenceSnapshot {
+                entity_id: entity_id.to_string(),
+                schema_version: 2,
+                payload: valid_list
+                    .to_persistence_payload()
+                    .expect("serialize valid snapshot"),
+            },
+        )
+        .await
+        .expect("write valid snapshot");
+
+    fs::write(
+        entity_dir.join("99999999999999999999.snapshot"),
+        br#"{"ciphertext":"abc","nonce":"123","key_id":"legacy"}"#,
+    )
+    .await
+    .expect("write legacy candidate");
+    fs::write(entity_dir.join("99999999999999999998.snapshot"), b"not-json")
+        .await
+        .expect("write corrupt candidate");
+
+    let recovered = recover_task_list_startup(
+        &backend,
+        &PersistencePolicy {
+            enabled: true,
+            ..PersistencePolicy::default()
+        },
+        temp.path(),
+        entity_id,
+        TaskList::new(list_id(7), "empty".to_string(), peer(7)),
+    )
+    .await
+    .expect("startup should recover from first valid older snapshot");
+
+    assert_eq!(recovered.recovery.outcome, RecoveryOutcome::LoadedSnapshot);
+    assert_eq!(recovered.task_list.task_count(), 0);
+}
+
+#[tokio::test]
+async fn startup_recovery_returns_empty_store_when_no_valid_snapshot_exists() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let backend = FileSnapshotBackend::new(temp.path().to_path_buf(), PersistenceMode::Degraded);
+    let entity_id = "project-recovery-no-valid";
+    let entity_dir = temp.path().join(entity_id);
+    fs::create_dir_all(&entity_dir)
+        .await
+        .expect("create entity directory");
+    fs::write(
+        entity_dir.join("00000000000000000001.snapshot"),
+        br#"{"ciphertext":"abc","nonce":"123","key_id":"legacy"}"#,
+    )
+    .await
+    .expect("write legacy artifact");
+    fs::write(entity_dir.join("00000000000000000002.snapshot"), b"not-json")
+        .await
+        .expect("write corrupt artifact");
+
+    let recovered = recover_task_list_startup(
+        &backend,
+        &PersistencePolicy {
+            enabled: true,
+            ..PersistencePolicy::default()
+        },
+        temp.path(),
+        entity_id,
+        TaskList::new(list_id(8), "empty".to_string(), peer(8)),
+    )
+    .await
+    .expect("degraded mode should continue with empty store when no valid snapshots remain");
 
     assert_eq!(recovered.recovery.outcome, RecoveryOutcome::EmptyStore);
     assert_eq!(recovered.task_list.task_count(), 0);

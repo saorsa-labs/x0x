@@ -194,10 +194,7 @@ async fn observability_logs_emit_legacy_artifact_detection_event() {
         .load_latest(entity_id)
         .await
         .expect_err("legacy artifact must fail load");
-    assert!(matches!(
-        err,
-        PersistenceBackendError::DegradedSkippedLegacyArtifact { .. }
-    ));
+    assert!(matches!(err, PersistenceBackendError::NoLoadableSnapshot(_)));
 
     let events = parse_events(&writer);
     let detected = events.iter().any(|entry| {

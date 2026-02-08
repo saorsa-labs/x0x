@@ -40,6 +40,8 @@ pub enum PersistenceBackendError {
     UnsupportedLegacyEncryptedArtifact { path: String },
     #[error("degraded mode skipped unsupported legacy encrypted snapshot artifact at {path}")]
     DegradedSkippedLegacyArtifact { path: String },
+    #[error("invalid persistence entity_id '{entity_id}': {reason}")]
+    InvalidEntityId { entity_id: String, reason: String },
     #[error("backend I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("backend operation failed: {0}")]
