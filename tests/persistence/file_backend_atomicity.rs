@@ -68,6 +68,48 @@ async fn file_backend_atomicity_quarantines_corrupt_snapshot() {
 }
 
 #[tokio::test]
+async fn file_backend_atomicity_skips_unreadable_newest_snapshot_and_loads_older_valid_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let backend = FileSnapshotBackend::new(temp.path().to_path_buf(), PersistenceMode::Strict);
+    let entity = "entity-unreadable";
+
+    backend
+        .checkpoint(&checkpoint_request(entity), &snapshot(entity, b"baseline"))
+        .await
+        .expect("write baseline snapshot");
+
+    let entity_dir = temp.path().join(entity);
+    let unreadable_newest = entity_dir.join("99999999999999999999.snapshot");
+    fs::create_dir_all(&unreadable_newest)
+        .await
+        .expect("create unreadable newest snapshot directory");
+
+    let loaded = backend
+        .load_latest(entity)
+        .await
+        .expect("older valid snapshot should load when newest candidate is unreadable");
+    assert_eq!(loaded.payload, b"baseline");
+}
+
+#[tokio::test]
+async fn file_backend_atomicity_unreadable_candidates_without_valid_snapshot_return_no_loadable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let backend = FileSnapshotBackend::new(temp.path().to_path_buf(), PersistenceMode::Strict);
+    let entity = "entity-only-unreadable";
+
+    let entity_dir = temp.path().join(entity);
+    fs::create_dir_all(entity_dir.join("99999999999999999999.snapshot"))
+        .await
+        .expect("create unreadable candidate directory");
+
+    let err = backend
+        .load_latest(entity)
+        .await
+        .expect_err("unreadable-only candidates should not fail with an I/O short-circuit");
+    assert!(matches!(err, PersistenceBackendError::NoLoadableSnapshot(_)));
+}
+
+#[tokio::test]
 async fn file_backend_atomicity_legacy_artifacts_are_mode_deterministic() {
     let strict_temp = tempfile::tempdir().expect("strict temp dir");
     let strict_backend =

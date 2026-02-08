@@ -213,7 +213,18 @@ impl PersistenceBackend for FileSnapshotBackend {
         }
 
         for path in snapshots {
-            let bytes = fs::read(&path).await?;
+            let bytes = match fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(
+                        event = "persistence.snapshot.skipped_unreadable",
+                        mode = self.mode.as_str(),
+                        path = path.display().to_string(),
+                        reason = err.to_string()
+                    );
+                    continue;
+                }
+            };
             match SnapshotEnvelope::decode(&bytes) {
                 Ok((decoded, migration_result)) => {
                     tracing::info!(
