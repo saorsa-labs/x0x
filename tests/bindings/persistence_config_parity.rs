@@ -4,7 +4,6 @@ mod node_config;
 mod python_config;
 
 use x0x::config::{ConfigError, StartupConfig};
-use x0x::crdt::persistence::PersistencePolicyError;
 
 #[test]
 fn persistence_config_parity_defaults_match_core_resolution() {
@@ -110,7 +109,7 @@ fn persistence_config_parity_mode_parsing_matches_core_contract() {
 }
 
 #[test]
-fn persistence_config_parity_strict_init_requires_explicit_intent() {
+fn persistence_config_parity_allows_strict_without_init_intent_at_resolution_boundary() {
     let node_result =
         node_config::resolve_persistence_config(node_config::BindingPersistenceConfigInput {
             enabled: true,
@@ -125,16 +124,11 @@ fn persistence_config_parity_strict_init_requires_explicit_intent() {
             ..python_config::BindingPersistenceConfigInput::default()
         });
 
-    assert!(matches!(
-        node_result,
-        Err(ConfigError::InvalidPersistencePolicy(
-            PersistencePolicyError::StrictInitRequiresExplicitIntent
-        ))
-    ));
-    assert!(matches!(
-        python_result,
-        Err(ConfigError::InvalidPersistencePolicy(
-            PersistencePolicyError::StrictInitRequiresExplicitIntent
-        ))
-    ));
+    let node = node_result.expect("node strict config should resolve");
+    let python = python_result.expect("python strict config should resolve");
+
+    assert_eq!(node.mode, "strict");
+    assert!(!node.strict_initialize_if_missing);
+    assert_eq!(python.mode, "strict");
+    assert!(!python.strict_initialize_if_missing);
 }

@@ -121,12 +121,6 @@ impl PersistencePolicy {
             });
         }
 
-        if matches!(self.mode, PersistenceMode::Strict)
-            && !self.strict_initialization.initialize_if_missing
-        {
-            return Err(PersistencePolicyError::StrictInitRequiresExplicitIntent);
-        }
-
         Ok(())
     }
 }
@@ -141,8 +135,6 @@ pub enum PersistencePolicyError {
     InvalidDebounceFloor,
     #[error("invalid retention thresholds: warning={warning}, critical={critical}")]
     InvalidRetentionThresholds { warning: u8, critical: u8 },
-    #[error("strict mode requires explicit initialize_if_missing intent")]
-    StrictInitRequiresExplicitIntent,
 }
 
 #[cfg(test)]
@@ -196,17 +188,14 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_requires_explicit_initialize_intent() {
+    fn strict_mode_allows_resolution_without_initialize_intent() {
         let mut policy = PersistencePolicy {
             enabled: true,
             mode: PersistenceMode::Strict,
             ..PersistencePolicy::default()
         };
 
-        assert_eq!(
-            policy.validate().unwrap_err(),
-            PersistencePolicyError::StrictInitRequiresExplicitIntent
-        );
+        assert!(policy.validate().is_ok());
 
         policy.strict_initialization.initialize_if_missing = true;
         assert!(policy.validate().is_ok());
