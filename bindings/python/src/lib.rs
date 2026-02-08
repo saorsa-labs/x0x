@@ -6,6 +6,7 @@
 #![allow(non_local_definitions)] // False positive with pyo3 0.20 macros
 
 mod agent;
+mod config;
 mod events;
 mod identity;
 mod pubsub;
