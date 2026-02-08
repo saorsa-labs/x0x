@@ -36,7 +36,7 @@
 //! // Subscribe to a topic and receive messages
 //! let mut rx = agent.subscribe("coordination").await?;
 //! while let Some(msg) = rx.recv().await {
-//!     println!("{}: {:?}", msg.origin, msg.payload);
+//!     println!("{}: {:?}", msg.topic, msg.payload);
 //! }
 //! # Ok(())
 //! # }
