@@ -8,14 +8,14 @@ use crate::crdt::persistence::health::{
 use crate::crdt::persistence::migration::{resolve_legacy_artifact_outcome, ArtifactLoadOutcome};
 use crate::crdt::persistence::policy::PersistenceMode;
 use crate::crdt::persistence::snapshot::{SnapshotDecodeError, SnapshotEnvelope};
+use crate::crdt::persistence::snapshot_filename::{
+    snapshot_file_name, snapshot_timestamp_from_path,
+};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-
-const SNAPSHOT_EXT: &str = "snapshot";
-const SNAPSHOT_TIMESTAMP_WIDTH: usize = 20;
 
 #[derive(Debug, Clone)]
 pub struct FileSnapshotBackend {
@@ -35,10 +35,6 @@ impl FileSnapshotBackend {
 
     fn quarantine_dir(&self, entity_id: &str) -> PathBuf {
         self.entity_dir(entity_id).join("quarantine")
-    }
-
-    fn snapshot_file_name(timestamp_millis: u128) -> String {
-        format!("{:020}.{}", timestamp_millis, SNAPSHOT_EXT)
     }
 
     async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PersistenceBackendError> {
@@ -108,20 +104,6 @@ impl FileSnapshotBackend {
     }
 }
 
-fn snapshot_timestamp_from_path(path: &Path) -> Option<u128> {
-    let extension = path.extension().and_then(|ext| ext.to_str())?;
-    if extension != SNAPSHOT_EXT {
-        return None;
-    }
-
-    let stem = path.file_stem().and_then(|stem| stem.to_str())?;
-    if stem.len() != SNAPSHOT_TIMESTAMP_WIDTH || !stem.as_bytes().iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-
-    stem.parse::<u128>().ok()
-}
-
 #[async_trait]
 impl PersistenceBackend for FileSnapshotBackend {
     async fn checkpoint(
@@ -148,7 +130,7 @@ impl PersistenceBackend for FileSnapshotBackend {
 
         let path = self
             .entity_dir(&request.entity_id)
-            .join(Self::snapshot_file_name(timestamp_millis));
+            .join(snapshot_file_name(timestamp_millis));
         match Self::write_atomic(&path, &encoded).await {
             Ok(()) => {
                 tracing::info!(

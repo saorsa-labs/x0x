@@ -1,10 +1,8 @@
+use crate::crdt::persistence::snapshot_filename::snapshot_timestamp_from_path;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
-
-const SNAPSHOT_EXT: &str = "snapshot";
-const SNAPSHOT_TIMESTAMP_WIDTH: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionOutcome {
@@ -103,18 +101,4 @@ async fn trim_entity_snapshots(entity_dir: &Path, keep: usize) -> Result<usize, 
     }
 
     Ok(deleted)
-}
-
-fn snapshot_timestamp_from_path(path: &Path) -> Option<u128> {
-    let extension = path.extension().and_then(|ext| ext.to_str())?;
-    if extension != SNAPSHOT_EXT {
-        return None;
-    }
-
-    let stem = path.file_stem().and_then(|stem| stem.to_str())?;
-    if stem.len() != SNAPSHOT_TIMESTAMP_WIDTH || !stem.as_bytes().iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-
-    stem.parse::<u128>().ok()
 }

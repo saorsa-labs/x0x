@@ -55,13 +55,16 @@ impl SnapshotEnvelope {
     }
 
     pub fn decode(input: &[u8]) -> Result<(Self, MigrationResult), SnapshotDecodeError> {
-        if looks_like_legacy_encrypted_artifact(input) {
+        let value: Value = serde_json::from_slice(input)
+            .map_err(|e| SnapshotDecodeError::InvalidEncoding(e.to_string()))?;
+
+        if looks_like_legacy_encrypted_artifact_value(&value) {
             return Err(SnapshotDecodeError::Migration(
                 MigrationError::UnsupportedLegacyEncryptedArtifact,
             ));
         }
 
-        let envelope: Self = serde_json::from_slice(input)
+        let envelope: Self = serde_json::from_value(value)
             .map_err(|e| SnapshotDecodeError::InvalidEncoding(e.to_string()))?;
 
         if envelope.codec_marker != CODEC_MARKER_BINC {
@@ -84,6 +87,10 @@ pub fn looks_like_legacy_encrypted_artifact(input: &[u8]) -> bool {
         return false;
     };
 
+    looks_like_legacy_encrypted_artifact_value(&value)
+}
+
+fn looks_like_legacy_encrypted_artifact_value(value: &Value) -> bool {
     let Value::Object(map) = value else {
         return false;
     };
@@ -131,5 +138,12 @@ mod tests {
             err,
             SnapshotDecodeError::Migration(MigrationError::UnsupportedLegacyEncryptedArtifact)
         );
+    }
+
+    #[test]
+    fn snapshot_decode_invalid_json_remains_invalid_encoding_error() {
+        let err =
+            SnapshotEnvelope::decode(b"not-json").expect_err("invalid json should fail decode");
+        assert!(matches!(err, SnapshotDecodeError::InvalidEncoding(_)));
     }
 }
