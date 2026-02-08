@@ -1,6 +1,10 @@
 use crate::crdt::persistence::backend::{
     CheckpointRequest, PersistenceBackend, PersistenceBackendError, PersistenceSnapshot,
 };
+use crate::crdt::persistence::health::{
+    EVENT_CHECKPOINT_ATTEMPT, EVENT_CHECKPOINT_FAILURE, EVENT_CHECKPOINT_SUCCESS,
+    EVENT_LEGACY_ARTIFACT_DETECTED,
+};
 use crate::crdt::persistence::migration::{resolve_legacy_artifact_outcome, ArtifactLoadOutcome};
 use crate::crdt::persistence::policy::PersistenceMode;
 use crate::crdt::persistence::snapshot::{SnapshotDecodeError, SnapshotEnvelope};
@@ -115,6 +119,13 @@ impl PersistenceBackend for FileSnapshotBackend {
         request: &CheckpointRequest,
         snapshot: &PersistenceSnapshot,
     ) -> Result<(), PersistenceBackendError> {
+        tracing::info!(
+            event = EVENT_CHECKPOINT_ATTEMPT,
+            entity_id = request.entity_id,
+            reason = format!("{:?}", request.reason),
+            mutation_count = request.mutation_count
+        );
+
         let timestamp_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| PersistenceBackendError::Operation(e.to_string()))?
@@ -128,7 +139,27 @@ impl PersistenceBackend for FileSnapshotBackend {
         let path = self
             .entity_dir(&request.entity_id)
             .join(Self::snapshot_file_name(timestamp_millis));
-        Self::write_atomic(&path, &encoded).await
+        match Self::write_atomic(&path, &encoded).await {
+            Ok(()) => {
+                tracing::info!(
+                    event = EVENT_CHECKPOINT_SUCCESS,
+                    entity_id = request.entity_id,
+                    path = path.display().to_string(),
+                    reason = format!("{:?}", request.reason)
+                );
+                Ok(())
+            }
+            Err(err) => {
+                tracing::error!(
+                    event = EVENT_CHECKPOINT_FAILURE,
+                    entity_id = request.entity_id,
+                    path = path.display().to_string(),
+                    reason = format!("{:?}", request.reason),
+                    error = err.to_string()
+                );
+                Err(err)
+            }
+        }
     }
 
     async fn load_latest(
@@ -143,7 +174,13 @@ impl PersistenceBackend for FileSnapshotBackend {
         for path in snapshots {
             let bytes = fs::read(&path).await?;
             match SnapshotEnvelope::decode(&bytes) {
-                Ok((decoded, _migration_result)) => {
+                Ok((decoded, migration_result)) => {
+                    tracing::info!(
+                        event = "persistence.migration.decision",
+                        mode = self.mode.as_str(),
+                        path = path.display().to_string(),
+                        decision = format!("{:?}", migration_result)
+                    );
                     return Ok(PersistenceSnapshot {
                         entity_id: entity_id.to_string(),
                         schema_version: decoded.schema_version,
@@ -155,6 +192,12 @@ impl PersistenceBackend for FileSnapshotBackend {
                 )) => {
                     let outcome = resolve_legacy_artifact_outcome(self.mode);
                     let path_display = path.display().to_string();
+                    tracing::warn!(
+                        event = EVENT_LEGACY_ARTIFACT_DETECTED,
+                        mode = self.mode.as_str(),
+                        path = path_display,
+                        outcome = format!("{:?}", outcome)
+                    );
                     return match outcome {
                         ArtifactLoadOutcome::StrictFail(_) => {
                             Err(PersistenceBackendError::UnsupportedLegacyEncryptedArtifact {

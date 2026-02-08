@@ -1,4 +1,12 @@
 use crate::crdt::persistence::{
+    EVENT_CHECKPOINT_ATTEMPT,
+    EVENT_CHECKPOINT_FAILURE,
+    EVENT_CHECKPOINT_SUCCESS,
+    EVENT_DEGRADED_TRANSITION,
+    EVENT_INIT_EMPTY,
+    EVENT_INIT_FAILURE,
+    EVENT_INIT_LOADED,
+    EVENT_INIT_STARTED,
     resolve_strict_startup_manifest,
     run_checkpoint,
     CheckpointPolicy,
@@ -92,29 +100,63 @@ pub async fn recover_task_list_startup<B: PersistenceBackend>(
     entity_id: &str,
     empty_task_list: TaskList,
 ) -> Result<RecoveredTaskList, OrchestratorError> {
+    tracing::info!(
+        event = EVENT_INIT_STARTED,
+        entity_id,
+        mode = policy.mode.as_str()
+    );
+
     ensure_manifest_for_mode(policy, store_root, entity_id)?;
 
     match backend.load_latest(entity_id).await {
         Ok(snapshot) => {
             let decoded = TaskList::from_persistence_payload(&snapshot.payload)
                 .map_err(|err| OrchestratorError::SnapshotDecode(err.to_string()))?;
+            tracing::info!(
+                event = EVENT_INIT_LOADED,
+                entity_id,
+                mode = policy.mode.as_str(),
+                schema_version = snapshot.schema_version
+            );
             Ok(RecoveredTaskList {
                 task_list: decoded,
                 recovery: RecoveryState::loaded(),
             })
         }
         Err(PersistenceBackendError::SnapshotNotFound(_))
-        | Err(PersistenceBackendError::NoLoadableSnapshot(_)) => Ok(RecoveredTaskList {
-            task_list: empty_task_list,
-            recovery: RecoveryState::empty_store(),
-        }),
+        | Err(PersistenceBackendError::NoLoadableSnapshot(_)) => {
+            tracing::info!(
+                event = EVENT_INIT_EMPTY,
+                entity_id,
+                mode = policy.mode.as_str()
+            );
+            Ok(RecoveredTaskList {
+                task_list: empty_task_list,
+                recovery: RecoveryState::empty_store(),
+            })
+        }
         Err(err) if matches!(policy.mode, PersistenceMode::Strict) => {
+            tracing::error!(
+                event = EVENT_INIT_FAILURE,
+                entity_id,
+                mode = policy.mode.as_str(),
+                error = err.to_string()
+            );
             Err(OrchestratorError::StartupLoad(err))
         }
-        Err(err) => Ok(RecoveredTaskList {
-            task_list: empty_task_list,
-            recovery: RecoveryState::degraded_fallback(err.to_string()),
-        }),
+        Err(err) => {
+            tracing::warn!(
+                event = EVENT_DEGRADED_TRANSITION,
+                entity_id,
+                mode = policy.mode.as_str(),
+                reason = "startup_fallback",
+                error = err.to_string()
+            );
+            Ok(RecoveredTaskList {
+                task_list: empty_task_list,
+                recovery: RecoveryState::degraded_fallback(err.to_string()),
+            })
+        }
     }
 }
 
@@ -137,6 +179,13 @@ pub async fn run_graceful_shutdown_checkpoint<B: PersistenceBackend>(
     }
 
     let mutation_count = scheduler.mutation_count();
+    tracing::info!(
+        event = EVENT_CHECKPOINT_ATTEMPT,
+        entity_id,
+        mode = policy.mode.as_str(),
+        reason = "graceful_shutdown",
+        mutation_count
+    );
     match run_checkpoint(
         backend,
         entity_id,
@@ -149,14 +198,34 @@ pub async fn run_graceful_shutdown_checkpoint<B: PersistenceBackend>(
     {
         Ok(()) => {
             scheduler.mark_checkpoint(now);
+            tracing::info!(
+                event = EVENT_CHECKPOINT_SUCCESS,
+                entity_id,
+                mode = policy.mode.as_str(),
+                reason = "graceful_shutdown"
+            );
             Ok(ShutdownCheckpointOutcome::Persisted)
         }
         Err(err) if matches!(policy.mode, PersistenceMode::Strict) => {
+            tracing::error!(
+                event = EVENT_CHECKPOINT_FAILURE,
+                entity_id,
+                mode = policy.mode.as_str(),
+                reason = "graceful_shutdown",
+                error = err.to_string()
+            );
             Err(OrchestratorError::Checkpoint(err))
         }
         Err(err) => {
             recovery_state.degraded = true;
             recovery_state.last_error = Some(err.to_string());
+            tracing::warn!(
+                event = EVENT_DEGRADED_TRANSITION,
+                entity_id,
+                mode = policy.mode.as_str(),
+                reason = "graceful_shutdown",
+                error = recovery_state.last_error.as_deref().unwrap_or("unknown")
+            );
             Ok(ShutdownCheckpointOutcome::DegradedContinued)
         }
     }
@@ -171,10 +240,20 @@ fn ensure_manifest_for_mode(
         return Ok(());
     }
 
-    resolve_strict_startup_manifest(
+    let resolved = resolve_strict_startup_manifest(
         store_root,
         policy.strict_initialization.initialize_if_missing,
         &StoreManifest::v1(entity_id),
-    )?;
+    );
+    if let Err(err) = resolved {
+        tracing::error!(
+            event = EVENT_INIT_FAILURE,
+            entity_id,
+            mode = policy.mode.as_str(),
+            error = err.to_string()
+        );
+        return Err(err);
+    }
+
     Ok(())
 }

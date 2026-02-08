@@ -1,5 +1,16 @@
 use crate::crdt::persistence::{BudgetDecision, PersistenceBackendError, PersistenceMode};
 
+pub const EVENT_INIT_STARTED: &str = "persistence.init.started";
+pub const EVENT_INIT_LOADED: &str = "persistence.init.loaded";
+pub const EVENT_INIT_EMPTY: &str = "persistence.init.empty_store";
+pub const EVENT_INIT_FAILURE: &str = "persistence.init.failure";
+pub const EVENT_CHECKPOINT_ATTEMPT: &str = "persistence.checkpoint.attempt";
+pub const EVENT_CHECKPOINT_SUCCESS: &str = "persistence.checkpoint.success";
+pub const EVENT_CHECKPOINT_FAILURE: &str = "persistence.checkpoint.failure";
+pub const EVENT_BUDGET_THRESHOLD: &str = "persistence.budget.threshold";
+pub const EVENT_LEGACY_ARTIFACT_DETECTED: &str = "persistence.legacy_artifact.detected";
+pub const EVENT_DEGRADED_TRANSITION: &str = "persistence.health.degraded_transition";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceState {
     StartingUp,
@@ -71,6 +82,12 @@ impl PersistenceHealth {
         self.degraded = false;
         self.last_recovery_outcome = Some(RecoveryHealthOutcome::LoadedSnapshot);
         self.last_error = None;
+        tracing::info!(
+            event = EVENT_INIT_LOADED,
+            mode = self.mode.as_str(),
+            state = self.state.as_str(),
+            degraded = self.degraded
+        );
     }
 
     pub fn startup_empty_store(&mut self) {
@@ -78,6 +95,12 @@ impl PersistenceHealth {
         self.degraded = false;
         self.last_recovery_outcome = Some(RecoveryHealthOutcome::EmptyStore);
         self.last_error = None;
+        tracing::info!(
+            event = EVENT_INIT_EMPTY,
+            mode = self.mode.as_str(),
+            state = self.state.as_str(),
+            degraded = self.degraded
+        );
     }
 
     pub fn startup_fallback(&mut self, err: &PersistenceBackendError) {
@@ -104,6 +127,20 @@ impl PersistenceHealth {
                     .to_string()
             },
         });
+        tracing::warn!(
+            event = EVENT_DEGRADED_TRANSITION,
+            mode = self.mode.as_str(),
+            state = self.state.as_str(),
+            degraded = self.degraded,
+            error_code = self
+                .last_error
+                .as_ref()
+                .map_or("unknown", |error| error.code.as_str()),
+            error = self
+                .last_error
+                .as_ref()
+                .map_or("unknown", |error| error.message.as_str())
+        );
     }
 
     pub fn strict_init_failure(&mut self, err: impl Into<String>) {
@@ -116,6 +153,17 @@ impl PersistenceHealth {
             remediation: "Fix strict initialization prerequisites (manifest/store) and restart."
                 .to_string(),
         });
+        tracing::error!(
+            event = EVENT_INIT_FAILURE,
+            mode = self.mode.as_str(),
+            state = self.state.as_str(),
+            degraded = self.degraded,
+            error_code = PersistenceErrorCode::StrictInitializationFailure.as_str(),
+            error = self
+                .last_error
+                .as_ref()
+                .map_or("unknown", |error| error.message.as_str())
+        );
     }
 
     pub fn checkpoint_succeeded(&mut self) {
@@ -123,6 +171,12 @@ impl PersistenceHealth {
             self.state = PersistenceState::Ready;
             self.last_error = None;
         }
+        tracing::info!(
+            event = EVENT_CHECKPOINT_SUCCESS,
+            mode = self.mode.as_str(),
+            state = self.state.as_str(),
+            degraded = self.degraded
+        );
     }
 
     pub fn checkpoint_failed(&mut self, err: &PersistenceBackendError, strict_mode: bool) {
@@ -136,13 +190,36 @@ impl PersistenceHealth {
         if strict_mode {
             self.state = PersistenceState::Failed;
             self.degraded = true;
+            tracing::error!(
+                event = EVENT_CHECKPOINT_FAILURE,
+                mode = self.mode.as_str(),
+                state = self.state.as_str(),
+                degraded = self.degraded,
+                error_code = PersistenceErrorCode::CheckpointFailure.as_str(),
+                error = self
+                    .last_error
+                    .as_ref()
+                    .map_or("unknown", |error| error.message.as_str())
+            );
         } else {
             self.state = PersistenceState::Degraded;
             self.degraded = true;
+            tracing::warn!(
+                event = EVENT_CHECKPOINT_FAILURE,
+                mode = self.mode.as_str(),
+                state = self.state.as_str(),
+                degraded = self.degraded,
+                error_code = PersistenceErrorCode::CheckpointFailure.as_str(),
+                error = self
+                    .last_error
+                    .as_ref()
+                    .map_or("unknown", |error| error.message.as_str())
+            );
         }
     }
 
     pub fn apply_budget_decision(&mut self, decision: BudgetDecision) {
+        let previous = self.budget_pressure;
         match decision {
             BudgetDecision::BelowWarning => {
                 self.budget_pressure = BudgetPressure::Normal;
@@ -176,6 +253,67 @@ impl PersistenceHealth {
                             .to_string(),
                 });
             }
+        }
+
+        if previous != self.budget_pressure {
+            tracing::warn!(
+                event = EVENT_BUDGET_THRESHOLD,
+                mode = self.mode.as_str(),
+                state = self.state.as_str(),
+                degraded = self.degraded,
+                budget_pressure = self.budget_pressure.as_str()
+            );
+        }
+    }
+}
+
+impl PersistenceMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PersistenceMode::Strict => "strict",
+            PersistenceMode::Degraded => "degraded",
+        }
+    }
+}
+
+impl PersistenceState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PersistenceState::StartingUp => "starting_up",
+            PersistenceState::Ready => "ready",
+            PersistenceState::Degraded => "degraded",
+            PersistenceState::Failed => "failed",
+        }
+    }
+}
+
+impl BudgetPressure {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetPressure::Normal => "normal",
+            BudgetPressure::Warning => "warning",
+            BudgetPressure::Critical => "critical",
+            BudgetPressure::AtCapacity => "at_capacity",
+        }
+    }
+}
+
+impl PersistenceErrorCode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PersistenceErrorCode::StartupLoadFailure => "startup_load_failure",
+            PersistenceErrorCode::StrictInitializationFailure => "strict_initialization_failure",
+            PersistenceErrorCode::CheckpointFailure => "checkpoint_failure",
+            PersistenceErrorCode::UnsupportedLegacyEncryptedArtifact => {
+                "unsupported_legacy_encrypted_artifact"
+            }
+            PersistenceErrorCode::BudgetWarning => "budget_warning",
+            PersistenceErrorCode::BudgetCritical => "budget_critical",
+            PersistenceErrorCode::BudgetAtCapacity => "budget_at_capacity",
         }
     }
 }
