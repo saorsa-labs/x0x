@@ -3,11 +3,11 @@ use crate::crdt::persistence::checkpoint::{run_checkpoint, CheckpointAction, Che
 use crate::crdt::persistence::{
     CheckpointFrequencyBounds, CheckpointFrequencyContract, CheckpointFrequencyUpdateRequest,
     CheckpointPolicy, PersistenceBackend, PersistenceBackendError, PersistenceHealth,
-    PersistenceMode, PersistenceObservabilityContract, PersistencePolicy, PersistenceSnapshot,
-    RetentionPolicy, StrictInitializationPolicy,
+    PersistenceMode, PersistenceObservabilityContract, PersistenceSnapshot,
 };
 use crate::runtime::policy_bounds::{
-    apply_checkpoint_frequency_update, PolicyBoundsError, RuntimeCheckpointPolicyUpdate,
+    apply_checkpoint_frequency_update_to_checkpoint_policy, PolicyBoundsError,
+    RuntimeCheckpointPolicyUpdate,
 };
 use std::time::{Duration, Instant};
 
@@ -147,18 +147,8 @@ impl<B: PersistenceBackend> AgentCheckpointApi<B> {
         &mut self,
         update: CheckpointFrequencyUpdateRequest,
     ) -> Result<CheckpointFrequencyContract, AgentApiError> {
-        let current_policy = PersistencePolicy {
-            enabled: true,
-            mode: self.health.mode,
-            checkpoint: self.scheduler.policy().clone(),
-            retention: RetentionPolicy::default(),
-            strict_initialization: StrictInitializationPolicy {
-                initialize_if_missing: false,
-            },
-        };
-
-        let resolved = apply_checkpoint_frequency_update(
-            &current_policy,
+        let resolved = apply_checkpoint_frequency_update_to_checkpoint_policy(
+            self.scheduler.policy(),
             &self.host_policy,
             &RuntimeCheckpointPolicyUpdate {
                 mutation_threshold: update.mutation_threshold,
@@ -167,7 +157,7 @@ impl<B: PersistenceBackend> AgentCheckpointApi<B> {
             },
         )?;
 
-        self.scheduler.set_policy(resolved.checkpoint);
+        self.scheduler.set_policy(resolved);
         Ok(self.checkpoint_frequency_contract())
     }
 

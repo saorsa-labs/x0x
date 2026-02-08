@@ -1,7 +1,7 @@
 //! Host policy envelope bounds for runtime-adjustable persistence controls.
 
 use crate::config::HostPolicyEnvelopeConfig;
-use crate::crdt::persistence::PersistencePolicy;
+use crate::crdt::persistence::{CheckpointPolicy, PersistencePolicy};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +117,22 @@ pub fn apply_checkpoint_frequency_update(
     envelope: &HostPolicyEnvelopeConfig,
     update: &RuntimeCheckpointPolicyUpdate,
 ) -> Result<PersistencePolicy, PolicyBoundsError> {
+    let next_checkpoint = apply_checkpoint_frequency_update_to_checkpoint_policy(
+        &policy.checkpoint,
+        envelope,
+        update,
+    )?;
+
+    let mut next = policy.clone();
+    next.checkpoint = next_checkpoint;
+    Ok(next)
+}
+
+pub fn apply_checkpoint_frequency_update_to_checkpoint_policy(
+    checkpoint: &CheckpointPolicy,
+    envelope: &HostPolicyEnvelopeConfig,
+    update: &RuntimeCheckpointPolicyUpdate,
+) -> Result<CheckpointPolicy, PolicyBoundsError> {
     validate_host_envelope(envelope)?;
 
     if !envelope.allow_runtime_checkpoint_frequency_adjustment
@@ -127,7 +143,7 @@ pub fn apply_checkpoint_frequency_update(
         return Err(PolicyBoundsError::RuntimeCheckpointAdjustmentNotAllowed);
     }
 
-    let mut next = policy.clone();
+    let mut next = checkpoint.clone();
 
     if let Some(mutation_threshold) = update.mutation_threshold {
         if mutation_threshold < envelope.min_mutation_threshold
@@ -140,7 +156,7 @@ pub fn apply_checkpoint_frequency_update(
             });
         }
 
-        next.checkpoint.mutation_threshold = mutation_threshold;
+        next.mutation_threshold = mutation_threshold;
     }
 
     if let Some(dirty_time_floor) = update.dirty_time_floor {
@@ -155,7 +171,7 @@ pub fn apply_checkpoint_frequency_update(
             });
         }
 
-        next.checkpoint.dirty_time_floor = dirty_time_floor;
+        next.dirty_time_floor = dirty_time_floor;
     }
 
     if let Some(debounce_floor) = update.debounce_floor {
@@ -169,7 +185,7 @@ pub fn apply_checkpoint_frequency_update(
             });
         }
 
-        next.checkpoint.debounce_floor = debounce_floor;
+        next.debounce_floor = debounce_floor;
     }
 
     Ok(next)

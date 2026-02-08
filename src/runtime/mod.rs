@@ -8,7 +8,8 @@ pub use agent_api::{
 };
 pub use persistence_runtime::{EnabledPersistenceRuntime, PersistenceRuntime};
 pub use policy_bounds::{
-    apply_checkpoint_frequency_update, ensure_policy_within_envelope, validate_host_envelope,
-    PolicyBoundsError, RuntimeCheckpointPolicyUpdate,
+    apply_checkpoint_frequency_update, apply_checkpoint_frequency_update_to_checkpoint_policy,
+    ensure_policy_within_envelope, validate_host_envelope, PolicyBoundsError,
+    RuntimeCheckpointPolicyUpdate,
 };
 pub use shutdown::{graceful_shutdown, GracefulShutdownResult};
