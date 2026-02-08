@@ -1,6 +1,9 @@
 mod node_binding {
     pub mod health {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/bindings/nodejs/src/health.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/bindings/nodejs/src/health.rs"
+        ));
     }
     pub mod runtime_controls {
         include!(concat!(
@@ -12,7 +15,10 @@ mod node_binding {
 
 mod python_binding {
     pub mod health {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/bindings/python/src/health.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/bindings/python/src/health.rs"
+        ));
     }
     pub mod runtime_controls {
         include!(concat!(
@@ -97,10 +103,7 @@ fn persistence_control_bounds_reject_disallowed_runtime_adjustments() {
     )
     .expect_err("python request should be rejected");
 
-    assert_eq!(
-        node_err.code,
-        "runtime_checkpoint_adjustment_not_allowed"
-    );
+    assert_eq!(node_err.code, "runtime_checkpoint_adjustment_not_allowed");
     assert_eq!(python_err.code, node_err.code);
     assert_eq!(python_err.message, node_err.message);
 }
@@ -183,31 +186,44 @@ fn persistence_control_bounds_observability_parity_includes_bounds_contract() {
 
     assert_eq!(
         node.checkpoint_frequency_bounds.min_mutation_threshold,
-        observability.checkpoint_frequency_bounds.min_mutation_threshold
+        observability
+            .checkpoint_frequency_bounds
+            .min_mutation_threshold
     );
     assert_eq!(
         node.checkpoint_frequency_bounds.max_mutation_threshold,
-        observability.checkpoint_frequency_bounds.max_mutation_threshold
+        observability
+            .checkpoint_frequency_bounds
+            .max_mutation_threshold
     );
     assert_eq!(
         node.checkpoint_frequency_bounds.min_dirty_time_floor_secs,
-        observability.checkpoint_frequency_bounds.min_dirty_time_floor_secs
+        observability
+            .checkpoint_frequency_bounds
+            .min_dirty_time_floor_secs
     );
     assert_eq!(
         node.checkpoint_frequency_bounds.max_dirty_time_floor_secs,
-        observability.checkpoint_frequency_bounds.max_dirty_time_floor_secs
+        observability
+            .checkpoint_frequency_bounds
+            .max_dirty_time_floor_secs
     );
     assert_eq!(
         node.checkpoint_frequency_bounds.min_debounce_floor_secs,
-        observability.checkpoint_frequency_bounds.min_debounce_floor_secs
+        observability
+            .checkpoint_frequency_bounds
+            .min_debounce_floor_secs
     );
     assert_eq!(
         node.checkpoint_frequency_bounds.max_debounce_floor_secs,
-        observability.checkpoint_frequency_bounds.max_debounce_floor_secs
+        observability
+            .checkpoint_frequency_bounds
+            .max_debounce_floor_secs
     );
 
     assert_eq!(
-        node.checkpoint_frequency_bounds.allow_runtime_checkpoint_frequency_adjustment,
+        node.checkpoint_frequency_bounds
+            .allow_runtime_checkpoint_frequency_adjustment,
         python
             .checkpoint_frequency_bounds
             .allow_runtime_checkpoint_frequency_adjustment

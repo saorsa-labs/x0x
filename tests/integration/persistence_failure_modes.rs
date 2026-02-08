@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use saorsa_gossip_types::PeerId;
 use std::io;
 use std::time::Duration;
 use tokio::fs;
@@ -9,7 +10,6 @@ use x0x::crdt::persistence::{
     RecoveryOutcome, RecoveryState, ShutdownCheckpointOutcome,
 };
 use x0x::crdt::{TaskList, TaskListId};
-use saorsa_gossip_types::PeerId;
 
 struct FailingCheckpointBackend {
     error: PersistenceBackendError,
@@ -26,7 +26,9 @@ impl PersistenceBackend for FailingCheckpointBackend {
             PersistenceBackendError::Io(_) => {
                 PersistenceBackendError::Io(io::Error::other("simulated io error"))
             }
-            PersistenceBackendError::Operation(msg) => PersistenceBackendError::Operation(msg.clone()),
+            PersistenceBackendError::Operation(msg) => {
+                PersistenceBackendError::Operation(msg.clone())
+            }
             other => PersistenceBackendError::Operation(other.to_string()),
         })
     }
@@ -35,7 +37,9 @@ impl PersistenceBackend for FailingCheckpointBackend {
         &self,
         entity_id: &str,
     ) -> Result<PersistenceSnapshot, PersistenceBackendError> {
-        Err(PersistenceBackendError::SnapshotNotFound(entity_id.to_string()))
+        Err(PersistenceBackendError::SnapshotNotFound(
+            entity_id.to_string(),
+        ))
     }
 
     async fn delete_entity(&self, _entity_id: &str) -> Result<(), PersistenceBackendError> {
@@ -89,21 +93,25 @@ async fn failure_mode_corrupt_snapshot_is_quarantined_and_reported() {
     fs::create_dir_all(&entity_dir)
         .await
         .expect("create entity directory");
-    fs::write(entity_dir.join("99999999999999999999.snapshot"), b"not-json")
-        .await
-        .expect("write corrupt snapshot");
+    fs::write(
+        entity_dir.join("99999999999999999999.snapshot"),
+        b"not-json",
+    )
+    .await
+    .expect("write corrupt snapshot");
 
     let err = backend
         .load_latest(entity)
         .await
         .expect_err("corrupt snapshot should fail");
 
-    assert!(matches!(err, PersistenceBackendError::NoLoadableSnapshot(_)));
-    assert!(
-        fs::try_exists(entity_dir.join("quarantine"))
-            .await
-            .expect("quarantine check")
-    );
+    assert!(matches!(
+        err,
+        PersistenceBackendError::NoLoadableSnapshot(_)
+    ));
+    assert!(fs::try_exists(entity_dir.join("quarantine"))
+        .await
+        .expect("quarantine check"));
 }
 
 #[tokio::test]
@@ -136,8 +144,10 @@ async fn failure_mode_legacy_encrypted_artifact_is_mode_deterministic() {
     ));
 
     let degraded_temp = tempfile::tempdir().expect("degraded temp");
-    let degraded_backend =
-        FileSnapshotBackend::new(degraded_temp.path().to_path_buf(), PersistenceMode::Degraded);
+    let degraded_backend = FileSnapshotBackend::new(
+        degraded_temp.path().to_path_buf(),
+        PersistenceMode::Degraded,
+    );
     let degraded_path = degraded_temp
         .path()
         .join(entity)
@@ -165,12 +175,8 @@ async fn failure_mode_legacy_encrypted_artifact_is_mode_deterministic() {
 #[test]
 fn failure_mode_legacy_artifact_detection_helper_is_explicitly_covered() {
     let legacy_payload = br#"{"ciphertext":"abc","nonce":"123","key_id":"legacy"}"#;
-    assert!(x0x::crdt::persistence::snapshot::looks_like_legacy_encrypted_artifact(
-        legacy_payload
-    ));
-    assert!(!x0x::crdt::persistence::snapshot::looks_like_legacy_encrypted_artifact(
-        b"not-json"
-    ));
+    assert!(x0x::crdt::persistence::snapshot::looks_like_legacy_encrypted_artifact(legacy_payload));
+    assert!(!x0x::crdt::persistence::snapshot::looks_like_legacy_encrypted_artifact(b"not-json"));
 }
 
 #[tokio::test]
@@ -201,9 +207,9 @@ async fn failure_mode_shutdown_checkpoint_handles_disk_full_and_io_errors() {
 
     assert!(matches!(
         strict_err,
-        x0x::crdt::persistence::OrchestratorError::Checkpoint(
-            PersistenceBackendError::Operation(_)
-        )
+        x0x::crdt::persistence::OrchestratorError::Checkpoint(PersistenceBackendError::Operation(
+            _
+        ))
     ));
 
     let mut degraded_scheduler = CheckpointScheduler::new(CheckpointPolicy::default());

@@ -96,11 +96,9 @@ async fn retention_budget_removes_orphan_entity_directories_on_cycle() {
         .expect("run retention");
     assert_eq!(outcome.deleted_orphan_entities, 1);
 
-    assert!(
-        !fs::try_exists(temp.path().join(orphan))
-            .await
-            .expect("check orphan existence")
-    );
+    assert!(!fs::try_exists(temp.path().join(orphan))
+        .await
+        .expect("check orphan existence"));
 }
 
 #[tokio::test]

@@ -37,14 +37,15 @@ pub use migration::{
     CURRENT_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use orchestrator::{
-    checkpoint_policy_defaults, recover_task_list_startup, OrchestratorError, RecoveredTaskList,
-    RecoveryOutcome, RecoveryState, ShutdownCheckpointOutcome, run_graceful_shutdown_checkpoint,
+    checkpoint_policy_defaults, recover_task_list_startup, run_graceful_shutdown_checkpoint,
+    OrchestratorError, RecoveredTaskList, RecoveryOutcome, RecoveryState,
+    ShutdownCheckpointOutcome,
 };
 pub use policy::{
-    CheckpointPolicy, PersistenceMode, PersistencePolicy, PersistencePolicyError,
-    RetentionPolicy, StrictInitializationPolicy,
+    CheckpointPolicy, PersistenceMode, PersistencePolicy, PersistencePolicyError, RetentionPolicy,
+    StrictInitializationPolicy,
 };
+pub use retention::{enforce_retention_cycle, storage_usage_bytes, RetentionOutcome};
 pub use snapshot::{
     IntegrityMetadata, SnapshotDecodeError, SnapshotEnvelope, CODEC_MARKER_BINC, CODEC_VERSION_V1,
 };
-pub use retention::{enforce_retention_cycle, storage_usage_bytes, RetentionOutcome};

@@ -1,23 +1,9 @@
 use crate::crdt::persistence::{
-    EVENT_CHECKPOINT_ATTEMPT,
-    EVENT_CHECKPOINT_FAILURE,
-    EVENT_CHECKPOINT_SUCCESS,
-    EVENT_DEGRADED_TRANSITION,
-    EVENT_INIT_EMPTY,
-    EVENT_INIT_FAILURE,
-    EVENT_INIT_LOADED,
-    EVENT_INIT_STARTED,
-    resolve_strict_startup_manifest,
-    run_checkpoint,
-    CheckpointPolicy,
-    CheckpointReason,
-    CheckpointScheduler,
-    ManifestError,
-    PersistenceBackend,
-    PersistenceBackendError,
-    PersistenceMode,
-    PersistencePolicy,
-    StoreManifest,
+    resolve_strict_startup_manifest, run_checkpoint, CheckpointPolicy, CheckpointReason,
+    CheckpointScheduler, ManifestError, PersistenceBackend, PersistenceBackendError,
+    PersistenceMode, PersistencePolicy, StoreManifest, EVENT_CHECKPOINT_ATTEMPT,
+    EVENT_CHECKPOINT_FAILURE, EVENT_CHECKPOINT_SUCCESS, EVENT_DEGRADED_TRANSITION,
+    EVENT_INIT_EMPTY, EVENT_INIT_FAILURE, EVENT_INIT_LOADED, EVENT_INIT_STARTED,
 };
 use crate::crdt::TaskList;
 use std::path::Path;

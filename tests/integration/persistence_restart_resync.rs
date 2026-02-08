@@ -1,3 +1,4 @@
+use saorsa_gossip_types::PeerId;
 use tokio::time::{sleep, Duration};
 use x0x::crdt::persistence::{
     backends::file_backend::FileSnapshotBackend, recover_task_list_startup, CheckpointReason,
@@ -5,7 +6,6 @@ use x0x::crdt::persistence::{
 };
 use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
 use x0x::identity::AgentId;
-use saorsa_gossip_types::PeerId;
 
 fn peer(n: u8) -> PeerId {
     PeerId::new([n; 32])
@@ -49,7 +49,9 @@ async fn restart_resync_recovers_snapshot_and_converges_after_merge() {
             &x0x::crdt::persistence::PersistenceSnapshot {
                 entity_id: entity_id.to_string(),
                 schema_version: 2,
-                payload: baseline.to_persistence_payload().expect("serialize baseline"),
+                payload: baseline
+                    .to_persistence_payload()
+                    .expect("serialize baseline"),
             },
         )
         .await
@@ -107,7 +109,9 @@ async fn restart_resync_converges_with_delayed_out_of_order_state_delivery() {
             &x0x::crdt::persistence::PersistenceSnapshot {
                 entity_id: entity_id.to_string(),
                 schema_version: 2,
-                payload: persisted.to_persistence_payload().expect("serialize persisted"),
+                payload: persisted
+                    .to_persistence_payload()
+                    .expect("serialize persisted"),
             },
         )
         .await

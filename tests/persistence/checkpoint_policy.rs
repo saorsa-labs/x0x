@@ -14,17 +14,11 @@ struct CountingBackend {
 
 impl CountingBackend {
     fn write_count(&self) -> usize {
-        self.writes
-            .lock()
-            .expect("counting backend lock")
-            .len()
+        self.writes.lock().expect("counting backend lock").len()
     }
 
     fn reasons(&self) -> Vec<CheckpointReason> {
-        self.writes
-            .lock()
-            .expect("counting backend lock")
-            .clone()
+        self.writes.lock().expect("counting backend lock").clone()
     }
 }
 

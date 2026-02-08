@@ -131,9 +131,9 @@ fn health_controls_reject_out_of_bounds_runtime_updates() {
 
     assert!(matches!(
         result.expect_err("out-of-bounds mutation threshold must fail"),
-        AgentApiError::PolicyBounds(x0x::runtime::PolicyBoundsError::MutationThresholdOutOfBounds {
-            ..
-        })
+        AgentApiError::PolicyBounds(
+            x0x::runtime::PolicyBoundsError::MutationThresholdOutOfBounds { .. }
+        )
     ));
 }
 
@@ -198,11 +198,16 @@ async fn health_controls_checkpoint_success_self_heals_degraded_state() {
         },
     );
 
-    let first = api.record_mutation_and_maybe_checkpoint(vec![1, 2, 3]).await;
+    let first = api
+        .record_mutation_and_maybe_checkpoint(vec![1, 2, 3])
+        .await;
     assert!(matches!(first, Err(AgentApiError::Backend(_))));
 
     let degraded = api.persistence_health();
-    assert_eq!(degraded.state, x0x::crdt::persistence::PersistenceState::Degraded);
+    assert_eq!(
+        degraded.state,
+        x0x::crdt::persistence::PersistenceState::Degraded
+    );
     assert!(degraded.degraded);
     assert!(degraded.last_error.is_some());
 
@@ -213,7 +218,10 @@ async fn health_controls_checkpoint_success_self_heals_degraded_state() {
     );
 
     let healed = api.persistence_health();
-    assert_eq!(healed.state, x0x::crdt::persistence::PersistenceState::Ready);
+    assert_eq!(
+        healed.state,
+        x0x::crdt::persistence::PersistenceState::Ready
+    );
     assert!(!healed.degraded);
     assert!(healed.last_error.is_none());
 }
@@ -232,11 +240,16 @@ async fn health_controls_checkpoint_success_does_not_auto_clear_failed_strict_st
         },
     );
 
-    let first = api.record_mutation_and_maybe_checkpoint(vec![1, 2, 3]).await;
+    let first = api
+        .record_mutation_and_maybe_checkpoint(vec![1, 2, 3])
+        .await;
     assert!(matches!(first, Err(AgentApiError::Backend(_))));
 
     let failed = api.persistence_health();
-    assert_eq!(failed.state, x0x::crdt::persistence::PersistenceState::Failed);
+    assert_eq!(
+        failed.state,
+        x0x::crdt::persistence::PersistenceState::Failed
+    );
     assert!(failed.degraded);
     assert!(failed.last_error.is_some());
 

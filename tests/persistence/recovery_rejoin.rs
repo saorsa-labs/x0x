@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use saorsa_gossip_types::PeerId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::fs;
@@ -9,7 +10,6 @@ use x0x::crdt::persistence::{
 };
 use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
 use x0x::identity::AgentId;
-use saorsa_gossip_types::PeerId;
 
 #[derive(Clone, Default)]
 struct InMemoryBackend {
@@ -169,7 +169,9 @@ async fn startup_recovery_stale_snapshot_rejoins_and_converges_via_merge_path() 
     .expect("recover stale snapshot")
     .task_list;
 
-    recovered.merge(&live_peer).expect("merge anti-entropy payload");
+    recovered
+        .merge(&live_peer)
+        .expect("merge anti-entropy payload");
     assert_eq!(recovered.task_count(), live_peer.task_count());
 }
 
@@ -229,9 +231,12 @@ async fn startup_recovery_scans_newest_to_oldest_until_first_valid_snapshot() {
     )
     .await
     .expect("write legacy candidate");
-    fs::write(entity_dir.join("99999999999999999998.snapshot"), b"not-json")
-        .await
-        .expect("write corrupt candidate");
+    fs::write(
+        entity_dir.join("99999999999999999998.snapshot"),
+        b"not-json",
+    )
+    .await
+    .expect("write corrupt candidate");
 
     let recovered = recover_task_list_startup(
         &backend,
@@ -265,9 +270,12 @@ async fn startup_recovery_returns_empty_store_when_no_valid_snapshot_exists() {
     )
     .await
     .expect("write legacy artifact");
-    fs::write(entity_dir.join("00000000000000000002.snapshot"), b"not-json")
-        .await
-        .expect("write corrupt artifact");
+    fs::write(
+        entity_dir.join("00000000000000000002.snapshot"),
+        b"not-json",
+    )
+    .await
+    .expect("write corrupt artifact");
 
     let recovered = recover_task_list_startup(
         &backend,

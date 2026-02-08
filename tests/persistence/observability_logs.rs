@@ -46,11 +46,7 @@ impl Write for CaptureGuard {
 }
 
 fn parse_events(writer: &CaptureWriter) -> Vec<Value> {
-    let bytes = writer
-        .bytes
-        .lock()
-        .expect("capture writer lock")
-        .clone();
+    let bytes = writer.bytes.lock().expect("capture writer lock").clone();
     String::from_utf8(bytes)
         .expect("utf8 logs")
         .lines()
@@ -181,7 +177,9 @@ async fn observability_logs_emit_legacy_artifact_detection_event() {
     let dir = tempdir().expect("tempdir");
     let entity_id = "observability-legacy";
     let entity_dir = dir.path().join(entity_id);
-    fs::create_dir_all(&entity_dir).await.expect("create entity dir");
+    fs::create_dir_all(&entity_dir)
+        .await
+        .expect("create entity dir");
     fs::write(
         entity_dir.join("00000000000000000001.snapshot"),
         br#"{"ciphertext":"abc","nonce":"123","key_id":"k1"}"#,
@@ -194,7 +192,10 @@ async fn observability_logs_emit_legacy_artifact_detection_event() {
         .load_latest(entity_id)
         .await
         .expect_err("legacy artifact must fail load");
-    assert!(matches!(err, PersistenceBackendError::NoLoadableSnapshot(_)));
+    assert!(matches!(
+        err,
+        PersistenceBackendError::NoLoadableSnapshot(_)
+    ));
 
     let events = parse_events(&writer);
     let detected = events.iter().any(|entry| {

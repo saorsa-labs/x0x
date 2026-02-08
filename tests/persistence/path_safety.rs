@@ -72,11 +72,12 @@ async fn path_safety_prevents_delete_side_effects_outside_store_root() {
         .delete_entity("../outside-target")
         .await
         .expect_err("delete_entity traversal attempt must be rejected");
-    assert!(matches!(err, PersistenceBackendError::InvalidEntityId { .. }));
+    assert!(matches!(
+        err,
+        PersistenceBackendError::InvalidEntityId { .. }
+    ));
 
-    assert!(
-        fs::try_exists(outside.join("sentinel.txt"))
-            .await
-            .expect("sentinel exists check")
-    );
+    assert!(fs::try_exists(outside.join("sentinel.txt"))
+        .await
+        .expect("sentinel exists check"));
 }

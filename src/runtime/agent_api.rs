@@ -204,8 +204,10 @@ impl<B: PersistenceBackend> AgentCheckpointApi<B> {
                         Ok(ExplicitCheckpointOutcome::Persisted)
                     }
                     Err(err) => {
-                        self.health
-                            .checkpoint_failed(&err, matches!(self.health.mode, PersistenceMode::Strict));
+                        self.health.checkpoint_failed(
+                            &err,
+                            matches!(self.health.mode, PersistenceMode::Strict),
+                        );
                         Err(AgentApiError::Backend(err))
                     }
                 }
@@ -228,9 +230,9 @@ impl<B: PersistenceBackend> AgentCheckpointApi<B> {
             | Err(PersistenceBackendError::UnsupportedLegacyEncryptedArtifact { .. })
             | Err(PersistenceBackendError::DegradedSkippedLegacyArtifact { .. }) => {
                 self.health.startup_empty_store();
-                Err(AgentApiError::Backend(PersistenceBackendError::SnapshotNotFound(
-                    self.entity_id.clone(),
-                )))
+                Err(AgentApiError::Backend(
+                    PersistenceBackendError::SnapshotNotFound(self.entity_id.clone()),
+                ))
             }
             Err(err) => {
                 self.health.startup_fallback(&err);
@@ -268,8 +270,10 @@ impl<B: PersistenceBackend> AgentCheckpointApi<B> {
                         Ok(AutomaticCheckpointOutcome::Persisted)
                     }
                     Err(err) => {
-                        self.health
-                            .checkpoint_failed(&err, matches!(self.health.mode, PersistenceMode::Strict));
+                        self.health.checkpoint_failed(
+                            &err,
+                            matches!(self.health.mode, PersistenceMode::Strict),
+                        );
                         Err(AgentApiError::Backend(err))
                     }
                 }

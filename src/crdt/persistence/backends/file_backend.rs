@@ -88,7 +88,9 @@ impl FileSnapshotBackend {
 
     async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PersistenceBackendError> {
         let parent = path.parent().ok_or_else(|| {
-            PersistenceBackendError::Operation("snapshot path is missing parent directory".to_string())
+            PersistenceBackendError::Operation(
+                "snapshot path is missing parent directory".to_string(),
+            )
         })?;
         fs::create_dir_all(parent).await?;
 
@@ -209,7 +211,9 @@ impl PersistenceBackend for FileSnapshotBackend {
     ) -> Result<PersistenceSnapshot, PersistenceBackendError> {
         let snapshots = self.sorted_snapshots_newest_first(entity_id).await?;
         if snapshots.is_empty() {
-            return Err(PersistenceBackendError::SnapshotNotFound(entity_id.to_string()));
+            return Err(PersistenceBackendError::SnapshotNotFound(
+                entity_id.to_string(),
+            ));
         }
 
         for path in snapshots {
@@ -262,7 +266,9 @@ impl PersistenceBackend for FileSnapshotBackend {
             }
         }
 
-        Err(PersistenceBackendError::NoLoadableSnapshot(entity_id.to_string()))
+        Err(PersistenceBackendError::NoLoadableSnapshot(
+            entity_id.to_string(),
+        ))
     }
 
     async fn delete_entity(&self, entity_id: &str) -> Result<(), PersistenceBackendError> {

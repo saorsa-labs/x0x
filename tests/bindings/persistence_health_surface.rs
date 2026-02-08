@@ -33,11 +33,15 @@ impl x0x::crdt::persistence::PersistenceBackend for NoopBackend {
     async fn load_latest(
         &self,
         entity_id: &str,
-    ) -> Result<x0x::crdt::persistence::PersistenceSnapshot, x0x::crdt::persistence::PersistenceBackendError>
-    {
-        Err(x0x::crdt::persistence::PersistenceBackendError::SnapshotNotFound(
-            entity_id.to_string(),
-        ))
+    ) -> Result<
+        x0x::crdt::persistence::PersistenceSnapshot,
+        x0x::crdt::persistence::PersistenceBackendError,
+    > {
+        Err(
+            x0x::crdt::persistence::PersistenceBackendError::SnapshotNotFound(
+                entity_id.to_string(),
+            ),
+        )
     }
 
     async fn delete_entity(
@@ -61,15 +65,17 @@ impl x0x::crdt::persistence::PersistenceBackend for FixedLoadBackend {
     async fn load_latest(
         &self,
         _entity_id: &str,
-    ) -> Result<x0x::crdt::persistence::PersistenceSnapshot, x0x::crdt::persistence::PersistenceBackendError>
-    {
+    ) -> Result<
+        x0x::crdt::persistence::PersistenceSnapshot,
+        x0x::crdt::persistence::PersistenceBackendError,
+    > {
         match &self.response {
             FixedLoadResponse::NoLoadable => Err(PersistenceBackendError::NoLoadableSnapshot(
                 "entity-no-valid".to_string(),
             )),
-            FixedLoadResponse::OperationFailure => {
-                Err(PersistenceBackendError::Operation("simulated io failure".to_string()))
-            }
+            FixedLoadResponse::OperationFailure => Err(PersistenceBackendError::Operation(
+                "simulated io failure".to_string(),
+            )),
         }
     }
 
@@ -182,7 +188,8 @@ fn persistence_health_surface_observability_includes_frequency_and_bounds() {
         contract.checkpoint_frequency_bounds.max_mutation_threshold
     );
     assert_eq!(
-        node.checkpoint_frequency_bounds.allow_runtime_checkpoint_frequency_adjustment,
+        node.checkpoint_frequency_bounds
+            .allow_runtime_checkpoint_frequency_adjustment,
         contract
             .checkpoint_frequency_bounds
             .allow_runtime_checkpoint_frequency_adjustment
@@ -232,7 +239,10 @@ async fn persistence_health_surface_load_latest_no_valid_snapshot_maps_to_empty_
     ));
 
     let health = api.persistence_health();
-    assert_eq!(health.state, x0x::crdt::persistence::PersistenceState::Ready);
+    assert_eq!(
+        health.state,
+        x0x::crdt::persistence::PersistenceState::Ready
+    );
     assert!(!health.degraded);
     assert_eq!(
         health.last_recovery_outcome,
@@ -278,7 +288,10 @@ async fn persistence_health_surface_load_latest_hard_failure_maps_to_degraded_co
     );
     let node = node_health::map_persistence_health(&health);
     let python = python_health::map_persistence_health(&health);
-    assert_eq!(node.last_recovery_outcome.as_deref(), Some("degraded_fallback"));
+    assert_eq!(
+        node.last_recovery_outcome.as_deref(),
+        Some("degraded_fallback")
+    );
     assert_eq!(python.last_recovery_outcome, node.last_recovery_outcome);
 }
 
@@ -328,7 +341,10 @@ async fn persistence_health_surface_load_latest_recoverable_invalid_latest_stays
     assert_eq!(loaded.payload, vec![9, 8, 7]);
 
     let health = api.persistence_health();
-    assert_eq!(health.state, x0x::crdt::persistence::PersistenceState::Ready);
+    assert_eq!(
+        health.state,
+        x0x::crdt::persistence::PersistenceState::Ready
+    );
     assert!(!health.degraded);
     assert_eq!(
         health.last_recovery_outcome,

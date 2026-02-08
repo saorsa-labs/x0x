@@ -29,9 +29,13 @@ async fn file_backend_atomicity_ignores_torn_temp_files() {
     let entity = "entity-a";
 
     let entity_dir = temp.path().join(entity);
-    fs::create_dir_all(&entity_dir).await.expect("create entity dir");
+    fs::create_dir_all(&entity_dir)
+        .await
+        .expect("create entity dir");
     let torn_temp = entity_dir.join("00000000000000000001.tmp");
-    fs::write(&torn_temp, b"partial").await.expect("write torn temp");
+    fs::write(&torn_temp, b"partial")
+        .await
+        .expect("write torn temp");
 
     backend
         .checkpoint(&checkpoint_request(entity), &snapshot(entity, b"good"))
@@ -55,7 +59,9 @@ async fn file_backend_atomicity_quarantines_corrupt_snapshot() {
 
     let entity_dir = PathBuf::from(temp.path()).join(entity);
     let corrupt_latest = entity_dir.join("99999999999999999999.snapshot");
-    fs::write(&corrupt_latest, b"not-json").await.expect("write corrupt snapshot");
+    fs::write(&corrupt_latest, b"not-json")
+        .await
+        .expect("write corrupt snapshot");
 
     let err = backend
         .load_latest(entity)
@@ -64,7 +70,9 @@ async fn file_backend_atomicity_quarantines_corrupt_snapshot() {
     assert_eq!(err.payload, b"baseline");
 
     let quarantine_dir = entity_dir.join("quarantine");
-    assert!(fs::try_exists(&quarantine_dir).await.expect("quarantine dir check"));
+    assert!(fs::try_exists(&quarantine_dir)
+        .await
+        .expect("quarantine dir check"));
 }
 
 #[tokio::test]
@@ -106,7 +114,10 @@ async fn file_backend_atomicity_unreadable_candidates_without_valid_snapshot_ret
         .load_latest(entity)
         .await
         .expect_err("unreadable-only candidates should not fail with an I/O short-circuit");
-    assert!(matches!(err, PersistenceBackendError::NoLoadableSnapshot(_)));
+    assert!(matches!(
+        err,
+        PersistenceBackendError::NoLoadableSnapshot(_)
+    ));
 }
 
 #[tokio::test]
@@ -130,7 +141,10 @@ async fn file_backend_atomicity_legacy_artifacts_are_mode_deterministic() {
     .expect("write strict legacy artifact");
 
     strict_backend
-        .checkpoint(&checkpoint_request(entity), &snapshot(entity, b"strict-valid"))
+        .checkpoint(
+            &checkpoint_request(entity),
+            &snapshot(entity, b"strict-valid"),
+        )
         .await
         .expect("write strict valid snapshot");
 
@@ -161,12 +175,14 @@ async fn file_backend_atomicity_legacy_artifacts_are_mode_deterministic() {
         .expect_err("strict mode with only legacy artifacts should report no loadable snapshot");
     assert!(matches!(
         strict_legacy_only_err,
-        PersistenceBackendError::NoLoadableSnapshot(_) 
+        PersistenceBackendError::NoLoadableSnapshot(_)
     ));
 
     let degraded_temp = tempfile::tempdir().expect("degraded temp dir");
-    let degraded_backend =
-        FileSnapshotBackend::new(degraded_temp.path().to_path_buf(), PersistenceMode::Degraded);
+    let degraded_backend = FileSnapshotBackend::new(
+        degraded_temp.path().to_path_buf(),
+        PersistenceMode::Degraded,
+    );
     let degraded_path = degraded_temp
         .path()
         .join(entity)
@@ -182,7 +198,10 @@ async fn file_backend_atomicity_legacy_artifacts_are_mode_deterministic() {
     .expect("write degraded legacy artifact");
 
     degraded_backend
-        .checkpoint(&checkpoint_request(entity), &snapshot(entity, b"degraded-valid"))
+        .checkpoint(
+            &checkpoint_request(entity),
+            &snapshot(entity, b"degraded-valid"),
+        )
         .await
         .expect("write degraded valid snapshot");
 

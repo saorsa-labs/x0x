@@ -575,13 +575,15 @@ impl AgentBuilder {
     /// - Storage I/O fails
     /// - Keypair deserialization fails
     pub async fn build(self) -> error::Result<Agent> {
-        let persistence_runtime = runtime::PersistenceRuntime::from_startup_config(&self.startup_config)
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "invalid startup configuration: {}",
-                    e
-                )))
-            })?;
+        let persistence_runtime = runtime::PersistenceRuntime::from_startup_config(
+            &self.startup_config,
+        )
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "invalid startup configuration: {}",
+                e
+            )))
+        })?;
 
         // Determine machine keypair source
         let machine_keypair = if let Some(path) = self.machine_key_path {

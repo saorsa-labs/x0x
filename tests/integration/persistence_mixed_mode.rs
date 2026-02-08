@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use saorsa_gossip_types::PeerId;
 use std::io;
 use x0x::crdt::persistence::{
     recover_task_list_startup, CheckpointRequest, PersistenceBackend, PersistenceBackendError,
@@ -6,7 +7,6 @@ use x0x::crdt::persistence::{
 };
 use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
 use x0x::identity::AgentId;
-use saorsa_gossip_types::PeerId;
 
 struct FailingLoadBackend {
     error: PersistenceBackendError,
@@ -30,7 +30,9 @@ impl PersistenceBackend for FailingLoadBackend {
             PersistenceBackendError::Io(_) => {
                 PersistenceBackendError::Io(io::Error::other("simulated io outage"))
             }
-            PersistenceBackendError::Operation(msg) => PersistenceBackendError::Operation(msg.clone()),
+            PersistenceBackendError::Operation(msg) => {
+                PersistenceBackendError::Operation(msg.clone())
+            }
             other => PersistenceBackendError::Operation(other.to_string()),
         })
     }
@@ -89,7 +91,10 @@ async fn mixed_mode_recovery_degraded_fallback_still_allows_peer_merge() {
     .await
     .expect("degraded mode should continue with fallback");
 
-    assert_eq!(recovered.recovery.outcome, RecoveryOutcome::DegradedFallback);
+    assert_eq!(
+        recovered.recovery.outcome,
+        RecoveryOutcome::DegradedFallback
+    );
 
     let mut converged = recovered.task_list;
     converged
@@ -125,8 +130,8 @@ async fn mixed_mode_recovery_strict_mode_blocks_on_io_failure() {
 
     assert!(matches!(
         err,
-        x0x::crdt::persistence::OrchestratorError::StartupLoad(
-            PersistenceBackendError::Operation(_)
-        )
+        x0x::crdt::persistence::OrchestratorError::StartupLoad(PersistenceBackendError::Operation(
+            _
+        ))
     ));
 }
