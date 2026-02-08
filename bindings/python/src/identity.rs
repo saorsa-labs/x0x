@@ -31,7 +31,7 @@ impl MachineId {
     #[classmethod]
     fn from_hex(_cls: &PyType, hex_str: &str) -> PyResult<Self> {
         let bytes = hex::decode(hex_str)
-            .map_err(|e| PyValueError::new_err(format!("Invalid hex encoding: {}", e)))?;
+            .map_err(|e| PyValueError::new_err(format!("Invalid hex encoding: {e}")))?;
 
         if bytes.len() != 32 {
             return Err(PyValueError::new_err(format!(
@@ -105,7 +105,7 @@ impl AgentId {
     #[classmethod]
     fn from_hex(_cls: &PyType, hex_str: &str) -> PyResult<Self> {
         let bytes = hex::decode(hex_str)
-            .map_err(|e| PyValueError::new_err(format!("Invalid hex encoding: {}", e)))?;
+            .map_err(|e| PyValueError::new_err(format!("Invalid hex encoding: {e}")))?;
 
         if bytes.len() != 32 {
             return Err(PyValueError::new_err(format!(

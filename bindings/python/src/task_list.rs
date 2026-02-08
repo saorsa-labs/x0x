@@ -38,7 +38,7 @@ impl TaskId {
     #[classmethod]
     fn from_hex(_cls: &PyType, hex_str: &str) -> PyResult<Self> {
         let bytes = hex::decode(hex_str).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex string: {}", e))
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex string: {e}"))
         })?;
 
         let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
@@ -240,8 +240,7 @@ impl TaskList {
         future_into_py(py, async move {
             let task_id = handle.add_task(title, description).await.map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to add task: {}",
-                    e
+                    "Failed to add task: {e}"
                 ))
             })?;
 
@@ -271,7 +270,7 @@ impl TaskList {
     /// ```
     fn claim_task<'a>(&'a self, py: Python<'a>, task_id: String) -> PyResult<&'a PyAny> {
         let bytes = hex::decode(&task_id).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid task ID hex: {}", e))
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid task ID hex: {e}"))
         })?;
 
         let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
@@ -284,8 +283,7 @@ impl TaskList {
         future_into_py(py, async move {
             handle.claim_task(task_id).await.map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to claim task: {}",
-                    e
+                    "Failed to claim task: {e}"
                 ))
             })?;
 
@@ -314,7 +312,7 @@ impl TaskList {
     /// ```
     fn complete_task<'a>(&'a self, py: Python<'a>, task_id: String) -> PyResult<&'a PyAny> {
         let bytes = hex::decode(&task_id).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid task ID hex: {}", e))
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid task ID hex: {e}"))
         })?;
 
         let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
@@ -327,8 +325,7 @@ impl TaskList {
         future_into_py(py, async move {
             handle.complete_task(task_id).await.map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to complete task: {}",
-                    e
+                    "Failed to complete task: {e}"
                 ))
             })?;
 
@@ -361,8 +358,7 @@ impl TaskList {
         future_into_py(py, async move {
             let snapshots = handle.list_tasks().await.map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to list tasks: {}",
-                    e
+                    "Failed to list tasks: {e}"
                 ))
             })?;
 
@@ -396,10 +392,7 @@ impl TaskList {
 
         for id in task_ids {
             let bytes = hex::decode(&id).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Invalid task ID hex: {}",
-                    e
-                ))
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid task ID hex: {e}"))
             })?;
 
             let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
@@ -413,10 +406,7 @@ impl TaskList {
 
         future_into_py(py, async move {
             handle.reorder(task_id_list).await.map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to reorder: {}",
-                    e
-                ))
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to reorder: {e}"))
             })?;
 
             Ok(())

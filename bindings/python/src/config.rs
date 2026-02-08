@@ -93,6 +93,7 @@ pub struct BindingResolvedPersistenceConfig {
     pub host_policy: BindingHostPolicyEnvelope,
 }
 
+#[allow(dead_code)]
 pub fn resolve_persistence_config(
     input: BindingPersistenceConfigInput,
 ) -> Result<BindingResolvedPersistenceConfig, ConfigError> {
@@ -128,6 +129,7 @@ pub fn resolve_persistence_config(
     })
 }
 
+#[allow(dead_code)]
 pub fn parse_persistence_mode(mode: &str) -> Result<String, ConfigError> {
     PersistenceMode::from_str(mode)
         .map(|parsed| parsed.as_str().to_string())
