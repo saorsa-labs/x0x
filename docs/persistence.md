@@ -14,15 +14,13 @@ Phase 01 persistence is for **protocol-managed CRDT state only**. It is optional
 - Persistence enabled, degraded mode (default): startup attempts local load; on load/format/storage failure, runtime continues with empty local state and converges via network resync.
 - Persistence enabled, strict mode: startup failures are fail-closed.
 - Strict first-run initialization requires explicit `initialize_if_missing` intent and manifest sentinel handling.
-- Recovery path loads the latest valid snapshot and then rejoins normal anti-entropy/merge behavior.
+- Recovery scans snapshot candidates newest-to-oldest, skips invalid candidates (including unsupported legacy encrypted artifacts), and loads the first valid plaintext snapshot before rejoining anti-entropy/merge behavior.
 
 ## Mode Semantics: Strict vs Degraded
 
 - `degraded` (default): prioritize availability and convergence continuity.
 - `strict`: prioritize local durability guarantees; persistence errors fail startup/checkpoint operations.
-- Unsupported legacy encrypted artifacts are deterministic by mode:
-  - strict -> typed fail (`UnsupportedLegacyEncryptedArtifact`)
-  - degraded -> typed skip/continue (`DegradedSkippedLegacyArtifact`) and resync path
+- Unsupported legacy encrypted artifacts are treated as invalid recovery candidates and are skipped during newest-to-oldest scanning.
 
 ## Checkpoint Policy Semantics
 
@@ -33,6 +31,7 @@ Defaults are ADR-locked and enforced:
 - debounce floor: suppress repeated checkpoints within `2s`
 - explicit checkpoint requests: supported, but still honor dirty/debounce semantics
 - graceful shutdown: attempts final checkpoint with strict/degraded outcome behavior
+- degraded self-heal: a successful checkpoint clears degraded state and `last_error` only when the runtime is in `degraded`; strict `failed` state is not auto-cleared
 
 ## Retention and Storage Budget
 

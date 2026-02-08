@@ -199,7 +199,18 @@ impl PersistenceHealth {
     }
 
     pub fn checkpoint_succeeded(&mut self) {
-        if !self.degraded {
+        if matches!(self.state, PersistenceState::Degraded) && self.degraded {
+            tracing::info!(
+                event = EVENT_DEGRADED_TRANSITION,
+                mode = self.mode.as_str(),
+                reason = "checkpoint_self_healed",
+                from = "degraded",
+                to = "ready"
+            );
+            self.state = PersistenceState::Ready;
+            self.degraded = false;
+            self.last_error = None;
+        } else if !self.degraded {
             self.state = PersistenceState::Ready;
             self.last_error = None;
         }
@@ -393,13 +404,20 @@ mod tests {
             Some(PersistenceErrorCode::CheckpointFailure)
         );
         health.checkpoint_succeeded();
-        assert_eq!(health.state, PersistenceState::Degraded);
+        assert_eq!(health.state, PersistenceState::Ready);
+        assert!(!health.degraded);
+        assert!(health.last_error.is_none());
 
         let mut strict_health = PersistenceHealth::new(PersistenceMode::Strict);
         let strict_error = PersistenceBackendError::Operation("checkpoint failed".to_string());
         strict_health.checkpoint_failed(&strict_error, true);
         assert_eq!(strict_health.state, PersistenceState::Failed);
         assert!(strict_health.degraded);
+        assert!(strict_health.last_error.is_some());
+        strict_health.checkpoint_succeeded();
+        assert_eq!(strict_health.state, PersistenceState::Failed);
+        assert!(strict_health.degraded);
+        assert!(strict_health.last_error.is_some());
 
         let mut healthy = PersistenceHealth::new(PersistenceMode::Degraded);
         healthy.startup_loaded_snapshot();
