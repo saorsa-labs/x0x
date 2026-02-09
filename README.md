@@ -41,13 +41,13 @@ x0x provides a gossip-based communication layer for AI agent networks, built on 
 
 ### CRDT Persistence (v1)
 
-x0x includes optional local persistence for protocol CRDT state recovery.
+Agents can survive restart and rejoin the network from where they left off, without requiring full state reconciliation from peers. Persistence is optional and disabled by default - the agent's primary job is network participation, not checkpointing.
 
-- Default behavior remains in-memory when persistence is disabled.
-- File snapshot backend v1 supports strict/degraded modes, checkpoint policy controls, and retention/budget limits.
-- Phase 01 persistence is plaintext-at-rest for protocol state only; application data ownership remains outside this subsystem.
+- File-snapshot backend with strict/degraded failure modes, checkpoint policy controls, and retention/budget limits.
+- Persisted state is plaintext by design; security boundary is filesystem permissions and OS-level controls.
+- Application data ownership remains outside this subsystem - persistence is for protocol-managed CRDT state only.
 
-See `docs/persistence.md` for startup/recovery flow, mode behavior, checkpoint semantics, retention/budget policy, binding controls, and security boundary guidance.
+See `docs/persistence.md` for behaviour, defaults, and operator guidance.
 
 ### Agent Communication Model
 
