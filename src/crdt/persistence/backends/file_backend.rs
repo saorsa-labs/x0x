@@ -255,13 +255,21 @@ impl PersistenceBackend for FileSnapshotBackend {
                     continue;
                 }
                 Err(err) => {
-                    self.quarantine(entity_id, &path, "corrupt").await?;
                     tracing::warn!(
                         event = "persistence.snapshot.skipped_corrupt",
                         mode = self.mode.as_str(),
                         path = path.display().to_string(),
                         reason = err.to_string()
                     );
+                    if let Err(quarantine_err) = self.quarantine(entity_id, &path, "corrupt").await {
+                        tracing::warn!(
+                            event = "persistence.snapshot.quarantine_failed",
+                            mode = self.mode.as_str(),
+                            path = path.display().to_string(),
+                            reason = quarantine_err.to_string()
+                        );
+                    }
+                    continue;
                 }
             }
         }

@@ -226,9 +226,7 @@ impl<B: PersistenceBackend> AgentCheckpointApi<B> {
                 Ok(snapshot)
             }
             Err(PersistenceBackendError::SnapshotNotFound(_))
-            | Err(PersistenceBackendError::NoLoadableSnapshot(_))
-            | Err(PersistenceBackendError::UnsupportedLegacyEncryptedArtifact { .. })
-            | Err(PersistenceBackendError::DegradedSkippedLegacyArtifact { .. }) => {
+            | Err(PersistenceBackendError::NoLoadableSnapshot(_)) => {
                 self.health.startup_empty_store();
                 Err(AgentApiError::Backend(
                     PersistenceBackendError::SnapshotNotFound(self.entity_id.clone()),
