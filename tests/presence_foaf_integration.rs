@@ -252,7 +252,7 @@ async fn test_concurrent_presence_beacons() {
             let bootstrap_addrs = VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
 
             let agent = Agent::builder()
-                .with_machine_key(temp_dir.path().join(format!("machine-{}.key", i)))
+                .with_machine_key(temp_dir.path().join(format!("machine-{i}.key")))
                 .with_network_config(NetworkConfig {
                     bind_addr: Some("0.0.0.0:0".parse().unwrap()),
                     bootstrap_nodes: bootstrap_addrs,

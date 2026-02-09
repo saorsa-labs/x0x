@@ -153,7 +153,7 @@ impl MlsWelcome {
         let encrypted_secrets = self
             .encrypted_group_secrets
             .get(agent_id)
-            .ok_or_else(|| MlsError::MemberNotInGroup(format!("{:?}", agent_id)))?;
+            .ok_or_else(|| MlsError::MemberNotInGroup(format!("{agent_id:?}")))?;
 
         // Derive decryption key
         let invitee_key = Self::derive_invitee_key(agent_id, &self.group_id, self.epoch);

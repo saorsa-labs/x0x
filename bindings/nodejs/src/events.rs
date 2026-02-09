@@ -97,13 +97,13 @@ pub fn start_connected_forwarding(
                                 // Forward to JavaScript callback - call() returns Status
                                 let status = callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
                                 if status != napi::Status::Ok {
-                                    eprintln!("Error forwarding connected event: {:?}", status);
+                                    eprintln!("Error forwarding connected event: {status:?}");
                                 }
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             // Channel lagged, continue receiving (don't stop)
-                            eprintln!("Event channel lagged, skipped {} events", skipped);
+                            eprintln!("Event channel lagged, skipped {skipped} events");
                             continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -146,12 +146,12 @@ pub fn start_disconnected_forwarding(
 
                                 let status = callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
                                 if status != napi::Status::Ok {
-                                    eprintln!("Error forwarding disconnected event: {:?}", status);
+                                    eprintln!("Error forwarding disconnected event: {status:?}");
                                 }
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            eprintln!("Event channel lagged, skipped {} events", skipped);
+                            eprintln!("Event channel lagged, skipped {skipped} events");
                             continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -194,12 +194,12 @@ pub fn start_error_forwarding(
 
                                 let status = callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
                                 if status != napi::Status::Ok {
-                                    eprintln!("Error forwarding error event: {:?}", status);
+                                    eprintln!("Error forwarding error event: {status:?}");
                                 }
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            eprintln!("Event channel lagged, skipped {} events", skipped);
+                            eprintln!("Event channel lagged, skipped {skipped} events");
                             continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {

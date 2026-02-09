@@ -6,12 +6,20 @@
 #![allow(non_local_definitions)] // False positive with pyo3 0.20 macros
 
 mod agent;
+mod config;
 mod events;
+mod health;
 mod identity;
 mod pubsub;
+mod runtime_controls;
 mod task_list;
 
 use pyo3::prelude::*;
+
+pub use runtime_controls::{
+    query_persistence_observability, request_checkpoint_frequency_adjustment,
+    BindingCheckpointFrequencyUpdateRequest, BindingInvalidRequestError,
+};
 
 /// x0x - Secure P2P communication for AI agents
 ///

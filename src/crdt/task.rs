@@ -105,7 +105,7 @@ impl TaskId {
             ));
         }
 
-        let bytes = hex::decode(s).map_err(|e| format!("Invalid hex encoding: {}", e))?;
+        let bytes = hex::decode(s).map_err(|e| format!("Invalid hex encoding: {e}"))?;
 
         if bytes.len() != 32 {
             return Err(format!(
@@ -357,7 +357,7 @@ mod tests {
     fn test_task_id_display() {
         let agent = agent(1);
         let id = TaskId::new("Test", &agent, 1000);
-        let display = format!("{}", id);
+        let display = format!("{id}");
 
         // Should be 64 hex characters (32 bytes * 2)
         assert_eq!(display.len(), 64);

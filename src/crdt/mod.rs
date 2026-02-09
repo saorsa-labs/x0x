@@ -42,7 +42,6 @@ pub use checkbox::{CheckboxError, CheckboxState};
 pub use delta::TaskListDelta;
 pub use encrypted::EncryptedTaskListDelta;
 pub use error::{CrdtError, Result};
-pub use persistence::TaskListStorage;
 pub use sync::TaskListSync;
 pub use task::{TaskId, TaskMetadata};
 pub use task_item::TaskItem;

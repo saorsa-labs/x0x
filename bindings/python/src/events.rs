@@ -102,7 +102,7 @@ impl EventCallbacks {
                 // Call the callback with the event data
                 // If it fails, print the error but continue to other callbacks
                 if let Err(e) = callback.call1(py, (data,)) {
-                    eprintln!("Error in event callback for '{}': {}", event, e);
+                    eprintln!("Error in event callback for '{event}': {e}");
                     e.print(py);
                 }
             }

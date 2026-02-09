@@ -44,7 +44,7 @@ fn list_id(n: u8) -> TaskListId {
 fn metadata(title: &str, creator: u8) -> TaskMetadata {
     TaskMetadata {
         title: title.to_string(),
-        description: format!("Task: {}", title),
+        description: format!("Task: {title}"),
         priority: 128,
         created_by: agent_id(creator),
         created_at: unix_timestamp_ms(),
@@ -70,7 +70,7 @@ async fn test_concurrent_add_task() {
 
     // Create 10 replicas
     let mut replicas: Vec<TaskList> = (1..=10)
-        .map(|i| TaskList::new(task_list_id, format!("List-{}", i), peer_id(i)))
+        .map(|i| TaskList::new(task_list_id, format!("List-{i}"), peer_id(i)))
         .collect();
 
     // Each replica adds a unique task concurrently
@@ -112,8 +112,7 @@ async fn test_concurrent_add_task() {
         for expected_id in &task_ids {
             assert!(
                 replica_ids.contains(expected_id),
-                "Replica missing task {:?}",
-                expected_id
+                "Replica missing task {expected_id:?}"
             );
         }
     }
@@ -325,7 +324,7 @@ async fn test_mixed_concurrent_operations() {
 
     // Create 10 replicas
     let mut replicas: Vec<TaskList> = (1..=10)
-        .map(|i| TaskList::new(task_list_id, format!("Mixed-{}", i), peer_id(i)))
+        .map(|i| TaskList::new(task_list_id, format!("Mixed-{i}"), peer_id(i)))
         .collect();
 
     // Agent 1: Add task A
@@ -420,14 +419,14 @@ async fn test_convergence_time() {
 
     // Create 10 replicas
     let mut replicas: Vec<TaskList> = (1..=10)
-        .map(|i| TaskList::new(task_list_id, format!("Timing-{}", i), peer_id(i)))
+        .map(|i| TaskList::new(task_list_id, format!("Timing-{i}"), peer_id(i)))
         .collect();
 
     // Each replica adds 5 tasks
     for (i, replica) in replicas.iter_mut().enumerate() {
         for j in 1..=5 {
             let tid = task_id((i * 10 + j) as u8);
-            let meta = metadata(&format!("Task-{}-{}", i, j), i as u8 + 1);
+            let meta = metadata(&format!("Task-{i}-{j}"), i as u8 + 1);
             let task = TaskItem::new(tid, meta, peer_id(i as u8 + 1));
             replica
                 .add_task(task, peer_id(i as u8 + 1), (i * 10 + j) as u64)
@@ -454,15 +453,11 @@ async fn test_convergence_time() {
         );
     }
 
-    println!(
-        "Convergence time for 10 agents, 50 tasks: {:?}",
-        convergence_time
-    );
+    println!("Convergence time for 10 agents, 50 tasks: {convergence_time:?}");
 
     // Convergence should be fast (< 1 second for local merge)
     assert!(
         convergence_time < Duration::from_secs(1),
-        "Convergence should be fast, took {:?}",
-        convergence_time
+        "Convergence should be fast, took {convergence_time:?}"
     );
 }

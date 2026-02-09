@@ -55,7 +55,7 @@ impl EncryptedTaskListDelta {
 
         // Serialize the delta
         let plaintext = bincode::serialize(delta)
-            .map_err(|e| MlsError::EncryptionError(format!("delta serialization failed: {}", e)))?;
+            .map_err(|e| MlsError::EncryptionError(format!("delta serialization failed: {e}")))?;
 
         // Build AAD: "EncryptedDelta" || group_id || epoch
         let mut aad = Vec::new();
@@ -101,7 +101,7 @@ impl EncryptedTaskListDelta {
 
         // Deserialize the delta
         bincode::deserialize(&plaintext)
-            .map_err(|e| MlsError::DecryptionError(format!("delta deserialization failed: {}", e)))
+            .map_err(|e| MlsError::DecryptionError(format!("delta deserialization failed: {e}")))
     }
 
     /// Encrypts a delta using the key schedule derived from a group.
@@ -389,11 +389,11 @@ mod tests {
 
         // Add many tasks
         for i in 0..100 {
-            let task_id = TaskId::new(&format!("Task {}", i), &agent_id, 1000 + i);
+            let task_id = TaskId::new(&format!("Task {i}"), &agent_id, 1000 + i);
 
             let metadata = TaskMetadata {
-                title: format!("Task {}", i),
-                description: format!("Description {}", i),
+                title: format!("Task {i}"),
+                description: format!("Description {i}"),
                 priority: 128,
                 created_by: agent_id,
                 created_at: 1000 + i,

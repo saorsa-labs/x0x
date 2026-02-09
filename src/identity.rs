@@ -117,7 +117,7 @@ impl MachineKeypair {
     /// Generate a new random MachineKeypair.
     pub fn generate() -> Result<Self, crate::error::IdentityError> {
         let (public_key, secret_key) = ant_quic::generate_ml_dsa_keypair()
-            .map_err(|e| crate::error::IdentityError::KeyGeneration(format!("{:?}", e)))?;
+            .map_err(|e| crate::error::IdentityError::KeyGeneration(format!("{e:?}")))?;
         Ok(Self {
             public_key,
             secret_key,
@@ -186,7 +186,7 @@ impl AgentKeypair {
     /// Generate a new random AgentKeypair.
     pub fn generate() -> Result<Self, crate::error::IdentityError> {
         let (public_key, secret_key) = ant_quic::generate_ml_dsa_keypair()
-            .map_err(|e| crate::error::IdentityError::KeyGeneration(format!("{:?}", e)))?;
+            .map_err(|e| crate::error::IdentityError::KeyGeneration(format!("{e:?}")))?;
         Ok(Self {
             public_key,
             secret_key,

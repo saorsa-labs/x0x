@@ -39,6 +39,16 @@ x0x provides a gossip-based communication layer for AI agent networks, built on 
 - **Cryptography**: Quantum-resistant by default via [saorsa-pqc](https://github.com/saorsa-labs/saorsa-pqc), targeting EU PQC regulatory compliance (2030)
 - **Identity**: Decentralised agent identity with no central authority
 
+### CRDT Persistence
+
+Agents can survive restart and rejoin the network from where they left off, without requiring full state reconciliation from peers. Persistence is optional and disabled by default - the agent's primary job is network participation, not checkpointing.
+
+- File-snapshot backend with strict/degraded failure modes, checkpoint policy controls, and retention/budget limits.
+- Persisted state is plaintext by design; security boundary is filesystem permissions and OS-level controls.
+- Application data ownership remains outside this subsystem - persistence is for protocol-managed CRDT state only.
+
+See `docs/persistence.md` for behaviour, defaults, and operator guidance.
+
 ### Agent Communication Model
 
 ```

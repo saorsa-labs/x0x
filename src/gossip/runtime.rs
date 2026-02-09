@@ -63,7 +63,7 @@ impl GossipRuntime {
         // TODO: Phase 1.6 Task 4 will start background message handler
         // For now, this is a placeholder that validates config
         self.config.validate().map_err(|e| {
-            crate::error::NetworkError::NodeCreation(format!("invalid gossip config: {}", e))
+            crate::error::NetworkError::NodeCreation(format!("invalid gossip config: {e}"))
         })?;
 
         Ok(())

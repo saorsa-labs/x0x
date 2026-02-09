@@ -30,7 +30,7 @@ impl Agent {
         let inner = x0x::Agent::new().await.map_err(|e| {
             Error::new(
                 Status::GenericFailure,
-                format!("Failed to create agent: {}", e),
+                format!("Failed to create agent: {e}"),
             )
         })?;
 
@@ -80,7 +80,7 @@ impl Agent {
         self.inner.join_network().await.map_err(|e| {
             Error::new(
                 Status::GenericFailure,
-                format!("Failed to join network: {}", e),
+                format!("Failed to join network: {e}"),
             )
         })
     }
@@ -98,12 +98,10 @@ impl Agent {
     /// ```
     #[napi]
     pub async fn subscribe(&self, topic: String) -> Result<Subscription> {
-        let rx = self.inner.subscribe(&topic).await.map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to subscribe: {}", e),
-            )
-        })?;
+        let rx =
+            self.inner.subscribe(&topic).await.map_err(|e| {
+                Error::new(Status::GenericFailure, format!("Failed to subscribe: {e}"))
+            })?;
 
         Ok(Subscription { _inner: rx })
     }
@@ -124,7 +122,7 @@ impl Agent {
         self.inner
             .publish(&topic, payload.to_vec())
             .await
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to publish: {}", e)))
+            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to publish: {e}")))
     }
 
     /// Register an event listener for peer connected events.
@@ -250,7 +248,7 @@ impl Agent {
             .map_err(|e| {
                 Error::new(
                     Status::GenericFailure,
-                    format!("Failed to create task list: {}", e),
+                    format!("Failed to create task list: {e}"),
                 )
             })?;
 
@@ -282,7 +280,7 @@ impl Agent {
         let handle = self.inner.join_task_list(&topic).await.map_err(|e| {
             Error::new(
                 Status::GenericFailure,
-                format!("Failed to join task list: {}", e),
+                format!("Failed to join task list: {e}"),
             )
         })?;
 
@@ -349,7 +347,7 @@ impl AgentBuilder {
         })?;
 
         let keypair = x0x::identity::AgentKeypair::from_bytes(&public_key_bytes, &secret_key_bytes)
-            .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid agent keypair: {}", e)))?;
+            .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid agent keypair: {e}")))?;
 
         *guard = Some(builder.with_agent_key(keypair));
         Ok(self)
@@ -379,7 +377,7 @@ impl AgentBuilder {
         let inner = builder.build().await.map_err(|e| {
             Error::new(
                 Status::GenericFailure,
-                format!("Failed to build agent: {}", e),
+                format!("Failed to build agent: {e}"),
             )
         })?;
 

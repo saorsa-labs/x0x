@@ -88,7 +88,7 @@ mod tests {
     fn test_error_display_task_not_found() {
         let task_id = mock_task_id();
         let error = CrdtError::TaskNotFound(task_id);
-        let display = format!("{}", error);
+        let display = format!("{error}");
         assert!(display.contains("task not found"));
     }
 
@@ -102,7 +102,7 @@ mod tests {
                 timestamp: 100,
             },
         };
-        let display = format!("{}", error);
+        let display = format!("{error}");
         assert!(display.contains("invalid state transition"));
         assert!(display.contains("Empty"));
         assert!(display.contains("Done"));
@@ -112,14 +112,14 @@ mod tests {
     fn test_error_display_already_claimed() {
         let agent = mock_agent_id();
         let error = CrdtError::AlreadyClaimed(agent);
-        let display = format!("{}", error);
+        let display = format!("{error}");
         assert!(display.contains("already claimed"));
     }
 
     #[test]
     fn test_error_display_merge() {
         let error = CrdtError::Merge("conflict detected".to_string());
-        let display = format!("{}", error);
+        let display = format!("{error}");
         assert!(display.contains("CRDT merge error"));
         assert!(display.contains("conflict detected"));
     }
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn test_error_display_gossip() {
         let error = CrdtError::Gossip("connection failed".to_string());
-        let display = format!("{}", error);
+        let display = format!("{error}");
         assert!(display.contains("gossip error"));
         assert!(display.contains("connection failed"));
     }
@@ -147,7 +147,7 @@ mod tests {
     fn test_error_from_io() {
         let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let crdt_error: CrdtError = io_error.into();
-        let display = format!("{}", crdt_error);
+        let display = format!("{crdt_error}");
         assert!(display.contains("I/O error"));
         assert!(display.contains("file not found"));
     }

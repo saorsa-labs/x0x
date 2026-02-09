@@ -125,8 +125,7 @@ impl BootstrapConnector {
                     attempt += 1;
                     if attempt >= self.config.max_retries {
                         return Err(NetworkError::ConnectionFailed(format!(
-                            "Bootstrap connection failed after {} attempts: {}",
-                            attempt, e
+                            "Bootstrap connection failed after {attempt} attempts: {e}"
                         )));
                     }
 

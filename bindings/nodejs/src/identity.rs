@@ -19,7 +19,7 @@ impl AgentId {
     #[napi(factory)]
     pub fn from_string(s: String) -> Result<Self> {
         let bytes = hex::decode(&s)
-            .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid hex: {}", e)))?;
+            .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid hex: {e}")))?;
 
         if bytes.len() != 32 {
             return Err(Error::new(Status::InvalidArg, "AgentId must be 32 bytes"));
@@ -70,7 +70,7 @@ impl MachineId {
     #[napi(factory)]
     pub fn from_string(s: String) -> Result<Self> {
         let bytes = hex::decode(&s)
-            .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid hex: {}", e)))?;
+            .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid hex: {e}")))?;
 
         if bytes.len() != 32 {
             return Err(Error::new(Status::InvalidArg, "MachineId must be 32 bytes"));

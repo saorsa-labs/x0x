@@ -331,7 +331,7 @@ impl AgentBuilder {
         let mut guard = self
             .inner
             .lock()
-            .map_err(|e| PyErr::new::<PyIOError, _>(format!("Lock error: {}", e)))?;
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("Lock error: {e}")))?;
 
         let builder = guard
             .take()
@@ -382,14 +382,14 @@ impl AgentBuilder {
         let mut guard = self
             .inner
             .lock()
-            .map_err(|e| PyErr::new::<PyIOError, _>(format!("Lock error: {}", e)))?;
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("Lock error: {e}")))?;
 
         let builder = guard
             .take()
             .ok_or_else(|| PyErr::new::<PyValueError, _>("Builder already consumed by build()"))?;
 
         let keypair = x0x::identity::AgentKeypair::from_bytes(&public_key, &secret_key)
-            .map_err(|e| PyErr::new::<PyValueError, _>(format!("Invalid agent keypair: {}", e)))?;
+            .map_err(|e| PyErr::new::<PyValueError, _>(format!("Invalid agent keypair: {e}")))?;
 
         *guard = Some(builder.with_agent_key(keypair));
 
@@ -425,7 +425,7 @@ impl AgentBuilder {
         let mut guard = self
             .inner
             .lock()
-            .map_err(|e| PyErr::new::<PyIOError, _>(format!("Lock error: {}", e)))?;
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("Lock error: {e}")))?;
 
         let builder = guard.take().ok_or_else(|| {
             PyErr::new::<PyValueError, _>("Builder already consumed by previous build() call")
@@ -435,7 +435,7 @@ impl AgentBuilder {
             let agent = builder
                 .build()
                 .await
-                .map_err(|e| PyErr::new::<PyIOError, _>(format!("Failed to build agent: {}", e)))?;
+                .map_err(|e| PyErr::new::<PyIOError, _>(format!("Failed to build agent: {e}")))?;
 
             Python::with_gil(|py| {
                 Py::new(

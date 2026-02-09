@@ -214,7 +214,7 @@ impl TaskItem {
         let tag = (peer_id, seq); // seq used for OR-Set uniqueness
         self.checkbox
             .add(claimed_state, tag)
-            .map_err(|e| CrdtError::Merge(format!("Failed to add claimed state: {}", e)))?;
+            .map_err(|e| CrdtError::Merge(format!("Failed to add claimed state: {e}")))?;
 
         Ok(())
     }
@@ -286,7 +286,7 @@ impl TaskItem {
         let tag = (peer_id, seq); // seq used for OR-Set uniqueness
         self.checkbox
             .add(done_state, tag)
-            .map_err(|e| CrdtError::Merge(format!("Failed to add done state: {}", e)))?;
+            .map_err(|e| CrdtError::Merge(format!("Failed to add done state: {e}")))?;
 
         Ok(())
     }
@@ -442,7 +442,7 @@ impl TaskItem {
         // Merge OR-Set (checkbox states)
         self.checkbox
             .merge_state(&other.checkbox)
-            .map_err(|e| CrdtError::Merge(format!("Failed to merge checkbox states: {}", e)))?;
+            .map_err(|e| CrdtError::Merge(format!("Failed to merge checkbox states: {e}")))?;
 
         // Merge LWW-Registers (metadata)
         self.title.merge(&other.title);
