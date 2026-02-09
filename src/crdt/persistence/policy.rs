@@ -12,16 +12,11 @@ const DEFAULT_WARN_THRESHOLD_PERCENT: u8 = 80;
 const DEFAULT_CRITICAL_THRESHOLD_PERCENT: u8 = 90;
 
 /// Persistence failure mode policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PersistenceMode {
+    #[default]
     Degraded,
     Strict,
-}
-
-impl Default for PersistenceMode {
-    fn default() -> Self {
-        Self::Degraded
-    }
 }
 
 impl FromStr for PersistenceMode {
