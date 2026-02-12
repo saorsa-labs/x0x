@@ -70,10 +70,11 @@ fn default_log_level() -> String {
 }
 
 impl Default for BootstrapConfig {
+    #[allow(clippy::unwrap_used)]
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0:12000".parse().expect("valid address"),
-            health_address: "127.0.0.1:12600".parse().expect("valid address"),
+            bind_address: "0.0.0.0:12000".parse().unwrap(),
+            health_address: "127.0.0.1:12600".parse().unwrap(),
             machine_key_path: default_machine_key_path(),
             data_dir: default_data_dir(),
             coordinator: true,
