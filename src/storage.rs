@@ -1,11 +1,11 @@
 //! Key storage utilities for x0x identity persistence.
 //!
 //! This module provides serialization and storage functionality for
-//! MachineKeypair and AgentKeypair types, enabling persistence of
-//! identities across application restarts.
+//! MachineKeypair, AgentKeypair, UserKeypair, and AgentCertificate types,
+//! enabling persistence of identities across application restarts.
 
 use crate::error::{IdentityError, Result};
-use crate::identity::{AgentKeypair, MachineKeypair};
+use crate::identity::{AgentCertificate, AgentKeypair, MachineKeypair, UserKeypair};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -92,6 +92,15 @@ const X0X_DIR: &str = ".x0x";
 
 /// Machine keypair file name.
 const MACHINE_KEY_FILE: &str = "machine.key";
+
+/// Agent keypair file name.
+const AGENT_KEY_FILE: &str = "agent.key";
+
+/// User keypair file name.
+const USER_KEY_FILE: &str = "user.key";
+
+/// Agent certificate file name.
+const AGENT_CERT_FILE: &str = "agent.cert";
 
 /// Get the x0x configuration directory path.
 ///
@@ -263,6 +272,327 @@ pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<Machin
 pub async fn load_agent_keypair<P: AsRef<Path>>(path: P) -> Result<AgentKeypair> {
     let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_agent_keypair(&bytes)
+}
+
+/// Save an AgentKeypair to the default storage location.
+///
+/// Stores the keypair in `~/.x0x/agent.key` with appropriate
+/// file permissions. The directory will be created if it doesn't exist.
+///
+/// # Arguments
+///
+/// * `kp` - The AgentKeypair to save
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error if the operation fails
+pub async fn save_agent_keypair_default(kp: &AgentKeypair) -> Result<()> {
+    let dir = x0x_dir().await?;
+    fs::create_dir_all(&dir)
+        .await
+        .map_err(IdentityError::from)?;
+    let path = dir.join(AGENT_KEY_FILE);
+    let bytes = serialize_agent_keypair(kp)?;
+    fs::write(&path, bytes).await.map_err(IdentityError::from)?;
+
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&path)
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+    Ok(())
+}
+
+/// Load an AgentKeypair from the default storage location.
+///
+/// # Returns
+///
+/// The loaded AgentKeypair, or an error if the file doesn't exist or is invalid
+pub async fn load_agent_keypair_default() -> Result<AgentKeypair> {
+    let path = x0x_dir().await?.join(AGENT_KEY_FILE);
+    let bytes = fs::read(&path).await.map_err(IdentityError::from)?;
+    deserialize_agent_keypair(&bytes)
+}
+
+/// Check if an agent keypair exists in the default storage location.
+///
+/// # Returns
+///
+/// true if the agent key file exists, false otherwise
+pub async fn agent_keypair_exists() -> bool {
+    let Ok(path) = x0x_dir().await else {
+        return false;
+    };
+    tokio::fs::try_exists(path.join(AGENT_KEY_FILE))
+        .await
+        .unwrap_or(false)
+}
+
+/// Save an AgentKeypair to the specified file path.
+///
+/// Creates the parent directory if it doesn't exist. Sets file
+/// permissions to 0o600 on Unix systems.
+///
+/// # Arguments
+///
+/// * `kp` - The AgentKeypair to save
+/// * `path` - The file path to save to
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error if file I/O fails
+pub async fn save_agent_keypair_to<P: AsRef<Path> + Clone>(
+    kp: &AgentKeypair,
+    path: P,
+) -> Result<()> {
+    let bytes = serialize_agent_keypair(kp)?;
+
+    if let Some(parent) = path.as_ref().parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+
+    tokio::fs::write(path.clone(), bytes)
+        .await
+        .map_err(IdentityError::from)?;
+
+    #[cfg(unix)]
+    {
+        let mut perms = tokio::fs::metadata(path.as_ref())
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        tokio::fs::set_permissions(path.as_ref(), perms)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+
+    Ok(())
+}
+
+/// Load an AgentKeypair from the specified file path.
+///
+/// # Arguments
+///
+/// * `path` - The file path to load from
+///
+/// # Returns
+///
+/// The loaded AgentKeypair, or an error if the file doesn't exist or is invalid
+pub async fn load_agent_keypair_from<P: AsRef<Path>>(path: P) -> Result<AgentKeypair> {
+    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    deserialize_agent_keypair(&bytes)
+}
+
+// ── UserKeypair storage ──
+
+/// Serialize a UserKeypair to bytes for storage.
+///
+/// # Arguments
+///
+/// * `kp` - The UserKeypair to serialize
+///
+/// # Returns
+///
+/// A vector containing the serialized keypair data
+pub fn serialize_user_keypair(kp: &UserKeypair) -> Result<Vec<u8>> {
+    let data = SerializedKeypair {
+        public_key: kp.public_key().as_bytes().to_vec(),
+        secret_key: kp.secret_key().as_bytes().to_vec(),
+    };
+    bincode::serialize(&data).map_err(|e| IdentityError::Serialization(e.to_string()))
+}
+
+/// Deserialize a UserKeypair from bytes.
+///
+/// # Arguments
+///
+/// * `bytes` - The serialized keypair data
+///
+/// # Returns
+///
+/// A deserialized UserKeypair
+pub fn deserialize_user_keypair(bytes: &[u8]) -> Result<UserKeypair> {
+    let data: SerializedKeypair =
+        bincode::deserialize(bytes).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+    UserKeypair::from_bytes(&data.public_key, &data.secret_key)
+}
+
+/// Save a UserKeypair to the default storage location (`~/.x0x/user.key`).
+///
+/// # Arguments
+///
+/// * `kp` - The UserKeypair to save
+pub async fn save_user_keypair(kp: &UserKeypair) -> Result<()> {
+    let dir = x0x_dir().await?;
+    fs::create_dir_all(&dir)
+        .await
+        .map_err(IdentityError::from)?;
+    let path = dir.join(USER_KEY_FILE);
+    let bytes = serialize_user_keypair(kp)?;
+    fs::write(&path, bytes).await.map_err(IdentityError::from)?;
+
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&path)
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+    Ok(())
+}
+
+/// Load a UserKeypair from the default storage location (`~/.x0x/user.key`).
+pub async fn load_user_keypair() -> Result<UserKeypair> {
+    let path = x0x_dir().await?.join(USER_KEY_FILE);
+    let bytes = fs::read(&path).await.map_err(IdentityError::from)?;
+    deserialize_user_keypair(&bytes)
+}
+
+/// Check if a user keypair exists in the default storage location.
+pub async fn user_keypair_exists() -> bool {
+    let Ok(path) = x0x_dir().await else {
+        return false;
+    };
+    tokio::fs::try_exists(path.join(USER_KEY_FILE))
+        .await
+        .unwrap_or(false)
+}
+
+/// Save a UserKeypair to the specified file path.
+///
+/// Creates the parent directory if it doesn't exist. Sets file
+/// permissions to 0o600 on Unix systems.
+pub async fn save_user_keypair_to<P: AsRef<Path> + Clone>(
+    kp: &UserKeypair,
+    path: P,
+) -> Result<()> {
+    let bytes = serialize_user_keypair(kp)?;
+
+    if let Some(parent) = path.as_ref().parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+
+    tokio::fs::write(path.clone(), bytes)
+        .await
+        .map_err(IdentityError::from)?;
+
+    #[cfg(unix)]
+    {
+        let mut perms = tokio::fs::metadata(path.as_ref())
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        tokio::fs::set_permissions(path.as_ref(), perms)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+
+    Ok(())
+}
+
+/// Load a UserKeypair from the specified file path.
+pub async fn load_user_keypair_from<P: AsRef<Path>>(path: P) -> Result<UserKeypair> {
+    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    deserialize_user_keypair(&bytes)
+}
+
+// ── AgentCertificate storage ──
+
+/// Save an AgentCertificate to the default storage location (`~/.x0x/agent.cert`).
+pub async fn save_agent_certificate(cert: &AgentCertificate) -> Result<()> {
+    let dir = x0x_dir().await?;
+    fs::create_dir_all(&dir)
+        .await
+        .map_err(IdentityError::from)?;
+    let path = dir.join(AGENT_CERT_FILE);
+    let bytes =
+        bincode::serialize(cert).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+    fs::write(&path, bytes).await.map_err(IdentityError::from)?;
+
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&path)
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+    Ok(())
+}
+
+/// Load an AgentCertificate from the default storage location (`~/.x0x/agent.cert`).
+pub async fn load_agent_certificate() -> Result<AgentCertificate> {
+    let path = x0x_dir().await?.join(AGENT_CERT_FILE);
+    let bytes = fs::read(&path).await.map_err(IdentityError::from)?;
+    bincode::deserialize(&bytes).map_err(|e| IdentityError::Serialization(e.to_string()))
+}
+
+/// Check if an agent certificate exists in the default storage location.
+pub async fn agent_certificate_exists() -> bool {
+    let Ok(path) = x0x_dir().await else {
+        return false;
+    };
+    tokio::fs::try_exists(path.join(AGENT_CERT_FILE))
+        .await
+        .unwrap_or(false)
+}
+
+/// Save an AgentCertificate to the specified file path.
+pub async fn save_agent_certificate_to<P: AsRef<Path> + Clone>(
+    cert: &AgentCertificate,
+    path: P,
+) -> Result<()> {
+    let bytes =
+        bincode::serialize(cert).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+
+    if let Some(parent) = path.as_ref().parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+
+    tokio::fs::write(path.clone(), bytes)
+        .await
+        .map_err(IdentityError::from)?;
+
+    #[cfg(unix)]
+    {
+        let mut perms = tokio::fs::metadata(path.as_ref())
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        tokio::fs::set_permissions(path.as_ref(), perms)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+
+    Ok(())
+}
+
+/// Load an AgentCertificate from the specified file path.
+pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<AgentCertificate> {
+    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    bincode::deserialize(&bytes).map_err(|e| IdentityError::Serialization(e.to_string()))
 }
 
 #[cfg(test)]
