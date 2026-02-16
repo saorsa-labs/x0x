@@ -22,9 +22,10 @@ async fn test_agent_creation_workflow() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let temp_path = temp_dir.path();
 
-    // Create first agent with custom machine key path
+    // Create first agent with custom machine key path and agent key path
     let agent1 = Agent::builder()
         .with_machine_key(temp_path.join("machine1.key"))
+        .with_agent_key_path(temp_path.join("agent1.key"))
         .build()
         .await
         .expect("Failed to create agent1");
@@ -44,9 +45,10 @@ async fn test_agent_creation_workflow() {
         "Agent ID should not be zero"
     );
 
-    // Create second agent with same machine key (should reuse)
+    // Create second agent with same machine key but different agent key
     let agent2 = Agent::builder()
         .with_machine_key(temp_path.join("machine1.key"))
+        .with_agent_key_path(temp_path.join("agent2.key"))
         .build()
         .await
         .expect("Failed to create agent2");
