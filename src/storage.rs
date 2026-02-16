@@ -475,10 +475,7 @@ pub async fn user_keypair_exists() -> bool {
 ///
 /// Creates the parent directory if it doesn't exist. Sets file
 /// permissions to 0o600 on Unix systems.
-pub async fn save_user_keypair_to<P: AsRef<Path> + Clone>(
-    kp: &UserKeypair,
-    path: P,
-) -> Result<()> {
+pub async fn save_user_keypair_to<P: AsRef<Path> + Clone>(kp: &UserKeypair, path: P) -> Result<()> {
     let bytes = serialize_user_keypair(kp)?;
 
     if let Some(parent) = path.as_ref().parent() {

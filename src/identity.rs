@@ -406,14 +406,13 @@ impl AgentCertificate {
 
         let message = Self::build_message(&user_pub_bytes, &agent_pub_bytes, issued_at);
 
-        let signature =
-            ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(user_kp.secret_key(), &message)
-                .map_err(|e| {
-                    crate::error::IdentityError::CertificateVerification(format!(
-                        "signing failed: {:?}",
-                        e
-                    ))
-                })?;
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            user_kp.secret_key(),
+            &message,
+        )
+        .map_err(|e| {
+            crate::error::IdentityError::CertificateVerification(format!("signing failed: {:?}", e))
+        })?;
 
         Ok(Self {
             user_public_key: user_pub_bytes,
@@ -434,18 +433,20 @@ impl AgentCertificate {
             )
         })?;
 
-        let signature = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
-            &self.signature,
-        )
-        .map_err(|e| {
-            crate::error::IdentityError::CertificateVerification(format!(
-                "invalid signature format: {:?}",
-                e
-            ))
-        })?;
+        let signature =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&self.signature)
+                .map_err(|e| {
+                    crate::error::IdentityError::CertificateVerification(format!(
+                        "invalid signature format: {:?}",
+                        e
+                    ))
+                })?;
 
-        let message =
-            Self::build_message(&self.user_public_key, &self.agent_public_key, self.issued_at);
+        let message = Self::build_message(
+            &self.user_public_key,
+            &self.agent_public_key,
+            self.issued_at,
+        );
 
         ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
             &user_pubkey,

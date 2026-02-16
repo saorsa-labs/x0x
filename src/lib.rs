@@ -689,14 +689,16 @@ impl AgentBuilder {
                 match storage::load_agent_certificate().await {
                     Ok(c) => {
                         // Verify cert is for the current user - if not, re-issue
-                        let cert_matches_user = c.user_id()
+                        let cert_matches_user = c
+                            .user_id()
                             .map(|uid| uid == user_kp.user_id())
                             .unwrap_or(false);
                         if cert_matches_user {
                             c
                         } else {
                             // Cert was for a different user, issue new one
-                            let new_cert = identity::AgentCertificate::issue(&user_kp, &agent_keypair)?;
+                            let new_cert =
+                                identity::AgentCertificate::issue(&user_kp, &agent_keypair)?;
                             storage::save_agent_certificate(&new_cert).await?;
                             new_cert
                         }
