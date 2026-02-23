@@ -1,9 +1,10 @@
 # x0x Bootstrap Configuration - Nuremberg (saorsa-7)
 # Location: Nuremberg, Germany (Hetzner)
-# Public IP: 116.203.101.172
+# Public IPv4: 116.203.101.172
+# Public IPv6: 2a01:4f8:1c1a:31e6::1
 
-# QUIC transport bind address
-bind_address = "116.203.101.172:12000"
+# QUIC transport bind address (dual-stack: accepts both IPv4 and IPv6)
+bind_address = "[::]:12000"
 
 # Health/metrics endpoint (localhost only)
 health_address = "127.0.0.1:12600"
@@ -19,7 +20,7 @@ coordinator = true
 reflector = true
 relay = true
 
-# Known peers (other 5 bootstrap nodes)
+# Known peers (other 5 bootstrap nodes — IPv4 addresses for cross-node connectivity)
 known_peers = [
     "142.93.199.50:12000",      # saorsa-2 (NYC)
     "147.182.234.192:12000",    # saorsa-3 (SFO)

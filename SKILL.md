@@ -536,16 +536,18 @@ println!("My Machine ID: {}", agent.machine_id());
 
 That's it. `join_network()` connects to all bootstrap nodes in parallel with automatic retry. No configuration needed.
 
-**Bootstrap nodes** (hardcoded in `DEFAULT_BOOTSTRAP_PEERS`, port 12000/UDP QUIC):
+**Bootstrap nodes** (hardcoded in `DEFAULT_BOOTSTRAP_PEERS`, port 12000/UDP QUIC, dual-stack):
 
-| Location | Address | Provider |
-|----------|---------|----------|
-| New York, US | `142.93.199.50:12000` | DigitalOcean |
-| San Francisco, US | `147.182.234.192:12000` | DigitalOcean |
-| Helsinki, Finland | `65.21.157.229:12000` | Hetzner |
-| Nuremberg, Germany | `116.203.101.172:12000` | Hetzner |
-| Singapore | `149.28.156.231:12000` | Vultr |
-| Tokyo, Japan | `45.77.176.184:12000` | Vultr |
+| Location | IPv4 Address | IPv6 Address | Provider |
+|----------|-------------|-------------|----------|
+| New York, US | `142.93.199.50:12000` | `[2604:a880:400:d1:0:3:7db3:f001]:12000` | DigitalOcean |
+| San Francisco, US | `147.182.234.192:12000` | `[2604:a880:4:1d0:0:1:6ba1:f000]:12000` | DigitalOcean |
+| Helsinki, Finland | `65.21.157.229:12000` | `[2a01:4f9:c012:684b::1]:12000` | Hetzner |
+| Nuremberg, Germany | `116.203.101.172:12000` | `[2a01:4f8:1c1a:31e6::1]:12000` | Hetzner |
+| Singapore | `149.28.156.231:12000` | `[2001:19f0:4401:346:5400:5ff:fed9:9735]:12000` | Vultr |
+| Tokyo, Japan | `45.77.176.184:12000` | `[2401:c080:1000:4c32:5400:5ff:fed9:9737]:12000` | Vultr |
+
+All nodes bind to `[::]:12000` (dual-stack: accepts both IPv4 and IPv6 connections).
 
 **Custom bootstrap** (optional — only if you run your own network):
 ```rust

@@ -61,23 +61,34 @@ pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
 /// roles. They form a globally distributed mesh providing bootstrap, NAT traversal,
 /// and rendezvous services.
 ///
+/// All nodes bind to `[::]:12000` (dual-stack: accepts both IPv4 and IPv6).
+/// IPv6 addresses are included for nodes that have global IPv6 connectivity.
+///
 /// Locations:
-/// - `142.93.199.50` - NYC, US (DigitalOcean)
-/// - `147.182.234.192` - SFO, US (DigitalOcean)
-/// - `65.21.157.229` - Helsinki, FI (Hetzner)
-/// - `116.203.101.172` - Nuremberg, DE (Hetzner)
-/// - `149.28.156.231` - Singapore, SG (Vultr)
-/// - `45.77.176.184` - Tokyo, JP (Vultr)
+/// - `142.93.199.50` / `2604:a880:400:d1:0:3:7db3:f001` — NYC, US (DigitalOcean)
+/// - `147.182.234.192` / `2604:a880:4:1d0:0:1:6ba1:f000` — SFO, US (DigitalOcean)
+/// - `65.21.157.229` / `2a01:4f9:c012:684b::1` — Helsinki, FI (Hetzner)
+/// - `116.203.101.172` / `2a01:4f8:1c1a:31e6::1` — Nuremberg, DE (Hetzner)
+/// - `149.28.156.231` / `2001:19f0:4401:346:5400:5ff:fed9:9735` — Singapore, SG (Vultr)
+/// - `45.77.176.184` / `2401:c080:1000:4c32:5400:5ff:fed9:9737` — Tokyo, JP (Vultr)
 ///
 /// Agents can override these by calling `AgentBuilder::with_network_config`
 /// with a custom [`NetworkConfig`] containing different bootstrap nodes.
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
-    "142.93.199.50:12000",   // NYC
-    "147.182.234.192:12000", // SFO
-    "65.21.157.229:12000",   // Helsinki
-    "116.203.101.172:12000", // Nuremberg
-    "149.28.156.231:12000",  // Singapore
-    "45.77.176.184:12000",   // Tokyo
+    // IPv4
+    "142.93.199.50:12000",            // NYC
+    "147.182.234.192:12000",          // SFO
+    "65.21.157.229:12000",            // Helsinki
+    "116.203.101.172:12000",          // Nuremberg
+    "149.28.156.231:12000",           // Singapore
+    "45.77.176.184:12000",            // Tokyo
+    // IPv6
+    "[2604:a880:400:d1:0:3:7db3:f001]:12000",          // NYC
+    "[2604:a880:4:1d0:0:1:6ba1:f000]:12000",           // SFO
+    "[2a01:4f9:c012:684b::1]:12000",                    // Helsinki
+    "[2a01:4f8:1c1a:31e6::1]:12000",                    // Nuremberg
+    "[2001:19f0:4401:346:5400:5ff:fed9:9735]:12000",    // Singapore
+    "[2401:c080:1000:4c32:5400:5ff:fed9:9737]:12000",   // Tokyo
 ];
 
 /// x0x network node configuration.
@@ -906,8 +917,8 @@ mod tests {
         // Verify default bootstrap nodes are included
         assert_eq!(
             config.bootstrap_nodes.len(),
-            6,
-            "Should have 6 default bootstrap nodes"
+            12,
+            "Should have 12 default bootstrap nodes (6 IPv4 + 6 IPv6)"
         );
 
         // Verify specific bootstrap addresses

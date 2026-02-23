@@ -307,14 +307,14 @@ async fn main() -> Result<()> {
         .route("/peers", get(peers))
         .route("/publish", post(publish))
         .route("/subscribe", post(subscribe))
-        .route("/subscribe/{id}", delete(unsubscribe))
+        .route("/subscribe/:id", delete(unsubscribe))
         .route("/events", get(events_sse))
         .route("/presence", get(presence))
         .route("/task-lists", get(list_task_lists))
         .route("/task-lists", post(create_task_list))
-        .route("/task-lists/{id}/tasks", get(list_tasks))
-        .route("/task-lists/{id}/tasks", post(add_task))
-        .route("/task-lists/{id}/tasks/{tid}", patch(update_task))
+        .route("/task-lists/:id/tasks", get(list_tasks))
+        .route("/task-lists/:id/tasks", post(add_task))
+        .route("/task-lists/:id/tasks/:tid", patch(update_task))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -532,8 +532,8 @@ async fn presence(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 async fn list_task_lists(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let lists = state.task_lists.read().await;
     let entries: Vec<TaskListEntry> = lists
-        .iter()
-        .map(|(id, _handle)| TaskListEntry {
+        .keys()
+        .map(|id| TaskListEntry {
             id: id.clone(),
             topic: id.clone(), // topic is used as ID
         })
