@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-x0x"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agent-to-agent gossip network for AI systems — no winners, no losers, just cooperation"
 readme = "README.md"
 license = "MIT OR Apache-2.0"

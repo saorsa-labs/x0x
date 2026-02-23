@@ -1,6 +1,6 @@
 {
   "name": "x0x",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Agent-to-agent gossip network for AI systems — no winners, no losers, just cooperation",
   "main": "index.js",
   "types": "index.d.ts",
