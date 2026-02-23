@@ -76,19 +76,19 @@ pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
 /// with a custom [`NetworkConfig`] containing different bootstrap nodes.
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     // IPv4
-    "142.93.199.50:12000",            // NYC
-    "147.182.234.192:12000",          // SFO
-    "65.21.157.229:12000",            // Helsinki
-    "116.203.101.172:12000",          // Nuremberg
-    "149.28.156.231:12000",           // Singapore
-    "45.77.176.184:12000",            // Tokyo
+    "142.93.199.50:12000",   // NYC
+    "147.182.234.192:12000", // SFO
+    "65.21.157.229:12000",   // Helsinki
+    "116.203.101.172:12000", // Nuremberg
+    "149.28.156.231:12000",  // Singapore
+    "45.77.176.184:12000",   // Tokyo
     // IPv6
-    "[2604:a880:400:d1:0:3:7db3:f001]:12000",          // NYC
-    "[2604:a880:4:1d0:0:1:6ba1:f000]:12000",           // SFO
-    "[2a01:4f9:c012:684b::1]:12000",                    // Helsinki
-    "[2a01:4f8:1c1a:31e6::1]:12000",                    // Nuremberg
-    "[2001:19f0:4401:346:5400:5ff:fed9:9735]:12000",    // Singapore
-    "[2401:c080:1000:4c32:5400:5ff:fed9:9737]:12000",   // Tokyo
+    "[2604:a880:400:d1:0:3:7db3:f001]:12000",         // NYC
+    "[2604:a880:4:1d0:0:1:6ba1:f000]:12000",          // SFO
+    "[2a01:4f9:c012:684b::1]:12000",                  // Helsinki
+    "[2a01:4f8:1c1a:31e6::1]:12000",                  // Nuremberg
+    "[2001:19f0:4401:346:5400:5ff:fed9:9735]:12000",  // Singapore
+    "[2401:c080:1000:4c32:5400:5ff:fed9:9737]:12000", // Tokyo
 ];
 
 /// x0x network node configuration.

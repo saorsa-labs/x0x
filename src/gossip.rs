@@ -8,5 +8,5 @@ pub mod pubsub;
 pub mod runtime;
 
 pub use config::GossipConfig;
-pub use pubsub::{PubSubManager, PubSubMessage, Subscription};
+pub use pubsub::{PubSubManager, PubSubMessage, SigningContext, Subscription};
 pub use runtime::GossipRuntime;

@@ -180,11 +180,7 @@ impl TaskListSync {
     /// # Errors
     ///
     /// Returns an error if serialization or publishing fails.
-    pub async fn publish_delta(
-        &self,
-        local_peer_id: PeerId,
-        delta: TaskListDelta,
-    ) -> Result<()> {
+    pub async fn publish_delta(&self, local_peer_id: PeerId, delta: TaskListDelta) -> Result<()> {
         let serialized = bincode::serialize(&(local_peer_id, delta)).map_err(|e| {
             crate::crdt::CrdtError::Gossip(format!("failed to serialize delta: {e}"))
         })?;
@@ -192,9 +188,7 @@ impl TaskListSync {
         self.pubsub
             .publish(self.topic.clone(), bytes::Bytes::from(serialized))
             .await
-            .map_err(|e| {
-                crate::crdt::CrdtError::Gossip(format!("failed to publish delta: {e}"))
-            })?;
+            .map_err(|e| crate::crdt::CrdtError::Gossip(format!("failed to publish delta: {e}")))?;
 
         Ok(())
     }

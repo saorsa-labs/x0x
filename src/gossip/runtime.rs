@@ -1,7 +1,7 @@
 //! Gossip runtime orchestration.
 
 use super::config::GossipConfig;
-use super::pubsub::PubSubManager;
+use super::pubsub::{PubSubManager, SigningContext};
 use crate::error::NetworkResult;
 use crate::network::NetworkNode;
 use saorsa_gossip_membership::{HyParViewMembership, MembershipConfig};
@@ -47,7 +47,11 @@ impl GossipRuntime {
     /// # Errors
     ///
     /// Returns an error if configuration validation fails.
-    pub async fn new(config: GossipConfig, network: Arc<NetworkNode>) -> NetworkResult<Self> {
+    pub async fn new(
+        config: GossipConfig,
+        network: Arc<NetworkNode>,
+        signing: Option<Arc<SigningContext>>,
+    ) -> NetworkResult<Self> {
         config.validate().map_err(|e| {
             crate::error::NetworkError::NodeCreation(format!("invalid gossip config: {e}"))
         })?;
@@ -59,7 +63,7 @@ impl GossipRuntime {
             membership_config,
             Arc::clone(&network),
         ));
-        let pubsub = Arc::new(PubSubManager::new(Arc::clone(&network)));
+        let pubsub = Arc::new(PubSubManager::new(Arc::clone(&network), signing));
 
         Ok(Self {
             config,
@@ -148,7 +152,7 @@ mod tests {
         let network = NetworkNode::new(NetworkConfig::default())
             .await
             .expect("Failed to create network");
-        let runtime = GossipRuntime::new(config, Arc::new(network))
+        let runtime = GossipRuntime::new(config, Arc::new(network), None)
             .await
             .expect("Failed to create runtime");
 
@@ -164,7 +168,7 @@ mod tests {
         let network = NetworkNode::new(NetworkConfig::default())
             .await
             .expect("Failed to create network");
-        let runtime = GossipRuntime::new(config, Arc::new(network))
+        let runtime = GossipRuntime::new(config, Arc::new(network), None)
             .await
             .expect("Failed to create runtime");
 
@@ -179,7 +183,7 @@ mod tests {
             .await
             .expect("Failed to create network");
         let network_arc = Arc::new(network);
-        let runtime = GossipRuntime::new(config.clone(), network_arc.clone())
+        let runtime = GossipRuntime::new(config.clone(), network_arc.clone(), None)
             .await
             .expect("Failed to create runtime");
 
@@ -196,7 +200,7 @@ mod tests {
         let network_arc = Arc::new(network);
         let expected_peer_id =
             saorsa_gossip_transport::GossipTransport::local_peer_id(network_arc.as_ref());
-        let runtime = GossipRuntime::new(config, network_arc)
+        let runtime = GossipRuntime::new(config, network_arc, None)
             .await
             .expect("Failed to create runtime");
 
@@ -212,7 +216,7 @@ mod tests {
         let network = NetworkNode::new(NetworkConfig::default())
             .await
             .expect("Failed to create network");
-        let result = GossipRuntime::new(config, Arc::new(network)).await;
+        let result = GossipRuntime::new(config, Arc::new(network), None).await;
 
         assert!(result.is_err());
     }

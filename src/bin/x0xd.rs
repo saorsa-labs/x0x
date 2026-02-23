@@ -19,19 +19,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::signal;
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
+use x0x::contacts::{ContactStore, TrustLevel};
+use x0x::identity::AgentId;
 use x0x::network::NetworkConfig;
 use x0x::{Agent, Subscription, TaskListHandle};
 
@@ -115,6 +117,7 @@ struct AppState {
     agent: Arc<Agent>,
     subscriptions: RwLock<HashMap<String, Subscription>>,
     task_lists: RwLock<HashMap<String, TaskListHandle>>,
+    contacts: Arc<RwLock<ContactStore>>,
     start_time: Instant,
     broadcast_tx: broadcast::Sender<SseEvent>,
 }
@@ -155,6 +158,43 @@ struct AddTaskRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateTaskRequest {
     action: String, // "claim" or "complete"
+}
+
+/// POST /contacts request body.
+#[derive(Debug, Deserialize)]
+struct AddContactRequest {
+    /// Agent ID as 64-character hex string.
+    agent_id: String,
+    /// Trust level: "blocked", "unknown", "known", or "trusted".
+    trust_level: String,
+    /// Optional human-readable label.
+    label: Option<String>,
+}
+
+/// PATCH /contacts/:agent_id request body.
+#[derive(Debug, Deserialize)]
+struct UpdateContactRequest {
+    /// New trust level: "blocked", "unknown", "known", or "trusted".
+    trust_level: String,
+}
+
+/// POST /contacts/trust request body (quick trust shorthand).
+#[derive(Debug, Deserialize)]
+struct QuickTrustRequest {
+    /// Agent ID as 64-character hex string.
+    agent_id: String,
+    /// Trust level: "blocked", "unknown", "known", or "trusted".
+    level: String,
+}
+
+/// Contact entry for API responses.
+#[derive(Debug, Serialize)]
+struct ContactEntry {
+    agent_id: String,
+    trust_level: String,
+    label: Option<String>,
+    added_at: u64,
+    last_seen: Option<u64>,
 }
 
 /// Generic JSON response wrapper.
@@ -234,12 +274,7 @@ async fn main() -> Result<()> {
                 .map(|d| d.join("x0x").join("config.toml"))
                 .unwrap_or_else(|| PathBuf::from("/etc/x0x/config.toml"));
             if default_path.exists() {
-                load_config(
-                    default_path
-                        .to_str()
-                        .unwrap_or("/etc/x0x/config.toml"),
-                )
-                .await?
+                load_config(default_path.to_str().unwrap_or("/etc/x0x/config.toml")).await?
             } else {
                 DaemonConfig::default()
             }
@@ -282,6 +317,16 @@ async fn main() -> Result<()> {
     tracing::info!("Agent ID: {}", agent.agent_id());
     tracing::info!("Machine ID: {}", agent.machine_id());
 
+    // Create contact store and attach to gossip layer for trust filtering
+    let contacts = Arc::new(RwLock::new(ContactStore::new(
+        config.data_dir.join("contacts.json"),
+    )));
+    agent.set_contacts(Arc::clone(&contacts));
+    tracing::info!(
+        "Contact store loaded from {}",
+        config.data_dir.join("contacts.json").display()
+    );
+
     // Join network
     agent
         .join_network()
@@ -296,6 +341,7 @@ async fn main() -> Result<()> {
         agent: Arc::new(agent),
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
+        contacts,
         start_time: Instant::now(),
         broadcast_tx,
     });
@@ -310,6 +356,11 @@ async fn main() -> Result<()> {
         .route("/subscribe/:id", delete(unsubscribe))
         .route("/events", get(events_sse))
         .route("/presence", get(presence))
+        .route("/contacts", get(list_contacts))
+        .route("/contacts", post(add_contact))
+        .route("/contacts/trust", post(quick_trust))
+        .route("/contacts/:agent_id", patch(update_contact))
+        .route("/contacts/:agent_id", delete(delete_contact))
         .route("/task-lists", get(list_task_lists))
         .route("/task-lists", post(create_task_list))
         .route("/task-lists/:id/tasks", get(list_tasks))
@@ -344,12 +395,7 @@ async fn shutdown_signal() {
 
 /// GET /health
 async fn health(State(state): State<Arc<AppState>>) -> Json<ApiResponse<HealthData>> {
-    let peers = state
-        .agent
-        .peers()
-        .await
-        .map(|p| p.len())
-        .unwrap_or(0);
+    let peers = state.agent.peers().await.map(|p| p.len()).unwrap_or(0);
 
     Json(ApiResponse {
         ok: true,
@@ -413,10 +459,7 @@ async fn publish(
     };
 
     match state.agent.publish(&req.topic, payload).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "ok": true })),
-        ),
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
@@ -445,6 +488,9 @@ async fn subscribe(
                             "subscription_id": sub_id,
                             "topic": topic,
                             "payload": base64::engine::general_purpose::STANDARD.encode(&msg.payload),
+                            "sender": msg.sender.map(|s| hex::encode(s.0)),
+                            "verified": msg.verified,
+                            "trust_level": msg.trust_level.map(|t| t.to_string()),
                         }),
                     };
                     let _ = broadcast_tx.send(event);
@@ -484,10 +530,7 @@ async fn unsubscribe(
 ) -> impl IntoResponse {
     let mut subs = state.subscriptions.write().await;
     if subs.remove(&id).is_some() {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({ "ok": true })),
-        )
+        (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     } else {
         (
             StatusCode::NOT_FOUND,
@@ -526,6 +569,182 @@ async fn presence(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Contact handlers
+// ---------------------------------------------------------------------------
+
+/// Parse a 64-character hex string into an AgentId.
+fn parse_agent_id_hex(hex_str: &str) -> Result<AgentId, String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "expected 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        ));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(AgentId(arr))
+}
+
+/// GET /contacts — list all contacts with trust levels.
+async fn list_contacts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let store = state.contacts.read().await;
+    let entries: Vec<ContactEntry> = store
+        .list()
+        .into_iter()
+        .map(|c| ContactEntry {
+            agent_id: hex::encode(c.agent_id.0),
+            trust_level: c.trust_level.to_string(),
+            label: c.label.clone(),
+            added_at: c.added_at,
+            last_seen: c.last_seen,
+        })
+        .collect();
+    Json(serde_json::json!({ "ok": true, "contacts": entries }))
+}
+
+/// POST /contacts — add a new contact.
+async fn add_contact(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddContactRequest>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&req.agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let trust_level: TrustLevel = match req.trust_level.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let contact = x0x::contacts::Contact {
+        agent_id,
+        trust_level,
+        label: req.label,
+        added_at: now,
+        last_seen: None,
+    };
+
+    state.contacts.write().await.add(contact);
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "ok": true, "agent_id": hex::encode(agent_id.0) })),
+    )
+}
+
+/// PATCH /contacts/:agent_id — update trust level for a contact.
+async fn update_contact(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id_hex): Path<String>,
+    Json(req): Json<UpdateContactRequest>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let trust_level: TrustLevel = match req.trust_level.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    state
+        .contacts
+        .write()
+        .await
+        .set_trust(&agent_id, trust_level);
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
+/// DELETE /contacts/:agent_id — remove a contact.
+async fn delete_contact(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let removed = state.contacts.write().await.remove(&agent_id);
+    if removed.is_some() {
+        (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "contact not found" })),
+        )
+    }
+}
+
+/// POST /contacts/trust — quick trust shorthand.
+async fn quick_trust(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<QuickTrustRequest>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&req.agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let trust_level: TrustLevel = match req.level.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    state
+        .contacts
+        .write()
+        .await
+        .set_trust(&agent_id, trust_level);
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
 
 /// GET /task-lists
@@ -650,7 +869,9 @@ async fn update_task(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid task ID (expected 64 hex chars)" })),
+                Json(
+                    serde_json::json!({ "ok": false, "error": "invalid task ID (expected 64 hex chars)" }),
+                ),
             );
         }
     };
@@ -662,16 +883,15 @@ async fn update_task(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "action must be 'claim' or 'complete'" })),
+                Json(
+                    serde_json::json!({ "ok": false, "error": "action must be 'claim' or 'complete'" }),
+                ),
             );
         }
     };
 
     match result {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "ok": true })),
-        ),
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),

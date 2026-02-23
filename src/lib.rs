@@ -74,6 +74,9 @@ pub mod bootstrap;
 /// Network transport layer for x0x.
 pub mod network;
 
+/// Contact store with trust levels for message filtering.
+pub mod contacts;
+
 /// Gossip overlay networking for x0x.
 pub mod gossip;
 
@@ -84,7 +87,9 @@ pub mod crdt;
 pub mod mls;
 
 // Re-export key gossip types (including new pubsub components)
-pub use gossip::{GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, Subscription};
+pub use gossip::{
+    GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, SigningContext, Subscription,
+};
 
 /// The core agent that participates in the x0x gossip network.
 ///
@@ -266,6 +271,19 @@ impl Agent {
     #[must_use]
     pub fn network(&self) -> Option<&std::sync::Arc<network::NetworkNode>> {
         self.network.as_ref()
+    }
+
+    /// Attach a contact store for trust-based message filtering.
+    ///
+    /// When set, the gossip pub/sub layer will:
+    /// - Drop messages from `Blocked` senders (don't deliver, don't rebroadcast)
+    /// - Annotate messages with the sender's trust level for consumers
+    ///
+    /// Without a contact store, all messages pass through (open relay mode).
+    pub fn set_contacts(&self, store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>) {
+        if let Some(runtime) = &self.gossip_runtime {
+            runtime.pubsub().set_contacts(store);
+        }
     }
 
     /// Join the x0x gossip network.
@@ -511,11 +529,7 @@ impl Agent {
     /// ```ignore
     /// let list = agent.create_task_list("Sprint Planning", "team-sprint").await?;
     /// ```
-    pub async fn create_task_list(
-        &self,
-        name: &str,
-        topic: &str,
-    ) -> error::Result<TaskListHandle> {
+    pub async fn create_task_list(&self, name: &str, topic: &str) -> error::Result<TaskListHandle> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
                 "gossip runtime not initialized - configure agent with network first",
@@ -860,11 +874,17 @@ impl AgentBuilder {
             None
         };
 
+        // Create signing context from agent keypair for message authentication
+        let signing_ctx = std::sync::Arc::new(gossip::SigningContext::from_keypair(
+            identity.agent_keypair(),
+        ));
+
         // Create gossip runtime if network exists
         let gossip_runtime = if let Some(ref net) = network {
             let runtime = gossip::GossipRuntime::new(
                 gossip::GossipConfig::default(),
                 std::sync::Arc::clone(net),
+                Some(signing_ctx),
             )
             .await
             .map_err(|e| {
@@ -940,16 +960,12 @@ impl TaskListHandle {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let task_id = crdt::TaskId::new(&title, &self.agent_id, timestamp);
-        let metadata =
-            crdt::TaskMetadata::new(title, description, 128, self.agent_id, timestamp);
+        let metadata = crdt::TaskMetadata::new(title, description, 128, self.agent_id, timestamp);
         let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
 
         let mut list = self.sync.write().await;
         list.add_task(task, self.peer_id, timestamp).map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "add_task failed: {}",
-                e
-            )))
+            error::IdentityError::Storage(std::io::Error::other(format!("add_task failed: {}", e)))
         })?;
 
         Ok(task_id)
@@ -1043,10 +1059,7 @@ impl TaskListHandle {
     pub async fn reorder(&self, task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
         let mut list = self.sync.write().await;
         list.reorder(task_ids, self.peer_id).map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "reorder failed: {}",
-                e
-            )))
+            error::IdentityError::Storage(std::io::Error::other(format!("reorder failed: {}", e)))
         })
     }
 }
