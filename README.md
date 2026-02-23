@@ -37,7 +37,7 @@ x0x provides a gossip-based communication layer for AI agent networks, built on 
 - **Transport**: [ant-quic](https://github.com/saorsa-labs/ant-quic) — QUIC with post-quantum cryptography (ML-KEM-768 key exchange, ML-DSA-65 signatures), NAT traversal, and relay support
 - **Gossip**: [saorsa-gossip](https://github.com/saorsa-labs/saorsa-gossip) — epidemic broadcast, CRDT synchronisation, presence, pub/sub, and group management
 - **Cryptography**: Quantum-resistant by default via [saorsa-pqc](https://github.com/saorsa-labs/saorsa-pqc), targeting EU PQC regulatory compliance (2030)
-- **Identity**: Decentralised agent identity with no central authority
+- **Identity**: Three-layer decentralised identity (User → Agent → Machine) with certificate-based trust chains
 
 ### Agent Communication Model
 
@@ -134,6 +134,77 @@ async for msg in agent.subscribe("coordination"):
 ```
 
 > **Note**: The PyPI package is named `agent-x0x` (because `x0x` was unavailable), but the import remains `from x0x import ...`
+
+## x0xd — Local Agent Daemon
+
+x0xd runs a persistent x0x agent locally with a REST API. External tools (CLI, Fae, scripts) control it via HTTP.
+
+### Quick Start
+
+```bash
+# Download from latest release (or build: cargo build --release --bin x0xd)
+x0xd                                  # default: API on 127.0.0.1:12700
+x0xd --config /path/to/config.toml    # custom config
+x0xd --check                          # validate config and exit
+```
+
+### REST API
+
+```bash
+# Health check
+curl -s http://127.0.0.1:12700/health | jq .
+
+# Agent identity
+curl -s http://127.0.0.1:12700/agent | jq .
+
+# List peers
+curl -s http://127.0.0.1:12700/peers | jq .
+
+# Subscribe to a topic
+curl -s -X POST http://127.0.0.1:12700/subscribe \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "coordination"}'
+
+# Publish (payload is base64)
+curl -s -X POST http://127.0.0.1:12700/publish \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "coordination", "payload": "SGVsbG8="}'
+
+# Server-Sent Events stream
+curl -N http://127.0.0.1:12700/events
+
+# Task lists
+curl -s -X POST http://127.0.0.1:12700/task-lists \
+  -H "Content-Type: application/json" \
+  -d '{"name": "My Tasks", "topic": "my-tasks"}'
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Status, version, peer count, uptime |
+| GET | `/agent` | Agent/machine/user IDs |
+| GET | `/peers` | Connected gossip peers |
+| POST | `/publish` | Publish to topic (base64 payload) |
+| POST | `/subscribe` | Subscribe to topic |
+| DELETE | `/subscribe/{id}` | Unsubscribe |
+| GET | `/events` | SSE event stream |
+| GET | `/presence` | Known agents |
+| GET | `/task-lists` | List task lists |
+| POST | `/task-lists` | Create task list |
+| GET | `/task-lists/{id}/tasks` | List tasks |
+| POST | `/task-lists/{id}/tasks` | Add task |
+| PATCH | `/task-lists/{id}/tasks/{tid}` | Claim or complete task |
+
+### systemd (User Mode)
+
+```bash
+cp .deployment/x0xd.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now x0xd
+journalctl --user -u x0xd -f
+```
 
 ## Share x0x
 

@@ -424,6 +424,70 @@ impl Agent {
             })
     }
 
+    /// Get connected peer IDs.
+    ///
+    /// Returns the list of peers currently connected via the gossip network.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the network is not initialized.
+    pub async fn peers(&self) -> error::Result<Vec<saorsa_gossip_types::PeerId>> {
+        let network = self.network.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "network not initialized - configure agent with network first",
+            ))
+        })?;
+        let ant_peers = network.connected_peers().await;
+        Ok(ant_peers
+            .into_iter()
+            .map(|p| saorsa_gossip_types::PeerId::new(p.0))
+            .collect())
+    }
+
+    /// Get online agents.
+    ///
+    /// Returns a list of agent IDs that are currently known to be online.
+    /// This is a placeholder; full presence detection will use
+    /// saorsa-gossip-presence in a future release.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn presence(&self) -> error::Result<Vec<identity::AgentId>> {
+        let _runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        // Placeholder: presence tracking will be implemented with saorsa-gossip-presence
+        Ok(Vec::new())
+    }
+
+    /// Find an agent by ID.
+    ///
+    /// Looks up network addresses for a known agent. This is a placeholder;
+    /// full FOAF discovery will use saorsa-gossip-rendezvous in a future release.
+    ///
+    /// # Arguments
+    ///
+    /// * `_agent_id` - The agent ID to search for
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn find_agent(
+        &self,
+        _agent_id: identity::AgentId,
+    ) -> error::Result<Option<Vec<std::net::SocketAddr>>> {
+        let _runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        // Placeholder: agent discovery will be implemented with saorsa-gossip-rendezvous
+        Ok(None)
+    }
+
     /// Create a new collaborative task list bound to a topic.
     ///
     /// Creates a new `TaskList` and binds it to the specified gossip topic
@@ -438,6 +502,10 @@ impl Agent {
     ///
     /// A `TaskListHandle` for interacting with the task list.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -445,17 +513,45 @@ impl Agent {
     /// ```
     pub async fn create_task_list(
         &self,
-        _name: &str,
-        _topic: &str,
+        name: &str,
+        topic: &str,
     ) -> error::Result<TaskListHandle> {
-        // TODO: Implement task list creation when gossip runtime is available
-        // This would:
-        // 1. Create a new TaskList with TaskListId::from_content(name, agent_id, timestamp)
-        // 2. Wrap it in TaskListSync with the gossip runtime
-        // 3. Return a TaskListHandle
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskList creation not yet implemented",
-        )))
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+
+        let peer_id = runtime.peer_id();
+        let list_id = crdt::TaskListId::from_content(name, &self.agent_id(), 0);
+        let task_list = crdt::TaskList::new(list_id, name.to_string(), peer_id);
+
+        let sync = crdt::TaskListSync::new(
+            task_list,
+            std::sync::Arc::clone(runtime.pubsub()),
+            topic.to_string(),
+            30,
+        )
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "task list sync creation failed: {}",
+                e
+            )))
+        })?;
+
+        let sync = std::sync::Arc::new(sync);
+        sync.start().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "task list sync start failed: {}",
+                e
+            )))
+        })?;
+
+        Ok(TaskListHandle {
+            sync,
+            agent_id: self.agent_id(),
+            peer_id,
+        })
     }
 
     /// Join an existing task list by topic.
@@ -471,21 +567,53 @@ impl Agent {
     ///
     /// A `TaskListHandle` for interacting with the task list.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    ///
     /// # Example
     ///
     /// ```ignore
     /// let list = agent.join_task_list("team-sprint").await?;
     /// ```
-    pub async fn join_task_list(&self, _topic: &str) -> error::Result<TaskListHandle> {
-        // TODO: Implement task list joining when gossip runtime is available
-        // This would:
-        // 1. Create an empty TaskList (or load from persistence if exists)
-        // 2. Subscribe to the topic to receive updates
-        // 3. Start anti-entropy sync
-        // 4. Return a TaskListHandle
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskList joining not yet implemented",
-        )))
+    pub async fn join_task_list(&self, topic: &str) -> error::Result<TaskListHandle> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+
+        let peer_id = runtime.peer_id();
+        // Create empty task list; it will be populated via delta sync
+        let list_id = crdt::TaskListId::from_content(topic, &self.agent_id(), 0);
+        let task_list = crdt::TaskList::new(list_id, String::new(), peer_id);
+
+        let sync = crdt::TaskListSync::new(
+            task_list,
+            std::sync::Arc::clone(runtime.pubsub()),
+            topic.to_string(),
+            30,
+        )
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "task list sync creation failed: {}",
+                e
+            )))
+        })?;
+
+        let sync = std::sync::Arc::new(sync);
+        sync.start().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "task list sync start failed: {}",
+                e
+            )))
+        })?;
+
+        Ok(TaskListHandle {
+            sync,
+            agent_id: self.agent_id(),
+            peer_id,
+        })
     }
 }
 
@@ -733,13 +861,22 @@ impl AgentBuilder {
         };
 
         // Create gossip runtime if network exists
-        let gossip_runtime = network.as_ref().map(|net| {
-            let net_arc = std::sync::Arc::clone(net);
-            std::sync::Arc::new(gossip::GossipRuntime::new(
+        let gossip_runtime = if let Some(ref net) = network {
+            let runtime = gossip::GossipRuntime::new(
                 gossip::GossipConfig::default(),
-                net_arc,
-            ))
-        });
+                std::sync::Arc::clone(net),
+            )
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "gossip runtime initialization failed: {}",
+                    e
+                )))
+            })?;
+            Some(std::sync::Arc::new(runtime))
+        } else {
+            None
+        };
 
         Ok(Agent {
             identity,
@@ -762,9 +899,20 @@ impl AgentBuilder {
 /// handle.claim_task(task_id).await?;
 /// handle.complete_task(task_id).await?;
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TaskListHandle {
-    _sync: std::sync::Arc<()>, // Placeholder for Arc<TaskListSync>
+    sync: std::sync::Arc<crdt::TaskListSync>,
+    agent_id: identity::AgentId,
+    peer_id: saorsa_gossip_types::PeerId,
+}
+
+impl std::fmt::Debug for TaskListHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskListHandle")
+            .field("agent_id", &self.agent_id)
+            .field("peer_id", &self.peer_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TaskListHandle {
@@ -778,15 +926,33 @@ impl TaskListHandle {
     /// # Returns
     ///
     /// The TaskId of the created task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task cannot be added.
     pub async fn add_task(
         &self,
-        _title: String,
-        _description: String,
+        title: String,
+        description: String,
     ) -> error::Result<crdt::TaskId> {
-        // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskListHandle not yet implemented",
-        )))
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let task_id = crdt::TaskId::new(&title, &self.agent_id, timestamp);
+        let metadata =
+            crdt::TaskMetadata::new(title, description, 128, self.agent_id, timestamp);
+        let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
+
+        let mut list = self.sync.write().await;
+        list.add_task(task, self.peer_id, timestamp).map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "add_task failed: {}",
+                e
+            )))
+        })?;
+
+        Ok(task_id)
     }
 
     /// Claim a task in the list.
@@ -794,11 +960,24 @@ impl TaskListHandle {
     /// # Arguments
     ///
     /// * `task_id` - ID of the task to claim
-    pub async fn claim_task(&self, _task_id: crdt::TaskId) -> error::Result<()> {
-        // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskListHandle not yet implemented",
-        )))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task cannot be claimed.
+    pub async fn claim_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut list = self.sync.write().await;
+        list.claim_task(&task_id, self.agent_id, self.peer_id, timestamp)
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "claim_task failed: {}",
+                    e
+                )))
+            })
     }
 
     /// Complete a task in the list.
@@ -806,11 +985,24 @@ impl TaskListHandle {
     /// # Arguments
     ///
     /// * `task_id` - ID of the task to complete
-    pub async fn complete_task(&self, _task_id: crdt::TaskId) -> error::Result<()> {
-        // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskListHandle not yet implemented",
-        )))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task cannot be completed.
+    pub async fn complete_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut list = self.sync.write().await;
+        list.complete_task(&task_id, self.agent_id, self.peer_id, timestamp)
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "complete_task failed: {}",
+                    e
+                )))
+            })
     }
 
     /// List all tasks in their current order.
@@ -818,11 +1010,25 @@ impl TaskListHandle {
     /// # Returns
     ///
     /// A vector of `TaskSnapshot` representing the current state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task list cannot be read.
     pub async fn list_tasks(&self) -> error::Result<Vec<TaskSnapshot>> {
-        // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskListHandle not yet implemented",
-        )))
+        let list = self.sync.read().await;
+        let tasks = list.tasks_ordered();
+        Ok(tasks
+            .into_iter()
+            .map(|task| TaskSnapshot {
+                id: *task.id(),
+                title: task.title().to_string(),
+                description: task.description().to_string(),
+                state: task.current_state(),
+                assignee: task.assignee().copied(),
+                owner: None,
+                priority: task.priority(),
+            })
+            .collect())
     }
 
     /// Reorder tasks in the list.
@@ -830,11 +1036,18 @@ impl TaskListHandle {
     /// # Arguments
     ///
     /// * `task_ids` - New ordering of task IDs
-    pub async fn reorder(&self, _task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
-        // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskListHandle not yet implemented",
-        )))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reordering fails.
+    pub async fn reorder(&self, task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
+        let mut list = self.sync.write().await;
+        list.reorder(task_ids, self.peer_id).map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "reorder failed: {}",
+                e
+            )))
+        })
     }
 }
 

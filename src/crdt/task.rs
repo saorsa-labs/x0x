@@ -1,6 +1,6 @@
 //! Task identifier and metadata types for CRDT task lists.
 
-use crate::identity::AgentId;
+use crate::identity::{AgentId, UserId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -169,6 +169,12 @@ pub struct TaskMetadata {
     /// The agent who created this task.
     pub created_by: AgentId,
 
+    /// The human owner of the agent that created this task (if known).
+    ///
+    /// When set, this enables trust attribution: tasks can be traced
+    /// back to a human identity across different agents and machines.
+    pub owner: Option<UserId>,
+
     /// When this task was created (Unix timestamp in milliseconds).
     pub created_at: u64,
 
@@ -218,6 +224,7 @@ impl TaskMetadata {
             description: description.into(),
             priority,
             created_by,
+            owner: None,
             created_at,
             tags: Vec::new(),
         }
@@ -243,6 +250,21 @@ impl TaskMetadata {
         created_at: u64,
     ) -> Self {
         Self::new(title, description, 128, created_by, created_at)
+    }
+
+    /// Set the human owner of this task's creator.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The owner's user ID
+    ///
+    /// # Returns
+    ///
+    /// Self for chaining.
+    #[must_use]
+    pub fn with_owner(mut self, user_id: UserId) -> Self {
+        self.owner = Some(user_id);
+        self
     }
 
     /// Add a tag to this task.

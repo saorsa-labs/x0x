@@ -124,6 +124,7 @@ async fn test_crdt_convergence_10_agents_50_tasks() {
                 description: format!("Agent {} task {}", i, j),
                 priority: 128,
                 created_by: AgentId([i as u8; 32]),
+                owner: None,
                 created_at: 1000 + (i * 10 + j) as u64,
                 tags: vec!["scale".to_string()],
             };
@@ -255,6 +256,7 @@ async fn test_convergence_with_partitions() {
             description: String::new(),
             priority: 128,
             created_by: AgentId([i as u8; 32]),
+            owner: None,
             created_at: 1000 + i as u64,
             tags: vec![],
         };
@@ -280,6 +282,7 @@ async fn test_convergence_with_partitions() {
             description: String::new(),
             priority: 128,
             created_by: AgentId([(i + 5) as u8; 32]),
+            owner: None,
             created_at: 1000 + (i + 5) as u64,
             tags: vec![],
         };

@@ -47,6 +47,7 @@ proptest! {
             description: "Desc".to_string(),
             priority: 128,
             created_by: agent_id1,
+            owner: None,
             created_at: 1000,
             tags: vec![],
         };
@@ -83,6 +84,7 @@ proptest! {
             description: "Test".to_string(),
             priority: 128,
             created_by: agent_id,
+            owner: None,
             created_at: 1000,
             tags: vec![],
         };
@@ -127,6 +129,7 @@ proptest! {
             description: "".to_string(),
             priority: 128,
             created_by: agent1,
+            owner: None,
             created_at: 1000,
             tags: vec![],
         };
@@ -139,6 +142,7 @@ proptest! {
             description: "".to_string(),
             priority: 128,
             created_by: agent2,
+            owner: None,
             created_at: 2000,
             tags: vec![],
         };
@@ -281,6 +285,7 @@ fn test_task_list_add_performance() {
             description: String::new(),
             priority: 128,
             created_by: AgentId([i as u8; 32]),
+            owner: None,
             created_at: 1000 + i,
             tags: vec![],
         };
@@ -314,6 +319,7 @@ fn test_crdt_merge_performance() {
             description: String::new(),
             priority: 128,
             created_by: AgentId([i; 32]),
+            owner: None,
             created_at: 1000 + u64::from(i),
             tags: vec![],
         };

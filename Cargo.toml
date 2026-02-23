@@ -23,10 +23,17 @@ bytes = "1.11"
 chacha20poly1305 = "0.10"
 dirs = "5.0"
 hex = "0.4"
+axum = "0.7"
+base64 = "0.22"
+axum-extra = { version = "0.9", features = ["typed-header"] }
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
 saorsa-gossip-coordinator = "0.5"
 saorsa-gossip-crdt-sync = "0.5"
+saorsa-gossip-groups = "0.5"
+saorsa-gossip-identity = "0.5"
 saorsa-gossip-membership = "0.5"
 saorsa-gossip-presence = "0.5"
 saorsa-gossip-pubsub = "0.5"
@@ -55,6 +62,10 @@ tempfile = "3.14"
 [[bin]]
 name = "x0x-bootstrap"
 path = "src/bin/x0x-bootstrap.rs"
+
+[[bin]]
+name = "x0xd"
+path = "src/bin/x0xd.rs"
 
 [workspace]
 members = [

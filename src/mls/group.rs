@@ -4,7 +4,7 @@
 //! encrypted group communications between agents. It handles group membership, epoch
 //! management, and commit operations for forward-secure group encryption.
 
-use crate::identity::AgentId;
+use crate::identity::{AgentCertificate, AgentId, UserId};
 use crate::mls::{MlsError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -113,16 +113,38 @@ impl MlsGroupContext {
 pub struct MlsMemberInfo {
     /// The agent's identity.
     agent_id: AgentId,
+    /// The human identity of the agent's owner (if known).
+    user_id: Option<UserId>,
+    /// Certificate binding agent to user (if user identity is present).
+    certificate: Option<AgentCertificate>,
     /// Epoch when this member joined.
     join_epoch: u64,
 }
 
 impl MlsMemberInfo {
-    /// Creates new member info.
+    /// Creates new member info (without user identity).
     #[must_use]
     pub fn new(agent_id: AgentId, join_epoch: u64) -> Self {
         Self {
             agent_id,
+            user_id: None,
+            certificate: None,
+            join_epoch,
+        }
+    }
+
+    /// Creates new member info with user identity.
+    #[must_use]
+    pub fn new_with_user(
+        agent_id: AgentId,
+        user_id: UserId,
+        certificate: AgentCertificate,
+        join_epoch: u64,
+    ) -> Self {
+        Self {
+            agent_id,
+            user_id: Some(user_id),
+            certificate: Some(certificate),
             join_epoch,
         }
     }
@@ -131,6 +153,18 @@ impl MlsMemberInfo {
     #[must_use]
     pub fn agent_id(&self) -> &AgentId {
         &self.agent_id
+    }
+
+    /// Gets the user ID, if present.
+    #[must_use]
+    pub fn user_id(&self) -> Option<&UserId> {
+        self.user_id.as_ref()
+    }
+
+    /// Gets the agent certificate, if present.
+    #[must_use]
+    pub fn certificate(&self) -> Option<&AgentCertificate> {
+        self.certificate.as_ref()
     }
 
     /// Gets the join epoch.

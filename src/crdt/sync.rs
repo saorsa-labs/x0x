@@ -13,8 +13,8 @@
 //! This provides eventual consistency across all peers sharing the same topic.
 
 use crate::crdt::{Result, TaskList, TaskListDelta};
+use crate::gossip::PubSubManager;
 use saorsa_gossip_crdt_sync::AntiEntropyManager;
-use saorsa_gossip_runtime::GossipRuntime;
 use saorsa_gossip_types::PeerId;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -24,16 +24,16 @@ use tokio::sync::RwLock;
 /// Manages automatic background synchronization of a TaskList using
 /// anti-entropy gossip. Changes are propagated via deltas published
 /// to a gossip topic.
-#[allow(dead_code)] // TODO: Remove when full gossip integration is complete
 pub struct TaskListSync {
     /// The task list being synchronized (wrapped for concurrent access).
     task_list: Arc<RwLock<TaskList>>,
 
     /// Anti-entropy manager for periodic sync.
+    #[allow(dead_code)]
     anti_entropy: AntiEntropyManager<TaskList>,
 
-    /// Gossip runtime for pub/sub.
-    gossip_runtime: Arc<GossipRuntime>,
+    /// Pub/sub manager for topic-based messaging.
+    pubsub: Arc<PubSubManager>,
 
     /// Topic name for this task list.
     topic: String,
@@ -45,7 +45,7 @@ impl TaskListSync {
     /// # Arguments
     ///
     /// * `task_list` - The TaskList to synchronize
-    /// * `gossip_runtime` - Gossip runtime for networking
+    /// * `pubsub` - Pub/sub manager for gossip messaging
     /// * `topic` - Topic name for pub/sub (typically task list ID)
     /// * `sync_interval_secs` - How often to run anti-entropy (seconds)
     ///
@@ -53,20 +53,24 @@ impl TaskListSync {
     ///
     /// A new TaskListSync instance ready to start.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if initialization fails.
+    ///
     /// # Example
     ///
     /// ```ignore
     /// let task_list = TaskList::new(id, "My List".to_string(), peer_id);
     /// let sync = TaskListSync::new(
     ///     task_list,
-    ///     gossip_runtime,
+    ///     pubsub,
     ///     "tasklist-abc123".to_string(),
     ///     30, // Sync every 30 seconds
-    /// ).await?;
+    /// )?;
     /// ```
-    pub async fn new(
+    pub fn new(
         task_list: TaskList,
-        gossip_runtime: Arc<GossipRuntime>,
+        pubsub: Arc<PubSubManager>,
         topic: String,
         sync_interval_secs: u64,
     ) -> Result<Self> {
@@ -79,14 +83,14 @@ impl TaskListSync {
         Ok(Self {
             task_list,
             anti_entropy,
-            gossip_runtime,
+            pubsub,
             topic,
         })
     }
 
     /// Start background synchronization.
     ///
-    /// Begins the anti-entropy process and subscribes to the gossip topic.
+    /// Subscribes to the gossip topic and begins receiving remote deltas.
     /// This method returns immediately; synchronization runs in the background.
     ///
     /// # Returns
@@ -96,28 +100,34 @@ impl TaskListSync {
     /// # Errors
     ///
     /// Returns an error if subscription or anti-entropy startup fails.
-    ///
-    /// # Note
-    ///
-    /// This is a simplified implementation. Production usage would:
-    /// - Subscribe to the topic via runtime.pubsub
-    /// - Start the anti-entropy background task
-    /// - Set up message handlers for incoming deltas
     pub async fn start(&self) -> Result<()> {
-        // TODO: Subscribe via self.gossip_runtime.pubsub.write().await.subscribe(...)
-        // This requires the PubSub trait which is beyond the scope of this task.
-        // For now, we provide the structure and interface.
+        // Subscribe to topic — received messages will contain serialized deltas.
+        // The background task applies them via apply_remote_delta.
+        let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
+        let task_list = Arc::clone(&self.task_list);
 
-        // Start anti-entropy (background task)
-        // Note: In a full implementation, this would spawn a task that periodically
-        // exchanges versions with peers and sends deltas as needed.
+        tokio::spawn(async move {
+            while let Some(msg) = sub.recv().await {
+                match bincode::deserialize::<(PeerId, TaskListDelta)>(&msg.payload) {
+                    Ok((peer_id, delta)) => {
+                        let mut list = task_list.write().await;
+                        if let Err(e) = list.merge_delta(&delta, peer_id) {
+                            tracing::warn!("Failed to merge remote delta: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to deserialize delta from topic: {}", e);
+                    }
+                }
+            }
+        });
 
         Ok(())
     }
 
     /// Stop background synchronization.
     ///
-    /// Stops the anti-entropy process and unsubscribes from the gossip topic.
+    /// Unsubscribes from the gossip topic.
     ///
     /// # Returns
     ///
@@ -126,19 +136,8 @@ impl TaskListSync {
     /// # Errors
     ///
     /// Returns an error if operations fail.
-    ///
-    /// # Note
-    ///
-    /// This is a simplified implementation. Production usage would:
-    /// - Unsubscribe from the topic
-    /// - Stop the anti-entropy background task
-    /// - Clean up resources
     pub async fn stop(&self) -> Result<()> {
-        // TODO: Unsubscribe via self.gossip_runtime.pubsub.write().await.unsubscribe(...)
-
-        // Stop anti-entropy
-        // Note: Full implementation would signal the background task to stop
-
+        self.pubsub.unsubscribe(&self.topic).await;
         Ok(())
     }
 
@@ -160,12 +159,8 @@ impl TaskListSync {
     ///
     /// Returns an error if the merge fails.
     pub async fn apply_remote_delta(&self, peer_id: PeerId, delta: TaskListDelta) -> Result<()> {
-        // Acquire write lock
         let mut task_list = self.task_list.write().await;
-
-        // Merge the delta
         task_list.merge_delta(&delta, peer_id)?;
-
         Ok(())
     }
 
@@ -175,6 +170,7 @@ impl TaskListSync {
     ///
     /// # Arguments
     ///
+    /// * `local_peer_id` - The local peer's ID
     /// * `delta` - The delta to publish
     ///
     /// # Returns
@@ -183,19 +179,22 @@ impl TaskListSync {
     ///
     /// # Errors
     ///
-    /// Returns an error if publishing fails.
-    ///
-    /// # Note
-    ///
-    /// This is a simplified implementation. Production usage would:
-    /// - Serialize the delta
-    /// - Publish via self.gossip_runtime.pubsub.write().await.publish(...)
-    pub async fn publish_delta(&self, _delta: TaskListDelta) -> Result<()> {
-        // Serialize delta
-        // let serialized = bincode::serialize(&delta)?;
+    /// Returns an error if serialization or publishing fails.
+    pub async fn publish_delta(
+        &self,
+        local_peer_id: PeerId,
+        delta: TaskListDelta,
+    ) -> Result<()> {
+        let serialized = bincode::serialize(&(local_peer_id, delta)).map_err(|e| {
+            crate::crdt::CrdtError::Gossip(format!("failed to serialize delta: {e}"))
+        })?;
 
-        // TODO: Publish via self.gossip_runtime.pubsub.write().await.publish(...)
-        // This requires the PubSub trait which is beyond the scope of this task.
+        self.pubsub
+            .publish(self.topic.clone(), bytes::Bytes::from(serialized))
+            .await
+            .map_err(|e| {
+                crate::crdt::CrdtError::Gossip(format!("failed to publish delta: {e}"))
+            })?;
 
         Ok(())
     }
@@ -261,19 +260,13 @@ mod tests {
         TaskItem::new(task_id, metadata, peer)
     }
 
-    // Note: These tests are placeholders as they require a full GossipRuntime
-    // which is complex to set up in unit tests. In a production setting,
-    // these would be integration tests.
-
     #[tokio::test]
     async fn test_task_list_sync_creation() {
-        // This test demonstrates the API but cannot fully execute without a runtime
         let peer = peer(1);
         let id = list_id(1);
         let task_list = TaskList::new(id, "Test List".to_string(), peer);
 
-        // We cannot create a real GossipRuntime in a unit test
-        // In production, this would use the actual runtime from the Agent
+        // We cannot create a real PubSubManager in a unit test without a NetworkNode
         // For now, we just verify the types are correct
         let _list_for_sync = task_list;
     }

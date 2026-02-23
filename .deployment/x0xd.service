@@ -1,0 +1,31 @@
+[Unit]
+Description=x0xd — local x0x agent daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+
+# Binary location (user install)
+ExecStart=%h/.local/bin/x0xd
+
+# Working directory
+WorkingDirectory=%h
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=x0xd
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Environment
+Environment=RUST_LOG=info
+
+# Resource limits
+LimitNOFILE=4096
+
+[Install]
+WantedBy=default.target
