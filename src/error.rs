@@ -51,6 +51,12 @@ pub enum IdentityError {
     /// Serialization or deserialization of keypairs failed.
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    /// Agent certificate verification failed.
+    /// This indicates the certificate signature is invalid, the keys don't match,
+    /// or the certificate data has been tampered with.
+    #[error("certificate verification failed: {0}")]
+    CertificateVerification(String),
 }
 
 /// Standard Result type for x0x identity operations.

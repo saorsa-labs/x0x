@@ -72,8 +72,8 @@ fn default_log_level() -> String {
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0:12000".parse().expect("valid address"),
-            health_address: "127.0.0.1:12600".parse().expect("valid address"),
+            bind_address: SocketAddr::from(([0, 0, 0, 0], 12000)),
+            health_address: SocketAddr::from(([127, 0, 0, 1], 12600)),
             machine_key_path: default_machine_key_path(),
             data_dir: default_data_dir(),
             coordinator: true,

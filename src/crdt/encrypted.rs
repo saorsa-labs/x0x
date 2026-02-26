@@ -226,6 +226,7 @@ mod tests {
             description: "Test description".to_string(),
             priority: 128,
             created_by: agent_id,
+            owner: None,
             created_at: timestamp,
             tags: vec![],
         };
@@ -396,6 +397,7 @@ mod tests {
                 description: format!("Description {}", i),
                 priority: 128,
                 created_by: agent_id,
+                owner: None,
                 created_at: 1000 + i,
                 tags: vec![],
             };

@@ -1,6 +1,6 @@
 {
   "name": "@x0x/core-darwin-x64",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "x0x Node.js bindings for Intel macOS (darwin-x64)",
   "main": "x0x.darwin-x64.node",
   "license": "AGPL-3.0-or-later",

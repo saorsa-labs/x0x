@@ -47,6 +47,7 @@ fn metadata(title: &str, creator: u8) -> TaskMetadata {
         description: format!("Task: {}", title),
         priority: 128,
         created_by: agent_id(creator),
+        owner: None,
         created_at: unix_timestamp_ms(),
         tags: vec!["test".to_string()],
     }

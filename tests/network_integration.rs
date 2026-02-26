@@ -97,18 +97,20 @@ async fn test_builder_custom_machine_key() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let key_path = temp_dir.path().join("custom_machine.key");
 
-    // Create first agent with custom key
+    // Create first agent with custom machine key and agent key
     let agent1 = Agent::builder()
         .with_machine_key(&key_path)
+        .with_agent_key_path(temp_dir.path().join("agent1.key"))
         .build()
         .await
         .expect("Failed to create agent1");
 
     let machine_id1 = agent1.machine_id();
 
-    // Create second agent with same key - should reuse
+    // Create second agent with same machine key but different agent key
     let agent2 = Agent::builder()
         .with_machine_key(&key_path)
+        .with_agent_key_path(temp_dir.path().join("agent2.key"))
         .build()
         .await
         .expect("Failed to create agent2");

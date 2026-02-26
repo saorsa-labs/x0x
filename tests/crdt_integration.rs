@@ -41,6 +41,7 @@ fn test_metadata(title: &str, creator: u8) -> TaskMetadata {
         description: format!("Test task: {}", title),
         priority: 128,
         created_by: test_agent_id(creator),
+        owner: None,
         created_at: 1000 + creator as u64,
         tags: vec!["test".to_string()],
     }

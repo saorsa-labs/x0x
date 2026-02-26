@@ -214,3 +214,24 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --all-features --no-deps
+
+  installer:
+    name: Installer Contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify SKILL bootstrap instructions
+        run: bash scripts/ci/check-skill-bootstrap.sh
+
+      - name: Verify installer contract in non-interactive mode
+        run: bash scripts/ci/test-installer-contract.sh
+
+  installer-repeatability:
+    name: Installer Repeatability
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run repeatability matrix (fresh + rerun + skill path)
+        run: bash scripts/ci/test-repeatability-macos.sh

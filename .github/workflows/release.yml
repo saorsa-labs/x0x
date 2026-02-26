@@ -123,11 +123,11 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --bin x0x-bootstrap --bin x0xd
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }} --bin x0x-bootstrap --bin x0xd
 
       # ---- macOS Code Signing & Notarization ----
       - name: Import macOS signing certificate
@@ -150,36 +150,39 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
-      - name: Sign macOS binary
+      - name: Sign macOS binaries
         if: startsWith(matrix.platform, 'macos')
         env:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
-          BINARY="target/${{ matrix.target }}/release/${{ matrix.binary }}"
-          codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$BINARY"
-          codesign --verify --deep --strict "$BINARY"
-          echo "Binary signed successfully"
+          for bin in ${{ matrix.binary }} x0xd; do
+            BINARY="target/${{ matrix.target }}/release/${bin}"
+            if [ -f "$BINARY" ]; then
+              codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$BINARY"
+              codesign --verify --deep --strict "$BINARY"
+              echo "Signed ${bin} successfully"
+            fi
+          done
 
-      - name: Notarize macOS binary
+      - name: Notarize macOS binaries
         if: startsWith(matrix.platform, 'macos')
         env:
           MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
           MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
           MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
         run: |
-          BINARY="target/${{ matrix.target }}/release/${{ matrix.binary }}"
-
-          # Create a zip for notarization
-          ditto -c -k --keepParent "$BINARY" "$RUNNER_TEMP/notarize.zip"
-
-          # Submit for notarization
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --apple-id "$MACOS_NOTARIZATION_APPLE_ID" \
-            --password "$MACOS_NOTARIZATION_PASSWORD" \
-            --team-id "$MACOS_NOTARIZATION_TEAM_ID" \
-            --wait
-
-          echo "Binary notarized successfully"
+          for bin in ${{ matrix.binary }} x0xd; do
+            BINARY="target/${{ matrix.target }}/release/${bin}"
+            if [ -f "$BINARY" ]; then
+              ditto -c -k --keepParent "$BINARY" "$RUNNER_TEMP/notarize-${bin}.zip"
+              xcrun notarytool submit "$RUNNER_TEMP/notarize-${bin}.zip" \
+                --apple-id "$MACOS_NOTARIZATION_APPLE_ID" \
+                --password "$MACOS_NOTARIZATION_PASSWORD" \
+                --team-id "$MACOS_NOTARIZATION_TEAM_ID" \
+                --wait
+              echo "Notarized ${bin} successfully"
+            fi
+          done
 
       - name: Clean up macOS keychain
         if: startsWith(matrix.platform, 'macos') && always()
@@ -187,9 +190,11 @@ jobs:
           security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
 
       # ---- Strip Linux binaries ----
-      - name: Strip binary (Linux native)
+      - name: Strip binaries (Linux native)
         if: matrix.platform == 'linux-x64-gnu'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.binary }}
+        run: |
+          strip target/${{ matrix.target }}/release/${{ matrix.binary }}
+          strip target/${{ matrix.target }}/release/x0xd
 
       # ---- Package artifacts ----
       - name: Package (tar.gz)
@@ -198,6 +203,9 @@ jobs:
           STAGING="x0x-${{ matrix.platform }}"
           mkdir -p "$STAGING"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$STAGING/"
+          # Include x0xd daemon binary
+          X0XD="target/${{ matrix.target }}/release/x0xd"
+          if [ -f "$X0XD" ]; then cp "$X0XD" "$STAGING/"; fi
           cp LICENSE* "$STAGING/" 2>/dev/null || true
           cp README.md "$STAGING/" 2>/dev/null || true
           tar czf "x0x-${{ matrix.platform }}.tar.gz" "$STAGING"
@@ -210,6 +218,9 @@ jobs:
           $staging = "x0x-${{ matrix.platform }}"
           New-Item -ItemType Directory -Path $staging -Force
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" -Destination $staging
+          # Include x0xd daemon binary
+          $x0xd = "target/${{ matrix.target }}/release/x0xd.exe"
+          if (Test-Path $x0xd) { Copy-Item $x0xd -Destination $staging }
           if (Test-Path "LICENSE*") { Copy-Item LICENSE* -Destination $staging }
           if (Test-Path "README.md") { Copy-Item README.md -Destination $staging }
           Compress-Archive -Path "$staging/*" -DestinationPath "x0x-${{ matrix.platform }}.zip"
@@ -316,6 +327,11 @@ jobs:
             **Agent-to-Agent Secure Communication Network**
 
             Post-quantum encrypted P2P gossip network for AI agents. Enable agents to discover each other, communicate securely, and collaborate on shared task lists without central servers.
+
+            ### Binaries Included
+
+            - **x0x-bootstrap** — Bootstrap node for running network infrastructure
+            - **x0xd** — Local agent daemon with REST API (default: `127.0.0.1:12700`)
 
             ### Installation
 

@@ -36,7 +36,7 @@
 //! // Subscribe to a topic and receive messages
 //! let mut rx = agent.subscribe("coordination").await?;
 //! while let Some(msg) = rx.recv().await {
-//!     println!("{}: {:?}", msg.origin, msg.payload);
+//!     println!("topic: {:?}, payload: {:?}", msg.topic, msg.payload);
 //! }
 //! # Ok(())
 //! # }
@@ -74,6 +74,9 @@ pub mod bootstrap;
 /// Network transport layer for x0x.
 pub mod network;
 
+/// Contact store with trust levels for message filtering.
+pub mod contacts;
+
 /// Gossip overlay networking for x0x.
 pub mod gossip;
 
@@ -84,7 +87,9 @@ pub mod crdt;
 pub mod mls;
 
 // Re-export key gossip types (including new pubsub components)
-pub use gossip::{GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, Subscription};
+pub use gossip::{
+    GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, SigningContext, Subscription,
+};
 
 /// The core agent that participates in the x0x gossip network.
 ///
@@ -133,6 +138,7 @@ pub struct Message {
 /// The builder allows customization of the agent's identity:
 /// - Machine key path: Where to store/load the machine keypair
 /// - Agent keypair: Import a portable agent identity from another machine
+/// - User keypair: Bind a human identity to this agent
 ///
 /// # Example
 ///
@@ -156,11 +162,20 @@ pub struct Message {
 ///     .with_agent_key(agent_kp)
 ///     .build()
 ///     .await?;
+///
+/// // With user identity (three-layer)
+/// let agent = Agent::builder()
+///     .with_user_key_path("~/.x0x/user.key")
+///     .build()
+///     .await?;
 /// ```
 #[derive(Debug)]
 pub struct AgentBuilder {
     machine_key_path: Option<std::path::PathBuf>,
     agent_keypair: Option<identity::AgentKeypair>,
+    agent_key_path: Option<std::path::PathBuf>,
+    user_keypair: Option<identity::UserKeypair>,
+    user_key_path: Option<std::path::PathBuf>,
     #[allow(dead_code)]
     network_config: Option<network::NetworkConfig>,
 }
@@ -181,10 +196,14 @@ impl Agent {
     /// The builder supports:
     /// - Custom machine key path via `with_machine_key()`
     /// - Imported agent keypair via `with_agent_key()`
+    /// - User identity via `with_user_key()` or `with_user_key_path()`
     pub fn builder() -> AgentBuilder {
         AgentBuilder {
             machine_key_path: None,
             agent_keypair: None,
+            agent_key_path: None,
+            user_keypair: None,
+            user_key_path: None,
             network_config: None,
         }
     }
@@ -229,10 +248,42 @@ impl Agent {
         self.identity.agent_id()
     }
 
+    /// Get the user ID for this agent, if a user identity is bound.
+    ///
+    /// Returns `None` if no user keypair was provided during construction.
+    /// User keys are opt-in — they are never auto-generated.
+    #[inline]
+    #[must_use]
+    pub fn user_id(&self) -> Option<identity::UserId> {
+        self.identity.user_id()
+    }
+
+    /// Get the agent certificate, if one exists.
+    ///
+    /// The certificate cryptographically binds this agent to a user identity.
+    #[inline]
+    #[must_use]
+    pub fn agent_certificate(&self) -> Option<&identity::AgentCertificate> {
+        self.identity.agent_certificate()
+    }
+
     /// Get the network node, if initialized.
     #[must_use]
     pub fn network(&self) -> Option<&std::sync::Arc<network::NetworkNode>> {
         self.network.as_ref()
+    }
+
+    /// Attach a contact store for trust-based message filtering.
+    ///
+    /// When set, the gossip pub/sub layer will:
+    /// - Drop messages from `Blocked` senders (don't deliver, don't rebroadcast)
+    /// - Annotate messages with the sender's trust level for consumers
+    ///
+    /// Without a contact store, all messages pass through (open relay mode).
+    pub fn set_contacts(&self, store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>) {
+        if let Some(runtime) = &self.gossip_runtime {
+            runtime.pubsub().set_contacts(store);
+        }
     }
 
     /// Join the x0x gossip network.
@@ -391,6 +442,70 @@ impl Agent {
             })
     }
 
+    /// Get connected peer IDs.
+    ///
+    /// Returns the list of peers currently connected via the gossip network.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the network is not initialized.
+    pub async fn peers(&self) -> error::Result<Vec<saorsa_gossip_types::PeerId>> {
+        let network = self.network.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "network not initialized - configure agent with network first",
+            ))
+        })?;
+        let ant_peers = network.connected_peers().await;
+        Ok(ant_peers
+            .into_iter()
+            .map(|p| saorsa_gossip_types::PeerId::new(p.0))
+            .collect())
+    }
+
+    /// Get online agents.
+    ///
+    /// Returns a list of agent IDs that are currently known to be online.
+    /// This is a placeholder; full presence detection will use
+    /// saorsa-gossip-presence in a future release.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn presence(&self) -> error::Result<Vec<identity::AgentId>> {
+        let _runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        // Placeholder: presence tracking will be implemented with saorsa-gossip-presence
+        Ok(Vec::new())
+    }
+
+    /// Find an agent by ID.
+    ///
+    /// Looks up network addresses for a known agent. This is a placeholder;
+    /// full FOAF discovery will use saorsa-gossip-rendezvous in a future release.
+    ///
+    /// # Arguments
+    ///
+    /// * `_agent_id` - The agent ID to search for
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn find_agent(
+        &self,
+        _agent_id: identity::AgentId,
+    ) -> error::Result<Option<Vec<std::net::SocketAddr>>> {
+        let _runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        // Placeholder: agent discovery will be implemented with saorsa-gossip-rendezvous
+        Ok(None)
+    }
+
     /// Create a new collaborative task list bound to a topic.
     ///
     /// Creates a new `TaskList` and binds it to the specified gossip topic
@@ -405,24 +520,52 @@ impl Agent {
     ///
     /// A `TaskListHandle` for interacting with the task list.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    ///
     /// # Example
     ///
     /// ```ignore
     /// let list = agent.create_task_list("Sprint Planning", "team-sprint").await?;
     /// ```
-    pub async fn create_task_list(
-        &self,
-        _name: &str,
-        _topic: &str,
-    ) -> error::Result<TaskListHandle> {
-        // TODO: Implement task list creation when gossip runtime is available
-        // This would:
-        // 1. Create a new TaskList with TaskListId::from_content(name, agent_id, timestamp)
-        // 2. Wrap it in TaskListSync with the gossip runtime
-        // 3. Return a TaskListHandle
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskList creation not yet implemented",
-        )))
+    pub async fn create_task_list(&self, name: &str, topic: &str) -> error::Result<TaskListHandle> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+
+        let peer_id = runtime.peer_id();
+        let list_id = crdt::TaskListId::from_content(name, &self.agent_id(), 0);
+        let task_list = crdt::TaskList::new(list_id, name.to_string(), peer_id);
+
+        let sync = crdt::TaskListSync::new(
+            task_list,
+            std::sync::Arc::clone(runtime.pubsub()),
+            topic.to_string(),
+            30,
+        )
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "task list sync creation failed: {}",
+                e
+            )))
+        })?;
+
+        let sync = std::sync::Arc::new(sync);
+        sync.start().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "task list sync start failed: {}",
+                e
+            )))
+        })?;
+
+        Ok(TaskListHandle {
+            sync,
+            agent_id: self.agent_id(),
+            peer_id,
+        })
     }
 
     /// Join an existing task list by topic.
@@ -438,21 +581,53 @@ impl Agent {
     ///
     /// A `TaskListHandle` for interacting with the task list.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    ///
     /// # Example
     ///
     /// ```ignore
     /// let list = agent.join_task_list("team-sprint").await?;
     /// ```
-    pub async fn join_task_list(&self, _topic: &str) -> error::Result<TaskListHandle> {
-        // TODO: Implement task list joining when gossip runtime is available
-        // This would:
-        // 1. Create an empty TaskList (or load from persistence if exists)
-        // 2. Subscribe to the topic to receive updates
-        // 3. Start anti-entropy sync
-        // 4. Return a TaskListHandle
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskList joining not yet implemented",
-        )))
+    pub async fn join_task_list(&self, topic: &str) -> error::Result<TaskListHandle> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+
+        let peer_id = runtime.peer_id();
+        // Create empty task list; it will be populated via delta sync
+        let list_id = crdt::TaskListId::from_content(topic, &self.agent_id(), 0);
+        let task_list = crdt::TaskList::new(list_id, String::new(), peer_id);
+
+        let sync = crdt::TaskListSync::new(
+            task_list,
+            std::sync::Arc::clone(runtime.pubsub()),
+            topic.to_string(),
+            30,
+        )
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "task list sync creation failed: {}",
+                e
+            )))
+        })?;
+
+        let sync = std::sync::Arc::new(sync);
+        sync.start().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "task list sync start failed: {}",
+                e
+            )))
+        })?;
+
+        Ok(TaskListHandle {
+            sync,
+            agent_id: self.agent_id(),
+            peer_id,
+        })
     }
 }
 
@@ -475,10 +650,14 @@ impl AgentBuilder {
 
     /// Import an agent keypair.
     ///
-    /// If not set, a fresh agent keypair is generated.
+    /// If not set, the agent keypair is loaded from storage (or generated fresh
+    /// if no stored key exists).
     ///
     /// This enables running the same agent on multiple machines by importing
     /// the same agent keypair (but with different machine keypairs).
+    ///
+    /// Note: When an explicit keypair is provided via this method, it takes
+    /// precedence over `with_agent_key_path()`.
     ///
     /// # Arguments
     ///
@@ -489,6 +668,25 @@ impl AgentBuilder {
     /// Self for chaining.
     pub fn with_agent_key(mut self, keypair: identity::AgentKeypair) -> Self {
         self.agent_keypair = Some(keypair);
+        self
+    }
+
+    /// Set a custom path for the agent keypair.
+    ///
+    /// If not set, the agent keypair is stored in `~/.x0x/agent.key`.
+    /// If no stored key is found at the path, a fresh one is generated and saved.
+    ///
+    /// This is ignored when `with_agent_key()` provides an explicit keypair.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to store/load the agent keypair.
+    ///
+    /// # Returns
+    ///
+    /// Self for chaining.
+    pub fn with_agent_key_path<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+        self.agent_key_path = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -505,6 +703,48 @@ impl AgentBuilder {
     /// Self for chaining.
     pub fn with_network_config(mut self, config: network::NetworkConfig) -> Self {
         self.network_config = Some(config);
+        self
+    }
+
+    /// Import a user keypair for three-layer identity.
+    ///
+    /// This binds a human identity to this agent. When provided, an
+    /// [`identity::AgentCertificate`] is automatically issued (if one
+    /// doesn't already exist in storage) to cryptographically attest
+    /// that this agent belongs to the user.
+    ///
+    /// Note: When an explicit keypair is provided via this method, it takes
+    /// precedence over `with_user_key_path()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `keypair` - The user keypair to import.
+    ///
+    /// # Returns
+    ///
+    /// Self for chaining.
+    pub fn with_user_key(mut self, keypair: identity::UserKeypair) -> Self {
+        self.user_keypair = Some(keypair);
+        self
+    }
+
+    /// Set a custom path for the user keypair.
+    ///
+    /// Unlike machine and agent keys, user keys are **not** auto-generated.
+    /// If the file at this path doesn't exist, no user identity is set
+    /// (the agent operates with two-layer identity).
+    ///
+    /// This is ignored when `with_user_key()` provides an explicit keypair.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to load the user keypair from.
+    ///
+    /// # Returns
+    ///
+    /// Self for chaining.
+    pub fn with_user_key_path<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+        self.user_key_path = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -546,13 +786,80 @@ impl AgentBuilder {
             kp
         };
 
-        // Use provided agent keypair or generate a fresh one
-        let agent_keypair = self
-            .agent_keypair
-            .map_or_else(identity::AgentKeypair::generate, Ok)?;
+        // Resolve agent keypair: explicit > path-based > default storage > generate
+        let agent_keypair = if let Some(kp) = self.agent_keypair {
+            // Explicit keypair takes highest precedence
+            kp
+        } else if let Some(path) = self.agent_key_path {
+            // Custom path: load or generate+save
+            match storage::load_agent_keypair_from(&path).await {
+                Ok(kp) => kp,
+                Err(_) => {
+                    let kp = identity::AgentKeypair::generate()?;
+                    storage::save_agent_keypair_to(&kp, &path).await?;
+                    kp
+                }
+            }
+        } else if storage::agent_keypair_exists().await {
+            // Default path exists: load it
+            storage::load_agent_keypair_default().await?
+        } else {
+            // No stored key: generate and persist
+            let kp = identity::AgentKeypair::generate()?;
+            storage::save_agent_keypair_default(&kp).await?;
+            kp
+        };
 
-        // Combine into unified Identity
-        let identity = identity::Identity::new(machine_keypair, agent_keypair);
+        // Resolve user keypair: explicit > path-based > default storage > None (opt-in)
+        let user_keypair = if let Some(kp) = self.user_keypair {
+            Some(kp)
+        } else if let Some(path) = self.user_key_path {
+            // Custom path: load if exists, otherwise None (don't auto-generate)
+            storage::load_user_keypair_from(&path).await.ok()
+        } else if storage::user_keypair_exists().await {
+            // Default path exists: load it
+            storage::load_user_keypair().await.ok()
+        } else {
+            None
+        };
+
+        // Build identity with optional user layer
+        let identity = if let Some(user_kp) = user_keypair {
+            // Try to load existing certificate, or issue a new one
+            // IMPORTANT: Verify the cert matches the current user key
+            let cert = if storage::agent_certificate_exists().await {
+                match storage::load_agent_certificate().await {
+                    Ok(c) => {
+                        // Verify cert is for the current user - if not, re-issue
+                        let cert_matches_user = c
+                            .user_id()
+                            .map(|uid| uid == user_kp.user_id())
+                            .unwrap_or(false);
+                        if cert_matches_user {
+                            c
+                        } else {
+                            // Cert was for a different user, issue new one
+                            let new_cert =
+                                identity::AgentCertificate::issue(&user_kp, &agent_keypair)?;
+                            storage::save_agent_certificate(&new_cert).await?;
+                            new_cert
+                        }
+                    }
+                    Err(_) => {
+                        let c = identity::AgentCertificate::issue(&user_kp, &agent_keypair)?;
+                        storage::save_agent_certificate(&c).await?;
+                        c
+                    }
+                }
+            } else {
+                let c = identity::AgentCertificate::issue(&user_kp, &agent_keypair)?;
+                storage::save_agent_certificate(&c).await?;
+                c
+            };
+            identity::Identity::new_with_user(machine_keypair, agent_keypair, user_kp, cert)
+        } else {
+            identity::Identity::new(machine_keypair, agent_keypair)
+        };
 
         // Create network node if configured
         let network = if let Some(config) = self.network_config {
@@ -567,14 +874,29 @@ impl AgentBuilder {
             None
         };
 
+        // Create signing context from agent keypair for message authentication
+        let signing_ctx = std::sync::Arc::new(gossip::SigningContext::from_keypair(
+            identity.agent_keypair(),
+        ));
+
         // Create gossip runtime if network exists
-        let gossip_runtime = network.as_ref().map(|net| {
-            let net_arc = std::sync::Arc::clone(net);
-            std::sync::Arc::new(gossip::GossipRuntime::new(
+        let gossip_runtime = if let Some(ref net) = network {
+            let runtime = gossip::GossipRuntime::new(
                 gossip::GossipConfig::default(),
-                net_arc,
-            ))
-        });
+                std::sync::Arc::clone(net),
+                Some(signing_ctx),
+            )
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "gossip runtime initialization failed: {}",
+                    e
+                )))
+            })?;
+            Some(std::sync::Arc::new(runtime))
+        } else {
+            None
+        };
 
         Ok(Agent {
             identity,
@@ -597,9 +919,20 @@ impl AgentBuilder {
 /// handle.claim_task(task_id).await?;
 /// handle.complete_task(task_id).await?;
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TaskListHandle {
-    _sync: std::sync::Arc<()>, // Placeholder for Arc<TaskListSync>
+    sync: std::sync::Arc<crdt::TaskListSync>,
+    agent_id: identity::AgentId,
+    peer_id: saorsa_gossip_types::PeerId,
+}
+
+impl std::fmt::Debug for TaskListHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskListHandle")
+            .field("agent_id", &self.agent_id)
+            .field("peer_id", &self.peer_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TaskListHandle {
@@ -613,15 +946,29 @@ impl TaskListHandle {
     /// # Returns
     ///
     /// The TaskId of the created task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task cannot be added.
     pub async fn add_task(
         &self,
-        _title: String,
-        _description: String,
+        title: String,
+        description: String,
     ) -> error::Result<crdt::TaskId> {
-        // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskListHandle not yet implemented",
-        )))
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let task_id = crdt::TaskId::new(&title, &self.agent_id, timestamp);
+        let metadata = crdt::TaskMetadata::new(title, description, 128, self.agent_id, timestamp);
+        let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
+
+        let mut list = self.sync.write().await;
+        list.add_task(task, self.peer_id, timestamp).map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!("add_task failed: {}", e)))
+        })?;
+
+        Ok(task_id)
     }
 
     /// Claim a task in the list.
@@ -629,11 +976,24 @@ impl TaskListHandle {
     /// # Arguments
     ///
     /// * `task_id` - ID of the task to claim
-    pub async fn claim_task(&self, _task_id: crdt::TaskId) -> error::Result<()> {
-        // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskListHandle not yet implemented",
-        )))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task cannot be claimed.
+    pub async fn claim_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut list = self.sync.write().await;
+        list.claim_task(&task_id, self.agent_id, self.peer_id, timestamp)
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "claim_task failed: {}",
+                    e
+                )))
+            })
     }
 
     /// Complete a task in the list.
@@ -641,11 +1001,24 @@ impl TaskListHandle {
     /// # Arguments
     ///
     /// * `task_id` - ID of the task to complete
-    pub async fn complete_task(&self, _task_id: crdt::TaskId) -> error::Result<()> {
-        // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskListHandle not yet implemented",
-        )))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task cannot be completed.
+    pub async fn complete_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut list = self.sync.write().await;
+        list.complete_task(&task_id, self.agent_id, self.peer_id, timestamp)
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "complete_task failed: {}",
+                    e
+                )))
+            })
     }
 
     /// List all tasks in their current order.
@@ -653,11 +1026,25 @@ impl TaskListHandle {
     /// # Returns
     ///
     /// A vector of `TaskSnapshot` representing the current state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task list cannot be read.
     pub async fn list_tasks(&self) -> error::Result<Vec<TaskSnapshot>> {
-        // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskListHandle not yet implemented",
-        )))
+        let list = self.sync.read().await;
+        let tasks = list.tasks_ordered();
+        Ok(tasks
+            .into_iter()
+            .map(|task| TaskSnapshot {
+                id: *task.id(),
+                title: task.title().to_string(),
+                description: task.description().to_string(),
+                state: task.current_state(),
+                assignee: task.assignee().copied(),
+                owner: None,
+                priority: task.priority(),
+            })
+            .collect())
     }
 
     /// Reorder tasks in the list.
@@ -665,11 +1052,15 @@ impl TaskListHandle {
     /// # Arguments
     ///
     /// * `task_ids` - New ordering of task IDs
-    pub async fn reorder(&self, _task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
-        // TODO: Implement when TaskListSync is available
-        Err(error::IdentityError::Storage(std::io::Error::other(
-            "TaskListHandle not yet implemented",
-        )))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reordering fails.
+    pub async fn reorder(&self, task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
+        let mut list = self.sync.write().await;
+        list.reorder(task_ids, self.peer_id).map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!("reorder failed: {}", e)))
+        })
     }
 }
 
@@ -689,6 +1080,8 @@ pub struct TaskSnapshot {
     pub state: crdt::CheckboxState,
     /// Agent assigned to this task (if any).
     pub assignee: Option<identity::AgentId>,
+    /// Human owner of the agent that created this task (if known).
+    pub owner: Option<identity::UserId>,
     /// Task priority (0-255, higher = more important).
     pub priority: u8,
 }

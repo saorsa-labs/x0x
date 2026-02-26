@@ -1,9 +1,10 @@
 # x0x Bootstrap Configuration - SFO (saorsa-3)
 # Location: San Francisco, US (DigitalOcean)
-# Public IP: 147.182.234.192
+# Public IPv4: 147.182.234.192
+# Public IPv6: 2604:a880:4:1d0:0:1:6ba1:f000
 
-# QUIC transport bind address
-bind_address = "147.182.234.192:12000"
+# QUIC transport bind address (dual-stack: accepts both IPv4 and IPv6)
+bind_address = "[::]:12000"
 
 # Health/metrics endpoint (localhost only)
 health_address = "127.0.0.1:12600"
@@ -19,7 +20,7 @@ coordinator = true
 reflector = true
 relay = true
 
-# Known peers (other 5 bootstrap nodes)
+# Known peers (other 5 bootstrap nodes — IPv4 addresses for cross-node connectivity)
 known_peers = [
     "142.93.199.50:12000",      # saorsa-2 (NYC)
     "65.21.157.229:12000",      # saorsa-6 (Helsinki)

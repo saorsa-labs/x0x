@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "agent-x0x"
-version = "0.1.0"
+version = "0.2.0"
 description = "Secure P2P communication for AI agents with CRDT collaboration"
 readme = "README.md"
 requires-python = ">=3.8"

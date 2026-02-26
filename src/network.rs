@@ -61,23 +61,34 @@ pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
 /// roles. They form a globally distributed mesh providing bootstrap, NAT traversal,
 /// and rendezvous services.
 ///
+/// All nodes bind to `[::]:12000` (dual-stack: accepts both IPv4 and IPv6).
+/// IPv6 addresses are included for nodes that have global IPv6 connectivity.
+///
 /// Locations:
-/// - `142.93.199.50` - NYC, US (DigitalOcean)
-/// - `147.182.234.192` - SFO, US (DigitalOcean)
-/// - `65.21.157.229` - Helsinki, FI (Hetzner)
-/// - `116.203.101.172` - Nuremberg, DE (Hetzner)
-/// - `149.28.156.231` - Singapore, SG (Vultr)
-/// - `45.77.176.184` - Tokyo, JP (Vultr)
+/// - `142.93.199.50` / `2604:a880:400:d1:0:3:7db3:f001` — NYC, US (DigitalOcean)
+/// - `147.182.234.192` / `2604:a880:4:1d0:0:1:6ba1:f000` — SFO, US (DigitalOcean)
+/// - `65.21.157.229` / `2a01:4f9:c012:684b::1` — Helsinki, FI (Hetzner)
+/// - `116.203.101.172` / `2a01:4f8:1c1a:31e6::1` — Nuremberg, DE (Hetzner)
+/// - `149.28.156.231` / `2001:19f0:4401:346:5400:5ff:fed9:9735` — Singapore, SG (Vultr)
+/// - `45.77.176.184` / `2401:c080:1000:4c32:5400:5ff:fed9:9737` — Tokyo, JP (Vultr)
 ///
 /// Agents can override these by calling `AgentBuilder::with_network_config`
 /// with a custom [`NetworkConfig`] containing different bootstrap nodes.
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
+    // IPv4
     "142.93.199.50:12000",   // NYC
     "147.182.234.192:12000", // SFO
     "65.21.157.229:12000",   // Helsinki
     "116.203.101.172:12000", // Nuremberg
     "149.28.156.231:12000",  // Singapore
     "45.77.176.184:12000",   // Tokyo
+    // IPv6
+    "[2604:a880:400:d1:0:3:7db3:f001]:12000",         // NYC
+    "[2604:a880:4:1d0:0:1:6ba1:f000]:12000",          // SFO
+    "[2a01:4f9:c012:684b::1]:12000",                  // Helsinki
+    "[2a01:4f8:1c1a:31e6::1]:12000",                  // Nuremberg
+    "[2001:19f0:4401:346:5400:5ff:fed9:9735]:12000",  // Singapore
+    "[2401:c080:1000:4c32:5400:5ff:fed9:9737]:12000", // Tokyo
 ];
 
 /// x0x network node configuration.
@@ -906,8 +917,8 @@ mod tests {
         // Verify default bootstrap nodes are included
         assert_eq!(
             config.bootstrap_nodes.len(),
-            6,
-            "Should have 6 default bootstrap nodes"
+            12,
+            "Should have 12 default bootstrap nodes (6 IPv4 + 6 IPv6)"
         );
 
         // Verify specific bootstrap addresses
@@ -1094,6 +1105,112 @@ async fn test_network_node_multiple_subscribers() {
     // Both should receive
     assert!(rx1.recv().await.is_ok());
     assert!(rx2.recv().await.is_ok());
+}
+
+/// Test that connections between local nodes are bidirectionally visible.
+///
+/// This reproduces the "phantom connection" bug where `connect_addr()` succeeds
+/// on the initiator side but the acceptor never registers the connection,
+/// resulting in asymmetric peer counts.
+///
+/// See: .planning/ant-quic-phantom-connections.md
+#[tokio::test]
+async fn test_mesh_connections_are_bidirectional() {
+    const NODE_COUNT: usize = 4;
+    let base_port: u16 = 19200;
+
+    // Create N nodes with explicit bind addresses and no bootstrap peers
+    let mut nodes = Vec::with_capacity(NODE_COUNT);
+    let mut addrs = Vec::with_capacity(NODE_COUNT);
+
+    for i in 0..NODE_COUNT {
+        let addr: SocketAddr = format!("127.0.0.1:{}", base_port + i as u16)
+            .parse()
+            .unwrap();
+        addrs.push(addr);
+
+        let config = NetworkConfig {
+            bind_addr: Some(addr),
+            bootstrap_nodes: Vec::new(),
+            max_connections: 100,
+            connection_timeout: std::time::Duration::from_secs(10),
+            stats_interval: std::time::Duration::from_secs(60),
+            peer_cache_path: None,
+        };
+
+        let node = NetworkNode::new(config).await.unwrap();
+        nodes.push(node);
+    }
+
+    // Each node connects to all others in parallel (simulating bootstrap)
+    let mut handles = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        for (j, target_addr) in addrs.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let node = node.clone();
+            let addr = *target_addr;
+            handles.push(tokio::spawn(async move {
+                (i, j, node.connect_addr(addr).await)
+            }));
+        }
+    }
+
+    // Wait for all connections
+    for handle in handles {
+        let (from, to, result) = handle.await.unwrap();
+        if let Err(e) = &result {
+            eprintln!("Connection {}->{} failed: {}", from, to, e);
+        }
+    }
+
+    // Allow connections to stabilize
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // CRITICAL CHECK: Every node must see exactly (NODE_COUNT - 1) peers.
+    // A phantom connection bug would cause asymmetry: one node sees fewer
+    // peers than others because the acceptor side never registered the
+    // connection.
+    let mut counts = Vec::with_capacity(NODE_COUNT);
+    for (i, node) in nodes.iter().enumerate() {
+        let count = node.connection_count().await;
+        eprintln!("Node {} (:{}) has {} peers", i, base_port + i as u16, count);
+        counts.push(count);
+    }
+
+    let expected = NODE_COUNT - 1;
+    for (i, count) in counts.iter().enumerate() {
+        assert_eq!(
+            *count, expected,
+            "Node {} has {} peers, expected {} — possible phantom connection (asymmetric state)",
+            i, count, expected
+        );
+    }
+
+    // BIDIRECTIONALITY CHECK: For every pair (A, B), if A sees B as connected
+    // then B must also see A as connected.
+    for i in 0..NODE_COUNT {
+        let peers_i = nodes[i].connected_peers().await;
+        for j in 0..NODE_COUNT {
+            if i == j {
+                continue;
+            }
+            let peers_j = nodes[j].connected_peers().await;
+            let j_peer_id = nodes[j].peer_id();
+
+            let i_sees_j = peers_i.contains(&j_peer_id);
+            if i_sees_j {
+                let i_peer_id = nodes[i].peer_id();
+                let j_sees_i = peers_j.contains(&i_peer_id);
+                assert!(
+                    j_sees_i,
+                    "Phantom connection: node {} sees node {} but node {} does not see node {} back",
+                    i, j, j, i
+                );
+            }
+        }
+    }
 }
 /// A message transmitted through the x0x network.
 ///
