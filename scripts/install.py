@@ -29,16 +29,24 @@ BLUE = "\033[0;34m"
 NC = "\033[0m"
 
 REPO = "saorsa-labs/x0x"
-RELEASE_URL = f"https://github.com/{REPO}/releases/latest/download"
+RELEASE_URL = os.environ.get(
+    "X0X_RELEASE_URL", f"https://github.com/{REPO}/releases/latest/download"
+)
 VERSION = os.environ.get("X0X_VERSION", "0.2.0")
 
-if sys.platform == "win32":
+custom_install_dir = os.environ.get("X0X_INSTALL_DIR")
+
+if custom_install_dir:
+    INSTALL_DIR = Path(custom_install_dir)
+elif sys.platform == "win32":
     INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))) / "x0x"
 else:
     xdg_data = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
     INSTALL_DIR = Path(xdg_data) / "x0x"
 
-DAEMON_INSTALL_DIR = Path.home() / ".local" / "bin"
+DAEMON_INSTALL_DIR = Path(
+    os.environ.get("X0X_BIN_DIR", str(Path.home() / ".local" / "bin"))
+)
 
 
 class InstallError(Exception):
@@ -76,6 +84,8 @@ def warn(msg: str, interactive: bool) -> None:
 
 
 def check_gpg() -> bool:
+    if os.environ.get("X0X_SKIP_GPG") == "1":
+        return False
     try:
         subprocess.run(["gpg", "--version"], capture_output=True, check=True)
         return True
