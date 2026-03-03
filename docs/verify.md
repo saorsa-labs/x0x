@@ -4,7 +4,7 @@ After starting `x0xd`, run these checks in order. This sequence uses only endpoi
 
 Base URL: `http://127.0.0.1:12700`
 
-## 1) Health check
+## 1) Health check [working]
 
 Call:
 
@@ -36,7 +36,7 @@ Failure handling:
 - If `peers` is `0`, wait 30 seconds and retry up to 3 times (bootstrap may still be in progress).
 - If still `0` after retries, use `troubleshooting.md` (network/bootstrap diagnostics).
 
-## 2) Identity check
+## 2) Identity check [working]
 
 Call:
 
@@ -66,7 +66,7 @@ Failure handling:
 - If IDs are missing/malformed, identity initialization failed; restart `x0xd` and re-check.
 - If this persists, use `troubleshooting.md` and report the raw response.
 
-## 3) Pub/sub round-trip
+## 3) Pub/sub round-trip [working]
 
 Choose a topic and payload:
 
@@ -112,7 +112,7 @@ Expected SSE event data (event name `message`):
 
 ```json
 {
-  "event_type": "message",
+  "type": "message",
   "data": {
     "subscription_id": "...",
     "topic": "x0x.selftest",
@@ -148,7 +148,7 @@ Expected cleanup response:
 {"ok":true}
 ```
 
-## 4) Contact store add/list/delete
+## 4) Contact store add/list/delete [working]
 
 Use your own `agent_id` from step 2.
 
@@ -213,7 +213,7 @@ Failure handling:
 - If list does not include the contact, repeat add then list once; if still missing, use `troubleshooting.md`.
 - If delete returns `contact not found`, ensure the `agent_id` in URL exactly matches the one added.
 
-## All checks passed
+## All checks passed [working]
 
 You have verified:
 

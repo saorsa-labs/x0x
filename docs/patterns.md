@@ -73,7 +73,7 @@ Example event payload:
 
 ```json
 {
-  "event_type": "message",
+  "type": "message",
   "data": {
     "subscription_id": "4d9a0fe1b7e80a31",
     "topic": "agents.ops.alerts",
@@ -402,7 +402,7 @@ Example incoming event:
 
 ```json
 {
-  "event_type": "message",
+  "type": "message",
   "data": {
     "subscription_id": "4d9a0fe1b7e80a31",
     "topic": "agents.ops.alerts",

@@ -22,11 +22,11 @@ curl -sfL https://x0x.md/install.sh | bash -s -- --interactive
 
 ## Non-interactive default behavior
 
-- No prompts (`read`/`input`) in default mode.
-- Progress and warnings go to stderr.
-- Final machine-readable status goes to stdout as JSON.
-- If GPG is unavailable, installation continues and reports `"gpg_verified": false`.
-- If GPG verification fails, platform is unsupported, downloads fail, or writes fail, installation exits non-zero and emits error JSON.
+- No prompts (`read`/`input`) in default mode. [working]
+- Progress and warnings go to stderr. [working]
+- Final machine-readable status goes to stdout as JSON. [working]
+- If GPG is unavailable, installation continues and reports `"gpg_verified": false`. [working]
+- If GPG verification fails, platform is unsupported, downloads fail, or writes fail, installation exits non-zero and emits error JSON. [working]
 
 ## JSON output schema
 
@@ -66,9 +66,9 @@ Failure (stdout):
 
 ## What gets installed where
 
-- Binary: `~/.local/bin/x0xd`
-- Data root: `~/.local/share/x0x/`
-- Identity material (created on first daemon start): `~/.local/share/x0x/identity/`
+- Binary: `~/.local/bin/x0xd` [working]
+- Data root: `~/.local/share/x0x/` [working]
+- Identity material (created on first daemon start): `~/.local/share/x0x/identity/` [working]
 
 ## Post-install: start and wait for readiness
 

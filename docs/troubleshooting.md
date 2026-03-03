@@ -2,7 +2,7 @@
 
 Use this when `verify.md` fails. Each entry is Symptom -> Check -> Fix, with commands you can run directly.
 
-## 1) x0xd will not start
+## 1) x0xd will not start [working]
 
 Symptom:
 
@@ -44,7 +44,7 @@ rm -rf ~/.config/x0x
 x0xd &
 ```
 
-## 2) `peers` is `0` in `/health`
+## 2) `peers` is `0` in `/health` [working]
 
 Symptom:
 
@@ -85,7 +85,7 @@ x0xd &
 curl -sS http://127.0.0.1:12700/health
 ```
 
-## 3) Messages are not arriving
+## 3) Messages are not arriving [working]
 
 Symptom:
 
@@ -132,7 +132,7 @@ sleep 5
 curl -sS -X POST http://127.0.0.1:12700/publish -H 'content-type: application/json' -d '{"topic":"x0x.selftest","payload":"aGVsbG8="}'
 ```
 
-## 4) Lost identity after reinstall
+## 4) Lost identity after reinstall [working]
 
 Symptom:
 
@@ -165,7 +165,7 @@ curl -sS http://127.0.0.1:12700/agent
 curl -sS http://127.0.0.1:12700/agent
 ```
 
-## 5) Port 12700 already in use
+## 5) Port 12700 already in use [working]
 
 Symptom:
 
