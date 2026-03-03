@@ -11,10 +11,10 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 REPO="saorsa-labs/x0x"
-RELEASE_URL="https://github.com/$REPO/releases/latest/download"
+RELEASE_URL="${X0X_RELEASE_URL:-https://github.com/$REPO/releases/latest/download}"
 VERSION="${X0X_VERSION:-0.2.0}"
-INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x"
-BIN_DIR="$HOME/.local/bin"
+INSTALL_DIR="${X0X_INSTALL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/x0x}"
+BIN_DIR="${X0X_BIN_DIR:-$HOME/.local/bin}"
 INTERACTIVE=false
 
 for arg in "$@"; do
@@ -33,7 +33,9 @@ json_escape() {
     local text="$1"
     text="${text//\\/\\\\}"
     text="${text//\"/\\\"}"
-    text="${text//$'\n'/ }"
+    text="${text//$'\n'/\\n}"
+    text="${text//$'\r'/\\r}"
+    text="${text//$'\t'/\\t}"
     printf '%s' "$text"
 }
 
@@ -53,6 +55,23 @@ emit_json_already_installed() {
     escaped="$(json_escape "$path")"
     printf '{"status":"error","error":"x0xd already exists at install path","code":"already_installed","x0xd_path":"%s"}\n' "$escaped"
     exit 1
+}
+
+emit_json_success() {
+    local x0xd_path="$1"
+    local skill_path="$2"
+    local gpg_verified="$3"
+    local platform="$4"
+    local version="$5"
+    local escaped_x0xd_path escaped_skill_path escaped_platform escaped_version
+
+    escaped_x0xd_path="$(json_escape "$x0xd_path")"
+    escaped_skill_path="$(json_escape "$skill_path")"
+    escaped_platform="$(json_escape "$platform")"
+    escaped_version="$(json_escape "$version")"
+
+    printf '{"status":"ok","x0xd_path":"%s","skill_path":"%s","gpg_verified":%s,"platform":"%s","version":"%s"}\n' \
+        "$escaped_x0xd_path" "$escaped_skill_path" "$gpg_verified" "$escaped_platform" "$escaped_version"
 }
 
 log_info() {
@@ -122,7 +141,12 @@ fi
 GPG_AVAILABLE=true
 GPG_VERIFIED=false
 
-if ! command -v gpg > /dev/null 2>&1; then
+if [ "${X0X_SKIP_GPG:-0}" = "1" ]; then
+    GPG_AVAILABLE=false
+    if [ "$INTERACTIVE" = false ]; then
+        log_warn "GPG disabled via X0X_SKIP_GPG=1; proceeding without signature verification"
+    fi
+elif ! command -v gpg > /dev/null 2>&1; then
     GPG_AVAILABLE=false
     if [ "$INTERACTIVE" = true ]; then
         echo -e "${YELLOW}Warning: GPG not found. Signature verification will be skipped.${NC}"
@@ -269,5 +293,4 @@ if [ "$INTERACTIVE" = true ]; then
     exit 0
 fi
 
-printf '{"status":"ok","x0xd_path":"%s","skill_path":"%s","gpg_verified":%s,"platform":"%s","version":"%s"}\n' \
-    "$X0XD_PATH" "$INSTALL_DIR/SKILL.md" "$GPG_VERIFIED" "$PLATFORM" "$VERSION"
+emit_json_success "$X0XD_PATH" "$INSTALL_DIR/SKILL.md" "$GPG_VERIFIED" "$PLATFORM" "$VERSION"
