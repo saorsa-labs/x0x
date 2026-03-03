@@ -22,11 +22,12 @@ curl -sfL https://x0x.md/install.sh | bash -s -- --interactive
 
 ## Non-interactive default behavior
 
-- No prompts (`read`/`input`) in default mode. [working]
-- Progress and warnings go to stderr. [working]
-- Final machine-readable status goes to stdout as JSON. [working]
-- If GPG is unavailable, installation continues and reports `"gpg_verified": false`. [working]
-- If GPG verification fails, platform is unsupported, downloads fail, or writes fail, installation exits non-zero and emits error JSON. [working]
+- No prompts (`read`/`input`) in default mode. [planned]
+- Progress and warnings go to stderr. [planned]
+- Final machine-readable status goes to stdout as JSON. [planned]
+- If GPG is unavailable, installation continues and reports `"gpg_verified": false`. [planned]
+- If GPG verification fails, platform is unsupported, downloads fail, or writes fail, installation exits non-zero and emits error JSON. [planned]
+- This non-interactive JSON behavior is scheduled in Phase 02 plan `02-01`; current `scripts/install.sh` and `scripts/install.py` are still interactive by default. [working]
 
 ## JSON output schema
 
