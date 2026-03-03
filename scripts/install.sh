@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # x0x Installation Script (Unix/macOS/Linux)
 
-set -uo pipefail
+set -euo pipefail
 
 # Colors
 RED='\033[0;31m'
@@ -11,286 +11,186 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 REPO="saorsa-labs/x0x"
-RELEASE_URL="${X0X_RELEASE_URL:-https://github.com/$REPO/releases/latest/download}"
-VERSION="${X0X_VERSION:-0.2.0}"
-INSTALL_DIR="${X0X_INSTALL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/x0x}"
-BIN_DIR="${X0X_BIN_DIR:-$HOME/.local/bin}"
-INTERACTIVE=false
+RELEASE_URL="https://github.com/$REPO/releases/latest/download"
+INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x"
+BIN_DIR="$HOME/.local/bin"
 
-for arg in "$@"; do
-    case "$arg" in
-        --interactive)
-            INTERACTIVE=true
-            ;;
-        *)
-            printf '{"status":"error","error":"Unknown argument: %s","code":"invalid_argument"}\n' "$arg"
-            exit 1
-            ;;
-    esac
-done
+echo -e "${BLUE}x0x Installation Script${NC}"
+echo -e "${BLUE}========================${NC}"
+echo ""
 
-json_escape() {
-    local text="$1"
-    text="${text//\\/\\\\}"
-    text="${text//\"/\\\"}"
-    text="${text//$'\n'/\\n}"
-    text="${text//$'\r'/\\r}"
-    text="${text//$'\t'/\\t}"
-    printf '%s' "$text"
-}
-
-emit_json_error() {
-    local code="$1"
-    local message="$2"
-    local exit_code="${3:-1}"
-    local escaped
-    escaped="$(json_escape "$message")"
-    printf '{"status":"error","error":"%s","code":"%s"}\n' "$escaped" "$code"
-    exit "$exit_code"
-}
-
-emit_json_already_installed() {
-    local path="$1"
-    local escaped
-    escaped="$(json_escape "$path")"
-    printf '{"status":"error","error":"x0xd already exists at install path","code":"already_installed","x0xd_path":"%s"}\n' "$escaped"
-    exit 1
-}
-
-emit_json_success() {
-    local x0xd_path="$1"
-    local skill_path="$2"
-    local gpg_verified="$3"
-    local platform="$4"
-    local version="$5"
-    local escaped_x0xd_path escaped_skill_path escaped_platform escaped_version
-
-    escaped_x0xd_path="$(json_escape "$x0xd_path")"
-    escaped_skill_path="$(json_escape "$skill_path")"
-    escaped_platform="$(json_escape "$platform")"
-    escaped_version="$(json_escape "$version")"
-
-    printf '{"status":"ok","x0xd_path":"%s","skill_path":"%s","gpg_verified":%s,"platform":"%s","version":"%s"}\n' \
-        "$escaped_x0xd_path" "$escaped_skill_path" "$gpg_verified" "$escaped_platform" "$escaped_version"
-}
-
-log_info() {
-    if [ "$INTERACTIVE" = true ]; then
-        echo -e "$1"
-    else
-        printf '%s\n' "$1" >&2
-    fi
-}
-
-log_warn() {
-    if [ "$INTERACTIVE" = true ]; then
-        echo -e "${YELLOW}$1${NC}"
-    else
-        printf 'warning: %s\n' "$1" >&2
-    fi
-}
-
-download_file() {
-    local url="$1"
-    local dest="$2"
-    if command -v curl > /dev/null 2>&1; then
-        if ! curl -sfL "$url" -o "$dest"; then
-            emit_json_error "download_failed" "Failed to download $url"
-        fi
-    elif command -v wget > /dev/null 2>&1; then
-        if ! wget -qO "$dest" "$url"; then
-            emit_json_error "download_failed" "Failed to download $url"
-        fi
-    else
-        emit_json_error "download_failed" "Neither curl nor wget found"
-    fi
-}
-
-detect_platform() {
-    local os arch
-    os="$(uname -s)"
-    arch="$(uname -m)"
-
-    case "$os" in
-        Linux)
-            case "$arch" in
-                x86_64) printf '%s' "linux-x64-gnu" ;;
-                aarch64) printf '%s' "linux-arm64-gnu" ;;
-                *) printf '%s' "" ;;
-            esac
-            ;;
-        Darwin)
-            case "$arch" in
-                arm64) printf '%s' "macos-arm64" ;;
-                x86_64) printf '%s' "macos-x64" ;;
-                *) printf '%s' "" ;;
-            esac
-            ;;
-        *)
-            printf '%s' ""
-            ;;
-    esac
-}
-
-if [ "$INTERACTIVE" = true ]; then
-    echo -e "${BLUE}x0x Installation Script${NC}"
-    echo -e "${BLUE}========================${NC}"
+# Check if GPG is installed
+if ! command -v gpg &> /dev/null; then
+    echo -e "${YELLOW}⚠ Warning: GPG not found. Signature verification will be skipped.${NC}"
     echo ""
-fi
-
-GPG_AVAILABLE=true
-GPG_VERIFIED=false
-
-if [ "${X0X_SKIP_GPG:-0}" = "1" ]; then
-    GPG_AVAILABLE=false
-    if [ "$INTERACTIVE" = false ]; then
-        log_warn "GPG disabled via X0X_SKIP_GPG=1; proceeding without signature verification"
+    echo "To enable signature verification, install GPG:"
+    echo "  macOS:  brew install gnupg"
+    echo "  Ubuntu: sudo apt install gnupg"
+    echo "  Fedora: sudo dnf install gnupg"
+    echo ""
+    read -p "Continue without verification? (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
     fi
-elif ! command -v gpg > /dev/null 2>&1; then
     GPG_AVAILABLE=false
-    if [ "$INTERACTIVE" = true ]; then
-        echo -e "${YELLOW}Warning: GPG not found. Signature verification will be skipped.${NC}"
-        echo ""
-        echo "To enable signature verification, install GPG:"
-        echo "  macOS:  brew install gnupg"
-        echo "  Ubuntu: sudo apt install gnupg"
-        echo "  Fedora: sudo dnf install gnupg"
-        echo ""
-        read -p "Continue without verification? (y/N) " -n 1 -r
-        echo
-        if [[ ! ${REPLY:-} =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-    else
-        log_warn "GPG not found; proceeding without signature verification"
-    fi
+else
+    GPG_AVAILABLE=true
 fi
 
-if ! mkdir -p "$INSTALL_DIR"; then
-    emit_json_error "permission_denied" "Cannot create install directory $INSTALL_DIR"
-fi
+# Create install directory
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
 
-if ! cd "$INSTALL_DIR"; then
-    emit_json_error "permission_denied" "Cannot access install directory $INSTALL_DIR"
+echo "Downloading SKILL.md..."
+if command -v curl &> /dev/null; then
+    curl -sfL "$RELEASE_URL/SKILL.md" -o SKILL.md
+elif command -v wget &> /dev/null; then
+    wget -qO SKILL.md "$RELEASE_URL/SKILL.md"
+else
+    echo -e "${RED}✗ Error: Neither curl nor wget found${NC}"
+    exit 1
 fi
-
-log_info "Downloading SKILL.md..."
-download_file "$RELEASE_URL/SKILL.md" "SKILL.md"
 
 if [ "$GPG_AVAILABLE" = true ]; then
-    log_info "Downloading signature..."
-    download_file "$RELEASE_URL/SKILL.md.sig" "SKILL.md.sig"
-    download_file "$RELEASE_URL/SAORSA_PUBLIC_KEY.asc" "SAORSA_PUBLIC_KEY.asc"
+    echo "Downloading signature..."
+    if command -v curl &> /dev/null; then
+        curl -sfL "$RELEASE_URL/SKILL.md.sig" -o SKILL.md.sig
+        curl -sfL "$RELEASE_URL/SAORSA_PUBLIC_KEY.asc" -o SAORSA_PUBLIC_KEY.asc
+    else
+        wget -qO SKILL.md.sig "$RELEASE_URL/SKILL.md.sig"
+        wget -qO SAORSA_PUBLIC_KEY.asc "$RELEASE_URL/SAORSA_PUBLIC_KEY.asc"
+    fi
 
-    log_info "Importing Saorsa Labs public key..."
-    if ! gpg --import SAORSA_PUBLIC_KEY.asc > /dev/null 2>&1; then
-        if [ "$INTERACTIVE" = true ]; then
-            echo -e "${RED}Failed to import GPG key${NC}"
+    echo "Importing Saorsa Labs public key..."
+    gpg --import SAORSA_PUBLIC_KEY.asc 2>&1 | grep -v "^gpg:" || true
+
+    echo "Verifying signature..."
+    if gpg --verify SKILL.md.sig SKILL.md 2>&1 | grep -q "Good signature"; then
+        echo -e "${GREEN}✓ Signature verified${NC}"
+    else
+        echo -e "${RED}✗ Signature verification failed${NC}"
+        echo ""
+        echo "This file may have been tampered with."
+        read -p "Install anyway? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             exit 1
         fi
-        emit_json_error "gpg_verification_failed" "Failed to import GPG key"
-    fi
-
-    log_info "Verifying signature..."
-    if gpg --verify SKILL.md.sig SKILL.md > /dev/null 2>&1; then
-        GPG_VERIFIED=true
-        if [ "$INTERACTIVE" = true ]; then
-            echo -e "${GREEN}Signature verified${NC}"
-        fi
-    else
-        if [ "$INTERACTIVE" = true ]; then
-            echo -e "${RED}Signature verification failed${NC}"
-            echo ""
-            echo "This file may have been tampered with."
-            read -p "Install anyway? (y/N) " -n 1 -r
-            echo
-            if [[ ! ${REPLY:-} =~ ^[Yy]$ ]]; then
-                exit 1
-            fi
-        else
-            emit_json_error "gpg_verification_failed" "GPG signature verification failed"
-        fi
     fi
 fi
 
-log_info "Detecting platform..."
-PLATFORM="$(detect_platform)"
-if [ -z "$PLATFORM" ]; then
-    if [ "$INTERACTIVE" = true ]; then
-        log_warn "Unsupported platform; x0xd daemon installation skipped"
+# ── x0xd daemon binary ────────────────────────────────────────────────────────
+
+echo ""
+echo "Detecting platform..."
+
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+case "$OS" in
+    Linux)
+        case "$ARCH" in
+            x86_64)  PLATFORM="linux-x64-gnu" ;;
+            aarch64) PLATFORM="linux-arm64-gnu" ;;
+            *)
+                echo -e "${YELLOW}⚠ Unsupported Linux architecture: $ARCH${NC}"
+                echo "  x0xd daemon installation skipped."
+                PLATFORM=""
+                ;;
+        esac
+        ;;
+    Darwin)
+        case "$ARCH" in
+            arm64)   PLATFORM="macos-arm64" ;;
+            x86_64)  PLATFORM="macos-x64" ;;
+            *)
+                echo -e "${YELLOW}⚠ Unsupported macOS architecture: $ARCH${NC}"
+                echo "  x0xd daemon installation skipped."
+                PLATFORM=""
+                ;;
+        esac
+        ;;
+    *)
+        echo -e "${YELLOW}⚠ Unsupported operating system: $OS${NC}"
+        echo "  x0xd daemon installation is only supported on Linux and macOS."
+        echo "  Skipping daemon installation."
         PLATFORM=""
-    else
-        emit_json_error "unsupported_platform" "No x0xd binary available for this OS/arch"
-    fi
-fi
-
-X0XD_PATH="$BIN_DIR/x0xd"
-if [ -e "$X0XD_PATH" ] && [ "$INTERACTIVE" = false ]; then
-    emit_json_already_installed "$X0XD_PATH"
-fi
+        ;;
+esac
 
 if [ -n "$PLATFORM" ]; then
     ARCHIVE="x0x-${PLATFORM}.tar.gz"
+    ARCHIVE_URL="$RELEASE_URL/$ARCHIVE"
     TMPDIR="$(mktemp -d)"
-    if [ -z "$TMPDIR" ]; then
-        emit_json_error "permission_denied" "Could not create temporary directory"
-    fi
 
-    log_info "Downloading x0xd ($PLATFORM)..."
-    download_file "$RELEASE_URL/$ARCHIVE" "$TMPDIR/$ARCHIVE"
-
-    log_info "Extracting x0xd..."
-    if ! tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR" "x0x-${PLATFORM}/x0xd"; then
-        rm -rf "$TMPDIR" >/dev/null 2>&1 || true
-        emit_json_error "download_failed" "Downloaded archive is invalid or missing x0xd"
-    fi
-
-    if ! mkdir -p "$BIN_DIR"; then
-        rm -rf "$TMPDIR" >/dev/null 2>&1 || true
-        emit_json_error "permission_denied" "Cannot create binary directory $BIN_DIR"
-    fi
-
-    if ! mv "$TMPDIR/x0x-${PLATFORM}/x0xd" "$X0XD_PATH"; then
-        rm -rf "$TMPDIR" >/dev/null 2>&1 || true
-        emit_json_error "permission_denied" "Cannot write x0xd to $X0XD_PATH"
-    fi
-
-    if ! chmod +x "$X0XD_PATH"; then
-        rm -rf "$TMPDIR" >/dev/null 2>&1 || true
-        emit_json_error "permission_denied" "Cannot mark x0xd executable at $X0XD_PATH"
-    fi
-
-    rm -rf "$TMPDIR" >/dev/null 2>&1 || true
-fi
-
-if [ "$INTERACTIVE" = true ]; then
-    echo ""
-    echo -e "${GREEN}Installation complete${NC}"
-    echo ""
-    echo "SKILL.md installed to: $INSTALL_DIR/SKILL.md"
-    if [ -n "$PLATFORM" ]; then
-        echo "x0xd installed to:     $X0XD_PATH"
-    fi
-    echo ""
-    echo "Next steps:"
-    if [ -n "$PLATFORM" ]; then
-        echo "  1. Run x0xd:"
-        echo "       x0xd"
-        echo "  2. Manage contacts:"
-        echo "       curl http://127.0.0.1:12700/contacts"
-        echo "  3. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
-        echo ""
+    echo "Downloading x0xd ($PLATFORM)..."
+    if command -v curl &> /dev/null; then
+        curl -sfL "$ARCHIVE_URL" -o "$TMPDIR/$ARCHIVE"
     else
-        echo "  1. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
-        echo ""
+        wget -qO "$TMPDIR/$ARCHIVE" "$ARCHIVE_URL"
     fi
-    echo "  4. Install SDK:"
-    echo "     - Rust:       cargo add x0x"
-    echo "     - TypeScript: npm install x0x"
-    echo "     - Python:     pip install agent-x0x"
-    echo ""
-    echo "Learn more: https://github.com/$REPO"
-    exit 0
+
+    echo "Extracting x0xd..."
+    tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR" "x0x-${PLATFORM}/x0xd"
+
+    mkdir -p "$BIN_DIR"
+    mv "$TMPDIR/x0x-${PLATFORM}/x0xd" "$BIN_DIR/x0xd"
+    chmod +x "$BIN_DIR/x0xd"
+
+    rm -rf "$TMPDIR"
+
+    echo -e "${GREEN}✓ x0xd installed to: $BIN_DIR/x0xd${NC}"
+
+    # Warn if ~/.local/bin is not in PATH
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *)
+            echo ""
+            echo -e "${YELLOW}⚠ $BIN_DIR is not in your PATH.${NC}"
+            echo "  Add it by appending one of the following to your shell profile:"
+            echo ""
+            echo "    # bash (~/.bashrc or ~/.bash_profile)"
+            echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+            echo ""
+            echo "    # zsh (~/.zshrc)"
+            echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+            echo ""
+            echo "  Then reload your shell: source ~/.bashrc  (or ~/.zshrc)"
+            ;;
+    esac
 fi
 
-emit_json_success "$X0XD_PATH" "$INSTALL_DIR/SKILL.md" "$GPG_VERIFIED" "$PLATFORM" "$VERSION"
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+echo ""
+echo -e "${GREEN}✓ Installation complete${NC}"
+echo ""
+echo "SKILL.md installed to: $INSTALL_DIR/SKILL.md"
+if [ -n "$PLATFORM" ]; then
+    echo "x0xd installed to:     $BIN_DIR/x0xd"
+fi
+echo ""
+echo "Next steps:"
+if [ -n "$PLATFORM" ]; then
+    echo "  1. Run x0xd:"
+    echo "       x0xd"
+    echo "     (x0xd creates your identity on first run and joins the global network)"
+    echo "     (If x0xd is not found, ensure $BIN_DIR is in your PATH — see above)"
+    echo ""
+    echo "  2. Manage contacts:"
+    echo "       curl http://127.0.0.1:12700/contacts"
+    echo ""
+    echo "  3. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
+    echo ""
+    echo "  4. Install SDK:"
+else
+    echo "  1. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
+    echo ""
+    echo "  2. Install SDK:"
+fi
+echo "     - Rust:       cargo add x0x"
+echo "     - TypeScript: npm install x0x"
+echo "     - Python:     pip install agent-x0x"
+echo ""
+echo "Learn more: https://github.com/$REPO"

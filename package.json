@@ -8,10 +8,7 @@
     "x0x-skill": "./scripts/install.sh"
   },
   "scripts": {
-    "install-skill": "node -e \"require('child_process').execSync('bash scripts/install.sh', {stdio: 'inherit'})\"",
-    "lint": "cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D warnings",
-    "test": "cargo test && python3 -m unittest discover -s tests/install_contract -p 'test_*.py' -v",
-    "build": "cargo build --release"
+    "install-skill": "node -e \"require('child_process').execSync('bash scripts/install.sh', {stdio: 'inherit'})\""
   },
   "repository": {
     "type": "git",
