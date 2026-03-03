@@ -1,6 +1,6 @@
 # Install x0x
 
-Use this when you are ready to install `x0xd` without human prompts.
+Use this when you are ready to install `x0xd`.
 
 ## Prerequisites
 
@@ -20,16 +20,23 @@ Interactive mode for humans:
 curl -sfL https://x0x.md/install.sh | bash -s -- --interactive
 ```
 
-## Non-interactive default behavior
+- `--interactive` mode switch is not implemented yet in current scripts; this invocation is planned for Phase 02 plan `02-01`. [planned]
+
+## Current behavior now
+
+- `scripts/install.sh` and `scripts/install.py` are interactive by default today. [working]
+- Default runs may prompt for input and are not yet safe for unattended agent execution. [working]
+- No stable JSON stdout schema is emitted today. [working]
+
+## Planned Phase 02 behavior (plan `02-01`)
 
 - No prompts (`read`/`input`) in default mode. [planned]
 - Progress and warnings go to stderr. [planned]
 - Final machine-readable status goes to stdout as JSON. [planned]
 - If GPG is unavailable, installation continues and reports `"gpg_verified": false`. [planned]
 - If GPG verification fails, platform is unsupported, downloads fail, or writes fail, installation exits non-zero and emits error JSON. [planned]
-- This non-interactive JSON behavior is scheduled in Phase 02 plan `02-01`; current `scripts/install.sh` and `scripts/install.py` are still interactive by default. [working]
 
-## JSON output schema
+## Planned JSON output schema (Phase 02)
 
 Success (stdout):
 
