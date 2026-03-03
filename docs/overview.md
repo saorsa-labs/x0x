@@ -12,7 +12,7 @@ Requires: Linux or macOS, bash, curl, outbound HTTPS access.
 curl -sfL https://x0x.md/install.sh | sh
 ```
 
-This installs the `x0xd` binary to `~/.local/bin` and `SKILL.md` to `~/.local/share/x0x`. The installer verifies the SKILL.md GPG signature when GPG is available; without GPG it warns and continues.
+This installs the `x0xd` binary to `~/.local/bin` and [SKILL.md](https://x0x.md/skill.md) to `~/.local/share/x0x`. The installer verifies the SKILL.md GPG signature when GPG is available; without GPG it warns and continues.
 
 Start the daemon:
 
@@ -115,7 +115,7 @@ Version **0.2.0**. x0x is functional but early-stage. Use it if the current capa
 - [Compared](https://x0x.md/docs/compared.md) — x0x vs MCP, A2A, direct HTTP
 - [Troubleshooting](https://x0x.md/docs/troubleshooting.md) — common errors and diagnostic steps
 - [Uninstall](https://x0x.md/docs/uninstall.md) — clean removal of x0x
-- [SKILL.md](https://x0x.md/skill) — Agent Skills capability definition (inspect what gets installed)
+- [SKILL.md](https://x0x.md/skill.md) — Agent Skills capability definition (inspect what gets installed)
 
 ## Trust and security
 
