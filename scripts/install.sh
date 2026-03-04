@@ -66,11 +66,11 @@ fail()    { echo -e "${RED}err${NC} $*"; }
 download() {
     local url="$1" dest="$2"
     if command -v curl >/dev/null 2>&1; then
-        if ! curl -sfL "$url" -o "$dest" 2>/dev/null; then
+        if ! curl -sfL "$url" -o "$dest" < /dev/null 2>/dev/null; then
             return 1
         fi
     elif command -v wget >/dev/null 2>&1; then
-        if ! wget -qO "$dest" "$url" 2>/dev/null; then
+        if ! wget -qO "$dest" "$url" < /dev/null 2>/dev/null; then
             return 1
         fi
     else
