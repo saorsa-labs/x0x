@@ -65,7 +65,7 @@ impl GossipRuntime {
             membership_config,
             Arc::clone(&network),
         ));
-        let pubsub = Arc::new(PubSubManager::new(Arc::clone(&network), signing));
+        let pubsub = Arc::new(PubSubManager::new(Arc::clone(&network), signing)?);
 
         Ok(Self {
             config,
