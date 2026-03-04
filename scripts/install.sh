@@ -232,8 +232,7 @@ if [ -n "$PLATFORM" ]; then
     TMPDIR="$(mktemp -d)"
 
     if [ -f "$BIN_DIR/x0xd" ]; then
-        EXISTING_VERSION=$("$BIN_DIR/x0xd" --version 2>/dev/null || echo "unknown")
-        info "Existing x0xd found ($EXISTING_VERSION). Upgrading..."
+        info "Existing x0xd found at $BIN_DIR/x0xd. Upgrading..."
     fi
 
     echo "Downloading x0xd ($PLATFORM)..."
