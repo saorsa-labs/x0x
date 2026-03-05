@@ -176,8 +176,9 @@ if [ "$GPG_AVAILABLE" = true ]; then
                     exit 1
                 fi
             else
-                warn "Signature verification failed. Continuing anyway (non-interactive mode)."
-                INSTALL_WARNINGS+=("gpg_failed: SKILL.md signature verification failed")
+                fail "Signature verification failed in non-interactive mode. Aborting."
+                echo "  Re-run interactively or set X0X_SKIP_GPG=true to bypass."
+                exit 1
             fi
         fi
     else
