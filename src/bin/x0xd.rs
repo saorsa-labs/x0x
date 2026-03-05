@@ -1382,6 +1382,7 @@ async fn discovered_agent(
         }
     }
 
+
     match state.agent.discovered_agent(agent_id).await {
         Ok(Some(agent)) => (
             StatusCode::OK,

@@ -5,6 +5,7 @@ use super::pubsub::{PubSubManager, SigningContext};
 use crate::error::NetworkResult;
 use crate::network::NetworkNode;
 use saorsa_gossip_membership::{HyParViewMembership, MembershipConfig};
+use saorsa_gossip_transport::GossipStreamType;
 use saorsa_gossip_types::PeerId;
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ pub struct GossipRuntime {
     membership: Arc<HyParViewMembership<NetworkNode>>,
     pubsub: Arc<PubSubManager>,
     peer_id: PeerId,
+    dispatcher_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for GossipRuntime {
@@ -63,7 +65,7 @@ impl GossipRuntime {
             membership_config,
             Arc::clone(&network),
         ));
-        let pubsub = Arc::new(PubSubManager::new(Arc::clone(&network), signing));
+        let pubsub = Arc::new(PubSubManager::new(Arc::clone(&network), signing)?);
 
         Ok(Self {
             config,
@@ -71,6 +73,7 @@ impl GossipRuntime {
             membership,
             pubsub,
             peer_id,
+            dispatcher_handle: std::sync::Mutex::new(None),
         })
     }
 
@@ -112,8 +115,39 @@ impl GossipRuntime {
     ///
     /// Returns an error if initialization fails.
     pub async fn start(&self) -> NetworkResult<()> {
-        // Config is validated in new(); this is a placeholder for
-        // starting background tasks (shuffle, SWIM probes, etc.)
+        let network = Arc::clone(&self.network);
+        let pubsub = Arc::clone(&self.pubsub);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                match saorsa_gossip_transport::GossipTransport::receive_message(network.as_ref())
+                    .await
+                {
+                    Ok((peer, stream_type, data)) => match stream_type {
+                        GossipStreamType::PubSub => {
+                            pubsub.handle_incoming(peer, data).await;
+                        }
+                        other => {
+                            tracing::debug!("Ignoring {:?} stream (not yet implemented)", other);
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!("Message receive failed: {}", e);
+                        break;
+                    }
+                }
+            }
+            tracing::info!("Gossip message dispatcher shut down");
+        });
+
+        match self.dispatcher_handle.lock() {
+            Ok(mut guard) => *guard = Some(handle),
+            Err(_) => {
+                return Err(crate::error::NetworkError::NodeCreation(
+                    "dispatcher handle lock poisoned".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -125,6 +159,11 @@ impl GossipRuntime {
     ///
     /// Returns an error if shutdown fails.
     pub async fn shutdown(&self) -> NetworkResult<()> {
+        if let Ok(mut guard) = self.dispatcher_handle.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
         Ok(())
     }
 

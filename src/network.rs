@@ -231,6 +231,7 @@ impl NetworkNode {
         };
 
         network_node.spawn_receiver();
+        network_node.spawn_accept_loop();
 
         Ok(network_node)
     }
@@ -521,6 +522,55 @@ impl NetworkNode {
             }
 
             debug!("NetworkNode receiver task stopped");
+        });
+    }
+
+    /// Spawn a background task that accepts inbound connections.
+    ///
+    /// Without this, only outbound connections (initiated by `connect_addr`)
+    /// are registered in `connected_peers`. Inbound peers would complete the
+    /// QUIC handshake but never have a reader task spawned, so `recv()` would
+    /// never deliver their data.
+    fn spawn_accept_loop(&self) {
+        let node = Arc::clone(&self.node);
+        let event_sender = self.event_sender.clone();
+
+        tokio::spawn(async move {
+            debug!("NetworkNode accept loop started");
+
+            loop {
+                let node_guard = node.read().await;
+                let node_ref = match node_guard.as_ref() {
+                    Some(n) => n,
+                    None => {
+                        debug!("Node not initialized, accept loop stopping");
+                        break;
+                    }
+                };
+
+                match node_ref.accept().await {
+                    Some(peer_conn) => {
+                        tracing::info!(
+                            "Accepted inbound connection from peer {:?} at {:?}",
+                            peer_conn.peer_id,
+                            peer_conn.remote_addr
+                        );
+                        let _ = event_sender.send(NetworkEvent::PeerConnected {
+                            peer_id: peer_conn.peer_id.0,
+                            address: match peer_conn.remote_addr {
+                                ant_quic::TransportAddr::Udp(addr) => addr,
+                                _ => std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                            },
+                        });
+                    }
+                    None => {
+                        debug!("Accept loop ended (node shutting down)");
+                        break;
+                    }
+                }
+            }
+
+            debug!("NetworkNode accept loop stopped");
         });
     }
 }

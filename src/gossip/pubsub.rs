@@ -1,8 +1,8 @@
-//! x0x Pub/Sub with epidemic broadcast and ML-DSA-65 signed messages.
+//! x0x Pub/Sub with PlumTree dissemination and ML-DSA-65 signed messages.
 //!
-//! This module implements topic-based pub/sub for x0x with cryptographic
-//! message authentication. Published messages carry the sender's AgentId
-//! and ML-DSA-65 signature, verified by recipients before delivery.
+//! This module implements topic-based pub/sub for x0x with:
+//! - PlumTree dissemination via `saorsa-gossip-pubsub`
+//! - x0x payload-level message authentication (V2 signed format)
 //!
 //! Two wire formats coexist during the transition period:
 //! - **V1** (legacy): `[topic_len: u16_be | topic | payload]` — unsigned
@@ -13,9 +13,8 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::identity::AgentId;
 use crate::network::NetworkNode;
 use bytes::Bytes;
-use futures::future;
-use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
-use saorsa_gossip_types::PeerId;
+use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
+use saorsa_gossip_types::{PeerId, TopicId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -99,15 +98,15 @@ pub struct PubSubMessage {
 /// Subscription to a topic.
 ///
 /// Receives messages published to its topic through a channel receiver.
-/// The subscription is canceled when dropped, automatically cleaning up
-/// dead senders from the PubSubManager's subscription list.
+/// The subscription is canceled when dropped, automatically decrementing
+/// topic subscriber counts in the PubSubManager.
 pub struct Subscription {
     /// The topic this subscription is for.
     topic: String,
     /// Channel receiver for messages on this topic.
     receiver: mpsc::Receiver<PubSubMessage>,
-    /// Reference to subscriptions map for cleanup on drop.
-    subscriptions: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubMessage>>>>>,
+    /// Reference to per-topic subscriber counts for cleanup on drop.
+    topic_ref_counts: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 impl Subscription {
@@ -130,53 +129,60 @@ impl Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         let topic = self.topic.clone();
-        let subscriptions = self.subscriptions.clone();
+        let topic_ref_counts = self.topic_ref_counts.clone();
 
-        // Spawn a task to clean up dead senders from this topic.
+        // Spawn a task to decrement the refcount for this topic.
         // This avoids blocking on synchronous locks in drop.
         tokio::spawn(async move {
-            let mut subs_map = subscriptions.write().await;
-            if let Some(senders) = subs_map.get_mut(&topic) {
-                senders.retain(|sender| !sender.is_closed());
-                if senders.is_empty() {
-                    subs_map.remove(&topic);
+            let mut counts = topic_ref_counts.write().await;
+            if let Some(count) = counts.get_mut(&topic) {
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    counts.remove(&topic);
                 }
             }
         });
     }
 }
 
-/// Pub/Sub manager using epidemic broadcast with ML-DSA-65 message signing.
-///
-/// When a [`SigningContext`] is provided, published messages are signed
-/// and incoming v2 messages are verified before delivery. Unsigned v1
-/// messages are still accepted during the transition period.
+/// Pub/Sub manager using PlumTree dissemination with x0x payload signing.
 ///
 /// # Architecture
 ///
 /// ```text
 /// Publisher → PubSubManager.publish()
 ///     ├─> Sign with ML-DSA-65 (if signing context present)
-///     ├─> Deliver to local subscribers
-///     └─> Broadcast to all connected peers via GossipTransport
+///     └─> Publish encoded payload via PlumTree (saorsa-gossip-pubsub)
 ///
 /// Peer message → PubSubManager.handle_incoming()
-///     ├─> Decode (auto-detect v1/v2)
-///     ├─> Verify signature (v2 only — drop on failure)
-///     ├─> Deliver to local subscribers
-///     └─> Re-broadcast to other peers (epidemic)
+///     └─> Dispatch to PlumTree handler (EAGER/IHAVE/IWANT/AntiEntropy)
+///
+/// Local subscription delivery path:
+///     PlumTree topic receiver → decode x0x payload (v1/v2) → trust filter → subscriber channel
 /// ```
-#[derive(Debug)]
 pub struct PubSubManager {
-    /// Network node for sending/receiving messages.
+    /// Network node used by PlumTree transport and topic peer initialization.
     network: Arc<NetworkNode>,
-    /// Local subscriptions: topic -> list of senders.
-    subscriptions: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubMessage>>>>>,
+    /// PlumTree pub/sub engine from saorsa-gossip-pubsub.
+    plumtree: Arc<PlumtreePubSub<NetworkNode>>,
+    /// Local topic subscription ref-counts (for stats and cleanup).
+    topic_ref_counts: Arc<RwLock<HashMap<String, usize>>>,
     /// Signing context for authenticating published messages.
     signing: Option<Arc<SigningContext>>,
     /// Contact store for trust-based message filtering.
     /// Set via `set_contacts()` after construction.
     contacts: std::sync::OnceLock<Arc<tokio::sync::RwLock<ContactStore>>>,
+}
+
+impl std::fmt::Debug for PubSubManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PubSubManager")
+            .field("network", &self.network)
+            .field("topic_count", &"<dynamic>")
+            .field("signing_enabled", &self.signing.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PubSubManager {
@@ -191,13 +197,29 @@ impl PubSubManager {
     /// # Returns
     ///
     /// A new `PubSubManager` instance
-    pub fn new(network: Arc<NetworkNode>, signing: Option<Arc<SigningContext>>) -> Self {
-        Self {
+    pub fn new(
+        network: Arc<NetworkNode>,
+        signing: Option<Arc<SigningContext>>,
+    ) -> NetworkResult<Self> {
+        let peer_id = saorsa_gossip_transport::GossipTransport::local_peer_id(network.as_ref());
+        let plumtree_signing_key =
+            saorsa_gossip_identity::MlDsaKeyPair::generate().map_err(|e| {
+                NetworkError::NodeCreation(format!("failed to create PlumTree signing key: {e}"))
+            })?;
+
+        let plumtree = Arc::new(PlumtreePubSub::new(
+            peer_id,
+            Arc::clone(&network),
+            plumtree_signing_key,
+        ));
+
+        Ok(Self {
             network,
-            subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            plumtree,
+            topic_ref_counts: Arc::new(RwLock::new(HashMap::new())),
             signing,
             contacts: std::sync::OnceLock::new(),
-        }
+        })
     }
 
     /// Attach a contact store for trust-based message filtering.
@@ -218,19 +240,37 @@ impl PubSubManager {
     /// given topic. The subscription is canceled when the returned
     /// `Subscription` is dropped.
     pub async fn subscribe(&self, topic: String) -> Subscription {
-        let (tx, rx) = mpsc::channel(100);
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.initialize_topic_peers(topic_id).await;
 
-        self.subscriptions
-            .write()
-            .await
-            .entry(topic.clone())
-            .or_default()
-            .push(tx);
+        let mut plumtree_rx = self.plumtree.subscribe(topic_id);
+        // Plumtree registers subscribers on a spawned task; yield once so
+        // immediate local publishes in the same task see this subscriber.
+        tokio::task::yield_now().await;
+        let (tx, rx) = mpsc::channel(100);
+        let contacts = self.contacts.get().cloned();
+
+        {
+            let mut counts = self.topic_ref_counts.write().await;
+            *counts.entry(topic.clone()).or_insert(0) += 1;
+        }
+
+        tokio::spawn(async move {
+            while let Some((_peer, encoded_payload)) = plumtree_rx.recv().await {
+                let Some(message) = decode_for_delivery(encoded_payload, contacts.as_ref()).await
+                else {
+                    continue;
+                };
+                if tx.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
 
         Subscription {
             topic,
             receiver: rx,
-            subscriptions: self.subscriptions.clone(),
+            topic_ref_counts: self.topic_ref_counts.clone(),
         }
     }
 
@@ -243,142 +283,99 @@ impl PubSubManager {
     ///
     /// Returns an error if encoding or signing fails.
     pub async fn publish(&self, topic: String, payload: Bytes) -> NetworkResult<()> {
-        let (encoded, message) = if let Some(ref ctx) = self.signing {
+        let encoded = if let Some(ref ctx) = self.signing {
             let signing_payload =
                 build_signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload);
             let signature = ctx.sign(&signing_payload)?;
-            let enc = encode_v2(
+            encode_v2(
                 &ctx.agent_id,
                 &ctx.public_key_bytes,
                 &signature,
                 &topic,
                 &payload,
-            )?;
-            let msg = PubSubMessage {
-                topic: topic.clone(),
-                payload: payload.clone(),
-                sender: Some(ctx.agent_id),
-                sender_public_key: Some(ctx.public_key_bytes.clone()),
-                verified: true,
-                trust_level: None,
-            };
-            (enc, msg)
+            )?
         } else {
-            let enc = encode_v1(&topic, &payload)?;
-            let msg = PubSubMessage {
-                topic: topic.clone(),
-                payload: payload.clone(),
-                sender: None,
-                sender_public_key: None,
-                verified: false,
-                trust_level: None,
-            };
-            (enc, msg)
+            encode_v1(&topic, &payload)?
         };
 
-        self.deliver_message_to_local_subscribers(&message).await;
-        self.broadcast_to_peers(encoded, None).await;
-        Ok(())
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.initialize_topic_peers(topic_id).await;
+
+        self.plumtree
+            .publish(topic_id, encoded)
+            .await
+            .map_err(|e| NetworkError::ConnectionFailed(format!("PlumTree publish failed: {e}")))
     }
 
     /// Handle an incoming message from a peer.
     ///
-    /// Decodes the message (auto-detecting v1 or v2 format), verifies
-    /// the ML-DSA-65 signature for v2 messages, delivers to local
-    /// subscribers, and re-broadcasts to other peers.
-    ///
-    /// V2 messages with invalid signatures are dropped and NOT rebroadcast.
-    /// Messages from `Blocked` contacts are dropped and NOT rebroadcast.
+    /// This delegates to the PlumTree implementation for protocol-level
+    /// processing (EAGER/IHAVE/IWANT/AntiEntropy).
     pub async fn handle_incoming(&self, peer: PeerId, data: Bytes) {
-        let mut message = match decode_auto(data.clone()) {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to decode pubsub message from peer {:?}: {}",
-                    peer,
-                    e
-                );
-                return;
-            }
-        };
-
-        // Drop v2 messages with failed verification
-        if message.sender.is_some() && !message.verified {
-            tracing::warn!(
-                "Dropping pubsub message with invalid signature from sender {:?}",
-                message.sender
-            );
-            return;
+        if let Err(e) = self.plumtree.handle_message(peer, data).await {
+            tracing::warn!("Failed to handle PlumTree pubsub message from {peer}: {e}");
         }
-
-        // Trust filtering: if a contact store is attached, check trust level
-        if let Some(contacts) = self.contacts.get() {
-            if let Some(ref sender) = message.sender {
-                let store = contacts.read().await;
-                let trust = store.trust_level(sender);
-                if trust == TrustLevel::Blocked {
-                    tracing::debug!(
-                        "Dropping message from blocked sender {} (not rebroadcast)",
-                        sender
-                    );
-                    return; // Don't deliver, don't rebroadcast
-                }
-                message.trust_level = Some(trust);
-            }
-        }
-
-        self.deliver_message_to_local_subscribers(&message).await;
-
-        // Re-broadcast to other peers (epidemic broadcast)
-        // Use the original encoded data to preserve the signature
-        self.broadcast_to_peers(data, Some(&peer)).await;
-    }
-
-    /// Deliver a full message to all local subscribers for its topic.
-    async fn deliver_message_to_local_subscribers(&self, message: &PubSubMessage) {
-        if let Some(subs) = self.subscriptions.read().await.get(&message.topic) {
-            for tx in subs {
-                let _ = tx.send(message.clone()).await;
-            }
-        }
-    }
-
-    /// Broadcast encoded data to all connected peers, optionally excluding one.
-    async fn broadcast_to_peers(&self, encoded: Bytes, exclude: Option<&PeerId>) {
-        let connected_peers: Vec<_> = self
-            .network
-            .connected_peers()
-            .await
-            .into_iter()
-            .map(|p| PeerId::new(p.0))
-            .collect();
-
-        let futures: Vec<_> = connected_peers
-            .into_iter()
-            .filter(|p| exclude != Some(p))
-            .map(|peer| {
-                let network = self.network.clone();
-                let encoded = encoded.clone();
-                async move {
-                    let _ = network
-                        .send_to_peer(peer, GossipStreamType::PubSub, encoded)
-                        .await;
-                }
-            })
-            .collect();
-
-        future::join_all(futures).await;
     }
 
     /// Get the number of active subscriptions (topics with at least one subscriber).
     pub async fn subscription_count(&self) -> usize {
-        self.subscriptions.read().await.len()
+        self.topic_ref_counts.read().await.len()
     }
 
     /// Unsubscribe from a topic, removing all subscriptions.
     pub async fn unsubscribe(&self, topic: &str) {
-        self.subscriptions.write().await.remove(topic);
+        self.topic_ref_counts.write().await.remove(topic);
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        if let Err(e) = self.plumtree.unsubscribe(topic_id).await {
+            tracing::debug!("PlumTree unsubscribe failed for topic '{topic}': {e}");
+        }
     }
+
+    /// Initialize PlumTree peers for a topic from currently connected peers.
+    async fn initialize_topic_peers(&self, topic: TopicId) {
+        let peers: Vec<PeerId> = self
+            .network
+            .connected_peers()
+            .await
+            .into_iter()
+            .map(|peer| PeerId::new(peer.0))
+            .collect();
+        self.plumtree.initialize_topic_peers(topic, peers).await;
+    }
+}
+
+/// Decode and filter a delivered payload before exposing it to x0x subscribers.
+async fn decode_for_delivery(
+    encoded_payload: Bytes,
+    contacts: Option<&Arc<tokio::sync::RwLock<ContactStore>>>,
+) -> Option<PubSubMessage> {
+    let mut message = match decode_auto(encoded_payload) {
+        Ok(msg) => msg,
+        Err(e) => {
+            tracing::warn!("Failed to decode x0x payload from PlumTree message: {}", e);
+            return None;
+        }
+    };
+
+    // Drop signed messages with failed verification.
+    if message.sender.is_some() && !message.verified {
+        tracing::warn!(
+            "Dropping pubsub payload with invalid signature from sender {:?}",
+            message.sender
+        );
+        return None;
+    }
+
+    if let (Some(store), Some(sender)) = (contacts, message.sender) {
+        let trust = store.read().await.trust_level(&sender);
+        if trust == TrustLevel::Blocked {
+            tracing::debug!("Dropping delivered payload from blocked sender {}", sender);
+            return None;
+        }
+        message.trust_level = Some(trust);
+    }
+
+    Some(message)
 }
 
 // ---------------------------------------------------------------------------
@@ -895,13 +892,13 @@ mod tests {
     #[tokio::test]
     async fn test_pubsub_creation() {
         let node = test_node().await;
-        let _manager = PubSubManager::new(node, None);
+        let _manager = PubSubManager::new(node, None).expect("manager");
     }
 
     #[tokio::test]
     async fn test_subscribe_to_topic() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None);
+        let manager = PubSubManager::new(node, None).expect("manager");
         let sub = manager.subscribe("test-topic".to_string()).await;
         assert_eq!(sub.topic(), "test-topic");
     }
@@ -909,7 +906,7 @@ mod tests {
     #[tokio::test]
     async fn test_publish_local_delivery_unsigned() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None);
+        let manager = PubSubManager::new(node, None).expect("manager");
         let mut sub = manager.subscribe("chat".to_string()).await;
 
         manager
@@ -929,7 +926,7 @@ mod tests {
         let node = test_node().await;
         let kp = AgentKeypair::generate().expect("keygen");
         let ctx = Arc::new(SigningContext::from_keypair(&kp));
-        let manager = PubSubManager::new(node, Some(ctx.clone()));
+        let manager = PubSubManager::new(node, Some(ctx.clone())).expect("manager");
 
         let mut sub = manager.subscribe("chat".to_string()).await;
 
@@ -948,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_subscribers() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None);
+        let manager = PubSubManager::new(node, None).expect("manager");
         let mut sub1 = manager.subscribe("news".to_string()).await;
         let mut sub2 = manager.subscribe("news".to_string()).await;
 
@@ -966,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn test_publish_no_subscribers() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None);
+        let manager = PubSubManager::new(node, None).expect("manager");
         assert!(manager
             .publish("empty".to_string(), Bytes::from("nothing"))
             .await
@@ -976,7 +973,7 @@ mod tests {
     #[tokio::test]
     async fn test_unsubscribe() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None);
+        let manager = PubSubManager::new(node, None).expect("manager");
         let mut sub = manager.subscribe("temp".to_string()).await;
 
         manager
@@ -996,39 +993,23 @@ mod tests {
     #[tokio::test]
     async fn test_subscription_count() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None);
+        let manager = PubSubManager::new(node, None).expect("manager");
 
         assert_eq!(manager.subscription_count().await, 0);
-        manager.subscribe("t1".to_string()).await;
+        let _sub_t1 = manager.subscribe("t1".to_string()).await;
         assert_eq!(manager.subscription_count().await, 1);
-        manager.subscribe("t2".to_string()).await;
+        let _sub_t2 = manager.subscribe("t2".to_string()).await;
         assert_eq!(manager.subscription_count().await, 2);
-        manager.subscribe("t1".to_string()).await; // same topic
+        let _sub_t1_b = manager.subscribe("t1".to_string()).await; // same topic
         assert_eq!(manager.subscription_count().await, 2);
         manager.unsubscribe("t1").await;
         assert_eq!(manager.subscription_count().await, 1);
     }
 
     #[tokio::test]
-    async fn test_handle_incoming_v1() {
-        let node = test_node().await;
-        let manager = PubSubManager::new(node, None);
-        let mut sub = manager.subscribe("remote".to_string()).await;
-
-        let encoded = encode_v1("remote", &Bytes::from("incoming")).expect("encode");
-        let peer = PeerId::new([1; 32]);
-        manager.handle_incoming(peer, encoded).await;
-
-        let msg = sub.recv().await.expect("recv");
-        assert_eq!(msg.topic, "remote");
-        assert_eq!(msg.payload, Bytes::from("incoming"));
-        assert!(msg.sender.is_none());
-    }
-
-    #[tokio::test]
     async fn test_handle_incoming_invalid() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None);
+        let manager = PubSubManager::new(node, None).expect("manager");
         let _sub = manager.subscribe("test".to_string()).await;
 
         let peer = PeerId::new([1; 32]);
