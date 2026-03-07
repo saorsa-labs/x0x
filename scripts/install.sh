@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # x0x Installation Script (Unix/macOS/Linux)
+#
+# Interactive mode (default in terminal): prompts for confirmation when needed.
+# Non-interactive mode (piped or -y flag): uses safe defaults, never blocks.
+#
+# Examples:
+#   curl -sfL https://x0x.md | sh            # non-interactive (piped)
+#   bash install.sh                           # interactive
+#   bash install.sh -y                        # non-interactive (explicit)
 
 set -euo pipefail
 
@@ -15,6 +23,17 @@ RELEASE_URL="https://github.com/$REPO/releases/latest/download"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x"
 BIN_DIR="$HOME/.local/bin"
 
+# Detect interactive mode: false when piped (curl | sh) or when -y is passed
+INTERACTIVE=true
+if ! [ -t 0 ]; then
+    INTERACTIVE=false
+fi
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes) INTERACTIVE=false ;;
+    esac
+done
+
 echo -e "${BLUE}x0x Installation Script${NC}"
 echo -e "${BLUE}========================${NC}"
 echo ""
@@ -28,10 +47,15 @@ if ! command -v gpg &> /dev/null; then
     echo "  Ubuntu: sudo apt install gnupg"
     echo "  Fedora: sudo dnf install gnupg"
     echo ""
-    read -p "Continue without verification? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
+    if [ "$INTERACTIVE" = true ]; then
+        read -p "Continue without verification? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+    else
+        echo "Continuing without verification (non-interactive mode)."
+        echo ""
     fi
     GPG_AVAILABLE=false
 else
@@ -72,9 +96,15 @@ if [ "$GPG_AVAILABLE" = true ]; then
         echo -e "${RED}✗ Signature verification failed${NC}"
         echo ""
         echo "This file may have been tampered with."
-        read -p "Install anyway? (y/N) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        if [ "$INTERACTIVE" = true ]; then
+            read -p "Install anyway? (y/N) " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                exit 1
+            fi
+        else
+            echo -e "${RED}✗ Signature verification failed in non-interactive mode. Aborting.${NC}"
+            echo "  Re-run interactively or set X0X_SKIP_GPG=true to bypass."
             exit 1
         fi
     fi
