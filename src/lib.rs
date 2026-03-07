@@ -91,6 +91,9 @@ pub use gossip::{
     GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, SigningContext, Subscription,
 };
 
+// Import Membership trait for HyParView join() method
+use saorsa_gossip_membership::Membership as _;
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -669,7 +672,7 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|a| a.last_seen >= cutoff)
+            .filter(|a| a.announced_at >= cutoff)
             .cloned()
             .collect();
         agents.sort_by(|a, b| a.agent_id.0.cmp(&b.agent_id.0));
@@ -950,6 +953,23 @@ impl Agent {
             bootstrap_nodes.len()
         );
 
+        // Join the HyParView membership overlay via bootstrap nodes.
+        // This triggers JOIN messages that propagate through the network,
+        // allowing other agents to discover this node and establish
+        // overlay connections for gossip dissemination.
+        if let Some(ref runtime) = self.gossip_runtime {
+            let seeds: Vec<String> = bootstrap_nodes
+                .iter()
+                .filter(|addr| !failed.contains(addr))
+                .map(|addr| addr.to_string())
+                .collect();
+            if !seeds.is_empty() {
+                if let Err(e) = runtime.membership().join(seeds).await {
+                    tracing::warn!("HyParView membership join failed: {e}");
+                }
+            }
+        }
+
         if let Err(e) = self.announce_identity(false, false).await {
             tracing::warn!("Initial identity announcement failed: {}", e);
         }
@@ -1080,7 +1100,7 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|a| a.last_seen >= cutoff)
+            .filter(|a| a.announced_at >= cutoff)
             .map(|a| a.agent_id)
             .collect();
         agents.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1194,7 +1214,7 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|a| a.last_seen >= cutoff && a.user_id == Some(user_id))
+            .filter(|a| a.announced_at >= cutoff && a.user_id == Some(user_id))
             .cloned()
             .collect())
     }

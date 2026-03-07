@@ -96,6 +96,11 @@ struct DaemonConfig {
     #[serde(default = "default_identity_ttl")]
     identity_ttl_secs: u64,
 
+    /// Optional path to a user keypair file for human identity.
+    /// When set, the agent can announce with `include_user_identity: true`.
+    #[serde(default)]
+    user_key_path: Option<PathBuf>,
+
     /// Enable rendezvous `ProviderSummary` advertisements for global findability.
     #[serde(default = "default_rendezvous_enabled")]
     rendezvous_enabled: bool,
@@ -179,6 +184,7 @@ impl Default for DaemonConfig {
             update_repo: default_update_repo(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             identity_ttl_secs: default_identity_ttl(),
+            user_key_path: None,
             rendezvous_enabled: default_rendezvous_enabled(),
             rendezvous_validity_ms: default_rendezvous_validity_ms(),
         }
@@ -474,16 +480,23 @@ async fn main() -> Result<()> {
         peer_cache_path: Some(config.data_dir.join("peers.cache")),
     };
 
-    let agent = Agent::builder()
+    let mut builder = Agent::builder()
         .with_network_config(network_config)
         .with_heartbeat_interval(config.heartbeat_interval_secs)
-        .with_identity_ttl(config.identity_ttl_secs)
-        .build()
-        .await
-        .context("failed to create agent")?;
+        .with_identity_ttl(config.identity_ttl_secs);
+
+    if let Some(ref user_key_path) = config.user_key_path {
+        builder = builder.with_user_key_path(user_key_path);
+        tracing::info!("User key path: {}", user_key_path.display());
+    }
+
+    let agent = builder.build().await.context("failed to create agent")?;
 
     tracing::info!("Agent ID: {}", agent.agent_id());
     tracing::info!("Machine ID: {}", agent.machine_id());
+    if let Some(uid) = agent.user_id() {
+        tracing::info!("User ID: {}", uid);
+    }
 
     // Create contact store and attach to gossip layer for trust filtering
     let contacts = Arc::new(RwLock::new(ContactStore::new(

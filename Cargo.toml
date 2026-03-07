@@ -30,17 +30,17 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-saorsa-gossip-coordinator = "0.5"
-saorsa-gossip-crdt-sync = "0.5"
-saorsa-gossip-groups = "0.5"
-saorsa-gossip-identity = "0.5"
-saorsa-gossip-membership = "0.5"
-saorsa-gossip-presence = "0.5"
-saorsa-gossip-pubsub = "0.5"
-saorsa-gossip-rendezvous = "0.5"
-saorsa-gossip-runtime = "0.5"
-saorsa-gossip-transport = "0.5"
-saorsa-gossip-types = "0.5"
+saorsa-gossip-coordinator = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-crdt-sync = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-groups = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-identity = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-membership = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-presence = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-pubsub = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-rendezvous = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-runtime = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-transport = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-types = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
 saorsa-pqc = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

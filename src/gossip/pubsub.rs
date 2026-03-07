@@ -331,6 +331,26 @@ impl PubSubManager {
         }
     }
 
+    /// Re-initialize PlumTree peers for all locally subscribed topics.
+    ///
+    /// This ensures that newly connected peers are added to the eager set
+    /// for existing topics. Without this, a peer that connects after a topic
+    /// is subscribed would never receive messages on that topic from this node.
+    pub async fn refresh_topic_peers(&self) {
+        let topics: Vec<String> = self.topic_ref_counts.read().await.keys().cloned().collect();
+        let peers: Vec<PeerId> = self
+            .network
+            .connected_peers()
+            .await
+            .into_iter()
+            .map(|peer| PeerId::new(peer.0))
+            .collect();
+        for topic in topics {
+            let topic_id = TopicId::from_entity(topic.as_bytes());
+            self.plumtree.set_topic_peers(topic_id, peers.clone()).await;
+        }
+    }
+
     /// Initialize PlumTree peers for a topic from currently connected peers.
     async fn initialize_topic_peers(&self, topic: TopicId) {
         let peers: Vec<PeerId> = self

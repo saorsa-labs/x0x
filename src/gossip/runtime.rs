@@ -20,6 +20,7 @@ pub struct GossipRuntime {
     pubsub: Arc<PubSubManager>,
     peer_id: PeerId,
     dispatcher_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    peer_sync_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for GossipRuntime {
@@ -74,6 +75,7 @@ impl GossipRuntime {
             pubsub,
             peer_id,
             dispatcher_handle: std::sync::Mutex::new(None),
+            peer_sync_handle: std::sync::Mutex::new(None),
         })
     }
 
@@ -116,6 +118,7 @@ impl GossipRuntime {
     /// Returns an error if initialization fails.
     pub async fn start(&self) -> NetworkResult<()> {
         let network = Arc::clone(&self.network);
+        let membership = Arc::clone(&self.membership);
         let pubsub = Arc::clone(&self.pubsub);
 
         let handle = tokio::spawn(async move {
@@ -126,6 +129,13 @@ impl GossipRuntime {
                     Ok((peer, stream_type, data)) => match stream_type {
                         GossipStreamType::PubSub => {
                             pubsub.handle_incoming(peer, data).await;
+                        }
+                        GossipStreamType::Membership => {
+                            if let Err(e) = membership.dispatch_message(peer, &data).await {
+                                tracing::debug!(
+                                    "Failed to handle membership message from {peer}: {e}"
+                                );
+                            }
                         }
                         other => {
                             tracing::debug!("Ignoring {:?} stream (not yet implemented)", other);
@@ -139,6 +149,21 @@ impl GossipRuntime {
             }
             tracing::info!("Gossip message dispatcher shut down");
         });
+
+        // Periodically refresh PlumTree topic peers with current connections.
+        // This ensures newly connected peers (discovered via HyParView or
+        // direct connection) are added to the eager set for existing topics.
+        let pubsub_refresh = Arc::clone(&self.pubsub);
+        let peer_sync_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                pubsub_refresh.refresh_topic_peers().await;
+            }
+        });
+
+        if let Ok(mut guard) = self.peer_sync_handle.lock() {
+            *guard = Some(peer_sync_handle);
+        }
 
         match self.dispatcher_handle.lock() {
             Ok(mut guard) => *guard = Some(handle),
@@ -159,6 +184,11 @@ impl GossipRuntime {
     ///
     /// Returns an error if shutdown fails.
     pub async fn shutdown(&self) -> NetworkResult<()> {
+        if let Ok(mut guard) = self.peer_sync_handle.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
         if let Ok(mut guard) = self.dispatcher_handle.lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();
