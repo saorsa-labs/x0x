@@ -86,6 +86,9 @@ pub mod crdt;
 /// MLS (Messaging Layer Security) group encryption.
 pub mod mls;
 
+/// Self-update system with ML-DSA-65 signature verification and staged rollout.
+pub mod upgrade;
+
 // Re-export key gossip types (including new pubsub components)
 pub use gossip::{
     GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, SigningContext, Subscription,

@@ -31,3 +31,12 @@ known_peers = [
 
 # Logging
 log_level = "info"
+
+# Self-update configuration
+[update]
+enabled = true
+check_interval_hours = 6
+rollout_window_hours = 2
+reannounce_interval_hours = 6
+stop_on_upgrade = true
+repo = "saorsa-labs/x0x"

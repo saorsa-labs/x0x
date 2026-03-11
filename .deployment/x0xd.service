@@ -6,11 +6,11 @@ Wants=network-online.target
 [Service]
 Type=exec
 
-# Binary location (user install)
-ExecStart=%h/.local/bin/x0xd
+# Binary location (testnet/server deployment)
+ExecStart=/opt/x0x/x0xd --config /etc/x0x/x0xd.toml
 
 # Working directory
-WorkingDirectory=%h
+WorkingDirectory=/opt/x0x
 
 # Logging
 StandardOutput=journal
@@ -18,7 +18,7 @@ StandardError=journal
 SyslogIdentifier=x0xd
 
 # Restart policy
-Restart=on-failure
+Restart=always
 RestartSec=5s
 
 # Environment

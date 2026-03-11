@@ -15,14 +15,12 @@
 //! ```
 
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::{Path as FsPath, PathBuf};
-use std::process::Stdio;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
@@ -31,6 +29,7 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::signal;
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
@@ -39,6 +38,8 @@ use tower_http::cors::CorsLayer;
 use x0x::contacts::{ContactStore, TrustLevel};
 use x0x::identity::AgentId;
 use x0x::network::NetworkConfig;
+use x0x::upgrade::monitor::UpgradeMonitor;
+use x0x::upgrade::notification::{is_newer, ReleaseNotification, RELEASE_TOPIC};
 use x0x::{Agent, Subscription, TaskListHandle};
 
 // ---------------------------------------------------------------------------
@@ -64,29 +65,17 @@ struct DaemonConfig {
     #[serde(default = "default_log_level")]
     log_level: String,
 
+    /// Log format ("text" or "json").
+    #[serde(default = "default_log_format")]
+    log_format: String,
+
     /// Bootstrap peers to connect on startup.
     #[serde(default)]
     bootstrap_peers: Vec<SocketAddr>,
 
-    /// Enable self-update checks at startup.
-    #[serde(default = "default_update_enabled")]
-    update_enabled: bool,
-
-    /// Automatically install updates when available.
-    #[serde(default = "default_auto_update")]
-    auto_update: bool,
-
-    /// Restart daemon after successful self-update.
-    #[serde(default = "default_restart_after_update")]
-    restart_after_update: bool,
-
-    /// Check interval in hours for background update checks.
-    #[serde(default = "default_update_check_interval_hours")]
-    update_check_interval_hours: u64,
-
-    /// GitHub repo used for update discovery (owner/repo).
-    #[serde(default = "default_update_repo")]
-    update_repo: String,
+    /// Update configuration.
+    #[serde(default)]
+    update: DaemonUpdateConfig,
 
     /// How often to re-announce identity (seconds).
     #[serde(default = "default_heartbeat_interval")]
@@ -130,20 +119,68 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_update_enabled() -> bool {
+fn default_log_format() -> String {
+    "text".to_string()
+}
+
+/// Update configuration for x0xd daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonUpdateConfig {
+    /// Enable listening for release notifications via gossip and the GitHub fallback poll.
+    #[serde(default = "default_true")]
+    enabled: bool,
+
+    /// Maximum rollout window in minutes. Default: 1440 (24 hours).
+    #[serde(default = "default_rollout_window_minutes")]
+    rollout_window_minutes: u64,
+
+    /// Exit cleanly for service manager restart instead of spawning.
+    #[serde(default)]
+    stop_on_upgrade: bool,
+
+    /// GitHub fallback poll interval in minutes. Default: 2880 (48 hours).
+    /// Set to 0 to disable the fallback entirely (gossip-only mode).
+    #[serde(default = "default_fallback_check_interval_minutes")]
+    fallback_check_interval_minutes: u64,
+
+    /// GitHub repo for update discovery.
+    #[serde(default = "default_update_repo")]
+    repo: String,
+
+    /// Include pre-releases in update checks (default: false).
+    #[serde(default)]
+    include_prereleases: bool,
+
+    /// Enable gossip-based release notifications (default: true).
+    /// Set to false to only use the GitHub fallback poll.
+    #[serde(default = "default_true")]
+    gossip_updates: bool,
+}
+
+impl Default for DaemonUpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rollout_window_minutes: 1440,
+            stop_on_upgrade: false,
+            fallback_check_interval_minutes: 2880,
+            repo: default_update_repo(),
+            include_prereleases: false,
+            gossip_updates: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
     true
 }
 
-fn default_auto_update() -> bool {
-    true
+fn default_rollout_window_minutes() -> u64 {
+    1440
 }
 
-fn default_restart_after_update() -> bool {
-    true
-}
-
-fn default_update_check_interval_hours() -> u64 {
-    24
+fn default_fallback_check_interval_minutes() -> u64 {
+    2880
 }
 
 fn default_update_repo() -> String {
@@ -173,15 +210,12 @@ impl Default for DaemonConfig {
             api_address: default_api_address(),
             data_dir: default_data_dir(),
             log_level: default_log_level(),
+            log_format: default_log_format(),
             bootstrap_peers: x0x::network::DEFAULT_BOOTSTRAP_PEERS
                 .iter()
                 .filter_map(|s| s.parse().ok())
                 .collect(),
-            update_enabled: default_update_enabled(),
-            auto_update: default_auto_update(),
-            restart_after_update: default_restart_after_update(),
-            update_check_interval_hours: default_update_check_interval_hours(),
-            update_repo: default_update_repo(),
+            update: DaemonUpdateConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             identity_ttl_secs: default_identity_ttl(),
             user_key_path: None,
@@ -396,7 +430,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    init_logging(&config.log_level)?;
+    init_logging(&config.log_level, &config.log_format)?;
 
     if check_only {
         println!("Configuration is valid");
@@ -409,56 +443,38 @@ async fn main() -> Result<()> {
         .await
         .context("failed to create data directory")?;
 
-    if config.update_enabled && !skip_update_check {
-        let update_outcome = match check_and_apply_self_update(&config).await {
-            Ok(outcome) => Some(outcome),
-            Err(err) => {
+    // Startup banner
+    tracing::info!(
+        version = %x0x::VERSION,
+        binary = "x0xd",
+        pid = std::process::id(),
+        "x0xd started"
+    );
+
+    // Startup GitHub check (fallback mechanism — gossip is primary)
+    if config.update.enabled && !skip_update_check {
+        match run_startup_update_check(&config).await {
+            Ok(Some(version)) => {
                 if check_updates_only {
-                    return Err(err).context("self-update check failed");
-                }
-                tracing::warn!("Startup self-update check failed: {err}");
-                None
-            }
-        };
-
-        if let Some(update_outcome) = update_outcome {
-            if check_updates_only {
-                match update_outcome {
-                    UpdateOutcome::UpToDate => println!("x0xd is up to date ({})", x0x::VERSION),
-                    UpdateOutcome::Updated {
-                        latest_version,
-                        can_restart_now,
-                    } => {
-                        if can_restart_now {
-                            println!("x0xd updated to {latest_version}; restarting now")
-                        } else {
-                            println!("x0xd updated to {latest_version}; restart required")
-                        }
-                    }
-                    UpdateOutcome::UpdateAvailable { latest_version } => {
-                        println!("update available: {latest_version}")
-                    }
-                }
-                return Ok(());
-            }
-
-            if let UpdateOutcome::Updated {
-                can_restart_now: true,
-                ..
-            } = update_outcome
-            {
-                if config.restart_after_update {
-                    restart_current_process_with_skip_flag(&args)
-                        .context("failed to restart after self-update")?;
+                    println!("x0xd updated to {version}");
                     return Ok(());
                 }
             }
-        } else if check_updates_only {
-            println!("update check failed");
-            return Ok(());
+            Ok(None) => {
+                if check_updates_only {
+                    println!("x0xd is up to date ({})", x0x::VERSION);
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                if check_updates_only {
+                    return Err(e).context("self-update check failed");
+                }
+                tracing::warn!(error = %e, "Startup update check failed: {e}");
+            }
         }
     } else if check_updates_only {
-        if !config.update_enabled {
+        if !config.update.enabled {
             println!("self-update checks are disabled by configuration");
         } else {
             println!("self-update check skipped by --skip-update-check");
@@ -540,64 +556,21 @@ async fn main() -> Result<()> {
         broadcast_tx,
     });
 
-    if config.update_enabled && config.update_check_interval_hours > 0 {
-        let update_config = config.clone();
-        let startup_args = args.clone();
+    // Gossip-based release subscription (primary update mechanism)
+    if config.update.enabled && config.update.gossip_updates {
+        let update_config = config.update.clone();
+        let agent_for_gossip = Arc::clone(&state.agent);
+        let data_dir = config.data_dir.clone();
         tokio::spawn(async move {
-            let interval_secs = update_config
-                .update_check_interval_hours
-                .saturating_mul(3600);
-            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            run_gossip_update_listener(agent_for_gossip, update_config, data_dir).await;
+        });
+    }
 
-            // Skip immediate tick to avoid duplicate startup check.
-            ticker.tick().await;
-
-            loop {
-                ticker.tick().await;
-
-                match check_and_apply_self_update(&update_config).await {
-                    Ok(UpdateOutcome::UpToDate) => {
-                        tracing::debug!("Periodic self-update check: up to date");
-                    }
-                    Ok(UpdateOutcome::UpdateAvailable { latest_version }) => {
-                        tracing::info!(
-                            "Periodic self-update check: update available {}",
-                            latest_version
-                        );
-                    }
-                    Ok(UpdateOutcome::Updated {
-                        latest_version,
-                        can_restart_now,
-                    }) => {
-                        if can_restart_now && update_config.restart_after_update {
-                            tracing::info!(
-                                "Periodic self-update installed {}. Restarting daemon.",
-                                latest_version
-                            );
-
-                            if let Err(err) = restart_current_process_with_skip_flag(&startup_args)
-                            {
-                                tracing::warn!(
-                                    "Failed to restart after periodic self-update: {err}"
-                                );
-                            }
-                        } else if can_restart_now {
-                            tracing::warn!(
-                                "Periodic self-update installed {}. Restart x0xd to run the new version.",
-                                latest_version
-                            );
-                        } else {
-                            tracing::warn!(
-                                "Periodic self-update staged {}. Restart x0xd to activate it.",
-                                latest_version
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!("Periodic self-update check failed: {err}");
-                    }
-                }
-            }
+    // GitHub fallback poll (safety net, default every 48h)
+    if config.update.enabled && config.update.fallback_check_interval_minutes > 0 {
+        let update_config = config.update.clone();
+        tokio::spawn(async move {
+            run_fallback_github_poll(update_config).await;
         });
     }
 
@@ -670,477 +643,232 @@ async fn shutdown_signal() {
 }
 
 // ---------------------------------------------------------------------------
-// Self-update
+// Self-update (gossip-based + GitHub fallback)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    assets: Vec<GithubAsset>,
-}
+/// Startup GitHub check. Returns Some(version) if an update was applied.
+async fn run_startup_update_check(config: &DaemonConfig) -> Result<Option<String>> {
+    let monitor = UpgradeMonitor::new(&config.update.repo, "x0xd", x0x::VERSION)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_include_prereleases(config.update.include_prereleases);
 
-#[derive(Debug, Clone, Deserialize)]
-struct GithubAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-enum ArchiveKind {
-    TarGz,
-    Zip,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct UpdateAssetSpec {
-    archive_name: &'static str,
-    signature_name: &'static str,
-    inner_binary_path: &'static str,
-    archive_kind: ArchiveKind,
-}
-
-#[derive(Debug)]
-enum UpdateOutcome {
-    UpToDate,
-    UpdateAvailable {
-        latest_version: String,
-    },
-    Updated {
-        latest_version: String,
-        can_restart_now: bool,
-    },
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn current_update_asset_spec() -> Option<UpdateAssetSpec> {
-    Some(UpdateAssetSpec {
-        archive_name: "x0x-linux-x64-gnu.tar.gz",
-        signature_name: "x0x-linux-x64-gnu.tar.gz.asc",
-        inner_binary_path: "x0x-linux-x64-gnu/x0xd",
-        archive_kind: ArchiveKind::TarGz,
-    })
-}
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn current_update_asset_spec() -> Option<UpdateAssetSpec> {
-    Some(UpdateAssetSpec {
-        archive_name: "x0x-linux-arm64-gnu.tar.gz",
-        signature_name: "x0x-linux-arm64-gnu.tar.gz.asc",
-        inner_binary_path: "x0x-linux-arm64-gnu/x0xd",
-        archive_kind: ArchiveKind::TarGz,
-    })
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-fn current_update_asset_spec() -> Option<UpdateAssetSpec> {
-    Some(UpdateAssetSpec {
-        archive_name: "x0x-macos-x64.tar.gz",
-        signature_name: "x0x-macos-x64.tar.gz.asc",
-        inner_binary_path: "x0x-macos-x64/x0xd",
-        archive_kind: ArchiveKind::TarGz,
-    })
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn current_update_asset_spec() -> Option<UpdateAssetSpec> {
-    Some(UpdateAssetSpec {
-        archive_name: "x0x-macos-arm64.tar.gz",
-        signature_name: "x0x-macos-arm64.tar.gz.asc",
-        inner_binary_path: "x0x-macos-arm64/x0xd",
-        archive_kind: ArchiveKind::TarGz,
-    })
-}
-
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-fn current_update_asset_spec() -> Option<UpdateAssetSpec> {
-    Some(UpdateAssetSpec {
-        archive_name: "x0x-windows-x64.zip",
-        signature_name: "x0x-windows-x64.zip.asc",
-        inner_binary_path: "x0xd.exe",
-        archive_kind: ArchiveKind::Zip,
-    })
-}
-
-#[cfg(not(any(
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "x86_64"),
-    all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "windows", target_arch = "x86_64")
-)))]
-fn current_update_asset_spec() -> Option<UpdateAssetSpec> {
-    None
-}
-
-fn normalize_release_version(tag: &str) -> &str {
-    tag.strip_prefix('v').unwrap_or(tag)
-}
-
-fn parse_semver(version: &str) -> Result<semver::Version> {
-    semver::Version::parse(version).with_context(|| format!("invalid semver version: {version}"))
-}
-
-fn find_asset_url<'a>(release: &'a GithubRelease, name: &str) -> Option<&'a str> {
-    release
-        .assets
-        .iter()
-        .find(|asset| asset.name == name)
-        .map(|asset| asset.browser_download_url.as_str())
-}
-
-async fn fetch_latest_release(client: &reqwest::Client, repo: &str) -> Result<GithubRelease> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-
-    let response = client
-        .get(url)
-        .send()
+    let Some(info) = monitor
+        .check_for_updates()
         .await
-        .context("failed to query latest GitHub release")?
-        .error_for_status()
-        .context("GitHub releases API returned an error status")?;
-
-    response
-        .json::<GithubRelease>()
-        .await
-        .context("failed to deserialize GitHub release metadata")
-}
-
-async fn download_asset(client: &reqwest::Client, url: &str, destination: &FsPath) -> Result<()> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("failed to download asset: {url}"))?
-        .error_for_status()
-        .with_context(|| format!("failed to download asset: {url}"))?;
-
-    let bytes = response
-        .bytes()
-        .await
-        .with_context(|| format!("failed to read downloaded asset: {url}"))?;
-
-    tokio::fs::write(destination, bytes)
-        .await
-        .with_context(|| format!("failed to write asset: {}", destination.display()))
-}
-
-async fn verify_archive_signature(
-    public_key_path: &FsPath,
-    signature_path: &FsPath,
-    archive_path: &FsPath,
-) -> Result<()> {
-    let public_key_path = public_key_path.to_path_buf();
-    let signature_path = signature_path.to_path_buf();
-    let archive_path = archive_path.to_path_buf();
-
-    tokio::task::spawn_blocking(move || {
-        let gpg_home = archive_path
-            .parent()
-            .ok_or_else(|| anyhow!("archive has no parent directory"))?
-            .join("gnupg-home");
-
-        std::fs::create_dir_all(&gpg_home)
-            .with_context(|| format!("failed to create {}", gpg_home.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&gpg_home, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("failed to set permissions on {}", gpg_home.display()))?;
-        }
-
-        let import_status = std::process::Command::new("gpg")
-            .arg("--batch")
-            .arg("--homedir")
-            .arg(&gpg_home)
-            .arg("--import")
-            .arg(&public_key_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .context("failed to run gpg import (is gpg installed?)")?;
-
-        if !import_status.success() {
-            return Err(anyhow!("gpg key import failed"));
-        }
-
-        let verify_output = std::process::Command::new("gpg")
-            .arg("--batch")
-            .arg("--no-tty")
-            .arg("--status-fd")
-            .arg("1")
-            .arg("--homedir")
-            .arg(&gpg_home)
-            .arg("--verify")
-            .arg(&signature_path)
-            .arg(&archive_path)
-            .output()
-            .context("failed to run gpg verify")?;
-
-        let stdout = String::from_utf8_lossy(&verify_output.stdout);
-        let stderr = String::from_utf8_lossy(&verify_output.stderr);
-
-        if verify_output.status.success()
-            && (stdout.contains("[GNUPG:] GOODSIG") || stdout.contains("[GNUPG:] VALIDSIG"))
-        {
-            Ok(())
-        } else {
-            Err(anyhow!("signature verification failed: {}", stderr.trim()))
-        }
-    })
-    .await
-    .context("signature verification task failed")?
-}
-
-async fn extract_daemon_binary(
-    archive_path: &FsPath,
-    output_path: &FsPath,
-    asset_spec: UpdateAssetSpec,
-) -> Result<()> {
-    let archive_path = archive_path.to_path_buf();
-    let output_path = output_path.to_path_buf();
-
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        match asset_spec.archive_kind {
-            ArchiveKind::TarGz => {
-                let archive_file = std::fs::File::open(&archive_path)
-                    .with_context(|| format!("failed to open {}", archive_path.display()))?;
-                let decoder = flate2::read::GzDecoder::new(archive_file);
-                let mut archive = tar::Archive::new(decoder);
-
-                let mut found = false;
-                for entry in archive
-                    .entries()
-                    .context("failed to read tar archive entries")?
-                {
-                    let mut entry = entry.context("failed to read tar archive entry")?;
-                    let path = entry.path().context("failed to read tar entry path")?;
-                    if path.to_string_lossy() == asset_spec.inner_binary_path {
-                        let mut output =
-                            std::fs::File::create(&output_path).with_context(|| {
-                                format!("failed to create {}", output_path.display())
-                            })?;
-                        std::io::copy(&mut entry, &mut output)
-                            .context("failed to extract daemon binary")?;
-                        found = true;
-                        break;
-                    }
-                }
-
-                if !found {
-                    return Err(anyhow!(
-                        "daemon binary not found in archive: {}",
-                        asset_spec.inner_binary_path
-                    ));
-                }
-            }
-            ArchiveKind::Zip => {
-                let archive_file = std::fs::File::open(&archive_path)
-                    .with_context(|| format!("failed to open {}", archive_path.display()))?;
-                let mut archive =
-                    zip::ZipArchive::new(archive_file).context("failed to open zip archive")?;
-
-                let mut entry =
-                    archive
-                        .by_name(asset_spec.inner_binary_path)
-                        .with_context(|| {
-                            format!("failed to find {} in zip", asset_spec.inner_binary_path)
-                        })?;
-
-                let mut output = std::fs::File::create(&output_path)
-                    .with_context(|| format!("failed to create {}", output_path.display()))?;
-                std::io::copy(&mut entry, &mut output)
-                    .context("failed to extract daemon binary")?;
-            }
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(0o755))
-                .with_context(|| format!("failed to chmod {}", output_path.display()))?;
-        }
-
-        Ok(())
-    })
-    .await
-    .context("binary extraction task failed")?
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-enum InstallOutcome {
-    Replaced,
-    Staged,
-}
-
-async fn install_updated_binary(extracted_binary_path: &FsPath) -> Result<InstallOutcome> {
-    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
-
-    #[cfg(unix)]
-    {
-        let replacement_path = current_exe.with_extension("update");
-
-        tokio::fs::copy(extracted_binary_path, &replacement_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to stage update binary at {}",
-                    replacement_path.display()
-                )
-            })?;
-
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&replacement_path, std::fs::Permissions::from_mode(0o755))
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to set permissions on {}",
-                    replacement_path.display()
-                )
-            })?;
-
-        tokio::fs::rename(&replacement_path, &current_exe)
-            .await
-            .with_context(|| format!("failed to replace {}", current_exe.display()))?;
-
-        Ok(InstallOutcome::Replaced)
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let staged_path = current_exe.with_extension("new.exe");
-        tokio::fs::copy(extracted_binary_path, &staged_path)
-            .await
-            .with_context(|| format!("failed to stage update at {}", staged_path.display()))?;
-        Ok(InstallOutcome::Staged)
-    }
-
-    #[cfg(not(any(unix, target_os = "windows")))]
-    {
-        let _ = extracted_binary_path;
-        Err(anyhow!(
-            "self-update installation is not supported on this platform"
-        ))
-    }
-}
-
-async fn check_and_apply_self_update(config: &DaemonConfig) -> Result<UpdateOutcome> {
-    let Some(asset_spec) = current_update_asset_spec() else {
-        tracing::info!("Self-update not supported on this platform/architecture");
-        return Ok(UpdateOutcome::UpToDate);
+        .map_err(|e| anyhow::anyhow!(e))?
+    else {
+        return Ok(None);
     };
 
-    let client = reqwest::Client::builder()
-        .user_agent(format!("x0xd/{version}", version = x0x::VERSION))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("failed to build HTTP client for updates")?;
+    tracing::info!(new_version = %info.version, "Startup check: new version available, applying immediately");
 
-    let release = fetch_latest_release(&client, &config.update_repo).await?;
-    let latest_version = normalize_release_version(&release.tag_name).to_string();
+    let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
+        .with_stop_on_upgrade(config.update.stop_on_upgrade);
 
-    let latest_semver = parse_semver(&latest_version)?;
-    let current_semver = parse_semver(x0x::VERSION)?;
+    match upgrader.apply_upgrade_from_info(&info).await {
+        Ok(x0x::upgrade::UpgradeResult::Success { version }) => Ok(Some(version)),
+        Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
+            tracing::warn!(%reason, "Startup upgrade rolled back");
+            Ok(None)
+        }
+        Ok(x0x::upgrade::UpgradeResult::NoUpgrade) => Ok(None),
+        Err(e) => {
+            tracing::error!(error = %e, "Startup upgrade failed: {e}");
+            Ok(None)
+        }
+    }
+}
 
-    if latest_semver <= current_semver {
-        tracing::debug!("x0xd is up to date ({})", x0x::VERSION);
-        return Ok(UpdateOutcome::UpToDate);
+/// Gossip-based release subscription — the primary update mechanism for x0xd.
+async fn run_gossip_update_listener(
+    agent: Arc<Agent>,
+    config: DaemonUpdateConfig,
+    data_dir: PathBuf,
+) {
+    let mut release_sub = match agent.subscribe(RELEASE_TOPIC).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to subscribe to release topic: {e}");
+            return;
+        }
+    };
+
+    let rollout = x0x::upgrade::rollout::StagedRollout::new(
+        agent.machine_id().as_bytes(),
+        config.rollout_window_minutes,
+    );
+
+    let mut pending_version: Option<String> = None;
+
+    while let Some(msg) = release_sub.recv().await {
+        let notification = match ReleaseNotification::decode(&msg.payload) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to decode release notification");
+                continue;
+            }
+        };
+
+        tracing::info!(
+            version = %notification.version,
+            "Received release notification via gossip"
+        );
+
+        // Ignore if we're already on this version or newer
+        if !is_newer(&notification.version, x0x::VERSION) {
+            tracing::debug!(
+                version = %notification.version,
+                "Ignoring release notification for current/older version"
+            );
+            continue;
+        }
+
+        // Update SKILL.md if changed (independent of binary update)
+        update_skill_if_changed(&notification, &data_dir).await;
+
+        // Deduplicate: only start rollout timer once per version
+        if pending_version.as_deref() == Some(&notification.version) {
+            continue;
+        }
+
+        let delay = rollout.calculate_delay_for_version(&notification.version);
+        tracing::info!(
+            new_version = %notification.version,
+            delay_hours = delay.as_secs() / 3600,
+            delay_minutes = (delay.as_secs() % 3600) / 60,
+            "New version detected, staged rollout delay calculated"
+        );
+
+        pending_version = Some(notification.version.clone());
+
+        let notif = notification.clone();
+        let stop_on_upgrade = config.stop_on_upgrade;
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            tracing::info!(
+                version = %notif.version,
+                "Staged rollout delay elapsed, ready to upgrade"
+            );
+            let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
+                .with_stop_on_upgrade(stop_on_upgrade);
+            match upgrader.apply_upgrade_from_notification(&notif).await {
+                Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+                    tracing::info!(%version, "Successfully upgraded! Restarting...");
+                }
+                Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
+                    tracing::warn!(%reason, "Upgrade rolled back");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Upgrade failed: {e}");
+                }
+                _ => {}
+            }
+        });
+    }
+}
+
+/// Background GitHub fallback poll (safety net, every 48h by default).
+async fn run_fallback_github_poll(config: DaemonUpdateConfig) {
+    let interval = Duration::from_secs(config.fallback_check_interval_minutes * 60);
+    let mut ticker = tokio::time::interval(interval);
+    // Skip first tick (startup check already ran)
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        tracing::debug!("Fallback GitHub check");
+
+        let monitor = match UpgradeMonitor::new(&config.repo, "x0xd", x0x::VERSION) {
+            Ok(m) => m.with_include_prereleases(config.include_prereleases),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create upgrade monitor: {e}");
+                continue;
+            }
+        };
+
+        match monitor.check_for_updates().await {
+            Ok(Some(info)) => {
+                tracing::info!(
+                    new_version = %info.version,
+                    "Fallback check: new version found via GitHub"
+                );
+                let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
+                    .with_stop_on_upgrade(config.stop_on_upgrade);
+                match upgrader.apply_upgrade_from_info(&info).await {
+                    Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+                        tracing::info!(%version, "Fallback upgrade successful");
+                    }
+                    Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
+                        tracing::warn!(%reason, "Fallback upgrade rolled back");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Fallback upgrade failed: {e}");
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Fallback GitHub check failed: {e}");
+            }
+        }
+    }
+}
+
+/// Update SKILL.md if the notification has a different hash.
+async fn update_skill_if_changed(notification: &ReleaseNotification, data_dir: &std::path::Path) {
+    let skill_path = data_dir.join("SKILL.md");
+
+    let local_hash = match tokio::fs::read(&skill_path).await {
+        Ok(contents) => {
+            let hash: [u8; 32] = Sha256::digest(&contents).into();
+            hash
+        }
+        Err(_) => [0u8; 32], // Missing file — always update
+    };
+
+    if local_hash == notification.skill_sha256 {
+        return; // Already up to date
+    }
+
+    if notification.skill_url.is_empty() {
+        return;
     }
 
     tracing::info!(
-        "Self-update available: current={} latest={}",
-        x0x::VERSION,
-        latest_version
+        version = %notification.version,
+        "Updating SKILL.md to version {}",
+        notification.version
     );
 
-    if !config.auto_update {
-        return Ok(UpdateOutcome::UpdateAvailable { latest_version });
-    }
-
-    let work_dir = config.data_dir.join("updates").join(format!(
-        "x0xd-{}-{}",
-        latest_version,
-        std::process::id()
-    ));
-    tokio::fs::create_dir_all(&work_dir)
-        .await
-        .with_context(|| format!("failed to create update work dir {}", work_dir.display()))?;
-
-    let archive_path = work_dir.join(asset_spec.archive_name);
-    let signature_path = work_dir.join(asset_spec.signature_name);
-    let key_path = work_dir.join("SAORSA_PUBLIC_KEY.asc");
-    let extracted_binary_path = work_dir.join("x0xd-updated-binary");
-
-    let archive_url = find_asset_url(&release, asset_spec.archive_name)
-        .ok_or_else(|| anyhow!("release asset missing: {}", asset_spec.archive_name))?;
-    let signature_url = find_asset_url(&release, asset_spec.signature_name)
-        .ok_or_else(|| anyhow!("release asset missing: {}", asset_spec.signature_name))?;
-    let key_url = find_asset_url(&release, "SAORSA_PUBLIC_KEY.asc")
-        .ok_or_else(|| anyhow!("release asset missing: SAORSA_PUBLIC_KEY.asc"))?;
-
-    download_asset(&client, archive_url, &archive_path).await?;
-    download_asset(&client, signature_url, &signature_path).await?;
-    download_asset(&client, key_url, &key_path).await?;
-
-    verify_archive_signature(&key_path, &signature_path, &archive_path).await?;
-    extract_daemon_binary(&archive_path, &extracted_binary_path, asset_spec).await?;
-
-    let install_outcome = install_updated_binary(&extracted_binary_path).await?;
-
-    if let Err(err) = tokio::fs::remove_dir_all(&work_dir).await {
-        tracing::warn!("failed to clean update dir {}: {err}", work_dir.display());
-    }
-
-    match install_outcome {
-        InstallOutcome::Replaced => {
-            tracing::info!("Self-update installed successfully: {}", latest_version);
-            Ok(UpdateOutcome::Updated {
-                latest_version,
-                can_restart_now: true,
-            })
-        }
-        InstallOutcome::Staged => {
-            tracing::info!(
-                "Self-update staged successfully: {} (restart required)",
-                latest_version
-            );
-            Ok(UpdateOutcome::Updated {
-                latest_version,
-                can_restart_now: false,
-            })
-        }
-    }
-}
-
-fn restart_current_process_with_skip_flag(original_args: &[String]) -> Result<()> {
-    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
-
-    let mut restart_args: Vec<OsString> = original_args
-        .iter()
-        .skip(1)
-        .filter(|arg| arg.as_str() != "--skip-update-check")
-        .map(OsString::from)
-        .collect();
-    restart_args.push(OsString::from("--skip-update-check"));
-
-    #[cfg(unix)]
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
     {
-        use std::os::unix::process::CommandExt;
-        let error = std::process::Command::new(current_exe)
-            .args(&restart_args)
-            .exec();
-        Err(anyhow!("exec failed: {error}"))
-    }
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create HTTP client for SKILL.md: {e}");
+            return;
+        }
+    };
 
-    #[cfg(not(unix))]
-    {
-        std::process::Command::new(current_exe)
-            .args(&restart_args)
-            .spawn()
-            .context("failed to spawn updated process")?;
-        Ok(())
+    match client.get(&notification.skill_url).send().await {
+        Ok(resp) => match resp.bytes().await {
+            Ok(new_contents) => {
+                let new_hash: [u8; 32] = Sha256::digest(&new_contents).into();
+                if new_hash != notification.skill_sha256 {
+                    tracing::warn!("Downloaded SKILL.md hash mismatch \u{2014} ignoring");
+                    return;
+                }
+                if let Err(e) = tokio::fs::write(&skill_path, &new_contents).await {
+                    tracing::warn!(error = %e, "Failed to write SKILL.md");
+                } else {
+                    tracing::info!("SKILL.md updated successfully");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "Failed to download SKILL.md: {e}"),
+        },
+        Err(e) => tracing::warn!(error = %e, "Failed to download SKILL.md: {e}"),
     }
 }
 
@@ -1859,7 +1587,7 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
 }
 
 /// Initialize structured logging.
-fn init_logging(level: &str) -> Result<()> {
+fn init_logging(level: &str, format: &str) -> Result<()> {
     let level_filter = match level.to_lowercase().as_str() {
         "trace" => tracing::Level::TRACE,
         "debug" => tracing::Level::DEBUG,
@@ -1869,9 +1597,16 @@ fn init_logging(level: &str) -> Result<()> {
         _ => tracing::Level::INFO,
     };
 
-    tracing_subscriber::fmt()
-        .with_max_level(level_filter)
-        .init();
+    if format == "json" {
+        tracing_subscriber::fmt()
+            .with_max_level(level_filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(level_filter)
+            .init();
+    }
 
     Ok(())
 }
