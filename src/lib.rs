@@ -1010,7 +1010,8 @@ impl Agent {
 
         // Phase 1: Try cached peers first (if cache has peers beyond seeds).
         if let Some(ref cache) = self.bootstrap_cache {
-            let cached_peers = cache.select_peers(12).await;
+            const PHASE1_PEER_CANDIDATES: usize = 12;
+            let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
             let cached_addrs: Vec<std::net::SocketAddr> = cached_peers
                 .iter()
                 .flat_map(|p| p.addresses.iter().copied())
@@ -1803,6 +1804,7 @@ impl AgentBuilder {
     ///
     /// The cache persists peer quality metrics across restarts, enabling
     /// cache-first join strategy. Defaults to `~/.x0x/peers/` if not set.
+    /// Falls back to `./.x0x/peers/` (relative to CWD) if `$HOME` is unset.
     pub fn with_peer_cache_dir<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
         self.peer_cache_dir = Some(path.as_ref().to_path_buf());
         self

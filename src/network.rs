@@ -621,15 +621,17 @@ impl NetworkNode {
                             peer_conn.remote_addr
                         );
                         let addr = match peer_conn.remote_addr {
-                            ant_quic::TransportAddr::Udp(addr) => addr,
-                            _ => std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                            ant_quic::TransportAddr::Udp(addr) => Some(addr),
+                            _ => None,
                         };
-                        if let Some(ref cache) = bootstrap_cache {
+                        if let (Some(ref cache), Some(addr)) = (&bootstrap_cache, addr) {
                             cache
                                 .add_from_connection(peer_conn.peer_id, vec![addr], None)
                                 .await;
                             cache.record_success(&peer_conn.peer_id, 0).await;
                         }
+                        let addr =
+                            addr.unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
                         let _ = event_sender.send(NetworkEvent::PeerConnected {
                             peer_id: peer_conn.peer_id.0,
                             address: addr,
