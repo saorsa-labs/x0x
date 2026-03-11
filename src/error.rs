@@ -305,7 +305,7 @@ pub enum NetworkError {
 /// use x0x::network::NetworkNode;
 ///
 /// async fn create_node() -> NetworkResult<NetworkNode> {
-///     NetworkNode::new(config).await
+///     NetworkNode::new(config, None).await
 /// }
 /// ```
 pub type NetworkResult<T> = std::result::Result<T, NetworkError>;

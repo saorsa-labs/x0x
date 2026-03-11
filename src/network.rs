@@ -25,7 +25,6 @@
 use crate::error::{NetworkError, NetworkResult};
 use ant_quic::{Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
-use rand::seq::SliceRandom;
 use saorsa_gossip_transport::GossipStreamType;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -186,6 +185,8 @@ pub struct NetworkNode {
     recv_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, GossipStreamType, Bytes)>>>,
     /// Cached local peer ID (ant-quic PeerId).
     peer_id: AntPeerId,
+    /// Bootstrap peer cache for recording connection outcomes.
+    bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
 }
 
 impl NetworkNode {
@@ -202,7 +203,10 @@ impl NetworkNode {
     /// # Errors
     ///
     /// Returns `NetworkError` if node creation fails.
-    pub async fn new(config: NetworkConfig) -> NetworkResult<Self> {
+    pub async fn new(
+        config: NetworkConfig,
+        bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
+    ) -> NetworkResult<Self> {
         let mut builder = NodeConfig::builder();
 
         if let Some(bind_addr) = config.bind_addr {
@@ -228,6 +232,7 @@ impl NetworkNode {
             recv_tx,
             recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
             peer_id,
+            bootstrap_cache,
         };
 
         network_node.spawn_receiver();
@@ -252,6 +257,30 @@ impl NetworkNode {
     /// The local address this node is bound to.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.config.bind_addr
+    }
+
+    /// Get the external address as observed by remote peers.
+    ///
+    /// Returns `None` until at least one connection has completed and the
+    /// remote peer has reported our address via OBSERVED_ADDRESS frames.
+    pub async fn external_addr(&self) -> Option<SocketAddr> {
+        let node_guard = self.node.read().await;
+        node_guard.as_ref().and_then(|n| n.external_addr())
+    }
+
+    /// Get the best routable address for advertising to other peers.
+    ///
+    /// Prefers the external (observed) address over the local bind address.
+    /// Filters out unroutable addresses like `0.0.0.0`.
+    pub async fn routable_addr(&self) -> Option<SocketAddr> {
+        // Prefer observed external address
+        if let Some(addr) = self.external_addr().await {
+            return Some(addr);
+        }
+        // Fall back to bind address only if it's routable
+        self.config
+            .bind_addr
+            .filter(|addr| !addr.ip().is_unspecified())
     }
 
     /// Get current network statistics.
@@ -306,6 +335,71 @@ impl NetworkNode {
         let _ = self.event_sender.send(event);
     }
 
+    /// Connect to a cached peer using its expected peer ID.
+    ///
+    /// Tries the cached addresses for `peer_id` until one resolves back to the
+    /// same authenticated peer. Stale cache entries that now point at a
+    /// different peer are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if the peer is not cached or none of its cached
+    /// addresses lead back to the expected peer.
+    pub async fn connect_cached_peer(&self, peer_id: AntPeerId) -> NetworkResult<SocketAddr> {
+        if self.is_connected(&peer_id).await {
+            let node_guard = self.node.read().await;
+            if let Some(node) = node_guard.as_ref() {
+                if let Some(addr) = node
+                    .connected_peers()
+                    .await
+                    .into_iter()
+                    .find(|conn| conn.peer_id == peer_id)
+                    .and_then(|conn| match conn.remote_addr {
+                        TransportAddr::Udp(addr) => Some(addr),
+                        _ => None,
+                    })
+                {
+                    return Ok(addr);
+                }
+            }
+        }
+
+        let cache = self.bootstrap_cache.as_ref().ok_or_else(|| {
+            NetworkError::ConnectionFailed("bootstrap cache not configured".to_string())
+        })?;
+        let cached_peer = cache.get_peer(&peer_id).await.ok_or_else(|| {
+            NetworkError::ConnectionFailed(format!(
+                "peer {:?} not found in bootstrap cache",
+                peer_id
+            ))
+        })?;
+
+        for addr in &cached_peer.addresses {
+            match self.connect_addr(*addr).await {
+                Ok(connected_peer) if connected_peer == peer_id => return Ok(*addr),
+                Ok(connected_peer) => {
+                    warn!(
+                        "Cached address {} for peer {:?} resolved to unexpected peer {:?}",
+                        addr, peer_id, connected_peer
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        "Cached dial to peer {:?} at {} failed: {}",
+                        peer_id, addr, e
+                    );
+                }
+            }
+        }
+
+        cache.record_failure(&peer_id).await;
+        Err(NetworkError::ConnectionFailed(format!(
+            "peer {:?} not reachable via {} cached addresses",
+            peer_id,
+            cached_peer.addresses.len()
+        )))
+    }
+
     /// Connect to a peer by address.
     ///
     /// # Arguments
@@ -321,17 +415,42 @@ impl NetworkNode {
     /// Returns `NetworkError` if connection fails or node is not initialized.
     pub async fn connect_addr(&self, addr: SocketAddr) -> NetworkResult<AntPeerId> {
         let node = self.require_node().await?;
-        let peer_conn = node
-            .connect_addr(addr)
-            .await
-            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        let start = std::time::Instant::now();
+        let result = node.connect_addr(addr).await;
 
-        self.emit_event(NetworkEvent::PeerConnected {
-            peer_id: peer_conn.peer_id.0,
-            address: addr,
-        });
-
-        Ok(peer_conn.peer_id)
+        match result {
+            Ok(peer_conn) => {
+                let rtt_ms = start.elapsed().as_millis() as u32;
+                if let Some(ref cache) = self.bootstrap_cache {
+                    cache
+                        .add_from_connection(peer_conn.peer_id, vec![addr], None)
+                        .await;
+                    cache.record_success(&peer_conn.peer_id, rtt_ms).await;
+                }
+                self.emit_event(NetworkEvent::PeerConnected {
+                    peer_id: peer_conn.peer_id.0,
+                    address: addr,
+                });
+                Ok(peer_conn.peer_id)
+            }
+            Err(e) => {
+                // Record failure for any cached peers at this address so quality
+                // scores degrade when a peer becomes unreachable.
+                if let Some(ref cache) = self.bootstrap_cache {
+                    let all_peers = cache.all_peers().await;
+                    for peer in &all_peers {
+                        if peer.addresses.contains(&addr) {
+                            debug!(
+                                "Recording connection failure for peer {:?} at {addr}",
+                                peer.peer_id
+                            );
+                            cache.record_failure(&peer.peer_id).await;
+                        }
+                    }
+                }
+                Err(NetworkError::ConnectionFailed(e.to_string()))
+            }
+        }
     }
 
     /// Connect to a specific peer by ID.
@@ -349,6 +468,7 @@ impl NetworkNode {
     /// Returns `NetworkError` if connection fails.
     pub async fn connect_peer(&self, peer_id: AntPeerId) -> NetworkResult<SocketAddr> {
         let node = self.require_node().await?;
+        let start = std::time::Instant::now();
         let peer_conn = node
             .connect(peer_id)
             .await
@@ -362,6 +482,15 @@ impl NetworkNode {
                 ))
             }
         };
+
+        // Record in bootstrap cache so future connections use the cached address
+        let rtt_ms = start.elapsed().as_millis() as u32;
+        if let Some(ref cache) = self.bootstrap_cache {
+            cache
+                .add_from_connection(peer_conn.peer_id, vec![addr], None)
+                .await;
+            cache.record_success(&peer_conn.peer_id, rtt_ms).await;
+        }
 
         self.emit_event(NetworkEvent::PeerConnected {
             peer_id: peer_conn.peer_id.0,
@@ -534,6 +663,7 @@ impl NetworkNode {
     fn spawn_accept_loop(&self) {
         let node = Arc::clone(&self.node);
         let event_sender = self.event_sender.clone();
+        let bootstrap_cache = self.bootstrap_cache.clone();
 
         tokio::spawn(async move {
             debug!("NetworkNode accept loop started");
@@ -555,12 +685,21 @@ impl NetworkNode {
                             peer_conn.peer_id,
                             peer_conn.remote_addr
                         );
+                        let addr = match peer_conn.remote_addr {
+                            ant_quic::TransportAddr::Udp(addr) => Some(addr),
+                            _ => None,
+                        };
+                        if let (Some(ref cache), Some(addr)) = (&bootstrap_cache, addr) {
+                            cache
+                                .add_from_connection(peer_conn.peer_id, vec![addr], None)
+                                .await;
+                            cache.record_success(&peer_conn.peer_id, 0).await;
+                        }
+                        let addr =
+                            addr.unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
                         let _ = event_sender.send(NetworkEvent::PeerConnected {
                             peer_id: peer_conn.peer_id.0,
-                            address: match peer_conn.remote_addr {
-                                ant_quic::TransportAddr::Udp(addr) => addr,
-                                _ => std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
-                            },
+                            address: addr,
                         });
                     }
                     None => {
@@ -653,9 +792,17 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     ) -> anyhow::Result<()> {
         let ant_peer = gossip_to_ant_peer_id(&peer);
 
-        // Check if connected
+        // If not connected, try to establish a connection before giving up.
+        // HyParView exchanges PeerIds via SHUFFLE without addresses, so peers
+        // in the passive/active view may not yet have a QUIC connection.
         if !self.is_connected(&ant_peer).await {
-            return Err(anyhow::anyhow!("Peer {:?} not connected", peer));
+            if let Err(e) = self.connect_cached_peer(ant_peer).await {
+                return Err(anyhow::anyhow!(
+                    "Peer {:?} not connected and bootstrap cache dial failed: {}",
+                    peer,
+                    e,
+                ));
+            }
         }
 
         // Prepare message: [stream_type_byte | data]
@@ -743,186 +890,6 @@ pub enum NetworkEvent {
     },
 }
 
-/// In-memory peer cache for bootstrap persistence.
-///
-/// Uses epsilon-greedy algorithm for peer selection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerCache {
-    /// Cached peers with their addresses and success metrics.
-    peers: Vec<CachedPeer>,
-    /// Path to the cache file.
-    #[serde(skip)]
-    #[allow(dead_code)]
-    cache_path: PathBuf,
-    /// Epsilon value for epsilon-greedy selection.
-    epsilon: f64,
-}
-
-impl PeerCache {
-    /// Load peer cache from disk, or create a new one.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the cache file.
-    ///
-    /// # Returns
-    ///
-    /// A new PeerCache, either loaded or created.
-    pub async fn load_or_create(path: &PathBuf) -> NetworkResult<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| NetworkError::CacheError(e.to_string()))?;
-            }
-        }
-
-        if path.exists() {
-            let data = tokio::fs::read(path)
-                .await
-                .map_err(|e| NetworkError::CacheError(e.to_string()))?;
-            let cache: PeerCache =
-                bincode::deserialize(&data).map_err(|e| NetworkError::CacheError(e.to_string()))?;
-            return Ok(cache);
-        }
-
-        Ok(Self {
-            peers: Vec::new(),
-            cache_path: path.clone(),
-            epsilon: 0.1, // 10% exploration rate
-        })
-    }
-
-    /// Add a peer to the cache.
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_id` - The peer's ID.
-    /// * `address` - The peer's address.
-    pub fn add_peer(&mut self, peer_id: [u8; 32], address: SocketAddr) {
-        // Update existing peer or add new one.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0); // Fallback to 0 if system time is invalid (extremely unlikely)
-
-        if let Some(existing) = self.peers.iter_mut().find(|p| p.peer_id == peer_id) {
-            existing.address = address;
-            existing.success_count += 1;
-            existing.last_seen = now;
-        } else {
-            self.peers.push(CachedPeer {
-                peer_id,
-                address,
-                success_count: 1,
-                attempt_count: 0,
-                last_seen: now,
-                last_attempt: 0,
-            });
-        }
-    }
-
-    /// Select peers using epsilon-greedy algorithm.
-    ///
-    /// # Arguments
-    ///
-    /// * `count` - Number of peers to select.
-    ///
-    /// # Returns
-    ///
-    /// A vector of peer addresses.
-    pub fn select_peers(&self, count: usize) -> Vec<SocketAddr> {
-        if self.peers.is_empty() {
-            return Vec::new();
-        }
-
-        let mut sorted_peers: Vec<_> = self.peers.iter().collect();
-
-        // Sort by success rate (descending).
-        sorted_peers.sort_by(|a, b| {
-            let a_rate = a.success_count as f64 / (a.attempt_count.max(1) as f64);
-            let b_rate = b.success_count as f64 / (b.attempt_count.max(1) as f64);
-            b_rate
-                .partial_cmp(&a_rate)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let exploit_count = ((count as f64) * (1.0 - self.epsilon)).floor() as usize;
-        let explore_count =
-            (count - exploit_count).min(self.peers.len().saturating_sub(exploit_count));
-
-        let mut selected: Vec<SocketAddr> = sorted_peers[..exploit_count.min(count)]
-            .iter()
-            .map(|p| p.address)
-            .collect();
-
-        // Add random exploration peers from the remaining pool.
-        let explore_pool = &sorted_peers[exploit_count..];
-        if !explore_pool.is_empty() {
-            let mut rng = rand::thread_rng();
-            for _ in 0..explore_count {
-                if let Some(random_peer) = explore_pool.choose(&mut rng) {
-                    selected.push(random_peer.address);
-                }
-            }
-        }
-
-        selected
-    }
-
-    /// Save the peer cache to disk.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to save to (overrides the original path).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if saving fails.
-    pub async fn save(&self, path: &PathBuf) -> NetworkResult<()> {
-        let data = bincode::serialize(self).map_err(|e| NetworkError::CacheError(e.to_string()))?;
-        tokio::fs::write(path, data)
-            .await
-            .map_err(|e| NetworkError::CacheError(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Get the number of cached peers.
-    ///
-    /// # Returns
-    ///
-    /// The number of peers in the cache.
-    pub fn len(&self) -> usize {
-        self.peers.len()
-    }
-
-    /// Check if the cache is empty.
-    ///
-    /// # Returns
-    ///
-    /// True if the cache has no peers.
-    pub fn is_empty(&self) -> bool {
-        self.peers.is_empty()
-    }
-}
-
-/// A cached peer entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedPeer {
-    /// The peer's ID.
-    peer_id: [u8; 32],
-    /// The peer's address.
-    address: SocketAddr,
-    /// Number of successful connections.
-    success_count: u32,
-    /// Number of connection attempts.
-    attempt_count: u32,
-    /// Timestamp of last successful connection.
-    last_seen: u64,
-    /// Timestamp of last connection attempt.
-    last_attempt: u64,
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -933,7 +900,7 @@ mod tests {
     #[tokio::test]
     async fn test_gossip_transport_trait() {
         let config = NetworkConfig::default();
-        let node = NetworkNode::new(config).await.unwrap();
+        let node = NetworkNode::new(config, None).await.unwrap();
 
         // Test local_peer_id() method
         let peer_id = node.local_peer_id();
@@ -999,45 +966,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_peer_cache_add_and_select() {
-        let mut cache = PeerCache {
-            peers: Vec::new(),
-            cache_path: PathBuf::from("/tmp/test_peer_cache.bin"),
-            epsilon: 0.1,
-        };
-
-        // Add some peers.
-        cache.add_peer([1; 32], "127.0.0.1:9000".parse().unwrap());
-        cache.add_peer([2; 32], "127.0.0.1:9001".parse().unwrap());
-        cache.add_peer([3; 32], "127.0.0.1:9002".parse().unwrap());
-
-        // Select peers.
-        let selected = cache.select_peers(2);
-        assert_eq!(selected.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_peer_cache_persistence() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let cache_path = temp_dir.path().join("peer_cache.bin");
-
-        {
-            let mut cache = PeerCache {
-                peers: Vec::new(),
-                cache_path: cache_path.clone(),
-                epsilon: 0.1,
-            };
-
-            cache.add_peer([1; 32], "127.0.0.1:9000".parse().unwrap());
-            cache.save(&cache_path).await.unwrap();
-        }
-
-        // Load from disk.
-        let loaded = PeerCache::load_or_create(&cache_path).await.unwrap();
-        assert_eq!(loaded.len(), 1);
-    }
-
-    #[tokio::test]
     async fn test_network_stats_default() {
         let stats = NetworkStats::default();
         assert_eq!(stats.total_connections, 0);
@@ -1049,70 +977,9 @@ mod tests {
 }
 
 #[tokio::test]
-async fn test_peer_cache_epsilon_greedy_selection() {
-    let mut cache = PeerCache {
-        peers: Vec::new(),
-        cache_path: PathBuf::from("/tmp/test"),
-        epsilon: 0.5, // 50% exploration for testing
-    };
-
-    // Add peers with different success rates
-    // Peer A: 10 attempts, 9 successes (90% success rate)
-    cache.peers.push(CachedPeer {
-        peer_id: [1; 32],
-        address: "127.0.0.1:9000".parse().unwrap(),
-        success_count: 9,
-        attempt_count: 10,
-        last_seen: 0,
-        last_attempt: 0,
-    });
-
-    // Peer B: 10 attempts, 5 successes (50% success rate)
-    cache.peers.push(CachedPeer {
-        peer_id: [2; 32],
-        address: "127.0.0.1:9001".parse().unwrap(),
-        success_count: 5,
-        attempt_count: 10,
-        last_seen: 0,
-        last_attempt: 0,
-    });
-
-    // Peer C: 10 attempts, 2 successes (20% success rate)
-    cache.peers.push(CachedPeer {
-        peer_id: [3; 32],
-        address: "127.0.0.1:9002".parse().unwrap(),
-        success_count: 2,
-        attempt_count: 10,
-        last_seen: 0,
-        last_attempt: 0,
-    });
-
-    // Select 2 peers with 50% exploration
-    // Should mostly select A, sometimes B or C
-    let selected = cache.select_peers(2);
-    assert_eq!(selected.len(), 2);
-
-    // Peer A (highest success rate) should always be in selection
-    assert!(selected.contains(&"127.0.0.1:9000".parse().unwrap()));
-}
-
-#[tokio::test]
-async fn test_peer_cache_empty() {
-    let cache = PeerCache {
-        peers: Vec::new(),
-        cache_path: PathBuf::from("/tmp/test"),
-        epsilon: 0.1,
-    };
-
-    assert!(cache.is_empty());
-    assert_eq!(cache.len(), 0);
-    assert!(cache.select_peers(5).is_empty());
-}
-
-#[tokio::test]
 async fn test_network_node_subscribe_events() {
     let config = NetworkConfig::default();
-    let node = NetworkNode::new(config).await.unwrap();
+    let node = NetworkNode::new(config, None).await.unwrap();
 
     // Subscribe to events
     let mut receiver = node.subscribe();
@@ -1140,7 +1007,7 @@ async fn test_network_node_subscribe_events() {
 #[tokio::test]
 async fn test_network_node_multiple_subscribers() {
     let config = NetworkConfig::default();
-    let node = NetworkNode::new(config).await.unwrap();
+    let node = NetworkNode::new(config, None).await.unwrap();
 
     // Multiple subscribers
     let mut rx1 = node.subscribe();
@@ -1188,7 +1055,7 @@ async fn test_mesh_connections_are_bidirectional() {
             peer_cache_path: None,
         };
 
-        let node = NetworkNode::new(config).await.unwrap();
+        let node = NetworkNode::new(config, None).await.unwrap();
         nodes.push(node);
     }
 

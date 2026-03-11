@@ -7,7 +7,7 @@ use x0x::network::{NetworkConfig, NetworkNode};
 #[tokio::test]
 async fn test_receive_message_blocks_until_message() {
     // Create a network node
-    let network = NetworkNode::new(NetworkConfig::default())
+    let network = NetworkNode::new(NetworkConfig::default(), None)
         .await
         .expect("Failed to create network node");
 
@@ -25,7 +25,7 @@ async fn test_receive_message_blocks_until_message() {
 async fn test_receive_message_with_timeout_context() {
     // This test verifies that receive_message() doesn't panic or leak resources
     // when timing out
-    let network = NetworkNode::new(NetworkConfig::default())
+    let network = NetworkNode::new(NetworkConfig::default(), None)
         .await
         .expect("Failed to create network node");
 

@@ -218,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn test_runtime_creation() {
         let config = GossipConfig::default();
-        let network = NetworkNode::new(NetworkConfig::default())
+        let network = NetworkNode::new(NetworkConfig::default(), None)
             .await
             .expect("Failed to create network");
         let runtime = GossipRuntime::new(config, Arc::new(network), None)
@@ -234,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn test_runtime_start_stop() {
         let config = GossipConfig::default();
-        let network = NetworkNode::new(NetworkConfig::default())
+        let network = NetworkNode::new(NetworkConfig::default(), None)
             .await
             .expect("Failed to create network");
         let runtime = GossipRuntime::new(config, Arc::new(network), None)
@@ -248,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn test_runtime_accessors() {
         let config = GossipConfig::default();
-        let network = NetworkNode::new(NetworkConfig::default())
+        let network = NetworkNode::new(NetworkConfig::default(), None)
             .await
             .expect("Failed to create network");
         let network_arc = Arc::new(network);
@@ -263,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn test_runtime_peer_id() {
         let config = GossipConfig::default();
-        let network = NetworkNode::new(NetworkConfig::default())
+        let network = NetworkNode::new(NetworkConfig::default(), None)
             .await
             .expect("Failed to create network");
         let network_arc = Arc::new(network);
@@ -282,7 +282,7 @@ mod tests {
             active_view_size: 0,
             ..Default::default()
         };
-        let network = NetworkNode::new(NetworkConfig::default())
+        let network = NetworkNode::new(NetworkConfig::default(), None)
             .await
             .expect("Failed to create network");
         let result = GossipRuntime::new(config, Arc::new(network), None).await;
