@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
     let agent = Agent::builder()
         .with_machine_key(&config.machine_key_path)
         .with_network_config(network_config)
+        .with_peer_cache_dir(config.data_dir.join("peers"))
         .build()
         .await
         .context("failed to create agent")?;
@@ -199,6 +200,7 @@ async fn main() -> Result<()> {
     }
 
     // Graceful shutdown
+    agent.shutdown().await;
     health_handle.abort();
     reconnect_handle.abort();
     tracing::info!("Shutdown complete");

@@ -4,7 +4,7 @@
 //! retry logic and peer cache integration.
 
 use crate::error::{NetworkError, NetworkResult};
-use crate::network::{NetworkNode, PeerCache};
+use crate::network::NetworkNode;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -57,41 +57,6 @@ impl BootstrapConnector {
     /// * `config` - Bootstrap configuration with retry parameters.
     pub fn with_config(config: BootstrapConfig) -> Self {
         Self { config }
-    }
-
-    /// Connect to bootstrap nodes from peer cache.
-    ///
-    /// Attempts to connect to cached bootstrap peers using epsilon-greedy selection.
-    ///
-    /// # Arguments
-    ///
-    /// * `node` - The network node to use for connections.
-    /// * `cache` - The peer cache with bootstrap node information.
-    /// * `count` - Number of peers to attempt connection to.
-    ///
-    /// # Returns
-    ///
-    /// Number of successful connections.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if node is not initialized, but partial success is acceptable.
-    pub async fn connect_cached_peers(
-        &self,
-        node: &NetworkNode,
-        cache: &PeerCache,
-        count: usize,
-    ) -> NetworkResult<usize> {
-        let peers = cache.select_peers(count);
-        let mut success_count = 0;
-
-        for addr in peers {
-            if self.connect_with_retry(node, addr).await.is_ok() {
-                success_count += 1;
-            }
-        }
-
-        Ok(success_count)
     }
 
     /// Connect to a bootstrap node with exponential backoff retry.

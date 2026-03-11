@@ -666,7 +666,7 @@ mod tests {
     /// Helper to create a test network node.
     async fn test_node() -> Arc<NetworkNode> {
         Arc::new(
-            NetworkNode::new(NetworkConfig::default())
+            NetworkNode::new(NetworkConfig::default(), None)
                 .await
                 .expect("Failed to create test node"),
         )

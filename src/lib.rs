@@ -123,6 +123,8 @@ pub struct Agent {
     network: Option<std::sync::Arc<network::NetworkNode>>,
     /// The gossip runtime for pub/sub messaging.
     gossip_runtime: Option<std::sync::Arc<gossip::GossipRuntime>>,
+    /// Bootstrap peer cache for quality-based peer selection across restarts.
+    bootstrap_cache: Option<std::sync::Arc<ant_quic::BootstrapCache>>,
     /// Cache of discovered agents from identity announcements.
     identity_discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
@@ -200,6 +202,11 @@ struct IdentityAnnouncementUnsigned {
     machine_public_key: Vec<u8>,
     addresses: Vec<std::net::SocketAddr>,
     announced_at: u64,
+    /// QUIC transport PeerId (ant-quic PeerId) for this node.
+    /// Used by receiving agents to map announced addresses to the correct
+    /// bootstrap cache entry for auto-dial.
+    #[serde(default)]
+    transport_peer_id: Option<[u8; 32]>,
 }
 
 /// Signed identity announcement broadcast by agents.
@@ -224,6 +231,9 @@ pub struct IdentityAnnouncement {
     pub addresses: Vec<std::net::SocketAddr>,
     /// Unix timestamp (seconds) of announcement creation.
     pub announced_at: u64,
+    /// QUIC transport PeerId (ant-quic PeerId) for this node.
+    #[serde(default)]
+    pub transport_peer_id: Option<[u8; 32]>,
 }
 
 impl IdentityAnnouncement {
@@ -236,6 +246,7 @@ impl IdentityAnnouncement {
             machine_public_key: self.machine_public_key.clone(),
             addresses: self.addresses.clone(),
             announced_at: self.announced_at,
+            transport_peer_id: self.transport_peer_id,
         }
     }
 
@@ -373,6 +384,7 @@ pub struct AgentBuilder {
     user_key_path: Option<std::path::PathBuf>,
     #[allow(dead_code)]
     network_config: Option<network::NetworkConfig>,
+    peer_cache_dir: Option<std::path::PathBuf>,
     heartbeat_interval_secs: Option<u64>,
     identity_ttl_secs: Option<u64>,
 }
@@ -381,7 +393,6 @@ pub struct AgentBuilder {
 struct HeartbeatContext {
     identity: std::sync::Arc<identity::Identity>,
     runtime: std::sync::Arc<gossip::GossipRuntime>,
-    #[allow(dead_code)]
     network: std::sync::Arc<network::NetworkNode>,
     interval_secs: u64,
     cache: std::sync::Arc<
@@ -398,6 +409,14 @@ impl HeartbeatContext {
             .as_bytes()
             .to_vec();
         let announced_at = Agent::unix_timestamp_secs();
+
+        // Include our routable address so other agents can connect to us.
+        let addresses = match self.network.routable_addr().await {
+            Some(addr) => vec![addr],
+            None => Vec::new(),
+        };
+
+        let transport_peer_id = Some(self.network.peer_id().0);
         let unsigned = IdentityAnnouncementUnsigned {
             agent_id: self.identity.agent_id(),
             machine_id: self.identity.machine_id(),
@@ -407,8 +426,9 @@ impl HeartbeatContext {
                 .map(identity::UserKeypair::user_id),
             agent_certificate: self.identity.agent_certificate().cloned(),
             machine_public_key: machine_public_key.clone(),
-            addresses: Vec::new(),
+            addresses,
             announced_at,
+            transport_peer_id,
         };
         let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -437,6 +457,7 @@ impl HeartbeatContext {
             machine_signature,
             addresses: unsigned.addresses,
             announced_at,
+            transport_peer_id,
         };
         let encoded = bincode::serialize(&announcement).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -497,6 +518,7 @@ impl Agent {
             user_keypair: None,
             user_key_path: None,
             network_config: None,
+            peer_cache_dir: None,
             heartbeat_interval_secs: None,
             identity_ttl_secs: None,
         }
@@ -567,6 +589,21 @@ impl Agent {
         self.network.as_ref()
     }
 
+    /// Save the bootstrap cache and release resources.
+    ///
+    /// Call this before dropping the agent to ensure the peer cache is
+    /// persisted to disk. The background maintenance task saves periodically,
+    /// but this guarantees a final save.
+    pub async fn shutdown(&self) {
+        if let Some(ref cache) = self.bootstrap_cache {
+            if let Err(e) = cache.save().await {
+                tracing::warn!("Failed to save bootstrap cache on shutdown: {e}");
+            } else {
+                tracing::info!("Bootstrap cache saved on shutdown");
+            }
+        }
+    }
+
     /// Attach a contact store for trust-based message filtering.
     ///
     /// When set, the gossip pub/sub layer will:
@@ -609,8 +646,23 @@ impl Agent {
         })?;
 
         self.start_identity_listener().await?;
-        let announcement =
-            self.build_identity_announcement(include_user_identity, human_consent)?;
+
+        // Use routable address if available (prefers observed external address
+        // over potentially-unroutable bind address).
+        let addresses = if let Some(network) = self.network.as_ref() {
+            match network.routable_addr().await {
+                Some(addr) => vec![addr],
+                None => self.announcement_addresses(),
+            }
+        } else {
+            self.announcement_addresses()
+        };
+        let announcement = self.build_identity_announcement_with_addrs(
+            include_user_identity,
+            human_consent,
+            addresses,
+        )?;
+
         let encoded = bincode::serialize(&announcement).map_err(|e| {
             error::IdentityError::Serialization(format!(
                 "failed to serialize identity announcement: {e}"
@@ -739,6 +791,7 @@ impl Agent {
         let own_shard_topic = shard_topic_for_agent(&self.agent_id());
         let mut sub_shard = runtime.pubsub().subscribe(own_shard_topic).await;
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let bootstrap_cache = self.bootstrap_cache.clone();
 
         tokio::spawn(async move {
             loop {
@@ -766,6 +819,24 @@ impl Agent {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
 
+                // Add announced addresses to the bootstrap cache so auto-dial
+                // can connect to peers discovered via gossip announcements.
+                if !announcement.addresses.is_empty() {
+                    if let (Some(ref bc), Some(transport_id)) =
+                        (&bootstrap_cache, announcement.transport_peer_id)
+                    {
+                        let peer_id = ant_quic::PeerId(transport_id);
+                        bc.add_from_connection(peer_id, announcement.addresses.clone(), None)
+                            .await;
+                        tracing::debug!(
+                            "Added {} addresses from identity announcement to bootstrap cache for agent {:?} (transport {:?})",
+                            announcement.addresses.len(),
+                            announcement.agent_id,
+                            hex::encode(&transport_id[..8]),
+                        );
+                    }
+                }
+
                 cache.write().await.insert(
                     announcement.agent_id,
                     DiscoveredAgent {
@@ -791,8 +862,10 @@ impl Agent {
     }
 
     fn announcement_addresses(&self) -> Vec<std::net::SocketAddr> {
+        // Try routable_addr synchronously via local_addr fallback.
+        // The async routable_addr is used in HeartbeatContext::announce().
         match self.network.as_ref().and_then(|n| n.local_addr()) {
-            Some(addr) if addr.port() > 0 => vec![addr],
+            Some(addr) if addr.port() > 0 && !addr.ip().is_unspecified() => vec![addr],
             _ => Vec::new(),
         }
     }
@@ -801,6 +874,19 @@ impl Agent {
         &self,
         include_user_identity: bool,
         human_consent: bool,
+    ) -> error::Result<IdentityAnnouncement> {
+        self.build_identity_announcement_with_addrs(
+            include_user_identity,
+            human_consent,
+            self.announcement_addresses(),
+        )
+    }
+
+    fn build_identity_announcement_with_addrs(
+        &self,
+        include_user_identity: bool,
+        human_consent: bool,
+        addresses: Vec<std::net::SocketAddr>,
     ) -> error::Result<IdentityAnnouncement> {
         if include_user_identity && !human_consent {
             return Err(error::IdentityError::Storage(std::io::Error::other(
@@ -830,14 +916,16 @@ impl Agent {
             .public_key()
             .as_bytes()
             .to_vec();
+        let transport_peer_id = self.network.as_ref().map(|n| n.peer_id().0);
         let unsigned = IdentityAnnouncementUnsigned {
             agent_id: self.agent_id(),
             machine_id: self.machine_id(),
             user_id,
             agent_certificate: agent_certificate.clone(),
             machine_public_key: machine_public_key.clone(),
-            addresses: self.announcement_addresses(),
+            addresses,
             announced_at: Self::unix_timestamp_secs(),
+            transport_peer_id,
         };
         let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -866,6 +954,7 @@ impl Agent {
             machine_signature,
             addresses: unsigned.addresses,
             announced_at: unsigned.announced_at,
+            transport_peer_id,
         })
     }
 
@@ -905,64 +994,103 @@ impl Agent {
             return Ok(());
         }
 
-        // Round 1: Connect to all bootstrap peers in parallel
-        let mut failed = self.connect_peers_parallel(network, &bootstrap_nodes).await;
-        let connected = bootstrap_nodes.len() - failed.len();
-        tracing::info!(
-            "Bootstrap round 1: {}/{} peers connected",
-            connected,
-            bootstrap_nodes.len()
-        );
-
-        // Retry rounds for failed peers
-        for round in 2..=3 {
-            if failed.is_empty() {
-                break;
+        // Seed hardcoded bootstrap nodes into the cache so they are never evicted.
+        if let Some(ref cache) = self.bootstrap_cache {
+            for addr in &bootstrap_nodes {
+                // Use a deterministic PeerId derived from the address bytes.
+                let addr_bytes = addr.to_string();
+                let hash = blake3::hash(addr_bytes.as_bytes());
+                let peer_id = ant_quic::PeerId(*hash.as_bytes());
+                cache.add_seed(peer_id, vec![*addr]).await;
             }
-            // Wait for stale connections on remote nodes to expire
-            let delay = std::time::Duration::from_secs(if round == 2 { 10 } else { 15 });
-            tracing::info!(
-                "Retrying {} failed peers in {}s (round {})",
-                failed.len(),
-                delay.as_secs(),
-                round
-            );
-            tokio::time::sleep(delay).await;
-
-            failed = self.connect_peers_parallel(network, &failed).await;
-            let total_connected = bootstrap_nodes.len() - failed.len();
-            tracing::info!(
-                "Bootstrap round {}: {}/{} peers connected",
-                round,
-                total_connected,
-                bootstrap_nodes.len()
-            );
         }
 
-        if !failed.is_empty() {
-            tracing::warn!(
-                "Could not connect to {} bootstrap peers: {:?}",
-                failed.len(),
-                failed
+        let min_connected = 3;
+        let mut all_connected: Vec<std::net::SocketAddr> = Vec::new();
+
+        // Phase 1: Try cached peers first (if cache has peers beyond seeds).
+        if let Some(ref cache) = self.bootstrap_cache {
+            let cached_peers = cache.select_peers(12).await;
+            let cached_addrs: Vec<std::net::SocketAddr> = cached_peers
+                .iter()
+                .flat_map(|p| p.addresses.iter().copied())
+                .filter(|addr| !bootstrap_nodes.contains(addr))
+                .collect();
+            if !cached_addrs.is_empty() {
+                tracing::info!("Phase 1: Trying {} cached peers", cached_addrs.len());
+                let (succeeded, _failed) = self
+                    .connect_peers_parallel_tracked(network, &cached_addrs)
+                    .await;
+                all_connected.extend(&succeeded);
+                tracing::info!(
+                    "Phase 1: {}/{} cached peers connected",
+                    succeeded.len(),
+                    cached_addrs.len()
+                );
+            }
+        }
+
+        // Phase 2: Connect to hardcoded bootstrap nodes if we need more peers.
+        if all_connected.len() < min_connected {
+            let remaining: Vec<std::net::SocketAddr> = bootstrap_nodes
+                .iter()
+                .filter(|addr| !all_connected.contains(addr))
+                .copied()
+                .collect();
+
+            // Round 1: Connect to all bootstrap peers in parallel
+            let (succeeded, mut failed) = self
+                .connect_peers_parallel_tracked(network, &remaining)
+                .await;
+            all_connected.extend(&succeeded);
+            tracing::info!(
+                "Phase 2 round 1: {}/{} bootstrap peers connected",
+                succeeded.len(),
+                remaining.len()
             );
+
+            // Retry rounds for failed peers
+            for round in 2..=3 {
+                if failed.is_empty() {
+                    break;
+                }
+                let delay = std::time::Duration::from_secs(if round == 2 { 10 } else { 15 });
+                tracing::info!(
+                    "Retrying {} failed peers in {}s (round {})",
+                    failed.len(),
+                    delay.as_secs(),
+                    round
+                );
+                tokio::time::sleep(delay).await;
+
+                let (succeeded, still_failed) =
+                    self.connect_peers_parallel_tracked(network, &failed).await;
+                all_connected.extend(&succeeded);
+                failed = still_failed;
+                tracing::info!(
+                    "Phase 2 round {}: {} total peers connected",
+                    round,
+                    all_connected.len()
+                );
+            }
+
+            if !failed.is_empty() {
+                tracing::warn!(
+                    "Could not connect to {} bootstrap peers: {:?}",
+                    failed.len(),
+                    failed
+                );
+            }
         }
 
         tracing::info!(
-            "Network join complete. Connected to {}/{} bootstrap peers.",
-            bootstrap_nodes.len() - failed.len(),
-            bootstrap_nodes.len()
+            "Network join complete. Connected to {} peers.",
+            all_connected.len()
         );
 
-        // Join the HyParView membership overlay via bootstrap nodes.
-        // This triggers JOIN messages that propagate through the network,
-        // allowing other agents to discover this node and establish
-        // overlay connections for gossip dissemination.
+        // Join the HyParView membership overlay via connected peers.
         if let Some(ref runtime) = self.gossip_runtime {
-            let seeds: Vec<String> = bootstrap_nodes
-                .iter()
-                .filter(|addr| !failed.contains(addr))
-                .map(|addr| addr.to_string())
-                .collect();
+            let seeds: Vec<String> = all_connected.iter().map(|addr| addr.to_string()).collect();
             if !seeds.is_empty() {
                 if let Err(e) = runtime.membership().join(seeds).await {
                     tracing::warn!("HyParView membership join failed: {e}");
@@ -980,42 +1108,43 @@ impl Agent {
         Ok(())
     }
 
-    /// Connect to multiple peers in parallel, returning the list of failed addresses.
-    async fn connect_peers_parallel(
+    /// Connect to multiple peers in parallel, returning (succeeded, failed) address lists.
+    async fn connect_peers_parallel_tracked(
         &self,
         network: &std::sync::Arc<network::NetworkNode>,
         addrs: &[std::net::SocketAddr],
-    ) -> Vec<std::net::SocketAddr> {
+    ) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
         let handles: Vec<_> = addrs
             .iter()
             .map(|addr| {
                 let net = network.clone();
                 let addr = *addr;
                 tokio::spawn(async move {
-                    tracing::debug!("Connecting to bootstrap peer: {}", addr);
+                    tracing::debug!("Connecting to peer: {}", addr);
                     match net.connect_addr(addr).await {
                         Ok(_) => {
-                            tracing::info!("Connected to bootstrap peer: {}", addr);
-                            None
+                            tracing::info!("Connected to peer: {}", addr);
+                            Ok(addr)
                         }
                         Err(e) => {
                             tracing::warn!("Failed to connect to {}: {}", addr, e);
-                            Some(addr)
+                            Err(addr)
                         }
                     }
                 })
             })
             .collect();
 
+        let mut succeeded = Vec::new();
         let mut failed = Vec::new();
         for handle in handles {
             match handle.await {
-                Ok(Some(addr)) => failed.push(addr),
-                Ok(None) => {}
+                Ok(Ok(addr)) => succeeded.push(addr),
+                Ok(Err(addr)) => failed.push(addr),
                 Err(e) => tracing::error!("Connection task panicked: {}", e),
             }
         }
-        failed
+        (succeeded, failed)
     }
 
     /// Subscribe to messages on a given topic.
@@ -1670,6 +1799,15 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the directory for the bootstrap peer cache.
+    ///
+    /// The cache persists peer quality metrics across restarts, enabling
+    /// cache-first join strategy. Defaults to `~/.x0x/peers/` if not set.
+    pub fn with_peer_cache_dir<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+        self.peer_cache_dir = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     /// Import a user keypair for three-layer identity.
     ///
     /// This binds a human identity to this agent. When provided, an
@@ -1854,14 +1992,43 @@ impl AgentBuilder {
             identity::Identity::new(machine_keypair, agent_keypair)
         };
 
+        // Open bootstrap peer cache if network will be configured
+        let bootstrap_cache = if self.network_config.is_some() {
+            let cache_dir = self.peer_cache_dir.unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".x0x")
+                    .join("peers")
+            });
+            let config = ant_quic::BootstrapCacheConfig::builder()
+                .cache_dir(cache_dir)
+                .min_peers_to_save(1)
+                .build();
+            match ant_quic::BootstrapCache::open(config).await {
+                Ok(cache) => {
+                    let cache = std::sync::Arc::new(cache);
+                    std::sync::Arc::clone(&cache).start_maintenance();
+                    Some(cache)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to open bootstrap cache: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Create network node if configured
         let network = if let Some(config) = self.network_config {
-            let node = network::NetworkNode::new(config).await.map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "network initialization failed: {}",
-                    e
-                )))
-            })?;
+            let node = network::NetworkNode::new(config, bootstrap_cache.clone())
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "network initialization failed: {}",
+                        e
+                    )))
+                })?;
             Some(std::sync::Arc::new(node))
         } else {
             None
@@ -1895,6 +2062,7 @@ impl AgentBuilder {
             identity: std::sync::Arc::new(identity),
             network,
             gossip_runtime,
+            bootstrap_cache,
             identity_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),

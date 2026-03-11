@@ -482,6 +482,7 @@ async fn main() -> Result<()> {
 
     let mut builder = Agent::builder()
         .with_network_config(network_config)
+        .with_peer_cache_dir(config.data_dir.join("peers"))
         .with_heartbeat_interval(config.heartbeat_interval_secs)
         .with_identity_ttl(config.identity_ttl_secs);
 
@@ -645,7 +646,7 @@ async fn main() -> Result<()> {
         .route("/task-lists/:id/tasks", post(add_task))
         .route("/task-lists/:id/tasks/:tid", patch(update_task))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(Arc::clone(&state));
 
     // Start server
     let listener = tokio::net::TcpListener::bind(config.api_address)
@@ -658,6 +659,7 @@ async fn main() -> Result<()> {
         .await
         .context("API server error")?;
 
+    state.agent.shutdown().await;
     tracing::info!("Shutdown complete");
     Ok(())
 }
