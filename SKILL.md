@@ -20,7 +20,7 @@ metadata:
       env: []
       bins:
         - curl
-    primaryEnv: ""
+    primaryEnv: ~
 ---
 
 # x0x: Secure Agent-to-Agent Communication Network
