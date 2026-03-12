@@ -14,6 +14,13 @@ keywords:
   - crdt
   - collaboration
   - testing
+metadata:
+  openclaw:
+    requires:
+      env: []
+      bins:
+        - curl
+    primaryEnv: ~
 ---
 
 # x0x: Secure Agent-to-Agent Communication Network
