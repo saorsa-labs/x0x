@@ -6,6 +6,12 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# Prevent concurrent release workflows from racing on asset uploads.
+# A new tag push cancels any in-flight release for a previous tag.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -224,22 +230,121 @@ jobs:
           if-no-files-found: error
 
   # ============================================================
-  # GPG-sign SKILL.md and create GitHub Release
+  # ML-DSA-65 sign release archives (post-quantum)
   # ============================================================
-  create-release:
-    name: Create GitHub Release
+  sign-release:
+    name: ML-DSA-65 Sign Archives
     needs: build-release
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-sign-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build x0x-keygen
+        run: cargo build --release --bin x0x-keygen
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           pattern: release-*
+
+      - name: Write ML-DSA-65 signing key
+        env:
+          ML_DSA_SECRET_KEY: ${{ secrets.ML_DSA_SECRET_KEY }}
+        run: |
+          echo "$ML_DSA_SECRET_KEY" | base64 --decode > /tmp/release-signing.secret
+          chmod 600 /tmp/release-signing.secret
+
+      - name: Sign archives with ML-DSA-65
+        run: |
+          for archive in artifacts/release-*/*.tar.gz artifacts/release-*/*.zip; do
+            [ -f "$archive" ] || continue
+            ./target/release/x0x-keygen sign \
+              --key /tmp/release-signing.secret \
+              --input "$archive" \
+              --output "${archive}.sig" \
+              --context "x0x-release-v1"
+            echo "Signed: $archive"
+          done
+
+      - name: Generate and sign release manifest
+        run: |
+          # Collect all archives into a flat directory for manifest generation
+          mkdir -p manifest-assets
+          for archive in artifacts/release-*/*.tar.gz artifacts/release-*/*.zip; do
+            [ -f "$archive" ] || continue
+            cp "$archive" manifest-assets/
+          done
+          # Strip 'v' prefix from tag for version string
+          VERSION="${GITHUB_REF_NAME#v}"
+          ./target/release/x0x-keygen manifest \
+            --version "$VERSION" \
+            --assets-dir manifest-assets/ \
+            --skill-path SKILL.md \
+            --key /tmp/release-signing.secret \
+            --output-dir manifest-assets/
+
+      - name: Clean up signing key
+        if: always()
+        run: rm -f /tmp/release-signing.secret
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ml-dsa-signatures
+          path: artifacts/release-*/*.sig
+          if-no-files-found: error
+
+      - name: Upload release manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: |
+            manifest-assets/release-manifest.json
+            manifest-assets/release-manifest.json.sig
+          if-no-files-found: error
+
+  # ============================================================
+  # GPG-sign SKILL.md and create GitHub Release
+  # ============================================================
+  create-release:
+    name: Create GitHub Release
+    needs: [build-release, sign-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: release-*
+
+      - name: Download ML-DSA-65 signatures
+        uses: actions/download-artifact@v4
+        with:
+          name: ml-dsa-signatures
+          path: artifacts
+
+      - name: Download release manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: release-manifest
+          path: artifacts/manifest
 
       - name: Import GPG key
         env:
@@ -276,13 +381,17 @@ jobs:
       - name: Collect all release files
         run: |
           mkdir -p release-files
-          # Copy archives, checksums, and GPG signatures
+          # Copy archives, checksums, GPG signatures, and ML-DSA-65 signatures
           for dir in artifacts/release-*/; do
             cp "$dir"/*.tar.gz release-files/ 2>/dev/null || true
             cp "$dir"/*.zip release-files/ 2>/dev/null || true
             cp "$dir"/*.sha256 release-files/ 2>/dev/null || true
             cp "$dir"/*.asc release-files/ 2>/dev/null || true
+            cp "$dir"/*.sig release-files/ 2>/dev/null || true
           done
+          # Copy release manifest
+          cp artifacts/manifest/release-manifest.json release-files/ 2>/dev/null || true
+          cp artifacts/manifest/release-manifest.json.sig release-files/ 2>/dev/null || true
           # Copy SKILL.md artifacts
           cp SKILL.md release-files/
           cp SKILL.md.sig release-files/
@@ -329,14 +438,14 @@ jobs:
 
             | Platform | File | Code Signed |
             |----------|------|-------------|
-            | Linux x64 (glibc) | `x0x-linux-x64-gnu.tar.gz` | GPG |
-            | Linux x64 (musl/static) | `x0x-linux-x64-musl.tar.gz` | GPG |
-            | Linux ARM64 | `x0x-linux-arm64-gnu.tar.gz` | GPG |
-            | macOS x64 (Intel) | `x0x-macos-x64.tar.gz` | Apple + GPG |
-            | macOS ARM64 (Apple Silicon) | `x0x-macos-arm64.tar.gz` | Apple + GPG |
-            | Windows x64 | `x0x-windows-x64.zip` | GPG |
+            | Linux x64 (glibc) | `x0x-linux-x64-gnu.tar.gz` | ML-DSA-65 + GPG |
+            | Linux x64 (musl/static) | `x0x-linux-x64-musl.tar.gz` | ML-DSA-65 + GPG |
+            | Linux ARM64 | `x0x-linux-arm64-gnu.tar.gz` | ML-DSA-65 + GPG |
+            | macOS x64 (Intel) | `x0x-macos-x64.tar.gz` | ML-DSA-65 + Apple + GPG |
+            | macOS ARM64 (Apple Silicon) | `x0x-macos-arm64.tar.gz` | ML-DSA-65 + Apple + GPG |
+            | Windows x64 | `x0x-windows-x64.zip` | ML-DSA-65 + GPG |
 
-            All binaries are GPG-signed. macOS binaries are additionally signed with Apple Developer ID and notarized.
+            All binaries are signed with ML-DSA-65 (post-quantum, `.sig` files) and GPG (`.asc` files). macOS binaries are additionally signed with Apple Developer ID and notarized.
 
             ### Verify GPG Signatures
 

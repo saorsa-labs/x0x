@@ -21,6 +21,7 @@ bincode = "1.3"
 blake3 = "1.5"
 bytes = "1.11"
 chacha20poly1305 = "0.10"
+clap = { version = "4.5", features = ["derive"] }
 dirs = "5.0"
 hex = "0.4"
 axum = "0.7"
@@ -49,6 +50,7 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 semver = "1.0"
+sha2 = "0.10"
 flate2 = "1.0"
 tar = "0.4"
 zip = "2.0"
@@ -71,6 +73,10 @@ path = "src/bin/x0x-bootstrap.rs"
 [[bin]]
 name = "x0xd"
 path = "src/bin/x0xd.rs"
+
+[[bin]]
+name = "x0x-keygen"
+path = "src/bin/x0x-keygen.rs"
 
 [workspace]
 members = [
