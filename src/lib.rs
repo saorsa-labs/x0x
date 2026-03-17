@@ -2216,8 +2216,10 @@ impl TaskListHandle {
         }
         drop(list);
 
-        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
-            tracing::warn!("failed to publish claim_task delta: {}", e);
+        if !delta.is_empty() {
+            if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+                tracing::warn!("failed to publish claim_task delta: {}", e);
+            }
         }
 
         Ok(())
@@ -2257,8 +2259,10 @@ impl TaskListHandle {
         }
         drop(list);
 
-        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
-            tracing::warn!("failed to publish complete_task delta: {}", e);
+        if !delta.is_empty() {
+            if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+                tracing::warn!("failed to publish complete_task delta: {}", e);
+            }
         }
 
         Ok(())
@@ -2303,16 +2307,17 @@ impl TaskListHandle {
     ///
     /// Returns an error if the local CRDT mutation fails.
     pub async fn reorder(&self, task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         let mut list = self.sync.write().await;
         list.reorder(task_ids.clone(), self.peer_id).map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!("reorder failed: {}", e)))
         })?;
         drop(list);
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         let mut delta = crdt::TaskListDelta::new(timestamp);
         delta.ordering_update = Some(task_ids);
 

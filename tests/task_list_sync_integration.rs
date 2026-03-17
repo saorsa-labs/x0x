@@ -65,7 +65,7 @@ async fn test_sync_add_task_end_to_end() {
     remote_sync.start().await.expect("remote sync start");
 
     // Give subscriber time to register
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // Create "local" TaskListSync for publishing
     let local_list = TaskList::new(id, "Local".to_string(), peer1);
@@ -96,8 +96,20 @@ async fn test_sync_add_task_end_to_end() {
         .await
         .expect("publish delta");
 
-    // Wait for async delivery
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Wait for remote replica to receive and merge the task
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        {
+            let remote = remote_sync.read().await;
+            if remote.task_count() == 1 {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("timeout waiting for sync delivery");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     // Verify remote replica received and merged the task
     let remote = remote_sync.read().await;
@@ -136,7 +148,7 @@ async fn test_sync_claim_complete_end_to_end() {
         .expect("remote sync");
     remote_sync.start().await.expect("remote start");
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     let mut local_list = TaskList::new(id, "Local".to_string(), peer1);
     local_list.add_task(task, peer1, 1).expect("local pre-add");
@@ -163,7 +175,24 @@ async fn test_sync_claim_complete_end_to_end() {
         .await
         .expect("publish claim");
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Wait for remote to see the claim
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        {
+            let remote = remote_sync.read().await;
+            if remote
+                .get_task(&task_id)
+                .map(|t| t.current_state().is_claimed())
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("timeout waiting for claim sync delivery");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     // Verify remote sees claim
     {
@@ -198,7 +227,24 @@ async fn test_sync_claim_complete_end_to_end() {
         .await
         .expect("publish complete");
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Wait for remote to see the completion
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        {
+            let remote = remote_sync.read().await;
+            if remote
+                .get_task(&task_id)
+                .map(|t| t.current_state().is_done())
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("timeout waiting for complete sync delivery");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     // Verify remote sees completion
     let remote = remote_sync.read().await;
@@ -223,7 +269,7 @@ async fn test_sync_self_delivery_is_idempotent() {
         TaskListSync::new(local_list, Arc::clone(&pubsub), topic, 300).expect("sync creation");
     sync.start().await.expect("sync start");
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // Add task locally
     let task = make_task(1, peer1);
@@ -238,7 +284,10 @@ async fn test_sync_self_delivery_is_idempotent() {
     delta.added_tasks.insert(task_id, (task, (peer1, 1000)));
     sync.publish_delta(peer1, delta).await.expect("publish");
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Self-delivery is idempotent: the observable state (task_count == 1) doesn't
+    // change, so we can't poll for a condition. Use a short sleep to let the
+    // message round-trip before asserting.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Should still have exactly 1 task (idempotent merge)
     let list = sync.read().await;
