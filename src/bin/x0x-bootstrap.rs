@@ -6,17 +6,19 @@
 //! - Relay services for NAT traversal
 //! - Health monitoring endpoint
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::signal;
 use x0x::network::NetworkConfig;
-use x0x::upgrade::manifest::RELEASE_TOPIC;
+use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
+use x0x::upgrade::signature::verify_manifest_signature;
 use x0x::Agent;
 
 /// Configuration for the bootstrap node
@@ -315,6 +317,17 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Start gossip release listener (symmetric: bootstrap receives from any peer)
+    let gossip_update_handle = if config.update.enabled {
+        let update_config = config.update.clone();
+        let agent_for_gossip = Arc::clone(&agent);
+        Some(tokio::spawn(async move {
+            run_gossip_update_listener(agent_for_gossip, update_config).await;
+        }))
+    } else {
+        None
+    };
+
     // Wait for shutdown signal
     tracing::info!("Bootstrap node running. Press Ctrl+C to stop.");
     match signal::ctrl_c().await {
@@ -331,6 +344,9 @@ async fn main() -> Result<()> {
     health_handle.abort();
     reconnect_handle.abort();
     if let Some(h) = update_handle {
+        h.abort();
+    }
+    if let Some(h) = gossip_update_handle {
         h.abort();
     }
     tracing::info!("Shutdown complete");
@@ -571,6 +587,104 @@ async fn broadcast_current_manifest(agent: &Agent, repo: &str, include_prereleas
         Ok(None) => {}
         Err(e) => {
             tracing::debug!(error = %e, "Failed to fetch current manifest for broadcast: {e}");
+        }
+    }
+}
+
+/// Gossip-based release subscription — receives manifests from any peer.
+///
+/// Makes bootstrap fully symmetric: it can receive releases via gossip from
+/// x0xd nodes or other bootstrap nodes, not just discover them via GitHub polling.
+async fn run_gossip_update_listener(agent: Arc<Agent>, config: UpdateConfig) {
+    let mut release_sub = match agent.subscribe(RELEASE_TOPIC).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to subscribe to release topic: {e}");
+            return;
+        }
+    };
+
+    let mut rebroadcasted_versions: HashMap<String, Instant> = HashMap::new();
+    const REBROADCAST_INTERVAL: Duration = Duration::from_secs(300);
+
+    while let Some(msg) = release_sub.recv().await {
+        tracing::info!("Received release manifest via gossip");
+
+        let (manifest_json, sig) = match decode_signed_manifest(&msg.payload) {
+            Ok(parts) => parts,
+            Err(e) => {
+                tracing::warn!(error = %e, "Invalid manifest payload received via gossip");
+                continue;
+            }
+        };
+
+        if let Err(e) = verify_manifest_signature(manifest_json, sig) {
+            tracing::warn!(error = %e, "Release manifest signature verification failed");
+            continue;
+        }
+
+        let manifest: ReleaseManifest = match serde_json::from_slice(manifest_json) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "Invalid manifest JSON: {e}");
+                continue;
+            }
+        };
+
+        tracing::info!(
+            version = %manifest.version,
+            "Release manifest signature verified"
+        );
+
+        // Rebroadcast with time-windowed dedup
+        let should_rebroadcast = match rebroadcasted_versions.get(&manifest.version) {
+            None => true,
+            Some(last) => last.elapsed() >= REBROADCAST_INTERVAL,
+        };
+        if should_rebroadcast {
+            rebroadcasted_versions.insert(manifest.version.clone(), Instant::now());
+            if rebroadcasted_versions.len() > 5 {
+                let version = manifest.version.clone();
+                rebroadcasted_versions.clear();
+                rebroadcasted_versions.insert(version, Instant::now());
+            }
+            tracing::info!(
+                version = %manifest.version,
+                "Rebroadcasting verified release manifest v{}",
+                manifest.version
+            );
+            if let Err(e) = agent.publish(RELEASE_TOPIC, msg.payload.to_vec()).await {
+                tracing::debug!(error = %e, "Failed to rebroadcast release manifest: {e}");
+            }
+        }
+
+        if !is_newer(&manifest.version, x0x::VERSION) {
+            tracing::debug!(
+                version = %manifest.version,
+                "Already on latest version {}",
+                manifest.version
+            );
+            continue;
+        }
+
+        tracing::info!(
+            new_version = %manifest.version,
+            "Gossip: new version found, applying immediately"
+        );
+
+        let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0x-bootstrap")
+            .with_stop_on_upgrade(config.stop_on_upgrade);
+        match upgrader.apply_upgrade_from_manifest(&manifest).await {
+            Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+                tracing::info!(%version, "Gossip upgrade successful");
+            }
+            Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
+                tracing::warn!(%reason, "Gossip upgrade rolled back");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Gossip upgrade failed: {e}");
+            }
+            _ => {}
         }
     }
 }

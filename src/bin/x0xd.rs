@@ -781,35 +781,14 @@ async fn run_gossip_update_listener(
         }
     };
 
-    let rollout = x0x::upgrade::rollout::StagedRollout::new(
-        agent.machine_id().as_bytes(),
-        config.rollout_window_minutes,
-    );
-
-    let mut pending_version: Option<String> = None;
     // Track rebroadcasted versions with timestamps to prevent exponential gossip storms
     // while still allowing periodic re-rebroadcast for late-connecting peers.
     // publish() re-signs the payload with the local agent key, producing a new PlumTree
     // message ID each time — so PlumTree's transport-layer dedup cannot suppress re-sends.
     let mut rebroadcasted_versions: HashMap<String, Instant> = HashMap::new();
     const REBROADCAST_INTERVAL: Duration = Duration::from_secs(300);
-    // Channel to receive failure notifications from spawned upgrade tasks
-    let (fail_tx, mut fail_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     while let Some(msg) = release_sub.recv().await {
-        // Drain any failure notifications — clear pending_version so the failed
-        // version can be retried if a new gossip message arrives
-        while let Ok(failed_ver) = fail_rx.try_recv() {
-            if pending_version.as_deref() == Some(&failed_ver) {
-                tracing::info!(
-                    version = %failed_ver,
-                    "Clearing failed pending version {}, will retry on next gossip",
-                    failed_ver
-                );
-                pending_version = None;
-            }
-        }
-
         tracing::info!("Received release manifest via gossip");
 
         // Decode wire format: length-prefixed manifest JSON + signature
@@ -878,46 +857,25 @@ async fn run_gossip_update_listener(
         // Update SKILL.md if changed (independent of binary update)
         update_skill_if_changed(&manifest, &data_dir).await;
 
-        // Deduplicate: only start rollout timer once per version
-        if pending_version.as_deref() == Some(&manifest.version) {
-            continue;
-        }
-
-        let delay = rollout.calculate_delay_for_version(&manifest.version);
         tracing::info!(
             version = %manifest.version,
-            delay_seconds = delay.as_secs(),
-            "Staged rollout delay calculated"
+            "Applying upgrade immediately"
         );
 
-        pending_version = Some(manifest.version.clone());
-
-        let manifest_clone = manifest.clone();
-        let stop_on_upgrade = config.stop_on_upgrade;
-        let fail_tx = fail_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            tracing::info!(
-                version = %manifest_clone.version,
-                "Staged rollout delay elapsed, ready to upgrade"
-            );
-            let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-                .with_stop_on_upgrade(stop_on_upgrade);
-            match upgrader.apply_upgrade_from_manifest(&manifest_clone).await {
-                Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
-                    tracing::info!(%version, "Successfully upgraded to version {version}");
-                }
-                Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
-                    tracing::warn!(%reason, "Upgrade rolled back");
-                    let _ = fail_tx.send(manifest_clone.version.clone());
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Upgrade failed: {e}");
-                    let _ = fail_tx.send(manifest_clone.version.clone());
-                }
-                _ => {}
+        let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
+            .with_stop_on_upgrade(config.stop_on_upgrade);
+        match upgrader.apply_upgrade_from_manifest(&manifest).await {
+            Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+                tracing::info!(%version, "Successfully upgraded to version {version}");
             }
-        });
+            Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
+                tracing::warn!(%reason, "Upgrade rolled back");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Upgrade failed: {e}");
+            }
+            _ => {}
+        }
     }
 }
 
