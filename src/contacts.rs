@@ -191,6 +191,11 @@ impl ContactStore {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
+        // Skip if already revoked to avoid duplicate records
+        if self.revoked_keys.contains(&agent_id.0) {
+            return;
+        }
+
         self.revoked_keys.insert(agent_id.0);
 
         // Record the revocation event
@@ -220,6 +225,11 @@ impl ContactStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+
+        // Skip if already revoked to avoid duplicate records
+        if self.revoked_keys.contains(&agent_id.0) {
+            return;
+        }
 
         self.revoked_keys.insert(agent_id.0);
 
