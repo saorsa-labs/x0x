@@ -387,7 +387,14 @@ async fn decode_for_delivery(
     }
 
     if let (Some(store), Some(sender)) = (contacts, message.sender) {
-        let trust = store.read().await.trust_level(&sender);
+        let guard = store.read().await;
+        // Check revocation first — revoked keys are permanently rejected.
+        if guard.is_revoked(&sender) {
+            tracing::debug!("Dropping delivered payload from revoked sender {}", sender);
+            return None;
+        }
+        let trust = guard.trust_level(&sender);
+        drop(guard);
         if trust == TrustLevel::Blocked {
             tracing::debug!("Dropping delivered payload from blocked sender {}", sender);
             return None;

@@ -4,10 +4,17 @@
 //! associated trust levels. When integrated with [`crate::gossip::PubSubManager`],
 //! messages from blocked senders are dropped and messages from unknown
 //! senders are tagged with their trust level.
+//!
+//! ## Key Revocation
+//!
+//! When a peer's key is compromised, the [`ContactStore::revoke`] method
+//! permanently marks that key as revoked. Revoked keys are persisted to disk
+//! alongside contacts and cannot be un-revoked by calling [`ContactStore::set_trust`].
+//! The gossip layer checks revocation status before delivering messages.
 
 use crate::identity::AgentId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Trust level assigned to a contact.
@@ -70,12 +77,30 @@ pub struct Contact {
     pub last_seen: Option<u64>,
 }
 
+/// A record of a key revocation event.
+///
+/// Revocations are permanent — once a key is revoked it cannot be
+/// un-revoked. The record captures who revoked the key, when, and why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevocationRecord {
+    /// The revoked agent's identifier (raw 32-byte key).
+    pub agent_id: AgentId,
+    /// Human-readable reason for the revocation.
+    pub reason: String,
+    /// Unix timestamp when the revocation was issued.
+    pub timestamp: u64,
+    /// The agent ID of the node that issued the revocation.
+    pub revoker_id: Option<AgentId>,
+}
+
 /// Persistent contact store backed by a JSON file.
 ///
 /// Thread-safe access is managed externally (e.g., via `Arc<RwLock<ContactStore>>`).
 #[derive(Debug)]
 pub struct ContactStore {
     contacts: HashMap<[u8; 32], Contact>,
+    revoked_keys: HashSet<[u8; 32]>,
+    revocations: Vec<RevocationRecord>,
     storage_path: PathBuf,
 }
 
@@ -83,6 +108,8 @@ pub struct ContactStore {
 #[derive(Serialize, Deserialize)]
 struct ContactsFile {
     contacts: Vec<Contact>,
+    #[serde(default)]
+    revocations: Vec<RevocationRecord>,
 }
 
 impl ContactStore {
@@ -93,6 +120,8 @@ impl ContactStore {
     pub fn new(storage_path: PathBuf) -> Self {
         let mut store = Self {
             contacts: HashMap::new(),
+            revoked_keys: HashSet::new(),
+            revocations: Vec::new(),
             storage_path,
         };
         // Best-effort load from disk
@@ -101,7 +130,13 @@ impl ContactStore {
     }
 
     /// Add or update a contact.
-    pub fn add(&mut self, contact: Contact) {
+    ///
+    /// If the agent's key has been revoked, the contact is added with
+    /// trust level forced to `Blocked`.
+    pub fn add(&mut self, mut contact: Contact) {
+        if self.revoked_keys.contains(&contact.agent_id.0) {
+            contact.trust_level = TrustLevel::Blocked;
+        }
         self.contacts.insert(contact.agent_id.0, contact);
         let _ = self.save();
     }
@@ -109,6 +144,7 @@ impl ContactStore {
     /// Remove a contact by agent ID.
     ///
     /// Returns the removed contact, if it existed.
+    /// Note: removing a contact does NOT remove a revocation.
     pub fn remove(&mut self, agent_id: &AgentId) -> Option<Contact> {
         let result = self.contacts.remove(&agent_id.0);
         if result.is_some() {
@@ -118,7 +154,15 @@ impl ContactStore {
     }
 
     /// Set the trust level for an existing contact, or create a new entry.
+    ///
+    /// If the agent's key has been revoked, the trust level is forced to
+    /// `Blocked` regardless of the requested level.
     pub fn set_trust(&mut self, agent_id: &AgentId, trust_level: TrustLevel) {
+        let effective_trust = if self.revoked_keys.contains(&agent_id.0) {
+            TrustLevel::Blocked
+        } else {
+            trust_level
+        };
         let entry = self.contacts.entry(agent_id.0).or_insert_with(|| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -126,14 +170,77 @@ impl ContactStore {
                 .unwrap_or(0);
             Contact {
                 agent_id: *agent_id,
-                trust_level,
+                trust_level: effective_trust,
                 label: None,
                 added_at: now,
                 last_seen: None,
             }
         });
-        entry.trust_level = trust_level;
+        entry.trust_level = effective_trust;
         let _ = self.save();
+    }
+
+    /// Revoke an agent's key permanently.
+    ///
+    /// This adds the key to the revoked set, sets the contact's trust
+    /// level to `Blocked`, and persists a `RevocationRecord` to disk.
+    /// Once revoked, the key cannot be un-revoked via `set_trust()`.
+    pub fn revoke(&mut self, agent_id: &AgentId, reason: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        self.revoked_keys.insert(agent_id.0);
+
+        // Record the revocation event
+        self.revocations.push(RevocationRecord {
+            agent_id: *agent_id,
+            reason: reason.to_string(),
+            timestamp: now,
+            revoker_id: None,
+        });
+
+        // Force-block the contact entry
+        self.set_trust(agent_id, TrustLevel::Blocked);
+    }
+
+    /// Revoke an agent's key with an explicit revoker identity.
+    ///
+    /// Same as [`revoke`](Self::revoke) but also records who issued the
+    /// revocation, which is useful for audit trails and future revocation
+    /// propagation across the network.
+    pub fn revoke_with_revoker(
+        &mut self,
+        agent_id: &AgentId,
+        reason: &str,
+        revoker_id: &AgentId,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        self.revoked_keys.insert(agent_id.0);
+
+        self.revocations.push(RevocationRecord {
+            agent_id: *agent_id,
+            reason: reason.to_string(),
+            timestamp: now,
+            revoker_id: Some(*revoker_id),
+        });
+
+        self.set_trust(agent_id, TrustLevel::Blocked);
+    }
+
+    /// Check if an agent's key has been revoked.
+    pub fn is_revoked(&self, agent_id: &AgentId) -> bool {
+        self.revoked_keys.contains(&agent_id.0)
+    }
+
+    /// Get all revocation records.
+    pub fn revocations(&self) -> &[RevocationRecord] {
+        &self.revocations
     }
 
     /// Get a contact by agent ID.
@@ -183,10 +290,11 @@ impl ContactStore {
         }
     }
 
-    /// Persist contacts to disk.
+    /// Persist contacts and revocations to disk.
     fn save(&self) -> std::io::Result<()> {
         let file = ContactsFile {
             contacts: self.contacts.values().cloned().collect(),
+            revocations: self.revocations.clone(),
         };
         let json = serde_json::to_string_pretty(&file)
             .map_err(|e| std::io::Error::other(format!("serialize: {e}")))?;
@@ -203,7 +311,7 @@ impl ContactStore {
         Ok(())
     }
 
-    /// Load contacts from disk.
+    /// Load contacts and revocations from disk.
     fn load(&mut self) -> std::io::Result<()> {
         if !self.storage_path.exists() {
             return Ok(());
@@ -214,6 +322,10 @@ impl ContactStore {
         for contact in file.contacts {
             self.contacts.insert(contact.agent_id.0, contact);
         }
+        for record in &file.revocations {
+            self.revoked_keys.insert(record.agent_id.0);
+        }
+        self.revocations = file.revocations;
         Ok(())
     }
 
@@ -351,5 +463,118 @@ mod tests {
         assert_eq!(json, "\"trusted\"");
         let parsed: TrustLevel = serde_json::from_str(&json).expect("de");
         assert_eq!(parsed, TrustLevel::Trusted);
+    }
+
+    // -----------------------------------------------------------------------
+    // Key revocation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_revoke_blocks_future_messages() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+
+        let id = test_agent_id();
+        store.set_trust(&id, TrustLevel::Trusted);
+        assert!(store.is_trusted(&id));
+        assert!(!store.is_revoked(&id));
+
+        store.revoke(&id, "key compromised");
+
+        assert!(store.is_revoked(&id));
+        assert!(store.is_blocked(&id));
+        assert!(!store.is_trusted(&id));
+        assert_eq!(store.trust_level(&id), TrustLevel::Blocked);
+    }
+
+    #[test]
+    fn test_revocations_persist_across_reload() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("contacts.json");
+
+        let id = test_agent_id();
+        {
+            let mut store = ContactStore::new(path.clone());
+            store.set_trust(&id, TrustLevel::Trusted);
+            store.revoke(&id, "stolen key");
+        }
+
+        // Reload from disk
+        let store = ContactStore::new(path);
+        assert!(store.is_revoked(&id));
+        assert!(store.is_blocked(&id));
+        assert_eq!(store.revocations().len(), 1);
+        assert_eq!(store.revocations()[0].reason, "stolen key");
+    }
+
+    #[test]
+    fn test_revoked_key_cannot_be_unrevoked_by_set_trust() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+
+        let id = test_agent_id();
+        store.set_trust(&id, TrustLevel::Trusted);
+        store.revoke(&id, "compromised");
+
+        // Attempt to un-revoke by setting trust back to Trusted
+        store.set_trust(&id, TrustLevel::Trusted);
+
+        // Should still be blocked and revoked
+        assert!(store.is_revoked(&id));
+        assert!(store.is_blocked(&id));
+        assert_eq!(store.trust_level(&id), TrustLevel::Blocked);
+    }
+
+    #[test]
+    fn test_revoked_key_stays_blocked_after_add() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+
+        let id = test_agent_id();
+        store.revoke(&id, "bad actor");
+
+        // Try adding a contact with Trusted level for a revoked key
+        store.add(Contact {
+            agent_id: id,
+            trust_level: TrustLevel::Trusted,
+            label: Some("Sneaky".to_string()),
+            added_at: 3000,
+            last_seen: None,
+        });
+
+        assert!(store.is_revoked(&id));
+        assert!(store.is_blocked(&id));
+    }
+
+    #[test]
+    fn test_revoke_with_revoker() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+
+        let target = test_agent_id();
+        let revoker = test_agent_id();
+
+        store.revoke_with_revoker(&target, "audit finding", &revoker);
+
+        assert!(store.is_revoked(&target));
+        let record = &store.revocations()[0];
+        assert_eq!(record.revoker_id, Some(revoker));
+        assert_eq!(record.reason, "audit finding");
+    }
+
+    #[test]
+    fn test_revocation_record_fields() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+
+        let id = test_agent_id();
+        store.revoke(&id, "test reason");
+
+        assert_eq!(store.revocations().len(), 1);
+        let record = &store.revocations()[0];
+        assert_eq!(record.agent_id, id);
+        assert_eq!(record.reason, "test reason");
+        assert!(record.timestamp > 0);
+        assert_eq!(record.revoker_id, None);
     }
 }
