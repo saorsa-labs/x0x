@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use super::manifest::{current_platform_target, ReleaseManifest};
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
-use super::{UpgradeError, UpgradeResult, Upgrader, MAX_BINARY_SIZE_BYTES};
+use super::{UpgradeError, UpgradeResult, Upgrader};
 
 /// Auto-apply upgrader that handles the full download → verify → extract → replace → restart flow.
 pub struct AutoApplyUpgrader {
@@ -77,18 +77,6 @@ impl AutoApplyUpgrader {
             "Downloading release archive for {}", platform_target
         );
         download_to_file(&asset.archive_url, &archive_path).await?;
-
-        // Check size limit before reading into memory
-        let file_size = std::fs::metadata(&archive_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if file_size > MAX_BINARY_SIZE_BYTES {
-            let _ = std::fs::remove_dir_all(&temp_dir);
-            return Err(UpgradeError::BinaryTooLarge {
-                size: file_size,
-                limit: MAX_BINARY_SIZE_BYTES,
-            });
-        }
 
         let archive_data =
             std::fs::read(&archive_path).map_err(|e| UpgradeError::Other(e.to_string()))?;
@@ -219,8 +207,15 @@ pub fn current_binary_path() -> Result<PathBuf, UpgradeError> {
     }
 }
 
-/// Download a URL to a local file.
+/// Download a URL to a local file, enforcing a maximum size limit.
+///
+/// Checks `Content-Length` upfront and streams the response to disk with
+/// a running byte counter to prevent OOM on oversized payloads.
 async fn download_to_file(url: &str, destination: &Path) -> Result<(), UpgradeError> {
+    use futures::StreamExt;
+    use std::io::Write;
+    use super::MAX_BINARY_SIZE_BYTES;
+
     debug!(url = url, "Downloading: {url}");
 
     let client = reqwest::Client::builder()
@@ -242,21 +237,45 @@ async fn download_to_file(url: &str, destination: &Path) -> Result<(), UpgradeEr
             UpgradeError::DownloadError(e.to_string())
         })?;
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| UpgradeError::DownloadError(e.to_string()))?;
+    // Reject early if Content-Length exceeds limit
+    if let Some(content_length) = response.content_length() {
+        if content_length > MAX_BINARY_SIZE_BYTES {
+            return Err(UpgradeError::BinaryTooLarge {
+                size: content_length,
+                limit: MAX_BINARY_SIZE_BYTES,
+            });
+        }
+    }
+
+    // Stream to disk with running byte counter
+    let mut file = std::fs::File::create(destination)
+        .map_err(|e| UpgradeError::DownloadError(format!("create file failed: {e}")))?;
+    let mut downloaded: u64 = 0;
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk: bytes::Bytes =
+            chunk_result.map_err(|e| UpgradeError::DownloadError(e.to_string()))?;
+        downloaded += chunk.len() as u64;
+        if downloaded > MAX_BINARY_SIZE_BYTES {
+            drop(file);
+            let _ = std::fs::remove_file(destination);
+            return Err(UpgradeError::BinaryTooLarge {
+                size: downloaded,
+                limit: MAX_BINARY_SIZE_BYTES,
+            });
+        }
+        file.write_all(&chunk)
+            .map_err(|e| UpgradeError::DownloadError(format!("write failed: {e}")))?;
+    }
 
     debug!(
-        bytes = bytes.len(),
+        bytes = downloaded,
         path = %destination.display(),
         "Downloaded {} bytes to {}",
-        bytes.len(),
+        downloaded,
         destination.display()
     );
-
-    std::fs::write(destination, &bytes)
-        .map_err(|e| UpgradeError::DownloadError(format!("write failed: {e}")))?;
 
     Ok(())
 }

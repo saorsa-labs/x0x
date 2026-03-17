@@ -99,10 +99,19 @@ impl Upgrader {
     }
 
     /// Create a temp directory on the same filesystem as the target binary,
-    /// ensuring atomic rename will work.
+    /// ensuring atomic rename will work. Uses a unique suffix per invocation
+    /// to prevent collisions between concurrent upgrade tasks.
     pub fn create_temp_dir(&self) -> Result<PathBuf, UpgradeError> {
         let parent = self.target_path.parent().unwrap_or_else(|| Path::new("."));
-        let temp_dir = parent.join(format!(".x0x-upgrade-{}", std::process::id()));
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp_dir = parent.join(format!(
+            ".x0x-upgrade-{}-{}",
+            std::process::id(),
+            unique_id
+        ));
         std::fs::create_dir_all(&temp_dir).map_err(|e| UpgradeError::TempDirFailed {
             path: temp_dir.clone(),
             source: e,

@@ -289,6 +289,11 @@ jobs:
           done
           # Strip 'v' prefix from tag for version string
           VERSION="${GITHUB_REF_NAME#v}"
+          # Validate that VERSION is a valid semver string (prevents broken manifests from workflow_dispatch)
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "ERROR: '$VERSION' is not a valid semver version (expected tag like v1.2.3)"
+            exit 1
+          fi
           ./target/release/x0x-keygen manifest \
             --version "$VERSION" \
             --assets-dir manifest-assets/ \

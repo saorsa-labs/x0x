@@ -822,11 +822,13 @@ async fn run_gossip_update_listener(
         };
         if should_rebroadcast {
             rebroadcasted_versions.insert(manifest.version.clone(), Instant::now());
-            // Prune older versions — only the latest matters
-            if rebroadcasted_versions.len() > 5 {
-                let version = manifest.version.clone();
+            // Prune older versions — keep only the current to prevent
+            // re-broadcast of old versions after pruning
+            if rebroadcasted_versions.len() > 2 {
+                let current_version = manifest.version.clone();
+                let current_time = Instant::now();
                 rebroadcasted_versions.clear();
-                rebroadcasted_versions.insert(version, Instant::now());
+                rebroadcasted_versions.insert(current_version, current_time);
             }
             tracing::info!(
                 version = %manifest.version,

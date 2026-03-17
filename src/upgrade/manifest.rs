@@ -65,8 +65,10 @@ pub fn decode_signed_manifest(payload: &[u8]) -> Result<(&[u8], &[u8]), UpgradeE
     if payload.len() < 4 {
         return Err(UpgradeError::InvalidManifest("payload too short".into()));
     }
-    let len =
-        u32::from_be_bytes(payload[..4].try_into().expect("slice is exactly 4 bytes")) as usize;
+    let len_bytes: [u8; 4] = payload[..4]
+        .try_into()
+        .map_err(|_| UpgradeError::InvalidManifest("length prefix not 4 bytes".into()))?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
     if payload.len() < 4 + len {
         return Err(UpgradeError::InvalidManifest(
             "payload truncated: manifest length exceeds payload size".into(),

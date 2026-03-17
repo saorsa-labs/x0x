@@ -9,6 +9,9 @@ use super::manifest::{encode_signed_manifest, ReleaseManifest};
 use super::signature::verify_manifest_signature;
 use super::UpgradeError;
 
+/// Maximum age of a manifest timestamp before it is rejected (30 days).
+const MAX_MANIFEST_AGE_SECS: u64 = 30 * 24 * 3600;
+
 /// GitHub API release response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubRelease {
@@ -230,6 +233,9 @@ impl UpgradeMonitor {
         let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| UpgradeError::InvalidManifest(e.to_string()))?;
 
+        // Validate manifest timestamp to prevent replay of old signed manifests
+        validate_manifest_timestamp(&manifest)?;
+
         let manifest_json = manifest_bytes.to_vec();
         let signature = sig_bytes.to_vec();
         let gossip_payload = encode_signed_manifest(&manifest_json, &signature);
@@ -276,6 +282,42 @@ impl UpgradeMonitor {
 /// Strip the `v` prefix from a git tag to get the semver version.
 pub fn version_from_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
+}
+
+/// Validate that a manifest timestamp is not too old.
+///
+/// Rejects manifests older than `MAX_MANIFEST_AGE_SECS` to prevent indefinite
+/// replay of legitimately signed but outdated manifests.
+pub fn validate_manifest_timestamp(manifest: &ReleaseManifest) -> Result<(), UpgradeError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if manifest.timestamp == 0 {
+        // Timestamp not set — allow for backward compatibility with older manifests
+        debug!("Manifest has no timestamp, skipping age check");
+        return Ok(());
+    }
+
+    if now > manifest.timestamp && (now - manifest.timestamp) > MAX_MANIFEST_AGE_SECS {
+        let age_days = (now - manifest.timestamp) / 86400;
+        warn!(
+            manifest_timestamp = manifest.timestamp,
+            age_days = age_days,
+            max_age_days = MAX_MANIFEST_AGE_SECS / 86400,
+            "Rejecting stale manifest: {} days old (max {} days)",
+            age_days,
+            MAX_MANIFEST_AGE_SECS / 86400
+        );
+        return Err(UpgradeError::InvalidManifest(format!(
+            "manifest too old: {} days (max {} days)",
+            age_days,
+            MAX_MANIFEST_AGE_SECS / 86400
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

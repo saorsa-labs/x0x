@@ -157,6 +157,9 @@ pub enum SignatureError {
     #[error("signature verification failed: {0}")]
     VerificationFailed(String),
 
+    #[error("signing failed: {0}")]
+    SigningFailed(String),
+
     #[error("signature is invalid for this binary")]
     SignatureMismatch,
 
@@ -255,12 +258,12 @@ pub fn sign_with_context(secret_key_bytes: &[u8], data: &[u8]) -> Result<Vec<u8>
     use saorsa_pqc::api::sig::MlDsaSecretKey;
 
     let secret_key = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, secret_key_bytes)
-        .map_err(|e| SignatureError::InvalidPublicKey(format!("invalid secret key: {e}")))?;
+        .map_err(|e| SignatureError::SigningFailed(format!("invalid secret key: {e}")))?;
 
     let dsa = ml_dsa_65();
     let signature = dsa
         .sign_with_context(&secret_key, data, SIGNING_CONTEXT)
-        .map_err(|e| SignatureError::VerificationFailed(format!("signing failed: {e}")))?;
+        .map_err(|e| SignatureError::SigningFailed(e.to_string()))?;
 
     Ok(signature.to_bytes())
 }
