@@ -1213,13 +1213,25 @@ mod tests {
         let msg = sub.recv().await.expect("should receive first message");
         assert_eq!(msg.payload, Bytes::from("hello"));
 
-        // Publish a different message to confirm delivery still works
+        // Publish the SAME message again (exact duplicate)
+        manager
+            .publish("chat".to_string(), Bytes::from("hello"))
+            .await
+            .expect("publish 2 (duplicate)");
+
+        // Publish a DIFFERENT message to prove channel still works
         manager
             .publish("chat".to_string(), Bytes::from("world"))
             .await
-            .expect("publish 2");
+            .expect("publish 3 (distinct)");
 
-        let msg2 = sub.recv().await.expect("should receive second message");
-        assert_eq!(msg2.payload, Bytes::from("world"));
+        // Next received should be "world", not a second "hello".
+        // If replay protection works, the duplicate was silently dropped.
+        let msg2 = sub.recv().await.expect("should receive distinct message");
+        assert_eq!(
+            msg2.payload,
+            Bytes::from("world"),
+            "Expected world but got duplicate hello - replay protection failed"
+        );
     }
 }
