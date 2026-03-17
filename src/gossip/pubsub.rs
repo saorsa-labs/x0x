@@ -15,8 +15,9 @@ use crate::network::NetworkNode;
 use bytes::Bytes;
 use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
 use saorsa_gossip_types::{PeerId, TopicId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 
 /// Domain separation prefix for signed message payloads.
@@ -24,6 +25,12 @@ const MSG_V2_PREFIX: &[u8] = b"x0x-msg-v2";
 
 /// Version byte for signed messages.
 const VERSION_V2: u8 = 0x02;
+
+/// Maximum number of message hashes to retain in the replay cache.
+const REPLAY_CACHE_MAX_ENTRIES: usize = 10_000;
+
+/// Time-to-live for replay cache entries (5 minutes).
+const REPLAY_CACHE_TTL_SECS: u64 = 300;
 
 /// Signing context for message authentication.
 ///
@@ -146,6 +153,63 @@ impl Drop for Subscription {
     }
 }
 
+/// A time-bounded replay cache that tracks recently seen message hashes.
+///
+/// Each entry stores a BLAKE3 hash of the raw encoded payload along with
+/// the insertion timestamp. Entries older than [`REPLAY_CACHE_TTL_SECS`]
+/// are evicted, and the cache is capped at [`REPLAY_CACHE_MAX_ENTRIES`].
+#[derive(Debug)]
+struct ReplayCache {
+    /// Ordered queue of (timestamp, hash) for TTL-based eviction.
+    entries: VecDeque<(Instant, [u8; 32])>,
+    /// Set of hashes currently in the cache for O(1) lookup.
+    seen: HashSet<[u8; 32]>,
+}
+
+impl ReplayCache {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    /// Check if a payload hash has been seen before.
+    /// Returns `true` if this is a NEW (not-yet-seen) message.
+    /// Returns `false` if this is a REPLAY (already seen).
+    fn check_and_insert(&mut self, hash: [u8; 32]) -> bool {
+        self.evict_expired();
+
+        if self.seen.contains(&hash) {
+            return false; // replay detected
+        }
+
+        // If at capacity, evict the oldest entry
+        if self.seen.len() >= REPLAY_CACHE_MAX_ENTRIES {
+            if let Some((_, old_hash)) = self.entries.pop_front() {
+                self.seen.remove(&old_hash);
+            }
+        }
+
+        self.seen.insert(hash);
+        self.entries.push_back((Instant::now(), hash));
+        true // new message
+    }
+
+    /// Remove entries older than the TTL.
+    fn evict_expired(&mut self) {
+        let cutoff = Instant::now() - std::time::Duration::from_secs(REPLAY_CACHE_TTL_SECS);
+        while let Some(&(ts, hash)) = self.entries.front() {
+            if ts < cutoff {
+                self.entries.pop_front();
+                self.seen.remove(&hash);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 /// Pub/Sub manager using PlumTree dissemination with x0x payload signing.
 ///
 /// # Architecture
@@ -173,6 +237,8 @@ pub struct PubSubManager {
     /// Contact store for trust-based message filtering.
     /// Set via `set_contacts()` after construction.
     contacts: std::sync::OnceLock<Arc<tokio::sync::RwLock<ContactStore>>>,
+    /// Replay cache to prevent processing the same message twice.
+    replay_cache: Arc<RwLock<ReplayCache>>,
 }
 
 impl std::fmt::Debug for PubSubManager {
@@ -219,6 +285,7 @@ impl PubSubManager {
             topic_ref_counts: Arc::new(RwLock::new(HashMap::new())),
             signing,
             contacts: std::sync::OnceLock::new(),
+            replay_cache: Arc::new(RwLock::new(ReplayCache::new())),
         })
     }
 
@@ -249,6 +316,7 @@ impl PubSubManager {
         tokio::task::yield_now().await;
         let (tx, rx) = mpsc::channel(100);
         let contacts = self.contacts.get().cloned();
+        let replay_cache = self.replay_cache.clone();
 
         {
             let mut counts = self.topic_ref_counts.write().await;
@@ -257,7 +325,12 @@ impl PubSubManager {
 
         tokio::spawn(async move {
             while let Some((_peer, encoded_payload)) = plumtree_rx.recv().await {
-                let Some(message) = decode_for_delivery(encoded_payload, contacts.as_ref()).await
+                let Some(message) = decode_for_delivery(
+                    encoded_payload,
+                    contacts.as_ref(),
+                    &replay_cache,
+                )
+                .await
                 else {
                     continue;
                 };
@@ -365,10 +438,25 @@ impl PubSubManager {
 }
 
 /// Decode and filter a delivered payload before exposing it to x0x subscribers.
+///
+/// Performs replay detection by computing a BLAKE3 hash of the raw encoded
+/// payload and checking it against the shared replay cache. Duplicate
+/// messages are silently dropped.
 async fn decode_for_delivery(
     encoded_payload: Bytes,
     contacts: Option<&Arc<tokio::sync::RwLock<ContactStore>>>,
+    replay_cache: &Arc<RwLock<ReplayCache>>,
 ) -> Option<PubSubMessage> {
+    // Replay detection: hash the raw payload and check the cache.
+    let payload_hash: [u8; 32] = blake3::hash(&encoded_payload).into();
+    {
+        let mut cache = replay_cache.write().await;
+        if !cache.check_and_insert(payload_hash) {
+            tracing::debug!("Dropping replayed message (hash {:?})", hex::encode(payload_hash));
+            return None;
+        }
+    }
+
     let mut message = match decode_auto(encoded_payload) {
         Ok(msg) => msg,
         Err(e) => {
@@ -1037,5 +1125,101 @@ mod tests {
         manager
             .handle_incoming(peer, Bytes::from(&[0x12][..]))
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Replay cache unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_replay_cache_detects_duplicate() {
+        let mut cache = ReplayCache::new();
+        let hash: [u8; 32] = blake3::hash(b"test message").into();
+
+        assert!(cache.check_and_insert(hash), "First insert should succeed");
+        assert!(!cache.check_and_insert(hash), "Duplicate should be rejected");
+    }
+
+    #[test]
+    fn test_replay_cache_allows_different_messages() {
+        let mut cache = ReplayCache::new();
+        let hash1: [u8; 32] = blake3::hash(b"message 1").into();
+        let hash2: [u8; 32] = blake3::hash(b"message 2").into();
+
+        assert!(cache.check_and_insert(hash1));
+        assert!(cache.check_and_insert(hash2));
+    }
+
+    #[test]
+    fn test_replay_cache_respects_max_entries() {
+        let mut cache = ReplayCache::new();
+
+        // Fill the cache beyond max capacity
+        for i in 0..REPLAY_CACHE_MAX_ENTRIES + 100 {
+            let hash: [u8; 32] = blake3::hash(&i.to_be_bytes()).into();
+            assert!(cache.check_and_insert(hash), "New entry {i} should succeed");
+        }
+
+        // Cache should have evicted oldest entries to stay at max
+        assert!(cache.seen.len() <= REPLAY_CACHE_MAX_ENTRIES);
+
+        // The very first entry should have been evicted, so re-inserting succeeds
+        let first_hash: [u8; 32] = blake3::hash(&0usize.to_be_bytes()).into();
+        assert!(
+            cache.check_and_insert(first_hash),
+            "Evicted entry should be accepted again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decode_for_delivery_rejects_replay() {
+        let replay_cache = Arc::new(RwLock::new(ReplayCache::new()));
+        let payload = encode_v1("topic", &Bytes::from("hello")).expect("encode");
+
+        // First delivery should succeed
+        let msg1 = decode_for_delivery(payload.clone(), None, &replay_cache).await;
+        assert!(msg1.is_some(), "First message should be delivered");
+
+        // Same payload again should be dropped as replay
+        let msg2 = decode_for_delivery(payload.clone(), None, &replay_cache).await;
+        assert!(msg2.is_none(), "Replayed message should be dropped");
+    }
+
+    #[tokio::test]
+    async fn test_decode_for_delivery_allows_different_payloads() {
+        let replay_cache = Arc::new(RwLock::new(ReplayCache::new()));
+        let payload1 = encode_v1("topic", &Bytes::from("msg1")).expect("encode");
+        let payload2 = encode_v1("topic", &Bytes::from("msg2")).expect("encode");
+
+        let msg1 = decode_for_delivery(payload1, None, &replay_cache).await;
+        let msg2 = decode_for_delivery(payload2, None, &replay_cache).await;
+        assert!(msg1.is_some());
+        assert!(msg2.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_replay_protection_e2e() {
+        let node = test_node().await;
+        let manager = PubSubManager::new(node, None).expect("manager");
+        let mut sub = manager.subscribe("chat".to_string()).await;
+
+        // Publish the same message twice
+        manager
+            .publish("chat".to_string(), Bytes::from("hello"))
+            .await
+            .expect("publish 1");
+
+        // Receive the first one
+        let msg = sub.recv().await.expect("should receive first message");
+        assert_eq!(msg.payload, Bytes::from("hello"));
+
+        // Publish a different message to confirm delivery still works
+        manager
+            .publish("chat".to_string(), Bytes::from("world"))
+            .await
+            .expect("publish 2");
+
+        let msg2 = sub.recv().await.expect("should receive second message");
+        assert_eq!(msg2.payload, Bytes::from("world"));
     }
 }
