@@ -2134,6 +2134,10 @@ impl std::fmt::Debug for TaskListHandle {
 impl TaskListHandle {
     /// Add a new task to the list.
     ///
+    /// The task is applied to the local CRDT state immediately. Replication
+    /// to peers is best-effort via gossip — if publishing the delta fails,
+    /// the local mutation still stands and the error is logged (not returned).
+    ///
     /// # Arguments
     ///
     /// * `title` - Task title
@@ -2145,7 +2149,7 @@ impl TaskListHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the task cannot be added.
+    /// Returns an error if the local CRDT mutation fails.
     pub async fn add_task(
         &self,
         title: String,
@@ -2159,15 +2163,29 @@ impl TaskListHandle {
         let metadata = crdt::TaskMetadata::new(title, description, 128, self.agent_id, timestamp);
         let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
 
+        // Build per-operation delta before mutating (we need the task clone for the delta)
+        let mut delta = crdt::TaskListDelta::new(timestamp);
+        let tag = (self.peer_id, timestamp);
+        delta.added_tasks.insert(task_id, (task.clone(), tag));
+
         let mut list = self.sync.write().await;
         list.add_task(task, self.peer_id, timestamp).map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!("add_task failed: {}", e)))
         })?;
+        drop(list);
+
+        // Best-effort replication: log failures but don't propagate them
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish add_task delta: {}", e);
+        }
 
         Ok(task_id)
     }
 
     /// Claim a task in the list.
+    ///
+    /// The claim is applied to the local CRDT state immediately. Replication
+    /// to peers is best-effort via gossip.
     ///
     /// # Arguments
     ///
@@ -2175,7 +2193,7 @@ impl TaskListHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the task cannot be claimed.
+    /// Returns an error if the local CRDT mutation fails.
     pub async fn claim_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2189,10 +2207,26 @@ impl TaskListHandle {
                     "claim_task failed: {}",
                     e
                 )))
-            })
+            })?;
+
+        // Build per-operation delta with the updated task state
+        let mut delta = crdt::TaskListDelta::new(timestamp);
+        if let Some(task) = list.get_task(&task_id) {
+            delta.task_updates.insert(task_id, task.clone());
+        }
+        drop(list);
+
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish claim_task delta: {}", e);
+        }
+
+        Ok(())
     }
 
     /// Complete a task in the list.
+    ///
+    /// The completion is applied to the local CRDT state immediately. Replication
+    /// to peers is best-effort via gossip.
     ///
     /// # Arguments
     ///
@@ -2200,7 +2234,7 @@ impl TaskListHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the task cannot be completed.
+    /// Returns an error if the local CRDT mutation fails.
     pub async fn complete_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2214,7 +2248,20 @@ impl TaskListHandle {
                     "complete_task failed: {}",
                     e
                 )))
-            })
+            })?;
+
+        // Build per-operation delta with the updated task state
+        let mut delta = crdt::TaskListDelta::new(timestamp);
+        if let Some(task) = list.get_task(&task_id) {
+            delta.task_updates.insert(task_id, task.clone());
+        }
+        drop(list);
+
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish complete_task delta: {}", e);
+        }
+
+        Ok(())
     }
 
     /// List all tasks in their current order.
@@ -2245,18 +2292,35 @@ impl TaskListHandle {
 
     /// Reorder tasks in the list.
     ///
+    /// The reorder is applied to the local CRDT state immediately. Replication
+    /// to peers is best-effort via gossip.
+    ///
     /// # Arguments
     ///
     /// * `task_ids` - New ordering of task IDs
     ///
     /// # Errors
     ///
-    /// Returns an error if reordering fails.
+    /// Returns an error if the local CRDT mutation fails.
     pub async fn reorder(&self, task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
         let mut list = self.sync.write().await;
-        list.reorder(task_ids, self.peer_id).map_err(|e| {
+        list.reorder(task_ids.clone(), self.peer_id).map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!("reorder failed: {}", e)))
-        })
+        })?;
+        drop(list);
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut delta = crdt::TaskListDelta::new(timestamp);
+        delta.ordering_update = Some(task_ids);
+
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish reorder delta: {}", e);
+        }
+
+        Ok(())
     }
 }
 

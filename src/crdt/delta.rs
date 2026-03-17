@@ -435,4 +435,227 @@ mod tests {
         // Verify name changed
         assert_eq!(list.name(), "Updated");
     }
+
+    // --- Per-operation delta tests (matching TaskListHandle patterns) ---
+
+    #[test]
+    fn test_per_op_add_task_delta_propagates() {
+        // Simulates what TaskListHandle::add_task constructs and publishes
+        let peer1 = peer(1);
+        let peer2 = peer(2);
+        let id = list_id(1);
+
+        let mut local = TaskList::new(id, "List".to_string(), peer1);
+        let mut remote = TaskList::new(id, "List".to_string(), peer2);
+
+        let task = make_task(1, peer1);
+        let task_id = *task.id();
+        let timestamp = 1000u64;
+
+        // Build per-operation delta (same pattern as TaskListHandle::add_task)
+        let mut delta = TaskListDelta::new(timestamp);
+        let tag = (peer1, timestamp);
+        delta.added_tasks.insert(task_id, (task.clone(), tag));
+
+        // Apply locally
+        local.add_task(task, peer1, timestamp).ok().unwrap();
+
+        // Serialize/deserialize round-trip (simulates gossip transport)
+        let serialized = bincode::serialize(&(peer1, delta)).ok().unwrap();
+        let (from_peer, received_delta): (PeerId, TaskListDelta) =
+            bincode::deserialize(&serialized).ok().unwrap();
+
+        // Apply on remote
+        remote.merge_delta(&received_delta, from_peer).ok().unwrap();
+
+        // Both should have the task
+        assert_eq!(local.task_count(), 1);
+        assert_eq!(remote.task_count(), 1);
+        assert_eq!(remote.get_task(&task_id).unwrap().title(), "Task 1");
+    }
+
+    #[test]
+    fn test_per_op_claim_task_delta_propagates() {
+        // Simulates what TaskListHandle::claim_task constructs and publishes
+        let peer1 = peer(1);
+        let peer2 = peer(2);
+        let agent1 = agent(1);
+        let id = list_id(1);
+
+        let mut local = TaskList::new(id, "List".to_string(), peer1);
+        let mut remote = TaskList::new(id, "List".to_string(), peer2);
+
+        // Both lists start with the same task
+        let task = make_task(1, peer1);
+        let task_id = *task.id();
+        local.add_task(task.clone(), peer1, 1).ok().unwrap();
+        remote.add_task(task, peer1, 1).ok().unwrap();
+
+        // Claim locally
+        let timestamp = 2000u64;
+        local
+            .claim_task(&task_id, agent1, peer1, timestamp)
+            .ok()
+            .unwrap();
+
+        // Build per-operation delta (same pattern as TaskListHandle::claim_task)
+        let mut delta = TaskListDelta::new(timestamp);
+        let updated_task = local.get_task(&task_id).unwrap();
+        delta.task_updates.insert(task_id, updated_task.clone());
+
+        // Round-trip through serialization
+        let serialized = bincode::serialize(&(peer1, delta)).ok().unwrap();
+        let (from_peer, received_delta): (PeerId, TaskListDelta) =
+            bincode::deserialize(&serialized).ok().unwrap();
+
+        // Apply on remote
+        remote.merge_delta(&received_delta, from_peer).ok().unwrap();
+
+        // Remote should see the task as claimed
+        let remote_task = remote.get_task(&task_id).unwrap();
+        assert!(remote_task.current_state().is_claimed());
+    }
+
+    #[test]
+    fn test_per_op_complete_task_delta_propagates() {
+        // Simulates what TaskListHandle::complete_task constructs and publishes
+        let peer1 = peer(1);
+        let peer2 = peer(2);
+        let agent1 = agent(1);
+        let id = list_id(1);
+
+        let mut local = TaskList::new(id, "List".to_string(), peer1);
+        let mut remote = TaskList::new(id, "List".to_string(), peer2);
+
+        // Both lists start with the same claimed task
+        let task = make_task(1, peer1);
+        let task_id = *task.id();
+        local.add_task(task.clone(), peer1, 1).ok().unwrap();
+        remote.add_task(task, peer1, 1).ok().unwrap();
+        local.claim_task(&task_id, agent1, peer1, 2).ok().unwrap();
+        remote.claim_task(&task_id, agent1, peer1, 2).ok().unwrap();
+
+        // Complete locally
+        let timestamp = 3000u64;
+        local
+            .complete_task(&task_id, agent1, peer1, timestamp)
+            .ok()
+            .unwrap();
+
+        // Build per-operation delta (same pattern as TaskListHandle::complete_task)
+        let mut delta = TaskListDelta::new(timestamp);
+        let updated_task = local.get_task(&task_id).unwrap();
+        delta.task_updates.insert(task_id, updated_task.clone());
+
+        // Round-trip through serialization
+        let serialized = bincode::serialize(&(peer1, delta)).ok().unwrap();
+        let (from_peer, received_delta): (PeerId, TaskListDelta) =
+            bincode::deserialize(&serialized).ok().unwrap();
+
+        // Apply on remote
+        remote.merge_delta(&received_delta, from_peer).ok().unwrap();
+
+        // Remote should see the task as done
+        let remote_task = remote.get_task(&task_id).unwrap();
+        assert!(remote_task.current_state().is_done());
+    }
+
+    #[test]
+    fn test_per_op_reorder_delta_propagates() {
+        // Simulates what TaskListHandle::reorder constructs and publishes
+        let peer1 = peer(1);
+        let peer2 = peer(2);
+        let id = list_id(1);
+
+        let mut local = TaskList::new(id, "List".to_string(), peer1);
+        let mut remote = TaskList::new(id, "List".to_string(), peer2);
+
+        // Both lists start with the same tasks
+        let task1 = make_task(1, peer1);
+        let task2 = make_task(2, peer1);
+        let id1 = *task1.id();
+        let id2 = *task2.id();
+
+        local.add_task(task1.clone(), peer1, 1).ok().unwrap();
+        local.add_task(task2.clone(), peer1, 2).ok().unwrap();
+        remote.add_task(task1, peer1, 1).ok().unwrap();
+        remote.add_task(task2, peer1, 2).ok().unwrap();
+
+        // Reorder locally
+        let new_order = vec![id2, id1];
+        local.reorder(new_order.clone(), peer1).ok().unwrap();
+
+        // Build per-operation delta (same pattern as TaskListHandle::reorder)
+        let timestamp = 4000u64;
+        let mut delta = TaskListDelta::new(timestamp);
+        delta.ordering_update = Some(new_order);
+
+        // Round-trip through serialization
+        let serialized = bincode::serialize(&(peer1, delta)).ok().unwrap();
+        let (from_peer, received_delta): (PeerId, TaskListDelta) =
+            bincode::deserialize(&serialized).ok().unwrap();
+
+        // Apply on remote
+        remote.merge_delta(&received_delta, from_peer).ok().unwrap();
+
+        // Remote should have the new order
+        let remote_tasks = remote.tasks_ordered();
+        assert_eq!(remote_tasks[0].id(), &id2);
+        assert_eq!(remote_tasks[1].id(), &id1);
+    }
+
+    #[test]
+    fn test_per_op_sequential_operations_propagate() {
+        // Full lifecycle: add -> claim -> complete, each as a separate delta
+        let peer1 = peer(1);
+        let peer2 = peer(2);
+        let agent1 = agent(1);
+        let id = list_id(1);
+
+        let mut local = TaskList::new(id, "List".to_string(), peer1);
+        let mut remote = TaskList::new(id, "List".to_string(), peer2);
+
+        // Step 1: Add task
+        let task = make_task(1, peer1);
+        let task_id = *task.id();
+
+        let mut add_delta = TaskListDelta::new(1000);
+        add_delta
+            .added_tasks
+            .insert(task_id, (task.clone(), (peer1, 1000)));
+        local.add_task(task, peer1, 1000).ok().unwrap();
+        remote.merge_delta(&add_delta, peer1).ok().unwrap();
+
+        assert_eq!(remote.task_count(), 1);
+
+        // Step 2: Claim task
+        local
+            .claim_task(&task_id, agent1, peer1, 2000)
+            .ok()
+            .unwrap();
+        let mut claim_delta = TaskListDelta::new(2000);
+        claim_delta
+            .task_updates
+            .insert(task_id, local.get_task(&task_id).unwrap().clone());
+        remote.merge_delta(&claim_delta, peer1).ok().unwrap();
+
+        assert!(remote
+            .get_task(&task_id)
+            .unwrap()
+            .current_state()
+            .is_claimed());
+
+        // Step 3: Complete task
+        local
+            .complete_task(&task_id, agent1, peer1, 3000)
+            .ok()
+            .unwrap();
+        let mut complete_delta = TaskListDelta::new(3000);
+        complete_delta
+            .task_updates
+            .insert(task_id, local.get_task(&task_id).unwrap().clone());
+        remote.merge_delta(&complete_delta, peer1).ok().unwrap();
+
+        assert!(remote.get_task(&task_id).unwrap().current_state().is_done());
+    }
 }
