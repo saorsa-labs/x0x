@@ -119,6 +119,20 @@ pub struct NetworkConfig {
     /// Path to persist peer cache.
     #[serde(default)]
     pub peer_cache_path: Option<PathBuf>,
+
+    /// Pinned bootstrap peer IDs. When non-empty, `dial_bootstrap()` rejects
+    /// peers whose ID is not in this set. Prevents spoofed bootstrap nodes.
+    #[serde(default)]
+    pub pinned_bootstrap_peers: std::collections::HashSet<[u8; 32]>,
+
+    /// Inbound connection allowlist. When non-empty, `spawn_accept_loop()`
+    /// rejects connections from peers not in this set.
+    #[serde(default)]
+    pub inbound_allowlist: std::collections::HashSet<[u8; 32]>,
+
+    /// Max concurrent connections from a single IP. Limits Sybil attacks. Default: 3.
+    #[serde(default = "default_max_peers_per_ip")]
+    pub max_peers_per_ip: u32,
 }
 
 fn default_max_connections() -> u32 {
@@ -131,6 +145,10 @@ fn default_connection_timeout() -> Duration {
 
 fn default_stats_interval() -> Duration {
     DEFAULT_STATS_INTERVAL
+}
+
+fn default_max_peers_per_ip() -> u32 {
+    3
 }
 
 impl Default for NetworkConfig {
@@ -148,6 +166,9 @@ impl Default for NetworkConfig {
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             stats_interval: DEFAULT_STATS_INTERVAL,
             peer_cache_path: None,
+            pinned_bootstrap_peers: std::collections::HashSet::new(),
+            inbound_allowlist: std::collections::HashSet::new(),
+            max_peers_per_ip: 3,
         }
     }
 }
@@ -664,6 +685,7 @@ impl NetworkNode {
         let node = Arc::clone(&self.node);
         let event_sender = self.event_sender.clone();
         let bootstrap_cache = self.bootstrap_cache.clone();
+        let inbound_allowlist = self.config.inbound_allowlist.clone();
 
         tokio::spawn(async move {
             debug!("NetworkNode accept loop started");
@@ -680,6 +702,17 @@ impl NetworkNode {
 
                 match node_ref.accept().await {
                     Some(peer_conn) => {
+                        // Reject peers not in inbound allowlist (when configured)
+                        if !inbound_allowlist.is_empty()
+                            && !inbound_allowlist.contains(&peer_conn.peer_id.0)
+                        {
+                            tracing::warn!(
+                                "SECURITY: Rejecting inbound connection from non-allowlisted peer {:?}",
+                                peer_conn.peer_id
+                            );
+                            continue;
+                        }
+
                         tracing::info!(
                             "Accepted inbound connection from peer {:?} at {:?}",
                             peer_conn.peer_id,
@@ -770,6 +803,21 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             .connect_addr(addr)
             .await
             .map_err(|e| anyhow::anyhow!("bootstrap dial failed: {}", e))?;
+        // Reject bootstrap peers not in the pinned set (when configured).
+        if !self.config.pinned_bootstrap_peers.is_empty()
+            && !self.config.pinned_bootstrap_peers.contains(&ant_peer_id.0)
+        {
+            warn!(
+                "SECURITY: Bootstrap peer at {} has unexpected ID {:?} — not in pinned set",
+                addr, ant_peer_id
+            );
+            let _ = self.disconnect(&ant_peer_id).await;
+            return Err(anyhow::anyhow!(
+                "Bootstrap peer at {} has unpinned ID {:?}",
+                addr, ant_peer_id
+            ));
+        }
+
         Ok(ant_to_gossip_peer_id(&ant_peer_id))
     }
 
@@ -1053,6 +1101,9 @@ async fn test_mesh_connections_are_bidirectional() {
             connection_timeout: std::time::Duration::from_secs(10),
             stats_interval: std::time::Duration::from_secs(60),
             peer_cache_path: None,
+            pinned_bootstrap_peers: std::collections::HashSet::new(),
+            inbound_allowlist: std::collections::HashSet::new(),
+            max_peers_per_ip: 3,
         };
 
         let node = NetworkNode::new(config, None).await.unwrap();
