@@ -367,3 +367,95 @@ fn test_pending_invite_keyed_by_group_and_sender() {
     assert_eq!(map.get(&(gid1, sender_a)).unwrap().received_at, 100);
     assert_eq!(map.get(&(gid2, sender_b)).unwrap().received_at, 200);
 }
+
+// ---------------------------------------------------------------------------
+// Test 11: End-to-end create → invite → accept → encrypted sync
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_end_to_end_create_invite_accept_encrypted_sync() {
+    use x0x::crdt::{TaskList, TaskListId};
+
+    // 1. Alice creates group
+    let alice = test_identity();
+    let alice_id = agent_of(&alice);
+    let group_id_bytes = b"e2e-test-group".to_vec();
+    let mut alice_group = MlsGroup::new(group_id_bytes.clone(), alice_id).unwrap();
+    let group_id = GroupId::from_mls_group_id(&group_id_bytes);
+
+    // 2. Alice invites Bob
+    let bob = test_identity();
+    let bob_id = agent_of(&bob);
+    let _commit = alice_group.add_member(bob_id).unwrap();
+    let welcome = MlsWelcome::create(&alice_group, &bob_id).unwrap();
+
+    // 3. Bob accepts
+    let bob_group = MlsGroup::from_welcome(&welcome, bob_id).unwrap();
+    assert_eq!(bob_group.group_id(), alice_group.group_id());
+
+    // 4. Both create task lists (simulating what init_encrypted_sync does)
+    let alice_peer = saorsa_gossip_types::PeerId::new(*alice_id.as_bytes());
+    let bob_peer = saorsa_gossip_types::PeerId::new(*bob_id.as_bytes());
+    let list_id = TaskListId::new(*group_id.as_bytes());
+    let mut alice_list = TaskList::new(list_id, "E2E Test".to_string(), alice_peer);
+    let mut bob_list = TaskList::new(list_id, "E2E Test".to_string(), bob_peer);
+
+    // 5. Alice adds a task and creates a delta
+    let task_id = TaskId::new("Review the PR", &alice_id, 2000);
+    let metadata = TaskMetadata::new(
+        "Review the PR",
+        "Check the MLS implementation",
+        128,
+        alice_id,
+        2000,
+    );
+    let task = TaskItem::new(task_id, metadata, alice_peer);
+    let mut delta = TaskListDelta::new(1);
+    delta
+        .added_tasks
+        .insert(task_id, (task.clone(), (alice_peer, 1)));
+    alice_list.add_task(task, alice_peer, 1).unwrap();
+
+    // 6. Alice encrypts the delta with her group
+    let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &alice_group, 0).unwrap();
+
+    // 7. Bob decrypts with his group
+    let decrypted = encrypted.decrypt_with_group(&bob_group).unwrap();
+    assert_eq!(decrypted.added_tasks.len(), 1);
+    assert!(decrypted.added_tasks.contains_key(&task_id));
+
+    // 8. Bob merges the delta into his task list
+    bob_list.merge_delta(&decrypted, alice_peer).unwrap();
+    assert_eq!(bob_list.task_count(), 1);
+    let bob_task = bob_list.get_task(&task_id).unwrap();
+    assert_eq!(bob_task.title(), "Review the PR");
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: Non-member encrypted mutation rejected
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_non_member_encrypted_mutation_rejected() {
+    // Setup: Alice's group
+    let alice = test_identity();
+    let alice_id = agent_of(&alice);
+    let group_id_bytes = b"rejection-test".to_vec();
+    let alice_group = MlsGroup::new(group_id_bytes.clone(), alice_id).unwrap();
+
+    // Eve creates her own group (different keys)
+    let eve = test_identity();
+    let eve_id = agent_of(&eve);
+    let eve_group = MlsGroup::new(b"eve-group".to_vec(), eve_id).unwrap();
+
+    // Eve encrypts a delta with her own group keys
+    let delta = make_delta(&eve_id);
+    let eve_encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &eve_group, 0).unwrap();
+
+    // Alice tries to decrypt Eve's delta — should fail
+    let result = eve_encrypted.decrypt_with_group(&alice_group);
+    assert!(
+        result.is_err(),
+        "non-member encrypted delta should not decrypt with group keys"
+    );
+}
