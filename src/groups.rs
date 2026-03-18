@@ -1,11 +1,13 @@
 #![allow(missing_docs)]
 
 use crate::contacts::TrustLevel;
+use crate::crdt::EncryptedTaskListSync;
 use crate::identity::AgentId;
 use crate::mls::{MlsGroup, MlsWelcome};
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A pending invite received from another agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +56,7 @@ pub struct PendingInviteSummary {
 ///
 /// This is wrapped in `Arc<RwLock<>>` for concurrent access from the
 /// background invite listener and API handlers.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct GroupState {
     /// Active groups the agent is a member of.
     pub groups: HashMap<GroupId, MlsGroup>,
@@ -62,4 +64,17 @@ pub struct GroupState {
     pub group_names: HashMap<GroupId, String>,
     /// Pending invites keyed by (GroupId, sender AgentId).
     pub pending_invites: HashMap<(GroupId, AgentId), PendingInvite>,
+    /// Encrypted task list sync instances per group.
+    pub encrypted_syncs: HashMap<GroupId, Arc<EncryptedTaskListSync>>,
+}
+
+impl std::fmt::Debug for GroupState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupState")
+            .field("groups", &self.groups)
+            .field("group_names", &self.group_names)
+            .field("pending_invites", &self.pending_invites)
+            .field("encrypted_syncs", &self.encrypted_syncs)
+            .finish()
+    }
 }

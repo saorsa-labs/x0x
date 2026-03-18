@@ -549,6 +549,11 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Start background invite listener (non-fatal if it fails)
+    if let Err(e) = agent.start_invite_listener().await {
+        tracing::warn!("failed to start invite listener: {e}");
+    }
+
     // Build shared state
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
     let state = Arc::new(AppState {
@@ -2081,37 +2086,206 @@ async fn reject_invite(
     }
 }
 
-/// GET /groups/:id/tasks — stub (501 Not Implemented).
-async fn list_group_tasks(Path(_id): Path<String>) -> impl IntoResponse {
+/// GET /groups/:id/tasks — list tasks in a group's encrypted task list.
+async fn list_group_tasks(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let group_id = match GroupId::from_hex(&id) {
+        Ok(g) => g,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "invalid group id"})),
+            )
+        }
+    };
+
+    let group_state = state.agent.group_state().read().await;
+    let Some(sync) = group_state.encrypted_syncs.get(&group_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "group not found or no task list"})),
+        );
+    };
+
+    let list = sync.read().await;
+    let tasks: Vec<serde_json::Value> = list
+        .tasks_ordered()
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": format!("{}", t.id()),
+                "title": t.title(),
+                "description": t.description(),
+                "state": format!("{:?}", t.current_state()),
+                "assignee": t.assignee().map(|a| hex::encode(a.0)),
+                "priority": t.priority(),
+            })
+        })
+        .collect();
+
     (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "ok": false,
-            "error": "group task list operations require EncryptedTaskListSync (pending network integration)"
-        })),
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "tasks": tasks})),
     )
 }
 
-/// POST /groups/:id/tasks — stub (501 Not Implemented).
-async fn add_group_task(Path(_id): Path<String>) -> impl IntoResponse {
+/// POST /groups/:id/tasks — add a task to a group's encrypted task list.
+async fn add_group_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddTaskRequest>,
+) -> impl IntoResponse {
+    let group_id = match GroupId::from_hex(&id) {
+        Ok(g) => g,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "invalid group id"})),
+            )
+        }
+    };
+
+    let agent_id = state.agent.agent_id();
+    let peer_id = saorsa_gossip_types::PeerId::new(*agent_id.as_bytes());
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let task_id = x0x::crdt::TaskId::new(&req.title, &agent_id, timestamp);
+    let metadata =
+        x0x::crdt::TaskMetadata::new(req.title, req.description, 128, agent_id, timestamp);
+    let task = x0x::crdt::TaskItem::new(task_id, metadata, peer_id);
+
+    let group_state = state.agent.group_state().read().await;
+    let Some(sync) = group_state.encrypted_syncs.get(&group_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "group not found or no task list"})),
+        );
+    };
+    let sync = std::sync::Arc::clone(sync);
+    drop(group_state);
+
+    // Build delta before mutating
+    let mut delta = x0x::crdt::TaskListDelta::new(timestamp);
+    let tag = (peer_id, timestamp);
+    delta.added_tasks.insert(task_id, (task.clone(), tag));
+
+    // Apply locally
+    {
+        let mut list = sync.write().await;
+        if let Err(e) = list.add_task(task, peer_id, timestamp) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": format!("add_task failed: {e}")})),
+            );
+        }
+    }
+
+    // Best-effort encrypted replication
+    if let Err(e) = sync.publish_delta(peer_id, delta).await {
+        tracing::warn!("failed to publish encrypted add_task delta: {e}");
+    }
+
     (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "ok": false,
-            "error": "group task list operations require EncryptedTaskListSync (pending network integration)"
-        })),
+        StatusCode::CREATED,
+        Json(serde_json::json!({"ok": true, "task_id": format!("{task_id}")})),
     )
 }
 
-/// PATCH /groups/:id/tasks/:tid — stub (501 Not Implemented).
-async fn update_group_task(Path((_id, _tid)): Path<(String, String)>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "ok": false,
-            "error": "group task list operations require EncryptedTaskListSync (pending network integration)"
-        })),
-    )
+/// PATCH /groups/:id/tasks/:tid — update a task in a group's encrypted task list.
+async fn update_group_task(
+    State(state): State<Arc<AppState>>,
+    Path((id, tid)): Path<(String, String)>,
+    Json(req): Json<UpdateTaskRequest>,
+) -> impl IntoResponse {
+    let group_id = match GroupId::from_hex(&id) {
+        Ok(g) => g,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "invalid group id"})),
+            )
+        }
+    };
+
+    // Parse task ID from hex
+    let task_id_bytes: [u8; 32] = match hex::decode(&tid) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"ok": false, "error": "invalid task ID (expected 64 hex chars)"}),
+                ),
+            )
+        }
+    };
+    let task_id = x0x::crdt::TaskId::from_bytes(task_id_bytes);
+
+    let agent_id = state.agent.agent_id();
+    let peer_id = saorsa_gossip_types::PeerId::new(*agent_id.as_bytes());
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let group_state = state.agent.group_state().read().await;
+    let Some(sync) = group_state.encrypted_syncs.get(&group_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "group not found or no task list"})),
+        );
+    };
+    let sync = std::sync::Arc::clone(sync);
+    drop(group_state);
+
+    // Apply action to local CRDT
+    let mut list = sync.write().await;
+    let result = match req.action.as_str() {
+        "claim" => list.claim_task(&task_id, agent_id, peer_id, timestamp),
+        "complete" => list.complete_task(&task_id, agent_id, peer_id, timestamp),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"ok": false, "error": "action must be 'claim' or 'complete'"}),
+                ),
+            )
+        }
+    };
+
+    if let Err(e) = result {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok": false, "error": format!("{e}")})),
+        );
+    }
+
+    // Build delta with updated task state
+    let mut delta = x0x::crdt::TaskListDelta::new(timestamp);
+    if let Some(task) = list.get_task(&task_id) {
+        delta.task_updates.insert(task_id, task.clone());
+    }
+    drop(list);
+
+    // Best-effort encrypted replication
+    if !delta.is_empty() {
+        if let Err(e) = sync.publish_delta(peer_id, delta).await {
+            tracing::warn!("failed to publish encrypted update_task delta: {e}");
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
 // ---------------------------------------------------------------------------

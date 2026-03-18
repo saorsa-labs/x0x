@@ -243,6 +243,18 @@ pub struct EncryptedTaskListSync {
     counter: AtomicU64,
 }
 
+impl std::fmt::Debug for EncryptedTaskListSync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedTaskListSync")
+            .field("topic", &self.topic)
+            .field(
+                "counter",
+                &self.counter.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
 impl EncryptedTaskListSync {
     /// Create a new encrypted task list synchronization manager.
     ///
@@ -305,9 +317,13 @@ impl EncryptedTaskListSync {
                 };
                 drop(group);
 
-                // Extract peer_id from the message sender if available,
-                // otherwise use a default.
-                let peer_id = PeerId::new([0u8; 32]); // TODO: extract from V2 sender
+                // Extract peer_id from V2 message sender's authenticated AgentId.
+                // Falls back to zero if sender is absent (shouldn't happen for
+                // verified messages, but guards against legacy unsigned traffic).
+                let peer_id = msg
+                    .sender
+                    .map(|agent_id| PeerId::new(*agent_id.as_bytes()))
+                    .unwrap_or_else(|| PeerId::new([0u8; 32]));
 
                 let mut list = task_list.write().await;
                 if let Err(e) = list.merge_delta(&delta, peer_id) {

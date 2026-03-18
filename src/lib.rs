@@ -1254,9 +1254,18 @@ impl Agent {
             member_ids: vec![agent_id],
         };
 
+        // Initialize encrypted task list sync for this group.
+        // TODO: In MVP the EncryptedTaskListSync holds its own Arc<RwLock<MlsGroup>> copy.
+        // This is safe because epoch doesn't change without explicit commit/rotation.
+        // Post-MVP: share a single Arc<RwLock<MlsGroup>> between GroupState.groups and sync.
+        let encrypted_sync = self
+            .init_encrypted_sync(&group_id, &name, mls_group.clone())
+            .await?;
+
         let mut state = self.group_state.write().await;
         state.groups.insert(group_id, mls_group);
         state.group_names.insert(group_id, name);
+        state.encrypted_syncs.insert(group_id, encrypted_sync);
 
         Ok(summary)
     }
@@ -1323,26 +1332,45 @@ impl Agent {
         sender: &identity::AgentId,
     ) -> error::Result<GroupSummary> {
         let agent_id = self.agent_id();
-        let mut state = self.group_state.write().await;
 
-        let invite = state
-            .pending_invites
-            .get(&(*group_id, *sender))
-            .ok_or_else(|| {
-                error::IdentityError::CertificateVerification("invite not found".to_string())
-            })?;
+        // Phase 1: Validate under read lock (cheap checks, no state mutation).
+        let (mls_group, name) = {
+            let state = self.group_state.read().await;
 
-        if !invite.verified {
-            return Err(error::IdentityError::CertificateVerification(
-                "invite signature not verified".to_string(),
-            ));
-        }
+            let invite = state
+                .pending_invites
+                .get(&(*group_id, *sender))
+                .ok_or_else(|| {
+                    error::IdentityError::CertificateVerification("invite not found".to_string())
+                })?;
 
-        let mls_group = mls::MlsGroup::from_welcome(&invite.welcome, agent_id).map_err(|e| {
-            error::IdentityError::CertificateVerification(format!("failed to join group: {e}"))
-        })?;
+            if !invite.verified {
+                return Err(error::IdentityError::CertificateVerification(
+                    "invite signature not verified".to_string(),
+                ));
+            }
 
-        let name = format!("group-{}", &group_id.to_hex()[..8]);
+            let mls_group =
+                mls::MlsGroup::from_welcome(&invite.welcome, agent_id).map_err(|e| {
+                    error::IdentityError::CertificateVerification(format!(
+                        "failed to join group: {e}"
+                    ))
+                })?;
+
+            let name = format!("group-{}", &group_id.to_hex()[..8]);
+            (mls_group, name)
+        };
+        // Read lock released here.
+
+        // Phase 2: Initialize encrypted task list sync (needs gossip_runtime, no state lock held).
+        // TODO: In MVP the EncryptedTaskListSync holds its own Arc<RwLock<MlsGroup>> copy.
+        // This is safe because epoch doesn't change without explicit commit/rotation.
+        // Post-MVP: share a single Arc<RwLock<MlsGroup>> between GroupState.groups and sync.
+        let encrypted_sync = self
+            .init_encrypted_sync(group_id, &name, mls_group.clone())
+            .await?;
+
+        // Phase 3: Mutate state under write lock after all validation and init passes.
         let member_ids: Vec<identity::AgentId> = mls_group.members().keys().copied().collect();
         let summary = GroupSummary {
             group_id: *group_id,
@@ -1351,10 +1379,11 @@ impl Agent {
             member_ids,
         };
 
-        // Only mutate state after all validation passes
+        let mut state = self.group_state.write().await;
         state.pending_invites.remove(&(*group_id, *sender));
         state.groups.insert(*group_id, mls_group);
         state.group_names.insert(*group_id, name);
+        state.encrypted_syncs.insert(*group_id, encrypted_sync);
 
         Ok(summary)
     }
@@ -1373,6 +1402,46 @@ impl Agent {
                 error::IdentityError::CertificateVerification("invite not found".to_string())
             })?;
         Ok(())
+    }
+
+    /// Initialize an `EncryptedTaskListSync` for a group.
+    ///
+    /// Shared setup path used by both `create_group` and `accept_invite` to
+    /// ensure identical initialization. Requires the gossip runtime to be
+    /// available (i.e. the agent must have joined the network).
+    async fn init_encrypted_sync(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+        mls_group: mls::MlsGroup,
+    ) -> error::Result<std::sync::Arc<crdt::EncryptedTaskListSync>> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::CertificateVerification(
+                "gossip runtime not available — join network before creating/accepting groups"
+                    .to_string(),
+            )
+        })?;
+
+        let peer_id = runtime.peer_id();
+        let list_id = crdt::TaskListId::new(*group_id.as_bytes());
+        let task_list = crdt::TaskList::new(list_id, name.to_string(), peer_id);
+
+        let mls_group_arc = std::sync::Arc::new(tokio::sync::RwLock::new(mls_group));
+
+        let encrypted_sync = crdt::EncryptedTaskListSync::new(
+            task_list,
+            mls_group_arc,
+            std::sync::Arc::clone(runtime.pubsub()),
+            group_id,
+        );
+
+        encrypted_sync.start().await.map_err(|e| {
+            error::IdentityError::CertificateVerification(format!(
+                "encrypted sync start failed: {e}"
+            ))
+        })?;
+
+        Ok(std::sync::Arc::new(encrypted_sync))
     }
 
     /// List all groups this agent is a member of.
