@@ -30,7 +30,7 @@ Fix:
 
 ```bash
 # If x0xd is missing, reinstall
-curl -sfL https://x0x.md/install.sh | bash
+curl -sfL https://x0x.md/install.sh | bash -s -- --start --health
 ```
 
 ```bash

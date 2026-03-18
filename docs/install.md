@@ -1,99 +1,50 @@
-# Install x0x
+# Install x0xd
 
-Use this when you are ready to install `x0xd`.
+Use this when you are ready to install the local daemon.
 
-## Prerequisites
-
-- Shell access on the machine where x0x will run.
-- `curl` or `wget` available.
-- No root/sudo required.
-
-## Install command
+## Canonical command
 
 ```bash
-curl -sfL https://x0x.md/install.sh | bash
+curl -sfL https://x0x.md/install.sh | bash -s -- --start --health
 ```
 
-Interactive mode for humans:
+This installs `x0xd`, starts it, and waits for a successful local health check.
 
-```bash
-curl -sfL https://x0x.md/install.sh | bash -s -- --interactive
-```
+## Installer scope
 
-- `--interactive` mode switch is not implemented yet in current scripts; this invocation is planned for Phase 02 plan `02-01`. [planned]
+The install script is daemon-only.
 
-## Current behavior now
+- Installs `x0xd` to `~/.local/bin/x0xd`
+- Optionally starts `x0xd`
+- Optionally waits for `/health`
+- Does **not** install or place `SKILL.md`
 
-- `scripts/install.sh` and `scripts/install.py` are interactive by default today. [working]
-- Default runs may prompt for input and are not yet safe for unattended agent execution. [working]
-- No stable JSON stdout schema is emitted today. [working]
+## Flags
 
-## Planned Phase 02 behavior (plan `02-01`)
-
-- No prompts (`read`/`input`) in default mode. [planned]
-- Progress and warnings go to stderr. [planned]
-- Final machine-readable status goes to stdout as JSON. [planned]
-- If GPG is unavailable, installation continues and reports `"gpg_verified": false`. [planned]
-- If GPG verification fails, platform is unsupported, downloads fail, or writes fail, installation exits non-zero and emits error JSON. [planned]
-
-## Planned JSON output schema (Phase 02)
-
-Success (stdout):
-
-```json
-{
-  "status": "ok",
-  "x0xd_path": "/home/user/.local/bin/x0xd",
-  "skill_path": "/home/user/.local/share/x0x/SKILL.md",
-  "gpg_verified": true,
-  "platform": "macos-arm64",
-  "version": "0.2.0"
-}
-```
-
-Failure (stdout):
-
-```json
-{
-  "status": "error",
-  "error": "GPG signature verification failed",
-  "code": "gpg_verification_failed"
-}
-```
-
-`code` values:
-
-| Code | Meaning |
+| Flag | Behavior |
 |---|---|
-| `ok` | Installation succeeded |
-| `gpg_verification_failed` | SKILL.md signature did not verify |
-| `unsupported_platform` | No binary available for this OS/arch |
-| `download_failed` | Could not download from GitHub releases |
-| `permission_denied` | Cannot write to install directory |
-| `already_installed` | `x0xd` already exists at the install path |
+| `--install-only` | Install binary only (do not start / health-check) |
+| `--start` | Start daemon after install |
+| `--health` | Wait for successful `GET /health` |
+| `--upgrade` | Reinstall from latest release even if already installed |
+| `--no-verify` | Skip archive signature verification |
 
-## What gets installed where
-
-- Binary: `~/.local/bin/x0xd` [working]
-- Data root: `~/.local/share/x0x/` [working]
-- Identity material (created on first daemon start): `~/.local/share/x0x/identity/` [working]
-
-## Post-install: start and wait for readiness
-
-Start daemon:
+## Verify quickly
 
 ```bash
-x0xd &
+curl -sf http://127.0.0.1:12700/health
+curl -sf http://127.0.0.1:12700/agent
+curl -sf http://127.0.0.1:12700/status
 ```
 
-Wait for health endpoint before continuing:
+## Diagnose
 
 ```bash
-until curl -sf http://127.0.0.1:12700/health >/dev/null; do sleep 1; done
+x0xd doctor
 ```
 
-If readiness does not arrive, go to `troubleshooting.md` for startup diagnostics.
+`x0xd doctor` is useful both when the daemon is running and when it is down.
 
 ## Next step
 
-After `/health` responds, run `verify.md` to prove identity, network connectivity, pub/sub, and contact-store operations.
+After installation succeeds, run the first-success verification path in `verify.md`.

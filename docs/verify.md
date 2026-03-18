@@ -18,7 +18,7 @@ Expected shape (from `src/bin/x0xd.rs`):
 {
   "ok": true,
   "status": "healthy",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "peers": 3,
   "uptime_secs": 12
 }

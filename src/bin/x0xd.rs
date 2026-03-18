@@ -12,6 +12,7 @@
 //! x0xd --check                          # validate config and exit
 //! x0xd --check-updates                  # check/apply updates and exit
 //! x0xd --skip-update-check              # start daemon without startup update check
+//! x0xd doctor                            # diagnose local/runtime health
 //! ```
 
 use std::collections::HashMap;
@@ -211,6 +212,7 @@ struct AppState {
     subscriptions: RwLock<HashMap<String, Subscription>>,
     task_lists: RwLock<HashMap<String, TaskListHandle>>,
     contacts: Arc<RwLock<ContactStore>>,
+    api_address: SocketAddr,
     start_time: Instant,
     broadcast_tx: broadcast::Sender<SseEvent>,
 }
@@ -316,6 +318,18 @@ struct HealthData {
     uptime_secs: u64,
 }
 
+/// Rich runtime status response.
+#[derive(Debug, Serialize)]
+struct StatusData {
+    status: String,
+    version: String,
+    uptime_secs: u64,
+    api_address: String,
+    agent_id: String,
+    peers: usize,
+    warnings: Vec<String>,
+}
+
 /// Agent identity response.
 #[derive(Debug, Serialize)]
 struct AgentData {
@@ -380,6 +394,7 @@ async fn main() -> Result<()> {
     let check_only = args.contains(&"--check".to_string());
     let check_updates_only = args.contains(&"--check-updates".to_string());
     let skip_update_check = args.contains(&"--skip-update-check".to_string());
+    let doctor_mode = args.iter().any(|arg| arg == "doctor" || arg == "--doctor");
 
     let config = match &config_path {
         Some(path) => load_config(path).await?,
@@ -397,6 +412,10 @@ async fn main() -> Result<()> {
     };
 
     init_logging(&config.log_level)?;
+
+    if doctor_mode {
+        return run_doctor(&config).await;
+    }
 
     if check_only {
         println!("Configuration is valid");
@@ -491,7 +510,7 @@ async fn main() -> Result<()> {
         tracing::info!("User key path: {}", user_key_path.display());
     }
 
-    let agent = builder.build().await.context("failed to create agent")?;
+    let agent = Arc::new(builder.build().await.context("failed to create agent")?);
 
     tracing::info!("Agent ID: {}", agent.agent_id());
     tracing::info!("Machine ID: {}", agent.machine_id());
@@ -509,33 +528,37 @@ async fn main() -> Result<()> {
         config.data_dir.join("contacts.json").display()
     );
 
-    // Join network
-    agent
-        .join_network()
-        .await
-        .context("failed to join network")?;
+    // Start network join in the background so the local API is available quickly.
+    {
+        let join_agent = Arc::clone(&agent);
+        let rendezvous_enabled = config.rendezvous_enabled;
+        let rendezvous_validity_ms = config.rendezvous_validity_ms;
+        tokio::spawn(async move {
+            if let Err(err) = join_agent.join_network().await {
+                tracing::warn!("Network join failed: {err}");
+                return;
+            }
 
-    tracing::info!("Network joined");
+            tracing::info!("Network joined");
 
-    // Initial rendezvous advertisement (if enabled)
-    if config.rendezvous_enabled {
-        if let Err(e) = agent
-            .advertise_identity(config.rendezvous_validity_ms)
-            .await
-        {
-            tracing::warn!("Initial rendezvous advertisement failed: {e}");
-        } else {
-            tracing::info!("Rendezvous advertisement published");
-        }
+            if rendezvous_enabled {
+                if let Err(e) = join_agent.advertise_identity(rendezvous_validity_ms).await {
+                    tracing::warn!("Initial rendezvous advertisement failed: {e}");
+                } else {
+                    tracing::info!("Rendezvous advertisement published");
+                }
+            }
+        });
     }
 
     // Build shared state
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
     let state = Arc::new(AppState {
-        agent: Arc::new(agent),
+        agent,
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
         contacts,
+        api_address: config.api_address,
         start_time: Instant::now(),
         broadcast_tx,
     });
@@ -623,6 +646,7 @@ async fn main() -> Result<()> {
     // Build router
     let app = Router::new()
         .route("/health", get(health))
+        .route("/status", get(status))
         .route("/agent", get(agent_info))
         .route("/announce", post(announce_identity))
         .route("/peers", get(peers))
@@ -667,6 +691,166 @@ async fn main() -> Result<()> {
 async fn shutdown_signal() {
     let _ = signal::ctrl_c().await;
     tracing::info!("Received shutdown signal");
+}
+
+async fn run_doctor(config: &DaemonConfig) -> Result<()> {
+    let mut warnings = 0usize;
+    let mut failures = 0usize;
+
+    let print_pass = |msg: &str| println!("PASS {msg}");
+    let mut print_warn = |msg: &str| {
+        warnings += 1;
+        println!("WARN {msg}");
+    };
+    let mut print_fail = |msg: &str| {
+        failures += 1;
+        println!("FAIL {msg}");
+    };
+
+    println!("x0xd doctor");
+    println!("-----------");
+
+    match std::env::current_exe() {
+        Ok(path) => print_pass(&format!("binary path: {}", path.display())),
+        Err(err) => print_warn(&format!("could not determine binary path: {err}")),
+    }
+
+    let in_path = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join("x0xd").exists()))
+        .unwrap_or(false);
+    if in_path {
+        print_pass("x0xd found on PATH");
+    } else {
+        print_warn("x0xd not found on PATH");
+    }
+
+    print_pass("configuration loaded");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let health_url = format!("http://{}/health", config.api_address);
+    let agent_url = format!("http://{}/agent", config.api_address);
+    let status_url = format!("http://{}/status", config.api_address);
+
+    let mut daemon_reachable = false;
+
+    match client.get(&health_url).send().await {
+        Ok(response) if response.status().is_success() => {
+            daemon_reachable = true;
+            print_pass(&format!("daemon reachable at {}", config.api_address));
+
+            match response.json::<serde_json::Value>().await {
+                Ok(body) if body.get("ok").and_then(|v| v.as_bool()) == Some(true) => {
+                    print_pass("/health returned ok=true");
+                }
+                Ok(body) => {
+                    print_warn(&format!("/health returned unexpected payload: {body}"));
+                }
+                Err(err) => {
+                    print_warn(&format!("/health did not return valid JSON: {err}"));
+                }
+            }
+        }
+        Ok(response) => {
+            print_warn(&format!(
+                "daemon responded on /health with HTTP {}",
+                response.status()
+            ));
+        }
+        Err(err) => {
+            print_warn(&format!(
+                "daemon not reachable on {}: {err}",
+                config.api_address
+            ));
+        }
+    }
+
+    if daemon_reachable {
+        match client.get(&agent_url).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let has_agent_id = body
+                            .get("agent_id")
+                            .and_then(|v| v.as_str())
+                            .map(|v| !v.is_empty())
+                            .unwrap_or(false);
+                        if has_agent_id {
+                            print_pass("/agent returned a valid agent_id");
+                        } else {
+                            print_warn("/agent response missing agent_id");
+                        }
+                    }
+                    Err(err) => {
+                        print_warn(&format!("/agent did not return valid JSON: {err}"));
+                    }
+                }
+            }
+            Ok(response) => {
+                print_warn(&format!("/agent returned HTTP {}", response.status()));
+            }
+            Err(err) => {
+                print_warn(&format!("failed to call /agent: {err}"));
+            }
+        }
+
+        match client.get(&status_url).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let connectivity = body
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        print_pass(&format!("/status connectivity state: {connectivity}"));
+                    }
+                    Err(err) => {
+                        print_warn(&format!("/status did not return valid JSON: {err}"));
+                    }
+                }
+            }
+            Ok(response) => {
+                print_warn(&format!("/status returned HTTP {}", response.status()));
+            }
+            Err(err) => {
+                print_warn(&format!("failed to call /status: {err}"));
+            }
+        }
+    } else {
+        match tokio::net::TcpListener::bind(config.api_address).await {
+            Ok(listener) => {
+                drop(listener);
+                print_warn(&format!(
+                    "daemon not running (API address {} is free)",
+                    config.api_address
+                ));
+            }
+            Err(err) => {
+                print_fail(&format!(
+                    "API address {} is in use by another process: {err}",
+                    config.api_address
+                ));
+            }
+        }
+    }
+
+    println!("-----------");
+    if failures > 0 {
+        println!(
+            "Summary: FAIL ({} failure(s), {} warning(s))",
+            failures, warnings
+        );
+        anyhow::bail!("doctor detected failures")
+    } else if warnings > 0 {
+        println!("Summary: WARN ({} warning(s))", warnings);
+        Ok(())
+    } else {
+        println!("Summary: PASS");
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,6 +1343,44 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<ApiResponse<HealthDa
             version: x0x::VERSION.to_string(),
             peers,
             uptime_secs: state.start_time.elapsed().as_secs(),
+        },
+    })
+}
+
+/// GET /status
+async fn status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<StatusData>> {
+    let uptime_secs = state.start_time.elapsed().as_secs();
+    let mut warnings = Vec::new();
+
+    let peers = match state.agent.peers().await {
+        Ok(peer_list) => peer_list.len(),
+        Err(err) => {
+            warnings.push(format!("failed to query peers: {err}"));
+            0
+        }
+    };
+
+    let status = if !warnings.is_empty() {
+        "degraded"
+    } else if peers > 0 {
+        "connected"
+    } else if uptime_secs < 45 {
+        "connecting"
+    } else {
+        "isolated"
+    }
+    .to_string();
+
+    Json(ApiResponse {
+        ok: true,
+        data: StatusData {
+            status,
+            version: x0x::VERSION.to_string(),
+            uptime_secs,
+            api_address: state.api_address.to_string(),
+            agent_id: hex::encode(state.agent.agent_id().as_bytes()),
+            peers,
+            warnings,
         },
     })
 }
