@@ -89,7 +89,12 @@ pub mod mls;
 /// Shared types that span multiple subsystems.
 pub mod types;
 
+/// Group management: lifecycle, pending invites, and background invite listener.
+pub mod groups;
+
 pub use types::GroupId;
+
+pub use groups::{GroupState, GroupSummary, PendingInvite, PendingInviteSummary};
 
 // Re-export key gossip types (including new pubsub components)
 pub use gossip::{
@@ -144,6 +149,8 @@ pub struct Agent {
     heartbeat_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Whether a rendezvous `ProviderSummary` advertisement is active.
     rendezvous_advertised: std::sync::atomic::AtomicBool,
+    /// Group management state (active groups + pending invites).
+    group_state: std::sync::Arc<tokio::sync::RwLock<groups::GroupState>>,
 }
 
 /// A message received from the gossip network.
@@ -1223,6 +1230,231 @@ impl Agent {
             })
     }
 
+    // ---- Group management ----
+
+    /// Create a new private group.
+    ///
+    /// Creates an MLS group with this agent as the sole initial member and
+    /// returns a GroupSummary. The group name is used for display only.
+    pub async fn create_group(&self, name: String) -> error::Result<GroupSummary> {
+        let agent_id = self.agent_id();
+        // Use name bytes as the MLS group_id (simple deterministic scheme for MVP)
+        let mls_group_id =
+            format!("x0x.group.{}.{}", hex::encode(agent_id.as_bytes()), name).into_bytes();
+        let group_id = GroupId::from_mls_group_id(&mls_group_id);
+
+        let mls_group = mls::MlsGroup::new(mls_group_id, agent_id).map_err(|e| {
+            error::IdentityError::CertificateVerification(format!("group creation failed: {e}"))
+        })?;
+
+        let summary = GroupSummary {
+            group_id,
+            name: name.clone(),
+            known_members: 1,
+            member_ids: vec![agent_id],
+        };
+
+        let mut state = self.group_state.write().await;
+        state.groups.insert(group_id, mls_group);
+        state.group_names.insert(group_id, name);
+
+        Ok(summary)
+    }
+
+    /// Invite an agent to a group.
+    ///
+    /// Creates an MLS Welcome message and publishes it on the invitee's
+    /// invite topic (`x0x.invites.v1.{invitee_id_hex}`).
+    pub async fn invite_to_group(
+        &self,
+        group_id: &GroupId,
+        invitee: identity::AgentId,
+    ) -> error::Result<()> {
+        let state = self.group_state.read().await;
+        let mls_group = state.groups.get(group_id).ok_or_else(|| {
+            error::IdentityError::CertificateVerification("group not found".to_string())
+        })?;
+
+        let welcome = mls::MlsWelcome::create(mls_group, &invitee).map_err(|e| {
+            error::IdentityError::CertificateVerification(format!("welcome creation failed: {e}"))
+        })?;
+        drop(state); // release read lock before publish
+
+        let welcome_bytes = bincode::serialize(&welcome).map_err(|e| {
+            error::IdentityError::Serialization(format!("welcome serialization failed: {e}"))
+        })?;
+
+        let topic = format!("x0x.invites.v1.{}", hex::encode(invitee.as_bytes()));
+        self.publish(&topic, welcome_bytes).await?;
+
+        Ok(())
+    }
+
+    /// List pending invites.
+    pub async fn list_pending_invites(&self) -> Vec<groups::PendingInviteSummary> {
+        let state = self.group_state.read().await;
+        state
+            .pending_invites
+            .values()
+            .map(|invite| {
+                let group_id = GroupId::from_mls_group_id(invite.welcome.group_id());
+                groups::PendingInviteSummary {
+                    group_id,
+                    sender: invite.sender,
+                    verified: invite.verified,
+                    trust_level: invite.trust_level,
+                    received_at: invite.received_at,
+                }
+            })
+            .collect()
+    }
+
+    /// Accept a pending invite.
+    ///
+    /// Validation order (cheap first, expensive last):
+    /// 1. Pending invite exists for (group_id, sender)
+    /// 2. invite.verified == true
+    /// 3. Local agent identity matches welcome invitee
+    /// 4. Group construction from welcome succeeds
+    /// 5. Remove pending invite and activate group
+    pub async fn accept_invite(
+        &self,
+        group_id: &GroupId,
+        sender: &identity::AgentId,
+    ) -> error::Result<GroupSummary> {
+        let agent_id = self.agent_id();
+        let mut state = self.group_state.write().await;
+
+        let invite = state
+            .pending_invites
+            .get(&(*group_id, *sender))
+            .ok_or_else(|| {
+                error::IdentityError::CertificateVerification("invite not found".to_string())
+            })?;
+
+        if !invite.verified {
+            return Err(error::IdentityError::CertificateVerification(
+                "invite signature not verified".to_string(),
+            ));
+        }
+
+        let mls_group = mls::MlsGroup::from_welcome(&invite.welcome, agent_id).map_err(|e| {
+            error::IdentityError::CertificateVerification(format!("failed to join group: {e}"))
+        })?;
+
+        let name = format!("group-{}", &group_id.to_hex()[..8]);
+        let member_ids: Vec<identity::AgentId> = mls_group.members().keys().copied().collect();
+        let summary = GroupSummary {
+            group_id: *group_id,
+            name: name.clone(),
+            known_members: member_ids.len(),
+            member_ids,
+        };
+
+        // Only mutate state after all validation passes
+        state.pending_invites.remove(&(*group_id, *sender));
+        state.groups.insert(*group_id, mls_group);
+        state.group_names.insert(*group_id, name);
+
+        Ok(summary)
+    }
+
+    /// Reject a pending invite.
+    pub async fn reject_invite(
+        &self,
+        group_id: &GroupId,
+        sender: &identity::AgentId,
+    ) -> error::Result<()> {
+        let mut state = self.group_state.write().await;
+        state
+            .pending_invites
+            .remove(&(*group_id, *sender))
+            .ok_or_else(|| {
+                error::IdentityError::CertificateVerification("invite not found".to_string())
+            })?;
+        Ok(())
+    }
+
+    /// List all groups this agent is a member of.
+    pub async fn list_groups(&self) -> Vec<GroupSummary> {
+        let state = self.group_state.read().await;
+        state
+            .groups
+            .iter()
+            .map(|(group_id, mls_group)| {
+                let name = state.group_names.get(group_id).cloned().unwrap_or_default();
+                let member_ids: Vec<identity::AgentId> =
+                    mls_group.members().keys().copied().collect();
+                GroupSummary {
+                    group_id: *group_id,
+                    name,
+                    known_members: member_ids.len(),
+                    member_ids,
+                }
+            })
+            .collect()
+    }
+
+    /// Get the shared group state (for use by background listeners and sync).
+    pub fn group_state(&self) -> &std::sync::Arc<tokio::sync::RwLock<groups::GroupState>> {
+        &self.group_state
+    }
+
+    /// Start the background invite listener.
+    ///
+    /// Subscribes to `x0x.invites.v1.{self.agent_id_hex}` and stores
+    /// incoming verified invites as pending.
+    pub async fn start_invite_listener(&self) -> error::Result<()> {
+        let agent_id = self.agent_id();
+        let topic = format!("x0x.invites.v1.{}", hex::encode(agent_id.as_bytes()));
+        let mut subscription = self.subscribe(&topic).await?;
+        let group_state = self.group_state.clone();
+
+        tokio::spawn(async move {
+            while let Some(msg) = subscription.recv().await {
+                // Only process V2 signed messages
+                if !msg.verified {
+                    tracing::debug!("ignoring unverified invite message");
+                    continue;
+                }
+
+                let Some(sender) = msg.sender else {
+                    tracing::debug!("ignoring invite without sender");
+                    continue;
+                };
+
+                // Deserialize the welcome
+                let welcome: mls::MlsWelcome = match bincode::deserialize(&msg.payload) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::debug!("failed to deserialize invite welcome: {e}");
+                        continue;
+                    }
+                };
+
+                let group_id = GroupId::from_mls_group_id(welcome.group_id());
+                let received_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let pending = groups::PendingInvite {
+                    welcome,
+                    sender,
+                    verified: msg.verified,
+                    trust_level: msg.trust_level,
+                    received_at,
+                };
+
+                let mut state = group_state.write().await;
+                state.pending_invites.insert((group_id, sender), pending);
+                tracing::info!("received invite for group {} from {}", group_id, sender);
+            }
+        });
+
+        Ok(())
+    }
+
     /// Get connected peer IDs.
     ///
     /// Returns the list of peers currently connected via the gossip network.
@@ -2103,6 +2335,9 @@ impl AgentBuilder {
             identity_ttl_secs: self.identity_ttl_secs.unwrap_or(IDENTITY_TTL_SECS),
             heartbeat_handle: tokio::sync::Mutex::new(None),
             rendezvous_advertised: std::sync::atomic::AtomicBool::new(false),
+            group_state: std::sync::Arc::new(tokio::sync::RwLock::new(
+                groups::GroupState::default(),
+            )),
         })
     }
 }
