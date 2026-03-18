@@ -5,7 +5,7 @@
 //! management, and commit operations for forward-secure group encryption.
 
 use crate::identity::{AgentCertificate, AgentId, UserId};
-use crate::mls::{MlsError, Result};
+use crate::mls::{MlsError, MlsWelcome, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -258,7 +258,7 @@ impl MlsCommit {
 /// The `MlsGroup` tracks membership, handles commits, and manages the group's
 /// cryptographic state across epochs. It provides the foundation for end-to-end
 /// encrypted group messaging.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MlsGroup {
     /// Unique identifier for this group.
     group_id: Vec<u8>,
@@ -295,6 +295,36 @@ impl MlsGroup {
             members,
             pending_commits: Vec::new(),
             epoch: 0,
+        })
+    }
+
+    /// Creates an `MlsGroup` from a Welcome message.
+    ///
+    /// The acceptor decrypts the Welcome to obtain the group context, then
+    /// becomes the only known member of the resulting group.
+    ///
+    /// # Arguments
+    /// * `welcome` - The Welcome message received from an existing group member
+    /// * `acceptor` - The AgentId of the agent accepting the invitation
+    ///
+    /// # Returns
+    /// A new `MlsGroup` whose state matches the group that issued the Welcome.
+    ///
+    /// # Errors
+    /// Returns an error if the Welcome cannot be accepted (wrong agent, decryption
+    /// failure, or verification failure).
+    pub fn from_welcome(welcome: &MlsWelcome, acceptor: AgentId) -> Result<Self> {
+        let context = welcome.accept(&acceptor)?;
+        let group_id = context.group_id().to_vec();
+        let epoch = context.epoch();
+        let mut members = HashMap::new();
+        members.insert(acceptor, MlsMemberInfo::new(acceptor, epoch));
+        Ok(Self {
+            group_id,
+            context,
+            members,
+            pending_commits: Vec::new(),
+            epoch,
         })
     }
 
@@ -718,5 +748,84 @@ mod tests {
         assert_eq!(commit.operations().len(), 1);
         assert_eq!(commit.new_tree_hash(), tree_hash.as_slice());
         assert_eq!(commit.new_transcript_hash(), transcript_hash.as_slice());
+    }
+
+    #[test]
+    fn test_mls_group_serde_roundtrip() {
+        let group_id = b"serde-group".to_vec();
+        let initiator = test_agent_id(1);
+        let member = test_agent_id(2);
+
+        let mut group = MlsGroup::new(group_id, initiator).unwrap();
+        group.add_member(member).unwrap();
+
+        // Serialize with bincode
+        let serialized = bincode::serialize(&group).expect("serialization failed");
+        let deserialized: MlsGroup =
+            bincode::deserialize(&serialized).expect("deserialization failed");
+
+        // Verify fields match
+        assert_eq!(deserialized.group_id(), group.group_id());
+        assert_eq!(deserialized.current_epoch(), group.current_epoch());
+        assert_eq!(deserialized.members().len(), group.members().len());
+        assert!(deserialized.is_member(&initiator));
+        assert!(deserialized.is_member(&member));
+        assert_eq!(
+            deserialized.context().tree_hash(),
+            group.context().tree_hash()
+        );
+        assert_eq!(
+            deserialized.context().confirmed_transcript_hash(),
+            group.context().confirmed_transcript_hash()
+        );
+    }
+
+    #[test]
+    fn test_from_welcome() {
+        use crate::identity::Identity;
+        use crate::mls::MlsWelcome;
+
+        let creator_identity = Identity::generate().expect("identity generation failed");
+        let creator = creator_identity.agent_id();
+        let group_id = b"welcome-group".to_vec();
+        let group = MlsGroup::new(group_id.clone(), creator).unwrap();
+
+        let invitee_identity = Identity::generate().expect("identity generation failed");
+        let invitee = invitee_identity.agent_id();
+
+        // Create welcome for invitee
+        let welcome = MlsWelcome::create(&group, &invitee).expect("welcome creation failed");
+
+        // Accept via from_welcome
+        let joined = MlsGroup::from_welcome(&welcome, invitee).expect("from_welcome failed");
+
+        assert_eq!(joined.group_id(), group_id.as_slice());
+        assert_eq!(joined.current_epoch(), group.current_epoch());
+        assert_eq!(joined.members().len(), 1);
+        assert!(joined.is_member(&invitee));
+    }
+
+    #[test]
+    fn test_from_welcome_wrong_agent() {
+        use crate::identity::Identity;
+        use crate::mls::MlsWelcome;
+
+        let creator_identity = Identity::generate().expect("identity generation failed");
+        let creator = creator_identity.agent_id();
+        let group_id = b"welcome-group".to_vec();
+        let group = MlsGroup::new(group_id, creator).unwrap();
+
+        let invitee_identity = Identity::generate().expect("identity generation failed");
+        let invitee = invitee_identity.agent_id();
+
+        let wrong_identity = Identity::generate().expect("identity generation failed");
+        let wrong_agent = wrong_identity.agent_id();
+
+        // Create welcome for invitee
+        let welcome = MlsWelcome::create(&group, &invitee).expect("welcome creation failed");
+
+        // Wrong agent tries from_welcome
+        let result = MlsGroup::from_welcome(&welcome, wrong_agent);
+        assert!(result.is_err());
     }
 }
