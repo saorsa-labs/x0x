@@ -19,9 +19,12 @@ pub struct EncryptedTaskListDelta {
     group_id: Vec<u8>,
     /// Epoch when this delta was encrypted.
     epoch: u64,
+    /// Nonce counter, carried in the clear. Must be unique per message
+    /// within the same epoch key to ensure ChaCha20-Poly1305 security.
+    counter: u64,
     /// Encrypted delta ciphertext (includes authentication tag).
     ciphertext: Vec<u8>,
-    /// Additional authenticated data (group_id + epoch).
+    /// Additional authenticated data (group_id + epoch + counter).
     aad: Vec<u8>,
 }
 
@@ -45,10 +48,15 @@ impl EncryptedTaskListDelta {
     /// - Encryption operation fails
     ///
     /// # Security
-    /// The group_id and epoch are included in the AAD (Additional Authenticated Data),
-    /// binding the ciphertext to a specific group and epoch. This prevents replay attacks
-    /// and cross-group confusion.
-    pub fn encrypt(delta: &TaskListDelta, group: &MlsGroup, cipher: &MlsCipher) -> MlsResult<Self> {
+    /// The group_id, epoch, and counter are included in the AAD (Additional
+    /// Authenticated Data), binding the ciphertext to a specific group, epoch,
+    /// and nonce. This prevents replay attacks and cross-group confusion.
+    pub fn encrypt(
+        delta: &TaskListDelta,
+        group: &MlsGroup,
+        cipher: &MlsCipher,
+        counter: u64,
+    ) -> MlsResult<Self> {
         let context = group.context();
         let group_id = context.group_id().to_vec();
         let epoch = context.epoch();
@@ -57,18 +65,20 @@ impl EncryptedTaskListDelta {
         let plaintext = bincode::serialize(delta)
             .map_err(|e| MlsError::EncryptionError(format!("delta serialization failed: {}", e)))?;
 
-        // Build AAD: "EncryptedDelta" || group_id || epoch
+        // Build AAD: "EncryptedDelta" || group_id || epoch || counter
         let mut aad = Vec::new();
         aad.extend_from_slice(b"EncryptedDelta");
         aad.extend_from_slice(&group_id);
         aad.extend_from_slice(&epoch.to_le_bytes());
+        aad.extend_from_slice(&counter.to_le_bytes());
 
-        // Encrypt with counter 0 (each delta is a single message)
-        let ciphertext = cipher.encrypt(&plaintext, &aad, 0)?;
+        // Encrypt with the provided counter for nonce derivation
+        let ciphertext = cipher.encrypt(&plaintext, &aad, counter)?;
 
         Ok(Self {
             group_id,
             epoch,
+            counter,
             ciphertext,
             aad,
         })
@@ -96,8 +106,8 @@ impl EncryptedTaskListDelta {
     /// - Wrong epoch key is being used
     /// - The AAD doesn't match (wrong group or epoch)
     pub fn decrypt(&self, cipher: &MlsCipher) -> MlsResult<TaskListDelta> {
-        // Decrypt with counter 0
-        let plaintext = cipher.decrypt(&self.ciphertext, &self.aad, 0)?;
+        // Decrypt using the counter carried in the envelope
+        let plaintext = cipher.decrypt(&self.ciphertext, &self.aad, self.counter)?;
 
         // Deserialize the delta
         bincode::deserialize(&plaintext)
@@ -118,13 +128,17 @@ impl EncryptedTaskListDelta {
     ///
     /// # Errors
     /// Returns `MlsError` if key derivation or encryption fails.
-    pub fn encrypt_with_group(delta: &TaskListDelta, group: &MlsGroup) -> MlsResult<Self> {
+    pub fn encrypt_with_group(
+        delta: &TaskListDelta,
+        group: &MlsGroup,
+        counter: u64,
+    ) -> MlsResult<Self> {
         let key_schedule = MlsKeySchedule::from_group(group)?;
         let cipher = MlsCipher::new(
             key_schedule.encryption_key().to_vec(),
             key_schedule.base_nonce().to_vec(),
         );
-        Self::encrypt(delta, group, &cipher)
+        Self::encrypt(delta, group, &cipher, counter)
     }
 
     /// Decrypts this delta using the key schedule derived from a group.
@@ -181,6 +195,12 @@ impl EncryptedTaskListDelta {
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Gets the nonce counter for this encrypted delta.
+    #[must_use]
+    pub fn counter(&self) -> u64 {
+        self.counter
     }
 
     /// Gets the ciphertext (including authentication tag).
@@ -245,8 +265,8 @@ mod tests {
         let delta = create_test_delta();
 
         // Encrypt
-        let encrypted =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0)
+            .expect("encryption failed");
 
         assert_eq!(encrypted.group_id(), group.context().group_id());
         assert_eq!(encrypted.epoch(), group.current_epoch());
@@ -267,8 +287,8 @@ mod tests {
         let (group, group_id) = create_test_group();
         let delta = create_test_delta();
 
-        let encrypted =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0)
+            .expect("encryption failed");
 
         assert_eq!(encrypted.group_id(), &group_id);
         assert_eq!(encrypted.epoch(), 0);
@@ -280,8 +300,8 @@ mod tests {
         let delta = create_test_delta();
 
         // Encrypt at epoch 0
-        let encrypted =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0)
+            .expect("encryption failed");
 
         // Simulate epoch change
         let commit = group.commit().expect("commit failed");
@@ -311,8 +331,8 @@ mod tests {
         let delta = create_test_delta();
 
         // Encrypt with group1
-        let encrypted =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group1).expect("encryption failed");
+        let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &group1, 0)
+            .expect("encryption failed");
 
         // Try to decrypt with group2 (different group_id)
         let result = encrypted.decrypt_with_group(&group2);
@@ -329,8 +349,8 @@ mod tests {
         let (group, _) = create_test_group();
         let delta = create_test_delta();
 
-        let mut encrypted =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        let mut encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0)
+            .expect("encryption failed");
 
         // Tamper with ciphertext
         encrypted.ciphertext[0] ^= 1;
@@ -347,16 +367,16 @@ mod tests {
         let delta = create_test_delta();
 
         // Encrypt at epoch 0
-        let encrypted1 =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        let encrypted1 = EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0)
+            .expect("encryption failed");
 
         // Advance epoch
         let commit = group.commit().expect("commit failed");
         group.apply_commit(&commit).expect("apply failed");
 
         // Encrypt same delta at epoch 1
-        let encrypted2 =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        let encrypted2 = EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0)
+            .expect("encryption failed");
 
         // Ciphertexts should be different
         assert_ne!(encrypted1.ciphertext(), encrypted2.ciphertext());
@@ -368,8 +388,8 @@ mod tests {
         let (group, _) = create_test_group();
         let delta = TaskListDelta::new(1); // Empty delta
 
-        let encrypted =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0)
+            .expect("encryption failed");
 
         let decrypted = encrypted
             .decrypt_with_group(&group)
@@ -407,8 +427,8 @@ mod tests {
             delta.added_tasks.insert(task_id, (task, tag));
         }
 
-        let encrypted =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0)
+            .expect("encryption failed");
 
         let decrypted = encrypted
             .decrypt_with_group(&group)
@@ -422,8 +442,8 @@ mod tests {
         let (group, _) = create_test_group();
         let delta = create_test_delta();
 
-        let encrypted =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0)
+            .expect("encryption failed");
 
         // Serialize and deserialize (using bincode)
         let serialized = bincode::serialize(&encrypted).expect("serialization failed");
@@ -440,8 +460,8 @@ mod tests {
         let (group, _) = create_test_group();
         let delta = create_test_delta();
 
-        let encrypted =
-            EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0)
+            .expect("encryption failed");
 
         let aad = encrypted.aad();
 
@@ -450,5 +470,29 @@ mod tests {
 
         // AAD should be longer than just the prefix (includes group_id and epoch)
         assert!(aad.len() > b"EncryptedDelta".len());
+    }
+
+    #[test]
+    fn test_nonce_counter_produces_different_ciphertexts() {
+        let (group, _) = create_test_group();
+        let delta = create_test_delta();
+
+        let encrypted0 =
+            EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0).expect("encrypt c=0");
+        let encrypted1 =
+            EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 1).expect("encrypt c=1");
+
+        // Same plaintext + same key but different counters must yield different ciphertexts
+        assert_ne!(
+            encrypted0.ciphertext(),
+            encrypted1.ciphertext(),
+            "different counters must produce different ciphertexts"
+        );
+
+        // Both must round-trip successfully
+        let dec0 = encrypted0.decrypt_with_group(&group).expect("decrypt c=0");
+        let dec1 = encrypted1.decrypt_with_group(&group).expect("decrypt c=1");
+        assert_eq!(dec0.version, delta.version);
+        assert_eq!(dec1.version, delta.version);
     }
 }

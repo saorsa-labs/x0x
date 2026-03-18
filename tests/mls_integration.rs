@@ -114,7 +114,7 @@ async fn test_forward_secrecy() {
     // Create a delta and encrypt at epoch 0
     let delta1 = TaskListDelta::new(1);
     let encrypted1 =
-        EncryptedTaskListDelta::encrypt_with_group(&delta1, &group).expect("encryption failed");
+        EncryptedTaskListDelta::encrypt_with_group(&delta1, &group, 0).expect("encryption failed");
 
     // Advance epoch
     let commit = group.commit().expect("commit failed");
@@ -127,7 +127,7 @@ async fn test_forward_secrecy() {
     // But we can encrypt/decrypt at the new epoch
     let delta2 = TaskListDelta::new(2);
     let encrypted2 =
-        EncryptedTaskListDelta::encrypt_with_group(&delta2, &group).expect("encryption failed");
+        EncryptedTaskListDelta::encrypt_with_group(&delta2, &group, 0).expect("encryption failed");
     let decrypted2 = encrypted2
         .decrypt_with_group(&group)
         .expect("decryption failed");
@@ -146,7 +146,7 @@ async fn test_encrypted_task_list_sync() {
     // Create and encrypt a task list delta
     let delta = TaskListDelta::new(1);
     let encrypted =
-        EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0).expect("encryption failed");
 
     // Verify encryption metadata
     assert_eq!(encrypted.group_id(), group.context().group_id());
@@ -191,7 +191,7 @@ async fn test_multi_agent_group_operations() {
 
     // Initiator encrypts
     let encrypted =
-        EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0).expect("encryption failed");
 
     // All members can decrypt (in practice, they'd have the same group keys)
     let decrypted = encrypted
@@ -253,7 +253,7 @@ async fn test_encryption_authentication() {
 
     let delta = TaskListDelta::new(1);
     let encrypted =
-        EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0).expect("encryption failed");
 
     // Tamper with ciphertext
     let ciphertext = encrypted.ciphertext().to_vec();
@@ -262,7 +262,7 @@ async fn test_encryption_authentication() {
 
     // Create new encrypted delta with tampered ciphertext (simulate network attack)
     let _tampered_encrypted =
-        EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+        EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0).expect("encryption failed");
     // In real scenario, attacker would modify the serialized bytes
 
     // For this test, just verify that tampering the actual struct's ciphertext field

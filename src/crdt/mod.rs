@@ -43,7 +43,7 @@ pub use delta::TaskListDelta;
 pub use encrypted::EncryptedTaskListDelta;
 pub use error::{CrdtError, Result};
 pub use persistence::TaskListStorage;
-pub use sync::TaskListSync;
+pub use sync::{EncryptedTaskListSync, TaskListSync};
 pub use task::{TaskId, TaskMetadata};
 pub use task_item::TaskItem;
 pub use task_list::{TaskList, TaskListId};

@@ -14,8 +14,10 @@
 
 use crate::crdt::{Result, TaskList, TaskListDelta};
 use crate::gossip::PubSubManager;
+use crate::types::GroupId;
 use saorsa_gossip_crdt_sync::AntiEntropyManager;
 use saorsa_gossip_types::PeerId;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -217,6 +219,150 @@ impl TaskListSync {
     }
 
     /// Get the topic name for this task list.
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+}
+
+/// Encrypted synchronization wrapper for a TaskList within an MLS group.
+///
+/// Like `TaskListSync` but encrypts/decrypts deltas with the group's
+/// epoch key. Owns an `AtomicU64` nonce counter that increments on
+/// each publish to ensure nonce uniqueness.
+pub struct EncryptedTaskListSync {
+    /// The task list being synchronized.
+    task_list: Arc<RwLock<TaskList>>,
+    /// The MLS group (for key derivation).
+    mls_group: Arc<RwLock<crate::mls::MlsGroup>>,
+    /// Pub/sub manager for topic-based messaging.
+    pubsub: Arc<PubSubManager>,
+    /// Topic name for encrypted deltas: `x0x.group.{group_id_hex}.tasklist`
+    topic: String,
+    /// Monotonically increasing nonce counter.
+    counter: AtomicU64,
+}
+
+impl EncryptedTaskListSync {
+    /// Create a new encrypted task list synchronization manager.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_list` - The TaskList to synchronize
+    /// * `mls_group` - The MLS group for key derivation (shared via `Arc<RwLock<>>`)
+    /// * `pubsub` - Pub/sub manager for gossip messaging
+    /// * `group_id` - The application-facing group identifier
+    pub fn new(
+        task_list: TaskList,
+        mls_group: Arc<RwLock<crate::mls::MlsGroup>>,
+        pubsub: Arc<PubSubManager>,
+        group_id: &GroupId,
+    ) -> Self {
+        let topic = format!("x0x.group.{}.tasklist", group_id.to_hex());
+        Self {
+            task_list: Arc::new(RwLock::new(task_list)),
+            mls_group,
+            pubsub,
+            topic,
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Start background receive loop.
+    ///
+    /// Subscribes to the encrypted gossip topic and spawns a task that
+    /// deserializes, decrypts, and merges incoming deltas into the local
+    /// task list. Returns immediately; synchronization runs in the background.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be established.
+    pub async fn start(&self) -> Result<()> {
+        let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
+        let task_list = Arc::clone(&self.task_list);
+        let mls_group = Arc::clone(&self.mls_group);
+
+        tokio::spawn(async move {
+            while let Some(msg) = sub.recv().await {
+                // Deserialize encrypted envelope
+                let encrypted: crate::crdt::EncryptedTaskListDelta =
+                    match bincode::deserialize(&msg.payload) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::debug!("encrypted delta deserialization failed: {e}");
+                            continue;
+                        }
+                    };
+
+                // Decrypt using group key
+                let group = mls_group.read().await;
+                let delta = match encrypted.decrypt_with_group(&group) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        tracing::debug!("encrypted delta decryption failed");
+                        continue;
+                    }
+                };
+                drop(group);
+
+                // Extract peer_id from the message sender if available,
+                // otherwise use a default.
+                let peer_id = PeerId::new([0u8; 32]); // TODO: extract from V2 sender
+
+                let mut list = task_list.write().await;
+                if let Err(e) = list.merge_delta(&delta, peer_id) {
+                    tracing::warn!("failed to merge decrypted delta: {e}");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Publish an encrypted delta to the group topic.
+    ///
+    /// Encrypts the delta with the current MLS epoch key and a unique nonce
+    /// counter, then publishes the serialized envelope to the gossip topic.
+    ///
+    /// # Arguments
+    ///
+    /// * `_local_peer_id` - The local peer's ID (reserved for future sender tagging)
+    /// * `delta` - The delta to encrypt and publish
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encryption, serialization, or publishing fails.
+    pub async fn publish_delta(&self, _local_peer_id: PeerId, delta: TaskListDelta) -> Result<()> {
+        let counter = self.counter.fetch_add(1, Ordering::Relaxed);
+
+        let group = self.mls_group.read().await;
+        let encrypted =
+            crate::crdt::EncryptedTaskListDelta::encrypt_with_group(&delta, &group, counter)
+                .map_err(|e| crate::crdt::CrdtError::Gossip(format!("encryption failed: {e}")))?;
+        drop(group);
+
+        let serialized = bincode::serialize(&encrypted)
+            .map_err(|e| crate::crdt::CrdtError::Gossip(format!("serialization failed: {e}")))?;
+
+        self.pubsub
+            .publish(self.topic.clone(), bytes::Bytes::from(serialized))
+            .await
+            .map_err(|e| crate::crdt::CrdtError::Gossip(format!("publish failed: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Get a read guard to the task list.
+    pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, TaskList> {
+        self.task_list.read().await
+    }
+
+    /// Get a write guard to the task list.
+    pub async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, TaskList> {
+        self.task_list.write().await
+    }
+
+    /// Get the topic name.
     #[must_use]
     pub fn topic(&self) -> &str {
         &self.topic
