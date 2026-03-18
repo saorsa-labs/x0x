@@ -39,7 +39,7 @@ use tower_http::cors::CorsLayer;
 use x0x::contacts::{ContactStore, TrustLevel};
 use x0x::identity::AgentId;
 use x0x::network::NetworkConfig;
-use x0x::{Agent, Subscription, TaskListHandle};
+use x0x::{Agent, GroupId, GroupSummary, Subscription, TaskListHandle};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -260,6 +260,26 @@ struct AddTaskRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateTaskRequest {
     action: String, // "claim" or "complete"
+}
+
+/// POST /groups request body.
+#[derive(Debug, Deserialize)]
+struct CreateGroupRequest {
+    name: String,
+}
+
+/// POST /groups/:id/invite request body.
+#[derive(Debug, Deserialize)]
+struct InviteRequest {
+    /// Hex-encoded AgentId of the invitee (64 hex chars = 32 bytes).
+    agent_id: String,
+}
+
+/// POST /invites/:group_id/accept and reject request body.
+#[derive(Debug, Deserialize)]
+struct InviteActionRequest {
+    /// Hex-encoded AgentId of the invite sender.
+    sender: String,
 }
 
 /// POST /contacts request body.
@@ -645,6 +665,16 @@ async fn main() -> Result<()> {
         .route("/task-lists/:id/tasks", get(list_tasks))
         .route("/task-lists/:id/tasks", post(add_task))
         .route("/task-lists/:id/tasks/:tid", patch(update_task))
+        .route("/groups", post(create_group))
+        .route("/groups", get(list_groups))
+        .route("/groups/:id", get(get_group))
+        .route("/groups/:id/invite", post(invite_to_group))
+        .route("/invites", get(list_invites))
+        .route("/invites/:group_id/accept", post(accept_invite))
+        .route("/invites/:group_id/reject", post(reject_invite))
+        .route("/groups/:id/tasks", get(list_group_tasks))
+        .route("/groups/:id/tasks", post(add_group_task))
+        .route("/groups/:id/tasks/:tid", patch(update_group_task))
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 
@@ -1844,6 +1874,244 @@ async fn update_task(
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Group handlers
+// ---------------------------------------------------------------------------
+
+/// Serialize a GroupSummary into a JSON value with hex-encoded IDs.
+fn group_summary_to_json(g: &GroupSummary) -> serde_json::Value {
+    serde_json::json!({
+        "group_id": g.group_id.to_hex(),
+        "name": g.name,
+        "known_members": g.known_members,
+        "member_ids": g.member_ids.iter().map(|id| hex::encode(id.0)).collect::<Vec<_>>(),
+    })
+}
+
+/// POST /groups
+async fn create_group(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateGroupRequest>,
+) -> impl IntoResponse {
+    match state.agent.create_group(req.name).await {
+        Ok(summary) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "ok": true, "group": group_summary_to_json(&summary) })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /groups
+async fn list_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let groups = state.agent.list_groups().await;
+    let entries: Vec<serde_json::Value> = groups.iter().map(group_summary_to_json).collect();
+    Json(serde_json::json!({ "ok": true, "groups": entries }))
+}
+
+/// GET /groups/:id
+async fn get_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let group_id = match GroupId::from_hex(&id) {
+        Ok(gid) => gid,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid group ID: {e}") })),
+            );
+        }
+    };
+
+    let gs = state.agent.group_state().read().await;
+    if gs.groups.contains_key(&group_id) {
+        let name = gs.group_names.get(&group_id).cloned().unwrap_or_default();
+        let member_ids: Vec<AgentId> = gs
+            .groups
+            .get(&group_id)
+            .map(|g| g.members().keys().copied().collect())
+            .unwrap_or_default();
+        let summary = GroupSummary {
+            group_id,
+            name,
+            known_members: member_ids.len(),
+            member_ids,
+        };
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "group": group_summary_to_json(&summary) })),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        )
+    }
+}
+
+/// POST /groups/:id/invite
+async fn invite_to_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<InviteRequest>,
+) -> impl IntoResponse {
+    let group_id = match GroupId::from_hex(&id) {
+        Ok(gid) => gid,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid group ID: {e}") })),
+            );
+        }
+    };
+
+    let invitee = match parse_agent_id_hex(&req.agent_id) {
+        Ok(aid) => aid,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid agent_id: {e}") })),
+            );
+        }
+    };
+
+    match state.agent.invite_to_group(&group_id, invitee).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /invites
+async fn list_invites(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let invites = state.agent.list_pending_invites().await;
+    let entries: Vec<serde_json::Value> = invites
+        .iter()
+        .map(|inv| {
+            serde_json::json!({
+                "group_id": inv.group_id.to_hex(),
+                "sender": hex::encode(inv.sender.0),
+                "verified": inv.verified,
+                "trust_level": inv.trust_level.as_ref().map(|t| format!("{t:?}")),
+                "received_at": inv.received_at,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "ok": true, "invites": entries }))
+}
+
+/// POST /invites/:group_id/accept
+async fn accept_invite(
+    State(state): State<Arc<AppState>>,
+    Path(group_id_hex): Path<String>,
+    Json(req): Json<InviteActionRequest>,
+) -> impl IntoResponse {
+    let group_id = match GroupId::from_hex(&group_id_hex) {
+        Ok(gid) => gid,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid group ID: {e}") })),
+            );
+        }
+    };
+
+    let sender = match parse_agent_id_hex(&req.sender) {
+        Ok(aid) => aid,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid sender: {e}") })),
+            );
+        }
+    };
+
+    match state.agent.accept_invite(&group_id, &sender).await {
+        Ok(summary) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "group": group_summary_to_json(&summary) })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// POST /invites/:group_id/reject
+async fn reject_invite(
+    State(state): State<Arc<AppState>>,
+    Path(group_id_hex): Path<String>,
+    Json(req): Json<InviteActionRequest>,
+) -> impl IntoResponse {
+    let group_id = match GroupId::from_hex(&group_id_hex) {
+        Ok(gid) => gid,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid group ID: {e}") })),
+            );
+        }
+    };
+
+    let sender = match parse_agent_id_hex(&req.sender) {
+        Ok(aid) => aid,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid sender: {e}") })),
+            );
+        }
+    };
+
+    match state.agent.reject_invite(&group_id, &sender).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /groups/:id/tasks — stub (501 Not Implemented).
+async fn list_group_tasks(Path(_id): Path<String>) -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "group task list operations require EncryptedTaskListSync (pending network integration)"
+        })),
+    )
+}
+
+/// POST /groups/:id/tasks — stub (501 Not Implemented).
+async fn add_group_task(Path(_id): Path<String>) -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "group task list operations require EncryptedTaskListSync (pending network integration)"
+        })),
+    )
+}
+
+/// PATCH /groups/:id/tasks/:tid — stub (501 Not Implemented).
+async fn update_group_task(Path((_id, _tid)): Path<(String, String)>) -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "group task list operations require EncryptedTaskListSync (pending network integration)"
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
