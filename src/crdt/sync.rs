@@ -293,7 +293,6 @@ impl EncryptedTaskListSync {
         let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
         let task_list = Arc::clone(&self.task_list);
         let mls_group = Arc::clone(&self.mls_group);
-
         tokio::spawn(async move {
             while let Some(msg) = sub.recv().await {
                 // Deserialize encrypted envelope
@@ -310,8 +309,8 @@ impl EncryptedTaskListSync {
                 let group = mls_group.read().await;
                 let delta = match encrypted.decrypt_with_group(&group) {
                     Ok(d) => d,
-                    Err(_) => {
-                        tracing::debug!("encrypted delta decryption failed");
+                    Err(e) => {
+                        tracing::debug!("encrypted delta decryption failed: {e}");
                         continue;
                     }
                 };

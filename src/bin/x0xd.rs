@@ -2401,7 +2401,6 @@ mod tests {
         let (url_b, agent_b, _quic_b, _dir_b) = spawn_daemon(vec![quic_a]).await;
 
         let client = reqwest::Client::new();
-
         // --- Phase 1: Group creation and membership ---
 
         // 1. Create group on A
@@ -2436,7 +2435,7 @@ mod tests {
 
         // 4. Poll B's /invites until the invite arrives (timeout: 6s)
         let mut invite_found = false;
-        for _ in 0..30 {
+        for _ in 0..100 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let resp = client.get(format!("{url_b}/invites")).send().await.unwrap();
             let body: serde_json::Value = resp.json().await.unwrap();
@@ -2451,7 +2450,7 @@ mod tests {
                 break;
             }
         }
-        assert!(invite_found, "invite did not arrive at B within 6s");
+        assert!(invite_found, "invite did not arrive at B within 20s");
 
         // 5. Accept invite on B
         let a_agent_id_hex = hex::encode(agent_a.agent_id().0);
@@ -2478,7 +2477,7 @@ mod tests {
             "B has no groups"
         );
 
-        // --- Phase 2: A adds task, B reads it ---
+        // --- Phase 2: A adds task, B sees it ---
 
         // 7. A adds a task
         let resp = client
@@ -2507,136 +2506,128 @@ mod tests {
         assert_eq!(tasks[0]["title"].as_str().unwrap(), "Build thing");
         assert_eq!(tasks[0]["state"].as_str().unwrap(), "empty");
 
-        // 9. B sees the task locally (B's encrypted sync has its own TaskList
-        //    but the task was added on A's side only — encrypted gossip replication
-        //    is best-effort and may not arrive instantly. For the MVP the task is
-        //    guaranteed on A; B can independently add/claim tasks on its own list.
-        //    Here we test B's local task operations via REST.)
+        // 9. Poll B until the task from A appears via encrypted replication.
+        let mut b_saw_task = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let resp = client
+                .get(format!("{url_b}/groups/{group_id}/tasks"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            let b_tasks = body["tasks"].as_array().unwrap();
 
-        // --- Phase 3: B claims and completes the task on its own list ---
-
-        // 10. B adds its own task to the shared group
-        let resp = client
-            .post(format!("{url_b}/groups/{group_id}/tasks"))
-            .json(&serde_json::json!({
-                "title": "Review thing",
-                "description": "review the built thing"
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 201, "B add task failed");
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let b_task_id = body["task_id"].as_str().unwrap().to_string();
-
-        // 11. B sees its task
-        let resp = client
-            .get(format!("{url_b}/groups/{group_id}/tasks"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let b_tasks = body["tasks"].as_array().unwrap();
+            if let Some(b_task) = b_tasks
+                .iter()
+                .find(|t| t["id"].as_str().unwrap_or_default() == task_id)
+            {
+                assert_eq!(b_task["title"].as_str().unwrap(), "Build thing");
+                assert_eq!(b_task["state"].as_str().unwrap(), "empty");
+                b_saw_task = true;
+                break;
+            }
+        }
         assert!(
-            !b_tasks.is_empty(),
-            "B should have at least one task in group"
+            b_saw_task,
+            "B did not see A's task via encrypted replication within 6s"
         );
 
-        // Find B's task in the list
-        let b_task = b_tasks
-            .iter()
-            .find(|t| t["id"].as_str().unwrap() == b_task_id)
-            .expect("B's task not found in B's task list");
-        assert_eq!(b_task["title"].as_str().unwrap(), "Review thing");
-        assert_eq!(b_task["state"].as_str().unwrap(), "empty");
+        // --- Phase 3: B updates A's task and A observes updates ---
 
-        // 12. B claims its task
+        // 10. B claims A's task
         let resp = client
-            .patch(format!("{url_b}/groups/{group_id}/tasks/{b_task_id}"))
+            .patch(format!("{url_b}/groups/{group_id}/tasks/{task_id}"))
             .json(&serde_json::json!({ "action": "claim" }))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200, "B claim failed");
 
-        // 13. B sees the task is now Claimed
-        let resp = client
+        // Confirm B observes its own claim locally.
+        let b_claim_view: serde_json::Value = client
             .get(format!("{url_b}/groups/{group_id}/tasks"))
             .send()
             .await
+            .unwrap()
+            .json()
+            .await
             .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let b_task = body["tasks"]
+        let b_task_state = b_claim_view["tasks"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["id"].as_str().unwrap() == b_task_id)
-            .expect("B's task missing after claim");
-        assert_eq!(b_task["state"].as_str().unwrap(), "claimed");
+            .find(|t| t["id"].as_str().unwrap_or_default() == task_id)
+            .and_then(|t| t["state"].as_str())
+            .unwrap_or("<missing>");
+        assert_eq!(
+            b_task_state, "claimed",
+            "B should see its own claim locally"
+        );
 
-        // 14. B completes the task
+        // 11. Poll A until the task is claimed.
+        let mut a_saw_claimed = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let resp = client
+                .get(format!("{url_a}/groups/{group_id}/tasks"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            if let Some(a_task) = body["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"].as_str().unwrap_or_default() == task_id)
+            {
+                if a_task["state"].as_str().unwrap_or_default() == "claimed" {
+                    a_saw_claimed = true;
+                    break;
+                }
+            }
+        }
+        assert!(a_saw_claimed, "A did not observe B's claim within 6s");
+
+        // 12. B completes A's task
         let resp = client
-            .patch(format!("{url_b}/groups/{group_id}/tasks/{b_task_id}"))
+            .patch(format!("{url_b}/groups/{group_id}/tasks/{task_id}"))
             .json(&serde_json::json!({ "action": "complete" }))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200, "B complete failed");
 
-        // 15. B sees the task is Done
-        let resp = client
-            .get(format!("{url_b}/groups/{group_id}/tasks"))
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let b_task = body["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["id"].as_str().unwrap() == b_task_id)
-            .expect("B's task missing after complete");
-        assert_eq!(b_task["state"].as_str().unwrap(), "done");
+        // 13. Poll A until the task is done.
+        let mut a_saw_done = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let resp = client
+                .get(format!("{url_a}/groups/{group_id}/tasks"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            if let Some(a_task) = body["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"].as_str().unwrap_or_default() == task_id)
+            {
+                if a_task["state"].as_str().unwrap_or_default() == "done" {
+                    a_saw_done = true;
+                    break;
+                }
+            }
+        }
+        assert!(a_saw_done, "A did not observe B's complete within 20s");
 
-        // --- Phase 4: A also has its own task and can operate on it ---
+        // --- Phase 4: Error paths ---
 
-        // 16. A claims its own task
-        let resp = client
-            .patch(format!("{url_a}/groups/{group_id}/tasks/{task_id}"))
-            .json(&serde_json::json!({ "action": "claim" }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "A claim failed");
-
-        // 17. A completes its own task
-        let resp = client
-            .patch(format!("{url_a}/groups/{group_id}/tasks/{task_id}"))
-            .json(&serde_json::json!({ "action": "complete" }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "A complete failed");
-
-        // 18. A sees its task is Done
-        let resp = client
-            .get(format!("{url_a}/groups/{group_id}/tasks"))
-            .send()
-            .await
-            .unwrap();
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let a_task = body["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["id"].as_str().unwrap() == task_id)
-            .expect("A's task missing");
-        assert_eq!(a_task["state"].as_str().unwrap(), "done");
-
-        // --- Phase 5: Error paths ---
-
-        // 19. Non-existent group returns 404 for tasks
+        // 14. Non-existent group returns 404 for tasks
         let fake_id = "00".repeat(32);
         let resp = client
             .get(format!("{url_a}/groups/{fake_id}/tasks"))
@@ -2645,7 +2636,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 404);
 
-        // 20. Invalid action returns 400
+        // 15. Invalid action returns 400
         let resp = client
             .patch(format!("{url_a}/groups/{group_id}/tasks/{task_id}"))
             .json(&serde_json::json!({ "action": "delete" }))

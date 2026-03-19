@@ -187,6 +187,15 @@ pub struct NetworkNode {
     peer_id: AntPeerId,
     /// Bootstrap peer cache for recording connection outcomes.
     bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
+    /// Addresses we have already successfully connected to, mapped to peer ID.
+    /// Guards against double-connecting to the same address, which breaks
+    /// ant-quic's reader task setup (the second connection replaces the first
+    /// in the DashMap without a reader task being spawned via accept()).
+    connected_addrs: Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, AntPeerId>>>,
+    /// Per-address dial locks to serialize concurrent connect attempts to the
+    /// same address. Different addresses can still connect in parallel.
+    dial_locks:
+        Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl NetworkNode {
@@ -233,6 +242,8 @@ impl NetworkNode {
             recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
             peer_id,
             bootstrap_cache,
+            connected_addrs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            dial_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         network_node.spawn_receiver();
@@ -414,6 +425,35 @@ impl NetworkNode {
     ///
     /// Returns `NetworkError` if connection fails or node is not initialized.
     pub async fn connect_addr(&self, addr: SocketAddr) -> NetworkResult<AntPeerId> {
+        // Serialize concurrent connect attempts to the same address.
+        // ant-quic's DashMap replaces the connection entry on a second connect,
+        // but the receiver side's accept() loop may not process the new connection
+        // in time, leaving no reader task for it. This breaks message delivery.
+        //
+        // Per-address locks allow different addresses to connect in parallel
+        // while ensuring only one dial to the same address runs at a time.
+        let addr_lock = {
+            let mut locks = self.dial_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks
+                .entry(addr)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _dial_guard = addr_lock.lock().await;
+
+        // Check if already connected (may have been connected by the task
+        // that held the per-address lock before us).
+        {
+            let addrs = self
+                .connected_addrs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(&peer_id) = addrs.get(&addr) {
+                debug!("Already connected to {addr}, returning cached peer ID");
+                return Ok(peer_id);
+            }
+        }
+
         let node = self.require_node().await?;
         let start = std::time::Instant::now();
         let result = node.connect_addr(addr).await;
@@ -421,6 +461,14 @@ impl NetworkNode {
         match result {
             Ok(peer_conn) => {
                 let rtt_ms = start.elapsed().as_millis() as u32;
+                // Record this address so subsequent callers get the cached result.
+                {
+                    let mut addrs = self
+                        .connected_addrs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    addrs.insert(addr, peer_conn.peer_id);
+                }
                 if let Some(ref cache) = self.bootstrap_cache {
                     cache
                         .add_from_connection(peer_conn.peer_id, vec![addr], None)
@@ -519,6 +567,15 @@ impl NetworkNode {
             .await
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 
+        // Remove stale entries from connected_addrs so future connects succeed.
+        {
+            let mut addrs = self
+                .connected_addrs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            addrs.retain(|_, v| v != peer_id);
+        }
+
         self.emit_event(NetworkEvent::PeerDisconnected { peer_id: peer_id.0 });
 
         Ok(())
@@ -563,6 +620,19 @@ impl NetworkNode {
     ///
     /// Drops the inner node, closing all connections.
     pub async fn shutdown(&self) {
+        // Clear connection tracking before dropping the node.
+        {
+            let mut addrs = self
+                .connected_addrs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            addrs.clear();
+        }
+        {
+            let mut locks = self.dial_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks.clear();
+        }
+
         let mut node_guard = self.node.write().await;
         // Taking the node drops it, closing all connections
         let _ = node_guard.take();
@@ -598,22 +668,25 @@ impl NetworkNode {
     fn spawn_receiver(&self) {
         let node = Arc::clone(&self.node);
         let recv_tx = self.recv_tx.clone();
-
         tokio::spawn(async move {
             debug!("NetworkNode receiver task started");
 
             loop {
-                // Get node read lock
-                let node_guard = node.read().await;
-                let node_ref = match node_guard.as_ref() {
-                    Some(n) => n,
-                    None => {
-                        debug!("Node not initialized, receiver stopping");
-                        break;
+                // Clone node so we don't hold the RwLock across the recv() call.
+                // Holding the read guard across a long .await (recv blocks until
+                // data arrives) can starve writers and interfere with accept().
+                let node_clone = {
+                    let guard = node.read().await;
+                    match guard.as_ref().cloned() {
+                        Some(n) => n,
+                        None => {
+                            debug!("Node not initialized, receiver stopping");
+                            break;
+                        }
                     }
-                };
+                }; // RwLock released here
 
-                match node_ref.recv().await {
+                match node_clone.recv().await {
                     Ok((peer_id, data)) => {
                         if data.is_empty() {
                             continue;
@@ -669,16 +742,19 @@ impl NetworkNode {
             debug!("NetworkNode accept loop started");
 
             loop {
-                let node_guard = node.read().await;
-                let node_ref = match node_guard.as_ref() {
-                    Some(n) => n,
-                    None => {
-                        debug!("Node not initialized, accept loop stopping");
-                        break;
+                // Clone node so we don't hold the RwLock across the accept() call.
+                let node_clone = {
+                    let guard = node.read().await;
+                    match guard.as_ref().cloned() {
+                        Some(n) => n,
+                        None => {
+                            debug!("Node not initialized, accept loop stopping");
+                            break;
+                        }
                     }
-                };
+                }; // RwLock released here
 
-                match node_ref.accept().await {
+                match node_clone.accept().await {
                     Some(peer_conn) => {
                         tracing::info!(
                             "Accepted inbound connection from peer {:?} at {:?}",
@@ -795,7 +871,8 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // If not connected, try to establish a connection before giving up.
         // HyParView exchanges PeerIds via SHUFFLE without addresses, so peers
         // in the passive/active view may not yet have a QUIC connection.
-        if !self.is_connected(&ant_peer).await {
+        let connected = self.is_connected(&ant_peer).await;
+        if !connected {
             if let Err(e) = self.connect_cached_peer(ant_peer).await {
                 return Err(anyhow::anyhow!(
                     "Peer {:?} not connected and bootstrap cache dial failed: {}",
@@ -816,9 +893,17 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
 
-        node.send(&ant_peer, &buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("send failed: {}", e))?;
+        if let Err(e) = node.send(&ant_peer, &buf).await {
+            // Connection is dead — remove stale entry so future callers re-dial.
+            {
+                let mut addrs = self
+                    .connected_addrs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                addrs.retain(|_, v| *v != ant_peer);
+            }
+            return Err(anyhow::anyhow!("send failed: {}", e));
+        }
 
         debug!(
             "Sent {} bytes ({:?}) to peer {:?}",

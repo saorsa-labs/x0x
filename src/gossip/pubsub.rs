@@ -360,7 +360,9 @@ impl PubSubManager {
             .into_iter()
             .map(|peer| PeerId::new(peer.0))
             .collect();
-        self.plumtree.initialize_topic_peers(topic, peers).await;
+        // Keep topic peers fresh to avoid one-way delivery when subscriptions
+        // are created before all connections are fully established.
+        self.plumtree.set_topic_peers(topic, peers).await;
     }
 }
 
