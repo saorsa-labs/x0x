@@ -3,13 +3,17 @@
 # Private Groups Demo — Manual REST walkthrough
 # =============================================================================
 #
-# Demonstrates two x0xd daemons collaborating on an encrypted task list.
+# Writes local config and walks the REST flow once two x0xd daemons are
+# already running. Each daemon must use isolated identity storage (see
+# the HOME override in startup instructions below) so they get distinct
+# Agent IDs.
+#
 # Run from the repo root after building: cargo build --all-features
 #
 # Usage:
 #   1. Open three terminal tabs
-#   2. Tab 1: Start daemon A    (see Step 1 below)
-#   3. Tab 2: Start daemon B    (see Step 2 below)
+#   2. Tab 1: Start daemon A with isolated HOME (see instructions below)
+#   3. Tab 2: Start daemon B with isolated HOME (see instructions below)
 #   4. Tab 3: Run this script   (./examples/demo-private-groups.sh)
 #
 # Prerequisites:
@@ -43,7 +47,7 @@ cat > /tmp/x0x-demo-a/config.toml <<'EOF'
 bind_address = "127.0.0.1:12800"
 api_address = "127.0.0.1:12700"
 data_dir = "/tmp/x0x-demo-a/data"
-bootstrap_nodes = []
+bootstrap_peers = []
 rendezvous_enabled = false
 update_enabled = false
 log_level = "info"
@@ -53,7 +57,7 @@ cat > /tmp/x0x-demo-b/config.toml <<'EOF'
 bind_address = "127.0.0.1:12801"
 api_address = "127.0.0.1:12701"
 data_dir = "/tmp/x0x-demo-b/data"
-bootstrap_nodes = ["127.0.0.1:12800"]
+bootstrap_peers = ["127.0.0.1:12800"]
 rendezvous_enabled = false
 update_enabled = false
 log_level = "info"
@@ -61,10 +65,13 @@ EOF
 
 echo "Config files written to /tmp/x0x-demo-{a,b}/config.toml"
 echo ""
+echo "Each daemon needs its own identity storage so they get distinct Agent IDs."
+echo "Use the HOME override below to isolate key material per daemon."
+echo ""
 echo "Before running this script, start the daemons in separate terminals:"
 echo ""
-echo "  Terminal 1:  cargo run --bin x0xd -- --config /tmp/x0x-demo-a/config.toml"
-echo "  Terminal 2:  cargo run --bin x0xd -- --config /tmp/x0x-demo-b/config.toml"
+echo "  Terminal 1:  HOME=/tmp/x0x-demo-a cargo run --bin x0xd -- --config /tmp/x0x-demo-a/config.toml"
+echo "  Terminal 2:  HOME=/tmp/x0x-demo-b cargo run --bin x0xd -- --config /tmp/x0x-demo-b/config.toml"
 echo ""
 read -p "Press Enter when both daemons are running..."
 
@@ -231,4 +238,4 @@ echo "  - Two agents created an MLS-encrypted private group"
 echo "  - Invites were delivered and accepted via gossip"
 echo "  - Both agents added, claimed, and completed tasks"
 echo "  - All task data is encrypted with ChaCha20-Poly1305"
-echo "  - Non-members on the gossip network see only ciphertext"
+echo "  - Non-members cannot decrypt task content; gossip-visible data is ciphertext plus observable metadata"
