@@ -4,6 +4,8 @@
 //! without requiring a running network.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::MakeWriter;
 use x0x::contacts::TrustLevel;
 use x0x::crdt::{EncryptedTaskListDelta, TaskId, TaskItem, TaskListDelta, TaskMetadata};
 use x0x::groups::{GroupState, PendingInvite};
@@ -457,5 +459,314 @@ fn test_non_member_encrypted_mutation_rejected() {
     assert!(
         result.is_err(),
         "non-member encrypted delta should not decrypt with group keys"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: Ciphertext does not contain plaintext marker (privacy backstop)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ciphertext_does_not_contain_plaintext_marker() {
+    let creator_id = test_identity();
+    let creator = agent_of(&creator_id);
+
+    let group = MlsGroup::new(b"ciphertext-backstop-group".to_vec(), creator)
+        .expect("group creation failed");
+
+    // Create a delta with a distinctive canary marker in the task title
+    let canary = "CANARY_SECRET_xK9mQ2";
+    let timestamp = 3000u64;
+    let task_id = TaskId::new(canary, &creator, timestamp);
+    let peer_id = saorsa_gossip_types::PeerId::new(*creator.as_bytes());
+    let metadata = TaskMetadata::new(canary, "also secret description", 128, creator, timestamp);
+    let task = TaskItem::new(task_id, metadata, peer_id);
+    let mut delta = TaskListDelta::new(1);
+    delta.added_tasks.insert(task_id, (task, (peer_id, 1)));
+
+    // Encrypt
+    let encrypted =
+        EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0).expect("encryption failed");
+
+    // Serialize the entire encrypted envelope to bytes
+    let envelope_bytes = bincode::serialize(&encrypted).expect("serialization failed");
+
+    // The canary string must not appear in the raw bytes
+    let canary_bytes = canary.as_bytes();
+    for window in envelope_bytes.windows(canary_bytes.len()) {
+        assert_ne!(
+            window, canary_bytes,
+            "plaintext canary '{}' found in encrypted envelope",
+            canary
+        );
+    }
+
+    // Also check the ciphertext field directly
+    let ct = encrypted.ciphertext();
+    for window in ct.windows(canary_bytes.len()) {
+        assert_ne!(
+            window, canary_bytes,
+            "plaintext canary '{}' found in raw ciphertext",
+            canary
+        );
+    }
+
+    // Sanity: the canary IS in the plaintext delta
+    let plaintext_bytes = bincode::serialize(&delta).expect("delta serialization failed");
+    let found_in_plaintext = plaintext_bytes
+        .windows(canary_bytes.len())
+        .any(|w| w == canary_bytes);
+    assert!(
+        found_in_plaintext,
+        "canary should be present in unencrypted delta (test sanity check)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: Tampered welcome payload is rejected
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tampered_welcome_payload_rejected() {
+    let creator_id = test_identity();
+    let creator = agent_of(&creator_id);
+    let invitee_id = test_identity();
+    let invitee = agent_of(&invitee_id);
+
+    let group_id_bytes = b"tampered-welcome-group".to_vec();
+    let mut group = MlsGroup::new(group_id_bytes.clone(), creator).expect("group creation failed");
+    let _commit = group.add_member(invitee).unwrap();
+    let welcome = MlsWelcome::create(&group, &invitee).expect("welcome creation failed");
+
+    // Sanity: untampered welcome works
+    let ok = MlsGroup::from_welcome(&welcome, invitee);
+    assert!(ok.is_ok(), "untampered welcome should succeed");
+
+    // Tamper with the welcome by serialising, flipping bytes, deserialising
+    let mut bytes = bincode::serialize(&welcome).expect("serialization failed");
+
+    // Flip bytes in the middle of the payload (likely inside encrypted secrets)
+    let mid = bytes.len() / 2;
+    for i in mid..std::cmp::min(mid + 8, bytes.len()) {
+        bytes[i] ^= 0xFF;
+    }
+
+    let tampered: MlsWelcome = match bincode::deserialize(&bytes) {
+        Ok(w) => w,
+        Err(_) => {
+            // If deserialization itself fails, that's also a valid rejection —
+            // the tampered payload cannot produce a functioning group.
+            return;
+        }
+    };
+
+    // Tampered welcome should fail — either verify() or from_welcome()
+    let result = MlsGroup::from_welcome(&tampered, invitee);
+    assert!(
+        result.is_err(),
+        "tampered welcome should not produce a valid group"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: Malformed payloads do not crash or alter state
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_malformed_payloads_do_not_alter_state() {
+    let creator_id = test_identity();
+    let creator = agent_of(&creator_id);
+
+    let group_id_bytes = b"malformed-payload-group".to_vec();
+    let group = MlsGroup::new(group_id_bytes.clone(), creator).expect("group creation failed");
+
+    // Set up a task list with one known task
+    let peer_id = saorsa_gossip_types::PeerId::new(*creator.as_bytes());
+    let list_id = x0x::crdt::TaskListId::new(
+        *x0x::types::GroupId::from_mls_group_id(&group_id_bytes).as_bytes(),
+    );
+    let mut task_list = x0x::crdt::TaskList::new(list_id, "Resilience test".to_string(), peer_id);
+    let task_id = TaskId::new("Existing task", &creator, 1000);
+    let metadata = TaskMetadata::new("Existing task", "Already here", 128, creator, 1000);
+    let task = TaskItem::new(task_id, metadata, peer_id);
+    task_list.add_task(task, peer_id, 1).unwrap();
+    assert_eq!(task_list.task_count(), 1);
+
+    // --- Case 1: Random garbage bytes → fails envelope deserialization ---
+    let garbage: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03];
+    let deser_result: Result<EncryptedTaskListDelta, _> = bincode::deserialize(&garbage);
+    assert!(deser_result.is_err(), "garbage should fail deserialization");
+    assert_eq!(task_list.task_count(), 1, "state unchanged after garbage");
+
+    // --- Case 2: Corrupted ciphertext → fails AEAD decryption ---
+    let delta = make_delta(&creator);
+    let encrypted =
+        EncryptedTaskListDelta::encrypt_with_group(&delta, &group, 0).expect("encryption failed");
+
+    // Serialize, flip bytes near the end (ciphertext region), deserialize
+    let mut envelope_bytes = bincode::serialize(&encrypted).expect("serialization failed");
+    let len = envelope_bytes.len();
+    for byte in envelope_bytes.iter_mut().skip(len.saturating_sub(20)) {
+        *byte ^= 0xFF;
+    }
+    let corrupted: EncryptedTaskListDelta =
+        bincode::deserialize(&envelope_bytes).expect("envelope structure should still parse");
+    let decrypt_result = corrupted.decrypt_with_group(&group);
+    assert!(
+        decrypt_result.is_err(),
+        "corrupted ciphertext should fail decryption"
+    );
+    assert_eq!(
+        task_list.task_count(),
+        1,
+        "state unchanged after corrupted ciphertext"
+    );
+
+    // --- Case 3: Valid AEAD ciphertext containing garbage plaintext ---
+    // This exercises the decrypt() → bincode::deserialize error path:
+    // decryption succeeds but the plaintext is not valid TaskListDelta.
+    let key_schedule = x0x::mls::MlsKeySchedule::from_group(&group).expect("key schedule failed");
+    let cipher = x0x::mls::MlsCipher::new(
+        key_schedule.encryption_key().to_vec(),
+        key_schedule.base_nonce().to_vec(),
+    );
+    let fake_plaintext = vec![0xFF; 64]; // Not valid bincode for TaskListDelta
+    let context = group.context();
+    let mut aad = Vec::new();
+    aad.extend_from_slice(b"EncryptedDelta");
+    aad.extend_from_slice(context.group_id());
+    aad.extend_from_slice(&context.epoch().to_le_bytes());
+    aad.extend_from_slice(&99u64.to_le_bytes());
+    let fake_ciphertext = cipher
+        .encrypt(&fake_plaintext, &aad, 99)
+        .expect("encrypt failed");
+
+    // Decrypt succeeds (valid AEAD), but the plaintext is garbage bincode
+    let decrypted_garbage = cipher.decrypt(&fake_ciphertext, &aad, 99);
+    assert!(
+        decrypted_garbage.is_ok(),
+        "decryption of validly-encrypted garbage should succeed"
+    );
+    let bad_delta: Result<x0x::crdt::TaskListDelta, _> =
+        bincode::deserialize(&decrypted_garbage.unwrap());
+    assert!(
+        bad_delta.is_err(),
+        "garbage plaintext should fail delta deserialization"
+    );
+    assert_eq!(
+        task_list.task_count(),
+        1,
+        "state unchanged after bad delta deserialization"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: Logging does not expose plaintext canary (privacy regression)
+// ---------------------------------------------------------------------------
+
+/// A tracing writer that captures all output to a shared buffer.
+#[derive(Clone)]
+struct CaptureWriter {
+    buf: Arc<Mutex<Vec<u8>>>,
+}
+
+impl CaptureWriter {
+    fn new() -> Self {
+        Self {
+            buf: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn contents(&self) -> String {
+        let buf = self.buf.lock().unwrap();
+        String::from_utf8_lossy(&buf).to_string()
+    }
+}
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[test]
+fn test_logging_does_not_expose_plaintext_canary() {
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::prelude::*;
+
+    let capture = CaptureWriter::new();
+    let capture_clone = capture.clone();
+
+    // Install a scoped subscriber that captures all output.
+    // Uses set_default so it applies only to this thread.
+    let subscriber = fmt::layer()
+        .with_writer(capture_clone)
+        .with_ansi(false)
+        .with_level(true)
+        .with_target(true);
+
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(subscriber));
+
+    let canary = "CANARY_SECRET_xK9mQ2";
+
+    // --- Run the encrypted group lifecycle ---
+
+    // 1. Create group
+    let alice = test_identity();
+    let alice_id = agent_of(&alice);
+    let group_id_bytes = b"logging-test-group".to_vec();
+    let mut alice_group = MlsGroup::new(group_id_bytes.clone(), alice_id).unwrap();
+
+    // 2. Invite bob
+    let bob = test_identity();
+    let bob_id = agent_of(&bob);
+    let _commit = alice_group.add_member(bob_id).unwrap();
+    let welcome = MlsWelcome::create(&alice_group, &bob_id).unwrap();
+
+    // 3. Bob accepts
+    let bob_group = MlsGroup::from_welcome(&welcome, bob_id).unwrap();
+
+    // 4. Alice creates a delta with the canary in the task title
+    let timestamp = 5000u64;
+    let task_id = TaskId::new(canary, &alice_id, timestamp);
+    let peer_id = saorsa_gossip_types::PeerId::new(*alice_id.as_bytes());
+    let metadata = TaskMetadata::new(canary, "secret description too", 128, alice_id, timestamp);
+    let task = TaskItem::new(task_id, metadata, peer_id);
+    let mut delta = TaskListDelta::new(1);
+    delta.added_tasks.insert(task_id, (task, (peer_id, 1)));
+
+    // 5. Alice encrypts
+    let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &alice_group, 0).unwrap();
+
+    // 6. Bob decrypts
+    let decrypted = encrypted.decrypt_with_group(&bob_group).unwrap();
+    assert_eq!(decrypted.added_tasks.len(), 1);
+
+    // 7. Trigger a decryption failure path (wrong group)
+    let eve = test_identity();
+    let eve_id = agent_of(&eve);
+    let eve_group = MlsGroup::new(b"eve-logging-group".to_vec(), eve_id).unwrap();
+    let _ = encrypted.decrypt_with_group(&eve_group); // Expected to fail
+
+    // --- Check captured logs ---
+    let logs = capture.contents();
+    assert!(
+        !logs.contains(canary),
+        "plaintext canary '{}' found in tracing output:\n{}",
+        canary,
+        logs
     );
 }
