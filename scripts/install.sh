@@ -143,7 +143,7 @@ verify_archive() {
 
     if ! have_cmd gpg; then
         warn "gpg not found; signature verification skipped"
-        warn "Install gnupg and re-run without --no-verify for stricter verification"
+        warn "Install gnupg to enable signature verification, then re-run the installer"
         return
     fi
 
