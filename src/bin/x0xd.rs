@@ -288,7 +288,8 @@ struct CreateTaskListRequest {
 #[derive(Debug, Deserialize)]
 struct AddTaskRequest {
     title: String,
-    description: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// PATCH /task-lists/:id/tasks/:tid request body.
@@ -1683,7 +1684,7 @@ async fn add_task(
         );
     };
 
-    match handle.add_task(req.title, req.description).await {
+    match handle.add_task(req.title, req.description.unwrap_or_default()).await {
         Ok(task_id) => (
             StatusCode::CREATED,
             Json(serde_json::json!({ "ok": true, "task_id": format!("{task_id}") })),
