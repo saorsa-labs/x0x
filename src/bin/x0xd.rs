@@ -1101,9 +1101,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<ApiResponse<HealthDa
 }
 
 /// GET /network/status — NAT traversal diagnostics and connection stats.
-async fn network_status(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(network) = state.agent.network() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

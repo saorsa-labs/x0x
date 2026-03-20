@@ -979,6 +979,10 @@ impl Agent {
         let own_agent_id = self.agent_id();
 
         tokio::spawn(async move {
+            // Track agents we've already initiated auto-connect to, preventing
+            // duplicate connection attempts from concurrent announcements.
+            let mut auto_connect_attempted = std::collections::HashSet::<identity::AgentId>::new();
+
             loop {
                 // Drain whichever subscription fires next; deduplicate by AgentId in cache.
                 let msg = tokio::select! {
@@ -1078,12 +1082,16 @@ impl Agent {
                 // between peers that share bootstrap nodes but aren't directly connected.
                 // The gossip topology refresh (every 1s) will add the new peer to
                 // PlumTree topic trees once the QUIC connection is established.
-                if announcement.agent_id != own_agent_id && !announcement.addresses.is_empty() {
+                if announcement.agent_id != own_agent_id
+                    && !announcement.addresses.is_empty()
+                    && !auto_connect_attempted.contains(&announcement.agent_id)
+                {
                     if let (Some(ref net), Some(transport_id)) =
                         (&network, announcement.transport_peer_id)
                     {
                         let ant_peer = ant_quic::PeerId(transport_id);
                         if !net.is_connected(&ant_peer).await {
+                            auto_connect_attempted.insert(announcement.agent_id);
                             let net = std::sync::Arc::clone(net);
                             let addr = announcement.addresses[0];
                             tokio::spawn(async move {
