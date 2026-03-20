@@ -293,6 +293,13 @@ impl NetworkNode {
             .filter(|addr| !addr.ip().is_unspecified())
     }
 
+    /// Get the full node status from ant-quic, including NAT type,
+    /// external addresses, connection stats, and relay/coordinator state.
+    pub async fn node_status(&self) -> Option<ant_quic::NodeStatus> {
+        let node = self.node.read().await.as_ref().cloned()?;
+        Some(node.status().await)
+    }
+
     /// Get current network statistics.
     ///
     /// # Returns

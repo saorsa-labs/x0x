@@ -15,7 +15,7 @@ authors = ["David Irvine <david@saorsalabs.com>"]
 
 [dependencies]
 anyhow = "1.0"
-ant-quic = "0.22"
+ant-quic = { path = "../ant-quic" }
 async-trait = "0.1"
 bincode = "1.3"
 blake3 = "1.5"

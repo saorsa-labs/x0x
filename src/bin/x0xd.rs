@@ -645,6 +645,7 @@ async fn main() -> Result<()> {
         .route("/agent", get(agent_info))
         .route("/announce", post(announce_identity))
         .route("/peers", get(peers))
+        .route("/network/status", get(network_status))
         .route("/publish", post(publish))
         .route("/subscribe", post(subscribe))
         .route("/subscribe/:id", delete(unsubscribe))
@@ -1097,6 +1098,49 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<ApiResponse<HealthDa
             uptime_secs: state.start_time.elapsed().as_secs(),
         },
     })
+}
+
+/// GET /network/status — NAT traversal diagnostics and connection stats.
+async fn network_status(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let Some(network) = state.agent.network() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
+        );
+    };
+
+    let Some(status) = network.node_status().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "node not available" })),
+        );
+    };
+
+    let nat_type_str = format!("{:?}", status.nat_type);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "local_addr": status.local_addr.to_string(),
+            "external_addrs": status.external_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "nat_type": nat_type_str,
+            "has_public_ip": status.has_public_ip,
+            "can_receive_direct": status.can_receive_direct,
+            "connected_peers": status.connected_peers,
+            "direct_connections": status.direct_connections,
+            "relayed_connections": status.relayed_connections,
+            "hole_punch_success_rate": status.hole_punch_success_rate,
+            "is_relaying": status.is_relaying,
+            "relay_sessions": status.relay_sessions,
+            "is_coordinating": status.is_coordinating,
+            "coordination_sessions": status.coordination_sessions,
+            "avg_rtt_ms": status.avg_rtt.as_millis() as u64,
+            "uptime_secs": status.uptime.as_secs(),
+        })),
+    )
 }
 
 /// GET /agent
