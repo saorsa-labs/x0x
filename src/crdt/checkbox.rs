@@ -71,6 +71,20 @@ pub enum CheckboxState {
     },
 }
 
+impl std::fmt::Display for CheckboxState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckboxState::Empty => write!(f, "empty"),
+            CheckboxState::Claimed { agent_id, .. } => {
+                write!(f, "claimed:{}", hex::encode(agent_id.as_bytes()))
+            }
+            CheckboxState::Done { agent_id, .. } => {
+                write!(f, "done:{}", hex::encode(agent_id.as_bytes()))
+            }
+        }
+    }
+}
+
 impl CheckboxState {
     /// Create a new Claimed state.
     ///

@@ -1652,7 +1652,7 @@ async fn list_tasks(
                     id: format!("{}", t.id),
                     title: t.title,
                     description: t.description,
-                    state: format!("{:?}", t.state),
+                    state: format!("{}", t.state),
                     assignee: t.assignee.map(|a| format!("{a}")),
                     priority: t.priority,
                 })
