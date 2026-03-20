@@ -893,14 +893,14 @@ impl Agent {
     ) -> error::Result<IdentityAnnouncement> {
         if include_user_identity && !human_consent {
             return Err(error::IdentityError::Storage(std::io::Error::other(
-                "human identity disclosure requires explicit human consent",
+                "human identity disclosure requires explicit human consent — set human_consent: true in the request body",
             )));
         }
 
         let (user_id, agent_certificate) = if include_user_identity {
             let user_id = self.user_id().ok_or_else(|| {
                 error::IdentityError::Storage(std::io::Error::other(
-                    "human identity disclosure requested but no user identity is configured",
+                    "human identity disclosure requested but no user identity is configured — set user_key_path in your config.toml to point at your user keypair file",
                 ))
             })?;
             let cert = self.agent_certificate().cloned().ok_or_else(|| {
