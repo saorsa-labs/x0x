@@ -526,27 +526,9 @@ async fn main() -> Result<()> {
         config.data_dir.join("contacts.json").display()
     );
 
-    // Join network
-    agent
-        .join_network()
-        .await
-        .context("failed to join network")?;
-
-    tracing::info!("Network joined");
-
-    // Initial rendezvous advertisement (if enabled)
-    if config.rendezvous_enabled {
-        if let Err(e) = agent
-            .advertise_identity(config.rendezvous_validity_ms)
-            .await
-        {
-            tracing::warn!("Initial rendezvous advertisement failed: {e}");
-        } else {
-            tracing::info!("Rendezvous advertisement published");
-        }
-    }
-
-    // Build shared state
+    // Build shared state FIRST so the API server can start while the
+    // network join is in progress. join_network() can take 1-2 minutes
+    // when IPv6 peers fail, blocking the API the entire time.
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
     let state = Arc::new(AppState {
         agent: Arc::new(agent),
@@ -555,6 +537,32 @@ async fn main() -> Result<()> {
         contacts,
         start_time: Instant::now(),
         broadcast_tx,
+    });
+
+    // Join network in background so the API server starts immediately
+    let join_agent = Arc::clone(&state.agent);
+    let rendezvous_enabled = config.rendezvous_enabled;
+    let rendezvous_validity_ms = config.rendezvous_validity_ms;
+    tokio::spawn(async move {
+        match join_agent.join_network().await {
+            Ok(()) => {
+                tracing::info!("Network joined");
+                // Initial rendezvous advertisement (if enabled)
+                if rendezvous_enabled {
+                    if let Err(e) = join_agent
+                        .advertise_identity(rendezvous_validity_ms)
+                        .await
+                    {
+                        tracing::warn!("Initial rendezvous advertisement failed: {e}");
+                    } else {
+                        tracing::info!("Rendezvous advertisement published");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to join network: {e}");
+            }
+        }
     });
 
     // Gossip-based release subscription (primary update mechanism)
