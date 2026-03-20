@@ -41,6 +41,10 @@ pub enum CrdtError {
     /// I/O error during persistence.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// System clock error (e.g., clock set before Unix epoch).
+    #[error("system clock error: {0}")]
+    SystemClock(String),
 }
 
 #[cfg(test)]

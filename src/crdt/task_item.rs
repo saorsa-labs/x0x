@@ -191,7 +191,7 @@ impl TaskItem {
         // Generate Unix timestamp for conflict resolution (globally comparable)
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time before Unix epoch")
+            .map_err(|e| CrdtError::SystemClock(format!("clock before Unix epoch: {e}")))?
             .as_millis() as u64;
 
         // Check current state - can't claim if already done
@@ -251,7 +251,7 @@ impl TaskItem {
         // Generate Unix timestamp for conflict resolution (globally comparable)
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time before Unix epoch")
+            .map_err(|e| CrdtError::SystemClock(format!("clock before Unix epoch: {e}")))?
             .as_millis() as u64;
 
         // Check current state
