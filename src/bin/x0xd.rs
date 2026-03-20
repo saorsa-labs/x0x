@@ -305,6 +305,8 @@ struct AddContactRequest {
     /// Trust level: "blocked", "unknown", "known", or "trusted".
     trust_level: String,
     /// Optional human-readable label.
+    /// Also accepts "alias" for convenience (common alternative name).
+    #[serde(alias = "alias")]
     label: Option<String>,
 }
 
