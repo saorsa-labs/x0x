@@ -50,7 +50,9 @@ impl std::str::FromStr for TrustLevel {
             "unknown" => Ok(Self::Unknown),
             "known" => Ok(Self::Known),
             "trusted" => Ok(Self::Trusted),
-            _ => Err(format!("invalid trust level: {s}")),
+            _ => Err(format!(
+                "invalid trust level: {s} (valid values: blocked, unknown, known, trusted)"
+            )),
         }
     }
 }
