@@ -54,6 +54,10 @@ pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default stats collection interval.
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Maximum size for bincode deserialization of untrusted data (4 MiB).
+/// Prevents memory exhaustion from crafted payloads with large length prefixes.
+pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
+
 /// Default bootstrap nodes for the x0x network.
 ///
 /// These are Saorsa Labs VPS nodes running x0x-bootstrap with coordinator/reflector
@@ -1287,7 +1291,10 @@ impl Message {
     ///
     /// Returns `NetworkError` if binary deserialization fails.
     pub fn from_binary(data: &[u8]) -> NetworkResult<Self> {
-        bincode::deserialize(data)
+        use bincode::Options;
+        bincode::DefaultOptions::new()
+            .with_limit(MAX_MESSAGE_DESERIALIZE_SIZE)
+            .deserialize(data)
             .map_err(|e| NetworkError::SerializationError(format!("Binary decode failed: {}", e)))
     }
 

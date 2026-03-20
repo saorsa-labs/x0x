@@ -108,7 +108,12 @@ impl TaskListSync {
 
         tokio::spawn(async move {
             while let Some(msg) = sub.recv().await {
-                match bincode::deserialize::<(PeerId, TaskListDelta)>(&msg.payload) {
+                match {
+                    use bincode::Options;
+                    bincode::DefaultOptions::new()
+                        .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+                        .deserialize::<(PeerId, TaskListDelta)>(&msg.payload)
+                } {
                     Ok((peer_id, delta)) => {
                         let mut list = task_list.write().await;
                         if let Err(e) = list.merge_delta(&delta, peer_id) {
