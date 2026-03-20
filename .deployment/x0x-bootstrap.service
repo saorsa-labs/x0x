@@ -24,7 +24,7 @@ StandardError=journal
 SyslogIdentifier=x0x-bootstrap
 
 # Restart policy
-Restart=on-failure
+Restart=always
 RestartSec=10s
 
 # Security hardening
@@ -32,7 +32,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/x0x /var/log/x0x
+ReadWritePaths=/var/lib/x0x /var/log/x0x /opt/x0x
 ReadOnlyPaths=/etc/x0x
 
 # Resource limits

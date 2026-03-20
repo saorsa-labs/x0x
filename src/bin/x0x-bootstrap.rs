@@ -6,13 +6,19 @@
 //! - Relay services for NAT traversal
 //! - Health monitoring endpoint
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::signal;
 use x0x::network::NetworkConfig;
+use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
+use x0x::upgrade::monitor::UpgradeMonitor;
+use x0x::upgrade::signature::verify_manifest_signature;
 use x0x::Agent;
 
 /// Configuration for the bootstrap node
@@ -51,6 +57,67 @@ struct BootstrapConfig {
     /// Log level (trace, debug, info, warn, error)
     #[serde(default = "default_log_level")]
     log_level: String,
+
+    /// Log format ("text" or "json")
+    #[serde(default = "default_log_format")]
+    log_format: String,
+
+    /// Update configuration
+    #[serde(default)]
+    update: UpdateConfig,
+}
+
+/// Update configuration for x0x-bootstrap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdateConfig {
+    /// Enable self-update checks.
+    #[serde(default = "default_true")]
+    enabled: bool,
+
+    /// Check interval in seconds (default: 21600 = 6 hours).
+    #[serde(default = "default_check_interval_seconds")]
+    check_interval_seconds: u64,
+
+    /// Rollout window in minutes (default: 120 = 2 hours, only 6 bootstrap nodes).
+    #[serde(default = "default_rollout_window_minutes")]
+    rollout_window_minutes: u64,
+
+    /// Exit cleanly for systemd restart (default: true).
+    #[serde(default = "default_true")]
+    stop_on_upgrade: bool,
+
+    /// GitHub repo for update discovery.
+    #[serde(default = "default_update_repo")]
+    repo: String,
+
+    /// Include pre-releases in update checks (default: false).
+    #[serde(default)]
+    include_prereleases: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_seconds: 3600,
+            rollout_window_minutes: 120,
+            stop_on_upgrade: true,
+            repo: default_update_repo(),
+            include_prereleases: false,
+        }
+    }
+}
+
+fn default_check_interval_seconds() -> u64 {
+    3600
+}
+
+fn default_rollout_window_minutes() -> u64 {
+    120
+}
+
+fn default_update_repo() -> String {
+    "saorsa-labs/x0x".to_string()
 }
 
 fn default_machine_key_path() -> PathBuf {
@@ -69,6 +136,10 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_log_format() -> String {
+    "text".to_string()
+}
+
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
@@ -81,6 +152,8 @@ impl Default for BootstrapConfig {
             relay: true,
             known_peers: Vec::new(),
             log_level: "info".to_string(),
+            log_format: "text".to_string(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -119,12 +192,14 @@ async fn main() -> Result<()> {
 
     // Check config flag (validate without running)
     let check_only = args.contains(&"--check".to_string());
+    let check_updates_only = args.contains(&"--check-updates".to_string());
+    let skip_update_check = args.contains(&"--skip-update-check".to_string());
 
     // Load configuration
     let config = load_config(&config_path).await?;
 
     // Initialize logging
-    init_logging(&config.log_level)?;
+    init_logging(&config.log_level, &config.log_format)?;
 
     if check_only {
         println!("Configuration is valid");
@@ -132,14 +207,40 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Log startup
-    tracing::info!("Starting x0x bootstrap node v{}", x0x::VERSION);
+    // Startup banner
+    tracing::info!(
+        version = %x0x::VERSION,
+        binary = "x0x-bootstrap",
+        pid = std::process::id(),
+        "x0x-bootstrap started"
+    );
     tracing::info!("Bind address: {}", config.bind_address);
     tracing::info!("Health endpoint: {}", config.health_address);
     tracing::info!("Coordinator: {}", config.coordinator);
     tracing::info!("Reflector: {}", config.reflector);
     tracing::info!("Relay: {}", config.relay);
     tracing::info!("Known peers: {:?}", config.known_peers);
+
+    // Startup self-update check
+    if config.update.enabled && !skip_update_check {
+        match run_startup_update_check(&config).await {
+            Ok(true) => {
+                // Update applied — binary was replaced. If stop_on_upgrade, exit for systemd restart.
+                if config.update.stop_on_upgrade {
+                    tracing::info!(
+                        exit_code = 0,
+                        "Exiting with code 0 for service manager restart"
+                    );
+                    std::process::exit(0);
+                }
+            }
+            Ok(false) => {} // No update
+            Err(e) => tracing::warn!(error = %e, "Startup update check failed: {e}"),
+        }
+    }
+    if check_updates_only {
+        return Ok(());
+    }
 
     // Create data directory if it doesn't exist
     tokio::fs::create_dir_all(&config.data_dir)
@@ -156,13 +257,15 @@ async fn main() -> Result<()> {
         peer_cache_path: Some(config.data_dir.join("peers.cache")),
     };
 
-    let agent = Agent::builder()
-        .with_machine_key(&config.machine_key_path)
-        .with_network_config(network_config)
-        .with_peer_cache_dir(config.data_dir.join("peers"))
-        .build()
-        .await
-        .context("failed to create agent")?;
+    let agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(&config.machine_key_path)
+            .with_network_config(network_config)
+            .with_peer_cache_dir(config.data_dir.join("peers"))
+            .build()
+            .await
+            .context("failed to create agent")?,
+    );
 
     tracing::info!("Agent initialized");
     tracing::info!("Machine ID: {}", agent.machine_id());
@@ -188,6 +291,43 @@ async fn main() -> Result<()> {
         config.known_peers.clone(),
     ));
 
+    // Broadcast current manifest to gossip after joining the network.
+    // Ensures peers that missed the initial gossip window still receive it.
+    if config.update.enabled {
+        let agent_for_broadcast = Arc::clone(&agent);
+        let update_config = config.update.clone();
+        tokio::spawn(async move {
+            broadcast_current_manifest(
+                &agent_for_broadcast,
+                &update_config.repo,
+                update_config.include_prereleases,
+            )
+            .await;
+        });
+    }
+
+    // Start periodic GitHub poll (discovers releases, broadcasts to gossip)
+    let update_handle = if config.update.enabled {
+        let update_config = config.update.clone();
+        let agent_for_update = Arc::clone(&agent);
+        Some(tokio::spawn(async move {
+            run_github_poll(agent_for_update, update_config).await;
+        }))
+    } else {
+        None
+    };
+
+    // Start gossip release listener (symmetric: bootstrap receives from any peer)
+    let gossip_update_handle = if config.update.enabled {
+        let update_config = config.update.clone();
+        let agent_for_gossip = Arc::clone(&agent);
+        Some(tokio::spawn(async move {
+            run_gossip_update_listener(agent_for_gossip, update_config).await;
+        }))
+    } else {
+        None
+    };
+
     // Wait for shutdown signal
     tracing::info!("Bootstrap node running. Press Ctrl+C to stop.");
     match signal::ctrl_c().await {
@@ -203,6 +343,12 @@ async fn main() -> Result<()> {
     agent.shutdown().await;
     health_handle.abort();
     reconnect_handle.abort();
+    if let Some(h) = update_handle {
+        h.abort();
+    }
+    if let Some(h) = gossip_update_handle {
+        h.abort();
+    }
     tracing::info!("Shutdown complete");
 
     Ok(())
@@ -266,8 +412,8 @@ async fn load_config(path: &str) -> Result<BootstrapConfig> {
     toml::from_str(&content).with_context(|| format!("failed to parse config file: {}", path))
 }
 
-/// Initialize logging with structured output
-fn init_logging(level: &str) -> Result<()> {
+/// Initialize logging with configurable format
+fn init_logging(level: &str, format: &str) -> Result<()> {
     let level_filter = match level.to_lowercase().as_str() {
         "trace" => tracing::Level::TRACE,
         "debug" => tracing::Level::DEBUG,
@@ -277,10 +423,16 @@ fn init_logging(level: &str) -> Result<()> {
         _ => tracing::Level::INFO,
     };
 
-    tracing_subscriber::fmt()
-        .with_max_level(level_filter)
-        .json()
-        .init();
+    if format == "json" {
+        tracing_subscriber::fmt()
+            .with_max_level(level_filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(level_filter)
+            .init();
+    }
 
     Ok(())
 }
@@ -359,4 +511,293 @@ async fn run_health_server(
     server.await.context("health server failed")?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Self-update helpers
+// ---------------------------------------------------------------------------
+
+/// Run the startup update check. Returns `true` if an update was applied.
+async fn run_startup_update_check(config: &BootstrapConfig) -> Result<bool> {
+    let monitor = UpgradeMonitor::new(&config.update.repo, "x0x-bootstrap", x0x::VERSION)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_include_prereleases(config.update.include_prereleases);
+
+    let Some(verified) = monitor
+        .check_for_updates()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    else {
+        return Ok(false);
+    };
+
+    tracing::info!(
+        new_version = %verified.manifest.version,
+        "Startup check: new version available, applying immediately"
+    );
+
+    let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0x-bootstrap")
+        .with_stop_on_upgrade(config.update.stop_on_upgrade);
+
+    match upgrader
+        .apply_upgrade_from_manifest(&verified.manifest)
+        .await
+    {
+        Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+            tracing::info!(%version, "Successfully upgraded to version {version}");
+            Ok(true)
+        }
+        Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
+            tracing::warn!(%reason, "Upgrade rolled back");
+            Ok(false)
+        }
+        Ok(x0x::upgrade::UpgradeResult::NoUpgrade) => Ok(false),
+        Err(e) => {
+            tracing::error!(error = %e, "Upgrade failed: {e}");
+            Ok(false)
+        }
+    }
+}
+
+/// Broadcast the current release manifest to gossip after joining the network.
+///
+/// After a bootstrap node restarts (possibly after upgrading), it fetches the latest
+/// manifest from GitHub and broadcasts it regardless of whether it needs to upgrade.
+/// This ensures peers who missed the initial gossip window still receive the manifest.
+async fn broadcast_current_manifest(agent: &Agent, repo: &str, include_prereleases: bool) {
+    let monitor = match UpgradeMonitor::new(repo, "x0x-bootstrap", x0x::VERSION) {
+        Ok(m) => m.with_include_prereleases(include_prereleases),
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed to create monitor for startup broadcast");
+            return;
+        }
+    };
+
+    match monitor.fetch_current_manifest().await {
+        Ok(Some(verified)) => {
+            tracing::info!(
+                version = %verified.manifest.version,
+                "Broadcasting current release manifest v{} to gossip",
+                verified.manifest.version
+            );
+            if let Err(e) = agent.publish(RELEASE_TOPIC, verified.gossip_payload).await {
+                tracing::debug!(error = %e, "Failed to broadcast current manifest: {e}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed to fetch current manifest for broadcast: {e}");
+        }
+    }
+}
+
+/// Gossip-based release subscription — receives manifests from any peer.
+///
+/// Makes bootstrap fully symmetric: it can receive releases via gossip from
+/// x0xd nodes or other bootstrap nodes, not just discover them via GitHub polling.
+async fn run_gossip_update_listener(agent: Arc<Agent>, config: UpdateConfig) {
+    let mut release_sub = match agent.subscribe(RELEASE_TOPIC).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to subscribe to release topic: {e}");
+            return;
+        }
+    };
+
+    let mut rebroadcasted_versions: HashMap<String, Instant> = HashMap::new();
+    const REBROADCAST_INTERVAL: Duration = Duration::from_secs(300);
+
+    while let Some(msg) = release_sub.recv().await {
+        tracing::info!("Received release manifest via gossip");
+
+        let (manifest_json, sig) = match decode_signed_manifest(&msg.payload) {
+            Ok(parts) => parts,
+            Err(e) => {
+                tracing::warn!(error = %e, "Invalid manifest payload received via gossip");
+                continue;
+            }
+        };
+
+        if let Err(e) = verify_manifest_signature(manifest_json, sig) {
+            tracing::warn!(error = %e, "Release manifest signature verification failed");
+            continue;
+        }
+
+        let manifest: ReleaseManifest = match serde_json::from_slice(manifest_json) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "Invalid manifest JSON: {e}");
+                continue;
+            }
+        };
+
+        tracing::info!(
+            version = %manifest.version,
+            "Release manifest signature verified"
+        );
+
+        // Rebroadcast with time-windowed dedup
+        let should_rebroadcast = match rebroadcasted_versions.get(&manifest.version) {
+            None => true,
+            Some(last) => last.elapsed() >= REBROADCAST_INTERVAL,
+        };
+        if should_rebroadcast {
+            rebroadcasted_versions.insert(manifest.version.clone(), Instant::now());
+            if rebroadcasted_versions.len() > 5 {
+                let version = manifest.version.clone();
+                rebroadcasted_versions.clear();
+                rebroadcasted_versions.insert(version, Instant::now());
+            }
+            tracing::info!(
+                version = %manifest.version,
+                "Rebroadcasting verified release manifest v{}",
+                manifest.version
+            );
+            if let Err(e) = agent.publish(RELEASE_TOPIC, msg.payload.to_vec()).await {
+                tracing::debug!(error = %e, "Failed to rebroadcast release manifest: {e}");
+            }
+        }
+
+        if !is_newer(&manifest.version, x0x::VERSION) {
+            tracing::debug!(
+                version = %manifest.version,
+                "Already on latest version {}",
+                manifest.version
+            );
+            continue;
+        }
+
+        tracing::info!(
+            new_version = %manifest.version,
+            "Gossip: new version found, applying immediately"
+        );
+
+        let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0x-bootstrap")
+            .with_stop_on_upgrade(config.stop_on_upgrade);
+        match upgrader.apply_upgrade_from_manifest(&manifest).await {
+            Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+                tracing::info!(%version, "Gossip upgrade successful");
+            }
+            Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
+                tracing::warn!(%reason, "Gossip upgrade rolled back");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Gossip upgrade failed: {e}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Periodic GitHub poll: discovers releases and broadcasts to gossip.
+///
+/// Bootstrap's update flow is symmetric with x0xd — discover, verify manifest,
+/// broadcast to gossip, apply. Different config defaults (1h poll, 2h rollout,
+/// stop_on_upgrade=true).
+///
+/// Tracks versions that failed to apply and skips them for 30 minutes before
+/// retrying. A newer release superseding the failed version will be picked up
+/// immediately.
+async fn run_github_poll(agent: Arc<Agent>, config: UpdateConfig) {
+    let check_interval = Duration::from_secs(config.check_interval_seconds);
+    let mut ticker = tokio::time::interval(check_interval);
+    // Skip first tick (startup check already ran)
+    ticker.tick().await;
+
+    let mut failed_version: Option<(String, std::time::Instant)> = None;
+    const RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
+
+    loop {
+        ticker.tick().await;
+        tracing::debug!("GitHub poll check");
+
+        // Clear expired failure skip
+        if let Some((_, failed_at)) = &failed_version {
+            if failed_at.elapsed() >= RETRY_AFTER {
+                tracing::info!("Retry timeout elapsed, clearing failed version skip");
+                failed_version = None;
+            }
+        }
+
+        let monitor = match UpgradeMonitor::new(&config.repo, "x0x-bootstrap", x0x::VERSION) {
+            Ok(m) => m.with_include_prereleases(config.include_prereleases),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create upgrade monitor: {e}");
+                continue;
+            }
+        };
+
+        match monitor.check_for_updates().await {
+            Ok(Some(verified)) => {
+                // Skip versions that recently failed to apply
+                if let Some((ref ver, _)) = failed_version {
+                    if ver == &verified.manifest.version {
+                        tracing::debug!(
+                            version = %verified.manifest.version,
+                            "Skipping recently failed version {}",
+                            verified.manifest.version
+                        );
+                        continue;
+                    }
+                }
+
+                tracing::info!(
+                    new_version = %verified.manifest.version,
+                    "GitHub poll: new version found"
+                );
+
+                // Broadcast to gossip with timeout — don't let dead peers block upgrade
+                let publish_payload = verified.gossip_payload.clone();
+                let publish_agent = agent.clone();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        publish_agent.publish(RELEASE_TOPIC, publish_payload),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            tracing::debug!("Broadcast discovered release to gossip");
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!(error = %e, "Failed to broadcast discovered release: {e}");
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                "Gossip broadcast timed out (peers may be unreachable)"
+                            );
+                        }
+                    }
+                });
+
+                let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0x-bootstrap")
+                    .with_stop_on_upgrade(config.stop_on_upgrade);
+                match upgrader
+                    .apply_upgrade_from_manifest(&verified.manifest)
+                    .await
+                {
+                    Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+                        tracing::info!(%version, "GitHub poll upgrade successful");
+                    }
+                    Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
+                        tracing::warn!(%reason, "GitHub poll upgrade rolled back");
+                        failed_version =
+                            Some((verified.manifest.version.clone(), std::time::Instant::now()));
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "GitHub poll upgrade failed: {e}");
+                        failed_version =
+                            Some((verified.manifest.version.clone(), std::time::Instant::now()));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => {
+                tracing::debug!("GitHub poll: up to date");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "GitHub poll check failed: {e}");
+            }
+        }
+    }
 }

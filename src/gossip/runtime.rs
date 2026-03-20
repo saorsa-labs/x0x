@@ -153,10 +153,12 @@ impl GossipRuntime {
         // Periodically refresh PlumTree topic peers with current connections.
         // This ensures newly connected peers (discovered via HyParView or
         // direct connection) are added to the eager set for existing topics.
+        // Using 1-second interval to minimize the window where a newly-connected
+        // peer could miss a published message (e.g. release manifest broadcast).
         let pubsub_refresh = Arc::clone(&self.pubsub);
         let peer_sync_handle = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 pubsub_refresh.refresh_topic_peers().await;
             }
         });

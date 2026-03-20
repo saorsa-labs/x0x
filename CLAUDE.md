@@ -60,6 +60,25 @@ All IDs are SHA-256 hashes of ML-DSA-65 public keys (32 bytes).
 4. **CRDT** (`crdt/`): Collaborative task lists with OR-Set checkboxes (Empty/Claimed/Done), LWW-Register metadata, RGA ordering. Deltas can be encrypted via MLS groups.
 5. **MLS** (`mls/`): Group encryption using ChaCha20-Poly1305. `MlsGroup` manages membership, `MlsKeySchedule` derives epoch keys, `MlsWelcome` onboards new members.
 
+### Self-Update System (`upgrade/`)
+
+Manifest-based decentralized self-update with symmetric gossip propagation:
+
+- **`manifest.rs`**: `ReleaseManifest` and `PlatformAsset` types, length-prefixed wire format (`[4-byte BE len][JSON][ML-DSA-65 sig]`), platform target detection (including musl vs glibc)
+- **`signature.rs`**: ML-DSA-65 signing/verification for archives and manifests. Embedded release public key.
+- **`monitor.rs`**: `UpgradeMonitor` polls GitHub releases, `fetch_verified_manifest()` downloads and verifies manifest+signature, returns `VerifiedRelease` with pre-encoded gossip payload
+- **`apply.rs`**: `apply_upgrade_from_manifest()` — downloads archive, verifies SHA-256 hash, extracts binary, performs atomic replacement with rollback
+- **`rollout.rs`**: Staged rollout with deterministic delay based on machine ID hash (configurable window)
+
+**Update flow** (identical for x0xd and x0x-bootstrap):
+1. **Startup**: Check GitHub for new release, broadcast manifest to gossip if found
+2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
+3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
+
+All nodes verify and rebroadcast manifests (symmetric propagation — no privileged bootstrap role).
+
+**CI**: `release.yml` generates `release-manifest.json` and `release-manifest.json.sig` via `x0x-keygen manifest` during the release signing job.
+
 ### Module Dependency Flow
 
 ```
@@ -71,7 +90,8 @@ lib.rs (Agent, AgentBuilder, TaskListHandle)
   ├── bootstrap.rs ← Bootstrap retry logic
   ├── gossip/      ← Wraps saorsa-gossip-* crates
   ├── crdt/        ← TaskList, TaskItem, CheckboxState, Delta, Sync
-  └── mls/         ← MlsGroup, MlsCipher, MlsKeySchedule, MlsWelcome
+  ├── mls/         ← MlsGroup, MlsCipher, MlsKeySchedule, MlsWelcome
+  └── upgrade/     ← Self-update: manifest, monitor, apply, rollout, signature
 ```
 
 ### Key API Surface
