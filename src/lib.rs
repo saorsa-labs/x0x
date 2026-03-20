@@ -975,6 +975,8 @@ impl Agent {
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let bootstrap_cache = self.bootstrap_cache.clone();
         let contact_store = std::sync::Arc::clone(&self.contact_store);
+        let network = self.network.as_ref().map(std::sync::Arc::clone);
+        let own_agent_id = self.agent_id();
 
         tokio::spawn(async move {
             loop {
@@ -1071,6 +1073,36 @@ impl Agent {
                         is_coordinator: announcement.is_coordinator,
                     },
                 );
+
+                // Auto-connect to discovered agents so pub/sub messages can route
+                // between peers that share bootstrap nodes but aren't directly connected.
+                // The gossip topology refresh (every 1s) will add the new peer to
+                // PlumTree topic trees once the QUIC connection is established.
+                if announcement.agent_id != own_agent_id && !announcement.addresses.is_empty() {
+                    if let (Some(ref net), Some(transport_id)) =
+                        (&network, announcement.transport_peer_id)
+                    {
+                        let ant_peer = ant_quic::PeerId(transport_id);
+                        if !net.is_connected(&ant_peer).await {
+                            let net = std::sync::Arc::clone(net);
+                            let addr = announcement.addresses[0];
+                            tokio::spawn(async move {
+                                match net.connect_addr(addr).await {
+                                    Ok(_) => {
+                                        tracing::info!(
+                                            "Auto-connected to discovered agent at {addr}",
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Auto-connect to discovered agent at {addr} failed: {e}",
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
             }
         });
 
