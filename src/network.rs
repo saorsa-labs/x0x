@@ -212,7 +212,9 @@ impl NetworkNode {
         bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
         keypair: Option<(ant_quic::MlDsaPublicKey, ant_quic::MlDsaSecretKey)>,
     ) -> NetworkResult<Self> {
-        let mut builder = NodeConfig::builder();
+        let mut builder = NodeConfig::builder()
+            .data_channel_capacity(1024)
+            .max_concurrent_uni_streams(10_000);
 
         if let Some(bind_addr) = config.bind_addr {
             builder = builder.bind_addr(bind_addr);
