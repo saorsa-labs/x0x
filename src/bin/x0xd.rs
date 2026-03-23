@@ -440,6 +440,11 @@ struct TaskEntry {
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    // Doctor subcommand — runs before config loading so it works without a config file
+    if args.get(1).map(|s| s.as_str()) == Some("doctor") {
+        return run_doctor().await;
+    }
+
     let config_path = if let Some(idx) = args.iter().position(|a| a == "--config") {
         Some(
             args.get(idx + 1)
@@ -720,6 +725,153 @@ async fn main() -> Result<()> {
 async fn shutdown_signal() {
     let _ = signal::ctrl_c().await;
     tracing::info!("Received shutdown signal");
+}
+
+// ---------------------------------------------------------------------------
+// Doctor subcommand
+// ---------------------------------------------------------------------------
+
+async fn run_doctor() -> Result<()> {
+    println!("x0xd doctor");
+    println!("===========\n");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to create HTTP client")?;
+
+    let api_base = "http://127.0.0.1:12700";
+
+    // 1. Check binary in PATH
+    let x0xd_in_path = which_x0xd();
+    if let Some(ref path) = x0xd_in_path {
+        println!("  PASS  x0xd binary found: {}", path);
+    } else {
+        println!("  WARN  x0xd not found in PATH");
+        let home_bin = dirs::home_dir()
+            .map(|h| h.join(".local/bin/x0xd"))
+            .filter(|p| p.exists());
+        if let Some(ref path) = home_bin {
+            println!("        found at {} (not in PATH)", path.display());
+        }
+    }
+
+    // 2. Check config
+    let default_config_path = dirs::config_dir()
+        .map(|d| d.join("x0x").join("config.toml"))
+        .unwrap_or_else(|| PathBuf::from("/etc/x0x/config.toml"));
+    if default_config_path.exists() {
+        match load_config(default_config_path.to_str().unwrap_or("")).await {
+            Ok(_) => println!("  PASS  config: {}", default_config_path.display()),
+            Err(e) => println!("  FAIL  config parse error: {e}"),
+        }
+    } else {
+        println!("  PASS  config: using defaults (no config file found)");
+    }
+
+    // 3. Check daemon reachability
+    match client.get(format!("{api_base}/health")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let ok = body.get("ok").and_then(|v| v.as_bool()) == Some(true);
+            let status = body
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let version = body
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if ok {
+                println!("  PASS  daemon healthy (v{version}, status: {status})");
+            } else {
+                println!("  WARN  daemon responded but ok=false (status: {status})");
+            }
+        }
+        Ok(resp) => {
+            println!("  FAIL  daemon returned HTTP {}", resp.status());
+        }
+        Err(e) => {
+            if e.is_connect() {
+                println!("  FAIL  x0xd is not running (connection refused on {api_base})");
+                // Check if port is in use by something else
+                match std::net::TcpListener::bind("127.0.0.1:12700") {
+                    Ok(_) => println!("        port 12700 is free — start x0xd to use it"),
+                    Err(_) => println!(
+                        "        port 12700 is occupied by another process"
+                    ),
+                }
+            } else if e.is_timeout() {
+                println!("  FAIL  daemon not responding (timeout after 5s)");
+            } else {
+                println!("  FAIL  health check error: {e}");
+            }
+            println!();
+            return Ok(());
+        }
+    }
+
+    // 4. Agent identity
+    match client.get(format!("{api_base}/agent")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let agent_id = body
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let machine_id = body
+                .get("machine_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!("  PASS  agent:   {agent_id}");
+            println!("        machine: {machine_id}");
+            if let Some(user_id) = body.get("user_id").and_then(|v| v.as_str()) {
+                println!("        user:    {user_id}");
+            }
+        }
+        _ => {
+            println!("  WARN  could not fetch agent identity");
+        }
+    }
+
+    // 5. Status
+    match client.get(format!("{api_base}/status")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let status = body
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let peers = body.get("peers").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("  PASS  status: {status} ({peers} peers)");
+            if let Some(warnings) = body.get("warnings").and_then(|v| v.as_array()) {
+                for w in warnings {
+                    if let Some(s) = w.as_str() {
+                        println!("  WARN  {s}");
+                    }
+                }
+            }
+        }
+        _ => {
+            println!("  WARN  could not fetch status");
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Find x0xd in PATH.
+fn which_x0xd() -> Option<String> {
+    std::env::var("PATH").ok().and_then(|path| {
+        for dir in path.split(':') {
+            let candidate = std::path::Path::new(dir).join("x0xd");
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+        }
+        None
+    })
 }
 
 // ---------------------------------------------------------------------------
