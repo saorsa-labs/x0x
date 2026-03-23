@@ -212,9 +212,9 @@ pub fn current_binary_path() -> Result<PathBuf, UpgradeError> {
 /// Checks `Content-Length` upfront and streams the response to disk with
 /// a running byte counter to prevent OOM on oversized payloads.
 async fn download_to_file(url: &str, destination: &Path) -> Result<(), UpgradeError> {
+    use super::MAX_BINARY_SIZE_BYTES;
     use futures::StreamExt;
     use std::io::Write;
-    use super::MAX_BINARY_SIZE_BYTES;
 
     debug!(url = url, "Downloading: {url}");
 

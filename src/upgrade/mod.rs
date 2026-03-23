@@ -107,11 +107,7 @@ impl Upgrader {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let temp_dir = parent.join(format!(
-            ".x0x-upgrade-{}-{}",
-            std::process::id(),
-            unique_id
-        ));
+        let temp_dir = parent.join(format!(".x0x-upgrade-{}-{}", std::process::id(), unique_id));
         std::fs::create_dir_all(&temp_dir).map_err(|e| UpgradeError::TempDirFailed {
             path: temp_dir.clone(),
             source: e,
