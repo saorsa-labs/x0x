@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.4.0] - 2026-03-23
+
+### Added
+
+- **Identity unification** — `MachineId` now equals the `ant-quic` QUIC `PeerId`. The machine ML-DSA-65 keypair is passed directly to `ant-quic::NodeConfig` so that both identity and transport use the same key. No more disconnected transport identity.
+
+- **Flexible trust model** (`src/contacts.rs`, `src/trust.rs`) — Contacts now carry an `IdentityType` (`Anonymous | Known | Trusted | Pinned`) and a list of `MachineRecord` entries. `TrustEvaluator` evaluates `(AgentId, MachineId)` pairs:
+  - Machine pinning: `IdentityType::Pinned` accepts only messages from pinned machine IDs
+  - `TrustDecision`: `Accept | AcceptWithFlag | RejectMachineMismatch | RejectBlocked | Unknown`
+  - Identity listener now rejects blocked and machine-mismatched announcements
+
+- **Enhanced announcements** — `IdentityAnnouncement` and `DiscoveredAgent` now carry four optional NAT fields: `nat_type`, `can_receive_direct`, `is_relay`, `is_coordinator`. The async heartbeat populates them from `ant-quic::NodeStatus`.
+
+- **Connectivity module** (`src/connectivity.rs`) — New `ReachabilityInfo` struct (built from a `DiscoveredAgent`) with `likely_direct()` and `needs_coordination()` heuristics. New `ConnectOutcome` enum: `Direct(addr) | Coordinated(addr) | Unreachable | NotFound`.
+
+- **`Agent::connect_to_agent()`** — Attempts connection using direct-first strategy, falling back to coordinated NAT traversal via `ant-quic`. Enriches the bootstrap cache on success.
+
+- **`Agent::reachability()`** — Returns `Option<ReachabilityInfo>` for a discovered agent.
+
+- **`NetworkNode::node_status()`** — Accessor for the live `ant_quic::NodeStatus`.
+
+- **50 new integration tests** across 4 test files: `identity_unification_test.rs`, `trust_evaluation_test.rs`, `announcement_test.rs`, `connectivity_test.rs` (517 total tests).
+
+- **Technical documentation**: `docs/identity-architecture.md`, `docs/nat-traversal-strategy.md`, `docs/SKILLS.md`.
+
+### Changed
+
+- `ContactStore` gains `IdentityType`, `MachineRecord`, and machine management methods (`add_machine`, `remove_machine`, `pin_machine`, `unpin_machine`, `machines`, `set_identity_type`). The JSON storage format adds `identity_type` and `machines` fields with `#[serde(default)]` for backward compatibility.
+
+- `x0xd` REST API extended: `PATCH /contacts/:id` now accepts optional `identity_type` field; new routes `GET/POST /contacts/:id/machines` and `DELETE /contacts/:id/machines/:mid`.
+
+### Protocol Note
+
+`IdentityAnnouncement` wire format has changed. Messages encoded with v0.3.x cannot be decoded by v0.4.x because bincode 1.x treats all fields as required. Nodes must upgrade together.
+
 ## [v0.3.1] - 2026-03-05
 
 ### Fixed
