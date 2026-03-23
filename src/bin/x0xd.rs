@@ -249,6 +249,7 @@ struct AppState {
     contacts: Arc<RwLock<ContactStore>>,
     start_time: Instant,
     broadcast_tx: broadcast::Sender<SseEvent>,
+    api_address: SocketAddr,
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +375,18 @@ struct HealthData {
     version: String,
     peers: usize,
     uptime_secs: u64,
+}
+
+/// Status response (richer than health).
+#[derive(Debug, Serialize)]
+struct StatusData {
+    status: String,
+    version: String,
+    uptime_secs: u64,
+    api_address: String,
+    agent_id: String,
+    peers: usize,
+    warnings: Vec<String>,
 }
 
 /// Agent identity response.
@@ -551,35 +564,47 @@ async fn main() -> Result<()> {
         config.data_dir.join("contacts.json").display()
     );
 
-    // Join network
-    agent
-        .join_network()
-        .await
-        .context("failed to join network")?;
+    // Wrap agent in Arc before spawning background tasks
+    let agent = Arc::new(agent);
 
-    tracing::info!("Network joined");
+    // Join network in the background so the REST API is available immediately
+    {
+        let join_agent = Arc::clone(&agent);
+        let rendezvous_enabled = config.rendezvous_enabled;
+        let rendezvous_validity_ms = config.rendezvous_validity_ms;
+        tokio::spawn(async move {
+            match join_agent.join_network().await {
+                Ok(()) => {
+                    tracing::info!("Network joined");
 
-    // Initial rendezvous advertisement (if enabled)
-    if config.rendezvous_enabled {
-        if let Err(e) = agent
-            .advertise_identity(config.rendezvous_validity_ms)
-            .await
-        {
-            tracing::warn!("Initial rendezvous advertisement failed: {e}");
-        } else {
-            tracing::info!("Rendezvous advertisement published");
-        }
+                    // Initial rendezvous advertisement (if enabled)
+                    if rendezvous_enabled {
+                        if let Err(e) =
+                            join_agent.advertise_identity(rendezvous_validity_ms).await
+                        {
+                            tracing::warn!("Initial rendezvous advertisement failed: {e}");
+                        } else {
+                            tracing::info!("Rendezvous advertisement published");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to join network: {e}");
+                }
+            }
+        });
     }
 
     // Build shared state
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
     let state = Arc::new(AppState {
-        agent: Arc::new(agent),
+        agent,
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
         contacts,
         start_time: Instant::now(),
         broadcast_tx,
+        api_address: config.api_address,
     });
 
     // Gossip-based release subscription (primary update mechanism)
@@ -642,6 +667,7 @@ async fn main() -> Result<()> {
     // Build router
     let app = Router::new()
         .route("/health", get(health))
+        .route("/status", get(status))
         .route("/agent", get(agent_info))
         .route("/announce", post(announce_identity))
         .route("/peers", get(peers))
@@ -1095,6 +1121,38 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<ApiResponse<HealthDa
             version: x0x::VERSION.to_string(),
             peers,
             uptime_secs: state.start_time.elapsed().as_secs(),
+        },
+    })
+}
+
+/// GET /status — richer status with diagnostics
+async fn status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<StatusData>> {
+    let peers = state.agent.peers().await.map(|p| p.len()).unwrap_or(0);
+    let uptime_secs = state.start_time.elapsed().as_secs();
+
+    let mut warnings = Vec::new();
+    if peers == 0 {
+        warnings.push("no peers connected".to_string());
+    }
+
+    let status_str = if peers > 0 {
+        "connected"
+    } else if uptime_secs < 30 {
+        "connecting"
+    } else {
+        "isolated"
+    };
+
+    Json(ApiResponse {
+        ok: true,
+        data: StatusData {
+            status: status_str.to_string(),
+            version: x0x::VERSION.to_string(),
+            uptime_secs,
+            api_address: state.api_address.to_string(),
+            agent_id: hex::encode(state.agent.agent_id().as_bytes()),
+            peers,
+            warnings,
         },
     })
 }
