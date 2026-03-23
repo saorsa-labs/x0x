@@ -4,8 +4,15 @@
 //! associated trust levels. When integrated with [`crate::gossip::PubSubManager`],
 //! messages from blocked senders are dropped and messages from unknown
 //! senders are tagged with their trust level.
+//!
+//! # Machine Records and Identity Pinning
+//!
+//! Each contact can have one or more `MachineRecord` entries that track the
+//! machines an agent has been observed running on. When an agent's
+//! `IdentityType` is set to `Pinned`, messages are only
+//! accepted from machine IDs that appear in the contact's machine list.
 
-use crate::identity::AgentId;
+use crate::identity::{AgentId, MachineId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,12 +24,13 @@ use std::path::{Path, PathBuf};
 /// - `Unknown`: Delivered but flagged (consumer decides)
 /// - `Known`: Delivered normally
 /// - `Trusted`: Full delivery, can trigger actions
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustLevel {
     /// Messages silently dropped, never rebroadcast.
     Blocked,
     /// Default for new senders — messages delivered but flagged.
+    #[default]
     Unknown,
     /// Seen before, not explicitly trusted — messages delivered normally.
     Known,
@@ -55,6 +63,89 @@ impl std::str::FromStr for TrustLevel {
     }
 }
 
+/// How strongly we identify and constrain this contact's machine.
+///
+/// Controls whether machine identity is taken into account when accepting
+/// messages from this contact:
+///
+/// - `Anonymous`: No machine constraint — agent is trusted regardless of machine.
+/// - `Known`: Machine seen but not pinned — accepted from any known machine.
+/// - `Trusted`: Trusted identity; accepted from any machine.
+/// - `Pinned`: Messages only accepted from machine IDs that appear in the
+///   contact's machine list with `pinned: true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityType {
+    /// No machine information — agent is trusted regardless of machine.
+    #[default]
+    Anonymous,
+    /// Machine seen but not pinned — accepted from any known machine.
+    Known,
+    /// Trusted identity; accepted from any machine.
+    Trusted,
+    /// Pinned to specific machine(s) — only those machine_ids are accepted.
+    Pinned,
+}
+
+impl std::fmt::Display for IdentityType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Anonymous => write!(f, "anonymous"),
+            Self::Known => write!(f, "known"),
+            Self::Trusted => write!(f, "trusted"),
+            Self::Pinned => write!(f, "pinned"),
+        }
+    }
+}
+
+impl std::str::FromStr for IdentityType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "anonymous" => Ok(Self::Anonymous),
+            "known" => Ok(Self::Known),
+            "trusted" => Ok(Self::Trusted),
+            "pinned" => Ok(Self::Pinned),
+            _ => Err(format!("invalid identity type: {s}")),
+        }
+    }
+}
+
+/// A record of a known machine for a contact.
+///
+/// Tracks the machines an agent has been observed running on.
+/// When the contact's [`IdentityType`] is [`IdentityType::Pinned`],
+/// only machines with `pinned: true` will have their messages accepted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineRecord {
+    /// Machine identity (SHA-256 of ML-DSA-65 public key).
+    pub machine_id: MachineId,
+    /// Human-readable label for this machine.
+    pub label: Option<String>,
+    /// Unix timestamp when first seen.
+    pub first_seen: u64,
+    /// Unix timestamp when last seen.
+    pub last_seen: u64,
+    /// Whether to reject messages from other machines for this contact.
+    pub pinned: bool,
+}
+
+impl MachineRecord {
+    /// Create a new `MachineRecord` with the current time as both `first_seen` and `last_seen`.
+    #[must_use]
+    pub fn new(machine_id: MachineId, label: Option<String>) -> Self {
+        let now = now_secs();
+        Self {
+            machine_id,
+            label,
+            first_seen: now,
+            last_seen: now,
+            pinned: false,
+        }
+    }
+}
+
 /// A contact entry in the store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
@@ -68,6 +159,12 @@ pub struct Contact {
     pub added_at: u64,
     /// Unix timestamp of last message seen from this contact.
     pub last_seen: Option<u64>,
+    /// How machine identity is applied to this contact.
+    #[serde(default)]
+    pub identity_type: IdentityType,
+    /// Known machines for this contact.
+    #[serde(default)]
+    pub machines: Vec<MachineRecord>,
 }
 
 /// Persistent contact store backed by a JSON file.
@@ -83,6 +180,13 @@ pub struct ContactStore {
 #[derive(Serialize, Deserialize)]
 struct ContactsFile {
     contacts: Vec<Contact>,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl ContactStore {
@@ -119,18 +223,14 @@ impl ContactStore {
 
     /// Set the trust level for an existing contact, or create a new entry.
     pub fn set_trust(&mut self, agent_id: &AgentId, trust_level: TrustLevel) {
-        let entry = self.contacts.entry(agent_id.0).or_insert_with(|| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            Contact {
-                agent_id: *agent_id,
-                trust_level,
-                label: None,
-                added_at: now,
-                last_seen: None,
-            }
+        let entry = self.contacts.entry(agent_id.0).or_insert_with(|| Contact {
+            agent_id: *agent_id,
+            trust_level,
+            label: None,
+            added_at: now_secs(),
+            last_seen: None,
+            identity_type: IdentityType::default(),
+            machines: Vec::new(),
         });
         entry.trust_level = trust_level;
         let _ = self.save();
@@ -139,6 +239,11 @@ impl ContactStore {
     /// Get a contact by agent ID.
     pub fn get(&self, agent_id: &AgentId) -> Option<&Contact> {
         self.contacts.get(&agent_id.0)
+    }
+
+    /// Get a mutable reference to a contact by agent ID.
+    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<&mut Contact> {
+        self.contacts.get_mut(&agent_id.0)
     }
 
     /// List all contacts.
@@ -173,14 +278,130 @@ impl ContactStore {
     /// Update the last_seen timestamp for a contact.
     pub fn touch(&mut self, agent_id: &AgentId) {
         if let Some(contact) = self.contacts.get_mut(&agent_id.0) {
-            contact.last_seen = Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            );
+            contact.last_seen = Some(now_secs());
             let _ = self.save();
         }
+    }
+
+    /// Add or update a machine record for a contact.
+    ///
+    /// Returns `true` if this is the first time this machine was recorded.
+    /// If the machine already exists, its `last_seen` timestamp is updated.
+    /// Creates the contact entry if it does not exist yet.
+    pub fn add_machine(&mut self, agent_id: &AgentId, record: MachineRecord) -> bool {
+        let contact = self.contacts.entry(agent_id.0).or_insert_with(|| Contact {
+            agent_id: *agent_id,
+            trust_level: TrustLevel::Unknown,
+            label: None,
+            added_at: now_secs(),
+            last_seen: None,
+            identity_type: IdentityType::default(),
+            machines: Vec::new(),
+        });
+
+        if let Some(existing) = contact
+            .machines
+            .iter_mut()
+            .find(|m| m.machine_id == record.machine_id)
+        {
+            existing.last_seen = now_secs();
+            if record.label.is_some() {
+                existing.label = record.label;
+            }
+            let _ = self.save();
+            false
+        } else {
+            contact.machines.push(record);
+            let _ = self.save();
+            true
+        }
+    }
+
+    /// Remove a machine record from a contact.
+    ///
+    /// Returns `true` if the machine was found and removed.
+    pub fn remove_machine(&mut self, agent_id: &AgentId, machine_id: &MachineId) -> bool {
+        if let Some(contact) = self.contacts.get_mut(&agent_id.0) {
+            let before = contact.machines.len();
+            contact.machines.retain(|m| m.machine_id != *machine_id);
+            let removed = contact.machines.len() < before;
+            if removed {
+                let _ = self.save();
+            }
+            removed
+        } else {
+            false
+        }
+    }
+
+    /// Return the machine records for a contact.
+    pub fn machines(&self, agent_id: &AgentId) -> &[MachineRecord] {
+        self.contacts
+            .get(&agent_id.0)
+            .map(|c| c.machines.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Pin a machine for a contact.
+    ///
+    /// Sets `pinned: true` for the machine record with the given ID and
+    /// sets `identity_type` to `Pinned` on the contact.
+    /// Returns `true` if the machine was found.
+    pub fn pin_machine(&mut self, agent_id: &AgentId, machine_id: &MachineId) -> bool {
+        if let Some(contact) = self.contacts.get_mut(&agent_id.0) {
+            if let Some(record) = contact
+                .machines
+                .iter_mut()
+                .find(|m| m.machine_id == *machine_id)
+            {
+                record.pinned = true;
+                contact.identity_type = IdentityType::Pinned;
+                let _ = self.save();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Unpin a machine for a contact.
+    ///
+    /// Sets `pinned: false` for the machine record with the given ID.
+    /// If no machines remain pinned, resets `identity_type` to `Known`.
+    /// Returns `true` if the machine was found.
+    pub fn unpin_machine(&mut self, agent_id: &AgentId, machine_id: &MachineId) -> bool {
+        if let Some(contact) = self.contacts.get_mut(&agent_id.0) {
+            if let Some(record) = contact
+                .machines
+                .iter_mut()
+                .find(|m| m.machine_id == *machine_id)
+            {
+                record.pinned = false;
+                // If no machines are still pinned, downgrade identity type
+                if !contact.machines.iter().any(|m| m.pinned) {
+                    contact.identity_type = IdentityType::Known;
+                }
+                let _ = self.save();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Set the identity type for a contact.
+    ///
+    /// Creates the contact entry (with `Unknown` trust) if it does not exist.
+    pub fn set_identity_type(&mut self, agent_id: &AgentId, identity_type: IdentityType) {
+        let contact = self.contacts.entry(agent_id.0).or_insert_with(|| Contact {
+            agent_id: *agent_id,
+            trust_level: TrustLevel::Unknown,
+            label: None,
+            added_at: now_secs(),
+            last_seen: None,
+            identity_type: IdentityType::default(),
+            machines: Vec::new(),
+        });
+        contact.identity_type = identity_type;
+        let _ = self.save();
     }
 
     /// Persist contacts to disk.
@@ -232,6 +453,12 @@ mod tests {
         AgentKeypair::generate().expect("keygen").agent_id()
     }
 
+    fn test_machine_id() -> MachineId {
+        // Use a random machine keypair to generate a unique machine id for tests
+        let kp = crate::identity::MachineKeypair::generate().expect("keygen");
+        kp.machine_id()
+    }
+
     #[test]
     fn test_trust_level_display_and_parse() {
         for level in [
@@ -252,6 +479,30 @@ mod tests {
     }
 
     #[test]
+    fn test_identity_type_display_and_parse() {
+        for ty in [
+            IdentityType::Anonymous,
+            IdentityType::Known,
+            IdentityType::Trusted,
+            IdentityType::Pinned,
+        ] {
+            let s = ty.to_string();
+            let parsed: IdentityType = s.parse().expect("parse");
+            assert_eq!(parsed, ty);
+        }
+    }
+
+    #[test]
+    fn test_identity_type_parse_invalid() {
+        assert!("invalid".parse::<IdentityType>().is_err());
+    }
+
+    #[test]
+    fn test_identity_type_default() {
+        assert_eq!(IdentityType::default(), IdentityType::Anonymous);
+    }
+
+    #[test]
     fn test_contact_store_add_get_remove() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut store = ContactStore::new(dir.path().join("contacts.json"));
@@ -263,6 +514,8 @@ mod tests {
             label: Some("Test".to_string()),
             added_at: 1000,
             last_seen: None,
+            identity_type: IdentityType::default(),
+            machines: Vec::new(),
         });
 
         assert!(store.get(&id).is_some());
@@ -322,6 +575,8 @@ mod tests {
                 label: Some("Persistent".to_string()),
                 added_at: 2000,
                 last_seen: None,
+                identity_type: IdentityType::default(),
+                machines: Vec::new(),
             });
         }
 
@@ -351,5 +606,173 @@ mod tests {
         assert_eq!(json, "\"trusted\"");
         let parsed: TrustLevel = serde_json::from_str(&json).expect("de");
         assert_eq!(parsed, TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn test_machine_record_new() {
+        let mid = test_machine_id();
+        let rec = MachineRecord::new(mid, Some("laptop".to_string()));
+        assert_eq!(rec.machine_id, mid);
+        assert_eq!(rec.label.as_deref(), Some("laptop"));
+        assert!(!rec.pinned);
+        assert!(rec.first_seen > 0);
+        assert_eq!(rec.first_seen, rec.last_seen);
+    }
+
+    #[test]
+    fn test_add_machine_new() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+
+        let agent = test_agent_id();
+        let machine = test_machine_id();
+        let rec = MachineRecord::new(machine, None);
+        let is_new = store.add_machine(&agent, rec);
+        assert!(is_new);
+        assert_eq!(store.machines(&agent).len(), 1);
+    }
+
+    #[test]
+    fn test_add_machine_duplicate_updates_last_seen() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+
+        let agent = test_agent_id();
+        let machine = test_machine_id();
+
+        store.add_machine(&agent, MachineRecord::new(machine, None));
+        let is_new = store.add_machine(&agent, MachineRecord::new(machine, Some("new".into())));
+        assert!(!is_new);
+        assert_eq!(store.machines(&agent).len(), 1);
+        assert_eq!(store.machines(&agent)[0].label.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn test_remove_machine() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+
+        let agent = test_agent_id();
+        let machine = test_machine_id();
+
+        store.add_machine(&agent, MachineRecord::new(machine, None));
+        assert!(store.remove_machine(&agent, &machine));
+        assert_eq!(store.machines(&agent).len(), 0);
+
+        // Removing non-existent machine returns false
+        assert!(!store.remove_machine(&agent, &machine));
+    }
+
+    #[test]
+    fn test_pin_and_unpin_machine() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+
+        let agent = test_agent_id();
+        let machine = test_machine_id();
+
+        store.add_machine(&agent, MachineRecord::new(machine, None));
+        assert!(store.pin_machine(&agent, &machine));
+        assert_eq!(
+            store.get(&agent).expect("exists").identity_type,
+            IdentityType::Pinned
+        );
+        assert!(store.machines(&agent)[0].pinned);
+
+        // Pinning unknown machine returns false
+        let other = test_machine_id();
+        assert!(!store.pin_machine(&agent, &other));
+
+        // Unpin
+        assert!(store.unpin_machine(&agent, &machine));
+        assert!(!store.machines(&agent)[0].pinned);
+        // identity_type downgraded to Known because no pinned machines remain
+        assert_eq!(
+            store.get(&agent).expect("exists").identity_type,
+            IdentityType::Known
+        );
+    }
+
+    #[test]
+    fn test_set_identity_type() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+
+        let agent = test_agent_id();
+        store.set_identity_type(&agent, IdentityType::Trusted);
+        assert_eq!(
+            store.get(&agent).expect("exists").identity_type,
+            IdentityType::Trusted
+        );
+    }
+
+    #[test]
+    fn test_machine_record_persistence() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("contacts.json");
+
+        let agent = test_agent_id();
+        let machine = test_machine_id();
+
+        {
+            let mut store = ContactStore::new(path.clone());
+            store.add_machine(&agent, MachineRecord::new(machine, Some("desktop".into())));
+            store.pin_machine(&agent, &machine);
+        }
+
+        let store = ContactStore::new(path);
+        let machines = store.machines(&agent);
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].machine_id, machine);
+        assert_eq!(machines[0].label.as_deref(), Some("desktop"));
+        assert!(machines[0].pinned);
+        assert_eq!(
+            store.get(&agent).expect("exists").identity_type,
+            IdentityType::Pinned
+        );
+    }
+
+    #[test]
+    fn test_backward_compat_no_machines_field() {
+        // Simulate loading an old-format JSON without machines/identity_type fields.
+        // Build the JSON by first saving a contact, then removing the new fields via serde_json.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("contacts.json");
+
+        let agent_id = test_agent_id();
+        {
+            // Write the contact using the new format
+            let mut store = ContactStore::new(path.clone());
+            store.add(Contact {
+                agent_id,
+                trust_level: TrustLevel::Trusted,
+                label: None,
+                added_at: 1000,
+                last_seen: None,
+                identity_type: IdentityType::Anonymous,
+                machines: Vec::new(),
+            });
+        }
+
+        // Remove new fields from each contact entry to simulate an old-format file
+        let json = std::fs::read_to_string(&path).expect("read");
+        let mut root: serde_json::Value =
+            serde_json::from_str(&json).expect("parse saved contacts");
+        if let Some(contacts) = root.get_mut("contacts").and_then(|v| v.as_array_mut()) {
+            for c in contacts.iter_mut() {
+                if let Some(obj) = c.as_object_mut() {
+                    obj.remove("identity_type");
+                    obj.remove("machines");
+                }
+            }
+        }
+        let stripped = serde_json::to_string_pretty(&root).expect("serialize");
+        std::fs::write(&path, &stripped).expect("write");
+
+        let store = ContactStore::new(path);
+        let contact = store.get(&agent_id).expect("should load");
+        assert_eq!(contact.trust_level, TrustLevel::Trusted);
+        assert_eq!(contact.identity_type, IdentityType::Anonymous);
+        assert!(contact.machines.is_empty());
     }
 }

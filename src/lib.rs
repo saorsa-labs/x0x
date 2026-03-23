@@ -77,6 +77,12 @@ pub mod network;
 /// Contact store with trust levels for message filtering.
 pub mod contacts;
 
+/// Trust evaluation for `(identity, machine)` pairs.
+///
+/// The [`trust::TrustEvaluator`] combines an agent's trust level with its
+/// identity type and machine records to produce a [`trust::TrustDecision`].
+pub mod trust;
+
 /// Gossip overlay networking for x0x.
 pub mod gossip;
 
@@ -142,6 +148,8 @@ pub struct Agent {
     heartbeat_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Whether a rendezvous `ProviderSummary` advertisement is active.
     rendezvous_advertised: std::sync::atomic::AtomicBool,
+    /// Contact store for trust evaluation of incoming identity announcements.
+    contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
 }
 
 /// A message received from the gossip network.
@@ -381,6 +389,8 @@ pub struct AgentBuilder {
     peer_cache_dir: Option<std::path::PathBuf>,
     heartbeat_interval_secs: Option<u64>,
     identity_ttl_secs: Option<u64>,
+    /// Custom path for the contacts file.
+    contact_store_path: Option<std::path::PathBuf>,
 }
 
 /// Context captured by the background identity heartbeat task.
@@ -512,6 +522,7 @@ impl Agent {
             peer_cache_dir: None,
             heartbeat_interval_secs: None,
             identity_ttl_secs: None,
+            contact_store_path: None,
         }
     }
 
@@ -578,6 +589,18 @@ impl Agent {
     #[must_use]
     pub fn network(&self) -> Option<&std::sync::Arc<network::NetworkNode>> {
         self.network.as_ref()
+    }
+
+    /// Get a reference to the contact store.
+    ///
+    /// The contact store persists trust levels and machine records for known
+    /// agents. It is backed by `~/.x0x/contacts.json` by default.
+    ///
+    /// Use [`with_contact_store_path`](AgentBuilder::with_contact_store_path)
+    /// on the builder to customise the path.
+    #[must_use]
+    pub fn contacts(&self) -> &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>> {
+        &self.contact_store
     }
 
     /// Save the bootstrap cache and release resources.
@@ -783,6 +806,7 @@ impl Agent {
         let mut sub_shard = runtime.pubsub().subscribe(own_shard_topic).await;
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let bootstrap_cache = self.bootstrap_cache.clone();
+        let contact_store = std::sync::Arc::clone(&self.contact_store);
 
         tokio::spawn(async move {
             loop {
@@ -804,6 +828,42 @@ impl Agent {
                 if let Err(e) = announcement.verify() {
                     tracing::warn!("Ignoring unverifiable identity announcement: {}", e);
                     continue;
+                }
+
+                // Evaluate trust for this (agent, machine) pair.
+                // Blocked or machine-pinning violations are silently dropped.
+                {
+                    let store = contact_store.read().await;
+                    let evaluator = trust::TrustEvaluator::new(&store);
+                    let decision = evaluator.evaluate(&trust::TrustContext {
+                        agent_id: &announcement.agent_id,
+                        machine_id: &announcement.machine_id,
+                    });
+                    match decision {
+                        trust::TrustDecision::RejectBlocked => {
+                            tracing::debug!(
+                                "Dropping identity announcement from blocked agent {:?}",
+                                hex::encode(&announcement.agent_id.0[..8]),
+                            );
+                            continue;
+                        }
+                        trust::TrustDecision::RejectMachineMismatch => {
+                            tracing::warn!(
+                                "Dropping identity announcement from agent {:?}: machine {:?} not in pinned list",
+                                hex::encode(&announcement.agent_id.0[..8]),
+                                hex::encode(&announcement.machine_id.0[..8]),
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Update machine records in the contact store.
+                {
+                    let mut store = contact_store.write().await;
+                    let record = contacts::MachineRecord::new(announcement.machine_id, None);
+                    store.add_machine(&announcement.agent_id, record);
                 }
 
                 let now = std::time::SystemTime::now()
@@ -1891,6 +1951,20 @@ impl AgentBuilder {
         self
     }
 
+    /// Set a custom path for the contacts file.
+    ///
+    /// The contacts file persists trust levels and machine records for known
+    /// agents. Defaults to `~/.x0x/contacts.json` if not set.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path for the contacts file.
+    #[must_use]
+    pub fn with_contact_store_path<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+        self.contact_store_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     /// Build and initialise the agent.
     ///
     /// This performs the following:
@@ -2054,15 +2128,14 @@ impl AgentBuilder {
         };
 
         let network = if let Some(config) = self.network_config {
-            let node =
-                network::NetworkNode::new(config, bootstrap_cache.clone(), machine_keypair)
-                    .await
-                    .map_err(|e| {
-                        error::IdentityError::Storage(std::io::Error::other(format!(
-                            "network initialization failed: {}",
-                            e
-                        )))
-                    })?;
+            let node = network::NetworkNode::new(config, bootstrap_cache.clone(), machine_keypair)
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "network initialization failed: {}",
+                        e
+                    )))
+                })?;
 
             // Verify identity unification: ant-quic PeerId must equal MachineId
             debug_assert_eq!(
@@ -2100,6 +2173,17 @@ impl AgentBuilder {
             None
         };
 
+        // Initialise contact store
+        let contacts_path = self.contact_store_path.unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".x0x")
+                .join("contacts.json")
+        });
+        let contact_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            contacts::ContactStore::new(contacts_path),
+        ));
+
         Ok(Agent {
             identity: std::sync::Arc::new(identity),
             network,
@@ -2115,6 +2199,7 @@ impl AgentBuilder {
             identity_ttl_secs: self.identity_ttl_secs.unwrap_or(IDENTITY_TTL_SECS),
             heartbeat_handle: tokio::sync::Mutex::new(None),
             rendezvous_advertised: std::sync::atomic::AtomicBool::new(false),
+            contact_store,
         })
     }
 }

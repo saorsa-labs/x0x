@@ -35,8 +35,9 @@ use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
-use x0x::contacts::{ContactStore, TrustLevel};
+use x0x::contacts::{ContactStore, IdentityType, MachineRecord, TrustLevel};
 use x0x::identity::AgentId;
+use x0x::identity::MachineId;
 use x0x::network::NetworkConfig;
 use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
@@ -312,7 +313,31 @@ struct AddContactRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateContactRequest {
     /// New trust level: "blocked", "unknown", "known", or "trusted".
-    trust_level: String,
+    trust_level: Option<String>,
+    /// New identity type: "anonymous", "known", "trusted", or "pinned".
+    identity_type: Option<String>,
+}
+
+/// POST /contacts/:agent_id/machines request body.
+#[derive(Debug, Deserialize)]
+struct AddMachineRequest {
+    /// Machine ID as 64-character hex string.
+    machine_id: String,
+    /// Optional human-readable label.
+    label: Option<String>,
+    /// Whether to pin this machine immediately.
+    #[serde(default)]
+    pinned: bool,
+}
+
+/// Machine record entry for API responses.
+#[derive(Debug, Serialize)]
+struct MachineEntry {
+    machine_id: String,
+    label: Option<String>,
+    first_seen: u64,
+    last_seen: u64,
+    pinned: bool,
 }
 
 /// POST /contacts/trust request body (quick trust shorthand).
@@ -634,6 +659,14 @@ async fn main() -> Result<()> {
         .route("/contacts/trust", post(quick_trust))
         .route("/contacts/:agent_id", patch(update_contact))
         .route("/contacts/:agent_id", delete(delete_contact))
+        .route(
+            "/contacts/:agent_id/machines",
+            get(list_machines).post(add_machine),
+        )
+        .route(
+            "/contacts/:agent_id/machines/:machine_id",
+            delete(delete_machine),
+        )
         .route("/task-lists", get(list_task_lists))
         .route("/task-lists", post(create_task_list))
         .route("/task-lists/:id/tasks", get(list_tasks))
@@ -1492,6 +1525,8 @@ async fn add_contact(
         label: req.label,
         added_at: now,
         last_seen: None,
+        identity_type: x0x::contacts::IdentityType::default(),
+        machines: Vec::new(),
     };
 
     state.contacts.write().await.add(contact);
@@ -1502,7 +1537,7 @@ async fn add_contact(
     )
 }
 
-/// PATCH /contacts/:agent_id — update trust level for a contact.
+/// PATCH /contacts/:agent_id — update trust level and/or identity type for a contact.
 async fn update_contact(
     State(state): State<Arc<AppState>>,
     Path(agent_id_hex): Path<String>,
@@ -1518,23 +1553,196 @@ async fn update_contact(
         }
     };
 
-    let trust_level: TrustLevel = match req.trust_level.parse() {
-        Ok(t) => t,
+    let mut store = state.contacts.write().await;
+
+    if let Some(ref tl_str) = req.trust_level {
+        let trust_level: TrustLevel = match tl_str.parse() {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": e })),
+                );
+            }
+        };
+        store.set_trust(&agent_id, trust_level);
+    }
+
+    if let Some(ref it_str) = req.identity_type {
+        let identity_type: IdentityType = match it_str.parse() {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": e })),
+                );
+            }
+        };
+        store.set_identity_type(&agent_id, identity_type);
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
+/// GET /contacts/:agent_id/machines — list machine records for a contact.
+async fn list_machines(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "ok": false, "error": e })),
-            );
+            )
+                .into_response();
         }
     };
 
-    state
+    let store = state.contacts.read().await;
+    let entries: Vec<MachineEntry> = store
+        .machines(&agent_id)
+        .iter()
+        .map(|m| MachineEntry {
+            machine_id: hex::encode(m.machine_id.0),
+            label: m.label.clone(),
+            first_seen: m.first_seen,
+            last_seen: m.last_seen,
+            pinned: m.pinned,
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "machines": entries })),
+    )
+        .into_response()
+}
+
+/// POST /contacts/:agent_id/machines — add a machine record for a contact.
+async fn add_machine(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id_hex): Path<String>,
+    Json(req): Json<AddMachineRequest>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            )
+                .into_response();
+        }
+    };
+
+    let machine_bytes = match hex::decode(&req.machine_id) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "machine_id must be a 64-character hex string"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let machine_id = MachineId(machine_bytes);
+
+    let record = MachineRecord::new(machine_id, req.label.clone());
+    let mut store = state.contacts.write().await;
+    let is_new = store.add_machine(&agent_id, record);
+
+    if req.pinned {
+        store.pin_machine(&agent_id, &machine_id);
+    }
+
+    let status = if is_new {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    let entry = MachineEntry {
+        machine_id: hex::encode(machine_id.0),
+        label: req.label,
+        first_seen: store
+            .machines(&agent_id)
+            .iter()
+            .find(|m| m.machine_id == machine_id)
+            .map(|m| m.first_seen)
+            .unwrap_or(0),
+        last_seen: store
+            .machines(&agent_id)
+            .iter()
+            .find(|m| m.machine_id == machine_id)
+            .map(|m| m.last_seen)
+            .unwrap_or(0),
+        pinned: req.pinned,
+    };
+
+    (
+        status,
+        Json(serde_json::json!({ "ok": true, "machine": entry })),
+    )
+        .into_response()
+}
+
+/// DELETE /contacts/:agent_id/machines/:machine_id — remove a machine record.
+async fn delete_machine(
+    State(state): State<Arc<AppState>>,
+    Path((agent_id_hex, machine_id_hex)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            )
+                .into_response();
+        }
+    };
+
+    let machine_bytes = match hex::decode(&machine_id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "machine_id must be a 64-character hex string"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let machine_id = MachineId(machine_bytes);
+
+    let removed = state
         .contacts
         .write()
         .await
-        .set_trust(&agent_id, trust_level);
-
-    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        .remove_machine(&agent_id, &machine_id);
+    if removed {
+        (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "machine not found" })),
+        )
+            .into_response()
+    }
 }
 
 /// DELETE /contacts/:agent_id — remove a contact.
