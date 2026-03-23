@@ -1,6 +1,6 @@
 [package]
 name = "x0x"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.75.0"
 license = "MIT OR Apache-2.0"
@@ -15,7 +15,7 @@ authors = ["David Irvine <david@saorsalabs.com>"]
 
 [dependencies]
 anyhow = "1.0"
-ant-quic = "0.21"
+ant-quic = "0.22"
 async-trait = "0.1"
 bincode = "1.3"
 blake3 = "1.5"
@@ -31,17 +31,17 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-saorsa-gossip-coordinator = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
-saorsa-gossip-crdt-sync = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
-saorsa-gossip-groups = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
-saorsa-gossip-identity = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
-saorsa-gossip-membership = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
-saorsa-gossip-presence = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
-saorsa-gossip-pubsub = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
-saorsa-gossip-rendezvous = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
-saorsa-gossip-runtime = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
-saorsa-gossip-transport = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
-saorsa-gossip-types = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-do_not_abort_eager_forwarding" }
+saorsa-gossip-coordinator = "0.5.4"
+saorsa-gossip-crdt-sync = "0.5.4"
+saorsa-gossip-groups = "0.5.4"
+saorsa-gossip-identity = "0.5.4"
+saorsa-gossip-membership = "0.5.4"
+saorsa-gossip-presence = "0.5.4"
+saorsa-gossip-pubsub = "0.5.4"
+saorsa-gossip-rendezvous = "0.5.4"
+saorsa-gossip-runtime = "0.5.4"
+saorsa-gossip-transport = "0.5.4"
+saorsa-gossip-types = "0.5.4"
 saorsa-pqc = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
