@@ -1,6 +1,6 @@
-# Install x0x
+# Install x0xd
 
-Use this when you are ready to install `x0xd`.
+Use this when you are ready to install the x0xd daemon.
 
 ## Prerequisites
 
@@ -11,88 +11,61 @@ Use this when you are ready to install `x0xd`.
 ## Install command
 
 ```bash
-curl -sfL https://x0x.md/install.sh | bash
+curl -sfL https://x0x.md/install.sh | bash -s -- --start --health
 ```
 
-Interactive mode for humans:
+This downloads the x0xd binary, optionally verifies the archive signature (when GPG is available), starts the daemon, and waits for the health check to pass.
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--install-only` | Install binary only (do not start or health-check) |
+| `--start` | Start x0xd after installation |
+| `--health` | Wait for `/health` to respond after start |
+| `--upgrade` | Reinstall even if x0xd is already present |
+| `--no-verify` | Skip GPG signature verification |
+
+### Examples
 
 ```bash
-curl -sfL https://x0x.md/install.sh | bash -s -- --interactive
+# Install, start, and verify health
+curl -sfL https://x0x.md/install.sh | bash -s -- --start --health
+
+# Install binary only (no start)
+curl -sfL https://x0x.md/install.sh | bash -s -- --install-only
+
+# Upgrade existing installation
+curl -sfL https://x0x.md/install.sh | bash -s -- --upgrade --start --health
 ```
-
-- `--interactive` mode switch is not implemented yet in current scripts; this invocation is planned for Phase 02 plan `02-01`. [planned]
-
-## Current behavior now
-
-- `scripts/install.sh` and `scripts/install.py` are interactive by default today. [working]
-- Default runs may prompt for input and are not yet safe for unattended agent execution. [working]
-- No stable JSON stdout schema is emitted today. [working]
-
-## Planned Phase 02 behavior (plan `02-01`)
-
-- No prompts (`read`/`input`) in default mode. [planned]
-- Progress and warnings go to stderr. [planned]
-- Final machine-readable status goes to stdout as JSON. [planned]
-- If GPG is unavailable, installation continues and reports `"gpg_verified": false`. [planned]
-- If GPG verification fails, platform is unsupported, downloads fail, or writes fail, installation exits non-zero and emits error JSON. [planned]
-
-## Planned JSON output schema (Phase 02)
-
-Success (stdout):
-
-```json
-{
-  "status": "ok",
-  "x0xd_path": "/home/user/.local/bin/x0xd",
-  "skill_path": "/home/user/.local/share/x0x/SKILL.md",
-  "gpg_verified": true,
-  "platform": "macos-arm64",
-  "version": "0.2.0"
-}
-```
-
-Failure (stdout):
-
-```json
-{
-  "status": "error",
-  "error": "GPG signature verification failed",
-  "code": "gpg_verification_failed"
-}
-```
-
-`code` values:
-
-| Code | Meaning |
-|---|---|
-| `ok` | Installation succeeded |
-| `gpg_verification_failed` | SKILL.md signature did not verify |
-| `unsupported_platform` | No binary available for this OS/arch |
-| `download_failed` | Could not download from GitHub releases |
-| `permission_denied` | Cannot write to install directory |
-| `already_installed` | `x0xd` already exists at the install path |
 
 ## What gets installed where
 
-- Binary: `~/.local/bin/x0xd` [working]
-- Data root: `~/.local/share/x0x/` [working]
-- Identity material (created on first daemon start): `~/.local/share/x0x/identity/` [working]
+- Binary: `~/.local/bin/x0xd`
+- Identity material (created on first daemon start): `~/.x0x/`
 
-## Post-install: start and wait for readiness
-
-Start daemon:
+## Post-install: verify
 
 ```bash
-x0xd &
+# Health check
+curl -s http://127.0.0.1:12700/health
+
+# Agent identity
+curl -s http://127.0.0.1:12700/agent
+
+# Richer status with diagnostics
+curl -s http://127.0.0.1:12700/status
 ```
 
-Wait for health endpoint before continuing:
+## Diagnostics
+
+If something isn't working:
 
 ```bash
-until curl -sf http://127.0.0.1:12700/health >/dev/null; do sleep 1; done
+x0xd doctor
 ```
 
-If readiness does not arrive, go to `troubleshooting.md` for startup diagnostics.
+This checks binary availability, configuration, daemon health, and network connectivity.
 
 ## Next step
 

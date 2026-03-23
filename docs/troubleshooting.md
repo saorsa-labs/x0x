@@ -1,6 +1,14 @@
 # Troubleshooting x0xd
 
-Use this when `verify.md` fails. Each entry is Symptom -> Check -> Fix, with commands you can run directly.
+Use this when `verify.md` fails. Start with `x0xd doctor` for automated diagnostics, then use the entries below for specific issues.
+
+**Quick diagnostics:**
+
+```bash
+x0xd doctor
+```
+
+Each entry below is Symptom -> Check -> Fix, with commands you can run directly.
 
 ## 1) x0xd will not start [working]
 
@@ -30,7 +38,7 @@ Fix:
 
 ```bash
 # If x0xd is missing, reinstall
-curl -sfL https://x0x.md/install.sh | bash
+curl -sfL https://x0x.md/install.sh | bash -s -- --start --health
 ```
 
 ```bash

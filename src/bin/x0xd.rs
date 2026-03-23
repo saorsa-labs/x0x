@@ -584,8 +584,7 @@ async fn main() -> Result<()> {
 
                     // Initial rendezvous advertisement (if enabled)
                     if rendezvous_enabled {
-                        if let Err(e) =
-                            join_agent.advertise_identity(rendezvous_validity_ms).await
+                        if let Err(e) = join_agent.advertise_identity(rendezvous_validity_ms).await
                         {
                             tracing::warn!("Initial rendezvous advertisement failed: {e}");
                         } else {
@@ -797,9 +796,7 @@ async fn run_doctor() -> Result<()> {
                 // Check if port is in use by something else
                 match std::net::TcpListener::bind("127.0.0.1:12700") {
                     Ok(_) => println!("        port 12700 is free — start x0xd to use it"),
-                    Err(_) => println!(
-                        "        port 12700 is occupied by another process"
-                    ),
+                    Err(_) => println!("        port 12700 is occupied by another process"),
                 }
             } else if e.is_timeout() {
                 println!("  FAIL  daemon not responding (timeout after 5s)");
