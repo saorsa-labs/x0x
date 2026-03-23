@@ -1,226 +1,285 @@
 #!/usr/bin/env bash
-# x0x Installation Script (Unix/macOS/Linux)
+# x0xd installer (daemon only)
 #
-# Interactive mode (default in terminal): prompts for confirmation when needed.
-# Non-interactive mode (piped or -y flag): uses safe defaults, never blocks.
-#
-# Examples:
-#   curl -sfL https://x0x.md | sh            # non-interactive (piped)
-#   bash install.sh                           # interactive
-#   bash install.sh -y                        # non-interactive (explicit)
+# Canonical usage:
+#   curl -sfL https://x0x.md/install.sh | bash -s -- --start --health
 
 set -euo pipefail
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 REPO="saorsa-labs/x0x"
 RELEASE_URL="https://github.com/$REPO/releases/latest/download"
-INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/x0x"
 BIN_DIR="$HOME/.local/bin"
+TARGET_BIN="$BIN_DIR/x0xd"
+HEALTH_URL="http://127.0.0.1:12700/health"
+HEALTH_TIMEOUT_SECS="${X0X_HEALTH_TIMEOUT_SECS:-30}"
 
-# Detect interactive mode: false when piped (curl | sh) or when -y is passed
-INTERACTIVE=true
-if ! [ -t 0 ]; then
-    INTERACTIVE=false
-fi
+INSTALL_ONLY=false
+START=false
+HEALTH=false
+UPGRADE=false
+VERIFY=true
+
+info() {
+    echo -e "${BLUE}[*]${NC} $1"
+}
+
+ok() {
+    echo -e "${GREEN}[+]${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}[!]${NC} $1"
+}
+
+fail() {
+    echo -e "${RED}[x]${NC} $1" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+x0xd installer (daemon only)
+
+Options:
+  --install-only   Install binary only (do not start or health-check)
+  --start          Start x0xd after installation
+  --health         Wait for /health after start (or check existing daemon)
+  --upgrade        Reinstall even if x0xd is already present
+  --no-verify      Skip archive signature verification
+  -h, --help       Show this help
+
+Examples:
+  curl -sfL https://x0x.md/install.sh | bash -s -- --start --health
+  curl -sfL https://x0x.md/install.sh | bash -s -- --install-only
+EOF
+}
+
+have_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+download() {
+    local url="$1"
+    local out="$2"
+
+    if have_cmd curl; then
+        curl -sfL "$url" -o "$out"
+    elif have_cmd wget; then
+        wget -qO "$out" "$url"
+    else
+        fail "Neither curl nor wget is available"
+    fi
+}
+
+http_ok() {
+    local url="$1"
+    if have_cmd curl; then
+        curl -sf "$url" >/dev/null 2>&1
+    elif have_cmd wget; then
+        wget -qO- "$url" >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+detect_platform() {
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+
+    case "$os" in
+        Linux)
+            case "$arch" in
+                x86_64)
+                    PLATFORM="linux-x64-gnu"
+                    ;;
+                aarch64)
+                    PLATFORM="linux-arm64-gnu"
+                    ;;
+                *)
+                    fail "Unsupported Linux architecture: $arch"
+                    ;;
+            esac
+            ;;
+        Darwin)
+            case "$arch" in
+                x86_64)
+                    PLATFORM="macos-x64"
+                    ;;
+                arm64)
+                    PLATFORM="macos-arm64"
+                    ;;
+                *)
+                    fail "Unsupported macOS architecture: $arch"
+                    ;;
+            esac
+            ;;
+        *)
+            fail "Unsupported operating system: $os"
+            ;;
+    esac
+
+    ARCHIVE="x0x-${PLATFORM}.tar.gz"
+    SIGNATURE="${ARCHIVE}.asc"
+    INNER_BINARY="x0x-${PLATFORM}/x0xd"
+}
+
+verify_archive() {
+    local archive_path="$1"
+    local signature_path="$2"
+    local key_path="$3"
+    local gpg_home="$4"
+
+    if [ "$VERIFY" = false ]; then
+        warn "Skipping signature verification (--no-verify)"
+        return
+    fi
+
+    if ! have_cmd gpg; then
+        warn "gpg not found; signature verification skipped"
+        warn "Install gnupg to enable signature verification, then re-run the installer"
+        return
+    fi
+
+    mkdir -p "$gpg_home"
+    chmod 700 "$gpg_home"
+
+    info "Importing signing key"
+    gpg --batch --homedir "$gpg_home" --import "$key_path" >/dev/null 2>&1 \
+        || fail "Failed to import signing key"
+
+    info "Verifying archive signature"
+    if gpg --batch --no-tty --status-fd 1 --homedir "$gpg_home" --verify "$signature_path" "$archive_path" 2>/dev/null \
+        | grep -Eq "\[GNUPG:\] GOODSIG|\[GNUPG:\] VALIDSIG"; then
+        ok "Archive signature verified"
+    else
+        fail "Archive signature verification failed"
+    fi
+}
+
+start_daemon() {
+    if http_ok "$HEALTH_URL"; then
+        ok "x0xd already appears to be running"
+        return
+    fi
+
+    local daemon_path="x0xd"
+    if ! have_cmd x0xd; then
+        daemon_path="$TARGET_BIN"
+    fi
+
+    info "Starting x0xd"
+    nohup "$daemon_path" >/dev/null 2>&1 &
+    sleep 1
+}
+
+wait_for_health() {
+    local i
+    info "Waiting for x0xd health check (${HEALTH_TIMEOUT_SECS}s timeout)"
+    for ((i = 1; i <= HEALTH_TIMEOUT_SECS; i++)); do
+        if http_ok "$HEALTH_URL"; then
+            ok "x0xd is healthy"
+            return
+        fi
+        sleep 1
+    done
+
+    fail "x0xd did not become healthy at $HEALTH_URL"
+}
+
 for arg in "$@"; do
     case "$arg" in
-        -y|--yes) INTERACTIVE=false ;;
+        --install-only)
+            INSTALL_ONLY=true
+            ;;
+        --start)
+            START=true
+            ;;
+        --health)
+            HEALTH=true
+            ;;
+        --upgrade)
+            UPGRADE=true
+            ;;
+        --no-verify)
+            VERIFY=false
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "Unknown option: $arg (use --help)"
+            ;;
     esac
 done
 
-echo -e "${BLUE}x0x Installation Script${NC}"
-echo -e "${BLUE}========================${NC}"
-echo ""
+if [ "$INSTALL_ONLY" = true ] && { [ "$START" = true ] || [ "$HEALTH" = true ]; }; then
+    fail "--install-only cannot be combined with --start or --health"
+fi
 
-# Check if GPG is installed
-if ! command -v gpg &> /dev/null; then
-    echo -e "${YELLOW}⚠ Warning: GPG not found. Signature verification will be skipped.${NC}"
-    echo ""
-    echo "To enable signature verification, install GPG:"
-    echo "  macOS:  brew install gnupg"
-    echo "  Ubuntu: sudo apt install gnupg"
-    echo "  Fedora: sudo dnf install gnupg"
-    echo ""
-    if [ "$INTERACTIVE" = true ]; then
-        read -p "Continue without verification? (y/N) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-    else
-        echo "Continuing without verification (non-interactive mode)."
-        echo ""
-    fi
-    GPG_AVAILABLE=false
+echo -e "${BLUE}x0xd installer${NC}"
+echo -e "${BLUE}==============${NC}"
+
+detect_platform
+
+mkdir -p "$BIN_DIR"
+
+if [ -x "$TARGET_BIN" ] && [ "$UPGRADE" = false ]; then
+    ok "x0xd already installed at $TARGET_BIN"
+    info "Use --upgrade to reinstall from latest release"
 else
-    GPG_AVAILABLE=true
-fi
+    TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "$TMPDIR"' EXIT
 
-# Create install directory
-mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR"
+    ARCHIVE_PATH="$TMPDIR/$ARCHIVE"
+    SIGNATURE_PATH="$TMPDIR/$SIGNATURE"
+    KEY_PATH="$TMPDIR/SAORSA_PUBLIC_KEY.asc"
+    GPG_HOME="$TMPDIR/gnupg-home"
 
-echo "Downloading SKILL.md..."
-if command -v curl &> /dev/null; then
-    curl -sfL "$RELEASE_URL/SKILL.md" -o SKILL.md
-elif command -v wget &> /dev/null; then
-    wget -qO SKILL.md "$RELEASE_URL/SKILL.md"
-else
-    echo -e "${RED}✗ Error: Neither curl nor wget found${NC}"
-    exit 1
-fi
+    info "Downloading $ARCHIVE"
+    download "$RELEASE_URL/$ARCHIVE" "$ARCHIVE_PATH"
 
-if [ "$GPG_AVAILABLE" = true ]; then
-    echo "Downloading signature..."
-    if command -v curl &> /dev/null; then
-        curl -sfL "$RELEASE_URL/SKILL.md.sig" -o SKILL.md.sig
-        curl -sfL "$RELEASE_URL/SAORSA_PUBLIC_KEY.asc" -o SAORSA_PUBLIC_KEY.asc
-    else
-        wget -qO SKILL.md.sig "$RELEASE_URL/SKILL.md.sig"
-        wget -qO SAORSA_PUBLIC_KEY.asc "$RELEASE_URL/SAORSA_PUBLIC_KEY.asc"
+    if [ "$VERIFY" = true ]; then
+        info "Downloading signature and public key"
+        download "$RELEASE_URL/$SIGNATURE" "$SIGNATURE_PATH"
+        download "$RELEASE_URL/SAORSA_PUBLIC_KEY.asc" "$KEY_PATH"
     fi
 
-    echo "Importing Saorsa Labs public key..."
-    gpg --import SAORSA_PUBLIC_KEY.asc 2>&1 | grep -v "^gpg:" || true
+    verify_archive "$ARCHIVE_PATH" "$SIGNATURE_PATH" "$KEY_PATH" "$GPG_HOME"
 
-    echo "Verifying signature..."
-    if gpg --verify SKILL.md.sig SKILL.md 2>&1 | grep -q "Good signature"; then
-        echo -e "${GREEN}✓ Signature verified${NC}"
-    else
-        echo -e "${RED}✗ Signature verification failed${NC}"
-        echo ""
-        echo "This file may have been tampered with."
-        if [ "$INTERACTIVE" = true ]; then
-            read -p "Install anyway? (y/N) " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                exit 1
-            fi
-        else
-            echo -e "${RED}✗ Signature verification failed in non-interactive mode. Aborting.${NC}"
-            echo "  Re-run interactively or set X0X_SKIP_GPG=true to bypass."
-            exit 1
-        fi
-    fi
+    info "Extracting x0xd"
+    tar -xzf "$ARCHIVE_PATH" -C "$TMPDIR" "$INNER_BINARY" \
+        || fail "Failed to extract x0xd from archive"
+
+    mv "$TMPDIR/$INNER_BINARY" "$TARGET_BIN"
+    chmod +x "$TARGET_BIN"
+    ok "Installed x0xd to $TARGET_BIN"
 fi
 
-# ── x0xd daemon binary ────────────────────────────────────────────────────────
-
-echo ""
-echo "Detecting platform..."
-
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-
-case "$OS" in
-    Linux)
-        case "$ARCH" in
-            x86_64)  PLATFORM="linux-x64-gnu" ;;
-            aarch64) PLATFORM="linux-arm64-gnu" ;;
-            *)
-                echo -e "${YELLOW}⚠ Unsupported Linux architecture: $ARCH${NC}"
-                echo "  x0xd daemon installation skipped."
-                PLATFORM=""
-                ;;
-        esac
-        ;;
-    Darwin)
-        case "$ARCH" in
-            arm64)   PLATFORM="macos-arm64" ;;
-            x86_64)  PLATFORM="macos-x64" ;;
-            *)
-                echo -e "${YELLOW}⚠ Unsupported macOS architecture: $ARCH${NC}"
-                echo "  x0xd daemon installation skipped."
-                PLATFORM=""
-                ;;
-        esac
-        ;;
+case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
     *)
-        echo -e "${YELLOW}⚠ Unsupported operating system: $OS${NC}"
-        echo "  x0xd daemon installation is only supported on Linux and macOS."
-        echo "  Skipping daemon installation."
-        PLATFORM=""
+        warn "$BIN_DIR is not in PATH"
+        warn "Add: export PATH=\"\$HOME/.local/bin:\$PATH\""
         ;;
 esac
 
-if [ -n "$PLATFORM" ]; then
-    ARCHIVE="x0x-${PLATFORM}.tar.gz"
-    ARCHIVE_URL="$RELEASE_URL/$ARCHIVE"
-    TMPDIR="$(mktemp -d)"
-
-    echo "Downloading x0xd ($PLATFORM)..."
-    if command -v curl &> /dev/null; then
-        curl -sfL "$ARCHIVE_URL" -o "$TMPDIR/$ARCHIVE"
-    else
-        wget -qO "$TMPDIR/$ARCHIVE" "$ARCHIVE_URL"
-    fi
-
-    echo "Extracting x0xd..."
-    tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR" "x0x-${PLATFORM}/x0xd"
-
-    mkdir -p "$BIN_DIR"
-    mv "$TMPDIR/x0x-${PLATFORM}/x0xd" "$BIN_DIR/x0xd"
-    chmod +x "$BIN_DIR/x0xd"
-
-    rm -rf "$TMPDIR"
-
-    echo -e "${GREEN}✓ x0xd installed to: $BIN_DIR/x0xd${NC}"
-
-    # Warn if ~/.local/bin is not in PATH
-    case ":$PATH:" in
-        *":$BIN_DIR:"*) ;;
-        *)
-            echo ""
-            echo -e "${YELLOW}⚠ $BIN_DIR is not in your PATH.${NC}"
-            echo "  Add it by appending one of the following to your shell profile:"
-            echo ""
-            echo "    # bash (~/.bashrc or ~/.bash_profile)"
-            echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
-            echo ""
-            echo "    # zsh (~/.zshrc)"
-            echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
-            echo ""
-            echo "  Then reload your shell: source ~/.bashrc  (or ~/.zshrc)"
-            ;;
-    esac
+if [ "$START" = true ]; then
+    start_daemon
 fi
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+if [ "$HEALTH" = true ]; then
+    wait_for_health
+fi
 
-echo ""
-echo -e "${GREEN}✓ Installation complete${NC}"
-echo ""
-echo "SKILL.md installed to: $INSTALL_DIR/SKILL.md"
-if [ -n "$PLATFORM" ]; then
-    echo "x0xd installed to:     $BIN_DIR/x0xd"
+ok "Done"
+if [ "$START" = true ] && [ "$HEALTH" = false ]; then
+    info "To verify now: curl -sf $HEALTH_URL"
 fi
-echo ""
-echo "Next steps:"
-if [ -n "$PLATFORM" ]; then
-    echo "  1. Run x0xd:"
-    echo "       x0xd"
-    echo "     (x0xd creates your identity on first run and joins the global network)"
-    echo "     (If x0xd is not found, ensure $BIN_DIR is in your PATH — see above)"
-    echo ""
-    echo "  2. Manage contacts:"
-    echo "       curl http://127.0.0.1:12700/contacts"
-    echo ""
-    echo "  3. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
-    echo ""
-    echo "  4. Install SDK:"
-else
-    echo "  1. Review SKILL.md: cat $INSTALL_DIR/SKILL.md"
-    echo ""
-    echo "  2. Install SDK:"
-fi
-echo "     - Rust:       cargo add x0x"
-echo "     - TypeScript: npm install x0x"
-echo "     - Python:     pip install agent-x0x"
-echo ""
-echo "Learn more: https://github.com/$REPO"
