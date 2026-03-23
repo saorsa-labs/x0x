@@ -355,6 +355,10 @@ fn fake_agent(last_seen: u64) -> DiscoveredAgent {
         announced_at: last_seen,
         last_seen,
         machine_public_key: Vec::new(),
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
     }
 }
 

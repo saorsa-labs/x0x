@@ -324,6 +324,16 @@ impl NetworkNode {
         node.status().await.connected_peers
     }
 
+    /// Get the full node status from ant-quic.
+    ///
+    /// Returns `None` if the network node has not been started yet.
+    /// The status includes NAT type, relay capability, coordination status,
+    /// and connectivity metrics.
+    pub async fn node_status(&self) -> Option<ant_quic::NodeStatus> {
+        let node = self.node.read().await.as_ref().cloned()?;
+        Some(node.status().await)
+    }
+
     /// Subscribe to network events.
     ///
     /// Returns a receiver that will receive all network events
