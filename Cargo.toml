@@ -15,7 +15,7 @@ authors = ["David Irvine <david@saorsalabs.com>"]
 
 [dependencies]
 anyhow = "1.0"
-ant-quic = { git = "ssh://git@github.com/jacderida/ant-quic.git", branch = "feat/observed-address-peer-tracking" }
+ant-quic = { git = "https://github.com/jacderida/ant-quic.git", branch = "feat/observed-address-peer-tracking" }
 async-trait = "0.1"
 bincode = "1.3"
 blake3 = "1.5"
@@ -31,17 +31,17 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-saorsa-gossip-coordinator = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
-saorsa-gossip-crdt-sync = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
-saorsa-gossip-groups = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
-saorsa-gossip-identity = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
-saorsa-gossip-membership = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
-saorsa-gossip-presence = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
-saorsa-gossip-pubsub = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
-saorsa-gossip-rendezvous = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
-saorsa-gossip-runtime = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
-saorsa-gossip-transport = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
-saorsa-gossip-types = { git = "ssh://git@github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-coordinator = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-crdt-sync = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-groups = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-identity = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-membership = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-presence = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-pubsub = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-rendezvous = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-runtime = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-transport = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
+saorsa-gossip-types = { git = "https://github.com/jacderida/saorsa-gossip.git", branch = "fix-asymmetric-plumtree-routing" }
 saorsa-pqc = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
