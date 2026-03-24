@@ -236,9 +236,10 @@ Six workflows in `.github/workflows/`:
 
 Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile` crate for temp directories.
 
-## Incomplete APIs
+## API Completeness
 
-`Agent::create_task_list()` and `Agent::join_task_list()` return "not yet implemented" errors. The underlying CRDT types are fully implemented — only the `TaskListHandle` bridge to `GossipRuntime` is pending.
+All public APIs are fully implemented and exposed via x0xd REST endpoints (36 total).
+No stubs, no incomplete handlers, no "not yet implemented" errors.
 
 ## Crate-Level Lint Suppressions
 

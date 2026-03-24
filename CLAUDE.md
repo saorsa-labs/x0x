@@ -218,9 +218,13 @@ The sync `build_announcement()` leaves these as `None` (no network access). The 
 
 Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile` crate for temp directories.
 
-## Incomplete APIs
+## API Completeness
 
-`Agent::create_task_list()` and `Agent::join_task_list()` return "not yet implemented" errors. The underlying CRDT types are fully implemented — only the `TaskListHandle` bridge to `GossipRuntime` is pending.
+All public APIs are fully implemented and wired to x0xd REST endpoints:
+- Direct messaging: `send_direct()`, `recv_direct()`, `connect_to_agent()`, `subscribe_direct()`
+- MLS groups: `MlsGroup::new()`, `add_member()`, `remove_member()`, `MlsCipher::encrypt/decrypt()`
+- Task lists: `create_task_list()`, `join_task_list()` via `TaskListHandle`
+- Identity, trust, contacts, gossip pub/sub: all complete
 
 ## Crate-Level Lint Suppressions
 

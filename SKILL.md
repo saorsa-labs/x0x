@@ -632,6 +632,9 @@ x0xd doctor
 | POST | `/contacts/trust` | Quick trust update |
 | PATCH | `/contacts/:id` | Update contact |
 | DELETE | `/contacts/:id` | Remove contact |
+| GET | `/contacts/:id/machines` | List machine records for a contact |
+| POST | `/contacts/:id/machines` | Add machine record |
+| DELETE | `/contacts/:id/machines/:mid` | Remove machine record |
 
 ### Collaborative Data (CRDTs)
 
@@ -642,6 +645,18 @@ x0xd doctor
 | GET | `/task-lists/:id/tasks` | Tasks in a list |
 | POST | `/task-lists/:id/tasks` | Add a task |
 | PATCH | `/task-lists/:id/tasks/:tid` | Claim or complete a task |
+
+### MLS Group Encryption
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/mls/groups` | Create an encrypted group |
+| GET | `/mls/groups` | List all groups |
+| GET | `/mls/groups/:id` | Group details and members |
+| POST | `/mls/groups/:id/members` | Add member to group |
+| DELETE | `/mls/groups/:id/members/:agent_id` | Remove member |
+| POST | `/mls/groups/:id/encrypt` | Encrypt data with group key |
+| POST | `/mls/groups/:id/decrypt` | Decrypt data with group key |
 
 ## Architecture
 
