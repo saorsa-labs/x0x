@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.5.0] - 2026-03-24
+
+### Added
+
+- **Direct agent-to-agent messaging** (`src/direct.rs`) — Point-to-point communication between connected agents, bypassing gossip for private, efficient, reliable delivery.
+  - `agent.send_direct(&agent_id, payload)` — send bytes to a connected agent
+  - `agent.recv_direct()` — blocking receive from any agent
+  - `agent.recv_direct_filtered()` — receive with trust filtering (drops messages from blocked agents)
+  - `agent.subscribe_direct()` — broadcast receiver for concurrent processing
+  - `agent.is_agent_connected(&agent_id)` — check connection state
+  - `agent.connected_agents()` — list all connected agents
+  - Wire format: `[0x10][sender_agent_id: 32 bytes][payload]` — max 16 MB
+
+- **Trust-filtered direct messaging** — `recv_direct_filtered()` checks `ContactStore` before delivering messages. Blocked agents' direct messages are silently dropped, matching gossip pub/sub behavior.
+
+- **Receive-side payload size enforcement** — Network layer drops direct messages exceeding 16 MB + 32 bytes before forwarding to the channel, preventing memory exhaustion from malicious peers.
+
+- **New error variants** — `AgentNotConnected`, `AgentNotFound`, `PayloadTooLarge`, `InvalidMessage` in `NetworkError`.
+
+- **21 new tests** — 8 unit tests in `direct.rs`, 13 integration tests in `tests/direct_messaging_integration.rs` (536 total tests).
+
+- **SKILL.md major update** — Direct messaging API docs, "Build Any Decentralized Application" vision with complete primitive table, human-centric tool replacement guide (GitHub → decentralized git, Zoom → saorsa-webrtc, etc.), sibling project references, plugin creation examples.
+
+### Changed
+
+- `connect_to_agent()` now registers agent mappings in `DirectMessaging` on successful connection, enabling subsequent `send_direct()` calls.
+
+- Network receiver (`spawn_receiver()`) routes `0x10`-tagged messages to a separate direct message channel, distinct from gossip streams.
+
+### Security
+
+- Documented sender spoofing limitation: the `sender` AgentId in direct messages is self-asserted. The `machine_id` IS authenticated via QUIC/ML-DSA-65. See `DirectMessage` docs for guidance.
+
+### Removed
+
+- `NetworkNode::try_recv_direct()` — dead code stub that always returned `None`.
+
 ## [v0.4.0] - 2026-03-23
 
 ### Added
