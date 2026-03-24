@@ -990,8 +990,15 @@ impl Agent {
                     Some(m) = sub_shard.recv() => m,
                     else => break,
                 };
-                let announcement = match bincode::deserialize::<IdentityAnnouncement>(&msg.payload)
-                {
+                let decoded = {
+                    use bincode::Options;
+                    bincode::options()
+                        .with_fixint_encoding()
+                        .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+                        .allow_trailing_bytes()
+                        .deserialize::<IdentityAnnouncement>(&msg.payload)
+                };
+                let announcement = match decoded {
                     Ok(a) => a,
                     Err(e) => {
                         tracing::debug!("Ignoring invalid identity announcement payload: {}", e);
@@ -1584,7 +1591,12 @@ impl Agent {
             let timeout = tokio::time::sleep_until(deadline);
             tokio::select! {
                 Some(msg) = sub.recv() => {
-                    if let Ok(ann) = bincode::deserialize::<IdentityAnnouncement>(&msg.payload) {
+                    if let Ok(ann) = {
+                        use bincode::Options;
+                        bincode::DefaultOptions::new()
+                            .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+                            .deserialize::<IdentityAnnouncement>(&msg.payload)
+                    } {
                         if ann.verify().is_ok() && ann.agent_id == agent_id {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1875,7 +1887,13 @@ impl Agent {
                     let addrs: Vec<std::net::SocketAddr> = summary
                         .extensions
                         .as_deref()
-                        .and_then(|b| bincode::deserialize(b).ok())
+                        .and_then(|b| {
+                            use bincode::Options;
+                            bincode::DefaultOptions::new()
+                                .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+                                .deserialize(b)
+                                .ok()
+                        })
                         .unwrap_or_default();
                     if !addrs.is_empty() {
                         return Ok(Some(addrs));

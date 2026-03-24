@@ -551,35 +551,43 @@ async fn main() -> Result<()> {
         config.data_dir.join("contacts.json").display()
     );
 
-    // Join network
-    agent
-        .join_network()
-        .await
-        .context("failed to join network")?;
-
-    tracing::info!("Network joined");
-
-    // Initial rendezvous advertisement (if enabled)
-    if config.rendezvous_enabled {
-        if let Err(e) = agent
-            .advertise_identity(config.rendezvous_validity_ms)
-            .await
-        {
-            tracing::warn!("Initial rendezvous advertisement failed: {e}");
-        } else {
-            tracing::info!("Rendezvous advertisement published");
-        }
-    }
-
-    // Build shared state
+    // Build shared state BEFORE joining network so the API server can
+    // start immediately. Network-dependent endpoints will return errors
+    // until join completes, which is better than blocking the entire API.
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
+    let agent = Arc::new(agent);
     let state = Arc::new(AppState {
-        agent: Arc::new(agent),
+        agent: Arc::clone(&agent),
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
         contacts,
         start_time: Instant::now(),
         broadcast_tx,
+    });
+
+    // Join network in background — API is available immediately
+    let join_agent = Arc::clone(&agent);
+    let rendezvous_enabled = config.rendezvous_enabled;
+    let rendezvous_validity_ms = config.rendezvous_validity_ms;
+    tokio::spawn(async move {
+        match join_agent.join_network().await {
+            Ok(()) => {
+                tracing::info!("Network joined");
+                if rendezvous_enabled {
+                    if let Err(e) = join_agent
+                        .advertise_identity(rendezvous_validity_ms)
+                        .await
+                    {
+                        tracing::warn!("Initial rendezvous advertisement failed: {e}");
+                    } else {
+                        tracing::info!("Rendezvous advertisement published");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to join network: {e}");
+            }
+        }
     });
 
     // Gossip-based release subscription (primary update mechanism)
