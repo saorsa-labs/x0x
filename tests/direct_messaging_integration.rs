@@ -232,3 +232,8 @@ fn test_direct_messaging_decode_too_short() {
 //
 // Those tests would be added in a follow-up when the infrastructure
 // for spawning multiple local agents with direct connectivity is available.
+//
+// Additional behaviors covered by code but not easily unit-testable:
+// - recv_direct_filtered() drops messages from blocked agents
+// - Network layer drops oversized direct messages (>16MB + 32 bytes)
+// - Sender AgentId is self-asserted (security documentation)

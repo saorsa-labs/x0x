@@ -24,6 +24,26 @@
 //! The sender's AgentId is included in the message so the receiver can
 //! identify who sent it, even if multiple agents share a machine.
 //!
+//! ## Security Model
+//!
+//! **Sender identity is self-asserted.** The `sender` field in [`DirectMessage`]
+//! is claimed by the sender and not cryptographically verified against the AgentId.
+//! However, the underlying QUIC connection *is* authenticated by the sender's
+//! [`MachineId`](crate::identity::MachineId) via ML-DSA-65 signatures.
+//!
+//! This means:
+//! - You can trust which *machine* sent the message (via `machine_id`)
+//! - The claimed `sender` AgentId is only as trustworthy as that machine
+//! - A malicious machine could claim any AgentId
+//!
+//! For high-trust scenarios, verify the AgentId→MachineId binding against
+//! a known-good source (e.g., a signed identity announcement you've cached).
+//!
+//! **Trust filtering:** Unlike gossip pub/sub, direct messages do not
+//! automatically filter based on [`ContactStore`](crate::contacts::ContactStore)
+//! trust levels. Use [`Agent::recv_direct_filtered()`](crate::Agent::recv_direct_filtered)
+//! if you need trust-based filtering.
+//!
 //! ## Example
 //!
 //! ```rust,ignore
@@ -53,11 +73,27 @@ pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
 pub const MAX_DIRECT_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
 /// A direct message received from another agent.
+///
+/// # Security Note
+///
+/// The `sender` field is **self-asserted** by the sender and not cryptographically
+/// verified. However, `machine_id` is authenticated via the QUIC connection's
+/// ML-DSA-65 handshake, so you can trust which machine sent this message.
+///
+/// The claimed `sender` AgentId is only as trustworthy as the machine that sent it.
+/// For sensitive operations, verify the AgentId→MachineId binding against a
+/// trusted source (e.g., a signed identity announcement).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectMessage {
-    /// The AgentId of the sender.
+    /// The AgentId claimed by the sender.
+    ///
+    /// **Warning:** This is self-asserted and not cryptographically verified.
+    /// Use `machine_id` for authenticated sender identity.
     pub sender: AgentId,
-    /// The MachineId the message was sent from.
+    /// The MachineId the message was sent from (authenticated via QUIC).
+    ///
+    /// This is derived from the QUIC connection's peer identity and is
+    /// cryptographically verified via ML-DSA-65 signatures.
     pub machine_id: MachineId,
     /// The message payload.
     pub payload: Vec<u8>,
