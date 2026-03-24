@@ -264,6 +264,27 @@ pub enum NetworkError {
         limit: usize,
     },
 
+    /// Payload too large for direct send.
+    #[error("payload too large: {size} bytes exceeds limit of {max}")]
+    PayloadTooLarge {
+        /// Actual payload size.
+        size: usize,
+        /// Maximum allowed size.
+        max: usize,
+    },
+
+    /// Invalid message format.
+    #[error("invalid message: {0}")]
+    InvalidMessage(String),
+
+    /// Agent not connected for direct send.
+    #[error("agent not connected: {0:?}")]
+    AgentNotConnected([u8; 32]),
+
+    /// Agent not found in discovery cache.
+    #[error("agent not found: {0:?}")]
+    AgentNotFound([u8; 32]),
+
     /// Channel closed unexpectedly.
     #[error("channel closed: {0}")]
     ChannelClosed(String),

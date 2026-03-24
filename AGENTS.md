@@ -88,6 +88,36 @@ The identity listener applies trust evaluation to all incoming announcements.
 - `Unreachable` — no path found
 - `NotFound` — agent not in discovery cache
 
+### Direct Messaging
+
+Point-to-point communication between connected agents, bypassing gossip:
+
+```rust
+// Connect to an agent
+let outcome = agent.connect_to_agent(&target_agent_id).await?;
+
+// Send data directly
+agent.send_direct(&target_agent_id, b"hello".to_vec()).await?;
+
+// Receive direct messages
+if let Some(msg) = agent.recv_direct().await {
+    println!("From {:?}: {:?}", msg.sender, msg.payload_str());
+}
+
+// Or subscribe for concurrent processing
+let mut rx = agent.subscribe_direct();
+while let Some(msg) = rx.recv().await {
+    // Process message
+}
+
+// Check connection state
+agent.is_agent_connected(&agent_id).await  // bool
+agent.connected_agents().await             // Vec<AgentId>
+```
+
+Wire format: `[0x10][sender_agent_id: 32 bytes][payload]`
+Max payload: 16 MB (`direct::MAX_DIRECT_PAYLOAD_SIZE`)
+
 ### Module Dependency Flow
 
 ```
@@ -100,6 +130,7 @@ lib.rs (Agent, AgentBuilder, TaskListHandle)
   ├── contacts.rs    ← ContactStore: TrustLevel, IdentityType, MachineRecord
   ├── trust.rs       ← TrustEvaluator: (AgentId, MachineId) → TrustDecision
   ├── connectivity.rs ← ReachabilityInfo, ConnectOutcome
+  ├── direct.rs      ← DirectMessage, DirectMessaging, DirectMessageReceiver
   ├── gossip/        ← Wraps saorsa-gossip-* crates
   ├── crdt/          ← TaskList, TaskItem, CheckboxState, Delta, Sync
   └── mls/           ← MlsGroup, MlsCipher, MlsKeySchedule, MlsWelcome
@@ -127,6 +158,14 @@ agent.agent_certificate() // Option<&AgentCertificate>
 
 // Discovery
 agent.discovered_agents().await?          // Vec<DiscoveredAgent> (TTL-filtered)
+
+// Direct messaging (point-to-point, bypasses gossip)
+agent.connect_to_agent(&agent_id).await?  // ConnectOutcome
+agent.send_direct(&agent_id, payload).await?
+agent.recv_direct().await                 // Option<DirectMessage>
+agent.subscribe_direct()                  // DirectMessageReceiver
+agent.is_agent_connected(&agent_id).await // bool
+agent.connected_agents().await            // Vec<AgentId>
 agent.reachability(&agent_id).await       // Option<ReachabilityInfo>
 
 // Connectivity
@@ -173,7 +212,7 @@ Six workflows in `.github/workflows/`:
 
 ## Test Organization
 
-16 integration test files in `tests/`:
+17 integration test files in `tests/`:
 
 | File | Tests |
 |------|-------|
@@ -183,6 +222,7 @@ Six workflows in `.github/workflows/`:
 | `announcement_test.rs` | Announcement round-trips, NAT fields, discovery cache |
 | `connectivity_test.rs` | ReachabilityInfo heuristics, ConnectOutcome, connect_to_agent |
 | `identity_announcement_integration.rs` | Signature verification, TTL expiry, shard topics |
+| `direct_messaging_integration.rs` | DirectMessage, send_direct, recv_direct, connection tracking |
 | `crdt_integration.rs` | TaskList CRUD, state transitions |
 | `crdt_convergence_concurrent.rs` | Concurrent CRDT operations converging |
 | `crdt_partition_tolerance.rs` | Network partition and recovery |

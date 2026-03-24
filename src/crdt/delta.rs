@@ -413,7 +413,10 @@ mod tests {
         assert!(result.is_ok());
 
         // Version reflects all mutations from the merge: add_task + reorder + update_name
-        assert!(DeltaCrdt::version(&list1) > 0, "version should be bumped after merge");
+        assert!(
+            DeltaCrdt::version(&list1) > 0,
+            "version should be bumped after merge"
+        );
         assert_eq!(list1.task_count(), 1);
     }
 
