@@ -917,7 +917,8 @@ impl Agent {
     /// // Messages from blocked agents are silently dropped
     /// loop {
     ///     if let Some(msg) = agent.recv_direct_filtered().await {
-    ///         // msg.sender is guaranteed not to be blocked
+    ///         // msg.sender is not in the blocked list
+    ///         // (note: sender is self-asserted, see DirectMessage docs)
     ///     }
     /// }
     /// ```

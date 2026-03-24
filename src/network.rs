@@ -759,7 +759,8 @@ impl NetworkNode {
                             let payload = Bytes::copy_from_slice(&data[1..]);
 
                             // Enforce max payload size (16 MB) to prevent memory exhaustion
-                            // The payload includes 32-byte AgentId prefix, so effective data limit is MAX - 32
+                            // payload = 32-byte AgentId prefix + actual data, so effective
+                            // data limit is exactly MAX_DIRECT_PAYLOAD_SIZE (16 MB)
                             if payload.len() > crate::direct::MAX_DIRECT_PAYLOAD_SIZE + 32 {
                                 warn!(
                                     "[1/6 network] dropping oversized direct message: {} bytes from peer {:?} (max: {})",
