@@ -67,6 +67,33 @@ impl TaskListDelta {
         }
     }
 
+    /// Create a delta for a single add_task operation.
+    #[must_use]
+    pub fn for_add(task_id: TaskId, task: TaskItem, tag: UniqueTag, version: u64) -> Self {
+        let mut delta = Self::new(version);
+        delta.added_tasks.insert(task_id, (task, tag));
+        delta
+    }
+
+    /// Create a delta for a state change (claim or complete).
+    ///
+    /// Includes the full TaskItem so receivers can upsert if they
+    /// haven't received the add delta yet (out-of-order delivery).
+    #[must_use]
+    pub fn for_state_change(task_id: TaskId, full_task: TaskItem, version: u64) -> Self {
+        let mut delta = Self::new(version);
+        delta.task_updates.insert(task_id, full_task);
+        delta
+    }
+
+    /// Create a delta for a reorder operation.
+    #[must_use]
+    pub fn for_reorder(new_order: Vec<TaskId>, version: u64) -> Self {
+        let mut delta = Self::new(version);
+        delta.ordering_update = Some(new_order);
+        delta
+    }
+
     /// Check if this delta is empty (contains no changes).
     #[must_use]
     pub fn is_empty(&self) -> bool {

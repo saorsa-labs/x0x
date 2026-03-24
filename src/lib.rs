@@ -2502,15 +2502,27 @@ impl TaskListHandle {
         title: String,
         description: String,
     ) -> error::Result<crdt::TaskId> {
-        let mut list = self.sync.write().await;
-        let seq = list.next_seq();
-        let task_id = crdt::TaskId::new(&title, &self.agent_id, seq);
-        let metadata = crdt::TaskMetadata::new(title, description, 128, self.agent_id, seq);
-        let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
-        list.add_task(task, self.peer_id, seq).map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!("add_task failed: {}", e)))
-        })?;
-
+        let (task_id, delta) = {
+            let mut list = self.sync.write().await;
+            let seq = list.next_seq();
+            let task_id = crdt::TaskId::new(&title, &self.agent_id, seq);
+            let metadata = crdt::TaskMetadata::new(title, description, 128, self.agent_id, seq);
+            let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
+            list.add_task(task.clone(), self.peer_id, seq).map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "add_task failed: {}",
+                    e
+                )))
+            })?;
+            let tag = (self.peer_id, seq);
+            let delta =
+                crdt::TaskListDelta::for_add(task_id, task, tag, list.current_version());
+            (task_id, delta)
+        };
+        // Best-effort replication: local mutation succeeded regardless
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish add_task delta: {}", e);
+        }
         Ok(task_id)
     }
 
@@ -2524,15 +2536,31 @@ impl TaskListHandle {
     ///
     /// Returns an error if the task cannot be claimed.
     pub async fn claim_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
-        let mut list = self.sync.write().await;
-        let seq = list.next_seq();
-        list.claim_task(&task_id, self.agent_id, self.peer_id, seq)
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "claim_task failed: {}",
-                    e
-                )))
-            })
+        let delta = {
+            let mut list = self.sync.write().await;
+            let seq = list.next_seq();
+            list.claim_task(&task_id, self.agent_id, self.peer_id, seq)
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "claim_task failed: {}",
+                        e
+                    )))
+                })?;
+            // Include full task so receivers can upsert if add hasn't arrived yet
+            let full_task = list
+                .get_task(&task_id)
+                .ok_or_else(|| {
+                    error::IdentityError::Storage(std::io::Error::other(
+                        "task disappeared after claim",
+                    ))
+                })?
+                .clone();
+            crdt::TaskListDelta::for_state_change(task_id, full_task, list.current_version())
+        };
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish claim_task delta: {}", e);
+        }
+        Ok(())
     }
 
     /// Complete a task in the list.
@@ -2545,15 +2573,30 @@ impl TaskListHandle {
     ///
     /// Returns an error if the task cannot be completed.
     pub async fn complete_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
-        let mut list = self.sync.write().await;
-        let seq = list.next_seq();
-        list.complete_task(&task_id, self.agent_id, self.peer_id, seq)
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "complete_task failed: {}",
-                    e
-                )))
-            })
+        let delta = {
+            let mut list = self.sync.write().await;
+            let seq = list.next_seq();
+            list.complete_task(&task_id, self.agent_id, self.peer_id, seq)
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "complete_task failed: {}",
+                        e
+                    )))
+                })?;
+            let full_task = list
+                .get_task(&task_id)
+                .ok_or_else(|| {
+                    error::IdentityError::Storage(std::io::Error::other(
+                        "task disappeared after complete",
+                    ))
+                })?
+                .clone();
+            crdt::TaskListDelta::for_state_change(task_id, full_task, list.current_version())
+        };
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish complete_task delta: {}", e);
+        }
+        Ok(())
     }
 
     /// List all tasks in their current order.
@@ -2592,10 +2635,20 @@ impl TaskListHandle {
     ///
     /// Returns an error if reordering fails.
     pub async fn reorder(&self, task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
-        let mut list = self.sync.write().await;
-        list.reorder(task_ids, self.peer_id).map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!("reorder failed: {}", e)))
-        })
+        let delta = {
+            let mut list = self.sync.write().await;
+            list.reorder(task_ids.clone(), self.peer_id).map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "reorder failed: {}",
+                    e
+                )))
+            })?;
+            crdt::TaskListDelta::for_reorder(task_ids, list.current_version())
+        };
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish reorder delta: {}", e);
+        }
+        Ok(())
     }
 }
 
