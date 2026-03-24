@@ -18,6 +18,8 @@ use crate::crdt::{CrdtError, Result, TaskId, TaskItem};
 use crate::identity::AgentId;
 use saorsa_gossip_crdt_sync::{LwwRegister, OrSet};
 use saorsa_gossip_types::PeerId;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -66,6 +68,10 @@ impl std::fmt::Display for TaskListId {
 /// - HashMap for task content (the TaskItem CRDTs)
 /// - LWW-Register for ordering (task display order)
 /// - LWW-Register for metadata (list name)
+fn default_seq_counter() -> Arc<AtomicU64> {
+    Arc::new(AtomicU64::new(0))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskList {
     /// Unique identifier for this task list.
@@ -86,6 +92,19 @@ pub struct TaskList {
 
     /// List name (LWW semantics).
     name: LwwRegister<String>,
+
+    /// Version counter — incremented on every mutation for accurate
+    /// delta-based synchronization.
+    #[serde(default)]
+    version: u64,
+
+    /// Monotonic sequence counter for generating unique OR-Set tags.
+    ///
+    /// Shared via `Arc` so clones share the same counter, preventing
+    /// tag collisions. Not serialized — remote replicas start their own
+    /// counters from 0; uniqueness comes from the `PeerId` component.
+    #[serde(skip, default = "default_seq_counter")]
+    seq_counter: Arc<AtomicU64>,
 }
 
 impl TaskList {
@@ -108,7 +127,26 @@ impl TaskList {
             task_data: HashMap::new(),
             ordering: LwwRegister::new(Vec::new()),
             name: LwwRegister::new(name),
+            version: 0,
+            seq_counter: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Get the current version counter.
+    ///
+    /// Incremented on every mutation (add, remove, claim, complete, reorder, rename).
+    #[must_use]
+    pub fn current_version(&self) -> u64 {
+        self.version
+    }
+
+    /// Return the next monotonically-increasing sequence number.
+    ///
+    /// Used to construct `UniqueTag = (PeerId, seq)` for OR-Set
+    /// operations. Guaranteed distinct on this node even when multiple
+    /// operations occur within the same millisecond.
+    pub fn next_seq(&self) -> u64 {
+        self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Get the task list ID.
@@ -163,6 +201,7 @@ impl TaskList {
             self.ordering.set(current_order, peer_id);
         }
 
+        self.version += 1;
         Ok(())
     }
 
@@ -195,6 +234,7 @@ impl TaskList {
         // Note: We don't remove from ordering vector to preserve order of remaining tasks
         // The ordering will be filtered when tasks_ordered() is called
 
+        self.version += 1;
         Ok(())
     }
 
@@ -228,7 +268,9 @@ impl TaskList {
             .get_mut(task_id)
             .ok_or(CrdtError::TaskNotFound(*task_id))?;
 
-        task.claim(agent_id, peer_id, seq)
+        task.claim(agent_id, peer_id, seq)?;
+        self.version += 1;
+        Ok(())
     }
 
     /// Complete a task in the list.
@@ -261,7 +303,9 @@ impl TaskList {
             .get_mut(task_id)
             .ok_or(CrdtError::TaskNotFound(*task_id))?;
 
-        task.complete(agent_id, peer_id, seq)
+        task.complete(agent_id, peer_id, seq)?;
+        self.version += 1;
+        Ok(())
     }
 
     /// Reorder the tasks in the list.
@@ -289,6 +333,7 @@ impl TaskList {
         // Update ordering
         self.ordering.set(new_order, peer_id);
 
+        self.version += 1;
         Ok(())
     }
 
@@ -383,6 +428,7 @@ impl TaskList {
     /// * `peer_id` - Peer making this change
     pub fn update_name(&mut self, name: String, peer_id: PeerId) {
         self.name.set(name, peer_id);
+        self.version += 1;
     }
 
     /// Get the number of tasks in the list.
@@ -749,5 +795,60 @@ mod tests {
         assert_eq!(list.id(), deserialized.id());
         assert_eq!(list.name(), deserialized.name());
         assert_eq!(list.task_count(), deserialized.task_count());
+    }
+
+    #[test]
+    fn test_next_seq_starts_at_one() {
+        let list = TaskList::new(list_id(99), "seq test".to_string(), peer(1));
+        assert_eq!(list.next_seq(), 1);
+    }
+
+    #[test]
+    fn test_next_seq_is_strictly_monotonic() {
+        let list = TaskList::new(list_id(99), "seq test".to_string(), peer(1));
+        let mut prev = 0;
+        for _ in 0..100 {
+            let s = list.next_seq();
+            assert!(s > prev, "seq must be strictly increasing");
+            prev = s;
+        }
+    }
+
+    #[test]
+    fn test_next_seq_survives_clone() {
+        let list = TaskList::new(list_id(99), "seq test".to_string(), peer(1));
+        let s1 = list.next_seq();
+        let cloned = list.clone();
+        let s2 = cloned.next_seq();
+        assert_ne!(s1, s2, "clone must share counter via Arc");
+        assert_eq!(s2, s1 + 1);
+    }
+
+    #[test]
+    fn test_seq_counter_resets_after_serde() {
+        let list = TaskList::new(list_id(99), "seq test".to_string(), peer(1));
+        for _ in 0..10 {
+            let _ = list.next_seq();
+        }
+
+        let bytes = bincode::serialize(&list).ok().unwrap();
+        let restored: TaskList = bincode::deserialize(&bytes).ok().unwrap();
+        assert_eq!(restored.next_seq(), 1, "deserialized counter must start fresh");
+    }
+
+    #[test]
+    fn test_rapid_add_tasks_all_survive() {
+        let p = peer(1);
+        let mut list = TaskList::new(list_id(99), "rapid".to_string(), p);
+        for i in 0u8..50 {
+            let task = make_task(i, p);
+            let seq = list.next_seq();
+            list.add_task(task, p, seq).ok().unwrap();
+        }
+        assert_eq!(
+            list.task_count(),
+            50,
+            "all 50 tasks must survive; duplicate OR-Set tags would drop some"
+        );
     }
 }

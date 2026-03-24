@@ -92,9 +92,7 @@ impl TaskList {
     /// would track the actual version in TaskList's state.
     #[must_use]
     pub fn version(&self) -> u64 {
-        // For now, we use the task count as a proxy for version
-        // A production implementation would add a version field to TaskList
-        self.task_count() as u64
+        self.current_version()
     }
 
     /// Generate a delta containing changes since a given version.
@@ -181,10 +179,20 @@ impl TaskList {
             let _ = self.remove_task(task_id);
         }
 
-        // Apply task updates
+        // Apply task updates (upsert: merge if exists, insert if missing).
+        // The upsert is critical for out-of-order delivery — a claim/complete
+        // delta may arrive before the corresponding add delta. Since the
+        // TaskItem in task_updates contains full state, inserting it directly
+        // is safe and preserves the state change.
         for (task_id, updated_task) in &delta.task_updates {
             if let Some(existing_task) = self.get_task_mut(task_id) {
                 existing_task.merge(updated_task)?;
+            } else {
+                // Task not yet known — insert it with a synthetic OR-Set add.
+                // Use the peer_id from the delta sender and seq=0 (the OR-Set
+                // tag just needs to exist; uniqueness is already guaranteed by
+                // the sender's monotonic counter).
+                self.add_task(updated_task.clone(), peer_id, 0)?;
             }
         }
 
@@ -377,7 +385,9 @@ mod tests {
         let result = DeltaCrdt::merge(&mut list1, &delta);
         assert!(result.is_ok());
 
-        assert_eq!(DeltaCrdt::version(&list1), 1);
+        // Version reflects all mutations from the merge: add_task + reorder + update_name
+        assert!(DeltaCrdt::version(&list1) > 0, "version should be bumped after merge");
+        assert_eq!(list1.task_count(), 1);
     }
 
     #[test]

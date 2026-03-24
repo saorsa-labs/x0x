@@ -2502,16 +2502,12 @@ impl TaskListHandle {
         title: String,
         description: String,
     ) -> error::Result<crdt::TaskId> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let task_id = crdt::TaskId::new(&title, &self.agent_id, timestamp);
-        let metadata = crdt::TaskMetadata::new(title, description, 128, self.agent_id, timestamp);
-        let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
-
         let mut list = self.sync.write().await;
-        list.add_task(task, self.peer_id, timestamp).map_err(|e| {
+        let seq = list.next_seq();
+        let task_id = crdt::TaskId::new(&title, &self.agent_id, seq);
+        let metadata = crdt::TaskMetadata::new(title, description, 128, self.agent_id, seq);
+        let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
+        list.add_task(task, self.peer_id, seq).map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!("add_task failed: {}", e)))
         })?;
 
@@ -2528,13 +2524,9 @@ impl TaskListHandle {
     ///
     /// Returns an error if the task cannot be claimed.
     pub async fn claim_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
         let mut list = self.sync.write().await;
-        list.claim_task(&task_id, self.agent_id, self.peer_id, timestamp)
+        let seq = list.next_seq();
+        list.claim_task(&task_id, self.agent_id, self.peer_id, seq)
             .map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
                     "claim_task failed: {}",
@@ -2553,13 +2545,9 @@ impl TaskListHandle {
     ///
     /// Returns an error if the task cannot be completed.
     pub async fn complete_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
         let mut list = self.sync.write().await;
-        list.complete_task(&task_id, self.agent_id, self.peer_id, timestamp)
+        let seq = list.next_seq();
+        list.complete_task(&task_id, self.agent_id, self.peer_id, seq)
             .map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
                     "complete_task failed: {}",
