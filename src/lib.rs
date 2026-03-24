@@ -870,6 +870,13 @@ impl Agent {
     ///
     /// Blocks until a direct message is received.
     ///
+    /// # Security Note
+    ///
+    /// This method does **not** apply trust filtering from [`ContactStore`].
+    /// Messages from blocked agents will still be delivered. Use
+    /// [`recv_direct_filtered()`](Self::recv_direct_filtered) if you need
+    /// trust-based filtering.
+    ///
     /// # Returns
     ///
     /// The received [`DirectMessage`] containing sender, payload, and timestamp.
@@ -884,6 +891,58 @@ impl Agent {
     /// }
     /// ```
     pub async fn recv_direct(&self) -> Option<direct::DirectMessage> {
+        self.recv_direct_inner().await
+    }
+
+    /// Receive the next direct message, filtering by trust level.
+    ///
+    /// Messages from blocked agents are silently dropped. This mirrors the
+    /// behavior of gossip pub/sub message filtering.
+    ///
+    /// # Returns
+    ///
+    /// The received [`DirectMessage`], or `None` if the channel closes.
+    /// Messages from blocked senders are dropped and the method continues
+    /// waiting for the next acceptable message.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Block an agent
+    /// {
+    ///     let mut contacts = agent.contacts().write().await;
+    ///     contacts.set_trust(&bad_agent_id, TrustLevel::Blocked);
+    /// }
+    ///
+    /// // Messages from blocked agents are silently dropped
+    /// loop {
+    ///     if let Some(msg) = agent.recv_direct_filtered().await {
+    ///         // msg.sender is guaranteed not to be blocked
+    ///     }
+    /// }
+    /// ```
+    pub async fn recv_direct_filtered(&self) -> Option<direct::DirectMessage> {
+        loop {
+            let msg = self.recv_direct_inner().await?;
+
+            // Check trust level
+            let contacts = self.contact_store.read().await;
+            if let Some(contact) = contacts.get(&msg.sender) {
+                if contact.trust_level == contacts::TrustLevel::Blocked {
+                    tracing::debug!(
+                        "Dropping direct message from blocked agent {:?}",
+                        msg.sender
+                    );
+                    continue;
+                }
+            }
+
+            return Some(msg);
+        }
+    }
+
+    /// Internal helper for receiving direct messages.
+    async fn recv_direct_inner(&self) -> Option<direct::DirectMessage> {
         let network = self.network.as_ref()?;
 
         // Get the raw message from network layer

@@ -719,17 +719,6 @@ impl NetworkNode {
         rx.recv().await
     }
 
-    /// Try to receive a direct message without blocking.
-    ///
-    /// # Returns
-    ///
-    /// `Some((peer_id, payload))` if a message is available, `None` otherwise.
-    pub fn try_recv_direct(&self) -> Option<(AntPeerId, Bytes)> {
-        // Note: This needs synchronous access which isn't ideal.
-        // In practice, callers should use recv_direct() or the channel directly.
-        None
-    }
-
     /// Spawn background receiver task that parses gossip stream types.
     ///
     /// This task continuously receives messages from ant-quic, parses the
@@ -768,6 +757,19 @@ impl NetworkNode {
                         if type_byte == DIRECT_MESSAGE_STREAM_TYPE {
                             // Direct message: forward to direct channel (includes full payload with sender AgentId)
                             let payload = Bytes::copy_from_slice(&data[1..]);
+
+                            // Enforce max payload size (16 MB) to prevent memory exhaustion
+                            // The payload includes 32-byte AgentId prefix, so effective data limit is MAX - 32
+                            if payload.len() > crate::direct::MAX_DIRECT_PAYLOAD_SIZE + 32 {
+                                warn!(
+                                    "[1/6 network] dropping oversized direct message: {} bytes from peer {:?} (max: {})",
+                                    payload.len(),
+                                    peer_id,
+                                    crate::direct::MAX_DIRECT_PAYLOAD_SIZE + 32
+                                );
+                                continue;
+                            }
+
                             info!(
                                 "[1/6 network] recv direct: {} bytes from peer {:?}",
                                 payload.len(),
