@@ -289,7 +289,8 @@ struct CreateTaskListRequest {
 #[derive(Debug, Deserialize)]
 struct AddTaskRequest {
     title: String,
-    description: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// PATCH /task-lists/:id/tasks/:tid request body.
@@ -1212,13 +1213,28 @@ async fn publish(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PublishRequest>,
 ) -> impl IntoResponse {
+    // Reject empty topic
+    if req.topic.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "topic must not be empty" })),
+        );
+    }
+
     // Decode base64 payload
     let payload = match base64::engine::general_purpose::STANDARD.decode(&req.payload) {
         Ok(p) => p,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": format!("invalid base64: {e}") })),
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "invalid base64 in payload field: {e}. \
+                         The payload must be base64-encoded \
+                         (e.g., use `echo -n \"hello\" | base64`)"
+                    )
+                })),
             );
         }
     };
@@ -1923,7 +1939,7 @@ async fn list_tasks(
                     id: format!("{}", t.id),
                     title: t.title,
                     description: t.description,
-                    state: format!("{:?}", t.state),
+                    state: format!("{}", t.state),
                     assignee: t.assignee.map(|a| format!("{a}")),
                     priority: t.priority,
                 })
@@ -1954,7 +1970,7 @@ async fn add_task(
         );
     };
 
-    match handle.add_task(req.title, req.description).await {
+    match handle.add_task(req.title, req.description.unwrap_or_default()).await {
         Ok(task_id) => (
             StatusCode::CREATED,
             Json(serde_json::json!({ "ok": true, "task_id": format!("{task_id}") })),

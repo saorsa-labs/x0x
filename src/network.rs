@@ -139,12 +139,24 @@ fn default_stats_interval() -> Duration {
     DEFAULT_STATS_INTERVAL
 }
 
+/// Quick check whether the host can bind an IPv6 socket.
+///
+/// Returns `false` if IPv6 is not available (e.g., containers, VMs,
+/// or hosts with `net.ipv6.conf.all.disable_ipv6 = 1`).
+fn check_ipv6_available() -> bool {
+    std::net::UdpSocket::bind("[::1]:0").is_ok()
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
-        // Parse default bootstrap peers
+        // Parse default bootstrap peers, filtering out IPv6 addresses
+        // if IPv6 is not available on this host. This avoids wasting time
+        // on deterministic connection failures during bootstrap.
+        let ipv6_available = check_ipv6_available();
         let bootstrap_nodes = DEFAULT_BOOTSTRAP_PEERS
             .iter()
-            .filter_map(|addr| addr.parse().ok())
+            .filter_map(|addr| addr.parse::<std::net::SocketAddr>().ok())
+            .filter(|addr| ipv6_available || addr.is_ipv4())
             .collect();
 
         Self {
