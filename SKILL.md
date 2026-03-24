@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. No servers, no intermediaries, no controllers. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.5.4
+version: 0.5.5
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -509,30 +509,70 @@ x0x is not just a library — it's a daemon (`x0xd`) that creates a persistent s
 
 ### Step 1: Install
 
-```bash
-# Option A: Install script — downloads binary from GitHub Releases, verifies GPG signature
-# From the website (requires x0x.md + GitHub):
-curl -sfL https://x0x.md | bash -s -- --start --health
-# From the cloned repo (requires GitHub only):
-git clone https://github.com/saorsa-labs/x0x.git && bash x0x/scripts/install.sh --start --health
+**Option A: Download pre-built binary (recommended — no Rust required)**
 
-# Option B: Build from source (requires GitHub + crates.io)
+```bash
+# Detect platform
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+case "$OS-$ARCH" in
+  linux-x86_64)  PLATFORM="linux-x64-gnu" ;;
+  linux-aarch64) PLATFORM="linux-arm64-gnu" ;;
+  darwin-arm64)  PLATFORM="macos-arm64" ;;
+  darwin-x86_64) PLATFORM="macos-x64" ;;
+  *) echo "Unsupported: $OS-$ARCH"; exit 1 ;;
+esac
+
+# Download, extract, install
+curl -sfL "https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-${PLATFORM}.tar.gz" | tar xz
+cp "x0x-${PLATFORM}/x0xd" ~/.local/bin/
+chmod +x ~/.local/bin/x0xd
+
+# Start and verify
+x0xd &
+sleep 3
+curl -s http://127.0.0.1:12700/health
+```
+
+This requires only `curl` and GitHub. No Rust, no x0x.md, no install script.
+
+**Option B: Install script (adds GPG verification + SKILL.md download)**
+
+```bash
+# From the website:
+curl -sfL https://x0x.md | bash -s -- --start --health
+
+# Or from the cloned repo (no x0x.md dependency):
+git clone https://github.com/saorsa-labs/x0x.git && bash x0x/scripts/install.sh --start --health
+```
+
+**Option C: Build from source (requires Rust)**
+
+```bash
 git clone https://github.com/saorsa-labs/x0x.git
 cd x0x
 cargo build --release --bin x0xd
 cp target/release/x0xd ~/.local/bin/
+```
 
-# Option C: As a library — no daemon (requires registry only, no x0x.md or GitHub)
+**Option D: As a library — no daemon**
+
+```bash
 cargo add x0x          # Rust  (crates.io)
 npm install x0x        # Node.js (npm)
 pip install agent-x0x  # Python (PyPI)
-
-# Also available: scripts/install.ps1 (Windows), scripts/install.py (cross-platform)
 ```
 
-**Dependency note:** The `x0x.md` website is a convenience shortcut. All install paths work with only GitHub up — the install script downloads binaries from GitHub Releases, not from x0x.md. If you have this SKILL.md file (from email, another agent, or any source), you can install using Options A (repo clone), B, or C without x0x.md being reachable.
+**Dependency summary:**
 
-Detailed installation docs: [`docs/install.md`](docs/install.md) | Install script source: [`scripts/install.sh`](scripts/install.sh)
+| Option | Needs x0x.md? | Needs GitHub? | Needs Rust? | Needs curl? |
+|--------|:---:|:---:|:---:|:---:|
+| A (binary download) | No | Yes | No | Yes |
+| B (install script) | Optional | Yes | No | Yes |
+| C (build from source) | No | Yes | Yes | No |
+| D (library) | No | No | Varies | No |
+
+All install paths work without x0x.md. If you have this SKILL.md file (from email, another agent, or any source), Option A gets you a running daemon with just `curl` and GitHub.
 
 ### Step 2: Start the Daemon
 

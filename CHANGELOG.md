@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.5.5] - 2026-03-24
+
+### Added
+
+- **`--start` and `--health` flags in install script** — `bash scripts/install.sh --start --health` now actually starts the daemon and waits for it to be healthy. Previously these flags were documented in SKILL.md but silently ignored by the script.
+
+- **Direct binary download instructions in SKILL.md** — agents can now install x0xd with only `curl` and GitHub, no Rust toolchain or install script needed. Platform detection + `curl` + `tar` is all that's required.
+
+### Fixed
+
+- **Install script platform paths** — macOS data directory now correctly uses `~/Library/Application Support/` instead of `~/.local/share/` (matches x0xd's `dirs::data_dir()` behavior).
+
+- **x0x.md dependency clarified** — SKILL.md now explicitly states that x0x.md is optional. All install paths work with only GitHub up.
+
 ## [v0.5.4] - 2026-03-24
 
 ### Fixed
