@@ -258,7 +258,7 @@ impl MlsCommit {
 /// The `MlsGroup` tracks membership, handles commits, and manages the group's
 /// cryptographic state across epochs. It provides the foundation for end-to-end
 /// encrypted group messaging.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MlsGroup {
     /// Unique identifier for this group.
     group_id: Vec<u8>,

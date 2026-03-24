@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.5.1] - 2026-03-24
+
+### Added
+
+- **x0xd REST endpoints for direct messaging** — 4 new endpoints exposing the direct messaging API via the daemon's HTTP interface:
+  - `POST /agents/connect` — connect to a discovered agent
+  - `POST /direct/send` — send direct message (with trust filtering — blocked agents rejected)
+  - `GET /direct/connections` — list connected agents
+  - `GET /direct/events` — SSE stream of incoming direct messages (with 15s keepalive)
+
+- **x0xd REST endpoints for MLS group encryption** — 7 new endpoints for managing encrypted groups:
+  - `POST /mls/groups` — create a group (random or specified ID)
+  - `GET /mls/groups` — list all groups
+  - `GET /mls/groups/:id` — get group details and members
+  - `POST /mls/groups/:id/members` — add member
+  - `DELETE /mls/groups/:id/members/:agent_id` — remove member
+  - `POST /mls/groups/:id/encrypt` — encrypt with group key
+  - `POST /mls/groups/:id/decrypt` — decrypt with group key
+
+- **MLS group persistence** — groups are saved to `<data_dir>/mls_groups.json` on every mutation and restored on daemon restart.
+
+- **1 MB body-size limit** — `DefaultBodyLimit::max(1MB)` on all endpoints to prevent memory exhaustion.
+
+- **Trust check on direct send** — `POST /direct/send` checks `ContactStore` and rejects messages to blocked agents with HTTP 403.
+
+### Security
+
+- All internal error details are logged with `tracing::error!` but HTTP responses return only generic error messages. No file paths, socket addresses, or cryptographic details are leaked to API consumers.
+
+- Extracted `decode_base64_payload()` and `make_mls_cipher()` helpers to eliminate duplicated error-handling code.
+
 ## [v0.5.0] - 2026-03-24
 
 ### Added

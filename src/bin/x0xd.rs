@@ -255,6 +255,8 @@ struct AppState {
     subscriptions: RwLock<HashMap<String, String>>,
     task_lists: RwLock<HashMap<String, TaskListHandle>>,
     contacts: Arc<RwLock<ContactStore>>,
+    mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
+    mls_groups_path: PathBuf,
     api_address: SocketAddr,
     start_time: Instant,
     broadcast_tx: broadcast::Sender<SseEvent>,
@@ -405,6 +407,60 @@ struct AgentData {
     agent_id: String,
     machine_id: String,
     user_id: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Direct messaging request / response types
+// ---------------------------------------------------------------------------
+
+/// POST /agents/connect request body.
+#[derive(Debug, Deserialize)]
+struct ConnectAgentRequest {
+    /// Agent ID as 64-character hex string.
+    agent_id: String,
+}
+
+/// POST /direct/send request body.
+#[derive(Debug, Deserialize)]
+struct DirectSendRequest {
+    /// Target agent ID as 64-character hex string.
+    agent_id: String,
+    /// Base64-encoded payload.
+    payload: String,
+}
+
+// ---------------------------------------------------------------------------
+// MLS request / response types
+// ---------------------------------------------------------------------------
+
+/// POST /mls/groups request body.
+#[derive(Debug, Deserialize)]
+struct CreateMlsGroupRequest {
+    /// Optional group ID as hex string. Random if omitted.
+    group_id: Option<String>,
+}
+
+/// POST /mls/groups/:id/members request body.
+#[derive(Debug, Deserialize)]
+struct AddMlsMemberRequest {
+    /// Agent ID as 64-character hex string.
+    agent_id: String,
+}
+
+/// POST /mls/groups/:id/encrypt request body.
+#[derive(Debug, Deserialize)]
+struct MlsEncryptRequest {
+    /// Base64-encoded plaintext.
+    payload: String,
+}
+
+/// POST /mls/groups/:id/decrypt request body.
+#[derive(Debug, Deserialize)]
+struct MlsDecryptRequest {
+    /// Base64-encoded ciphertext.
+    ciphertext: String,
+    /// Epoch used for encryption.
+    epoch: u64,
 }
 
 /// Discovered identity entry from gossip announcements.
@@ -645,6 +701,31 @@ async fn main() -> Result<()> {
         config.data_dir.join("contacts.json").display()
     );
 
+    // Load MLS groups from disk (if any)
+    let mls_groups_path = config.data_dir.join("mls_groups.json");
+    let mls_groups = match tokio::fs::read_to_string(&mls_groups_path).await {
+        Ok(content) => {
+            match serde_json::from_str::<HashMap<String, x0x::mls::MlsGroup>>(&content) {
+                Ok(groups) => {
+                    tracing::info!(
+                        "Loaded {} MLS groups from {}",
+                        groups.len(),
+                        mls_groups_path.display()
+                    );
+                    groups
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse MLS groups file, starting fresh: {e}");
+                    HashMap::new()
+                }
+            }
+        }
+        Err(_) => {
+            tracing::info!("No MLS groups file found, starting fresh");
+            HashMap::new()
+        }
+    };
+
     // Build shared state BEFORE joining network so the API server can
     // start immediately. Network-dependent endpoints will return errors
     // until join completes, which is better than blocking the entire API.
@@ -655,6 +736,8 @@ async fn main() -> Result<()> {
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
         contacts,
+        mls_groups: RwLock::new(mls_groups),
+        mls_groups_path,
         api_address: config.api_address,
         start_time: Instant::now(),
         broadcast_tx,
@@ -774,6 +857,23 @@ async fn main() -> Result<()> {
         .route("/task-lists/:id/tasks", get(list_tasks))
         .route("/task-lists/:id/tasks", post(add_task))
         .route("/task-lists/:id/tasks/:tid", patch(update_task))
+        // Direct messaging endpoints
+        .route("/agents/connect", post(connect_agent))
+        .route("/direct/send", post(direct_send))
+        .route("/direct/connections", get(direct_connections))
+        .route("/direct/events", get(direct_events_sse))
+        // MLS group encryption endpoints
+        .route("/mls/groups", post(create_mls_group))
+        .route("/mls/groups", get(list_mls_groups))
+        .route("/mls/groups/:id", get(get_mls_group))
+        .route("/mls/groups/:id/members", post(add_mls_member))
+        .route(
+            "/mls/groups/:id/members/:agent_id",
+            delete(remove_mls_member),
+        )
+        .route("/mls/groups/:id/encrypt", post(mls_encrypt))
+        .route("/mls/groups/:id/decrypt", post(mls_decrypt))
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 
@@ -2390,6 +2490,519 @@ async fn update_task(
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Direct messaging handlers
+// ---------------------------------------------------------------------------
+
+/// POST /agents/connect — connect to a discovered agent.
+async fn connect_agent(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ConnectAgentRequest>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&req.agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    match state.agent.connect_to_agent(&agent_id).await {
+        Ok(outcome) => {
+            let (outcome_str, addr) = match outcome {
+                x0x::connectivity::ConnectOutcome::Direct(a) => ("Direct", Some(a.to_string())),
+                x0x::connectivity::ConnectOutcome::Coordinated(a) => {
+                    ("Coordinated", Some(a.to_string()))
+                }
+                x0x::connectivity::ConnectOutcome::Unreachable => ("Unreachable", None),
+                x0x::connectivity::ConnectOutcome::NotFound => ("NotFound", None),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "outcome": outcome_str,
+                    "addr": addr
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::error!("connect_agent failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "connection failed" })),
+            )
+        }
+    }
+}
+
+/// POST /direct/send — send a direct message to a connected agent.
+async fn direct_send(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DirectSendRequest>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&req.agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    // Check trust level before sending — reject blocked agents
+    {
+        let contacts = state.contacts.read().await;
+        if let Some(contact) = contacts.get(&agent_id) {
+            if contact.trust_level == TrustLevel::Blocked {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({ "ok": false, "error": "agent is blocked" })),
+                );
+            }
+        }
+    }
+
+    let payload = match decode_base64_payload(&req.payload) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    match state.agent.send_direct(&agent_id, payload).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => {
+            tracing::error!("direct_send failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "send failed" })),
+            )
+        }
+    }
+}
+
+/// GET /direct/connections — list connected agents.
+async fn direct_connections(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let connected = state.agent.connected_agents().await;
+    let dm = state.agent.direct_messaging();
+
+    let mut entries = Vec::new();
+    for agent_id in &connected {
+        let machine_id = dm
+            .get_machine_id(agent_id)
+            .await
+            .map(|m| hex::encode(m.as_bytes()));
+        entries.push(serde_json::json!({
+            "agent_id": hex::encode(agent_id.as_bytes()),
+            "machine_id": machine_id
+        }));
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "connections": entries })),
+    )
+}
+
+/// GET /direct/events — SSE stream of incoming direct messages.
+async fn direct_events_sse(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    tracing::info!("[6/6 x0xd] SSE client connected to /direct/events");
+    let mut rx = state.agent.subscribe_direct();
+
+    let stream = async_stream::stream! {
+        while let Some(msg) = rx.recv().await {
+            let data = serde_json::json!({
+                "sender": hex::encode(msg.sender.as_bytes()),
+                "machine_id": hex::encode(msg.machine_id.as_bytes()),
+                "payload": base64::engine::general_purpose::STANDARD.encode(&msg.payload),
+                "received_at": msg.received_at
+            });
+            let event = Event::default()
+                .event("direct_message")
+                .data(data.to_string());
+            yield Ok(event);
+        }
+    };
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// MLS group encryption handlers
+//
+// NOTE: Groups are persisted to <data_dir>/mls_groups.json on every
+// mutation (create, add/remove member). Loaded on startup.
+//
+// NOTE: Group operations have no ownership model — any caller on the local
+// socket can modify any group. This is acceptable because x0xd listens on
+// localhost only, so all callers are implicitly the local agent.
+// ---------------------------------------------------------------------------
+
+/// POST /mls/groups — create a new MLS group.
+async fn create_mls_group(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateMlsGroupRequest>,
+) -> impl IntoResponse {
+    let group_id_bytes = match req.group_id {
+        Some(hex_str) => match hex::decode(&hex_str) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": format!("invalid hex: {e}") })),
+                );
+            }
+        },
+        None => {
+            let mut bytes = vec![0u8; 32];
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut bytes);
+            bytes
+        }
+    };
+
+    let agent_id = state.agent.agent_id();
+    let group_id_hex = hex::encode(&group_id_bytes);
+
+    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id) {
+        Ok(group) => {
+            let epoch = group.current_epoch();
+            let members: Vec<String> = group
+                .members()
+                .keys()
+                .map(|id| hex::encode(id.as_bytes()))
+                .collect();
+
+            state
+                .mls_groups
+                .write()
+                .await
+                .insert(group_id_hex.clone(), group);
+            save_mls_groups(&state).await;
+
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "group_id": group_id_hex,
+                    "epoch": epoch,
+                    "members": members
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::error!("operation failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "internal error" })),
+            )
+        }
+    }
+}
+
+/// GET /mls/groups — list all MLS groups.
+async fn list_mls_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let groups = state.mls_groups.read().await;
+    let entries: Vec<serde_json::Value> = groups
+        .iter()
+        .map(|(id, group)| {
+            serde_json::json!({
+                "group_id": id,
+                "epoch": group.current_epoch(),
+                "member_count": group.members().len()
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "groups": entries })),
+    )
+}
+
+/// GET /mls/groups/:id — get details of a specific MLS group.
+async fn get_mls_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let groups = state.mls_groups.read().await;
+    let Some(group) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+
+    let members: Vec<String> = group
+        .members()
+        .keys()
+        .map(|id| hex::encode(id.as_bytes()))
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": id,
+            "epoch": group.current_epoch(),
+            "members": members
+        })),
+    )
+}
+
+/// POST /mls/groups/:id/members — add a member to a group.
+async fn add_mls_member(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddMlsMemberRequest>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&req.agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let mut groups = state.mls_groups.write().await;
+    let Some(group) = groups.get_mut(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+
+    match group.add_member(agent_id) {
+        Ok(commit) => match group.apply_commit(&commit) {
+            Ok(()) => {
+                let resp = (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "epoch": group.current_epoch(),
+                        "member_count": group.members().len()
+                    })),
+                );
+                drop(groups);
+                save_mls_groups(&state).await;
+                resp
+            }
+            Err(e) => {
+                tracing::error!("apply commit: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": "operation failed" })),
+                )
+            }
+        },
+        Err(e) => {
+            tracing::error!("add_mls_member failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "operation failed" })),
+            )
+        }
+    }
+}
+
+/// DELETE /mls/groups/:id/members/:agent_id — remove a member from a group.
+async fn remove_mls_member(
+    State(state): State<Arc<AppState>>,
+    Path((id, agent_id_hex)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let mut groups = state.mls_groups.write().await;
+    let Some(group) = groups.get_mut(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+
+    match group.remove_member(agent_id) {
+        Ok(commit) => match group.apply_commit(&commit) {
+            Ok(()) => {
+                let resp = (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "epoch": group.current_epoch(),
+                        "member_count": group.members().len()
+                    })),
+                );
+                drop(groups);
+                save_mls_groups(&state).await;
+                resp
+            }
+            Err(e) => {
+                tracing::error!("apply commit: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": "operation failed" })),
+                )
+            }
+        },
+        Err(e) => {
+            tracing::error!("remove_mls_member failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "internal error" })),
+            )
+        }
+    }
+}
+
+/// POST /mls/groups/:id/encrypt — encrypt data with group key.
+async fn mls_encrypt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<MlsEncryptRequest>,
+) -> impl IntoResponse {
+    let plaintext = match decode_base64_payload(&req.payload) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    let groups = state.mls_groups.read().await;
+    let Some(group) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+
+    let (cipher, epoch) = match make_mls_cipher(group) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    match cipher.encrypt(&plaintext, &[], epoch) {
+        Ok(ciphertext) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "ciphertext": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+                "epoch": epoch
+            })),
+        ),
+        Err(e) => {
+            tracing::error!("mls_encrypt failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "encryption failed" })),
+            )
+        }
+    }
+}
+
+/// POST /mls/groups/:id/decrypt — decrypt data with group key.
+async fn mls_decrypt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<MlsDecryptRequest>,
+) -> impl IntoResponse {
+    let ciphertext = match decode_base64_payload(&req.ciphertext) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    let groups = state.mls_groups.read().await;
+    let Some(group) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+
+    let (cipher, _epoch) = match make_mls_cipher(group) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    match cipher.decrypt(&ciphertext, &[], req.epoch) {
+        Ok(plaintext) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "payload": base64::engine::general_purpose::STANDARD.encode(&plaintext)
+            })),
+        ),
+        Err(e) => {
+            tracing::error!("mls_decrypt failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "decryption failed" })),
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for new endpoints
+// ---------------------------------------------------------------------------
+
+/// Persist MLS groups to disk.
+async fn save_mls_groups(state: &AppState) {
+    let groups = state.mls_groups.read().await;
+    match serde_json::to_string_pretty(&*groups) {
+        Ok(json) => {
+            if let Err(e) = tokio::fs::write(&state.mls_groups_path, json).await {
+                tracing::error!("Failed to save MLS groups: {e}");
+            }
+        }
+        Err(e) => tracing::error!("Failed to serialize MLS groups: {e}"),
+    }
+}
+
+/// Decode a base64-encoded payload from a request field.
+fn decode_base64_payload(encoded: &str) -> Result<Vec<u8>, (StatusCode, Json<serde_json::Value>)> {
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid base64: {e}") })),
+            )
+        })
+}
+
+/// Derive an MLS cipher from a group's current key schedule.
+fn make_mls_cipher(
+    group: &x0x::mls::MlsGroup,
+) -> Result<(x0x::mls::MlsCipher, u64), (StatusCode, Json<serde_json::Value>)> {
+    let key_schedule = x0x::mls::MlsKeySchedule::from_group(group).map_err(|e| {
+        tracing::error!("MLS key derivation failed: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": "key derivation failed" })),
+        )
+    })?;
+    let cipher = x0x::mls::MlsCipher::new(
+        key_schedule.encryption_key().to_vec(),
+        key_schedule.base_nonce().to_vec(),
+    );
+    Ok((cipher, group.current_epoch()))
 }
 
 // ---------------------------------------------------------------------------
