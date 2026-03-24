@@ -98,6 +98,12 @@ pub mod crdt;
 /// MLS (Messaging Layer Security) group encryption.
 pub mod mls;
 
+/// Direct agent-to-agent messaging.
+///
+/// Point-to-point communication that bypasses gossip for private,
+/// efficient, reliable delivery between connected agents.
+pub mod direct;
+
 /// Self-update system with ML-DSA-65 signature verification and staged rollout.
 pub mod upgrade;
 
@@ -105,6 +111,9 @@ pub mod upgrade;
 pub use gossip::{
     GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, SigningContext, Subscription,
 };
+
+// Re-export direct messaging types
+pub use direct::{DirectMessage, DirectMessageReceiver, DirectMessaging};
 
 // Import Membership trait for HyParView join() method
 use saorsa_gossip_membership::Membership as _;
@@ -156,6 +165,8 @@ pub struct Agent {
     rendezvous_advertised: std::sync::atomic::AtomicBool,
     /// Contact store for trust evaluation of incoming identity announcements.
     contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+    /// Direct messaging infrastructure for point-to-point communication.
+    direct_messaging: std::sync::Arc<direct::DirectMessaging>,
 }
 
 /// A message received from the gossip network.
@@ -736,6 +747,10 @@ impl Agent {
                             let peer_id = ant_quic::PeerId(agent.machine_id.0);
                             bc.add_from_connection(peer_id, vec![*addr], None).await;
                         }
+                        // Register agent mapping for direct messaging
+                        self.direct_messaging
+                            .mark_connected(agent.agent_id, agent.machine_id)
+                            .await;
                         return Ok(connectivity::ConnectOutcome::Direct(*addr));
                     }
                     Err(e) => {
@@ -755,6 +770,10 @@ impl Agent {
                             let peer_id = ant_quic::PeerId(agent.machine_id.0);
                             bc.add_from_connection(peer_id, vec![*addr], None).await;
                         }
+                        // Register agent mapping for direct messaging
+                        self.direct_messaging
+                            .mark_connected(agent.agent_id, agent.machine_id)
+                            .await;
                         return Ok(connectivity::ConnectOutcome::Coordinated(*addr));
                     }
                     Err(e) => {
@@ -780,6 +799,252 @@ impl Agent {
                 tracing::info!("Bootstrap cache saved on shutdown");
             }
         }
+    }
+
+    // === Direct Messaging ===
+
+    /// Send data directly to a connected agent.
+    ///
+    /// This bypasses gossip pub/sub for efficient point-to-point communication.
+    /// The agent must be connected first via [`Self::connect_to_agent`].
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_id` - The target agent's identifier.
+    /// * `payload` - The data to send.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Network is not initialized
+    /// - Agent is not connected
+    /// - Agent is not found in discovery cache
+    /// - Send fails
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // First connect to the agent
+    /// let outcome = agent.connect_to_agent(&target_agent_id).await?;
+    ///
+    /// // Then send data directly
+    /// agent.send_direct(&target_agent_id, b"hello".to_vec()).await?;
+    /// ```
+    pub async fn send_direct(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: Vec<u8>,
+    ) -> error::NetworkResult<()> {
+        let network = self.network.as_ref().ok_or_else(|| {
+            error::NetworkError::NodeCreation("network not initialized".to_string())
+        })?;
+
+        // Look up machine_id from discovery cache
+        let machine_id = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache.get(agent_id).map(|d| d.machine_id)
+        }
+        .ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
+
+        // Check if connected
+        let ant_peer_id = ant_quic::PeerId(machine_id.0);
+        if !network.is_connected(&ant_peer_id).await {
+            return Err(error::NetworkError::AgentNotConnected(agent_id.0));
+        }
+
+        // Send via network layer
+        network
+            .send_direct(&ant_peer_id, &self.identity.agent_id().0, &payload)
+            .await?;
+
+        tracing::info!(
+            "Sent {} bytes directly to agent {:?}",
+            payload.len(),
+            agent_id
+        );
+
+        Ok(())
+    }
+
+    /// Receive the next direct message from any connected agent.
+    ///
+    /// Blocks until a direct message is received.
+    ///
+    /// # Security Note
+    ///
+    /// This method does **not** apply trust filtering from [`ContactStore`].
+    /// Messages from blocked agents will still be delivered. Use
+    /// [`recv_direct_filtered()`](Self::recv_direct_filtered) if you need
+    /// trust-based filtering.
+    ///
+    /// # Returns
+    ///
+    /// The received [`DirectMessage`] containing sender, payload, and timestamp.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// loop {
+    ///     if let Some(msg) = agent.recv_direct().await {
+    ///         println!("From {:?}: {:?}", msg.sender, msg.payload_str());
+    ///     }
+    /// }
+    /// ```
+    pub async fn recv_direct(&self) -> Option<direct::DirectMessage> {
+        self.recv_direct_inner().await
+    }
+
+    /// Receive the next direct message, filtering by trust level.
+    ///
+    /// Messages from blocked agents are silently dropped. This mirrors the
+    /// behavior of gossip pub/sub message filtering.
+    ///
+    /// # Returns
+    ///
+    /// The received [`DirectMessage`], or `None` if the channel closes.
+    /// Messages from blocked senders are dropped and the method continues
+    /// waiting for the next acceptable message.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Block an agent
+    /// {
+    ///     let mut contacts = agent.contacts().write().await;
+    ///     contacts.set_trust(&bad_agent_id, TrustLevel::Blocked);
+    /// }
+    ///
+    /// // Messages from blocked agents are silently dropped
+    /// loop {
+    ///     if let Some(msg) = agent.recv_direct_filtered().await {
+    ///         // msg.sender is not in the blocked list
+    ///         // (note: sender is self-asserted, see DirectMessage docs)
+    ///     }
+    /// }
+    /// ```
+    pub async fn recv_direct_filtered(&self) -> Option<direct::DirectMessage> {
+        loop {
+            let msg = self.recv_direct_inner().await?;
+
+            // Check trust level
+            let contacts = self.contact_store.read().await;
+            if let Some(contact) = contacts.get(&msg.sender) {
+                if contact.trust_level == contacts::TrustLevel::Blocked {
+                    tracing::debug!(
+                        "Dropping direct message from blocked agent {:?}",
+                        msg.sender
+                    );
+                    continue;
+                }
+            }
+
+            return Some(msg);
+        }
+    }
+
+    /// Internal helper for receiving direct messages.
+    async fn recv_direct_inner(&self) -> Option<direct::DirectMessage> {
+        let network = self.network.as_ref()?;
+
+        // Get the raw message from network layer
+        let (ant_peer_id, payload) = network.recv_direct().await?;
+
+        // Parse sender agent_id from payload (first 32 bytes after stream type)
+        if payload.len() < 32 {
+            tracing::warn!("Direct message too short to contain sender agent_id");
+            return None;
+        }
+
+        let mut sender_bytes = [0u8; 32];
+        sender_bytes.copy_from_slice(&payload[..32]);
+        let sender = identity::AgentId(sender_bytes);
+        let machine_id = identity::MachineId(ant_peer_id.0);
+        let data = payload[32..].to_vec();
+
+        // Register the mapping for future lookups
+        self.direct_messaging
+            .register_agent(sender, machine_id)
+            .await;
+
+        Some(direct::DirectMessage::new(sender, machine_id, data))
+    }
+
+    /// Subscribe to direct messages.
+    ///
+    /// Returns a receiver that can be cloned for multiple consumers.
+    /// Messages are broadcast to all receivers.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut rx = agent.subscribe_direct();
+    /// tokio::spawn(async move {
+    ///     while let Some(msg) = rx.recv().await {
+    ///         println!("Direct message: {:?}", msg);
+    ///     }
+    /// });
+    /// ```
+    pub fn subscribe_direct(&self) -> direct::DirectMessageReceiver {
+        self.direct_messaging.subscribe()
+    }
+
+    /// Get the direct messaging infrastructure.
+    ///
+    /// Provides low-level access to connection tracking and agent mappings.
+    pub fn direct_messaging(&self) -> &std::sync::Arc<direct::DirectMessaging> {
+        &self.direct_messaging
+    }
+
+    /// Check if an agent is currently connected for direct messaging.
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_id` - The agent to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a QUIC connection exists to this agent's machine.
+    pub async fn is_agent_connected(&self, agent_id: &identity::AgentId) -> bool {
+        let Some(network) = &self.network else {
+            return false;
+        };
+
+        // Look up machine_id from discovery cache
+        let machine_id = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache.get(agent_id).map(|d| d.machine_id)
+        };
+
+        match machine_id {
+            Some(mid) => {
+                let ant_peer_id = ant_quic::PeerId(mid.0);
+                network.is_connected(&ant_peer_id).await
+            }
+            None => false,
+        }
+    }
+
+    /// Get list of currently connected agents.
+    ///
+    /// Returns agents that have been discovered and are currently connected
+    /// via QUIC transport.
+    pub async fn connected_agents(&self) -> Vec<identity::AgentId> {
+        let Some(network) = &self.network else {
+            return Vec::new();
+        };
+
+        let connected_peers = network.connected_peers().await;
+        let cache = self.identity_discovery_cache.read().await;
+
+        // Find agents whose machine_id matches a connected peer
+        cache
+            .values()
+            .filter(|agent| {
+                let ant_peer_id = ant_quic::PeerId(agent.machine_id.0);
+                connected_peers.contains(&ant_peer_id)
+            })
+            .map(|agent| agent.agent_id)
+            .collect()
     }
 
     /// Attach a contact store for trust-based message filtering.
@@ -2433,6 +2698,9 @@ impl AgentBuilder {
             contacts::ContactStore::new(contacts_path),
         ));
 
+        // Initialize direct messaging infrastructure
+        let direct_messaging = std::sync::Arc::new(direct::DirectMessaging::new());
+
         Ok(Agent {
             identity: std::sync::Arc::new(identity),
             network,
@@ -2449,6 +2717,7 @@ impl AgentBuilder {
             heartbeat_handle: tokio::sync::Mutex::new(None),
             rendezvous_advertised: std::sync::atomic::AtomicBool::new(false),
             contact_store,
+            direct_messaging,
         })
     }
 }
@@ -2508,15 +2777,15 @@ impl TaskListHandle {
             let task_id = crdt::TaskId::new(&title, &self.agent_id, seq);
             let metadata = crdt::TaskMetadata::new(title, description, 128, self.agent_id, seq);
             let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
-            list.add_task(task.clone(), self.peer_id, seq).map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "add_task failed: {}",
-                    e
-                )))
-            })?;
+            list.add_task(task.clone(), self.peer_id, seq)
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "add_task failed: {}",
+                        e
+                    )))
+                })?;
             let tag = (self.peer_id, seq);
-            let delta =
-                crdt::TaskListDelta::for_add(task_id, task, tag, list.current_version());
+            let delta = crdt::TaskListDelta::for_add(task_id, task, tag, list.current_version());
             (task_id, delta)
         };
         // Best-effort replication: local mutation succeeded regardless

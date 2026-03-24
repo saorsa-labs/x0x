@@ -18,10 +18,10 @@ use crate::crdt::{CrdtError, Result, TaskId, TaskItem};
 use crate::identity::AgentId;
 use saorsa_gossip_crdt_sync::{LwwRegister, OrSet};
 use saorsa_gossip_types::PeerId;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Task list identifier.
 ///
@@ -833,7 +833,11 @@ mod tests {
 
         let bytes = bincode::serialize(&list).ok().unwrap();
         let restored: TaskList = bincode::deserialize(&bytes).ok().unwrap();
-        assert_eq!(restored.next_seq(), 1, "deserialized counter must start fresh");
+        assert_eq!(
+            restored.next_seq(),
+            1,
+            "deserialized counter must start fresh"
+        );
     }
 
     #[test]

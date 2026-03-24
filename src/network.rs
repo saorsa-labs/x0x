@@ -206,6 +206,9 @@ pub struct NetworkStats {
     pub peer_count: usize,
 }
 
+/// Stream type byte for direct messages (distinct from gossip: 0, 1, 2).
+pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
+
 /// The x0x network node.
 ///
 /// This wraps ant-quic's Node with x0x-specific functionality
@@ -222,6 +225,9 @@ pub struct NetworkNode {
     /// Used by GossipTransport::receive_message().
     recv_tx: mpsc::Sender<(AntPeerId, GossipStreamType, Bytes)>,
     recv_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, GossipStreamType, Bytes)>>>,
+    /// Receiver channel for direct messages (separate from gossip).
+    direct_tx: mpsc::Sender<(AntPeerId, Bytes)>,
+    direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, Bytes)>>>,
     /// Cached local peer ID (ant-quic PeerId).
     peer_id: AntPeerId,
     /// Bootstrap peer cache for recording connection outcomes.
@@ -275,6 +281,7 @@ impl NetworkNode {
         let peer_id = node.peer_id();
         let (event_sender, _event_receiver) = broadcast::channel(32);
         let (recv_tx, recv_rx) = mpsc::channel(128);
+        let (direct_tx, direct_rx) = mpsc::channel(256);
 
         let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
@@ -282,6 +289,8 @@ impl NetworkNode {
             event_sender,
             recv_tx,
             recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
+            direct_tx,
+            direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             peer_id,
             bootstrap_cache,
         };
@@ -648,14 +657,78 @@ impl NetworkNode {
         self.peer_id
     }
 
+    // === Direct Messaging ===
+
+    /// Send a direct message to a connected peer.
+    ///
+    /// The message is prefixed with the direct message stream type (0x10)
+    /// and the sender's agent ID for identification.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer_id` - The ant-quic PeerId of the recipient (maps to MachineId).
+    /// * `sender_agent_id` - The AgentId of the sender (included in message).
+    /// * `payload` - The message payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if the peer is not connected or send fails.
+    pub async fn send_direct(
+        &self,
+        peer_id: &AntPeerId,
+        sender_agent_id: &[u8; 32],
+        payload: &[u8],
+    ) -> NetworkResult<()> {
+        // Check connection first
+        if !self.is_connected(peer_id).await {
+            return Err(NetworkError::NotConnected(peer_id.0));
+        }
+
+        // Build wire format: [0x10][sender_agent_id: 32 bytes][payload]
+        let mut buf = Vec::with_capacity(1 + 32 + payload.len());
+        buf.push(DIRECT_MESSAGE_STREAM_TYPE);
+        buf.extend_from_slice(sender_agent_id);
+        buf.extend_from_slice(payload);
+
+        // Send via ant-quic
+        let node = self.require_node().await?;
+        node.send(peer_id, &buf)
+            .await
+            .map_err(|e| NetworkError::ConnectionFailed(format!("send failed: {}", e)))?;
+
+        info!(
+            "[1/6 network] send_direct: {} bytes to peer {:?}",
+            payload.len(),
+            peer_id
+        );
+
+        Ok(())
+    }
+
+    /// Receive the next direct message.
+    ///
+    /// Blocks until a direct message is received. Returns the sender's
+    /// MachineId (as ant-quic PeerId) and the raw payload (including
+    /// the sender's AgentId prefix).
+    ///
+    /// # Returns
+    ///
+    /// Tuple of (sender_peer_id, payload_with_agent_id).
+    pub async fn recv_direct(&self) -> Option<(AntPeerId, Bytes)> {
+        let mut rx = self.direct_rx.lock().await;
+        rx.recv().await
+    }
+
     /// Spawn background receiver task that parses gossip stream types.
     ///
     /// This task continuously receives messages from ant-quic, parses the
-    /// stream type from the first byte, and forwards parsed messages to
-    /// the internal channel for GossipTransport::receive_message().
+    /// stream type from the first byte, and forwards parsed messages to:
+    /// - Direct message channel (for 0x10 direct messages)
+    /// - Gossip transport channel (for 0x00, 0x01, 0x02 gossip messages)
     fn spawn_receiver(&self) {
         let node = Arc::clone(&self.node);
         let recv_tx = self.recv_tx.clone();
+        let direct_tx = self.direct_tx.clone();
 
         tokio::spawn(async move {
             debug!("NetworkNode receiver task started");
@@ -679,6 +752,38 @@ impl NetworkNode {
 
                         // Parse stream type from first byte (safe: data is non-empty)
                         let type_byte = data[0];
+
+                        // Handle direct messages separately (0x10)
+                        if type_byte == DIRECT_MESSAGE_STREAM_TYPE {
+                            // Direct message: forward to direct channel (includes full payload with sender AgentId)
+                            let payload = Bytes::copy_from_slice(&data[1..]);
+
+                            // Enforce max payload size (16 MB) to prevent memory exhaustion
+                            // payload = 32-byte AgentId prefix + actual data, so effective
+                            // data limit is exactly MAX_DIRECT_PAYLOAD_SIZE (16 MB)
+                            if payload.len() > crate::direct::MAX_DIRECT_PAYLOAD_SIZE + 32 {
+                                warn!(
+                                    "[1/6 network] dropping oversized direct message: {} bytes from peer {:?} (max: {})",
+                                    payload.len(),
+                                    peer_id,
+                                    crate::direct::MAX_DIRECT_PAYLOAD_SIZE + 32
+                                );
+                                continue;
+                            }
+
+                            info!(
+                                "[1/6 network] recv direct: {} bytes from peer {:?}",
+                                payload.len(),
+                                peer_id
+                            );
+                            if let Err(e) = direct_tx.send((peer_id, payload)).await {
+                                error!("Failed to forward direct message: {}", e);
+                                break;
+                            }
+                            continue;
+                        }
+
+                        // Handle gossip messages (0x00, 0x01, 0x02)
                         let stream_type = match GossipStreamType::from_byte(type_byte) {
                             Some(st) => st,
                             None => {

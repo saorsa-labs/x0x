@@ -669,10 +669,7 @@ async fn main() -> Result<()> {
             Ok(()) => {
                 tracing::info!("Network joined");
                 if rendezvous_enabled {
-                    if let Err(e) = join_agent
-                        .advertise_identity(rendezvous_validity_ms)
-                        .await
-                    {
+                    if let Err(e) = join_agent.advertise_identity(rendezvous_validity_ms).await {
                         tracing::warn!("Initial rendezvous advertisement failed: {e}");
                     } else {
                         tracing::info!("Rendezvous advertisement published");
@@ -947,7 +944,10 @@ async fn run_doctor(config: &DaemonConfig) -> Result<()> {
             }
         }
         Ok(resp) => print_warn(&format!("/health HTTP {}", resp.status())),
-        Err(err) => print_warn(&format!("daemon not reachable at {}: {err}", config.api_address)),
+        Err(err) => print_warn(&format!(
+            "daemon not reachable at {}: {err}",
+            config.api_address
+        )),
     }
 
     if daemon_reachable {
@@ -2323,7 +2323,10 @@ async fn add_task(
         );
     };
 
-    match handle.add_task(req.title, req.description.unwrap_or_default()).await {
+    match handle
+        .add_task(req.title, req.description.unwrap_or_default())
+        .await
+    {
         Ok(task_id) => (
             StatusCode::CREATED,
             Json(serde_json::json!({ "ok": true, "task_id": format!("{task_id}") })),

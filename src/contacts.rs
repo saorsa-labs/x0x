@@ -305,12 +305,7 @@ impl ContactStore {
     ///
     /// Same as [`revoke`](Self::revoke) but also records who issued the
     /// revocation, useful for audit trails.
-    pub fn revoke_with_revoker(
-        &mut self,
-        agent_id: &AgentId,
-        reason: &str,
-        revoker_id: &AgentId,
-    ) {
+    pub fn revoke_with_revoker(&mut self, agent_id: &AgentId, reason: &str, revoker_id: &AgentId) {
         if self.revoked_keys.contains(&agent_id.0) {
             return;
         }
