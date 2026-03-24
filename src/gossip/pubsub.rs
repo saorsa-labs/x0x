@@ -1038,4 +1038,63 @@ mod tests {
             .handle_incoming(peer, Bytes::from(&[0x12][..]))
             .await;
     }
+
+    // -----------------------------------------------------------------------
+    // Replay protection tests (protection is in saorsa-gossip PlumTree layer)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_multiple_subscribers_not_starved_by_replay_cache() {
+        // Regression test: a shared replay cache at the subscriber level
+        // would cause only 1 of N subscribers to receive each message.
+        // With replay detection in PlumTree (before fan-out), all
+        // subscribers must receive every legitimate message.
+        let node = test_node().await;
+        let manager = PubSubManager::new(node, None).expect("manager");
+        let mut sub1 = manager.subscribe("multi".to_string()).await;
+        let mut sub2 = manager.subscribe("multi".to_string()).await;
+        let mut sub3 = manager.subscribe("multi".to_string()).await;
+
+        manager
+            .publish("multi".to_string(), Bytes::from("msg-a"))
+            .await
+            .expect("publish a");
+
+        let m1 = sub1.recv().await.expect("sub1");
+        let m2 = sub2.recv().await.expect("sub2");
+        let m3 = sub3.recv().await.expect("sub3");
+        assert_eq!(m1.payload, Bytes::from("msg-a"));
+        assert_eq!(m2.payload, Bytes::from("msg-a"));
+        assert_eq!(m3.payload, Bytes::from("msg-a"));
+    }
+
+    #[tokio::test]
+    async fn test_local_duplicate_publishes_are_delivered() {
+        // Local publishes are trusted — the replay cache only gates
+        // network-incoming messages (handle_eager). An agent that
+        // intentionally publishes the same content twice should see
+        // both deliveries locally.
+        let node = test_node().await;
+        let manager = PubSubManager::new(node, None).expect("manager");
+        let mut sub = manager.subscribe("dedup".to_string()).await;
+
+        manager
+            .publish("dedup".to_string(), Bytes::from("hello"))
+            .await
+            .expect("publish 1");
+        manager
+            .publish("dedup".to_string(), Bytes::from("hello"))
+            .await
+            .expect("publish 2 (same content, intentional)");
+
+        let msg1 = sub.recv().await.expect("should receive first message");
+        assert_eq!(msg1.payload, Bytes::from("hello"));
+
+        let msg2 = sub.recv().await.expect("should receive second message");
+        assert_eq!(
+            msg2.payload,
+            Bytes::from("hello"),
+            "Local duplicate publishes should both be delivered"
+        );
+    }
 }
