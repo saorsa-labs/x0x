@@ -1028,6 +1028,7 @@ async fn main() -> Result<()> {
         .route("/groups/:id/invite", post(create_group_invite))
         .route("/groups/join", post(join_group_via_invite))
         .route("/groups/:id/display-name", put(set_group_display_name))
+        .route("/groups/:id", delete(leave_group))
         // KvStore endpoints
         .route("/stores", get(list_kv_stores))
         .route("/stores", post(create_kv_store))
@@ -3273,6 +3274,32 @@ async fn set_group_display_name(
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "display_name": req.name })),
+    )
+}
+
+/// DELETE /groups/:id — leave or delete a group.
+async fn leave_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // Remove from named groups
+    let info = state.named_groups.write().await.remove(&id);
+    if info.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    }
+    save_named_groups(&state).await;
+
+    // Remove MLS group
+    state.mls_groups.write().await.remove(&id);
+    save_mls_groups(&state).await;
+
+    let name = info.map(|i| i.name).unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "left": name })),
     )
 }
 

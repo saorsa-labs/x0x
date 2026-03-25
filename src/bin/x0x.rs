@@ -478,6 +478,11 @@ enum GroupSub {
         /// Display name.
         name: String,
     },
+    /// Leave (or delete) a group.
+    Leave {
+        /// Group ID.
+        group_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -842,6 +847,7 @@ async fn run(
             Some(GroupSub::SetName { group_id, name }) => {
                 commands::group::set_name(&client, &group_id, &name).await
             }
+            Some(GroupSub::Leave { group_id }) => commands::group::leave(&client, &group_id).await,
         },
         Commands::Store { sub } => match sub {
             None => commands::store::list(&client).await,

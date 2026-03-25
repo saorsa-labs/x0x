@@ -415,6 +415,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Set display name in group",
         category: "named-groups",
     },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/groups/:id",
+        cli_name: "group leave",
+        description: "Leave or delete a group",
+        category: "named-groups",
+    },
     // ── Task lists ──────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

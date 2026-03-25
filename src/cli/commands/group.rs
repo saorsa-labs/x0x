@@ -76,3 +76,11 @@ pub async fn set_name(client: &DaemonClient, group_id: &str, name: &str) -> Resu
     print_value(client.format(), &resp);
     Ok(())
 }
+
+/// `x0x group leave` — DELETE /groups/:id.
+pub async fn leave(client: &DaemonClient, group_id: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.delete(&format!("/groups/{group_id}")).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}

@@ -125,12 +125,17 @@ nav.open{left:0}
 <div class="id-row"><span class="k">Machine ID</span><span class="v" id="ov-mid" onclick="copyText(this)">—</span></div>
 <div class="id-row"><span class="k">User ID</span><span class="v" id="ov-uid" onclick="copyText(this)">—</span></div>
 </div>
-<div class="row">
-<button onclick="fetchCard()">Export Identity Card</button>
-<button onclick="document.getElementById('card-import').click()">Import Identity Card</button>
-<input type="file" id="card-import" style="display:none" onchange="importCard(this)">
+<h3>Your Identity Card</h3>
+<div class="card mb">
+<div class="row"><input id="ov-display-name" placeholder="Your display name" style="max-width:200px" onchange="saveCardName()"><button class="pri" onclick="generateCard()">Generate Card</button><button onclick="copyCardLink()" id="ov-copy-card" style="display:none">Copy Link</button></div>
+<div id="ov-card" style="font-size:10px;color:var(--cy);word-break:break-all;margin-top:8px;user-select:all;cursor:pointer;display:none" onclick="copyCardLink()"></div>
+<div style="font-size:11px;color:var(--dm);margin-top:4px">Set your name once — your card is always available to share. Anyone can import it to find you.</div>
 </div>
-<pre id="ov-card" style="font-size:11px;color:var(--dm);max-height:120px;overflow:auto;margin-bottom:12px"></pre>
+<h3>Import Contact</h3>
+<div class="card mb">
+<div class="row"><input id="ov-import-link" placeholder="Paste x0x://agent/... card link" style="flex:1"><button class="pri" onclick="importCardLink()">Import</button></div>
+<div id="ov-import-result" style="font-size:11px;margin-top:4px;display:none"></div>
+</div>
 <h3>Discovered Agents</h3>
 <table><thead><tr><th>Agent ID</th><th>Addresses</th><th>NAT</th><th>Seen</th></tr></thead><tbody id="ov-agents"></tbody></table>
 </div>
@@ -151,6 +156,7 @@ nav.open{left:0}
 <!-- WORKSPACE -->
 <div class="tab" id="tab-workspace">
 <h2>Workspace</h2>
+<div style="font-size:11px;color:var(--dm);margin-bottom:12px">Select a group to access its workspace. <strong style="color:var(--cy)">Chat</strong> for real-time group messaging via gossip. <strong style="color:var(--cy)">Board</strong> for collaborative kanban with CRDT-synced tasks. <strong style="color:var(--cy)">Files</strong> for P2P file sharing with group members.</div>
 <div class="row mb">
 <select id="ws-group" onchange="wsGroupChanged()"><option value="">Select group…</option></select>
 </div>
@@ -181,6 +187,7 @@ nav.open{left:0}
 <!-- MESSAGES -->
 <div class="tab" id="tab-messages">
 <h2>Direct Messages</h2>
+<div style="font-size:11px;color:var(--dm);margin-bottom:12px">Private point-to-point messages via QUIC. Import someone's identity card on the Overview tab — they'll appear here as a contact you can message directly.</div>
 <div class="contacts-wrap">
 <div class="contact-list" id="dm-contacts"></div>
 <div class="dm-area">
@@ -194,6 +201,7 @@ nav.open{left:0}
 <!-- SWARM -->
 <div class="tab" id="tab-swarm">
 <h2>Swarm</h2>
+<div style="font-size:11px;color:var(--dm);margin-bottom:12px">Delegate tasks to agents on the network. Post a task with capability tags — agents that match can claim it, do the work, and return results. All coordination happens via gossip pub/sub. This is the AI-to-AI collaboration demo.</div>
 <div class="row mb">
 <input id="sw-task" placeholder="Task description" style="flex:2">
 <input id="sw-caps" placeholder="Capabilities (comma-sep)">
@@ -208,6 +216,7 @@ nav.open{left:0}
 <!-- DROP -->
 <div class="tab" id="tab-drop">
 <h2>Drop</h2>
+<div style="font-size:11px;color:var(--dm);margin-bottom:12px">P2P file sharing — like AirDrop over the internet. Select a recipient from discovered agents, drop a file, and it transfers directly via QUIC with SHA-256 integrity verification. No server in the middle.</div>
 <div class="row mb">
 <select id="drop-target"><option value="">Select recipient…</option></select>
 </div>
@@ -392,21 +401,45 @@ async function pollNet(){
 }
 
 // --- IDENTITY CARD ---
-async function fetchCard(){
-  const name=prompt('Display name for your card:','Agent');if(!name)return;
+let myCardLink='';
+function saveCardName(){
+  const name=document.getElementById('ov-display-name').value.trim();
+  if(name)try{localStorage.setItem('x0x_display_name',name)}catch(e){}
+}
+async function generateCard(){
+  const name=document.getElementById('ov-display-name').value.trim()||'Agent';
+  saveCardName();
   const r=await api('/agent/card?display_name='+encodeURIComponent(name)+'&include_groups=true');
-  if(r&&r.link){document.getElementById('ov-card').textContent=r.link;document.getElementById('ov-card').style.color='var(--cy)';navigator.clipboard.writeText(r.link)}
-  else{document.getElementById('ov-card').textContent='Failed'}
+  if(r&&r.link){
+    myCardLink=r.link;
+    document.getElementById('ov-card').textContent=r.link;
+    document.getElementById('ov-card').style.display='block';
+    document.getElementById('ov-copy-card').style.display='';
+    try{localStorage.setItem('x0x_card_link',r.link)}catch(e){}
+  }else{
+    document.getElementById('ov-card').textContent='Failed to generate card';
+    document.getElementById('ov-card').style.display='block';
+    document.getElementById('ov-card').style.color='var(--rd)';
+  }
 }
-function importCardFromClipboard(){
-  const link=prompt('Paste x0x://agent/... card link:');if(!link)return;
-  api('/agent/card/import',{method:'POST',body:JSON.stringify({card:link,trust_level:'known'})}).then(r=>{
-    if(r&&r.ok){alert('Imported: '+r.display_name+' ('+r.trust_level+')');pollNet()}
-    else{alert('Import failed: '+(r&&r.error||'unknown'))}
-  });
+function copyCardLink(){
+  if(myCardLink){navigator.clipboard.writeText(myCardLink);document.getElementById('ov-copy-card').textContent='Copied!';setTimeout(()=>document.getElementById('ov-copy-card').textContent='Copy Link',1500)}
 }
-// Fix import button
-try{document.querySelector('button[onclick*="card-import"]').onclick=importCardFromClipboard}catch(e){}
+async function importCardLink(){
+  const link=document.getElementById('ov-import-link').value.trim();if(!link)return;
+  const r=await api('/agent/card/import',{method:'POST',body:JSON.stringify({card:link,trust_level:'known'})});
+  const el=document.getElementById('ov-import-result');
+  el.style.display='block';
+  if(r&&r.ok){el.style.color='var(--gn)';el.textContent='Imported: '+r.display_name+' ('+r.trust_level+')';document.getElementById('ov-import-link').value='';pollNet()}
+  else{el.style.color='var(--rd)';el.textContent='Failed: '+(r&&r.error||'unknown')}
+}
+// Restore saved name and card on load
+try{
+  const savedName=localStorage.getItem('x0x_display_name');
+  if(savedName)document.getElementById('ov-display-name').value=savedName;
+  const savedCard=localStorage.getItem('x0x_card_link');
+  if(savedCard){myCardLink=savedCard;document.getElementById('ov-card').textContent=savedCard;document.getElementById('ov-card').style.display='block';document.getElementById('ov-copy-card').style.display=''}
+}catch(e){}
 
 // --- GROUPS ---
 const savedInvites={}; // persist invite links across re-renders
@@ -434,7 +467,7 @@ async function pollGroups(){
     const iid='inv-'+x.group_id.slice(0,16);
     // Re-render saved invite if we have one
     const invContent=savedInvites[x.group_id]?inviteHtml(savedInvites[x.group_id]):'';
-    return '<div class="card mb"><div class="row"><strong style="color:var(--cy)">'+esc(x.name)+'</strong><span style="color:var(--dm);font-size:11px">'+(x.member_count||1)+' members</span><button onclick="genInvite(\''+x.group_id+'\',\''+iid+'\')">Invite</button></div><div id="'+iid+'" style="font-size:10px;color:var(--dm);word-break:break-all;margin-top:4px">'+invContent+'</div></div>';
+    return '<div class="card mb"><div class="row"><strong style="color:var(--cy)">'+esc(x.name)+'</strong><span style="color:var(--dm);font-size:11px">'+(x.member_count||1)+' members</span><button onclick="genInvite(\''+x.group_id+'\',\''+iid+'\')">Invite</button><button onclick="leaveGroup(\''+x.group_id+'\',\''+esc(x.name)+'\')" style="border-color:var(--rd);color:var(--rd)">Leave</button></div><div id="'+iid+'" style="font-size:10px;color:var(--dm);word-break:break-all;margin-top:4px">'+invContent+'</div></div>';
   }).join('')||'<div style="color:var(--dm)">No groups yet</div>';
 }
 async function genInvite(gid,elId){
@@ -448,6 +481,12 @@ async function genInvite(gid,elId){
     const el=document.getElementById(elId);
     if(el)el.textContent='Failed to generate invite';
   }
+}
+async function leaveGroup(gid,name){
+  if(!confirm('Leave group "'+name+'"? This removes it from your local list.'))return;
+  const r=await api('/groups/'+gid,{method:'DELETE'});
+  if(r&&r.ok){delete savedInvites[gid];pollGroups()}
+  else{alert('Failed: '+(r&&r.error||'unknown'))}
 }
 
 // --- WORKSPACE ---
