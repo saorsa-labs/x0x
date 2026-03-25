@@ -887,7 +887,7 @@ impl Agent {
     ///
     /// # Security Note
     ///
-    /// This method does **not** apply trust filtering from [`ContactStore`].
+    /// This method does **not** apply trust filtering from `ContactStore`.
     /// Messages from blocked agents will still be delivered. Use
     /// [`recv_direct_filtered()`](Self::recv_direct_filtered) if you need
     /// trust-based filtering.

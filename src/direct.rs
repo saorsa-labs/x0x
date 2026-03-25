@@ -298,7 +298,7 @@ impl DirectMessaging {
 
     /// Encode a direct message for transmission.
     ///
-    /// Format: [0x10][sender_agent_id: 32 bytes][payload]
+    /// Format: `[0x10][sender_agent_id: 32 bytes][payload]`
     pub fn encode_message(sender_agent_id: &AgentId, payload: &[u8]) -> NetworkResult<Vec<u8>> {
         if payload.len() > MAX_DIRECT_PAYLOAD_SIZE {
             return Err(NetworkError::PayloadTooLarge {

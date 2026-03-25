@@ -30,7 +30,7 @@ pub struct GroupInfo {
     pub mls_group_id: String,
     /// KvStore topic for group metadata.
     pub metadata_topic: String,
-    /// Gossip topic prefix for chat rooms (e.g., "group/<id>/chat/").
+    /// Gossip topic prefix for chat rooms (e.g., `group/{id}/chat/`).
     pub chat_topic_prefix: String,
     /// Display names for members (agent_id_hex -> display name).
     pub display_names: HashMap<String, String>,

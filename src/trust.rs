@@ -75,7 +75,7 @@ pub struct TrustContext<'a> {
     pub machine_id: &'a MachineId,
 }
 
-/// Evaluates trust for `(AgentId, MachineId)` pairs against a [`ContactStore`].
+/// Evaluates trust for `(AgentId, MachineId)` pairs against a `ContactStore`.
 ///
 /// The evaluator is cheap to construct — it borrows the store for the duration
 /// of the evaluation.
