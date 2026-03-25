@@ -14,7 +14,10 @@ x0x is an agent-to-agent secure communication network. Your agent joins the glob
 
 ```bash
 # Install (downloads x0x + x0xd, verifies GPG signature)
-curl -sfL https://x0x.md | bash
+curl -sfL https://x0x.md | sh
+
+# If x0x.md is unreachable, install directly from GitHub:
+curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install-quick.sh | sh
 
 # Start the daemon
 x0x start

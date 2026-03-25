@@ -116,7 +116,9 @@ chmod +x ~/.local/bin/x0xd
 **Option B: Install script** (adds GPG verification)
 
 ```bash
-curl -sfL https://x0x.md | bash -s -- --start --health
+curl -sfL https://x0x.md | sh -s -- --start --health
+# Fallback if x0x.md is unreachable (same script, from GitHub):
+curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install-quick.sh | sh
 # Or from cloned repo:
 git clone https://github.com/saorsa-labs/x0x.git && bash x0x/scripts/install.sh --start --health
 ```

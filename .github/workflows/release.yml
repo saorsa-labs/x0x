@@ -104,11 +104,11 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }} --bin x0x-bootstrap --bin x0xd
+        run: cargo build --release --target ${{ matrix.target }} --bin x0x-bootstrap --bin x0xd --bin x0x
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} --bin x0x-bootstrap --bin x0xd
+        run: cross build --release --target ${{ matrix.target }} --bin x0x-bootstrap --bin x0xd --bin x0x
 
       # ---- macOS Code Signing & Notarization ----
       - name: Import macOS signing certificate
@@ -136,7 +136,7 @@ jobs:
         env:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
-          for bin in ${{ matrix.binary }} x0xd; do
+          for bin in ${{ matrix.binary }} x0xd x0x; do
             BINARY="target/${{ matrix.target }}/release/${bin}"
             if [ -f "$BINARY" ]; then
               codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$BINARY"
@@ -152,7 +152,7 @@ jobs:
           MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
           MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
         run: |
-          for bin in ${{ matrix.binary }} x0xd; do
+          for bin in ${{ matrix.binary }} x0xd x0x; do
             BINARY="target/${{ matrix.target }}/release/${bin}"
             if [ -f "$BINARY" ]; then
               ditto -c -k --keepParent "$BINARY" "$RUNNER_TEMP/notarize-${bin}.zip"
@@ -176,6 +176,7 @@ jobs:
         run: |
           strip target/${{ matrix.target }}/release/${{ matrix.binary }}
           strip target/${{ matrix.target }}/release/x0xd
+          strip target/${{ matrix.target }}/release/x0x
 
       # ---- Package artifacts ----
       - name: Package (tar.gz)
@@ -184,9 +185,11 @@ jobs:
           STAGING="x0x-${{ matrix.platform }}"
           mkdir -p "$STAGING"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$STAGING/"
-          # Include x0xd daemon binary
-          X0XD="target/${{ matrix.target }}/release/x0xd"
-          if [ -f "$X0XD" ]; then cp "$X0XD" "$STAGING/"; fi
+          # Include x0xd daemon and x0x CLI binaries
+          for extra in x0xd x0x; do
+            BIN="target/${{ matrix.target }}/release/${extra}"
+            if [ -f "$BIN" ]; then cp "$BIN" "$STAGING/"; fi
+          done
           cp LICENSE* "$STAGING/" 2>/dev/null || true
           cp README.md "$STAGING/" 2>/dev/null || true
           tar czf "x0x-${{ matrix.platform }}.tar.gz" "$STAGING"
@@ -199,9 +202,11 @@ jobs:
           $staging = "x0x-${{ matrix.platform }}"
           New-Item -ItemType Directory -Path $staging -Force
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" -Destination $staging
-          # Include x0xd daemon binary
+          # Include x0xd daemon and x0x CLI binaries
           $x0xd = "target/${{ matrix.target }}/release/x0xd.exe"
           if (Test-Path $x0xd) { Copy-Item $x0xd -Destination $staging }
+          $x0x = "target/${{ matrix.target }}/release/x0x.exe"
+          if (Test-Path $x0x) { Copy-Item $x0x -Destination $staging }
           if (Test-Path "LICENSE*") { Copy-Item LICENSE* -Destination $staging }
           if (Test-Path "README.md") { Copy-Item README.md -Destination $staging }
           Compress-Archive -Path "$staging/*" -DestinationPath "x0x-${{ matrix.platform }}.zip"
