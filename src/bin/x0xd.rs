@@ -1920,12 +1920,43 @@ async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
     let nat_type_str = format!("{:?}", status.nat_type);
 
+    // Collect all known addresses: ant-quic observed + local global IPv6.
+    // ant-quic currently only reports IPv4 via OBSERVED_ADDRESS frames,
+    // so we detect our global IPv6 locally using a UDP socket connect trick
+    // (no data sent — the OS routing table resolves our source address).
+    let mut all_addrs: Vec<String> = status
+        .external_addrs
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+
+    let port = status.local_addr.port();
+    if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
+        // Connect to a well-known IPv6 address to discover our source addr
+        if sock.connect("[2001:4860:4860::8888]:80").is_ok() {
+            if let Ok(local) = sock.local_addr() {
+                if let std::net::IpAddr::V6(v6) = local.ip() {
+                    let segs = v6.segments();
+                    let is_global = (segs[0] & 0xffc0) != 0xfe80  // not link-local
+                        && (segs[0] & 0xff00) != 0xfd00           // not ULA
+                        && !v6.is_loopback();
+                    if is_global {
+                        let addr_str = format!("[{v6}]:{port}");
+                        if !all_addrs.contains(&addr_str) {
+                            all_addrs.push(addr_str);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "local_addr": status.local_addr.to_string(),
-            "external_addrs": status.external_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "external_addrs": all_addrs,
             "nat_type": nat_type_str,
             "has_public_ip": status.has_public_ip,
             "can_receive_direct": status.can_receive_direct,

@@ -484,16 +484,36 @@ impl HeartbeatContext {
 
         // Include ALL routable addresses (IPv4 and IPv6) so other agents
         // can connect to us via whichever protocol they support.
-        let addresses = match self.network.node_status().await {
+        let mut addresses = match self.network.node_status().await {
             Some(status) if !status.external_addrs.is_empty() => status.external_addrs,
-            _ => {
-                // Fall back to single routable address
-                match self.network.routable_addr().await {
-                    Some(addr) => vec![addr],
-                    None => Vec::new(),
+            _ => match self.network.routable_addr().await {
+                Some(addr) => vec![addr],
+                None => Vec::new(),
+            },
+        };
+
+        // Detect global IPv6 address locally (ant-quic currently only
+        // reports IPv4 via OBSERVED_ADDRESS). Uses UDP connect trick —
+        // no data is sent, the OS routing table resolves our source addr.
+        let port = addresses.first().map(|a| a.port()).unwrap_or(5483);
+        if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
+            if sock.connect("[2001:4860:4860::8888]:80").is_ok() {
+                if let Ok(local) = sock.local_addr() {
+                    if let std::net::IpAddr::V6(v6) = local.ip() {
+                        let segs = v6.segments();
+                        let is_global = (segs[0] & 0xffc0) != 0xfe80
+                            && (segs[0] & 0xff00) != 0xfd00
+                            && !v6.is_loopback();
+                        if is_global {
+                            let v6_addr = std::net::SocketAddr::new(std::net::IpAddr::V6(v6), port);
+                            if !addresses.contains(&v6_addr) {
+                                addresses.push(v6_addr);
+                            }
+                        }
+                    }
                 }
             }
-        };
+        }
 
         // Query NAT and relay status from the network layer.
         let (nat_type, can_receive_direct, is_relay, is_coordinator) =
@@ -1113,7 +1133,7 @@ impl Agent {
         self.start_identity_listener().await?;
 
         // Include ALL routable addresses (IPv4 and IPv6).
-        let addresses = if let Some(network) = self.network.as_ref() {
+        let mut addresses = if let Some(network) = self.network.as_ref() {
             match network.node_status().await {
                 Some(status) if !status.external_addrs.is_empty() => status.external_addrs,
                 _ => match network.routable_addr().await {
@@ -1124,6 +1144,26 @@ impl Agent {
         } else {
             self.announcement_addresses()
         };
+        // Detect global IPv6 locally (same trick as heartbeat)
+        let port = addresses.first().map(|a| a.port()).unwrap_or(5483);
+        if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
+            if sock.connect("[2001:4860:4860::8888]:80").is_ok() {
+                if let Ok(local) = sock.local_addr() {
+                    if let std::net::IpAddr::V6(v6) = local.ip() {
+                        let segs = v6.segments();
+                        let is_global = (segs[0] & 0xffc0) != 0xfe80
+                            && (segs[0] & 0xff00) != 0xfd00
+                            && !v6.is_loopback();
+                        if is_global {
+                            let v6_addr = std::net::SocketAddr::new(std::net::IpAddr::V6(v6), port);
+                            if !addresses.contains(&v6_addr) {
+                                addresses.push(v6_addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let announcement = self.build_identity_announcement_with_addrs(
             include_user_identity,
             human_consent,
