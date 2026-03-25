@@ -179,8 +179,7 @@ tr:hover td{background:rgba(0,212,255,.02)}
   <div class="page" id="page-network">
     <h2>Network Status</h2>
     <div class="grid grid-4">
-      <div class="card"><div class="card-label">NAT Type</div><div class="card-value" id="n-nat">—</div></div>
-      <div class="card"><div class="card-label">External Addrs</div><div class="card-value mono" id="n-addrs" style="font-size:.8rem;word-break:break-all">—</div></div>
+      <div class="card"><div class="card-label">External Addresses</div><div class="card-value mono" id="n-addrs" style="font-size:.8rem;word-break:break-all">—</div></div>
       <div class="card"><div class="card-label">Direct / Relayed</div><div class="card-value" id="n-conns">— / —</div></div>
       <div class="card"><div class="card-label">Avg RTT</div><div class="card-value" id="n-rtt">— ms</div></div>
     </div>
@@ -335,7 +334,7 @@ async function pollDashboard(){
 async function pollNetwork(){
   const n=await api("/network/status");
   if(n&&n.ok){
-    $("n-nat").textContent=n.nat_type||"Unknown";
+    // NAT type removed — unreliable to determine definitively
     $("n-addrs").textContent=(n.external_addrs||[]).join(", ")||"none";
     $("n-conns").textContent=(n.direct_connections!=null?n.direct_connections:"—")+" / "+(n.relayed_connections!=null?n.relayed_connections:"—");
     $("n-rtt").textContent=n.avg_rtt_ms!=null?Math.round(n.avg_rtt_ms)+" ms":"N/A";

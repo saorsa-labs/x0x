@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.9.1] - 2026-03-25
+
+### Fixed
+
+- **Group auto-subscribe** — creating or joining a group now automatically subscribes to the group's chat and metadata gossip topics. Previously, members couldn't see each other because neither side was subscribed to the gossip topics. Join/create events are now announced on the chat topic.
+
+- **IPv6 addresses in announcements** — identity announcements now include ALL external addresses (IPv4 and IPv6) from ant-quic's NodeStatus, not just the first observed address. Agents with dual-stack connectivity now advertise both addresses so peers can connect via whichever protocol works.
+
+- **Removed NAT type from GUI** — NAT type detection is unreliable and showing an incorrect value is worse than showing nothing. Removed from the network dashboard until it can be determined definitively.
+
 ## [v0.9.0] - 2026-03-25
 
 ### Added

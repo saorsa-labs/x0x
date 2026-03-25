@@ -482,10 +482,17 @@ impl HeartbeatContext {
             .to_vec();
         let announced_at = Agent::unix_timestamp_secs();
 
-        // Include our routable address so other agents can connect to us.
-        let addresses = match self.network.routable_addr().await {
-            Some(addr) => vec![addr],
-            None => Vec::new(),
+        // Include ALL routable addresses (IPv4 and IPv6) so other agents
+        // can connect to us via whichever protocol they support.
+        let addresses = match self.network.node_status().await {
+            Some(status) if !status.external_addrs.is_empty() => status.external_addrs,
+            _ => {
+                // Fall back to single routable address
+                match self.network.routable_addr().await {
+                    Some(addr) => vec![addr],
+                    None => Vec::new(),
+                }
+            }
         };
 
         // Query NAT and relay status from the network layer.
@@ -1105,12 +1112,14 @@ impl Agent {
 
         self.start_identity_listener().await?;
 
-        // Use routable address if available (prefers observed external address
-        // over potentially-unroutable bind address).
+        // Include ALL routable addresses (IPv4 and IPv6).
         let addresses = if let Some(network) = self.network.as_ref() {
-            match network.routable_addr().await {
-                Some(addr) => vec![addr],
-                None => self.announcement_addresses(),
+            match network.node_status().await {
+                Some(status) if !status.external_addrs.is_empty() => status.external_addrs,
+                _ => match network.routable_addr().await {
+                    Some(addr) => vec![addr],
+                    None => self.announcement_addresses(),
+                },
             }
         } else {
             self.announcement_addresses()
