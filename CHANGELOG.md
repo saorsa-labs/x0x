@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.7.0] - 2026-03-25
+
+### Added
+
+- **`x0x` CLI binary** — unified command-line tool that controls a running x0xd daemon. Every REST endpoint is available as a subcommand (`x0x health`, `x0x contacts list`, `x0x direct send`, `x0x groups create`, etc.). Supports `--json` output and `--name` for named instances.
+
+- **Shared API endpoint registry** (`src/api/mod.rs`) — 50 endpoint definitions consumed by both x0xd and the CLI. Routes and CLI commands can never drift out of sync.
+
+- **12 new daemon endpoints** closing the library→daemon API gap:
+  - `POST /agents/find/:id` — active 3-stage agent search
+  - `GET /agents/reachability/:id` — reachability prediction
+  - `POST /contacts/:id/revoke` — key revocation
+  - `GET /contacts/:id/revocations` — revocation audit trail
+  - `POST /contacts/:id/machines/:mid/pin` — machine pinning
+  - `DELETE /contacts/:id/machines/:mid/pin` — machine unpinning
+  - `POST /trust/evaluate` — trust decision evaluation
+  - `POST /mls/groups/:id/welcome` — MLS welcome message
+  - `GET /upgrade/check` — update check
+  - `GET /network/bootstrap-cache` — peer cache stats
+  - `GET /agents/discovered?unfiltered=true` — include stale entries
+
+- **51 daemon API integration tests** — comprehensive test suite covering all routes against a live daemon with real bootstrap node connections.
+
+- **`install-quick.sh`** — single-command installer: `curl -sfL https://x0x.md | sh`. Downloads binary, starts daemon, waits for healthy, prints agent ID.
+
+- **File transfer protocol types** (`src/files/mod.rs`) — types and state management for future file sharing.
+
+### Changed
+
+- 51 routes total (was 39 in v0.6.0)
+- `futures` dependency now includes `alloc` feature for WebSocket test support
+
 ## [v0.6.0] - 2026-03-24
 
 ### Added
