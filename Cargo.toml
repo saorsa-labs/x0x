@@ -57,7 +57,7 @@ zip = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 zeroize = "1.8.2"
-futures = "0.3"
+futures = { version = "0.3", features = ["alloc"] }
 async-stream = "0.3.6"
 uuid = { version = "1.20.0", features = ["v4"] }
 
@@ -65,7 +65,7 @@ uuid = { version = "1.20.0", features = ["v4"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 criterion = "0.5"
-futures = "0.3"
+futures = { version = "0.3", features = ["alloc"] }
 proptest = "1.4"
 serde_json = "1.0"
 tempfile = "3.14"
