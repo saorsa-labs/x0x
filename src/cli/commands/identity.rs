@@ -30,3 +30,51 @@ pub async fn announce(client: &DaemonClient, include_user: bool, consent: bool) 
     print_value(client.format(), &resp);
     Ok(())
 }
+
+/// `x0x agent card` — GET /agent/card
+pub async fn card(
+    client: &DaemonClient,
+    display_name: Option<&str>,
+    include_groups: bool,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let mut params = Vec::new();
+    if let Some(name) = display_name {
+        params.push(format!("display_name={name}"));
+    }
+    if include_groups {
+        params.push("include_groups=true".to_string());
+    }
+    let query = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
+    let resp = client.get(&format!("/agent/card{query}")).await?;
+
+    // Print the link prominently
+    if let Some(link) = resp.get("link").and_then(|v| v.as_str()) {
+        eprintln!("\nYour shareable identity card:\n");
+        eprintln!("  {link}\n");
+        eprintln!("Share this link with anyone — they can import it with:");
+        eprintln!("  x0x agent import <link>\n");
+    }
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x agent import` — POST /agent/card/import
+pub async fn import_card(
+    client: &DaemonClient,
+    card_link: &str,
+    trust_level: Option<&str>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let mut body = serde_json::json!({ "card": card_link });
+    if let Some(tl) = trust_level {
+        body["trust_level"] = serde_json::Value::String(tl.to_string());
+    }
+    let resp = client.post("/agent/card/import", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}

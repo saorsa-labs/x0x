@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>x0x network</title>
+<style>
+:root { --bg: #0a0a0f; --card: #12121a; --border: #1e1e2e; --accent: #00d4ff; --green: #00e676; --orange: #ff6b35; --red: #ff1744; --dim: #555; --text: #e0e0e0; --muted: #888; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; padding: 20px; min-height: 100vh; }
+.mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.85em; }
+h1 { font-size: 1.4em; font-weight: 600; margin-bottom: 20px; display: flex; align-items: center; gap: 10px; }
+h1 span { color: var(--accent); }
+h2 { font-size: 1em; font-weight: 500; color: var(--muted); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+.grid { display: grid; gap: 16px; margin-bottom: 20px; }
+.grid-4 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.grid-2 { grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.card-label { font-size: 0.75em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+.card-value { font-size: 1.5em; font-weight: 700; }
+.badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.75em; font-weight: 600; text-transform: uppercase; }
+.badge-green { background: rgba(0,230,118,0.15); color: var(--green); }
+.badge-blue { background: rgba(0,212,255,0.15); color: var(--accent); }
+.badge-gray { background: rgba(136,136,136,0.15); color: var(--muted); }
+.badge-red { background: rgba(255,23,68,0.15); color: var(--red); }
+.badge-orange { background: rgba(255,107,53,0.15); color: var(--orange); }
+.health-bar { display: flex; align-items: center; gap: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 20px; margin-bottom: 20px; flex-wrap: wrap; }
+.health-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dim); flex-shrink: 0; }
+.health-dot.ok { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.health-dot.err { background: var(--red); box-shadow: 0 0 8px var(--red); }
+.health-bar .sep { color: var(--border); }
+.id-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.id-label { width: 80px; flex-shrink: 0; font-size: 0.75em; color: var(--muted); text-transform: uppercase; }
+.id-value { cursor: pointer; color: var(--accent); word-break: break-all; transition: opacity 0.15s; }
+.id-value:hover { opacity: 0.7; }
+.pct-bar { height: 6px; border-radius: 3px; background: #1e1e2e; overflow: hidden; margin-top: 6px; }
+.pct-fill { height: 100%; border-radius: 3px; transition: width 0.4s; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-size: 0.7em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+td { padding: 8px 10px; border-bottom: 1px solid #0e0e16; font-size: 0.88em; vertical-align: top; }
+tr:hover td { background: rgba(0,212,255,0.03); }
+.clickable { cursor: pointer; color: var(--accent); }
+.clickable:hover { text-decoration: underline; }
+.toast { position: fixed; bottom: 24px; right: 24px; background: var(--accent); color: #000; padding: 8px 18px; border-radius: 8px; font-weight: 600; font-size: 0.85em; opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 99; }
+.toast.show { opacity: 1; }
+.offline-screen { display: none; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 80px 20px; }
+.offline-screen h2 { font-size: 1.8em; color: var(--red); margin-bottom: 16px; text-transform: none; letter-spacing: 0; }
+.offline-screen p { color: var(--muted); max-width: 440px; line-height: 1.6; }
+.offline-screen code { background: var(--card); padding: 2px 8px; border-radius: 4px; color: var(--accent); }
+.empty { color: var(--dim); font-style: italic; padding: 20px; text-align: center; }
+@media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } body { padding: 12px; } }
+</style>
+</head>
+<body>
+<div id="toast" class="toast">Copied</div>
+<div id="offline" class="offline-screen">
+  <h2>x0xd is not running</h2>
+  <p>Start the daemon to see your network:</p>
+  <p style="margin-top:12px"><code>x0x start</code></p>
+  <p style="margin-top:8px;font-size:0.85em">Dashboard will reconnect automatically.</p>
+</div>
+<div id="app">
+  <h1><span>x0x</span> network</h1>
+  <div class="health-bar">
+    <div class="health-dot" id="health-dot"></div>
+    <span id="h-status" class="badge badge-gray">connecting</span>
+    <span class="sep">|</span>
+    <span class="mono" id="h-version">--</span>
+    <span class="sep">|</span>
+    <span id="h-uptime">--</span>
+    <span class="sep">|</span>
+    <span id="h-peers">-- peers</span>
+  </div>
+  <h2>Network</h2>
+  <div class="grid grid-4">
+    <div class="card"><div class="card-label">NAT Type</div><div class="card-value" id="n-nat">--</div></div>
+    <div class="card"><div class="card-label">External Addresses</div><div class="card-value mono" id="n-addrs" style="font-size:0.9em;word-break:break-all">--</div></div>
+    <div class="card"><div class="card-label">Direct / Relayed</div><div class="card-value" id="n-conns">-- / --</div></div>
+    <div class="card"><div class="card-label">Hole-Punch Success</div><div class="card-value" id="n-hp">--%</div><div class="pct-bar"><div class="pct-fill" id="n-hp-bar" style="width:0%;background:var(--accent)"></div></div></div>
+    <div class="card"><div class="card-label">Avg RTT</div><div class="card-value" id="n-rtt">-- ms</div></div>
+  </div>
+  <h2>Your Identity</h2>
+  <div class="card" style="margin-bottom:20px">
+    <div class="id-row"><span class="id-label">Agent</span><span class="id-value mono" id="i-agent" onclick="copyId(this)">--</span></div>
+    <div class="id-row"><span class="id-label">Machine</span><span class="id-value mono" id="i-machine" onclick="copyId(this)">--</span></div>
+    <div class="id-row" id="i-user-row" style="display:none"><span class="id-label">User</span><span class="id-value mono" id="i-user" onclick="copyId(this)">--</span></div>
+  </div>
+  <div class="grid grid-2">
+    <div>
+      <h2>Discovered Agents <span class="badge badge-blue" id="da-count">0</span></h2>
+      <div class="card" style="overflow-x:auto">
+        <table><thead><tr><th>Agent ID</th><th>Machine ID</th><th>Addresses</th><th>Last Seen</th></tr></thead>
+        <tbody id="da-body"><tr><td colspan="4" class="empty">No agents discovered</td></tr></tbody></table>
+      </div>
+    </div>
+    <div>
+      <h2>Contacts <span class="badge badge-blue" id="ct-count">0</span></h2>
+      <div class="card" style="overflow-x:auto">
+        <table><thead><tr><th>Agent ID</th><th>Trust</th><th>Label</th><th>Last Seen</th></tr></thead>
+        <tbody id="ct-body"><tr><td colspan="4" class="empty">No contacts</td></tr></tbody></table>
+      </div>
+      <h2 style="margin-top:20px">Gossip Peers <span class="badge badge-blue" id="gp-count">0</span></h2>
+      <div class="card">
+        <div id="gp-list" class="empty">No peers</div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const API_URL = "http://localhost:12700";
+const POLL_MS = 3000;
+let online = false;
+
+function $(id) { return document.getElementById(id); }
+function trustBadge(t) {
+  const m = { Trusted: "badge-green", Known: "badge-blue", Unknown: "badge-gray", Blocked: "badge-red" };
+  return '<span class="badge ' + (m[t] || "badge-gray") + '">' + (t || "Unknown") + "</span>";
+}
+function truncId(id, n) { n = n || 12; return id && id.length > n * 2 ? id.slice(0, n) + "…" + id.slice(-n) : (id || "--"); }
+function relTime(ts) {
+  if (!ts) return "--";
+  const d = Date.now() / 1000 - ts;
+  if (d < 5) return "just now"; if (d < 60) return Math.floor(d) + "s ago";
+  if (d < 3600) return Math.floor(d / 60) + "m ago";
+  if (d < 86400) return Math.floor(d / 3600) + "h ago";
+  return Math.floor(d / 86400) + "d ago";
+}
+function fmtUptime(s) {
+  if (!s && s !== 0) return "--";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  return (h ? h + "h " : "") + m + "m " + sec + "s";
+}
+function copyId(el) {
+  const t = el.textContent; if (!t || t === "--") return;
+  navigator.clipboard.writeText(t).then(() => { $("toast").classList.add("show"); setTimeout(() => $("toast").classList.remove("show"), 1200); });
+}
+async function api(path) { const r = await fetch(API_URL + path, { signal: AbortSignal.timeout(2500) }); return r.json(); }
+function setOnline(v) { if (v === online) return; online = v; $("offline").style.display = v ? "none" : "flex"; $("app").style.display = v ? "block" : "none"; }
+
+async function poll() {
+  try {
+    const h = await api("/health"); setOnline(true);
+    $("health-dot").className = "health-dot " + (h.status === "healthy" ? "ok" : "err");
+    const sc = h.status === "healthy" ? "badge-green" : "badge-orange";
+    $("h-status").className = "badge " + sc; $("h-status").textContent = h.status || "unknown";
+    $("h-version").textContent = h.version || "--"; $("h-uptime").textContent = fmtUptime(h.uptime_secs);
+    $("h-peers").textContent = (h.peers != null ? h.peers : "--") + " peers";
+  } catch { setOnline(false); return; }
+
+  try {
+    const n = await api("/network/status");
+    $("n-nat").textContent = n.nat_type || "Unknown";
+    $("n-addrs").textContent = (n.external_addrs || []).join(", ") || "none";
+    $("n-conns").textContent = (n.direct_connections != null ? n.direct_connections : "--") + " / " + (n.relayed_connections != null ? n.relayed_connections : "--");
+    const hp = n.hole_punch_success_rate, hpPct = hp != null ? Math.round(hp * 100) : null;
+    $("n-hp").textContent = hpPct != null ? hpPct + "%" : "N/A";
+    $("n-hp-bar").style.width = (hpPct || 0) + "%";
+    $("n-hp-bar").style.background = hpPct >= 70 ? "var(--green)" : hpPct >= 40 ? "var(--orange)" : "var(--red)";
+    $("n-rtt").textContent = n.avg_rtt_ms != null ? Math.round(n.avg_rtt_ms) + " ms" : "N/A";
+  } catch { /* graceful */ }
+
+  try {
+    const a = await api("/agent");
+    $("i-agent").textContent = a.agent_id || "--"; $("i-machine").textContent = a.machine_id || "--";
+    if (a.user_id) { $("i-user-row").style.display = "flex"; $("i-user").textContent = a.user_id; }
+  } catch { /* graceful */ }
+
+  try {
+    const d = await api("/agents/discovered"), agents = d.agents || [];
+    $("da-count").textContent = agents.length;
+    const body = $("da-body");
+    if (!agents.length) { body.innerHTML = '<tr><td colspan="4" class="empty">No agents discovered</td></tr>'; }
+    else { body.innerHTML = agents.map(a => {
+      const addrs = (a.addresses || []).join(", ") || "--";
+      const ls = a.last_seen ? relTime(a.last_seen) : (a.announced_at ? relTime(a.announced_at) : "--");
+      return '<tr><td class="mono clickable" onclick="copyId(this)" title="' + a.agent_id + '">' + truncId(a.agent_id) + '</td><td class="mono" style="color:var(--muted);font-size:0.8em">' + truncId(a.machine_id, 8) + '</td><td class="mono" style="font-size:0.8em">' + addrs + "</td><td>" + ls + "</td></tr>";
+    }).join(""); }
+  } catch { /* graceful */ }
+
+  try {
+    const p = await api("/peers"), peers = p.peers || [];
+    $("gp-count").textContent = peers.length;
+    const el = $("gp-list");
+    if (!peers.length) { el.className = "empty"; el.innerHTML = "No peers"; }
+    else { el.className = "mono"; el.style.fontSize = "0.82em"; el.style.lineHeight = "1.8";
+      el.innerHTML = peers.map(p => '<span class="clickable" onclick="copyId(this)" title="' + p.id + '">' + truncId(p.id) + "</span>").join("<br>"); }
+  } catch { /* graceful */ }
+
+  try {
+    const c = await api("/contacts"), contacts = c.contacts || [];
+    $("ct-count").textContent = contacts.length;
+    const body = $("ct-body");
+    if (!contacts.length) { body.innerHTML = '<tr><td colspan="4" class="empty">No contacts</td></tr>'; }
+    else { body.innerHTML = contacts.map(c => {
+      const ls = c.last_seen ? relTime(c.last_seen) : "--";
+      return '<tr><td class="mono clickable" onclick="copyId(this)" title="' + c.agent_id + '">' + truncId(c.agent_id) + "</td><td>" + trustBadge(c.trust_level) + "</td><td>" + (c.label || "--") + "</td><td>" + ls + "</td></tr>";
+    }).join(""); }
+  } catch { /* graceful */ }
+}
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

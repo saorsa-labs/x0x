@@ -2,6 +2,74 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.9.0] - 2026-03-25
+
+### Added
+
+- **KvStore — CRDT-backed key-value store** with access control:
+  - Generic replicated key-value store using OR-Set for keys, LWW for values
+  - Access policies: **Signed** (owner-only writes), **Allowlisted** (approved writers), **Encrypted** (MLS group members only)
+  - Unauthorized writes silently rejected — no spam possible
+  - Delta-based sync over gossip with BLAKE3 content hashing
+  - 7 REST endpoints: `POST/GET /stores`, `POST /stores/:id/join`, `GET /stores/:id/keys`, `PUT/GET/DELETE /stores/:id/:key`
+  - 7 CLI commands: `x0x store create/list/join/keys/put/get/rm`
+  - 46 unit tests covering CRUD, merge semantics, access control, serialization
+
+- **Named Groups** — human-friendly group management:
+  - Groups tie together MLS encryption + KvStore metadata + gossip chat topics
+  - Display names per member (like Slack/Discord)
+  - 6 REST endpoints: `POST/GET /groups`, `GET /groups/:id`, `POST /groups/:id/invite`, `POST /groups/join`, `PUT /groups/:id/display-name`
+  - 6 CLI commands: `x0x group create/list/info/invite/join/set-name`
+
+- **Invite Links** — shareable group invitations:
+  - Format: `x0x://invite/<base64url(json)>` — share via email, chat, QR code
+  - Configurable expiry (default 7 days, 0 = never)
+  - Expired and malformed invites properly rejected
+  - Invite tokens contain group name, inviter identity, one-time secret
+
+- **AgentCard — Shareable Identity**:
+  - Portable identity card: `x0x://agent/<base64url(json)>`
+  - Contains display name, agent/machine/user IDs, addresses, groups, stores
+  - Import a card to add someone to your contacts in one step
+  - Share a card that includes group invites — one link to add you AND join your groups
+  - `GET /agent/card` — generate your card
+  - `POST /agent/card/import` — import someone's card
+  - `x0x agent card --name "David"` / `x0x agent import <link>`
+
+- **Embedded GUI** — full web interface compiled into x0xd:
+  - `x0x gui` opens it in your default browser (macOS/Linux/Windows)
+  - Served at `GET /gui` — no external files needed
+  - Dashboard: identity, peers, uptime, discovered agents, identity cards
+  - Groups: create, invite, join, display names
+  - Chat: group-scoped rooms via WebSocket
+  - Network: NAT type, addresses, peers, contacts, trust levels
+  - Help: CLI reference, example app gallery, about
+
+- **5 Example Apps** — single-file HTML apps in `examples/apps/`:
+  - **x0x-chat** — group chat via WebSocket pub/sub
+  - **x0x-board** — collaborative kanban (CRDT task lists)
+  - **x0x-network** — network topology dashboard
+  - **x0x-drop** — secure P2P file sharing with SHA-256
+  - **x0x-swarm** — AI agent task delegation (the killer demo)
+  - All self-contained, zero dependencies, dark terminal aesthetic
+  - Starting points for humans and agents to build their own apps
+
+- **App Distribution Design** — `docs/design/content-store-and-apps.md`:
+  - Architecture for distributing web apps over the x0x network
+  - App manifests signed with ML-DSA-65, discovered via gossip
+  - Small apps inline via CRDT, large apps via file transfer
+  - Roadmap through content store → app registry → static serving
+
+### Fixed
+
+- **Critical bootstrap bug** — config files without explicit `bootstrap_peers` field resulted in zero bootstrap peers (empty `Vec` from serde default). Nodes would start healthy but never connect to anyone. Fixed: `#[serde(default = "default_bootstrap_peers")]` now populates the 6 hardcoded global bootstrap nodes. This affected all users running x0xd with a custom config file.
+
+### Changed
+
+- REST API expanded from 50 to **70 endpoints**
+- Total test count: **615+ tests** (was 519)
+- All 6 VPS bootstrap nodes verified on v0.9.0 with full global mesh (NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo)
+
 ## [v0.8.1] - 2026-03-25
 
 ### Added

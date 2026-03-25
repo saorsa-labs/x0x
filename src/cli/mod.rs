@@ -155,6 +155,22 @@ impl DaemonClient {
         self.handle_response(resp).await
     }
 
+    /// Send a PUT request with a JSON body.
+    pub async fn put<T: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .put(format!("{}{}", self.base_url, path))
+            .json(body)
+            .send()
+            .await
+            .context("request failed")?;
+        self.handle_response(resp).await
+    }
+
     /// Send a DELETE request.
     pub async fn delete(&self, path: &str) -> Result<serde_json::Value> {
         let resp = self

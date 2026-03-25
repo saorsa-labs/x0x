@@ -141,6 +141,16 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<GroupsSub>,
     },
+    /// Named group management (create, invite, join).
+    Group {
+        #[command(subcommand)]
+        sub: Option<GroupSub>,
+    },
+    /// Key-value store operations.
+    Store {
+        #[command(subcommand)]
+        sub: Option<StoreSub>,
+    },
     /// Collaborative task lists (CRDTs).
     Tasks {
         #[command(subcommand)]
@@ -156,6 +166,8 @@ enum Commands {
         #[command(subcommand)]
         sub: WsSub,
     },
+    /// Open the x0x GUI in your browser.
+    Gui,
     /// Print all API routes.
     Routes,
     /// Send a file to an agent.
@@ -184,6 +196,23 @@ enum Commands {
 enum AgentSub {
     /// Show current agent's user ID.
     UserId,
+    /// Generate a shareable identity card.
+    Card {
+        /// Your display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Include group invite links in the card.
+        #[arg(long)]
+        include_groups: bool,
+    },
+    /// Import an agent card (add to contacts).
+    Import {
+        /// Card link (x0x://agent/...) or raw base64.
+        card: String,
+        /// Trust level: trusted, known, blocked.
+        #[arg(long, default_value = "known")]
+        trust: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -407,6 +436,100 @@ enum GroupsSub {
 }
 
 #[derive(Subcommand)]
+enum GroupSub {
+    /// List all groups.
+    List,
+    /// Create a new named group.
+    Create {
+        /// Group name.
+        name: String,
+        /// Group description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Your display name in this group.
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+    /// Get group details.
+    Info {
+        /// Group ID.
+        group_id: String,
+    },
+    /// Generate an invite link.
+    Invite {
+        /// Group ID.
+        group_id: String,
+        /// Seconds until expiry (default: 7 days).
+        #[arg(long, default_value = "604800")]
+        expiry: u64,
+    },
+    /// Join a group via invite link.
+    Join {
+        /// Invite link (x0x://invite/...) or raw base64 token.
+        invite: String,
+        /// Your display name in this group.
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+    /// Set your display name in a group.
+    SetName {
+        /// Group ID.
+        group_id: String,
+        /// Display name.
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreSub {
+    /// List all stores.
+    List,
+    /// Create a new store.
+    Create {
+        /// Store name.
+        name: String,
+        /// Gossip topic for sync.
+        topic: String,
+    },
+    /// Join an existing store by topic.
+    Join {
+        /// Gossip topic.
+        topic: String,
+    },
+    /// List keys in a store.
+    Keys {
+        /// Store ID (topic).
+        store_id: String,
+    },
+    /// Put a value.
+    Put {
+        /// Store ID (topic).
+        store_id: String,
+        /// Key name.
+        key: String,
+        /// Value (string).
+        value: String,
+        /// Content type.
+        #[arg(long)]
+        content_type: Option<String>,
+    },
+    /// Get a value.
+    Get {
+        /// Store ID (topic).
+        store_id: String,
+        /// Key name.
+        key: String,
+    },
+    /// Remove a key.
+    Rm {
+        /// Store ID (topic).
+        store_id: String,
+        /// Key name.
+        key: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum TasksSub {
     /// List all task lists.
     List,
@@ -516,11 +639,54 @@ async fn run(
 
     // Commands that need a running daemon.
     match command {
+        Commands::Gui => {
+            // Ensure daemon is running and open GUI in browser
+            client.ensure_running().await?;
+            let url = format!("{}/gui", client.base_url());
+            eprintln!("x0x GUI: {url}");
+
+            let opened = {
+                #[cfg(target_os = "macos")]
+                {
+                    std::process::Command::new("open").arg(&url).spawn().is_ok()
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    std::process::Command::new("xdg-open")
+                        .arg(&url)
+                        .spawn()
+                        .is_ok()
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    std::process::Command::new("cmd")
+                        .args(["/C", "start", &url])
+                        .spawn()
+                        .is_ok()
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+                {
+                    false
+                }
+            };
+
+            if !opened {
+                eprintln!("Could not open browser. Open the URL above manually.");
+            }
+            Ok(())
+        }
         Commands::Health => commands::network::health(&client).await,
         Commands::Status => commands::network::status(&client).await,
         Commands::Agent { sub } => match sub {
             None => commands::identity::agent(&client).await,
             Some(AgentSub::UserId) => commands::identity::user_id(&client).await,
+            Some(AgentSub::Card {
+                name,
+                include_groups,
+            }) => commands::identity::card(&client, name.as_deref(), include_groups).await,
+            Some(AgentSub::Import { card, trust }) => {
+                commands::identity::import_card(&client, &card, Some(trust.as_str())).await
+            }
         },
         Commands::Announce {
             include_user,
@@ -647,6 +813,58 @@ async fn run(
             }) => commands::groups::decrypt(&client, &group_id, &ciphertext, epoch).await,
             Some(GroupsSub::Welcome { group_id, agent_id }) => {
                 commands::groups::welcome(&client, &group_id, &agent_id).await
+            }
+        },
+        Commands::Group { sub } => match sub {
+            None => commands::group::list(&client).await,
+            Some(GroupSub::List) => commands::group::list(&client).await,
+            Some(GroupSub::Create {
+                name,
+                description,
+                display_name,
+            }) => {
+                commands::group::create(
+                    &client,
+                    &name,
+                    description.as_deref(),
+                    display_name.as_deref(),
+                )
+                .await
+            }
+            Some(GroupSub::Info { group_id }) => commands::group::info(&client, &group_id).await,
+            Some(GroupSub::Invite { group_id, expiry }) => {
+                commands::group::invite(&client, &group_id, expiry).await
+            }
+            Some(GroupSub::Join {
+                invite,
+                display_name,
+            }) => commands::group::join(&client, &invite, display_name.as_deref()).await,
+            Some(GroupSub::SetName { group_id, name }) => {
+                commands::group::set_name(&client, &group_id, &name).await
+            }
+        },
+        Commands::Store { sub } => match sub {
+            None => commands::store::list(&client).await,
+            Some(StoreSub::List) => commands::store::list(&client).await,
+            Some(StoreSub::Create { name, topic }) => {
+                commands::store::create(&client, &name, &topic).await
+            }
+            Some(StoreSub::Join { topic }) => commands::store::join(&client, &topic).await,
+            Some(StoreSub::Keys { store_id }) => commands::store::keys(&client, &store_id).await,
+            Some(StoreSub::Put {
+                store_id,
+                key,
+                value,
+                content_type,
+            }) => {
+                commands::store::put(&client, &store_id, &key, &value, content_type.as_deref())
+                    .await
+            }
+            Some(StoreSub::Get { store_id, key }) => {
+                commands::store::get(&client, &store_id, &key).await
+            }
+            Some(StoreSub::Rm { store_id, key }) => {
+                commands::store::rm(&client, &store_id, &key).await
             }
         },
         Commands::Tasks { sub } => match sub {

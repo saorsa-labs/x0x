@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>x0x drop</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0f;--card:#12121a;--card2:#1a1a28;--accent:#00d4ff;--accent2:#0090b0;--text:#e0e0e8;--dim:#6a6a80;--green:#00e676;--red:#ff4060;--yellow:#ffc400;--border:#2a2a3a}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column}
+.mono{font-family:'SF Mono',Consolas,monospace;font-size:.85em}
+header{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;border-bottom:1px solid var(--border);background:var(--card)}
+header h1{font-size:1.2em;font-weight:700;letter-spacing:2px;color:var(--accent)}
+.hdr-right{display:flex;align-items:center;gap:12px;font-size:.85em;color:var(--dim)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--red);flex-shrink:0}
+.dot.on{background:var(--green);box-shadow:0 0 8px var(--green)}
+main{flex:1;display:grid;grid-template-columns:260px 1fr 320px;gap:16px;padding:16px}
+@media(max-width:960px){main{grid-template-columns:1fr;grid-template-rows:auto 1fr auto}}
+.pnl{background:var(--card);border-radius:12px;border:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.pnl-head{padding:12px 16px;border-bottom:1px solid var(--border);font-size:.8em;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:1px;display:flex;align-items:center;justify-content:space-between}
+.pnl-body{flex:1;overflow-y:auto;padding:8px}
+.btn{display:inline-flex;align-items:center;justify-content:center;padding:6px 14px;border-radius:8px;border:1px solid var(--border);background:var(--card2);color:var(--text);font-size:.82em;cursor:pointer;transition:all .15s}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.primary{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:600}
+.btn.primary:hover{background:var(--accent2)}
+.btn-sm{padding:4px 10px;font-size:.75em}
+.btn-green{border-color:var(--green);color:var(--green)}.btn-green:hover{background:var(--green);color:var(--bg)}
+.btn-red{border-color:var(--red);color:var(--red)}.btn-red:hover{background:var(--red);color:#fff}
+.peer{padding:10px 12px;border-radius:8px;cursor:pointer;transition:all .15s;border:1px solid transparent;margin-bottom:4px}
+.peer:hover{background:var(--card2)}
+.peer.sel{border-color:var(--accent);background:rgba(0,212,255,.06)}
+.peer .pid{font-size:.8em;color:var(--accent)}
+.peer .meta{font-size:.72em;color:var(--dim);margin-top:2px}
+.trust{display:inline-block;padding:1px 6px;border-radius:4px;font-size:.7em;font-weight:600;text-transform:uppercase}
+.trust-Trusted{background:rgba(0,230,118,.15);color:var(--green)}
+.trust-Known{background:rgba(255,196,0,.15);color:var(--yellow)}
+.trust-Unknown{background:rgba(106,106,128,.2);color:var(--dim)}
+#dropzone{display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px dashed var(--border);border-radius:16px;margin:12px;flex:1;cursor:pointer;transition:all .2s;min-height:200px}
+#dropzone.over{border-color:var(--accent);background:rgba(0,212,255,.04);box-shadow:0 0 40px rgba(0,212,255,.08) inset}
+#dropzone.has-file{border-style:solid;border-color:var(--accent2)}
+.drop-icon{font-size:3em;margin-bottom:12px;opacity:.4}
+.drop-text{color:var(--dim);font-size:.9em}
+.file-info{text-align:center}
+.file-info .fname{font-size:1em;color:var(--accent);word-break:break-all}
+.file-info .fsize{font-size:.82em;color:var(--dim);margin-top:4px}
+.file-info .fhash{font-size:.7em;color:var(--dim);margin-top:4px;word-break:break-all}
+#send-row{padding:12px;display:flex;justify-content:center}
+.xfer{padding:10px 12px;border-radius:8px;background:var(--card2);margin-bottom:6px;border:1px solid var(--border)}
+.xfer .top{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.xfer .dir{font-size:1.1em}
+.xfer .fname2{font-size:.82em;color:var(--text);flex:1;margin:0 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.xfer .xbadge{padding:2px 8px;border-radius:4px;font-size:.7em;font-weight:600;text-transform:uppercase}
+.xbadge-Pending{background:rgba(255,196,0,.15);color:var(--yellow)}
+.xbadge-InProgress{background:rgba(0,212,255,.15);color:var(--accent)}
+.xbadge-Complete{background:rgba(0,230,118,.15);color:var(--green)}
+.xbadge-Rejected{background:rgba(255,64,96,.15);color:var(--red)}
+.pbar{height:4px;border-radius:2px;background:var(--border);overflow:hidden;margin-bottom:6px}
+.pbar .fill{height:100%;background:linear-gradient(90deg,var(--accent2),var(--accent));border-radius:2px;transition:width .3s}
+.xfer .bottom{display:flex;align-items:center;justify-content:space-between;font-size:.72em;color:var(--dim)}
+.xfer .actions{display:flex;gap:6px;margin-top:6px}
+.empty{text-align:center;color:var(--dim);font-size:.82em;padding:24px}
+input[type=file]{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>x0x drop</h1>
+  <div class="hdr-right">
+    <span class="mono" id="my-id">—</span>
+    <div class="dot" id="conn-dot"></div>
+    <span id="conn-label">Disconnected</span>
+  </div>
+</header>
+<main>
+  <div class="pnl">
+    <div class="pnl-head">Agents <button class="btn btn-sm" onclick="fetchAgents()">&#8635;</button></div>
+    <div class="pnl-body" id="agent-list"><div class="empty">Connecting…</div></div>
+  </div>
+  <div class="pnl">
+    <div id="dropzone" onclick="document.getElementById('fileIn').click()">
+      <div class="drop-icon">&#8693;</div>
+      <div class="drop-text">Drop files here or click to select</div>
+    </div>
+    <input type="file" id="fileIn">
+    <div id="send-row"><button class="btn primary" id="send-btn" onclick="sendFile()" style="display:none">Send File</button></div>
+  </div>
+  <div class="pnl">
+    <div class="pnl-head">Transfers</div>
+    <div class="pnl-body" id="xfer-list"><div class="empty">No transfers</div></div>
+  </div>
+</main>
+<script>
+const API_URL = "http://localhost:12700";
+let selectedAgent = null, chosenFile = null, fileHash = null;
+
+function trunc(s, n) { n = n || 12; return s ? s.slice(0, n) + "…" : "—"; }
+function fmtSize(b) {
+  if (b < 1024) return b + " B"; if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+  if (b < 1073741824) return (b / 1048576).toFixed(1) + " MB";
+  return (b / 1073741824).toFixed(2) + " GB";
+}
+function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+async function api(path, opts) { try { const r = await fetch(API_URL + path, opts); return await r.json(); } catch { return null; } }
+
+async function checkHealth() {
+  const d = await api("/health");
+  const on = d && d.ok !== undefined;
+  document.getElementById("conn-dot").className = "dot" + (on ? " on" : "");
+  document.getElementById("conn-label").textContent = on ? "Connected" : "Disconnected";
+  if (on) { const a = await api("/agent"); if (a && a.agent_id) document.getElementById("my-id").textContent = trunc(a.agent_id, 16); }
+  return on;
+}
+
+let agents = [];
+async function fetchAgents() {
+  const d = await api("/agents/discovered");
+  const el = document.getElementById("agent-list");
+  if (!d || !d.agents || !d.agents.length) { el.innerHTML = '<div class="empty">No agents discovered</div>'; agents = []; return; }
+  agents = d.agents;
+  el.innerHTML = agents.map(a => {
+    const sel = selectedAgent === a.agent_id ? " sel" : "";
+    const trust = a.trust_level || "Unknown";
+    const addrs = (a.addresses || []).length;
+    return '<div class="peer' + sel + '" onclick="pickAgent(\'' + a.agent_id + '\')">' +
+      '<div class="pid mono">' + trunc(a.agent_id, 20) + "</div>" +
+      '<div class="meta"><span class="trust trust-' + trust + '">' + trust + "</span> · " + addrs + " addr" + (addrs !== 1 ? "s" : "") + "</div></div>";
+  }).join("");
+}
+function pickAgent(id) { selectedAgent = id; fetchAgents(); updateSendBtn(); }
+
+const dz = document.getElementById("dropzone");
+["dragenter", "dragover"].forEach(e => dz.addEventListener(e, ev => { ev.preventDefault(); dz.classList.add("over"); }));
+["dragleave", "drop"].forEach(e => dz.addEventListener(e, ev => { ev.preventDefault(); dz.classList.remove("over"); }));
+dz.addEventListener("drop", ev => { if (ev.dataTransfer.files.length) handleFile(ev.dataTransfer.files[0]); });
+document.getElementById("fileIn").addEventListener("change", ev => { if (ev.target.files.length) handleFile(ev.target.files[0]); });
+
+async function handleFile(f) {
+  chosenFile = f; fileHash = null;
+  dz.classList.add("has-file");
+  dz.innerHTML = '<div class="file-info"><div style="font-size:2.5em;margin-bottom:8px">&#128196;</div><div class="fname">' + esc(f.name) + '</div><div class="fsize">' + fmtSize(f.size) + '</div><div class="fhash mono">Hashing…</div></div>';
+  const buf = await f.arrayBuffer();
+  const hash = await crypto.subtle.digest("SHA-256", buf);
+  fileHash = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
+  dz.querySelector(".fhash").textContent = "SHA-256: " + fileHash.slice(0, 16) + "…";
+  updateSendBtn();
+}
+function updateSendBtn() { document.getElementById("send-btn").style.display = (chosenFile && fileHash && selectedAgent) ? "" : "none"; }
+
+async function sendFile() {
+  if (!chosenFile || !fileHash || !selectedAgent) return;
+  const btn = document.getElementById("send-btn");
+  btn.textContent = "Sending…"; btn.style.pointerEvents = "none";
+  const d = await api("/files/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agent_id: selectedAgent, filename: chosenFile.name, size: chosenFile.size, sha256: fileHash }) });
+  btn.textContent = "Send File"; btn.style.pointerEvents = "";
+  if (d && d.transfer_id) {
+    chosenFile = null; fileHash = null; selectedAgent = null;
+    dz.classList.remove("has-file");
+    dz.innerHTML = '<div class="drop-icon">&#8693;</div><div class="drop-text">Drop files here or click to select</div>';
+    updateSendBtn(); fetchAgents();
+  }
+}
+
+let completedAt = {};
+async function fetchTransfers() {
+  const d = await api("/files/transfers");
+  const el = document.getElementById("xfer-list");
+  if (!d || !d.transfers || !d.transfers.length) { el.innerHTML = '<div class="empty">No transfers</div>'; return; }
+  const now = Date.now();
+  const xfers = d.transfers.filter(t => {
+    if (t.status === "Complete" || t.status === "Rejected") {
+      if (!completedAt[t.transfer_id]) completedAt[t.transfer_id] = now;
+      return (now - completedAt[t.transfer_id]) < 30000;
+    } return true;
+  });
+  if (!xfers.length) { el.innerHTML = '<div class="empty">No transfers</div>'; return; }
+  el.innerHTML = xfers.map(t => {
+    const pct = t.total_size > 0 ? Math.round(100 * t.bytes_transferred / t.total_size) : 0;
+    const dir = t.direction === "Sending" ? "&#8593;" : "&#8595;";
+    const incoming = t.direction === "Receiving" && t.status === "Pending";
+    return '<div class="xfer"><div class="top"><span class="dir">' + dir + '</span><span class="fname2" title="' + esc(t.filename) + '">' + esc(t.filename) + '</span><span class="xbadge xbadge-' + t.status + '">' + t.status + '</span></div>' +
+      '<div class="pbar"><div class="fill" style="width:' + pct + '%"></div></div>' +
+      '<div class="bottom"><span class="mono">' + trunc(t.remote_agent_id || "", 14) + '</span><span>' + fmtSize(t.bytes_transferred || 0) + " / " + fmtSize(t.total_size || 0) + " · " + pct + "%</span></div>" +
+      (incoming ? '<div class="actions"><button class="btn btn-sm btn-green" onclick="xferAct(\'accept\',\'' + t.transfer_id + '\')">Accept</button><button class="btn btn-sm btn-red" onclick="xferAct(\'reject\',\'' + t.transfer_id + '\')">Reject</button></div>' : "") +
+      "</div>";
+  }).join("");
+}
+async function xferAct(action, id) { await api("/files/" + action + "/" + id, { method: "POST" }); fetchTransfers(); }
+
+async function init() {
+  const ok = await checkHealth(); if (ok) fetchAgents();
+  setInterval(async () => { const ok = await checkHealth(); if (ok) { fetchAgents(); fetchTransfers(); } }, 2000);
+}
+init();
+</script>
+</body>
+</html>

@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>x0x swarm</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0f;--card:#12121a;--border:#1e1e2e;--text:#e0e0e8;--dim:#6a6a7a;--cyan:#00d4ff;--orange:#ff6b35;--yellow:#ffab00;--green:#00e676;--red:#ff4466}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;min-height:100vh;display:flex;flex-direction:column}
+.mono{font-family:'SF Mono',Menlo,Consolas,monospace;font-size:.85em}
+header{padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.75rem}
+header h1{font-size:1.2rem;font-weight:700;color:var(--cyan);letter-spacing:.5px}
+header h1 span{color:var(--dim);font-weight:400;font-size:.85rem;margin-left:.5rem}
+.status{display:flex;align-items:center;gap:.5rem;font-size:.8rem}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--red);flex-shrink:0}
+.dot.ok{background:var(--green)}
+.session-bar{padding:.5rem 1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:1rem;flex-wrap:wrap;font-size:.8rem}
+.session-bar label{color:var(--dim)}
+.session-bar code{color:var(--cyan);cursor:pointer}
+.session-bar input{background:var(--card);border:1px solid var(--border);color:var(--text);padding:.25rem .5rem;border-radius:4px;font-size:.8rem;width:10rem}
+.session-bar button{background:transparent;border:1px solid var(--border);color:var(--cyan);padding:.25rem .75rem;border-radius:4px;cursor:pointer;font-size:.8rem}
+.session-bar button:hover{background:var(--border)}
+main{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:0;overflow:hidden}
+.panel{padding:1.25rem;overflow-y:auto;display:flex;flex-direction:column;gap:1rem}
+.panel-left{border-right:1px solid var(--border)}
+h2{font-size:.9rem;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:.25rem}
+textarea{width:100%;background:var(--card);border:1px solid var(--border);color:var(--text);padding:.75rem;border-radius:6px;font-family:inherit;font-size:.9rem;resize:vertical;min-height:80px}
+textarea:focus,input:focus{outline:none;border-color:var(--cyan)}
+.row{display:flex;gap:.5rem;align-items:center}
+.row input{flex:1;background:var(--card);border:1px solid var(--border);color:var(--text);padding:.5rem .75rem;border-radius:6px;font-size:.9rem}
+.btn{padding:.5rem 1.25rem;border:none;border-radius:6px;cursor:pointer;font-size:.85rem;font-weight:600;transition:opacity .15s}
+.btn:hover{opacity:.85}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-cyan{background:var(--cyan);color:#000}
+.my-tasks{display:flex;flex-direction:column;gap:.5rem}
+.task-card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:.75rem}
+.task-card .title{font-size:.9rem;margin-bottom:.35rem}
+.task-card .meta{font-size:.75rem;color:var(--dim);display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}
+.tag{padding:.15rem .5rem;border-radius:3px;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.tag-pending{background:rgba(255,107,53,.15);color:var(--orange)}
+.tag-claimed{background:rgba(255,171,0,.15);color:var(--yellow)}
+.tag-done{background:rgba(0,230,118,.15);color:var(--green)}
+.roster{display:flex;flex-wrap:wrap;gap:.4rem;padding:.5rem 0}
+.agent-pill{background:var(--card);border:1px solid var(--border);padding:.2rem .6rem;border-radius:12px;font-size:.7rem;color:var(--dim)}
+.agent-pill .mono{color:var(--cyan)}
+.feed{display:flex;flex-direction:column;gap:.4rem;flex:1}
+.event{padding:.5rem .75rem;border-radius:6px;font-size:.82rem;border-left:3px solid var(--dim);background:rgba(18,18,26,.6)}
+.event.posted{border-color:var(--cyan)}
+.event.claimed{border-color:var(--orange)}
+.event.completed{border-color:var(--green)}
+.event .time{color:var(--dim);font-size:.7rem;margin-right:.5rem}
+.event .agent{color:var(--cyan);font-family:'SF Mono',Menlo,monospace;font-size:.75rem}
+.result-text{margin-top:.35rem;padding:.4rem .6rem;background:rgba(0,230,118,.08);border-radius:4px;font-size:.8rem;color:var(--green)}
+.empty{color:var(--dim);font-size:.85rem;text-align:center;padding:2rem 0}
+@media(max-width:768px){main{grid-template-columns:1fr;grid-template-rows:auto 1fr}.panel-left{border-right:none;border-bottom:1px solid var(--border);max-height:45vh}}
+</style>
+</head>
+<body>
+<header>
+  <h1>x0x swarm <span>agent task delegation</span></h1>
+  <div class="status"><div class="dot" id="dot"></div><span id="statusText">Connecting…</span></div>
+</header>
+<div class="session-bar">
+  <label>Session</label><code id="sessionId" title="Click to copy">—</code>
+  <label>Join:</label><input id="joinInput" placeholder="paste session id"><button id="joinBtn">Join</button>
+  <span style="margin-left:auto;color:var(--dim)" id="agentLabel">—</span>
+</div>
+<main>
+  <div class="panel panel-left">
+    <div>
+      <h2>Post a Task</h2>
+      <textarea id="taskDesc" placeholder="Describe the task for the swarm…"></textarea>
+      <div class="row" style="margin-top:.5rem">
+        <input id="taskCap" placeholder="Capability tag (optional)">
+        <button class="btn btn-cyan" id="submitBtn" disabled>Submit</button>
+      </div>
+    </div>
+    <div>
+      <h2>Your Tasks</h2>
+      <div class="my-tasks" id="myTasks"><div class="empty">No tasks yet</div></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div>
+      <h2>Agents Online <span id="agentCount" style="color:var(--cyan)"></span></h2>
+      <div class="roster" id="roster"><span class="empty" style="padding:.5rem 0">Discovering…</span></div>
+    </div>
+    <h2>Live Feed</h2>
+    <div class="feed" id="feed"><div class="empty">Waiting for activity…</div></div>
+  </div>
+</main>
+<script>
+const API_URL = "http://localhost:12700";
+const WS_URL = "ws://localhost:12700/ws";
+
+let ws = null, connected = false, myAgentId = null, sessionId = null, taskListId = null;
+let myTasks = [], feedEvents = [], agents = new Map(), taskMap = new Map();
+
+function genId(n) { n = n || 8; return [...crypto.getRandomValues(new Uint8Array(n))].map(b => b.toString(16).padStart(2, "0")).join(""); }
+function shortId(id) { return id ? id.slice(0, 8) : "???"; }
+function ago(ts) { const s = Math.floor((Date.now() - ts) / 1000); if (s < 5) return "just now"; if (s < 60) return s + "s ago"; if (s < 3600) return Math.floor(s / 60) + "m ago"; return Math.floor(s / 3600) + "h ago"; }
+function b64e(obj) { return btoa(JSON.stringify(obj)); }
+function b64d(s) { try { return JSON.parse(atob(s)); } catch { return null; } }
+function esc(s) { if (!s) return ""; const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+function initSession() {
+  const hash = location.hash.slice(1);
+  sessionId = (hash && /^[0-9a-f]{8,16}$/i.test(hash)) ? hash : genId(4);
+  location.hash = sessionId;
+  document.getElementById("sessionId").textContent = sessionId;
+  document.getElementById("sessionId").onclick = () => {
+    navigator.clipboard.writeText(sessionId);
+    document.getElementById("sessionId").textContent = "copied!";
+    setTimeout(() => document.getElementById("sessionId").textContent = sessionId, 1200);
+  };
+}
+
+function setStatus(ok, msg) {
+  document.getElementById("dot").className = ok ? "dot ok" : "dot";
+  document.getElementById("statusText").textContent = msg;
+  connected = ok;
+  document.getElementById("submitBtn").disabled = !ok;
+}
+
+async function api(method, path, body) {
+  const opts = { method, headers: { "Content-Type": "application/json" } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(API_URL + path, opts);
+  if (!r.ok) throw new Error(r.status + " " + r.statusText);
+  const text = await r.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function init() {
+  initSession();
+  try {
+    const info = await api("GET", "/agent");
+    myAgentId = info.agent_id || "unknown";
+    document.getElementById("agentLabel").innerHTML = 'You: <code class="mono">' + shortId(myAgentId) + "</code>";
+    setStatus(true, "Connected to x0xd");
+    await ensureTaskList();
+    connectWs();
+    pollLoop();
+    discoverAgents();
+  } catch (e) {
+    setStatus(false, "x0xd not reachable");
+    setTimeout(init, 5000);
+  }
+}
+
+async function ensureTaskList() {
+  try {
+    const res = await api("GET", "/task-lists");
+    const lists = res.task_lists || [];
+    const existing = lists.find(l => l.name === "Swarm:" + sessionId);
+    if (existing) { taskListId = existing.id; return; }
+  } catch (e) { /* no lists yet */ }
+  try {
+    const created = await api("POST", "/task-lists", { name: "Swarm:" + sessionId, topic: "x0x-swarm/" + sessionId });
+    taskListId = created.id;
+  } catch (e) { console.warn("Could not create task list", e); }
+}
+
+function connectWs() {
+  if (ws) try { ws.close(); } catch (e) { /* ignore */ }
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: "subscribe", topics: ["x0x-swarm/tasks", "x0x-swarm/results"] }));
+    setStatus(true, "Connected");
+  };
+  ws.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "message") {
+      const data = b64d(msg.payload);
+      if (!data) return;
+      if (msg.topic === "x0x-swarm/tasks") handleTaskEvent(data, msg.origin);
+      if (msg.topic === "x0x-swarm/results") handleResultEvent(data, msg.origin);
+    }
+  };
+  ws.onclose = () => { setStatus(false, "Disconnected"); setTimeout(connectWs, 3000); };
+  ws.onerror = () => { if (ws) ws.close(); };
+}
+
+function wsPub(topic, obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "publish", topic, payload: b64e(obj) })); }
+
+function addFeedEvent(type, html, ts) {
+  feedEvents.unshift({ type, html, ts: ts || Date.now() });
+  if (feedEvents.length > 100) feedEvents.pop();
+  renderFeed();
+}
+
+function handleTaskEvent(data, origin) {
+  const oid = shortId(data.requester || data.claimer || origin);
+  if (data.event === "posted" || data.description) {
+    taskMap.set(data.task_id, { ...data, state: "pending", ts: data.timestamp || Date.now() });
+    const cap = data.capability ? ' <span class="tag tag-pending">' + esc(data.capability) + "</span>" : "";
+    addFeedEvent("posted", '<span class="agent">' + oid + "</span> posted" + cap + '<div style="margin-top:.25rem;color:var(--text)">' + esc(data.description) + "</div>", data.timestamp);
+  } else if (data.event === "claimed") {
+    const t = taskMap.get(data.task_id); if (t) t.state = "claimed";
+    addFeedEvent("claimed", '<span class="agent">' + oid + "</span> claimed: <em>" + esc(t ? t.description : data.task_id) + "</em>");
+  }
+}
+
+function handleResultEvent(data, origin) {
+  const oid = shortId(data.completer || origin);
+  const t = taskMap.get(data.task_id); if (t) { t.state = "done"; t.result = data.result; }
+  addFeedEvent("completed", '<span class="agent">' + oid + "</span> completed: <em>" + esc(t ? t.description : data.task_id) + "</em>" + (data.result ? '<div class="result-text">' + esc(data.result) + "</div>" : ""));
+  renderMyTasks();
+}
+
+function renderFeed() {
+  const el = document.getElementById("feed");
+  if (!feedEvents.length) { el.innerHTML = '<div class="empty">Waiting for activity…</div>'; return; }
+  el.innerHTML = feedEvents.map(e => '<div class="event ' + e.type + '"><span class="time">' + ago(e.ts) + "</span>" + e.html + "</div>").join("");
+}
+
+function renderMyTasks() {
+  const el = document.getElementById("myTasks");
+  if (!myTasks.length) { el.innerHTML = '<div class="empty">No tasks yet</div>'; return; }
+  el.innerHTML = myTasks.map(t => {
+    const cls = t.state === "done" ? "tag-done" : t.state === "claimed" ? "tag-claimed" : "tag-pending";
+    const label = t.state === "done" ? "Done" : t.state === "claimed" ? "Claimed" : "Pending";
+    const res = t.result ? '<div class="result-text">' + esc(t.result) + "</div>" : "";
+    return '<div class="task-card"><div class="title">' + esc(t.description) + '</div><div class="meta"><span class="tag ' + cls + '">' + label + "</span>" + (t.capability ? "<span>" + esc(t.capability) + "</span>" : "") + "<span>" + ago(t.ts) + "</span></div>" + res + "</div>";
+  }).join("");
+}
+
+async function submitTask() {
+  const desc = document.getElementById("taskDesc").value.trim();
+  if (!desc) return;
+  const cap = document.getElementById("taskCap").value.trim();
+  const taskId = genId(8);
+  const task = { task_id: taskId, description: desc, capability: cap || null, requester: myAgentId, timestamp: Date.now() };
+  if (taskListId) { try { await api("POST", "/task-lists/" + taskListId + "/tasks", { title: desc }); } catch (e) { /* ok */ } }
+  wsPub("x0x-swarm/tasks", { ...task, event: "posted" });
+  myTasks.unshift({ ...task, state: "pending", ts: Date.now() });
+  taskMap.set(taskId, { ...task, state: "pending", ts: Date.now() });
+  addFeedEvent("posted", '<span class="agent">' + shortId(myAgentId) + "</span> posted" + (cap ? ' <span class="tag tag-pending">' + esc(cap) + "</span>" : "") + '<div style="margin-top:.25rem;color:var(--text)">' + esc(desc) + "</div>");
+  renderMyTasks();
+  document.getElementById("taskDesc").value = ""; document.getElementById("taskCap").value = "";
+}
+
+async function discoverAgents() {
+  try {
+    const d = await api("GET", "/agents/discovered");
+    agents.clear();
+    (d.agents || []).forEach(a => { const id = a.agent_id; if (id) agents.set(id, a); });
+    renderRoster();
+  } catch (e) { /* ok */ }
+  setTimeout(discoverAgents, 8000);
+}
+
+function renderRoster() {
+  const el = document.getElementById("roster");
+  document.getElementById("agentCount").textContent = agents.size ? "(" + agents.size + ")" : "";
+  if (!agents.size) { el.innerHTML = '<span class="empty" style="padding:.5rem 0">Discovering…</span>'; return; }
+  el.innerHTML = [...agents.keys()].map(id => '<span class="agent-pill"><span class="mono">' + shortId(id) + "</span></span>").join("");
+}
+
+async function pollLoop() {
+  if (taskListId) {
+    try {
+      const res = await api("GET", "/task-lists/" + taskListId + "/tasks");
+      const tasks = res.tasks || [];
+      tasks.forEach(t => {
+        const mt = myTasks.find(m => m.description === t.title);
+        if (mt) {
+          const newState = t.state === "Done" ? "done" : t.state === "Claimed" ? "claimed" : "pending";
+          if (mt.state !== newState) { mt.state = newState; renderMyTasks(); }
+        }
+      });
+    } catch (e) { /* ok */ }
+  }
+  setTimeout(pollLoop, 3000);
+}
+
+document.getElementById("submitBtn").onclick = submitTask;
+document.getElementById("taskDesc").onkeydown = e => { if (e.key === "Enter" && e.metaKey) submitTask(); };
+document.getElementById("joinBtn").onclick = () => {
+  const v = document.getElementById("joinInput").value.trim();
+  if (v && /^[0-9a-f]{4,16}$/i.test(v)) {
+    sessionId = v; location.hash = v; document.getElementById("sessionId").textContent = v;
+    taskListId = null; myTasks = []; feedEvents = []; taskMap.clear();
+    ensureTaskList(); renderMyTasks(); renderFeed(); connectWs();
+  }
+};
+
+setInterval(renderFeed, 15000);
+init();
+</script>
+</body>
+</html>

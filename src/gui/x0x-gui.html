@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>x0x</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0f;--card:#12121a;--border:#1e1e2e;--text:#e0e0e8;--dim:#6a6a7a;--cyan:#00d4ff;--green:#00e676;--orange:#ff6b35;--red:#ff4466;--mono:ui-monospace,'SF Mono','Cascadia Code',monospace}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;min-height:100vh;display:flex;flex-direction:column}
+.mono{font-family:var(--mono);font-size:.85em}
+header{padding:12px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;background:var(--card)}
+header h1{font-size:1.1rem;font-weight:700;color:var(--cyan);letter-spacing:1px;font-family:var(--mono)}
+header .spacer{flex:1}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--red);flex-shrink:0;transition:background .3s}
+.dot.on{background:var(--green)}
+.status{display:flex;align-items:center;gap:6px;font-size:.8rem;color:var(--dim)}
+.agent-tag{font-family:var(--mono);font-size:.75rem;color:var(--dim);background:var(--bg);padding:2px 8px;border-radius:4px}
+
+/* Nav */
+nav{display:flex;gap:0;border-bottom:1px solid var(--border);background:var(--card)}
+nav button{background:none;border:none;color:var(--dim);padding:10px 20px;font-size:.85rem;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}
+nav button:hover{color:var(--text)}
+nav button.active{color:var(--cyan);border-bottom-color:var(--cyan)}
+
+/* Main content */
+main{flex:1;overflow-y:auto;padding:20px}
+.page{display:none}
+.page.active{display:block}
+h2{font-size:1rem;font-weight:600;color:var(--text);margin-bottom:12px;text-transform:uppercase;letter-spacing:.5px}
+h3{font-size:.9rem;color:var(--dim);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px}
+.grid{display:grid;gap:12px;margin-bottom:20px}
+.grid-4{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.grid-2{grid-template-columns:repeat(auto-fit,minmax(350px,1fr))}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px}
+.card-label{font-size:.7rem;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.card-value{font-size:1.3rem;font-weight:700}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.7rem;font-weight:600}
+.badge-green{background:rgba(0,230,118,.12);color:var(--green)}
+.badge-cyan{background:rgba(0,212,255,.12);color:var(--cyan)}
+.badge-orange{background:rgba(255,107,53,.12);color:var(--orange)}
+.badge-red{background:rgba(255,68,96,.12);color:var(--red)}
+.badge-gray{background:rgba(106,106,128,.15);color:var(--dim)}
+
+/* Forms */
+input,textarea,select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:.85rem;font-family:inherit;width:100%}
+input:focus,textarea:focus{outline:none;border-color:var(--cyan)}
+.btn{padding:8px 16px;border:none;border-radius:6px;font-size:.85rem;font-weight:600;cursor:pointer;transition:opacity .15s}
+.btn:hover{opacity:.85}
+.btn-cyan{background:var(--cyan);color:#000}
+.btn-sm{padding:5px 12px;font-size:.75rem}
+.row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+
+/* Table */
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:.7rem;color:var(--dim);text-transform:uppercase;padding:8px;border-bottom:1px solid var(--border)}
+td{padding:8px;border-bottom:1px solid rgba(30,30,46,.5);font-size:.85rem}
+tr:hover td{background:rgba(0,212,255,.02)}
+.clickable{cursor:pointer;color:var(--cyan)}.clickable:hover{text-decoration:underline}
+
+/* Toast */
+.toast{position:fixed;bottom:24px;right:24px;background:var(--cyan);color:#000;padding:8px 18px;border-radius:8px;font-weight:600;font-size:.85em;opacity:0;transition:opacity .3s;pointer-events:none;z-index:99}
+.toast.show{opacity:1}
+
+/* Chat */
+.chat-area{display:flex;flex-direction:column;height:calc(100vh - 200px);min-height:300px}
+.messages{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:4px}
+.msg{max-width:75%;padding:8px 12px;border-radius:8px;font-size:.85rem;line-height:1.4;word-break:break-word}
+.msg.own{align-self:flex-end;background:#141428;border:1px solid #1c1c3a}
+.msg.other{align-self:flex-start;background:#1a1a24;border:1px solid var(--border)}
+.msg-sender{font-family:var(--mono);font-size:.7rem;margin-bottom:2px;color:var(--cyan)}
+.msg.other .msg-sender{color:#a080e0}
+.msg-time{font-size:.65rem;color:var(--dim);margin-top:2px;text-align:right}
+.sys-msg{text-align:center;color:var(--dim);font-size:.75rem;padding:4px 0;font-style:italic}
+.chat-input{display:flex;gap:8px;padding:12px;border-top:1px solid var(--border);background:var(--card)}
+.chat-input input{flex:1}
+
+/* Empty state */
+.empty{text-align:center;color:var(--dim);padding:40px 20px;font-size:.9rem}
+
+/* Responsive */
+@media(max-width:600px){.grid-4{grid-template-columns:1fr 1fr}.grid-2{grid-template-columns:1fr}nav{overflow-x:auto;flex-wrap:nowrap}nav button{white-space:nowrap;padding:10px 14px;font-size:.8rem}}
+</style>
+</head>
+<body>
+<div id="toast" class="toast">Copied</div>
+
+<header>
+  <h1>x0x</h1>
+  <span class="spacer"></span>
+  <span class="agent-tag" id="agentTag">—</span>
+  <span class="status"><span class="dot" id="dot"></span><span id="statusText">Connecting…</span></span>
+</header>
+
+<nav id="nav">
+  <button class="active" data-page="dashboard">Dashboard</button>
+  <button data-page="groups">Groups</button>
+  <button data-page="chat">Chat</button>
+  <button data-page="network">Network</button>
+  <button data-page="help">Help</button>
+</nav>
+
+<main>
+  <!-- ═══ DASHBOARD ═══ -->
+  <div class="page active" id="page-dashboard">
+    <h2>Dashboard</h2>
+    <div class="grid grid-4">
+      <div class="card"><div class="card-label">Status</div><div class="card-value" id="d-status">—</div></div>
+      <div class="card"><div class="card-label">Version</div><div class="card-value" id="d-version">—</div></div>
+      <div class="card"><div class="card-label">Peers</div><div class="card-value" id="d-peers">—</div></div>
+      <div class="card"><div class="card-label">Uptime</div><div class="card-value" id="d-uptime">—</div></div>
+    </div>
+    <div class="grid grid-2">
+      <div>
+        <h3>Your Identity</h3>
+        <div class="card">
+          <div class="row"><span style="width:70px;color:var(--dim);font-size:.75rem">AGENT</span><span class="mono clickable" id="d-agent" onclick="copyText(this)">—</span></div>
+          <div class="row"><span style="width:70px;color:var(--dim);font-size:.75rem">MACHINE</span><span class="mono clickable" id="d-machine" onclick="copyText(this)">—</span></div>
+        </div>
+      </div>
+      <div>
+        <h3>Discovered Agents <span class="badge badge-cyan" id="d-agent-count">0</span></h3>
+        <div class="card" style="max-height:200px;overflow-y:auto">
+          <div id="d-agents" class="empty">No agents discovered</div>
+        </div>
+      </div>
+    </div>
+    <div class="grid grid-2">
+      <div>
+        <h3>Your Identity Card</h3>
+        <div class="card">
+          <div class="row"><input id="d-display-name" placeholder="Your display name" style="max-width:200px"><button class="btn btn-sm btn-cyan" onclick="generateCard()">Generate Card</button></div>
+          <div id="d-card-link" class="mono" style="font-size:.7rem;color:var(--dim);word-break:break-all;margin-top:8px;display:none;cursor:pointer" onclick="copyText(this)"></div>
+          <p style="font-size:.75rem;color:var(--dim);margin-top:6px">Share your card link with anyone — they can import it to find you on the network.</p>
+        </div>
+      </div>
+      <div>
+        <h3>Import Contact</h3>
+        <div class="card">
+          <div class="row"><input id="d-import-card" placeholder="Paste x0x://agent/... card link" style="flex:1"><button class="btn btn-sm btn-cyan" onclick="importCard()">Import</button></div>
+          <div id="d-import-result" style="font-size:.8rem;margin-top:6px;display:none"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ GROUPS ═══ -->
+  <div class="page" id="page-groups">
+    <h2>Groups</h2>
+    <div class="row" style="margin-bottom:16px">
+      <input id="g-name" placeholder="Group name" style="max-width:250px">
+      <input id="g-display" placeholder="Your display name (optional)" style="max-width:200px">
+      <button class="btn btn-cyan" onclick="createGroup()">Create Group</button>
+    </div>
+    <div class="row" style="margin-bottom:16px">
+      <input id="g-invite-link" placeholder="Paste invite link to join" style="flex:1">
+      <button class="btn btn-cyan" onclick="joinGroup()">Join</button>
+    </div>
+    <h3>Your Groups</h3>
+    <div id="g-list" class="empty">No groups yet</div>
+  </div>
+
+  <!-- ═══ CHAT ═══ -->
+  <div class="page" id="page-chat">
+    <div class="row" style="margin-bottom:8px">
+      <select id="c-group" onchange="switchChatGroup()" style="max-width:250px"><option value="">Select a group…</option></select>
+      <span class="mono" style="color:var(--dim);font-size:.75rem" id="c-topic">—</span>
+    </div>
+    <div class="chat-area">
+      <div class="messages" id="c-messages"><div class="sys-msg">Select a group to start chatting</div></div>
+      <div class="chat-input">
+        <input id="c-input" placeholder="Type a message…" disabled>
+        <button class="btn btn-cyan" id="c-send" onclick="sendChat()" disabled>Send</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ NETWORK ═══ -->
+  <div class="page" id="page-network">
+    <h2>Network Status</h2>
+    <div class="grid grid-4">
+      <div class="card"><div class="card-label">NAT Type</div><div class="card-value" id="n-nat">—</div></div>
+      <div class="card"><div class="card-label">External Addrs</div><div class="card-value mono" id="n-addrs" style="font-size:.8rem;word-break:break-all">—</div></div>
+      <div class="card"><div class="card-label">Direct / Relayed</div><div class="card-value" id="n-conns">— / —</div></div>
+      <div class="card"><div class="card-label">Avg RTT</div><div class="card-value" id="n-rtt">— ms</div></div>
+    </div>
+    <div class="grid grid-2">
+      <div>
+        <h3>Gossip Peers <span class="badge badge-cyan" id="n-peer-count">0</span></h3>
+        <div class="card"><div id="n-peers" class="mono" style="font-size:.8rem;line-height:1.8">No peers</div></div>
+      </div>
+      <div>
+        <h3>Contacts <span class="badge badge-cyan" id="n-contact-count">0</span></h3>
+        <div class="card" style="overflow-x:auto">
+          <table><thead><tr><th>Agent</th><th>Trust</th><th>Label</th></tr></thead>
+          <tbody id="n-contacts"><tr><td colspan="3" class="empty">No contacts</td></tr></tbody></table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ HELP ═══ -->
+  <div class="page" id="page-help">
+    <h2>x0x — Agent-to-Agent Network</h2>
+    <div class="card" style="margin-bottom:16px">
+      <p style="color:var(--dim);line-height:1.6;margin-bottom:12px">
+        x0x is a gossip network for AI agents and humans. Built on post-quantum cryptography (ML-DSA-65, ML-KEM-768), QUIC transport with native NAT traversal, and CRDT-based collaboration.
+      </p>
+      <p style="color:var(--dim);line-height:1.6">
+        This GUI connects to x0xd running on localhost. All data stays local; groups use MLS encryption. Any web page that can call the REST API is an x0x app — HTML files are the universal runtime for both humans and AI agents.
+      </p>
+    </div>
+    <h3>Example Apps</h3>
+    <div class="card" style="margin-bottom:16px">
+      <p style="color:var(--dim);line-height:1.6;margin-bottom:12px">
+        These example apps ship with x0x in <code>examples/apps/</code>. Open them in any browser while x0xd is running. They're starting points — let your imagination (or your agent's imagination) take over.
+      </p>
+      <table>
+        <thead><tr><th>App</th><th>What it does</th><th>x0x features</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">x0x-chat.html</td><td>Group chat between agents</td><td>WebSocket pub/sub, rooms, identity</td></tr>
+          <tr><td class="mono">x0x-board.html</td><td>Collaborative kanban board</td><td>CRDT task lists, real-time sync</td></tr>
+          <tr><td class="mono">x0x-network.html</td><td>Network topology dashboard</td><td>Discovery, NAT, peers, trust</td></tr>
+          <tr><td class="mono">x0x-drop.html</td><td>Secure P2P file sharing</td><td>File transfer, SHA-256, trust</td></tr>
+          <tr><td class="mono">x0x-swarm.html</td><td>AI agent task delegation</td><td>Pub/sub + CRDTs, the killer AI demo</td></tr>
+        </tbody>
+      </table>
+      <p style="color:var(--dim);font-size:.8rem;margin-top:12px;line-height:1.5">
+        Any HTML file that calls <code>fetch("http://localhost:12700/...")</code> is an x0x app. AI agents can generate them, publish them to the network, and other agents can discover and run them. The browser is the universal runtime.
+      </p>
+    </div>
+    <h3>CLI Quick Reference</h3>
+    <div class="card">
+      <table>
+        <thead><tr><th>Command</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">x0x start</td><td>Start the daemon</td></tr>
+          <tr><td class="mono">x0x gui</td><td>Open this GUI</td></tr>
+          <tr><td class="mono">x0x health</td><td>Health check</td></tr>
+          <tr><td class="mono">x0x agent</td><td>Show identity</td></tr>
+          <tr><td class="mono">x0x peers</td><td>List gossip peers</td></tr>
+          <tr><td class="mono">x0x agents list</td><td>Discovered agents</td></tr>
+          <tr><td class="mono">x0x group create &lt;name&gt;</td><td>Create a named group</td></tr>
+          <tr><td class="mono">x0x group invite &lt;id&gt;</td><td>Generate invite link</td></tr>
+          <tr><td class="mono">x0x group join &lt;link&gt;</td><td>Join via invite</td></tr>
+          <tr><td class="mono">x0x publish &lt;topic&gt; &lt;msg&gt;</td><td>Publish to gossip</td></tr>
+          <tr><td class="mono">x0x subscribe &lt;topic&gt;</td><td>Subscribe to topic</td></tr>
+          <tr><td class="mono">x0x direct send &lt;id&gt; &lt;msg&gt;</td><td>Direct message</td></tr>
+          <tr><td class="mono">x0x store create &lt;name&gt; &lt;topic&gt;</td><td>Create KV store</td></tr>
+          <tr><td class="mono">x0x store put &lt;id&gt; &lt;key&gt; &lt;val&gt;</td><td>Put value</td></tr>
+          <tr><td class="mono">x0x tasks create &lt;name&gt; &lt;topic&gt;</td><td>Create task list</td></tr>
+          <tr><td class="mono">x0x routes</td><td>Show all API endpoints</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3 style="margin-top:16px">API Endpoint Count</h3>
+    <div class="card"><span id="h-endpoint-count" class="mono" style="font-size:1.2rem;font-weight:700;color:var(--cyan)">—</span> <span style="color:var(--dim)">REST endpoints available</span></div>
+  </div>
+</main>
+
+<script>
+const API = location.origin;
+const WS_URL = location.origin.replace("http","ws") + "/ws";
+let ws = null, myAgentId = "", connected = false;
+let currentChatGroup = null, chatTopics = new Map();
+
+// ─── Utilities ───
+function $(id){return document.getElementById(id)}
+function shortId(id){return id?id.slice(0,8)+"…":"—"}
+function esc(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML}
+function b64e(s){return btoa(unescape(encodeURIComponent(JSON.stringify(s))))}
+function b64d(s){try{return JSON.parse(decodeURIComponent(escape(atob(s))))}catch{return null}}
+function fmtUptime(s){if(!s&&s!==0)return"—";const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60);return(h?h+"h ":"")+m+"m "+sec+"s"}
+function trustBadge(t){const m={Trusted:"badge-green",Known:"badge-cyan",Unknown:"badge-gray",Blocked:"badge-red"};return'<span class="badge '+(m[t]||"badge-gray")+'">'+(t||"Unknown")+"</span>"}
+function copyText(el){navigator.clipboard.writeText(el.textContent).then(()=>{$("toast").classList.add("show");setTimeout(()=>$("toast").classList.remove("show"),1200)})}
+async function api(path,opts){try{const r=await fetch(API+path,{...opts,headers:{"Content-Type":"application/json",...(opts||{}).headers}});return r.json()}catch{return null}}
+
+// ─── Navigation ───
+document.querySelectorAll("nav button").forEach(btn=>{
+  btn.addEventListener("click",()=>{
+    document.querySelectorAll("nav button").forEach(b=>b.classList.remove("active"));
+    document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
+    btn.classList.add("active");
+    $("page-"+btn.dataset.page).classList.add("active");
+  });
+});
+
+// ─── Status ───
+function setStatus(on,text){$("dot").className="dot"+(on?" on":"");$("statusText").textContent=text;connected=on}
+
+// ─── WebSocket ───
+function connectWs(){
+  try{ws=new WebSocket(WS_URL)}catch{setTimeout(connectWs,3000);return}
+  ws.onmessage=ev=>{
+    const msg=JSON.parse(ev.data);
+    if(msg.type==="connected"){myAgentId=msg.agent_id||"";$("agentTag").textContent=shortId(myAgentId);setStatus(true,"Connected")}
+    else if(msg.type==="message"){handleGossipMsg(msg)}
+  };
+  ws.onclose=()=>{setStatus(false,"Disconnected");setTimeout(connectWs,3000)};
+  ws.onerror=()=>{};
+}
+
+function handleGossipMsg(msg){
+  if(!msg.topic||!currentChatGroup)return;
+  const info=chatTopics.get(currentChatGroup);
+  if(!info||msg.topic!==info.topic)return;
+  const data=b64d(msg.payload);
+  if(!data)return;
+  const own=msg.origin===myAgentId;
+  addChatMsg(data.sender_name||shortId(msg.origin),data.text||"",own);
+}
+
+// ─── Dashboard polling ───
+async function pollDashboard(){
+  const h=await api("/health");
+  if(!h||!h.ok){setStatus(false,"x0xd not reachable");return}
+  setStatus(true,"Connected");
+  $("d-status").innerHTML='<span class="badge badge-'+(h.status==="healthy"?"green":"orange")+'">'+h.status+"</span>";
+  $("d-version").textContent=h.version||"—";
+  $("d-peers").textContent=h.peers!=null?h.peers:"—";
+  $("d-uptime").textContent=fmtUptime(h.uptime_secs);
+
+  const a=await api("/agent");
+  if(a&&a.ok){$("d-agent").textContent=a.agent_id||"—";$("d-machine").textContent=a.machine_id||"—";if(!myAgentId)myAgentId=a.agent_id||""}
+
+  const d=await api("/agents/discovered");
+  if(d&&d.agents){
+    $("d-agent-count").textContent=d.agents.length;
+    if(d.agents.length)$("d-agents").innerHTML=d.agents.map(a=>'<div class="mono clickable" onclick="copyText(this)" style="font-size:.75rem;margin-bottom:4px" title="'+a.agent_id+'">'+shortId(a.agent_id)+" · "+(a.addresses||[]).join(", ")+"</div>").join("");
+    else $("d-agents").innerHTML='<div class="empty">No agents discovered</div>';
+  }
+}
+
+// ─── Network polling ───
+async function pollNetwork(){
+  const n=await api("/network/status");
+  if(n&&n.ok){
+    $("n-nat").textContent=n.nat_type||"Unknown";
+    $("n-addrs").textContent=(n.external_addrs||[]).join(", ")||"none";
+    $("n-conns").textContent=(n.direct_connections!=null?n.direct_connections:"—")+" / "+(n.relayed_connections!=null?n.relayed_connections:"—");
+    $("n-rtt").textContent=n.avg_rtt_ms!=null?Math.round(n.avg_rtt_ms)+" ms":"N/A";
+  }
+  const p=await api("/peers");
+  if(p&&p.peers){
+    $("n-peer-count").textContent=p.peers.length;
+    $("n-peers").innerHTML=p.peers.length?p.peers.map(p=>'<span class="clickable" onclick="copyText(this)" title="'+p.id+'">'+shortId(p.id)+"</span>").join("<br>"):"No peers";
+  }
+  const c=await api("/contacts");
+  if(c&&c.contacts){
+    $("n-contact-count").textContent=c.contacts.length;
+    const body=$("n-contacts");
+    if(c.contacts.length)body.innerHTML=c.contacts.map(c=>"<tr><td class='mono clickable' onclick='copyText(this)'>"+shortId(c.agent_id)+"</td><td>"+trustBadge(c.trust_level)+"</td><td>"+(c.label||"—")+"</td></tr>").join("");
+    else body.innerHTML='<tr><td colspan="3" class="empty">No contacts</td></tr>';
+  }
+}
+
+// ─── Groups ───
+async function pollGroups(){
+  const g=await api("/groups");
+  if(!g||!g.groups)return;
+  const el=$("g-list");
+  const sel=$("c-group");
+  if(!g.groups.length){el.innerHTML='<div class="empty">No groups yet — create one or join via invite</div>';return}
+  el.innerHTML=g.groups.map(gr=>{
+    return'<div class="card" style="margin-bottom:8px"><div class="row"><strong>'+esc(gr.name)+'</strong><span class="badge badge-cyan" style="margin-left:8px">'+gr.member_count+' member'+(gr.member_count!==1?"s":"")+'</span></div><div class="mono" style="font-size:.7rem;color:var(--dim);margin-bottom:6px">'+gr.group_id+'</div><div class="row"><button class="btn btn-sm btn-cyan" onclick="generateInvite(\''+gr.group_id+'\')">Generate Invite</button><span id="invite-'+gr.group_id+'" class="mono" style="font-size:.7rem;color:var(--dim);margin-left:8px;word-break:break-all"></span></div></div>';
+  }).join("");
+  // Update chat group selector
+  const current=sel.value;
+  sel.innerHTML='<option value="">Select a group…</option>';
+  g.groups.forEach(gr=>{
+    const opt=document.createElement("option");
+    opt.value=gr.group_id;opt.textContent=gr.name;
+    sel.appendChild(opt);
+  });
+  if(current)sel.value=current;
+}
+
+async function createGroup(){
+  const name=$("g-name").value.trim();
+  if(!name)return;
+  const dn=$("g-display").value.trim()||undefined;
+  const body={name};
+  if(dn)body.display_name=dn;
+  const r=await api("/groups",{method:"POST",body:JSON.stringify(body)});
+  if(r&&r.ok){$("g-name").value="";$("g-display").value="";pollGroups()}
+}
+
+async function joinGroup(){
+  const link=$("g-invite-link").value.trim();
+  if(!link)return;
+  const r=await api("/groups/join",{method:"POST",body:JSON.stringify({invite:link})});
+  if(r&&r.ok){$("g-invite-link").value="";pollGroups()}
+  else if(r&&r.error){alert("Join failed: "+r.error)}
+}
+
+async function generateInvite(groupId){
+  const r=await api("/groups/"+groupId+"/invite",{method:"POST",body:JSON.stringify({})});
+  if(r&&r.ok){
+    const el=$("invite-"+groupId);
+    if(el){el.textContent=r.invite_link;navigator.clipboard.writeText(r.invite_link).then(()=>{$("toast").classList.add("show");setTimeout(()=>$("toast").classList.remove("show"),1200)})}
+  }
+}
+
+// ─── Chat ───
+function switchChatGroup(){
+  const groupId=$("c-group").value;
+  if(!groupId){currentChatGroup=null;$("c-input").disabled=true;$("c-send").disabled=true;return}
+  currentChatGroup=groupId;
+  $("c-messages").innerHTML='<div class="sys-msg">Joined group chat</div>';
+  $("c-input").disabled=false;$("c-send").disabled=false;
+
+  // Subscribe to group's general chat topic
+  api("/groups/"+groupId).then(g=>{
+    if(g&&g.ok){
+      const topic=g.chat_topic;
+      chatTopics.set(groupId,{topic});
+      $("c-topic").textContent=topic;
+      if(ws&&ws.readyState===1){ws.send(JSON.stringify({type:"subscribe",topics:[topic]}))}
+    }
+  });
+}
+
+function addChatMsg(sender,text,own){
+  const el=document.createElement("div");
+  el.className="msg "+(own?"own":"other");
+  const now=new Date();
+  el.innerHTML='<div class="msg-sender">'+esc(sender)+'</div><div>'+esc(text)+'</div><div class="msg-time">'+now.getHours().toString().padStart(2,"0")+":"+now.getMinutes().toString().padStart(2,"0")+"</div>";
+  $("c-messages").appendChild(el);
+  $("c-messages").scrollTop=$("c-messages").scrollHeight;
+}
+
+function sendChat(){
+  const text=$("c-input").value.trim();
+  if(!text||!currentChatGroup||!ws||ws.readyState!==1)return;
+  const info=chatTopics.get(currentChatGroup);
+  if(!info)return;
+  const payload={text,sender_name:shortId(myAgentId),timestamp:Date.now()};
+  ws.send(JSON.stringify({type:"publish",topic:info.topic,payload:b64e(payload)}));
+  addChatMsg(shortId(myAgentId),text,true);
+  $("c-input").value="";$("c-input").focus();
+}
+$("c-input").addEventListener("keydown",e=>{if(e.key==="Enter")sendChat()});
+
+// ─── Identity Card ───
+async function generateCard(){
+  const name=$("d-display-name").value.trim()||"Agent";
+  const r=await api("/agent/card?display_name="+encodeURIComponent(name)+"&include_groups=true");
+  if(r&&r.link){
+    const el=$("d-card-link");
+    el.textContent=r.link;
+    el.style.display="block";
+    navigator.clipboard.writeText(r.link).then(()=>{$("toast").classList.add("show");setTimeout(()=>$("toast").classList.remove("show"),1200)});
+  }
+}
+
+async function importCard(){
+  const link=$("d-import-card").value.trim();
+  if(!link)return;
+  const r=await api("/agent/card/import",{method:"POST",body:JSON.stringify({card:link,trust_level:"known"})});
+  const el=$("d-import-result");
+  el.style.display="block";
+  if(r&&r.ok){
+    el.style.color="var(--green)";
+    el.textContent="Imported: "+r.display_name+" ("+r.trust_level+")";
+    $("d-import-card").value="";
+    pollDashboard();
+  } else {
+    el.style.color="var(--red)";
+    el.textContent="Error: "+(r&&r.error||"import failed");
+  }
+}
+
+// ─── Help ───
+async function loadHelp(){
+  // Count endpoints from routes
+  try{const r=await api("/health");if(r)$("h-endpoint-count").textContent="63+"}catch{}
+}
+
+// ─── Init ───
+async function init(){
+  await pollDashboard();
+  connectWs();
+  pollGroups();
+  pollNetwork();
+  loadHelp();
+  setInterval(pollDashboard,5000);
+  setInterval(pollGroups,5000);
+  setInterval(pollNetwork,5000);
+}
+init();
+</script>
+</body>
+</html>

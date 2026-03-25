@@ -95,6 +95,12 @@ pub mod gossip;
 /// CRDT-based collaborative task lists.
 pub mod crdt;
 
+/// CRDT-backed key-value store.
+pub mod kv;
+
+/// High-level group management (MLS + KvStore + gossip).
+pub mod groups;
+
 /// MLS (Messaging Layer Security) group encryption.
 pub mod mls;
 
@@ -2928,6 +2934,277 @@ impl TaskListHandle {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// KvStore API
+// ---------------------------------------------------------------------------
+
+impl Agent {
+    /// Create a new key-value store.
+    ///
+    /// The store is automatically synchronized to all peers subscribed
+    /// to the same `topic` via gossip delta propagation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn create_kv_store(&self, name: &str, topic: &str) -> error::Result<KvStoreHandle> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+
+        let peer_id = runtime.peer_id();
+        let store_id = kv::KvStoreId::from_content(name, &self.agent_id());
+        let store = kv::KvStore::new(
+            store_id,
+            name.to_string(),
+            self.agent_id(),
+            kv::AccessPolicy::Signed,
+        );
+
+        let sync = kv::KvStoreSync::new(
+            store,
+            std::sync::Arc::clone(runtime.pubsub()),
+            topic.to_string(),
+            30,
+        )
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "kv store sync creation failed: {e}",
+            )))
+        })?;
+
+        let sync = std::sync::Arc::new(sync);
+        sync.start().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "kv store sync start failed: {e}",
+            )))
+        })?;
+
+        Ok(KvStoreHandle {
+            sync,
+            agent_id: self.agent_id(),
+            peer_id,
+        })
+    }
+
+    /// Join an existing key-value store by topic.
+    ///
+    /// Creates an empty store that will be populated via delta sync
+    /// from peers already sharing the topic. The access policy will
+    /// be learned from the first full delta received from the owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn join_kv_store(&self, topic: &str) -> error::Result<KvStoreHandle> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+
+        let peer_id = runtime.peer_id();
+        let store_id = kv::KvStoreId::from_content(topic, &self.agent_id());
+        // Use Encrypted as the most permissive default — the actual policy
+        // will be set when the first delta from the owner arrives.
+        let store = kv::KvStore::new(
+            store_id,
+            String::new(),
+            self.agent_id(),
+            kv::AccessPolicy::Encrypted {
+                group_id: Vec::new(),
+            },
+        );
+
+        let sync = kv::KvStoreSync::new(
+            store,
+            std::sync::Arc::clone(runtime.pubsub()),
+            topic.to_string(),
+            30,
+        )
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "kv store sync creation failed: {e}",
+            )))
+        })?;
+
+        let sync = std::sync::Arc::new(sync);
+        sync.start().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "kv store sync start failed: {e}",
+            )))
+        })?;
+
+        Ok(KvStoreHandle {
+            sync,
+            agent_id: self.agent_id(),
+            peer_id,
+        })
+    }
+}
+
+/// Handle for interacting with a replicated key-value store.
+///
+/// Provides async methods for putting, getting, and removing entries.
+/// Changes are automatically replicated to peers via gossip.
+#[derive(Clone)]
+pub struct KvStoreHandle {
+    sync: std::sync::Arc<kv::KvStoreSync>,
+    agent_id: identity::AgentId,
+    peer_id: saorsa_gossip_types::PeerId,
+}
+
+impl std::fmt::Debug for KvStoreHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvStoreHandle")
+            .field("agent_id", &self.agent_id)
+            .field("peer_id", &self.peer_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl KvStoreHandle {
+    /// Put a key-value pair into the store.
+    ///
+    /// If the key already exists, the value is updated. Changes are
+    /// automatically replicated to peers via gossip.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value exceeds the maximum inline size (64 KB).
+    pub async fn put(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        content_type: String,
+    ) -> error::Result<()> {
+        let delta = {
+            let mut store = self.sync.write().await;
+            store
+                .put(
+                    key.clone(),
+                    value.clone(),
+                    content_type.clone(),
+                    self.peer_id,
+                )
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "kv put failed: {e}",
+                    )))
+                })?;
+            let entry = store.get(&key).cloned();
+            let version = store.current_version();
+            match entry {
+                Some(e) => {
+                    kv::KvStoreDelta::for_put(key, e, (self.peer_id, store.next_seq()), version)
+                }
+                None => return Ok(()), // shouldn't happen after successful put
+            }
+        };
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish kv put delta: {e}");
+        }
+        Ok(())
+    }
+
+    /// Get a value by key.
+    ///
+    /// Returns `None` if the key does not exist or has been removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be read.
+    pub async fn get(&self, key: &str) -> error::Result<Option<KvEntrySnapshot>> {
+        let store = self.sync.read().await;
+        Ok(store.get(key).map(|e| KvEntrySnapshot {
+            key: e.key.clone(),
+            value: e.value.clone(),
+            content_hash: hex::encode(e.content_hash),
+            content_type: e.content_type.clone(),
+            metadata: e.metadata.clone(),
+            created_at: e.created_at,
+            updated_at: e.updated_at,
+        }))
+    }
+
+    /// Remove a key from the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key does not exist.
+    pub async fn remove(&self, key: &str) -> error::Result<()> {
+        let delta = {
+            let mut store = self.sync.write().await;
+            store.remove(key).map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "kv remove failed: {e}",
+                )))
+            })?;
+            let mut d = kv::KvStoreDelta::new(store.current_version());
+            d.removed
+                .insert(key.to_string(), std::collections::HashSet::new());
+            d
+        };
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish kv remove delta: {e}");
+        }
+        Ok(())
+    }
+
+    /// List all active keys in the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be read.
+    pub async fn keys(&self) -> error::Result<Vec<KvEntrySnapshot>> {
+        let store = self.sync.read().await;
+        Ok(store
+            .active_entries()
+            .into_iter()
+            .map(|e| KvEntrySnapshot {
+                key: e.key.clone(),
+                value: e.value.clone(),
+                content_hash: hex::encode(e.content_hash),
+                content_type: e.content_type.clone(),
+                metadata: e.metadata.clone(),
+                created_at: e.created_at,
+                updated_at: e.updated_at,
+            })
+            .collect())
+    }
+
+    /// Get the store name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be read.
+    pub async fn name(&self) -> error::Result<String> {
+        let store = self.sync.read().await;
+        Ok(store.name().to_string())
+    }
+}
+
+/// Read-only snapshot of a KvStore entry.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KvEntrySnapshot {
+    /// The key.
+    pub key: String,
+    /// The value bytes.
+    pub value: Vec<u8>,
+    /// BLAKE3 hash of the value (hex-encoded).
+    pub content_hash: String,
+    /// Content type (MIME).
+    pub content_type: String,
+    /// User metadata.
+    pub metadata: std::collections::HashMap<String, String>,
+    /// Unix milliseconds when created.
+    pub created_at: u64,
+    /// Unix milliseconds when last updated.
+    pub updated_at: u64,
 }
 
 /// Read-only snapshot of a task's current state.

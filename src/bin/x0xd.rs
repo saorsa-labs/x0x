@@ -27,7 +27,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ use x0x::network::NetworkConfig;
 use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
 use x0x::upgrade::signature::verify_manifest_signature;
-use x0x::{Agent, TaskListHandle};
+use x0x::{Agent, KvStoreHandle, TaskListHandle};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -75,7 +75,8 @@ struct DaemonConfig {
     log_format: String,
 
     /// Bootstrap peers to connect on startup.
-    #[serde(default)]
+    /// Defaults to the hardcoded global bootstrap network if not specified.
+    #[serde(default = "default_bootstrap_peers")]
     bootstrap_peers: Vec<SocketAddr>,
 
     /// Update configuration.
@@ -114,6 +115,13 @@ struct DaemonConfig {
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
 /// Every x0x node uses the same well-known port by default.
 pub const DEFAULT_QUIC_PORT: u16 = 5483;
+
+fn default_bootstrap_peers() -> Vec<SocketAddr> {
+    x0x::network::DEFAULT_BOOTSTRAP_PEERS
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect()
+}
 
 fn default_bind_address() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], DEFAULT_QUIC_PORT))
@@ -270,6 +278,8 @@ struct AppState {
     agent: Arc<Agent>,
     subscriptions: RwLock<HashMap<String, String>>,
     task_lists: RwLock<HashMap<String, TaskListHandle>>,
+    kv_stores: RwLock<HashMap<String, KvStoreHandle>>,
+    named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
     contacts: Arc<RwLock<ContactStore>>,
     mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
     mls_groups_path: PathBuf,
@@ -856,6 +866,8 @@ async fn main() -> Result<()> {
         agent: Arc::clone(&agent),
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
+        kv_stores: RwLock::new(HashMap::new()),
+        named_groups: RwLock::new(HashMap::new()),
         contacts,
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
@@ -952,6 +964,8 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/agent", get(agent_info))
+        .route("/agent/card", get(get_agent_card))
+        .route("/agent/card/import", post(import_agent_card))
         .route("/announce", post(announce_identity))
         .route("/peers", get(peers))
         .route("/network/status", get(network_status))
@@ -982,6 +996,21 @@ async fn main() -> Result<()> {
         .route("/task-lists/:id/tasks", get(list_tasks))
         .route("/task-lists/:id/tasks", post(add_task))
         .route("/task-lists/:id/tasks/:tid", patch(update_task))
+        // Named group endpoints
+        .route("/groups", post(create_named_group))
+        .route("/groups", get(list_named_groups))
+        .route("/groups/:id", get(get_named_group))
+        .route("/groups/:id/invite", post(create_group_invite))
+        .route("/groups/join", post(join_group_via_invite))
+        .route("/groups/:id/display-name", put(set_group_display_name))
+        // KvStore endpoints
+        .route("/stores", get(list_kv_stores))
+        .route("/stores", post(create_kv_store))
+        .route("/stores/:id/join", post(join_kv_store))
+        .route("/stores/:id/keys", get(list_kv_keys))
+        .route("/stores/:id/:key", get(get_kv_value))
+        .route("/stores/:id/:key", put(put_kv_value))
+        .route("/stores/:id/:key", delete(delete_kv_value))
         // Direct messaging endpoints
         .route("/agents/connect", post(connect_agent))
         .route("/direct/send", post(direct_send))
@@ -1031,6 +1060,9 @@ async fn main() -> Result<()> {
         .route("/files/transfers/:id", get(file_transfer_status_handler))
         .route("/files/accept/:id", post(file_accept_handler))
         .route("/files/reject/:id", post(file_reject_handler))
+        // Embedded GUI
+        .route("/gui", get(serve_gui))
+        .route("/gui/", get(serve_gui))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
@@ -1947,6 +1979,158 @@ async fn announce_identity(
     }
 }
 
+/// Request body for POST /agent/card/import.
+#[derive(Debug, Deserialize)]
+struct ImportCardRequest {
+    /// Card link (`x0x://agent/...`) or raw base64.
+    card: String,
+    /// Trust level to assign (default: "known").
+    #[serde(default = "default_import_trust")]
+    trust_level: String,
+}
+
+fn default_import_trust() -> String {
+    "known".to_string()
+}
+
+/// Request body for GET /agent/card query params.
+#[derive(Debug, Deserialize)]
+struct CardQuery {
+    /// Display name to include in the card.
+    #[serde(default)]
+    display_name: Option<String>,
+    /// Whether to include group invites.
+    #[serde(default)]
+    include_groups: Option<bool>,
+}
+
+/// GET /agent/card — generate a shareable identity card.
+async fn get_agent_card(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<CardQuery>,
+) -> impl IntoResponse {
+    let agent_id = state.agent.agent_id();
+    let machine_id = hex::encode(state.agent.machine_id().as_bytes());
+    let display_name = query.display_name.unwrap_or_default();
+
+    let mut card = x0x::groups::card::AgentCard::new(display_name, &agent_id, &machine_id);
+
+    // Add user ID if available
+    card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
+
+    // Add external addresses from ant-quic NodeStatus
+    if let Some(network) = state.agent.network() {
+        if let Some(ns) = network.node_status().await {
+            card.addresses = ns.external_addrs.iter().map(|a| a.to_string()).collect();
+        }
+    }
+
+    // Optionally include group invite links
+    if query.include_groups.unwrap_or(false) {
+        let groups = state.named_groups.read().await;
+        for info in groups.values() {
+            let invite = x0x::groups::invite::SignedInvite::new(
+                info.mls_group_id.clone(),
+                info.name.clone(),
+                &agent_id,
+                x0x::groups::invite::DEFAULT_EXPIRY_SECS,
+            );
+            card.groups.push(x0x::groups::card::CardGroup {
+                name: info.name.clone(),
+                invite_link: invite.to_link(),
+            });
+        }
+    }
+
+    // Include stores
+    let stores = state.kv_stores.read().await;
+    for (topic, _) in stores.iter() {
+        card.stores.push(x0x::groups::card::CardStore {
+            name: topic.clone(),
+            topic: topic.clone(),
+        });
+    }
+
+    let link = card.to_link();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "card": card,
+        "link": link,
+    }))
+}
+
+/// POST /agent/card/import — import an agent card to contacts.
+async fn import_agent_card(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ImportCardRequest>,
+) -> impl IntoResponse {
+    // Parse card
+    let card = match x0x::groups::card::AgentCard::from_link(&req.card) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid card: {e}") })),
+            );
+        }
+    };
+
+    // Parse trust level
+    let trust = match req.trust_level.to_lowercase().as_str() {
+        "trusted" => x0x::contacts::TrustLevel::Trusted,
+        "known" => x0x::contacts::TrustLevel::Known,
+        "blocked" => x0x::contacts::TrustLevel::Blocked,
+        _ => x0x::contacts::TrustLevel::Known,
+    };
+
+    // Parse agent ID
+    let agent_id_bytes: [u8; 32] = match hex::decode(&card.agent_id) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid agent_id in card" })),
+            );
+        }
+    };
+    let agent_id = x0x::identity::AgentId(agent_id_bytes);
+
+    // Add to contacts
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let contact = x0x::contacts::Contact {
+        agent_id,
+        trust_level: trust,
+        label: Some(card.display_name.clone()),
+        added_at: now,
+        last_seen: None,
+        identity_type: x0x::contacts::IdentityType::default(),
+        machines: Vec::new(),
+    };
+
+    state.contacts.write().await.add(contact);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "agent_id": card.agent_id,
+            "display_name": card.display_name,
+            "trust_level": format!("{trust:?}"),
+            "groups": card.groups.len(),
+            "stores": card.stores.len(),
+        })),
+    )
+}
+
 /// GET /peers
 async fn peers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.agent.peers().await {
@@ -2661,6 +2845,319 @@ async fn quick_trust(
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
 
+// ---------------------------------------------------------------------------
+// Named group handlers
+// ---------------------------------------------------------------------------
+
+/// Request body for POST /groups.
+#[derive(Debug, Deserialize)]
+struct CreateGroupRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    /// Optional display name for the creator in this group.
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+/// Request body for POST /groups/join.
+#[derive(Debug, Deserialize)]
+struct JoinGroupRequest {
+    /// Invite link or raw base64 invite token.
+    invite: String,
+    /// Optional display name for the joiner.
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+/// Request body for POST /groups/:id/invite.
+#[derive(Debug, Deserialize)]
+struct CreateInviteRequest {
+    /// Seconds until expiry (default: 7 days, 0 = never).
+    #[serde(default = "default_expiry")]
+    expiry_secs: u64,
+}
+
+fn default_expiry() -> u64 {
+    x0x::groups::invite::DEFAULT_EXPIRY_SECS
+}
+
+/// Request body for PUT /groups/:id/display-name.
+#[derive(Debug, Deserialize)]
+struct SetDisplayNameRequest {
+    name: String,
+}
+
+/// POST /groups — create a named group.
+async fn create_named_group(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateGroupRequest>,
+) -> impl IntoResponse {
+    // Generate random MLS group ID
+    let mut group_id_bytes = vec![0u8; 32];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut group_id_bytes);
+    let group_id_hex = hex::encode(&group_id_bytes);
+
+    let agent_id = state.agent.agent_id();
+
+    // Create MLS group
+    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id) {
+        Ok(group) => {
+            // Create group metadata
+            let mut info = x0x::groups::GroupInfo::new(
+                req.name,
+                req.description,
+                agent_id,
+                group_id_hex.clone(),
+            );
+
+            // Set creator's display name if provided
+            if let Some(dn) = req.display_name {
+                info.set_display_name(hex::encode(agent_id.as_bytes()), dn);
+            }
+
+            // Store MLS group
+            state
+                .mls_groups
+                .write()
+                .await
+                .insert(group_id_hex.clone(), group);
+            save_mls_groups(&state).await;
+
+            // Store group info
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id_hex.clone(), info.clone());
+
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "group_id": group_id_hex,
+                    "name": info.name,
+                    "chat_topic": info.general_chat_topic(),
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /groups — list all named groups.
+async fn list_named_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let groups = state.named_groups.read().await;
+    let entries: Vec<serde_json::Value> = groups
+        .values()
+        .map(|info| {
+            serde_json::json!({
+                "group_id": info.mls_group_id,
+                "name": info.name,
+                "description": info.description,
+                "creator": hex::encode(info.creator.as_bytes()),
+                "created_at": info.created_at,
+                "member_count": info.display_names.len().max(1),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "ok": true, "groups": entries }))
+}
+
+/// GET /groups/:id — get group details.
+async fn get_named_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+
+    let members: Vec<serde_json::Value> = info
+        .display_names
+        .iter()
+        .map(|(agent_hex, name)| {
+            serde_json::json!({
+                "agent_id": agent_hex,
+                "display_name": name,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": info.mls_group_id,
+            "name": info.name,
+            "description": info.description,
+            "creator": hex::encode(info.creator.as_bytes()),
+            "created_at": info.created_at,
+            "chat_topic": info.general_chat_topic(),
+            "metadata_topic": info.metadata_topic,
+            "members": members,
+        })),
+    )
+}
+
+/// POST /groups/:id/invite — generate an invite link.
+async fn create_group_invite(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateInviteRequest>,
+) -> impl IntoResponse {
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+
+    let agent_id = state.agent.agent_id();
+    let invite = x0x::groups::invite::SignedInvite::new(
+        info.mls_group_id.clone(),
+        info.name.clone(),
+        &agent_id,
+        req.expiry_secs,
+    );
+
+    let link = invite.to_link();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "invite_link": link,
+            "group_id": info.mls_group_id,
+            "group_name": info.name,
+            "expires_at": invite.expires_at,
+        })),
+    )
+}
+
+/// POST /groups/join — join a group via invite link.
+async fn join_group_via_invite(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<JoinGroupRequest>,
+) -> impl IntoResponse {
+    // Parse invite
+    let invite = match x0x::groups::invite::SignedInvite::from_link(&req.invite) {
+        Ok(inv) => inv,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid invite: {e}") })),
+            );
+        }
+    };
+
+    // Check expiry
+    if invite.is_expired() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "invite has expired" })),
+        );
+    }
+
+    let agent_id = state.agent.agent_id();
+    let group_id_hex = invite.group_id.clone();
+
+    // Create the MLS group locally (in a real flow, the inviter would send
+    // a Welcome message; for now, we create a local group and the inviter
+    // will add us when they see our presence on the group topic)
+    let group_id_bytes = match hex::decode(&group_id_hex) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("invalid group_id hex: {e}") }),
+                ),
+            );
+        }
+    };
+
+    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id) {
+        Ok(group) => {
+            // Store MLS group
+            state
+                .mls_groups
+                .write()
+                .await
+                .insert(group_id_hex.clone(), group);
+            save_mls_groups(&state).await;
+
+            // Create group info from invite
+            let mut info = x0x::groups::GroupInfo::new(
+                invite.group_name.clone(),
+                String::new(),
+                agent_id,
+                group_id_hex.clone(),
+            );
+
+            // Set joiner's display name if provided
+            if let Some(dn) = req.display_name {
+                info.set_display_name(hex::encode(agent_id.as_bytes()), dn);
+            }
+
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id_hex.clone(), info);
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "group_id": group_id_hex,
+                    "group_name": invite.group_name,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// PUT /groups/:id/display-name — set your display name in a group.
+async fn set_group_display_name(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SetDisplayNameRequest>,
+) -> impl IntoResponse {
+    let mut groups = state.named_groups.write().await;
+    let Some(info) = groups.get_mut(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+
+    let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    info.set_display_name(agent_hex, req.name.clone());
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "display_name": req.name })),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Task list handlers
+// ---------------------------------------------------------------------------
+
 /// GET /task-lists
 async fn list_task_lists(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let lists = state.task_lists.read().await;
@@ -2808,6 +3305,239 @@ async fn update_task(
     };
 
     match result {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Embedded GUI
+// ---------------------------------------------------------------------------
+
+/// The embedded GUI HTML, compiled into the binary.
+const GUI_HTML: &str = include_str!("../gui/x0x-gui.html");
+
+/// GET /gui — serve the embedded GUI.
+async fn serve_gui() -> impl IntoResponse {
+    axum::response::Html(GUI_HTML)
+}
+
+// ---------------------------------------------------------------------------
+// KvStore handlers
+// ---------------------------------------------------------------------------
+
+/// Request body for POST /stores.
+#[derive(Debug, Deserialize)]
+struct CreateStoreRequest {
+    name: String,
+    topic: String,
+}
+
+/// Request body for PUT /stores/:id/:key.
+#[derive(Debug, Deserialize)]
+struct PutValueRequest {
+    value: String,
+    content_type: Option<String>,
+}
+
+/// Response entry for GET /stores.
+#[derive(Debug, Serialize)]
+struct StoreListEntry {
+    id: String,
+    topic: String,
+}
+
+/// GET /stores
+async fn list_kv_stores(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let stores = state.kv_stores.read().await;
+    let entries: Vec<StoreListEntry> = stores
+        .keys()
+        .map(|id| StoreListEntry {
+            id: id.clone(),
+            topic: id.clone(),
+        })
+        .collect();
+    Json(serde_json::json!({ "ok": true, "stores": entries }))
+}
+
+/// POST /stores
+async fn create_kv_store(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateStoreRequest>,
+) -> impl IntoResponse {
+    match state.agent.create_kv_store(&req.name, &req.topic).await {
+        Ok(handle) => {
+            let id = req.topic.clone();
+            state.kv_stores.write().await.insert(id.clone(), handle);
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "ok": true, "id": id })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// POST /stores/:id/join
+async fn join_kv_store(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.agent.join_kv_store(&id).await {
+        Ok(handle) => {
+            state.kv_stores.write().await.insert(id.clone(), handle);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "id": id })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /stores/:id/keys
+async fn list_kv_keys(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let stores = state.kv_stores.read().await;
+    let Some(handle) = stores.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "store not found" })),
+        );
+    };
+
+    match handle.keys().await {
+        Ok(entries) => {
+            let keys: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "key": e.key,
+                        "content_type": e.content_type,
+                        "content_hash": e.content_hash,
+                        "size": e.value.len(),
+                        "updated_at": e.updated_at,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "keys": keys })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// PUT /stores/:id/:key
+async fn put_kv_value(
+    State(state): State<Arc<AppState>>,
+    Path((id, key)): Path<(String, String)>,
+    Json(req): Json<PutValueRequest>,
+) -> impl IntoResponse {
+    let stores = state.kv_stores.read().await;
+    let Some(handle) = stores.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "store not found" })),
+        );
+    };
+
+    use base64::Engine;
+    let value = match base64::engine::general_purpose::STANDARD.decode(&req.value) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid base64: {e}") })),
+            );
+        }
+    };
+
+    let content_type = req
+        .content_type
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    match handle.put(key, value, content_type).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /stores/:id/:key
+async fn get_kv_value(
+    State(state): State<Arc<AppState>>,
+    Path((id, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let stores = state.kv_stores.read().await;
+    let Some(handle) = stores.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "store not found" })),
+        );
+    };
+
+    match handle.get(&key).await {
+        Ok(Some(entry)) => {
+            use base64::Engine;
+            let value_b64 = base64::engine::general_purpose::STANDARD.encode(&entry.value);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "key": entry.key,
+                    "value": value_b64,
+                    "content_type": entry.content_type,
+                    "content_hash": entry.content_hash,
+                    "metadata": entry.metadata,
+                    "created_at": entry.created_at,
+                    "updated_at": entry.updated_at,
+                })),
+            )
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "key not found" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// DELETE /stores/:id/:key
+async fn delete_kv_value(
+    State(state): State<Arc<AppState>>,
+    Path((id, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let stores = state.kv_stores.read().await;
+    let Some(handle) = stores.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "store not found" })),
+        );
+    };
+
+    match handle.remove(&key).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

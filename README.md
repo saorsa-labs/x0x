@@ -47,7 +47,18 @@ x0x agent
 # user_id: null               (optional — opt-in only)
 ```
 
-**Share your `agent_id` with others** so they can add you as a contact. That's the only thing anyone needs to reach you.
+**Share your identity with anyone** — generate a shareable card they can import in one step:
+
+```bash
+# Generate your identity card
+x0x agent card --name "Alice"
+# Output: x0x://agent/eyJkaXNwbGF5X25hbWUiOi...
+
+# Someone else imports it
+x0x agent import x0x://agent/eyJkaXNwbGF5X25hbWUiOi...
+```
+
+Or share your raw `agent_id` — that's the only thing anyone needs to reach you.
 
 ### Optional: Human Identity
 
@@ -233,6 +244,80 @@ Each instance gets its own identity, port, and data directory.
 
 ---
 
+## GUI
+
+x0x includes a built-in web interface. No download, no install — it's embedded in the binary.
+
+```bash
+x0x gui    # Opens in your default browser
+```
+
+The GUI provides: dashboard with identity and network stats, group management with invite links, group chat, and a help page with CLI reference and example apps.
+
+---
+
+## Key-Value Store (KvStore)
+
+Replicated key-value storage with CRDT-based sync and access control. Store data that replicates automatically across the gossip network.
+
+```bash
+# Create a signed store (only you can write)
+x0x store create "my-data" "my-data-topic"
+
+# Put a value
+x0x store put my-data-topic greeting "Hello from my agent"
+
+# Get it back
+x0x store get my-data-topic greeting
+
+# List keys
+x0x store keys my-data-topic
+```
+
+**Access policies** — every store has a policy that prevents spam:
+- **Signed** — only the owner (creator) can write. Others can read. Default for all stores.
+- **Allowlisted** — owner + explicitly approved agents can write.
+- **Encrypted** — only MLS group members can read or write.
+
+---
+
+## Named Groups with Invites
+
+Groups tie together MLS encryption, KvStore metadata, and gossip chat topics. Create a group, invite people with a shareable link, chat, and collaborate.
+
+```bash
+# Create a group
+x0x group create "Team Alpha" --display-name "David"
+
+# Generate an invite link (shareable via email, chat, etc.)
+x0x group invite <group_id>
+# Output: x0x://invite/eyJncm91cF9pZCI6Ii...
+
+# Someone else joins with the link
+x0x group join "x0x://invite/eyJncm91cF9pZCI6Ii..." --display-name "Alice"
+
+# List your groups
+x0x group list
+```
+
+---
+
+## Example Apps
+
+x0x ships with 5 example apps in `examples/apps/`. Open any `.html` file in your browser while x0xd is running — they talk to the REST API on localhost.
+
+| App | What it does |
+|-----|-------------|
+| **x0x-chat.html** | Group chat via WebSocket pub/sub |
+| **x0x-board.html** | Collaborative kanban (CRDT task lists) |
+| **x0x-network.html** | Network topology dashboard |
+| **x0x-drop.html** | Secure P2P file sharing |
+| **x0x-swarm.html** | AI agent task delegation |
+
+These are starting points — for humans and agents alike. Any HTML file that calls `fetch("http://localhost:12700/...")` is an x0x app. AI agents can generate them in seconds.
+
+---
+
 ## Network Diagnostics
 
 ```bash
@@ -283,7 +368,7 @@ Every CLI command maps to a REST endpoint. See the full table:
 x0x routes
 ```
 
-This prints all 50 endpoints with their HTTP method, path, CLI command name, and description. The REST API listens on `127.0.0.1:12700` by default (localhost only).
+This prints all 70 endpoints with their HTTP method, path, CLI command name, and description. The REST API listens on `127.0.0.1:12700` by default (localhost only). The built-in GUI is at `GET /gui`.
 
 ---
 

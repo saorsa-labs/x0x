@@ -82,7 +82,7 @@ All nodes verify and rebroadcast manifests (symmetric propagation — no privile
 ### Module Dependency Flow
 
 ```
-lib.rs (Agent, AgentBuilder, TaskListHandle)
+lib.rs (Agent, AgentBuilder, TaskListHandle, KvStoreHandle)
   ├── identity.rs  ← Uses ant-quic ML-DSA-65 keypairs
   ├── storage.rs   ← Bincode serialization to ~/.x0x/
   ├── error.rs     ← IdentityError + NetworkError (thiserror)
@@ -90,8 +90,11 @@ lib.rs (Agent, AgentBuilder, TaskListHandle)
   ├── bootstrap.rs ← Bootstrap retry logic
   ├── gossip/      ← Wraps saorsa-gossip-* crates
   ├── crdt/        ← TaskList, TaskItem, CheckboxState, Delta, Sync
+  ├── kv/          ← KvStore, KvEntry, KvStoreDelta, KvStoreSync, AccessPolicy
+  ├── groups/      ← GroupInfo, SignedInvite, AgentCard (high-level group mgmt)
   ├── mls/         ← MlsGroup, MlsCipher, MlsKeySchedule, MlsWelcome
-  └── upgrade/     ← Self-update: manifest, monitor, apply, rollout, signature
+  ├── upgrade/     ← Self-update: manifest, monitor, apply, rollout, signature
+  └── gui/         ← Embedded HTML GUI (compiled into binary via include_str!)
 ```
 
 ### Key API Surface
@@ -113,6 +116,16 @@ agent.machine_id()       // MachineId
 agent.agent_id()         // AgentId
 agent.user_id()          // Option<UserId>
 agent.agent_certificate() // Option<&AgentCertificate>
+
+// KvStore — replicated key-value with access control
+let store = agent.create_kv_store("name", "topic").await?;
+store.put("key".into(), b"value".to_vec(), "text/plain".into()).await?;
+let entry = store.get("key").await?;
+let keys = store.keys().await?;
+store.remove("key").await?;
+
+// Named groups with invite links
+// (managed via REST API: POST /groups, POST /groups/:id/invite, etc.)
 ```
 
 ### Error Handling
@@ -219,11 +232,16 @@ Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile
 
 ## API Completeness
 
-All public APIs are fully implemented and wired to x0xd REST endpoints:
-- Direct messaging: `send_direct()`, `recv_direct()`, `connect_to_agent()`, `subscribe_direct()`
+70 REST endpoints, all wired to x0xd and CLI:
+- Identity + AgentCard: `GET /agent`, `GET /agent/card`, `POST /agent/card/import`
+- Named groups: `POST/GET /groups`, `POST /groups/:id/invite`, `POST /groups/join`
+- KvStore: `POST/GET /stores`, `PUT/GET/DELETE /stores/:id/:key` (with access control)
+- Direct messaging: `send_direct()`, `recv_direct()`, `connect_to_agent()`
 - MLS groups: `MlsGroup::new()`, `add_member()`, `remove_member()`, `MlsCipher::encrypt/decrypt()`
-- Task lists: `create_task_list()`, `join_task_list()` via `TaskListHandle`
-- Identity, trust, contacts, gossip pub/sub: all complete
+- Task lists (CRDTs): `create_task_list()`, `join_task_list()` via `TaskListHandle`
+- File transfer: `POST /files/send`, `POST /files/accept/:id`
+- GUI: `GET /gui` (embedded HTML), `x0x gui` opens browser
+- Identity, trust, contacts, gossip pub/sub, WebSocket: all complete
 
 ## Crate-Level Lint Suppressions
 

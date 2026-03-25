@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>x0x board</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0a0a0f; --card: #12121a; --border: #1e1e2e; --text: #e0e0e8;
+  --dim: #6a6a80; --cyan: #00d4ff; --orange: #ff6b35; --green: #00e676;
+  --radius: 10px;
+}
+body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+.mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.82em; }
+
+header { display: flex; align-items: center; gap: 16px; padding: 14px 24px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+header h1 { font-size: 1.15rem; font-weight: 700; }
+header h1 span { color: var(--cyan); }
+.header-meta { display: flex; gap: 16px; align-items: center; margin-left: auto; flex-wrap: wrap; }
+.badge { padding: 3px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
+.badge-cyan { background: rgba(0,212,255,.12); color: var(--cyan); }
+.badge-orange { background: rgba(255,107,53,.12); color: var(--orange); }
+.badge-green { background: rgba(0,230,118,.12); color: var(--green); }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+.status-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.status-dot.off { background: #ff4444; box-shadow: 0 0 6px #ff4444; }
+
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.overlay.hidden { display: none; }
+.panel { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 32px; width: 420px; max-width: 92vw; }
+.panel h2 { font-size: 1.1rem; margin-bottom: 18px; }
+.panel input, .panel button { display: block; width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 0.9rem; margin-bottom: 10px; }
+.panel button { cursor: pointer; font-weight: 600; border: none; }
+.btn-cyan { background: var(--cyan); color: #000; }
+.btn-cyan:hover { opacity: .85; }
+.panel .board-list { list-style: none; max-height: 200px; overflow-y: auto; margin-bottom: 14px; }
+.panel .board-list li { padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px; cursor: pointer; transition: border-color .15s; }
+.panel .board-list li:hover { border-color: var(--cyan); }
+.error-box { background: rgba(255,68,68,.1); color: #ff6b6b; padding: 14px; border-radius: 8px; text-align: center; font-size: 0.9rem; }
+
+.board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 20px 24px; align-items: start; }
+@media (max-width: 740px) { .board { grid-template-columns: 1fr; } }
+.column { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; min-height: 300px; }
+.col-header { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+.col-dot { width: 10px; height: 10px; border-radius: 50%; }
+.col-header h3 { font-size: 0.88rem; font-weight: 600; }
+.col-count { margin-left: auto; font-size: 0.75rem; color: var(--dim); }
+
+.card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 10px; transition: transform .15s, box-shadow .15s; }
+.card:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+.card-title { font-size: 0.88rem; font-weight: 600; margin-bottom: 4px; }
+.card-desc { font-size: 0.78rem; color: var(--dim); margin-bottom: 8px; }
+.card-footer { display: flex; align-items: center; justify-content: space-between; }
+.card-agent { font-size: 0.7rem; color: var(--dim); }
+.card-btn { padding: 4px 12px; border-radius: 6px; border: none; font-size: 0.75rem; font-weight: 600; cursor: pointer; transition: opacity .15s; }
+.card-btn:hover { opacity: .8; }
+.card-btn.claim { background: rgba(255,107,53,.15); color: var(--orange); }
+.card-btn.done { background: rgba(0,230,118,.15); color: var(--green); }
+.card.entering { animation: fadeSlide .3s ease; }
+@keyframes fadeSlide { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+
+.add-form { display: flex; gap: 6px; margin-bottom: 12px; }
+.add-form input { flex: 1; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 0.82rem; outline: none; }
+.add-form input:focus { border-color: var(--cyan); }
+.add-form button { padding: 8px 14px; border-radius: 6px; border: none; background: var(--cyan); color: #000; font-weight: 600; font-size: 0.82rem; cursor: pointer; white-space: nowrap; }
+.board-name { font-size: 0.85rem; color: var(--dim); margin-left: 8px; padding-left: 16px; border-left: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>x0x</span> board</h1>
+  <span class="board-name" id="boardName"></span>
+  <div class="header-meta">
+    <span class="badge badge-cyan" id="countTodo">0 to do</span>
+    <span class="badge badge-orange" id="countProgress">0 in progress</span>
+    <span class="badge badge-green" id="countDone">0 done</span>
+    <span class="mono" style="color:var(--dim)" id="agentLabel"></span>
+    <span id="statusIndicator"><span class="status-dot off"></span> offline</span>
+  </div>
+</header>
+
+<div class="board" id="board" style="display:none">
+  <div class="column">
+    <div class="col-header"><div class="col-dot" style="background:var(--cyan)"></div><h3>To Do</h3><span class="col-count" id="cntTodo"></span></div>
+    <div class="add-form"><input id="newTask" placeholder="New task…"><button onclick="addTask()">Add</button></div>
+    <div id="todoCards"></div>
+  </div>
+  <div class="column">
+    <div class="col-header"><div class="col-dot" style="background:var(--orange)"></div><h3>In Progress</h3><span class="col-count" id="cntProgress"></span></div>
+    <div id="progressCards"></div>
+  </div>
+  <div class="column">
+    <div class="col-header"><div class="col-dot" style="background:var(--green)"></div><h3>Done</h3><span class="col-count" id="cntDone"></span></div>
+    <div id="doneCards"></div>
+  </div>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="panel">
+    <div id="errorView" style="display:none"><div class="error-box" id="errorMsg"></div></div>
+    <div id="selectView" style="display:none">
+      <h2>Select or create a board</h2>
+      <ul class="board-list" id="boardList"></ul>
+      <input id="newBoardName" placeholder="Board name">
+      <input id="newBoardTopic" placeholder="Topic (e.g. sprint-1)">
+      <button class="btn-cyan" onclick="createBoard()">Create Board</button>
+    </div>
+    <div id="loadingView"><p style="text-align:center;color:var(--dim)">Connecting to x0xd…</p></div>
+  </div>
+</div>
+
+<script>
+const API_URL = "http://localhost:12700";
+let boardId = null, agentId = "", pollTimer = null, knownIds = new Set();
+
+async function api(path, opts = {}) {
+  const r = await fetch(API_URL + path, { ...opts, headers: { "Content-Type": "application/json", ...opts.headers } });
+  return r.json();
+}
+function truncate(id) { return id ? id.slice(0, 8) + "…" : ""; }
+function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function setStatus(on) {
+  document.getElementById("statusIndicator").innerHTML =
+    '<span class="status-dot ' + (on ? "on" : "off") + '"></span> ' + (on ? "connected" : "offline");
+}
+
+async function init() {
+  try {
+    const health = await api("/health");
+    if (!health.ok) throw new Error("unhealthy");
+    setStatus(true);
+    const agent = await api("/agent");
+    agentId = agent.agent_id || "";
+    document.getElementById("agentLabel").textContent = truncate(agentId);
+    await showBoardSelector();
+  } catch (e) {
+    document.getElementById("loadingView").style.display = "none";
+    document.getElementById("errorView").style.display = "block";
+    document.getElementById("errorMsg").textContent = "Cannot reach x0xd at " + API_URL + ". Is the daemon running?";
+  }
+}
+
+async function showBoardSelector() {
+  document.getElementById("loadingView").style.display = "none";
+  document.getElementById("selectView").style.display = "block";
+  try {
+    const res = await api("/task-lists");
+    const lists = res.task_lists || [];
+    const ul = document.getElementById("boardList");
+    ul.innerHTML = "";
+    lists.forEach(b => {
+      const li = document.createElement("li");
+      li.textContent = b.name || b.topic || b.id;
+      li.onclick = () => openBoard(b.id || b.topic, b.name || b.topic);
+      ul.appendChild(li);
+    });
+  } catch (e) { /* no boards yet */ }
+}
+
+async function createBoard() {
+  const name = document.getElementById("newBoardName").value.trim();
+  const topic = document.getElementById("newBoardTopic").value.trim() || name.toLowerCase().replace(/\s+/g, "-");
+  if (!name) return;
+  await api("/task-lists", { method: "POST", body: JSON.stringify({ name, topic }) });
+  openBoard(topic, name);
+}
+
+function openBoard(id, name) {
+  boardId = id;
+  document.getElementById("overlay").classList.add("hidden");
+  document.getElementById("board").style.display = "grid";
+  document.getElementById("boardName").textContent = name || id;
+  knownIds.clear(); refresh();
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(refresh, 2000);
+  document.getElementById("newTask").addEventListener("keydown", e => { if (e.key === "Enter") addTask(); });
+}
+
+function renderCard(t, colState) {
+  const isNew = !knownIds.has(t.id); knownIds.add(t.id);
+  const assignee = t.assignee || "";
+  let btn = "";
+  if (colState === "Empty") btn = '<button class="card-btn claim" onclick="claimTask(\'' + t.id + "')\">" + "Claim</button>";
+  else if (colState === "Claimed") btn = '<button class="card-btn done" onclick="completeTask(\'' + t.id + "')\">" + "Done</button>";
+  return '<div class="card' + (isNew ? " entering" : "") + '">' +
+    '<div class="card-title">' + esc(t.title || "Untitled") + "</div>" +
+    (t.description ? '<div class="card-desc">' + esc(t.description) + "</div>" : "") +
+    '<div class="card-footer"><span class="card-agent mono">' + (assignee ? truncate(assignee) : "") + "</span>" + btn + "</div></div>";
+}
+
+async function refresh() {
+  if (!boardId) return;
+  try {
+    const res = await api("/task-lists/" + boardId + "/tasks");
+    const tasks = res.tasks || [];
+    const todo = tasks.filter(t => t.state === "Empty");
+    const prog = tasks.filter(t => t.state === "Claimed");
+    const done = tasks.filter(t => t.state === "Done");
+    document.getElementById("todoCards").innerHTML = todo.map(t => renderCard(t, "Empty")).join("");
+    document.getElementById("progressCards").innerHTML = prog.map(t => renderCard(t, "Claimed")).join("");
+    document.getElementById("doneCards").innerHTML = done.map(t => renderCard(t, "Done")).join("");
+    document.getElementById("countTodo").textContent = todo.length + " to do";
+    document.getElementById("countProgress").textContent = prog.length + " in progress";
+    document.getElementById("countDone").textContent = done.length + " done";
+    document.getElementById("cntTodo").textContent = todo.length;
+    document.getElementById("cntProgress").textContent = prog.length;
+    document.getElementById("cntDone").textContent = done.length;
+    setStatus(true);
+  } catch (e) { setStatus(false); }
+}
+
+async function addTask() {
+  const input = document.getElementById("newTask");
+  const title = input.value.trim();
+  if (!title || !boardId) return;
+  input.value = "";
+  await api("/task-lists/" + boardId + "/tasks", { method: "POST", body: JSON.stringify({ title }) });
+  refresh();
+}
+
+async function claimTask(tid) {
+  await api("/task-lists/" + boardId + "/tasks/" + tid, { method: "PATCH", body: JSON.stringify({ action: "claim" }) });
+  refresh();
+}
+
+async function completeTask(tid) {
+  await api("/task-lists/" + boardId + "/tasks/" + tid, { method: "PATCH", body: JSON.stringify({ action: "complete" }) });
+  refresh();
+}
+
+init();
+</script>
+</body>
+</html>

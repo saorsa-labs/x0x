@@ -10,6 +10,8 @@ pub enum Method {
     Get,
     /// HTTP POST
     Post,
+    /// HTTP PUT
+    Put,
     /// HTTP PATCH
     Patch,
     /// HTTP DELETE
@@ -21,6 +23,7 @@ impl std::fmt::Display for Method {
         match self {
             Method::Get => write!(f, "GET"),
             Method::Post => write!(f, "POST"),
+            Method::Put => write!(f, "PUT"),
             Method::Patch => write!(f, "PATCH"),
             Method::Delete => write!(f, "DELETE"),
         }
@@ -79,6 +82,20 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         path: "/agent/user-id",
         cli_name: "agent user-id",
         description: "Current agent user ID",
+        category: "identity",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/agent/card",
+        cli_name: "agent card",
+        description: "Generate shareable identity card",
+        category: "identity",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/agent/card/import",
+        cli_name: "agent import",
+        description: "Import agent card to contacts",
         category: "identity",
     },
     // ── Network ─────────────────────────────────────────────────────────
@@ -355,6 +372,49 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Create welcome for member",
         category: "groups",
     },
+    // ── Named groups (high-level) ─────────────────────────────────────
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups",
+        cli_name: "group create",
+        description: "Create named group",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups",
+        cli_name: "group list",
+        description: "List groups",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id",
+        cli_name: "group info",
+        description: "Get group info",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/invite",
+        cli_name: "group invite",
+        description: "Generate invite link",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/join",
+        cli_name: "group join",
+        description: "Join group via invite",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Put,
+        path: "/groups/:id/display-name",
+        cli_name: "group set-name",
+        description: "Set display name in group",
+        category: "named-groups",
+    },
     // ── Task lists ──────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,
@@ -390,6 +450,56 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "tasks update",
         description: "Claim or complete task",
         category: "tasks",
+    },
+    // ── Key-value stores ────────────────────────────────────────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/stores",
+        cli_name: "store list",
+        description: "List key-value stores",
+        category: "stores",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/stores",
+        cli_name: "store create",
+        description: "Create key-value store",
+        category: "stores",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/stores/:id/join",
+        cli_name: "store join",
+        description: "Join existing store",
+        category: "stores",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/stores/:id/keys",
+        cli_name: "store keys",
+        description: "List keys in store",
+        category: "stores",
+    },
+    EndpointDef {
+        method: Method::Put,
+        path: "/stores/:id/:key",
+        cli_name: "store put",
+        description: "Put value in store",
+        category: "stores",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/stores/:id/:key",
+        cli_name: "store get",
+        description: "Get value from store",
+        category: "stores",
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/stores/:id/:key",
+        cli_name: "store rm",
+        description: "Remove key from store",
+        category: "stores",
     },
     // ── Files ──────────────────────────────────────────────────────────
     EndpointDef {
