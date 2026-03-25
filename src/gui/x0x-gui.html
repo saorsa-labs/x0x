@@ -409,6 +409,7 @@ function importCardFromClipboard(){
 try{document.querySelector('button[onclick*="card-import"]').onclick=importCardFromClipboard}catch(e){}
 
 // --- GROUPS ---
+const savedInvites={}; // persist invite links across re-renders
 async function createGroup(){
   const n=document.getElementById('grp-name').value.trim();if(!n)return;
   const r=await api('/groups',{method:'POST',body:JSON.stringify({name:n})});
@@ -420,6 +421,10 @@ async function joinGroup(){
   if(r&&r.ok){document.getElementById('grp-invite-code').value='';pollGroups()}
   else{alert('Join failed: '+(r&&r.error||'unknown'))}
 }
+function inviteHtml(link){
+  // Use data attribute to avoid quoting hell in onclick
+  return '<span style="color:var(--tx);user-select:all;font-size:10px;word-break:break-all">'+esc(link)+'</span> <button data-link="'+esc(link)+'" onclick="navigator.clipboard.writeText(this.dataset.link);this.textContent=\'Copied!\';setTimeout(()=>this.textContent=\'Copy\',1500)" style="font-size:10px;padding:2px 6px">Copy</button>';
+}
 async function pollGroups(){
   const g=await api('/groups');if(!g||!g.groups)return;
   const sel=document.getElementById('ws-group'),cur=sel.value;
@@ -427,15 +432,22 @@ async function pollGroups(){
   sel.value=cur;
   document.getElementById('grp-list').innerHTML=g.groups.map(x=>{
     const iid='inv-'+x.group_id.slice(0,16);
-    return '<div class="card mb"><div class="row"><strong style="color:var(--cy)">'+esc(x.name)+'</strong><span style="color:var(--dm);font-size:11px">'+(x.member_count||1)+' members</span><button onclick="genInvite(\''+x.group_id+'\',\''+iid+'\')">Invite</button></div><div id="'+iid+'" style="font-size:10px;color:var(--dm);word-break:break-all;margin-top:4px"></div></div>';
+    // Re-render saved invite if we have one
+    const invContent=savedInvites[x.group_id]?inviteHtml(savedInvites[x.group_id]):'';
+    return '<div class="card mb"><div class="row"><strong style="color:var(--cy)">'+esc(x.name)+'</strong><span style="color:var(--dm);font-size:11px">'+(x.member_count||1)+' members</span><button onclick="genInvite(\''+x.group_id+'\',\''+iid+'\')">Invite</button></div><div id="'+iid+'" style="font-size:10px;color:var(--dm);word-break:break-all;margin-top:4px">'+invContent+'</div></div>';
   }).join('')||'<div style="color:var(--dm)">No groups yet</div>';
 }
 async function genInvite(gid,elId){
   const r=await api('/groups/'+gid+'/invite',{method:'POST',body:JSON.stringify({})});
-  const el=document.getElementById(elId);
   if(r&&r.ok&&r.invite_link){
-    el.innerHTML='<span style="color:var(--tx);user-select:all">'+esc(r.invite_link)+'</span> <button onclick="navigator.clipboard.writeText(this.previousElementSibling.textContent);this.textContent=\'Copied!\'" style="font-size:10px;padding:2px 6px">Copy</button>';
-  }else{el.textContent='Failed'}
+    savedInvites[gid]=r.invite_link; // persist across re-renders
+    const el=document.getElementById(elId);
+    if(el)el.innerHTML=inviteHtml(r.invite_link);
+    navigator.clipboard.writeText(r.invite_link); // auto-copy
+  }else{
+    const el=document.getElementById(elId);
+    if(el)el.textContent='Failed to generate invite';
+  }
 }
 
 // --- WORKSPACE ---

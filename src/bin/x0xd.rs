@@ -280,6 +280,7 @@ struct AppState {
     task_lists: RwLock<HashMap<String, TaskListHandle>>,
     kv_stores: RwLock<HashMap<String, KvStoreHandle>>,
     named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
+    named_groups_path: PathBuf,
     contacts: Arc<RwLock<ContactStore>>,
     mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
     mls_groups_path: PathBuf,
@@ -856,6 +857,29 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Load named groups from disk (if any)
+    let named_groups_path = config.data_dir.join("named_groups.json");
+    let named_groups = match tokio::fs::read_to_string(&named_groups_path).await {
+        Ok(json) => match serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&json) {
+            Ok(groups) => {
+                tracing::info!(
+                    "Loaded {} named groups from {}",
+                    groups.len(),
+                    named_groups_path.display()
+                );
+                groups
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse named groups file, starting fresh: {e}");
+                HashMap::new()
+            }
+        },
+        Err(_) => {
+            tracing::info!("No named groups file found, starting fresh");
+            HashMap::new()
+        }
+    };
+
     // Build shared state BEFORE joining network so the API server can
     // start immediately. Network-dependent endpoints will return errors
     // until join completes, which is better than blocking the entire API.
@@ -867,7 +891,8 @@ async fn main() -> Result<()> {
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
         kv_stores: RwLock::new(HashMap::new()),
-        named_groups: RwLock::new(HashMap::new()),
+        named_groups: RwLock::new(named_groups),
+        named_groups_path,
         contacts,
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
@@ -2959,12 +2984,13 @@ async fn create_named_group(
             let chat_topic = info.general_chat_topic();
             let metadata_topic = info.metadata_topic.clone();
 
-            // Store group info
+            // Store group info and persist to disk
             state
                 .named_groups
                 .write()
                 .await
                 .insert(group_id_hex.clone(), info.clone());
+            save_named_groups(&state).await;
 
             // Auto-subscribe to group topics so messages flow immediately
             let _ = state.agent.subscribe(&chat_topic).await;
@@ -3178,6 +3204,7 @@ async fn join_group_via_invite(
                 .write()
                 .await
                 .insert(group_id_hex.clone(), info.clone());
+            save_named_groups(&state).await;
 
             // Auto-subscribe to group topics so messages flow immediately
             let _ = state.agent.subscribe(&chat_topic).await;
@@ -3240,6 +3267,8 @@ async fn set_group_display_name(
 
     let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     info.set_display_name(agent_hex, req.name.clone());
+    drop(groups); // release write lock before saving
+    save_named_groups(&state).await;
 
     (
         StatusCode::OK,
@@ -4872,6 +4901,18 @@ async fn save_mls_groups(state: &AppState) {
             }
         }
         Err(e) => tracing::error!("Failed to serialize MLS groups: {e}"),
+    }
+}
+
+async fn save_named_groups(state: &AppState) {
+    let groups = state.named_groups.read().await;
+    match serde_json::to_string_pretty(&*groups) {
+        Ok(json) => {
+            if let Err(e) = tokio::fs::write(&state.named_groups_path, json).await {
+                tracing::error!("Failed to save named groups: {e}");
+            }
+        }
+        Err(e) => tracing::error!("Failed to serialize named groups: {e}"),
     }
 }
 
