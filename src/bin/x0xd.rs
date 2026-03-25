@@ -542,6 +542,29 @@ struct MlsDecryptRequest {
     epoch: u64,
 }
 
+/// POST /contacts/:agent_id/revoke request body.
+#[derive(Debug, Deserialize)]
+struct RevokeContactRequest {
+    /// Reason for revocation.
+    reason: String,
+}
+
+/// POST /trust/evaluate request body.
+#[derive(Debug, Deserialize)]
+struct EvaluateTrustRequest {
+    /// Agent ID as hex string.
+    agent_id: String,
+    /// Machine ID as hex string.
+    machine_id: String,
+}
+
+/// POST /mls/groups/:id/welcome request body.
+#[derive(Debug, Deserialize)]
+struct CreateWelcomeRequest {
+    /// Invitee agent ID as hex string.
+    agent_id: String,
+}
+
 /// Discovered identity entry from gossip announcements.
 #[derive(Debug, Serialize)]
 struct DiscoveredAgentEntry {
@@ -952,6 +975,28 @@ async fn main() -> Result<()> {
         )
         .route("/mls/groups/:id/encrypt", post(mls_encrypt))
         .route("/mls/groups/:id/decrypt", post(mls_decrypt))
+        // Agent discovery & connectivity
+        .route("/agents/find/:agent_id", post(find_agent))
+        .route("/agents/reachability/:agent_id", get(agent_reachability))
+        // Contact trust extensions
+        .route("/contacts/:agent_id/revoke", post(revoke_contact))
+        .route("/contacts/:agent_id/revocations", get(list_revocations))
+        .route(
+            "/contacts/:agent_id/machines/:machine_id/pin",
+            post(pin_machine),
+        )
+        .route(
+            "/contacts/:agent_id/machines/:machine_id/pin",
+            delete(unpin_machine),
+        )
+        // Trust evaluation
+        .route("/trust/evaluate", post(evaluate_trust))
+        // MLS welcome
+        .route("/mls/groups/:id/welcome", post(create_mls_welcome))
+        // Upgrade check
+        .route("/upgrade/check", get(check_upgrade))
+        // Network diagnostics
+        .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         // WebSocket endpoints
         .route("/ws", get(ws_handler))
         .route("/ws/direct", get(ws_direct_handler))
@@ -1913,8 +1958,24 @@ fn discovered_agent_entry(agent: x0x::DiscoveredAgent) -> DiscoveredAgentEntry {
 }
 
 /// GET /agents/discovered
-async fn discovered_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match state.agent.discovered_agents().await {
+/// Query parameters for `GET /agents/discovered`.
+#[derive(Deserialize, Default)]
+struct DiscoveredAgentsQuery {
+    /// When `true`, return all cache entries including stale (TTL-expired).
+    #[serde(default)]
+    unfiltered: bool,
+}
+
+async fn discovered_agents(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DiscoveredAgentsQuery>,
+) -> impl IntoResponse {
+    let result = if query.unfiltered {
+        state.agent.discovered_agents_unfiltered().await
+    } else {
+        state.agent.discovered_agents().await
+    };
+    match result {
         Ok(agents) => {
             let entries: Vec<DiscoveredAgentEntry> =
                 agents.into_iter().map(discovered_agent_entry).collect();
@@ -3038,6 +3099,395 @@ async fn mls_decrypt(
                 Json(serde_json::json!({ "ok": false, "error": "decryption failed" })),
             )
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent discovery & connectivity handlers
+// ---------------------------------------------------------------------------
+
+/// POST /agents/find/:agent_id — actively search for an agent (3-stage: cache → shard → rendezvous).
+async fn find_agent(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    match state.agent.find_agent(agent_id).await {
+        Ok(Some(addrs)) => {
+            let addr_strs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "found": true, "addresses": addr_strs })),
+            )
+        }
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "found": false })),
+        ),
+        Err(e) => {
+            tracing::error!("find_agent failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "search failed" })),
+            )
+        }
+    }
+}
+
+/// GET /agents/reachability/:agent_id — check reachability before connecting.
+async fn agent_reachability(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    match state.agent.reachability(&agent_id).await {
+        Some(info) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "likely_direct": info.likely_direct(),
+                "needs_coordination": info.needs_coordination(),
+                "is_relay": info.is_relay(),
+                "is_coordinator": info.is_coordinator(),
+                "addresses": info.addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>()
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "agent not in discovery cache" })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contact trust extension handlers
+// ---------------------------------------------------------------------------
+
+/// POST /contacts/:agent_id/revoke — permanently revoke an agent's key.
+async fn revoke_contact(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id_hex): Path<String>,
+    Json(req): Json<RevokeContactRequest>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let mut store = state.contacts.write().await;
+    store.revoke(&agent_id, &req.reason);
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
+/// GET /contacts/:agent_id/revocations — list revocation records.
+async fn list_revocations(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let store = state.contacts.read().await;
+    let revocations: Vec<serde_json::Value> = store
+        .revocations()
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "agent_id": hex::encode(r.agent_id.0),
+                "reason": r.reason,
+                "timestamp": r.timestamp,
+                "revoker_id": r.revoker_id.map(|id| hex::encode(id.0))
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "revocations": revocations })),
+    )
+}
+
+/// POST /contacts/:agent_id/machines/:machine_id/pin — pin a machine for identity verification.
+async fn pin_machine(
+    State(state): State<Arc<AppState>>,
+    Path((agent_id_hex, machine_id_hex)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let machine_bytes = match hex::decode(&machine_id_hex) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid machine_id hex" })),
+            );
+        }
+    };
+    let machine_id = MachineId(machine_bytes);
+
+    let mut store = state.contacts.write().await;
+    let pinned = store.pin_machine(&agent_id, &machine_id);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "pinned": pinned })),
+    )
+}
+
+/// DELETE /contacts/:agent_id/machines/:machine_id/pin — unpin a machine.
+async fn unpin_machine(
+    State(state): State<Arc<AppState>>,
+    Path((agent_id_hex, machine_id_hex)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let machine_bytes = match hex::decode(&machine_id_hex) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid machine_id hex" })),
+            );
+        }
+    };
+    let machine_id = MachineId(machine_bytes);
+
+    let mut store = state.contacts.write().await;
+    let unpinned = store.unpin_machine(&agent_id, &machine_id);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "unpinned": unpinned })),
+    )
+}
+
+/// POST /trust/evaluate — evaluate trust decision for an (agent, machine) pair.
+async fn evaluate_trust(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EvaluateTrustRequest>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&req.agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let machine_bytes = match hex::decode(&req.machine_id) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid machine_id hex" })),
+            );
+        }
+    };
+    let machine_id = MachineId(machine_bytes);
+
+    let store = state.contacts.read().await;
+    let evaluator = x0x::trust::TrustEvaluator::new(&store);
+    let ctx = x0x::trust::TrustContext {
+        agent_id: &agent_id,
+        machine_id: &machine_id,
+    };
+    let decision = evaluator.evaluate(&ctx);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "decision": format!("{:?}", decision)
+        })),
+    )
+}
+
+// Note: task deletion not exposed — TaskListHandle doesn't have remove_task().
+
+// ---------------------------------------------------------------------------
+// MLS welcome handler
+// ---------------------------------------------------------------------------
+
+/// POST /mls/groups/:id/welcome — generate a welcome message for a new member.
+async fn create_mls_welcome(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateWelcomeRequest>,
+) -> impl IntoResponse {
+    let invitee = match parse_agent_id_hex(&req.agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let groups = state.mls_groups.read().await;
+    let Some(group) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+
+    match x0x::mls::MlsWelcome::create(group, &invitee) {
+        Ok(welcome) => {
+            let welcome_bytes = match bincode::serialize(&welcome) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("welcome serialization failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "ok": false, "error": "serialization failed" })),
+                    );
+                }
+            };
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "welcome": base64::engine::general_purpose::STANDARD.encode(&welcome_bytes),
+                    "group_id": id,
+                    "epoch": welcome.epoch()
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::error!("create_mls_welcome failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "welcome creation failed" })),
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade check handler
+// ---------------------------------------------------------------------------
+
+/// GET /upgrade/check — check for available updates.
+async fn check_upgrade(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let monitor = match x0x::upgrade::monitor::UpgradeMonitor::new(
+        "saorsa-labs/x0x",
+        "x0xd",
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("upgrade monitor creation failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "upgrade check unavailable" })),
+            );
+        }
+    };
+
+    match monitor.check_for_updates().await {
+        Ok(Some(release)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "update_available": true,
+                "version": release.manifest.version,
+                "current_version": env!("CARGO_PKG_VERSION")
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "update_available": false,
+                "current_version": env!("CARGO_PKG_VERSION")
+            })),
+        ),
+        Err(e) => {
+            tracing::error!("upgrade check failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "upgrade check failed" })),
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network diagnostics handler
+// ---------------------------------------------------------------------------
+
+/// GET /network/bootstrap-cache — bootstrap peer cache statistics.
+async fn bootstrap_cache_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Access bootstrap cache via the network node if available
+    match state.agent.network() {
+        Some(network) => {
+            let connection_count = network.connection_count().await;
+            let connected_peers = network.connected_peers().await;
+            let peer_addrs: Vec<String> =
+                connected_peers.iter().map(|a| format!("{a:?}")).collect();
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "connection_count": connection_count,
+                    "connected_peers": peer_addrs
+                })),
+            )
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
+        ),
     }
 }
 
