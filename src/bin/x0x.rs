@@ -575,8 +575,6 @@ enum TasksSub {
 }
 
 #[derive(Subcommand)]
-// UpgradeSub removed — x0x upgrade is a single command now
-#[derive(Subcommand)]
 enum WsSub {
     /// List active WebSocket sessions.
     Sessions,
