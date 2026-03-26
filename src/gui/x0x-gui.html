@@ -1,671 +1,2159 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>x0x</title>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>x0x communitas</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;600;700&family=Outfit:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION 1: RESET & CUSTOM PROPERTIES
+   ═══════════════════════════════════════════════════════════════════ */
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#07070c;--sf:#0e0e16;--bd:#1a1a28;--tx:#c8c8d4;--dm:#4a4a5a;--cy:#00d4ff;--gn:#00e676;--og:#ff6b35;--rd:#ff4466;--mono:ui-monospace,'SF Mono','Cascadia Code','Fira Code',monospace;--sys:system-ui,-apple-system,sans-serif}
-html,body{height:100%;background:var(--bg);color:var(--tx);font:13px/1.5 var(--mono)}
-input,textarea,select,button{font:inherit;color:var(--tx);background:var(--bg);border:1px solid var(--bd);padding:6px 10px;border-radius:2px;outline:none}
-input:focus,textarea:focus,select:focus{border-color:var(--cy)}
-button{cursor:pointer;border-color:var(--dm);padding:6px 14px}
-button:hover{border-color:var(--cy);color:var(--cy)}
-button.pri{background:var(--cy);color:var(--bg);border-color:var(--cy);font-weight:700}
-button.pri:hover{opacity:.85}
-a{color:var(--cy);text-decoration:none}
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-track{background:var(--bg)}
+:root{
+  --bg:#0a0c14;--bg2:#10131e;--bg3:#161a2a;--bg4:#1c2036;
+  --bd:#252940;--bd2:#353a52;
+  --tx:#e4e6f0;--tx2:#b0b3cc;--tx3:#747896;
+  --cy:#00d4ff;--cy-dim:rgba(0,212,255,.12);--cy-glow:rgba(0,212,255,.25);
+  --gn:#10b981;--gn-dim:rgba(16,185,129,.12);
+  --am:#f59e0b;--am-dim:rgba(245,158,11,.12);
+  --rd:#ff4466;--rd-dim:rgba(255,68,102,.12);
+  --vt:#8b5cf6;--vt-dim:rgba(139,92,246,.12);
+  --lv:#a78bfa;--lv-dim:rgba(167,139,250,.12);
+  --pk:#ec4899;--pk-dim:rgba(236,72,153,.12);
+  --sk:#38bdf8;--og:#f97316;
+  --glass:rgba(12,14,24,.88);--glass-bd:rgba(255,255,255,.06);--glass-blur:16px;
+  --sans:'Outfit',system-ui,-apple-system,sans-serif;
+  --display:'Bricolage Grotesque','Outfit',system-ui,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,'SF Mono','Cascadia Code',monospace;
+  --sp1:4px;--sp2:8px;--sp3:12px;--sp4:16px;--sp5:20px;--sp6:24px;--sp8:32px;
+  --r-sm:6px;--r-md:10px;--r-lg:14px;--r-full:9999px;
+  --t-fast:.15s ease;--t-norm:.2s ease;--t-slow:.35s ease-out;
+  --sidebar:280px;--sidebar-min:72px;--detail:380px;
+}
+html,body{height:100%;background:var(--bg);color:var(--tx);font:13px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+::selection{background:var(--cy-dim);color:var(--cy)}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}
-#app{display:flex;height:100%;flex-direction:column}
-#main{display:flex;flex:1;overflow:hidden}
-nav{width:200px;min-width:200px;background:var(--sf);border-right:1px solid var(--bd);display:flex;flex-direction:column;padding:8px 0}
-nav .logo{padding:12px 16px 16px;font:700 15px var(--sys);color:var(--cy);letter-spacing:2px;border-bottom:1px solid var(--bd);margin-bottom:4px}
-nav a{display:flex;align-items:center;gap:10px;padding:8px 16px;color:var(--dm);font:13px var(--sys);text-decoration:none;border-left:2px solid transparent}
-nav a:hover{color:var(--tx);background:rgba(255,255,255,.02)}
-nav a.act{color:var(--cy);border-left-color:var(--cy);background:rgba(0,212,255,.04)}
-nav a svg{width:16px;height:16px;flex-shrink:0}
-nav .spacer{flex:1}
-#content{flex:1;overflow-y:auto;padding:20px 24px}
-#status{height:28px;background:var(--sf);border-top:1px solid var(--bd);display:flex;align-items:center;padding:0 16px;font-size:11px;color:var(--dm);gap:16px;flex-shrink:0}
-#status .dot{width:7px;height:7px;border-radius:50%;background:var(--rd);flex-shrink:0}
-#status .dot.on{background:var(--gn)}
-#status .aid{color:var(--cy);cursor:pointer}
-.tab{display:none}.tab.act{display:block}
-h2{font:600 14px var(--sys);color:var(--tx);margin-bottom:14px;text-transform:uppercase;letter-spacing:1px}
-h3{font:600 12px var(--sys);color:var(--dm);margin:16px 0 8px;text-transform:uppercase;letter-spacing:.5px}
-.grid{display:grid;gap:12px}
+::-webkit-scrollbar-thumb:hover{background:var(--bd2)}
+input,textarea,select,button{font:13px var(--sans);color:var(--tx);background:var(--bg);border:1px solid var(--bd);padding:8px 12px;border-radius:var(--r-sm);outline:none;transition:border-color var(--t-fast),box-shadow var(--t-fast)}
+input:focus,textarea:focus,select:focus{border-color:var(--cy);box-shadow:0 0 0 2px var(--cy-dim)}
+button{cursor:pointer;border-color:var(--bd);padding:8px 16px;font-weight:500;transition:all var(--t-fast)}
+button:hover{border-color:var(--cy);color:var(--cy)}
+button.pri{background:var(--cy);color:var(--bg);border-color:var(--cy);font-weight:600;letter-spacing:.3px}
+button.pri:hover{opacity:.88;box-shadow:0 0 16px var(--cy-glow)}
+button.danger{border-color:var(--rd);color:var(--rd)}
+button.danger:hover{background:var(--rd-dim)}
+button.ghost{border:none;padding:6px 10px;color:var(--tx2)}
+button.ghost:hover{color:var(--cy);background:var(--cy-dim)}
+a{color:var(--cy);text-decoration:none}
+a:hover{text-decoration:underline}
+.skip-link{position:absolute;top:-100px;left:0;background:var(--cy);color:var(--bg);padding:8px 16px;z-index:999;font-weight:600}
+.skip-link:focus{top:0}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION 2: LAYOUT
+   ═══════════════════════════════════════════════════════════════════ */
+#app{display:grid;grid-template-columns:var(--sidebar) 1fr 0px;grid-template-rows:1fr auto;height:100vh;overflow:hidden;transition:grid-template-columns var(--t-slow)}
+#app.collapsed{grid-template-columns:var(--sidebar-min) 1fr 0px}
+#app.detail-open{grid-template-columns:var(--sidebar) 1fr var(--detail)}
+#app.collapsed.detail-open{grid-template-columns:var(--sidebar-min) 1fr var(--detail)}
+#sidebar{grid-row:1;background:var(--bg2);border-right:1px solid var(--bd);display:flex;flex-direction:column;overflow:hidden;transition:width var(--t-slow)}
+#main{grid-row:1;overflow-y:auto;overflow-x:hidden}
+#detail{grid-row:1;background:var(--glass);backdrop-filter:blur(var(--glass-blur));border-left:1px solid var(--glass-bd);overflow-y:auto;overflow-x:hidden;transition:width var(--t-slow)}
+#statusbar{grid-column:1/-1;grid-row:2;height:32px;background:var(--bg2);border-top:1px solid var(--bd);display:flex;align-items:center;padding:0 var(--sp4);font-size:11px;color:var(--tx3);gap:var(--sp4);flex-shrink:0}
+.main-content{padding:var(--sp6) var(--sp8);max-width:1100px}
+#hamburger{display:none;position:fixed;top:10px;left:10px;z-index:200;background:var(--bg2);border:1px solid var(--bd);padding:6px 10px;font-size:16px;color:var(--cy);cursor:pointer;border-radius:var(--r-sm)}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION 3: SIDEBAR
+   ═══════════════════════════════════════════════════════════════════ */
+.sb-header{padding:var(--sp4) var(--sp4) var(--sp3);border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:var(--sp3)}
+.sb-logo{font:700 17px var(--display);color:var(--cy);letter-spacing:1.5px;white-space:nowrap}
+.sb-logo span{opacity:.5;font-weight:400;font-size:12px;margin-left:6px;letter-spacing:0}
+.sb-identity{padding:var(--sp3) var(--sp4);border-bottom:1px solid var(--bd);cursor:pointer;transition:background var(--t-fast)}
+.sb-identity:hover{background:var(--cy-dim)}
+.sb-identity .name{font:600 13px var(--sans);color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sb-identity .aid{font:11px var(--mono);color:var(--cy);opacity:.7}
+.sb-identity .chain{font-size:10px;color:var(--tx3);margin-top:2px}
+.sb-section{padding:var(--sp2) 0}
+.sb-section-title{font:600 10px var(--sans);text-transform:uppercase;letter-spacing:1.2px;color:var(--tx3);padding:var(--sp2) var(--sp4);display:flex;align-items:center;justify-content:space-between}
+.sb-section-title button{font-size:14px;padding:0 4px;border:none;color:var(--tx3);line-height:1}
+.sb-section-title button:hover{color:var(--cy)}
+.sb-item{display:flex;align-items:center;gap:var(--sp2);padding:6px var(--sp4) 6px var(--sp5);color:var(--tx2);font-size:13px;cursor:pointer;border-left:2px solid transparent;transition:all var(--t-fast);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sb-item:hover{color:var(--tx);background:rgba(255,255,255,.02)}
+.sb-item.active{color:var(--cy);border-left-color:var(--cy);background:var(--cy-dim)}
+.sb-item .icon{width:16px;text-align:center;flex-shrink:0;font-size:13px}
+.sb-item .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.sb-item .badge-count{margin-left:auto;font-size:10px;font-weight:600;background:var(--cy);color:var(--bg);padding:0 5px;border-radius:var(--r-full);min-width:16px;text-align:center}
+.sb-sub{padding-left:20px}
+.sb-sub .sb-item{font-size:12px;padding:4px var(--sp4) 4px 36px;color:var(--tx3)}
+.sb-sub .sb-item:hover{color:var(--tx)}
+.sb-sub .sb-item.active{color:var(--cy)}
+.sb-collapsible{max-height:400px;overflow-y:auto;overflow-x:hidden;transition:max-height var(--t-norm),opacity var(--t-norm)}
+.sb-collapsible.collapsed{max-height:0;overflow:hidden;opacity:0}
+.sb-spacer{flex:1}
+.sb-footer{padding:var(--sp2) var(--sp4);border-top:1px solid var(--bd)}
+.sb-collapse{width:100%;border:none;padding:6px;font-size:16px;color:var(--tx3);text-align:center}
+.sb-collapse:hover{color:var(--cy)}
+
+/* Collapsed sidebar */
+#app.collapsed .sb-logo span,#app.collapsed .sb-identity .name,#app.collapsed .sb-identity .chain,
+#app.collapsed .sb-section-title span,#app.collapsed .sb-section-title button,
+#app.collapsed .sb-item span:not(.icon):not(.dot),#app.collapsed .sb-item .badge-count,
+#app.collapsed .sb-sub{display:none}
+#app.collapsed .sb-item{padding-left:0;justify-content:center}
+#app.collapsed .sb-identity{text-align:center}
+#app.collapsed .sb-identity .aid{font-size:9px}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION 4: COMPONENTS
+   ═══════════════════════════════════════════════════════════════════ */
+h2{font:600 16px var(--display);color:var(--tx);margin-bottom:var(--sp5);letter-spacing:.3px}
+h3{font:600 11px var(--sans);color:var(--tx3);margin:var(--sp5) 0 var(--sp2);text-transform:uppercase;letter-spacing:.8px}
+.card{background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r-md);padding:var(--sp4);transition:border-color var(--t-fast)}
+.card:hover{border-color:var(--bd2)}
+.card-glow{box-shadow:0 0 20px rgba(0,0,0,.3)}
+.stat-card{text-align:center;padding:var(--sp5)}
+.stat-card .label{font-size:11px;color:var(--tx3);margin-bottom:var(--sp1);text-transform:uppercase;letter-spacing:.5px}
+.stat-card .val{font:700 22px var(--display);color:var(--cy)}
+.stat-card .val.gn{color:var(--gn)}.stat-card .val.am{color:var(--am)}.stat-card .val.rd{color:var(--rd)}
+.grid{display:grid;gap:var(--sp3)}
 .g2{grid-template-columns:1fr 1fr}
 .g3{grid-template-columns:1fr 1fr 1fr}
-.card{background:var(--sf);border:1px solid var(--bd);border-radius:2px;padding:12px}
-.card .label{font-size:11px;color:var(--dm);margin-bottom:4px}
-.card .val{font-size:18px;font-weight:700;color:var(--cy)}
-.card .val.gn{color:var(--gn)}.card .val.og{color:var(--og)}.card .val.rd{color:var(--rd)}
-.id-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--bd)}
-.id-row .k{color:var(--dm);width:80px;flex-shrink:0;font-size:11px}
-.id-row .v{color:var(--cy);cursor:pointer;word-break:break-all;font-size:12px}
-.id-row .v:hover{text-decoration:underline}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;color:var(--dm);font-weight:600;padding:6px 8px;border-bottom:1px solid var(--bd);font-size:11px;text-transform:uppercase}
-td{padding:6px 8px;border-bottom:1px solid var(--bd)}
-.badge{display:inline-block;padding:1px 6px;font-size:10px;font-weight:700;text-transform:uppercase;border:1px solid}
-.badge.gn{color:var(--gn);border-color:var(--gn)}.badge.cy{color:var(--cy);border-color:var(--cy)}
-.badge.og{color:var(--og);border-color:var(--og)}.badge.rd{color:var(--rd);border-color:var(--rd)}
-.badge.dm{color:var(--dm);border-color:var(--dm)}
-.chat-wrap{display:flex;flex-direction:column;height:calc(100vh - 160px);min-height:300px}
-.chat-msgs{flex:1;overflow-y:auto;padding:8px 0;display:flex;flex-direction:column;gap:2px}
-.chat-msg{padding:4px 0}.chat-msg .meta{font-size:11px;color:var(--dm)}.chat-msg .meta .who{color:var(--cy)}
-.chat-msg .body{color:var(--tx);word-break:break-word}
-.chat-input{display:flex;gap:8px;padding-top:8px;border-top:1px solid var(--bd)}
-.chat-input input{flex:1}
-.kanban{display:flex;gap:12px;overflow-x:auto;padding-bottom:8px}
-.kanban-col{flex:1;min-width:200px;background:var(--sf);border:1px solid var(--bd);border-radius:2px}
-.kanban-col .col-hd{padding:8px 10px;font:600 11px var(--sys);text-transform:uppercase;color:var(--dm);border-bottom:1px solid var(--bd)}
-.kanban-col .col-body{padding:6px;min-height:80px}
-.kanban-card{background:var(--bg);border:1px solid var(--bd);border-radius:2px;padding:8px;margin-bottom:6px;font-size:12px;cursor:pointer}
-.kanban-card:hover{border-color:var(--cy)}
-.kanban-card .state{font-size:10px;color:var(--dm)}
-.row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.g4{grid-template-columns:repeat(4,1fr)}
+.row{display:flex;gap:var(--sp2);align-items:center}
 .row input,.row select{flex:1}
-.contacts-wrap{display:flex;gap:12px;height:calc(100vh - 160px);min-height:300px}
-.contact-list{width:220px;min-width:180px;overflow-y:auto;border-right:1px solid var(--bd);padding-right:12px}
-.contact-item{padding:8px;cursor:pointer;border-bottom:1px solid var(--bd);font-size:12px}
-.contact-item:hover,.contact-item.act{color:var(--cy);background:rgba(0,212,255,.04)}
-.contact-item .cid{font-size:11px;color:var(--dm)}
-.dm-area{flex:1;display:flex;flex-direction:column}
-.drop-zone{border:2px dashed var(--bd);border-radius:2px;padding:40px;text-align:center;color:var(--dm);cursor:pointer;transition:border-color .2s}
-.drop-zone:hover,.drop-zone.over{border-color:var(--cy);color:var(--cy)}
-.feed{max-height:300px;overflow-y:auto;font-size:12px}
-.feed-item{padding:4px 0;border-bottom:1px solid var(--bd)}
-.inline{display:inline-flex;gap:6px;align-items:center}
-.mt{margin-top:12px}.mb{margin-bottom:12px}
-.sub-tabs{display:flex;gap:0;border-bottom:1px solid var(--bd);margin-bottom:14px}
-.sub-tabs button{border:none;border-bottom:2px solid transparent;border-radius:0;padding:6px 14px;color:var(--dm);font-size:12px;background:transparent}
-.sub-tabs button:hover{color:var(--tx)}
-.sub-tabs button.act{color:var(--cy);border-bottom-color:var(--cy)}
-.sub-panel{display:none}.sub-panel.act{display:block}
-.help-tbl td:first-child{color:var(--cy);white-space:nowrap;font-weight:600}
-.help-tbl td{vertical-align:top;padding:4px 12px 4px 0}
-#hamburger{display:none;position:fixed;top:8px;left:8px;z-index:100;background:var(--sf);border:1px solid var(--bd);padding:4px 8px;font-size:18px;color:var(--cy);cursor:pointer;border-radius:2px}
-@media(max-width:700px){
-nav{position:fixed;left:-220px;top:0;bottom:0;z-index:99;transition:left .2s}
-nav.open{left:0}
-#hamburger{display:block}
-.g2,.g3{grid-template-columns:1fr}
-.kanban{flex-direction:column}
-.contacts-wrap{flex-direction:column;height:auto}
-.contact-list{width:100%;border-right:none;border-bottom:1px solid var(--bd);max-height:150px}
+.mt{margin-top:var(--sp4)}.mb{margin-bottom:var(--sp4)}.mt2{margin-top:var(--sp6)}.mb2{margin-bottom:var(--sp6)}
+
+/* Trust badges */
+.trust{display:inline-flex;align-items:center;gap:3px;padding:1px 8px;font:600 10px var(--sans);text-transform:uppercase;letter-spacing:.5px;border-radius:var(--r-full);border:1px solid}
+.trust-blocked{color:var(--rd);border-color:var(--rd);background:var(--rd-dim)}
+.trust-unknown{color:var(--tx3);border-color:var(--bd);background:rgba(74,77,102,.1)}
+.trust-known{color:var(--am);border-color:var(--am);background:var(--am-dim)}
+.trust-trusted{color:var(--gn);border-color:var(--gn);background:var(--gn-dim)}
+
+/* Identity badges */
+.id-type{font-size:11px;color:var(--tx3)}
+.id-type.pinned{color:var(--am)}
+.id-type.trusted{color:var(--gn)}
+
+/* Presence dots */
+.presence{width:8px;height:8px;border-radius:50%;flex-shrink:0;display:inline-block}
+.presence.online{background:var(--gn);box-shadow:0 0 6px var(--gn)}
+.presence.away{background:var(--am)}
+.presence.offline{background:var(--tx3)}
+
+/* Agent ID display */
+.aid{font:12px var(--mono);color:var(--cy);cursor:pointer;word-break:break-all}
+.aid:hover{text-decoration:underline}
+.aid-short{font:11px var(--mono);color:var(--cy)}
+
+/* Tables */
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--tx3);font:600 10px var(--sans);padding:var(--sp2);border-bottom:1px solid var(--bd);text-transform:uppercase;letter-spacing:.5px}
+td{padding:var(--sp2);border-bottom:1px solid rgba(26,30,50,.5)}
+tr:hover td{background:rgba(255,255,255,.01)}
+
+/* Chat */
+.chat-wrap{display:flex;flex-direction:column;height:calc(100vh - 180px);min-height:300px}
+.chat-msgs{flex:1;overflow-y:auto;padding:var(--sp2) 0;display:flex;flex-direction:column;gap:2px}
+.chat-msg{padding:var(--sp1) 0}
+.chat-msg .meta{font-size:11px;color:var(--tx3);display:flex;gap:var(--sp2);align-items:center}
+.chat-msg .meta .who{font-weight:600}
+.chat-msg .meta .who.trusted{color:var(--gn)}
+.chat-msg .meta .who.known{color:var(--am)}
+.chat-msg .meta .who.unknown{color:var(--tx3)}
+.chat-msg .body{color:var(--tx);word-break:break-word;margin-top:1px}
+.chat-msg.system .body{color:var(--tx3);font-style:italic;font-size:12px}
+.chat-input{display:flex;gap:var(--sp2);padding-top:var(--sp3);border-top:1px solid var(--bd)}
+.chat-input input{flex:1}
+
+/* Kanban */
+.kanban{display:flex;gap:var(--sp3);overflow-x:auto;padding-bottom:var(--sp2)}
+.kanban-col{flex:1;min-width:220px;background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r-md)}
+.kanban-hd{padding:var(--sp3);font:600 11px var(--sans);text-transform:uppercase;color:var(--tx3);border-bottom:1px solid var(--bd);letter-spacing:.5px;display:flex;justify-content:space-between}
+.kanban-hd .count{font:500 10px var(--mono);color:var(--tx3);background:var(--bg);padding:1px 6px;border-radius:var(--r-full)}
+.kanban-body{padding:var(--sp2);min-height:80px}
+.kanban-card{background:var(--bg);border:1px solid var(--bd);border-radius:var(--r-sm);padding:var(--sp3);margin-bottom:var(--sp2);cursor:pointer;transition:all var(--t-fast)}
+.kanban-card:hover{border-color:var(--cy);transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,.2)}
+.kanban-card .title{font-size:12px;font-weight:500}
+.kanban-card .meta{font-size:10px;color:var(--tx3);margin-top:var(--sp1)}
+
+/* Sub-tabs */
+.sub-tabs{display:flex;gap:0;border-bottom:1px solid var(--bd);margin-bottom:var(--sp4);overflow-x:auto}
+.sub-tabs button{border:none;border-bottom:2px solid transparent;border-radius:0;padding:8px 16px;color:var(--tx3);font:500 12px var(--sans);background:transparent;white-space:nowrap}
+.sub-tabs button:hover{color:var(--tx);background:transparent}
+.sub-tabs button.active{color:var(--cy);border-bottom-color:var(--cy)}
+.sub-panel{display:none}.sub-panel.active{display:block}
+
+/* Drop zone */
+.drop-zone{border:2px dashed var(--bd);border-radius:var(--r-md);padding:40px;text-align:center;color:var(--tx3);cursor:pointer;transition:all var(--t-norm);font-size:14px}
+.drop-zone:hover,.drop-zone.over{border-color:var(--cy);color:var(--cy);background:var(--cy-dim)}
+
+/* Feed */
+.feed{max-height:400px;overflow-y:auto}
+.feed-item{padding:var(--sp3);border-bottom:1px solid rgba(26,30,50,.5);display:flex;gap:var(--sp3);align-items:flex-start}
+.feed-item:hover{background:rgba(255,255,255,.01)}
+.feed-item .content{flex:1}
+.feed-item .author{font-weight:600;font-size:12px}
+.feed-item .text{font-size:13px;margin-top:2px}
+.feed-item .time{font-size:10px;color:var(--tx3)}
+
+/* Toast */
+#toasts{position:fixed;top:var(--sp4);right:var(--sp4);z-index:1000;display:flex;flex-direction:column;gap:var(--sp2)}
+.toast{background:var(--glass);backdrop-filter:blur(12px);border:1px solid var(--glass-bd);border-radius:var(--r-md);padding:var(--sp3) var(--sp4);font-size:12px;color:var(--tx);box-shadow:0 8px 24px rgba(0,0,0,.4);animation:slideIn var(--t-slow) forwards;max-width:360px}
+.toast.success{border-left:3px solid var(--gn)}
+.toast.error{border-left:3px solid var(--rd)}
+.toast.warning{border-left:3px solid var(--am)}
+.toast.info{border-left:3px solid var(--cy)}
+
+/* Modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);z-index:500;display:flex;align-items:center;justify-content:center;animation:fadeIn .2s}
+.modal{background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r-lg);padding:var(--sp6);min-width:360px;max-width:500px;animation:scaleIn .25s ease-out}
+.modal h2{font-size:15px;margin-bottom:var(--sp4)}
+.modal .actions{display:flex;gap:var(--sp2);justify-content:flex-end;margin-top:var(--sp5)}
+
+/* Machine record */
+.machine-row{display:flex;align-items:center;gap:var(--sp3);padding:var(--sp3);border:1px solid var(--bd);border-radius:var(--r-sm);margin-bottom:var(--sp2);font-size:12px}
+.machine-row.pinned{border-color:var(--gn);background:var(--gn-dim)}
+.machine-row.new{border-color:var(--am);background:var(--am-dim)}
+.machine-row .pin-toggle{cursor:pointer;font-size:14px}
+
+/* Certificate chain */
+.cert-chain{padding:var(--sp4)}
+.cert-node{display:flex;align-items:center;gap:var(--sp3);padding:var(--sp3);border:1px solid var(--bd);border-radius:var(--r-sm);margin-bottom:2px}
+.cert-node.user{border-left:3px solid var(--lv)}
+.cert-node.agent{border-left:3px solid var(--am)}
+.cert-node.machine{border-left:3px solid var(--cy)}
+.cert-arrow{text-align:center;color:var(--tx3);font-size:11px;padding:2px 0;padding-left:20px}
+
+/* Channels */
+.channel-item{display:flex;align-items:center;gap:var(--sp2);padding:5px var(--sp3);font-size:12px;cursor:pointer;border-radius:var(--r-sm);color:var(--tx2);transition:all var(--t-fast)}
+.channel-item:hover{background:rgba(255,255,255,.03);color:var(--tx)}
+.channel-item.active{background:var(--cy-dim);color:var(--cy)}
+.channel-item .hash{color:var(--tx3);font-size:13px;font-weight:600;width:14px;text-align:center}
+.channel-item .unread{margin-left:auto;font-size:10px;font-weight:600;background:var(--cy);color:var(--bg);padding:0 5px;border-radius:var(--r-full);min-width:16px;text-align:center}
+.channel-header{display:flex;align-items:center;gap:var(--sp3);padding-bottom:var(--sp3);border-bottom:1px solid var(--bd);margin-bottom:var(--sp3)}
+.channel-header .name{font:600 15px var(--display);color:var(--tx)}
+.channel-header .desc{font-size:12px;color:var(--tx3)}
+.channel-bar{display:flex;gap:var(--sp1);padding:var(--sp2) 0;overflow-x:auto;flex-wrap:wrap}
+
+/* Threads */
+.thread-indicator{display:flex;align-items:center;gap:var(--sp2);padding:4px var(--sp3);margin-top:2px;border:1px solid var(--bd);border-radius:var(--r-sm);cursor:pointer;font-size:11px;color:var(--cy);transition:all var(--t-fast);background:rgba(0,212,255,.03)}
+.thread-indicator:hover{border-color:var(--cy);background:var(--cy-dim)}
+.thread-indicator .count{font-weight:600}
+.thread-indicator .participants{color:var(--tx3)}
+.thread-indicator .last{color:var(--tx3);margin-left:auto}
+.thread-panel{display:flex;flex-direction:column;height:100%}
+.thread-panel .thread-parent{padding:var(--sp4);border-bottom:1px solid var(--bd);background:var(--bg3)}
+.thread-panel .thread-replies{flex:1;overflow-y:auto;padding:var(--sp2) var(--sp4)}
+.thread-panel .thread-input{display:flex;gap:var(--sp2);padding:var(--sp3) var(--sp4);border-top:1px solid var(--bd);align-items:center}
+.thread-panel .thread-input input{flex:1}
+.thread-panel .broadcast-check{display:flex;align-items:center;gap:4px;font-size:11px;color:var(--tx3);white-space:nowrap}
+.thread-panel .broadcast-check input{width:auto;padding:0}
+
+/* KV Store */
+.kv-entry{padding:var(--sp3);border:1px solid var(--bd);border-radius:var(--r-sm);margin-bottom:var(--sp2)}
+.kv-entry .key{font:500 12px var(--mono);color:var(--cy)}
+.kv-entry .val-preview{font-size:12px;color:var(--tx2);margin-top:2px;max-height:60px;overflow:hidden}
+.kv-entry .meta{font-size:10px;color:var(--tx3);margin-top:var(--sp1);display:flex;gap:var(--sp3)}
+
+/* Access policy badges */
+.policy{display:inline-flex;align-items:center;gap:3px;padding:1px 7px;font:600 9px var(--sans);text-transform:uppercase;letter-spacing:.5px;border-radius:var(--r-full);border:1px solid}
+.policy-signed{color:var(--gn);border-color:var(--gn);background:var(--gn-dim)}
+.policy-allowlisted{color:var(--am);border-color:var(--am);background:var(--am-dim)}
+.policy-encrypted{color:var(--vt);border-color:var(--vt);background:var(--vt-dim)}
+
+/* Contacts/People */
+.person-group{margin-bottom:var(--sp5)}
+.person-header{display:flex;align-items:center;gap:var(--sp3);padding:var(--sp3);cursor:pointer;border-radius:var(--r-sm);transition:background var(--t-fast)}
+.person-header:hover{background:rgba(255,255,255,.02)}
+.person-header .user-name{font:600 13px var(--sans);color:var(--lv)}
+.person-agents{padding-left:var(--sp6)}
+.agent-row{display:flex;align-items:center;gap:var(--sp3);padding:var(--sp2) var(--sp3);border-radius:var(--r-sm);cursor:pointer;font-size:12px;transition:background var(--t-fast)}
+.agent-row:hover{background:rgba(255,255,255,.02)}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION 5: ABOUT PAGE
+   ═══════════════════════════════════════════════════════════════════ */
+.about-hero{position:relative;padding:60px var(--sp8) 40px;text-align:center;overflow:hidden}
+.about-hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 30% 20%,rgba(0,212,255,.08) 0%,transparent 50%),radial-gradient(ellipse at 70% 80%,rgba(16,185,129,.06) 0%,transparent 50%),radial-gradient(ellipse at 50% 50%,rgba(139,92,246,.04) 0%,transparent 60%);animation:meshFloat 20s ease-in-out infinite}
+.about-hero h1{font:700 36px var(--display);color:var(--cy);margin-bottom:var(--sp3);position:relative}
+.about-hero .tagline{font:300 18px var(--sans);color:var(--tx2);max-width:480px;margin:0 auto;position:relative}
+.about-section{padding:var(--sp6) var(--sp8);max-width:700px;margin:0 auto}
+.about-section h2{font:600 20px var(--display);color:var(--tx);margin-bottom:var(--sp3)}
+.about-section p{color:var(--tx2);line-height:1.7;margin-bottom:var(--sp4);font-size:14px}
+.about-section strong{color:var(--tx);font-weight:600}
+.about-cards{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp4);margin:var(--sp5) 0}
+.about-card{background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r-md);padding:var(--sp5);transition:all var(--t-norm)}
+.about-card:hover{border-color:var(--cy);transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.3)}
+.about-card .icon{font-size:24px;margin-bottom:var(--sp3)}
+.about-card h3{font:600 14px var(--display);color:var(--tx);margin-bottom:var(--sp2);text-transform:none;letter-spacing:0}
+.about-card p{font-size:12px;color:var(--tx2);line-height:1.5}
+.about-cta{text-align:center;padding:var(--sp8)}
+.about-cta a{display:inline-flex;align-items:center;gap:var(--sp2);padding:12px 28px;background:var(--cy);color:var(--bg);font:600 14px var(--sans);border-radius:var(--r-md);text-decoration:none;transition:all var(--t-fast)}
+.about-cta a:hover{opacity:.88;box-shadow:0 0 24px var(--cy-glow);text-decoration:none;transform:translateY(-1px)}
+.coming-soon{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;font:600 9px var(--sans);text-transform:uppercase;letter-spacing:.5px;color:var(--vt);border:1px solid var(--vt);background:var(--vt-dim);border-radius:var(--r-full)}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION 6: ANIMATIONS
+   ═══════════════════════════════════════════════════════════════════ */
+@keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes scaleIn{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:scale(1)}}
+@keyframes meshFloat{0%,100%{opacity:.7}50%{opacity:1}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+@keyframes glow{0%,100%{box-shadow:0 0 4px var(--cy-glow)}50%{box-shadow:0 0 12px var(--cy-glow)}}
+.animate-in{animation:fadeIn .3s ease-out}
+.pulse{animation:pulse 2s ease-in-out infinite}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION 7: DETAIL PANEL
+   ═══════════════════════════════════════════════════════════════════ */
+.detail-header{padding:var(--sp4);border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between}
+.detail-header h3{font:600 13px var(--sans);color:var(--tx);text-transform:none;letter-spacing:0;margin:0}
+.detail-close{cursor:pointer;font-size:18px;color:var(--tx3);padding:4px;border:none}
+.detail-close:hover{color:var(--tx)}
+.detail-body{padding:var(--sp4)}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION 8: STATUS BAR
+   ═══════════════════════════════════════════════════════════════════ */
+#statusbar .dot{width:7px;height:7px;border-radius:50%;background:var(--rd);flex-shrink:0;transition:background var(--t-fast)}
+#statusbar .dot.on{background:var(--gn);animation:glow 3s ease-in-out infinite}
+#statusbar .aid{font:11px var(--mono);color:var(--cy);cursor:pointer;opacity:.7}
+#statusbar .aid:hover{opacity:1}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION 9: RESPONSIVE
+   ═══════════════════════════════════════════════════════════════════ */
+@media(max-width:1200px){
+  #app{grid-template-columns:var(--sidebar-min) 1fr 0px}
+  #app.detail-open{grid-template-columns:var(--sidebar-min) 1fr var(--detail)}
+  #sidebar .sb-logo span,#sidebar .sb-identity .name,#sidebar .sb-identity .chain,
+  .sb-section-title span,.sb-section-title button,
+  .sb-item span:not(.icon):not(.dot),.sb-item .badge-count,.sb-sub{display:none}
+  .sb-item{padding-left:0;justify-content:center}
+  .sb-identity{text-align:center}
+  .sb-identity .aid{font-size:9px}
 }
+@media(max-width:700px){
+  #app{grid-template-columns:1fr!important;grid-template-rows:1fr 32px!important}
+  #app.collapsed{grid-template-columns:1fr!important}
+  #app.detail-open{grid-template-columns:1fr!important}
+  #sidebar{position:fixed;left:-300px;top:0;bottom:0;width:280px;z-index:100;transition:left var(--t-slow);border-right:1px solid var(--bd)}
+  #sidebar.open{left:0;box-shadow:4px 0 24px rgba(0,0,0,.5)}
+  #main{grid-row:1!important;grid-column:1!important}
+  #detail{position:fixed;right:0;top:0;bottom:32px;width:100%;z-index:99;background:var(--bg2)}
+  #hamburger{display:block}
+  .g2,.g3,.g4{grid-template-columns:1fr}
+  .kanban{flex-direction:column}
+  .about-cards{grid-template-columns:1fr}
+  .about-hero h1{font-size:24px}
+  .main-content{padding:var(--sp4);padding-top:48px}
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION 10: ACCESSIBILITY
+   ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════
+   SECTION: LIGHT THEME
+   ═══════════════════════════════════════════════════════════════════ */
+[data-theme="light"]{
+  --bg:#f5f6fa;--bg2:#ffffff;--bg3:#ebedf5;--bg4:#dfe1ec;
+  --bd:#d4d6e0;--bd2:#c0c2d0;
+  --tx:#1a1c2e;--tx2:#4a4d66;--tx3:#7a7d96;
+  --cy:#0090b8;--cy-dim:rgba(0,144,184,.1);--cy-glow:rgba(0,144,184,.2);
+  --gn:#059669;--gn-dim:rgba(5,150,105,.1);
+  --am:#d97706;--am-dim:rgba(217,119,6,.1);
+  --rd:#dc2626;--rd-dim:rgba(220,38,38,.1);
+  --vt:#7c3aed;--vt-dim:rgba(124,58,237,.1);
+  --lv:#6d28d9;--lv-dim:rgba(109,40,217,.1);
+  --pk:#db2777;--pk-dim:rgba(219,39,119,.1);
+  --sk:#0284c7;--og:#ea580c;
+  --glass:rgba(255,255,255,.92);--glass-bd:rgba(0,0,0,.08);--glass-blur:16px;
+}
+[data-theme="light"] .card{box-shadow:0 1px 3px rgba(0,0,0,.06)}
+[data-theme="light"] .modal{box-shadow:0 8px 32px rgba(0,0,0,.12)}
+[data-theme="light"] ::-webkit-scrollbar-thumb{background:var(--bd)}
+[data-theme="light"] .about-hero::before{
+  background:radial-gradient(ellipse at 30% 20%,rgba(0,144,184,.06) 0%,transparent 50%),
+  radial-gradient(ellipse at 70% 80%,rgba(5,150,105,.04) 0%,transparent 50%);
+}
+
+@media(prefers-reduced-motion:reduce){
+  *{animation-duration:0.01ms!important;transition-duration:0.01ms!important}
+}
+:focus-visible{outline:2px solid var(--cy);outline-offset:2px}
+[role="button"]{cursor:pointer}
 </style>
-</head><body>
+</head>
+<body>
+<a href="#main" class="skip-link">Skip to content</a>
+<button id="hamburger" onclick="document.getElementById('sidebar').classList.toggle('open')" aria-label="Toggle navigation">&#9776;</button>
+
 <div id="app">
-<button id="hamburger" onclick="document.querySelector('nav').classList.toggle('open')">☰</button>
-<div id="main">
-<nav id="nav">
-<div class="logo">x0x</div>
-<a href="#" data-tab="overview" class="act" onclick="switchTab(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>Overview</a>
-<a href="#" data-tab="groups" onclick="switchTab(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="7" r="4"/><path d="M5.5 21a6.5 6.5 0 0113 0"/></svg>Groups</a>
-<a href="#" data-tab="workspace" onclick="switchTab(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="1"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></svg>Workspace</a>
-<a href="#" data-tab="messages" onclick="switchTab(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>Messages</a>
-<a href="#" data-tab="swarm" onclick="switchTab(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="8" r="2"/><circle cx="20" cy="8" r="2"/><circle cx="4" cy="16" r="2"/><circle cx="20" cy="16" r="2"/><line x1="6" y1="8" x2="9" y2="11"/><line x1="18" y1="8" x2="15" y2="11"/><line x1="6" y1="16" x2="9" y2="13"/><line x1="18" y1="16" x2="15" y2="13"/></svg>Swarm</a>
-<a href="#" data-tab="drop" onclick="switchTab(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Drop</a>
-<a href="#" data-tab="network" onclick="switchTab(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10A15.3 15.3 0 0112 2z"/></svg>Network</a>
-<a href="#" data-tab="help" onclick="switchTab(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9 9a3 3 0 015.12 1.5c0 1.5-2.12 2-2.12 3.5"/><circle cx="12" cy="17" r=".5"/></svg>Help</a>
-<div class="spacer"></div>
+
+<!-- ═══════════════════════════════════════ SIDEBAR ═══════════════ -->
+<nav id="sidebar" role="navigation" aria-label="Main navigation">
+  <div class="sb-header">
+    <div class="sb-logo">x0x<span>communitas</span></div>
+  </div>
+  <div class="sb-identity" id="sb-identity" onclick="navigate('home')" title="Your identity">
+    <div class="name" id="sb-name">Agent</div>
+    <div class="aid" id="sb-aid">...</div>
+    <div class="chain" id="sb-chain"></div>
+  </div>
+  <div class="sb-section" style="flex:1;overflow-y:auto">
+    <div class="sb-section-title" onclick="toggleSection('spaces')" style="cursor:pointer"><span>Spaces</span><button onclick="event.stopPropagation();showCreateSpace()" title="Create space">+</button></div>
+    <div id="sb-spaces" class="sb-collapsible"></div>
+    <div class="sb-section-title" onclick="toggleSection('dms')" style="cursor:pointer"><span>Direct Messages</span></div>
+    <div id="sb-dms" class="sb-collapsible"></div>
+    <div class="sb-section-title"><span>System</span></div>
+    <div class="sb-item" onclick="navigate('people')"><span class="icon">&#128101;</span><span>People</span></div>
+    <div class="sb-item" onclick="navigate('network')"><span class="icon">&#127760;</span><span>Network</span></div>
+    <div class="sb-item" onclick="navigate('settings')"><span class="icon">&#9881;</span><span>Settings</span></div>
+    <div class="sb-item" onclick="navigate('about')"><span class="icon">&#9432;</span><span>About</span></div>
+  </div>
+  <div class="sb-footer">
+    <button class="sb-collapse" onclick="toggleSidebar()" title="Toggle sidebar">&#9664;</button>
+  </div>
 </nav>
-<div id="content">
 
-<!-- OVERVIEW -->
-<div class="tab act" id="tab-overview">
-<h2>Overview</h2>
-<div class="grid g2 mb" style="grid-template-columns:repeat(4,1fr)" id="ov-stats">
-<div class="card"><div class="label">Status</div><div class="val" id="ov-status">—</div></div>
-<div class="card"><div class="label">Version</div><div class="val" id="ov-version">—</div></div>
-<div class="card"><div class="label">Peers</div><div class="val" id="ov-peers">0</div></div>
-<div class="card"><div class="label">Uptime</div><div class="val" id="ov-uptime">—</div></div>
-</div>
-<h3>Identity</h3>
-<div class="card mb">
-<div class="id-row"><span class="k">Agent ID</span><span class="v" id="ov-aid" onclick="copyText(this)">—</span></div>
-<div class="id-row"><span class="k">Machine ID</span><span class="v" id="ov-mid" onclick="copyText(this)">—</span></div>
-<div class="id-row"><span class="k">User ID</span><span class="v" id="ov-uid" onclick="copyText(this)">—</span></div>
-</div>
-<h3>Your Identity Card</h3>
-<div class="card mb">
-<div class="row"><input id="ov-display-name" placeholder="Your display name" style="max-width:200px" onchange="saveCardName()"><button class="pri" onclick="generateCard()">Generate Card</button><button onclick="copyCardLink()" id="ov-copy-card" style="display:none">Copy Link</button></div>
-<div id="ov-card" style="font-size:10px;color:var(--cy);word-break:break-all;margin-top:8px;user-select:all;cursor:pointer;display:none" onclick="copyCardLink()"></div>
-<div style="font-size:11px;color:var(--dm);margin-top:4px">Set your name once — your card is always available to share. Anyone can import it to find you.</div>
-</div>
-<h3>Import Contact</h3>
-<div class="card mb">
-<div class="row"><input id="ov-import-link" placeholder="Paste x0x://agent/... card link" style="flex:1"><button class="pri" onclick="importCardLink()">Import</button></div>
-<div id="ov-import-result" style="font-size:11px;margin-top:4px;display:none"></div>
-</div>
-<h3>Discovered Agents</h3>
-<table><thead><tr><th>Agent ID</th><th>Addresses</th><th>NAT</th><th>Seen</th></tr></thead><tbody id="ov-agents"></tbody></table>
-</div>
+<!-- ═══════════════════════════════════════ MAIN ══════════════════ -->
+<main id="main" role="main">
+  <div class="main-content" id="view-container"></div>
+</main>
 
-<!-- GROUPS -->
-<div class="tab" id="tab-groups">
-<h2>Groups</h2>
-<div class="row mb">
-<input id="grp-name" placeholder="Group name"><button class="pri" onclick="createGroup()">Create</button>
-</div>
-<div class="row mb">
-<input id="grp-invite-code" placeholder="Paste invite code"><button onclick="joinGroup()">Join</button>
-</div>
-<h3>My Groups</h3>
-<div id="grp-list"></div>
-</div>
+<!-- ═══════════════════════════════════════ DETAIL ════════════════ -->
+<aside id="detail" role="complementary" aria-label="Details">
+  <div id="detail-content"></div>
+</aside>
 
-<!-- WORKSPACE -->
-<div class="tab" id="tab-workspace">
-<h2>Workspace</h2>
-<div style="font-size:11px;color:var(--dm);margin-bottom:12px">Select a group to access its workspace. <strong style="color:var(--cy)">Chat</strong> for real-time group messaging via gossip. <strong style="color:var(--cy)">Board</strong> for collaborative kanban with CRDT-synced tasks. <strong style="color:var(--cy)">Files</strong> for P2P file sharing with group members.</div>
-<div class="row mb">
-<select id="ws-group" onchange="wsGroupChanged()"><option value="">Select group…</option></select>
-</div>
-<div class="sub-tabs" id="ws-sub-tabs">
-<button class="act" onclick="wsSub(this,'ws-chat')">Chat</button>
-<button onclick="wsSub(this,'ws-board')">Board</button>
-<button onclick="wsSub(this,'ws-files')">Files</button>
-</div>
-<div class="sub-panel act" id="ws-chat">
-<div class="chat-wrap"><div class="chat-msgs" id="ws-msgs"></div>
-<div class="chat-input"><input id="ws-msg-in" placeholder="Message…" onkeydown="if(event.key==='Enter')wsSend()"><button class="pri" onclick="wsSend()">Send</button></div></div>
-</div>
-<div class="sub-panel" id="ws-board">
-<div class="row"><input id="ws-task-in" placeholder="New task…"><button class="pri" onclick="wsAddTask()">Add</button></div>
-<div class="kanban">
-<div class="kanban-col"><div class="col-hd">To Do</div><div class="col-body" id="kb-todo"></div></div>
-<div class="kanban-col"><div class="col-hd">In Progress</div><div class="col-body" id="kb-wip"></div></div>
-<div class="kanban-col"><div class="col-hd">Done</div><div class="col-body" id="kb-done"></div></div>
-</div>
-</div>
-<div class="sub-panel" id="ws-files">
-<div class="row"><input type="file" id="ws-file-in"><button class="pri" onclick="wsFileSend()">Send to Group</button></div>
-<h3>Transfers</h3>
-<table><thead><tr><th>File</th><th>Dir</th><th>Status</th><th>Progress</th></tr></thead><tbody id="ws-transfers"></tbody></table>
-</div>
-</div>
+<!-- ═══════════════════════════════════════ STATUS ════════════════ -->
+<footer id="statusbar" role="status">
+  <span class="dot" id="st-dot"></span>
+  <span id="st-conn">Connecting</span>
+  <span id="st-peers">0 peers</span>
+  <span class="aid" id="st-aid" onclick="copyId(this)" title="Click to copy">...</span>
+  <div style="flex:1"></div>
+  <span id="st-ver">x0x communitas</span>
+</footer>
 
-<!-- MESSAGES -->
-<div class="tab" id="tab-messages">
-<h2>Direct Messages</h2>
-<div style="font-size:11px;color:var(--dm);margin-bottom:12px">Private point-to-point messages via QUIC. Import someone's identity card on the Overview tab — they'll appear here as a contact you can message directly.</div>
-<div class="contacts-wrap">
-<div class="contact-list" id="dm-contacts"></div>
-<div class="dm-area">
-<div id="dm-header" style="padding-bottom:8px;border-bottom:1px solid var(--bd);margin-bottom:8px;font-size:12px;color:var(--dm)">Select a contact</div>
-<div class="chat-wrap"><div class="chat-msgs" id="dm-msgs"></div>
-<div class="chat-input"><input id="dm-msg-in" placeholder="Message…" onkeydown="if(event.key==='Enter')dmSend()"><button class="pri" onclick="dmSend()">Send</button></div></div>
-</div>
-</div>
-</div>
-
-<!-- SWARM -->
-<div class="tab" id="tab-swarm">
-<h2>Swarm</h2>
-<div style="font-size:11px;color:var(--dm);margin-bottom:12px">Delegate tasks to agents on the network. Post a task with capability tags — agents that match can claim it, do the work, and return results. All coordination happens via gossip pub/sub. This is the AI-to-AI collaboration demo.</div>
-<div class="row mb">
-<input id="sw-task" placeholder="Task description" style="flex:2">
-<input id="sw-caps" placeholder="Capabilities (comma-sep)">
-<button class="pri" onclick="swPost()">Post Task</button>
-</div>
-<div class="grid g2">
-<div><h3>Live Feed</h3><div class="feed" id="sw-feed"></div></div>
-<div><h3>Agent Roster</h3><table><thead><tr><th>Agent</th><th>Status</th><th>Task</th></tr></thead><tbody id="sw-roster"></tbody></table></div>
-</div>
-</div>
-
-<!-- DROP -->
-<div class="tab" id="tab-drop">
-<h2>Drop</h2>
-<div style="font-size:11px;color:var(--dm);margin-bottom:12px">P2P file sharing — like AirDrop over the internet. Select a recipient from discovered agents, drop a file, and it transfers directly via QUIC with SHA-256 integrity verification. No server in the middle.</div>
-<div class="row mb">
-<select id="drop-target"><option value="">Select recipient…</option></select>
-</div>
-<div class="drop-zone" id="drop-zone" onclick="document.getElementById('drop-file').click()">
-Drop file here or click to select
-<input type="file" id="drop-file" style="display:none" onchange="dropFileSelected(this)">
-</div>
-<div id="drop-hash" style="font-size:11px;color:var(--dm);margin-top:8px"></div>
-<h3>Incoming</h3>
-<div id="drop-incoming"></div>
-<h3>Transfers</h3>
-<table><thead><tr><th>File</th><th>To/From</th><th>Status</th><th>Hash</th></tr></thead><tbody id="drop-transfers"></tbody></table>
-</div>
-
-<!-- NETWORK -->
-<div class="tab" id="tab-network">
-<h2>Network</h2>
-<div class="grid g3 mb" id="net-stats">
-<div class="card"><div class="label">Direct</div><div class="val" id="net-direct">0</div></div>
-<div class="card"><div class="label">Relayed</div><div class="val" id="net-relayed">0</div></div>
-<div class="card"><div class="label">Avg RTT</div><div class="val" id="net-rtt">—</div></div>
-</div>
-<h3>External Addresses</h3>
-<div id="net-addrs" class="card mb" style="font-size:12px">—</div>
-<h3>Peers</h3>
-<table><thead><tr><th>Peer ID</th><th>Address</th><th>RTT</th><th>State</th></tr></thead><tbody id="net-peers"></tbody></table>
-<h3 class="mt">Contacts</h3>
-<table><thead><tr><th>Agent ID</th><th>Trust</th><th>Identity</th><th>Machines</th></tr></thead><tbody id="net-contacts"></tbody></table>
-</div>
-
-<!-- HELP -->
-<div class="tab" id="tab-help">
-<h2>Help</h2>
-<div class="card mb">
-<p style="margin-bottom:8px"><strong style="color:var(--cy)">x0x</strong> is an agent-to-agent gossip network for AI systems. Post-quantum encrypted, NAT-traversing, zero-config.</p>
-<p style="color:var(--dm)">This GUI talks to a local x0xd daemon via REST + WebSocket. Any HTML file that calls the same API is an x0x app.</p>
-</div>
-<h3>CLI Reference</h3>
-<table class="help-tbl"><tbody>
-<tr><td>x0x start</td><td>Start x0xd daemon</td></tr>
-<tr><td>x0x health</td><td>Check daemon health</td></tr>
-<tr><td>x0x agent</td><td>Show agent/machine/user IDs</td></tr>
-<tr><td>x0x contacts</td><td>List contacts with trust levels</td></tr>
-<tr><td>x0x publish &lt;topic&gt; &lt;msg&gt;</td><td>Publish to gossip topic</td></tr>
-<tr><td>x0x direct send &lt;id&gt; &lt;msg&gt;</td><td>Send direct message</td></tr>
-<tr><td>x0x groups list</td><td>List MLS groups</td></tr>
-<tr><td>x0x groups create &lt;name&gt;</td><td>Create encrypted group</td></tr>
-<tr><td>x0x tasks</td><td>Manage CRDT task lists</td></tr>
-<tr><td>x0x routes</td><td>Print all 50+ API endpoints</td></tr>
-<tr><td>x0x autostart on|off</td><td>Enable/disable launch at login</td></tr>
-</tbody></table>
-<h3>Example Apps</h3>
-<table class="help-tbl"><tbody>
-<tr><td>Swarm Dispatch</td><td>Post tasks with capability tags, agents claim and return results via gossip</td></tr>
-<tr><td>Encrypted Chat</td><td>MLS group messaging with forward secrecy and post-quantum key exchange</td></tr>
-<tr><td>P2P File Drop</td><td>Drag-and-drop file transfer with SHA-256 verification, NAT traversal</td></tr>
-<tr><td>Collaborative Board</td><td>CRDT-backed kanban board that syncs across agents in a group</td></tr>
-<tr><td>Agent Directory</td><td>Browse discovered agents, their capabilities, NAT type, and trust level</td></tr>
-</tbody></table>
-<p class="mt" style="font-size:11px;color:var(--dm)">Any HTML file that calls the x0xd REST API or connects to its WebSocket is a valid x0x app. No SDK needed.</p>
-</div>
-
-</div><!-- /content -->
-</div><!-- /main -->
-
-<div id="status">
-<span class="dot" id="st-dot"></span>
-<span id="st-conn">Disconnected</span>
-<span id="st-peers">0 peers</span>
-<span class="aid" id="st-aid" onclick="copyText(this)">—</span>
-<div style="flex:1"></div>
-<span id="st-ver">x0x</span>
-</div>
 </div><!-- /app -->
 
-<script>
-const B=document.location.origin,W=B.replace(/^http/,'ws')+'/ws';
-let ws,myAgentId='',wsConnected=false,dmTarget='',wsGroup='',wsGroupChatTopic='',boardListId='';
-let seenMsgIds=new Set(),swarmTasks={},swarmRoster={},allContacts=[];
+<div id="toasts" aria-live="polite"></div>
 
-// --- NAV ---
-function switchTab(el){
-  document.querySelectorAll('nav a').forEach(a=>a.classList.remove('act'));
-  el.classList.add('act');
-  document.querySelectorAll('.tab').forEach(d=>{d.classList.toggle('act',d.id==='tab-'+el.dataset.tab)});
-  document.querySelector('nav').classList.remove('open');
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 1: STATE MANAGEMENT
+   ═══════════════════════════════════════════════════════════════════ */
+const S={_d:{},_l:new Map(),
+  get(k){return this._d[k]},
+  set(k,v){this._d[k]=v;(this._l.get(k)||[]).forEach(fn=>fn(v))},
+  on(k,fn){if(!this._l.has(k))this._l.set(k,[]);this._l.get(k).push(fn)},
+  update(k,fn){this.set(k,fn(this._d[k]))}
+};
+// Initialize state
+S.set('view','home');S.set('spaceId','');S.set('spaceApp','chat');
+S.set('channel','general');S.set('threadId','');
+S.set('dmTarget','');S.set('connected',false);S.set('agentId','');
+S.set('machineId','');S.set('userId','');S.set('groups',[]);
+S.set('contacts',[]);S.set('discovered',[]);S.set('sidebarCollapsed',false);
+S.set('detailOpen',false);S.set('detailType','');S.set('detailData',null);
+
+// Channel metadata cache: { spaceId: [{ name, description, creator, topic, ... }] }
+const channelCache={};
+// Thread metadata cache: { msgId: { parent_msg_id, parent_text, reply_count, participants, topic } }
+const threadCache={};
+
+// LocalStorage helpers
+const LS={
+  get(k,def){try{const v=localStorage.getItem('x0x_v2_'+k);return v?JSON.parse(v):def}catch(e){return def}},
+  set(k,v){try{localStorage.setItem('x0x_v2_'+k,JSON.stringify(v))}catch(e){}},
+  del(k){try{localStorage.removeItem('x0x_v2_'+k)}catch(e){}}
+};
+
+// Restore preferences
+if(LS.get('sidebar_collapsed',false)){S.set('sidebarCollapsed',true);document.getElementById('app').classList.add('collapsed')}
+const savedName=LS.get('display_name','');
+const savedCard=LS.get('card_link','');
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 2: API & WEBSOCKET
+   ═══════════════════════════════════════════════════════════════════ */
+const BASE=location.origin;
+const WS_URL=BASE.replace(/^http/,'ws')+'/ws';
+let ws=null;
+const wsSubs=new Set();
+
+async function api(path,opt){
+  try{
+    const r=await fetch(BASE+path,{...opt,headers:{'Content-Type':'application/json',...(opt||{}).headers}});
+    return r.json();
+  }catch(e){return null}
 }
 
-// --- UTIL ---
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
-function copyText(el){navigator.clipboard.writeText(el.textContent).then(()=>{const o=el.style.color;el.style.color='var(--gn)';setTimeout(()=>el.style.color=o,600)})}
-function short(s){return s?s.substring(0,10)+'…':'—'}
-async function api(path,opt){try{const r=await fetch(B+path,{...opt,headers:{'Content-Type':'application/json',...(opt||{}).headers}});return r.json()}catch{return null}}
-function b64e(obj){return btoa(unescape(encodeURIComponent(JSON.stringify(obj))))}
-function b64d(s){try{return JSON.parse(decodeURIComponent(escape(atob(s))))}catch{return null}}
-function fmtUp(s){if(!s&&s!==0)return'—';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return(h?h+'h ':'')+(m+'m')}
-function trustBadge(t){const m={Trusted:'gn',Known:'cy',Unknown:'dm',Blocked:'rd'};return '<span class="badge '+(m[t]||'dm')+'">'+(t||'Unknown')+'</span>'}
-
-// --- WEBSOCKET ---
 function wsConnect(){
   if(ws&&ws.readyState<2)return;
-  try{ws=new WebSocket(W)}catch{setTimeout(wsConnect,3000);return}
-  ws.onopen=()=>{wsConnected=true;updStatus()};
-  ws.onclose=()=>{wsConnected=false;updStatus();setTimeout(wsConnect,3000)};
+  try{ws=new WebSocket(WS_URL)}catch(e){setTimeout(wsConnect,3000);return}
+  ws.onopen=()=>{S.set('connected',true);wsSubs.forEach(t=>wsSend({type:'subscribe',topics:[t]}))};
+  ws.onclose=()=>{S.set('connected',false);setTimeout(wsConnect,3000)};
   ws.onerror=()=>{};
-  ws.onmessage=e=>{try{handleWsMsg(JSON.parse(e.data))}catch(_){}};
+  ws.onmessage=e=>{try{handleWsMsg(JSON.parse(e.data))}catch(e){}};
 }
-function wsSubs(topics){if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'subscribe',topics:Array.isArray(topics)?topics:[topics]}))}
-function wsPub(topic,obj){if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'publish',topic,payload:b64e(obj)}))}
+function wsSend(obj){if(ws&&ws.readyState===1)ws.send(JSON.stringify(obj))}
+function wsSub(topic){wsSubs.add(topic);wsSend({type:'subscribe',topics:[topic]})}
+function wsPub(topic,obj){wsSend({type:'publish',topic,payload:b64e(obj)})}
+function b64e(o){return btoa(unescape(encodeURIComponent(JSON.stringify(o))))}
+function b64d(s){try{return JSON.parse(decodeURIComponent(escape(atob(s))))}catch(e){return null}}
+
 function handleWsMsg(m){
-  if(m.type==='connected'){myAgentId=m.agent_id||'';updStatus();wsSubs(['x0x-swarm/tasks','x0x-swarm/results']);return}
+  if(m.type==='connected'){S.set('agentId',m.agent_id||'');wsSub('x0x-swarm/tasks');wsSub('x0x-swarm/results');return}
   if(m.type==='direct_message'){
-    const data=b64d(m.payload);
-    if(data&&data.text)addDm(m.sender||'',data.sender_name||short(m.sender),data.text,false);
+    const d=b64d(m.payload);
+    if(d&&d.text)onDirectMessage(m.sender||'',d);
     return;
   }
   if(m.type==='message'){
-    if(m.origin===myAgentId)return;
-    if(wsGroupChatTopic&&m.topic===wsGroupChatTopic){
-      const data=b64d(m.payload);
-      if(data&&data.text)addWsChat(data.sender_name||short(m.origin),data.text,false);
-    }
-    if(m.topic==='x0x-swarm/tasks'){const d=b64d(m.payload);if(d)swarmIngest('task',d)}
-    if(m.topic==='x0x-swarm/results'){const d=b64d(m.payload);if(d)swarmIngest('result',d)}
+    if(m.origin===S.get('agentId'))return;
+    onGossipMessage(m.topic,m.origin,b64d(m.payload));
   }
 }
-function updStatus(){
-  document.getElementById('st-dot').classList.toggle('on',wsConnected);
-  document.getElementById('st-conn').textContent=wsConnected?'Connected':'Disconnected';
-  document.getElementById('st-aid').textContent=myAgentId?'agent:'+short(myAgentId):'—';
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 3: ROUTER & UTILS
+   ═══════════════════════════════════════════════════════════════════ */
+function navigate(view,data){
+  S.set('view',view);
+  if(data)Object.entries(data).forEach(([k,v])=>S.set(k,v));
+  renderView();
+  updateSidebarActive();
+  document.getElementById('sidebar').classList.remove('open');
+}
+function navigateSpace(id,app){navigate('space',{spaceId:id,spaceApp:app||'chat'})}
+function navigateDm(agentId){navigate('dm',{dmTarget:agentId})}
+
+// Utility
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function short(s,n){return s?(s.substring(0,n||10)+'…'):'—'}
+function copyId(el){navigator.clipboard.writeText(el.textContent.replace('agent:','').replace('…','')).then(()=>toast('Copied to clipboard','info'))}
+function copyText(text){navigator.clipboard.writeText(text).then(()=>toast('Copied','info'))}
+function fmtTime(ts){return ts?new Date(typeof ts==='number'&&ts<1e12?ts*1000:ts).toLocaleTimeString():'—'}
+function fmtDate(ts){return ts?new Date(typeof ts==='number'&&ts<1e12?ts*1000:ts).toLocaleDateString():'—'}
+function fmtUp(s){if(!s&&s!==0)return'—';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return(h?h+'h ':'')+(m+'m')}
+function trustClass(t){return'trust trust-'+(t||'unknown').toLowerCase()}
+function trustHtml(t){const sym={Trusted:'&#10003;&#10003;',Known:'&#10003;',Unknown:'?',Blocked:'&#10007;'};return '<span class="'+trustClass(t)+'">'+(sym[t]||'?')+' '+(t||'Unknown')+'</span>'}
+function policyHtml(p){if(!p)return'';const t=typeof p==='string'?p:p.type||'Signed';const c=t.toLowerCase();return '<span class="policy policy-'+c+'">'+(c==='encrypted'?'&#128274; ':'')+t+'</span>'}
+function presenceHtml(online){return '<span class="presence '+(online?'online':'offline')+'"></span>'}
+
+function toast(msg,type){
+  const el=document.createElement('div');
+  el.className='toast '+(type||'info');
+  el.textContent=msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(()=>el.remove(),4000);
 }
 
-// --- OVERVIEW ---
+function showDetail(type,data){
+  S.set('detailOpen',true);S.set('detailType',type);S.set('detailData',data);
+  document.getElementById('app').classList.add('detail-open');
+  renderDetail();
+}
+function hideDetail(){
+  S.set('detailOpen',false);
+  document.getElementById('app').classList.remove('detail-open');
+  document.getElementById('detail-content').innerHTML='';
+}
+
+function toggleSection(id){
+  const el=document.getElementById('sb-'+id);
+  if(el)el.classList.toggle('collapsed');
+}
+
+function toggleSidebar(){
+  const c=!S.get('sidebarCollapsed');
+  S.set('sidebarCollapsed',c);
+  document.getElementById('app').classList.toggle('collapsed',c);
+  LS.set('sidebar_collapsed',c);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 3B: CHANNELS & THREADS
+   ═══════════════════════════════════════════════════════════════════ */
+function getSpaceChannels(spaceId){
+  if(channelCache[spaceId])return channelCache[spaceId];
+  // Default: just #general. Will be hydrated from KvStore.
+  return [{name:'general',description:'General discussion',creator:'',topic:getChannelTopic(spaceId,'general')}];
+}
+
+function getChannelTopic(spaceId,channelName){
+  return 'x0x.group.'+spaceId.slice(0,16)+'.chat/'+channelName;
+}
+
+function getThreadTopic(spaceId,msgId){
+  return 'x0x.group.'+spaceId.slice(0,16)+'.thread/'+msgId;
+}
+
+function navigateChannel(spaceId,channelName){
+  S.set('channel',channelName);
+  navigate('space',{spaceId,spaceApp:'chat'});
+}
+
+function showCreateChannel(spaceId){
+  const m=showModal(`<h2>Create Channel</h2>
+    <input id="modal-chan-name" placeholder="channel-name (lowercase)" style="width:100%;margin-bottom:8px">
+    <input id="modal-chan-desc" placeholder="Description (optional)" style="width:100%;margin-bottom:12px">
+    <div class="actions">
+      <button onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+      <button class="pri" onclick="createChannel('${spaceId}')">Create</button>
+    </div>`);
+  setTimeout(()=>document.getElementById('modal-chan-name').focus(),100);
+}
+
+async function createChannel(spaceId){
+  const nameRaw=document.getElementById('modal-chan-name').value.trim();
+  const desc=document.getElementById('modal-chan-desc').value.trim();
+  const name=nameRaw.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/^-+|-+$/g,'');
+  if(!name)return;
+  const channel={name,description:desc||'',creator:S.get('agentId'),created_at:Date.now(),topic:getChannelTopic(spaceId,name)};
+  // Store in KvStore
+  const storeId='x0x-channels-'+spaceId.slice(0,16);
+  const stores=await api('/stores');
+  if(!(stores&&stores.stores||[]).find(s=>s.id===storeId)){
+    await api('/stores',{method:'POST',body:JSON.stringify({name:'Channels',topic:storeId})});
+  }
+  // Read existing channels, add new one
+  const existing=await api('/stores/'+storeId+'/channels_index');
+  let channels=[];
+  if(existing&&existing.value){try{channels=JSON.parse(atob(existing.value))}catch(e){}}
+  channels.push(channel);
+  await api('/stores/'+storeId+'/channels_index',{method:'PUT',body:JSON.stringify({value:btoa(JSON.stringify(channels)),content_type:'application/json'})});
+  channelCache[spaceId]=channels;
+  document.querySelector('.modal-overlay').remove();
+  toast('Channel #'+name+' created','success');
+  navigateChannel(spaceId,name);
+}
+
+async function loadSpaceChannels(spaceId){
+  const storeId='x0x-channels-'+spaceId.slice(0,16);
+  const r=await api('/stores/'+storeId+'/channels_index');
+  if(r&&r.value){
+    try{
+      const channels=JSON.parse(atob(r.value));
+      channelCache[spaceId]=channels;
+      return channels;
+    }catch(e){}
+  }
+  // Default channel
+  const defaults=[{name:'general',description:'General discussion',creator:'',topic:getChannelTopic(spaceId,'general')}];
+  channelCache[spaceId]=defaults;
+  return defaults;
+}
+
+// Thread helpers
+function getThreadMeta(msgId){return threadCache[msgId]||null}
+
+function openThread(spaceId,msg){
+  const threadTopic=getThreadTopic(spaceId,msg.id);
+  wsSub(threadTopic);
+  S.set('threadId',msg.id);
+  showDetail('thread',{spaceId,parentMsg:msg,topic:threadTopic});
+}
+
+function generateMsgId(){return crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)}
+
+// Message cache for thread lookups
+const msgCache={};
+function cacheMsg(m){if(m&&m.id)msgCache[m.id]=m}
+
+function openThreadById(spaceId,msgId){
+  const m=msgCache[msgId]||{id:msgId,text:'(loading...)',sender_name:'',sender_id:'',timestamp:Date.now()};
+  openThread(spaceId,m);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 4: SIDEBAR RENDERING
+   ═══════════════════════════════════════════════════════════════════ */
+function renderSidebar(){
+  const groups=S.get('groups')||[];
+  const contacts=S.get('contacts')||[];
+  const sid=S.get('spaceId');
+  const sapp=S.get('spaceApp');
+  const dmt=S.get('dmTarget');
+
+  // Identity
+  const aid=S.get('agentId');
+  const uid=S.get('userId');
+  document.getElementById('sb-name').textContent=LS.get('display_name','')||'Agent';
+  document.getElementById('sb-aid').textContent=aid?short(aid,12):'...';
+  document.getElementById('sb-chain').textContent=uid?'User \u00b7 Agent \u00b7 Machine':'Agent \u00b7 Machine';
+
+  // Spaces — sort by last activity (most recent first)
+  const sortedGroups=[...groups].sort((a,b)=>(b.created_at||0)-(a.created_at||0));
+  let sh='';
+  sortedGroups.forEach(g=>{
+    const active=S.get('view')==='space'&&sid===g.group_id;
+    sh+='<div class="sb-item'+(active?' active':'')+'" onclick="navigateSpace(\''+g.group_id+'\',\'chat\')" title="'+esc(g.name||'Space')+'">';
+    sh+='<span class="dot" style="background:var(--gn)"></span>';
+    sh+='<span>'+esc(g.name||short(g.group_id))+'</span>';
+    sh+='</div>';
+    if(active){
+      sh+='<div class="sb-sub">';
+      // Channels for this space
+      const channels=getSpaceChannels(g.group_id);
+      const curChan=S.get('channel')||'general';
+      channels.forEach(ch=>{
+        const chActive=sapp==='chat'&&curChan===ch.name;
+        const unread=LS.get('unread_ch_'+g.group_id+'_'+ch.name,0);
+        sh+='<div class="channel-item'+(chActive?' active':'')+'" onclick="navigateChannel(\''+g.group_id+'\',\''+esc(ch.name)+'\')">';
+        sh+='<span class="hash">#</span><span>'+esc(ch.name)+'</span>';
+        if(unread>0)sh+='<span class="unread">'+unread+'</span>';
+        sh+='</div>';
+      });
+      sh+='<div class="channel-item" onclick="showCreateChannel(\''+g.group_id+'\')" style="color:var(--tx3)"><span class="hash">+</span><span>Add channel</span></div>';
+      // Other apps
+      const appIcons={board:'&#128203;',files:'&#128193;',swarm:'&#128029;',feed:'&#128240;',wiki:'&#128214;',web:'&#127760;'};
+      const apps=['board','files','swarm','feed','wiki','web'];
+      apps.forEach(a=>{
+        sh+='<div class="sb-item'+(sapp===a?' active':'')+'" onclick="navigateSpace(\''+g.group_id+'\',\''+a+'\')">';
+        sh+='<span class="icon">'+appIcons[a]+'</span><span>'+a.charAt(0).toUpperCase()+a.slice(1)+'</span></div>';
+      });
+      sh+='</div>';
+    }
+  });
+  document.getElementById('sb-spaces').innerHTML=sh||'<div style="padding:4px 20px;font-size:11px;color:var(--tx3)">No spaces yet</div>';
+
+  // DMs — sort by last seen (most recent first)
+  let dh='';
+  const sortedContacts=[...contacts].filter(c=>c.trust_level!=='Blocked').sort((a,b)=>(b.last_seen||0)-(a.last_seen||0)).slice(0,20);
+  sortedContacts.forEach(c=>{
+    const active=S.get('view')==='dm'&&dmt===c.agent_id;
+    const unread=LS.get('unread_'+c.agent_id,0);
+    dh+='<div class="sb-item'+(active?' active':'')+'" onclick="navigateDm(\''+c.agent_id+'\')" title="'+esc(c.label||c.agent_id)+'">';
+    dh+=presenceHtml(false);
+    dh+='<span>'+(c.label||short(c.agent_id))+'</span>';
+    if(unread>0)dh+='<span class="badge-count">'+unread+'</span>';
+    dh+='</div>';
+  });
+  document.getElementById('sb-dms').innerHTML=dh||'<div style="padding:4px 20px;font-size:11px;color:var(--tx3)">No contacts</div>';
+}
+
+function updateSidebarActive(){
+  document.querySelectorAll('#sidebar .sb-item').forEach(el=>{
+    // Active state handled by full re-render
+  });
+  renderSidebar();
+}
+
+// Status bar
+S.on('connected',v=>{
+  document.getElementById('st-dot').classList.toggle('on',v);
+  document.getElementById('st-conn').textContent=v?'Connected':'Disconnected';
+});
+S.on('agentId',v=>{
+  document.getElementById('st-aid').textContent=v?'agent:'+short(v,8):'...';
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 5: VIEW RENDERER
+   ═══════════════════════════════════════════════════════════════════ */
+function renderView(){
+  const view=S.get('view');
+  const el=document.getElementById('view-container');
+  el.className='main-content animate-in';
+  switch(view){
+    case 'home':el.innerHTML=renderHome();mountHome();break;
+    case 'space':el.innerHTML=renderSpace();mountSpace();break;
+    case 'dm':el.innerHTML=renderDm();mountDm();break;
+    case 'people':el.innerHTML=renderPeople();mountPeople();break;
+    case 'network':el.innerHTML=renderNetwork();mountNetwork();break;
+    case 'settings':el.innerHTML=renderSettings();mountSettings();break;
+    case 'about':el.innerHTML=renderAbout();break;
+    default:el.innerHTML=renderHome();mountHome();
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 6: HOME VIEW
+   ═══════════════════════════════════════════════════════════════════ */
+function renderHome(){
+  return `<h2>Dashboard</h2>
+<div class="grid g4 mb2" id="home-stats">
+  <div class="card stat-card"><div class="label">Status</div><div class="val" id="h-status">—</div></div>
+  <div class="card stat-card"><div class="label">Version</div><div class="val" id="h-version">—</div></div>
+  <div class="card stat-card"><div class="label">Peers</div><div class="val" id="h-peers">0</div></div>
+  <div class="card stat-card"><div class="label">Uptime</div><div class="val" id="h-uptime">—</div></div>
+</div>
+<h3>Identity Chain</h3>
+<div class="card mb2" id="h-identity">
+  <div class="cert-chain" id="h-chain"></div>
+</div>
+<h3>Quick Actions</h3>
+<div class="row mb2">
+  <button class="pri" onclick="showCreateSpace()">Create Space</button>
+  <button onclick="showCardModal()">Generate Card</button>
+  <button onclick="showImportModal()">Import Card</button>
+</div>
+<h3>Discovered Agents</h3>
+<div class="card">
+  <table><thead><tr><th>Agent</th><th>User</th><th>Addresses</th><th>NAT</th><th>Last Seen</th></tr></thead>
+  <tbody id="h-agents"></tbody></table>
+</div>`;
+}
+
+function mountHome(){
+  pollDash();
+}
+
 async function pollDash(){
   const h=await api('/health');
   if(h&&h.ok){
-    document.getElementById('ov-status').textContent=h.status;
-    document.getElementById('ov-status').className='val '+(h.status==='healthy'?'gn':'og');
-    document.getElementById('ov-version').textContent=h.version||'—';
-    document.getElementById('ov-uptime').textContent=fmtUp(h.uptime_secs);
-    document.getElementById('ov-peers').textContent=h.peers!=null?h.peers:0;
+    const se=document.getElementById('h-status');
+    if(se){se.textContent=h.status;se.className='val '+(h.status==='healthy'?'gn':'am')}
+    const ve=document.getElementById('h-version');if(ve)ve.textContent=h.version||'—';
+    const pe=document.getElementById('h-peers');if(pe)pe.textContent=h.peers!=null?h.peers:0;
+    const ue=document.getElementById('h-uptime');if(ue)ue.textContent=fmtUp(h.uptime_secs);
     document.getElementById('st-peers').textContent=(h.peers||0)+' peers';
-    document.getElementById('st-ver').textContent='x0x '+(h.version||'');
+    document.getElementById('st-ver').textContent='x0x communitas '+(h.version||'');
   }
   const a=await api('/agent');
   if(a&&a.ok){
-    if(!myAgentId)myAgentId=a.agent_id||'';
-    document.getElementById('ov-aid').textContent=a.agent_id||'—';
-    document.getElementById('ov-mid').textContent=a.machine_id||'—';
-    document.getElementById('ov-uid').textContent=a.user_id||'none';
-    updStatus();
+    if(!S.get('agentId'))S.set('agentId',a.agent_id||'');
+    S.set('machineId',a.machine_id||'');
+    S.set('userId',a.user_id||'');
+    renderIdentityChain();
   }
   const d=await api('/agents/discovered');
   if(d&&d.agents){
-    document.getElementById('ov-agents').innerHTML=d.agents.map(x=>
-      '<tr><td style="color:var(--cy);cursor:pointer" onclick="copyText(this)">'+short(x.agent_id)+'</td><td>'+(x.addresses||[]).join(', ')+'</td><td>—</td><td>'+(x.last_seen?new Date(x.last_seen*1000).toLocaleTimeString():'—')+'</td></tr>'
-    ).join('')||'<tr><td colspan="4" style="color:var(--dm)">No agents</td></tr>';
-    const sel=document.getElementById('drop-target'),cur=sel.value;
-    sel.innerHTML='<option value="">Select recipient…</option>'+d.agents.map(x=>'<option value="'+x.agent_id+'">'+short(x.agent_id)+'</option>').join('');
-    sel.value=cur;
+    S.set('discovered',d.agents);
+    const tb=document.getElementById('h-agents');
+    if(tb)tb.innerHTML=d.agents.map(x=>`<tr>
+      <td><span class="aid-short" style="cursor:pointer" onclick="showAgentDetail('${x.agent_id}')">${short(x.agent_id)}</span></td>
+      <td>${x.user_id?'<span style="color:var(--lv)">'+short(x.user_id,8)+'</span>':'—'}</td>
+      <td style="font-size:11px">${(x.addresses||[]).join(', ')||'—'}</td>
+      <td>${x.nat_type||'—'}</td>
+      <td>${x.last_seen?fmtTime(x.last_seen):'—'}</td>
+    </tr>`).join('')||'<tr><td colspan="5" style="color:var(--tx3)">No agents discovered</td></tr>';
   }
 }
 
-// --- NETWORK ---
-async function pollNet(){
-  const s=await api('/network/status');
-  if(s&&s.ok){
-    document.getElementById('net-direct').textContent=s.direct_connections||0;
-    document.getElementById('net-relayed').textContent=s.relayed_connections||0;
-    document.getElementById('net-rtt').textContent=s.avg_rtt_ms!=null?Math.round(s.avg_rtt_ms)+'ms':'—';
-    document.getElementById('net-addrs').innerHTML=(s.external_addrs||[]).map(a=>'<div>'+esc(a)+'</div>').join('')||'none detected';
+function renderIdentityChain(){
+  const el=document.getElementById('h-chain');
+  if(!el)return;
+  const uid=S.get('userId');
+  const aid=S.get('agentId');
+  const mid=S.get('machineId');
+  let h='';
+  if(uid){
+    h+=`<div class="cert-node user"><span style="font-size:16px">&#128100;</span><div>
+      <div style="font:600 11px var(--sans);color:var(--lv);text-transform:uppercase;letter-spacing:.5px">User</div>
+      <div class="aid" onclick="copyText('${uid}')">${uid}</div>
+    </div></div>`;
+    h+='<div class="cert-arrow">&#9660; signed AgentCertificate</div>';
   }
-  const p=await api('/peers');
-  if(p&&p.peers){
-    document.getElementById('net-peers').innerHTML=p.peers.map(x=>'<tr><td style="color:var(--cy);cursor:pointer" onclick="copyText(this)">'+short(x.id)+'</td><td>—</td><td>—</td><td>connected</td></tr>').join('');
-  }
-  const c=await api('/contacts');
-  if(c&&c.contacts){
-    allContacts=c.contacts;
-    document.getElementById('net-contacts').innerHTML=c.contacts.map(x=>'<tr><td style="color:var(--cy)">'+short(x.agent_id)+'</td><td>'+trustBadge(x.trust_level)+'</td><td>'+(x.label||'—')+'</td><td>—</td></tr>').join('')||'<tr><td colspan="4" style="color:var(--dm)">No contacts</td></tr>';
-    document.getElementById('dm-contacts').innerHTML=c.contacts.filter(x=>x.trust_level!=='Blocked').map(x=>'<div class="contact-item'+(dmTarget===x.agent_id?' act':'')+'" onclick="selectDm(\''+x.agent_id+'\',\''+esc(x.label||'')+'\')">'+'<div>'+(x.label||short(x.agent_id))+'</div><div class="cid">'+short(x.agent_id)+'</div></div>').join('')||'<div style="color:var(--dm);padding:12px;font-size:12px">Import a contact card to message</div>';
-  }
+  h+=`<div class="cert-node agent"><span style="font-size:16px">&#129302;</span><div>
+    <div style="font:600 11px var(--sans);color:var(--am);text-transform:uppercase;letter-spacing:.5px">Agent</div>
+    <div class="aid" onclick="copyText('${aid}')">${aid||'...'}</div>
+  </div></div>`;
+  h+='<div class="cert-arrow">&#9660; running on</div>';
+  h+=`<div class="cert-node machine"><span style="font-size:16px">&#128187;</span><div>
+    <div style="font:600 11px var(--sans);color:var(--cy);text-transform:uppercase;letter-spacing:.5px">Machine</div>
+    <div class="aid" onclick="copyText('${mid}')">${mid||'...'}</div>
+  </div></div>`;
+  el.innerHTML=h;
 }
 
-// --- IDENTITY CARD ---
-let myCardLink='';
-function saveCardName(){
-  const name=document.getElementById('ov-display-name').value.trim();
-  if(name)try{localStorage.setItem('x0x_display_name',name)}catch(e){}
-}
-async function generateCard(){
-  const name=document.getElementById('ov-display-name').value.trim()||'Agent';
-  saveCardName();
-  const r=await api('/agent/card?display_name='+encodeURIComponent(name)+'&include_groups=true');
-  if(r&&r.link){
-    myCardLink=r.link;
-    document.getElementById('ov-card').textContent=r.link;
-    document.getElementById('ov-card').style.display='block';
-    document.getElementById('ov-copy-card').style.display='';
-    try{localStorage.setItem('x0x_card_link',r.link)}catch(e){}
-  }else{
-    document.getElementById('ov-card').textContent='Failed to generate card';
-    document.getElementById('ov-card').style.display='block';
-    document.getElementById('ov-card').style.color='var(--rd)';
-  }
-}
-function copyCardLink(){
-  if(myCardLink){navigator.clipboard.writeText(myCardLink);document.getElementById('ov-copy-card').textContent='Copied!';setTimeout(()=>document.getElementById('ov-copy-card').textContent='Copy Link',1500)}
-}
-async function importCardLink(){
-  const link=document.getElementById('ov-import-link').value.trim();if(!link)return;
-  const r=await api('/agent/card/import',{method:'POST',body:JSON.stringify({card:link,trust_level:'known'})});
-  const el=document.getElementById('ov-import-result');
-  el.style.display='block';
-  if(r&&r.ok){el.style.color='var(--gn)';el.textContent='Imported: '+r.display_name+' ('+r.trust_level+')';document.getElementById('ov-import-link').value='';pollNet()}
-  else{el.style.color='var(--rd)';el.textContent='Failed: '+(r&&r.error||'unknown')}
-}
-// Restore saved name and card on load
-try{
-  const savedName=localStorage.getItem('x0x_display_name');
-  if(savedName)document.getElementById('ov-display-name').value=savedName;
-  const savedCard=localStorage.getItem('x0x_card_link');
-  if(savedCard){myCardLink=savedCard;document.getElementById('ov-card').textContent=savedCard;document.getElementById('ov-card').style.display='block';document.getElementById('ov-copy-card').style.display=''}
-}catch(e){}
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 7: SPACE VIEW
+   ═══════════════════════════════════════════════════════════════════ */
+let spaceChatTopic='',spaceBoardId='',spaceKvId='',currentChannelTopic='';
+const chatHistory={};
+const swarmTasks={};
+const threadReplies={}; // { threadId: [messages] }
 
-// --- GROUPS ---
-const savedInvites={}; // persist invite links across re-renders
-async function createGroup(){
-  const n=document.getElementById('grp-name').value.trim();if(!n)return;
-  const r=await api('/groups',{method:'POST',body:JSON.stringify({name:n})});
-  if(r&&r.ok){document.getElementById('grp-name').value='';pollGroups()}
-}
-async function joinGroup(){
-  const c=document.getElementById('grp-invite-code').value.trim();if(!c)return;
-  const r=await api('/groups/join',{method:'POST',body:JSON.stringify({invite:c})});
-  if(r&&r.ok){document.getElementById('grp-invite-code').value='';pollGroups()}
-  else{alert('Join failed: '+(r&&r.error||'unknown'))}
-}
-function inviteHtml(link){
-  // Use data attribute to avoid quoting hell in onclick
-  return '<span style="color:var(--tx);user-select:all;font-size:10px;word-break:break-all">'+esc(link)+'</span> <button data-link="'+esc(link)+'" onclick="navigator.clipboard.writeText(this.dataset.link);this.textContent=\'Copied!\';setTimeout(()=>this.textContent=\'Copy\',1500)" style="font-size:10px;padding:2px 6px">Copy</button>';
-}
-async function pollGroups(){
-  const g=await api('/groups');if(!g||!g.groups)return;
-  const sel=document.getElementById('ws-group'),cur=sel.value;
-  sel.innerHTML='<option value="">Select group…</option>'+g.groups.map(x=>'<option value="'+x.group_id+'">'+(x.name||short(x.group_id))+'</option>').join('');
-  sel.value=cur;
-  document.getElementById('grp-list').innerHTML=g.groups.map(x=>{
-    const iid='inv-'+x.group_id.slice(0,16);
-    // Re-render saved invite if we have one
-    const invContent=savedInvites[x.group_id]?inviteHtml(savedInvites[x.group_id]):'';
-    return '<div class="card mb"><div class="row"><strong style="color:var(--cy)">'+esc(x.name)+'</strong><span style="color:var(--dm);font-size:11px">'+(x.member_count||1)+' members</span><button onclick="genInvite(\''+x.group_id+'\',\''+iid+'\')">Invite</button><button onclick="leaveGroup(\''+x.group_id+'\',\''+esc(x.name)+'\')" style="border-color:var(--rd);color:var(--rd)">Leave</button></div><div id="'+iid+'" style="font-size:10px;color:var(--dm);word-break:break-all;margin-top:4px">'+invContent+'</div></div>';
-  }).join('')||'<div style="color:var(--dm)">No groups yet</div>';
-}
-async function genInvite(gid,elId){
-  // If we already have an invite for this group, just copy it
-  if(savedInvites[gid]){
-    navigator.clipboard.writeText(savedInvites[gid]);
-    const el=document.getElementById(elId);
-    if(el){el.innerHTML=inviteHtml(savedInvites[gid])}
-    return;
-  }
-  // Generate new invite
-  const r=await api('/groups/'+gid+'/invite',{method:'POST',body:JSON.stringify({})});
-  if(r&&r.ok&&r.invite_link){
-    savedInvites[gid]=r.invite_link;
-    const el=document.getElementById(elId);
-    if(el)el.innerHTML=inviteHtml(r.invite_link);
-    navigator.clipboard.writeText(r.invite_link);
-  }else{
-    const el=document.getElementById(elId);
-    if(el)el.textContent='Failed to generate invite';
-  }
-}
-async function leaveGroup(gid,name){
-  if(!confirm('Leave group "'+name+'"? This removes it from your local list.'))return;
-  const r=await api('/groups/'+gid,{method:'DELETE'});
-  if(r&&r.ok){delete savedInvites[gid];pollGroups()}
-  else{alert('Failed: '+(r&&r.error||'unknown'))}
+function renderSpace(){
+  const sid=S.get('spaceId');
+  const app=S.get('spaceApp');
+  const g=(S.get('groups')||[]).find(x=>x.group_id===sid);
+  const name=g?g.name:short(sid);
+  const tabs=['chat','board','files','swarm','feed','wiki','web'];
+  return `<div class="row mb" style="justify-content:space-between;align-items:center">
+    <h2 style="margin:0">${esc(name)}</h2>
+    <div class="row" style="gap:4px">
+      <button class="ghost" onclick="showSpaceInfo('${sid}')" title="Space info">&#9432;</button>
+      <button class="ghost" onclick="genSpaceInvite('${sid}')" title="Invite">&#128279;</button>
+    </div>
+  </div>
+  <div class="sub-tabs">${tabs.map(t=>
+    `<button class="${t===app?'active':''}" onclick="navigateSpace('${sid}','${t}')">${t==='kv'?'Store':t.charAt(0).toUpperCase()+t.slice(1)}</button>`
+  ).join('')}</div>
+  <div id="space-content"></div>`;
 }
 
-// --- WORKSPACE ---
-async function wsGroupChanged(){
-  wsGroup=document.getElementById('ws-group').value;
-  document.getElementById('ws-msgs').innerHTML='';wsGroupChatTopic='';boardListId='';
-  if(!wsGroup)return;
-  const g=await api('/groups/'+wsGroup);
+async function mountSpace(){
+  const sid=S.get('spaceId');
+  const app=S.get('spaceApp');
+  // Load channels for this space
+  await loadSpaceChannels(sid);
+  renderSidebar();
+  // Subscribe to the base chat topic (for backward compat) and channel topic
+  const g=await api('/groups/'+sid);
   if(g&&g.ok){
-    wsGroupChatTopic=g.chat_topic||'';
-    if(wsGroupChatTopic)wsSubs([wsGroupChatTopic]);
-    document.getElementById('ws-msgs').innerHTML='<div class="chat-msg"><div class="meta" style="color:var(--dm)">Joined '+esc(g.name||'group')+'</div></div>';
-    loadChatHistory();
+    spaceChatTopic=g.chat_topic||'';
+    if(spaceChatTopic)wsSub(spaceChatTopic);
   }
-  const topic='x0x-board-'+wsGroup.slice(0,16);
+  const chan=S.get('channel')||'general';
+  currentChannelTopic=getChannelTopic(sid,chan);
+  wsSub(currentChannelTopic);
+  const el=document.getElementById('space-content');
+  if(!el)return;
+  switch(app){
+    case 'chat':renderSpaceChat(el,sid);break;
+    case 'board':renderSpaceBoard(el,sid);break;
+    case 'files':renderSpaceFiles(el);break;
+    case 'swarm':renderSpaceSwarm(el,sid);break;
+    case 'feed':renderSpaceFeed(el,sid);break;
+    case 'wiki':renderSpaceWiki(el,sid);break;
+    case 'web':renderSpaceWeb(el,sid);break;
+    default:renderSpaceChat(el,sid);
+  }
+}
+
+// --- Space: Chat (Channel-aware with threads) ---
+function renderSpaceChat(el,sid){
+  const chan=S.get('channel')||'general';
+  const channels=getSpaceChannels(sid);
+  const chanMeta=channels.find(c=>c.name===chan)||{name:chan,description:''};
+  const chatKey=sid+'_'+chan;
+  const hist=LS.get('chat_'+chatKey,[]);
+  if(!chatHistory[chatKey])chatHistory[chatKey]=hist;
+  el.innerHTML=`<div class="channel-header">
+    <span class="hash" style="font-size:18px;color:var(--tx3)">#</span>
+    <div>
+      <div class="name">${esc(chan)}</div>
+      ${chanMeta.description?'<div class="desc">'+esc(chanMeta.description)+'</div>':''}
+    </div>
+  </div>
+  <div class="chat-wrap">
+    <div class="chat-msgs" id="chat-msgs"></div>
+    <div class="chat-input">
+      <input id="chat-in" placeholder="Message #${esc(chan)}…" onkeydown="if(event.key==='Enter')sendSpaceChat()">
+      <button class="pri" onclick="sendSpaceChat()">Send</button>
+    </div>
+  </div>`;
+  const msgs=document.getElementById('chat-msgs');
+  (chatHistory[chatKey]||[]).forEach(m=>appendChatMsg(msgs,m,sid));
+  msgs.scrollTop=msgs.scrollHeight;
+}
+
+function sendSpaceChat(){
+  const inp=document.getElementById('chat-in');
+  const t=inp.value.trim();if(!currentChannelTopic)return;if(!t)return;
+  const name=LS.get('display_name','')||short(S.get('agentId'));
+  const sid=S.get('spaceId');
+  const chan=S.get('channel')||'general';
+  const msgId=generateMsgId();
+  const msg={id:msgId,text:t,sender_name:name,sender_id:S.get('agentId'),timestamp:Date.now(),channel:chan};
+  wsPub(currentChannelTopic,msg);
+  // Also pub to legacy base topic for backward compat
+  if(spaceChatTopic&&spaceChatTopic!==currentChannelTopic)wsPub(spaceChatTopic,msg);
+  addChatMsg(sid+'_'+chan,{...msg,own:true});
+  inp.value='';inp.focus();
+}
+
+const seenMsgHashes=new Set();
+function msgHash(msg){return (msg.sender_id||'')+'|'+(msg.text||'')+'|'+Math.floor((msg.timestamp||0)/1000)+'|'+(msg.broadcast?'bc':'')+'|'+(msg.thread_root||'')}
+
+function addChatMsg(chatKey,msg){
+  const h=msgHash(msg);
+  if(seenMsgHashes.has(h))return;
+  seenMsgHashes.add(h);
+  if(seenMsgHashes.size>2000){const it=seenMsgHashes.values();for(let i=0;i<500;i++)seenMsgHashes.delete(it.next().value)}
+  // Cache for thread lookup
+  cacheMsg(msg);
+  // Skip thread broadcasts that are just indicators
+  if(msg.thread_root&&!msg.broadcast)return;
+  if(!chatHistory[chatKey])chatHistory[chatKey]=[];
+  chatHistory[chatKey].push(msg);
+  if(chatHistory[chatKey].length>200)chatHistory[chatKey].splice(0,chatHistory[chatKey].length-200);
+  LS.set('chat_'+chatKey,chatHistory[chatKey]);
+  // Check if current view matches
+  const sid=S.get('spaceId');
+  const chan=S.get('channel')||'general';
+  const currentKey=sid+'_'+chan;
+  if(S.get('view')==='space'&&S.get('spaceApp')==='chat'&&chatKey===currentKey){
+    const msgs=document.getElementById('chat-msgs');
+    if(msgs){appendChatMsg(msgs,msg,sid);msgs.scrollTop=msgs.scrollHeight}
+  }
+}
+
+function addThreadReply(threadId,msg){
+  const h=msgHash(msg);
+  if(seenMsgHashes.has(h))return;
+  seenMsgHashes.add(h);
+  if(!threadReplies[threadId])threadReplies[threadId]=[];
+  threadReplies[threadId].push(msg);
+  // Update thread indicator count in chat
+  if(!threadCache[threadId])threadCache[threadId]={reply_count:0,participants:[]};
+  threadCache[threadId].reply_count=(threadReplies[threadId]||[]).length;
+  if(msg.sender_name&&!threadCache[threadId].participants.includes(msg.sender_name)){
+    threadCache[threadId].participants.push(msg.sender_name);
+  }
+  threadCache[threadId].last_reply_at=msg.timestamp;
+  // Update thread indicator in DOM
+  const indicator=document.getElementById('thread-ind-'+threadId);
+  if(indicator){
+    const tc=threadCache[threadId];
+    indicator.innerHTML='<span class="count">&#128172; '+tc.reply_count+' repl'+(tc.reply_count===1?'y':'ies')+'</span><span class="participants">'+tc.participants.slice(0,3).join(', ')+'</span><span class="last">'+fmtTime(tc.last_reply_at)+'</span>';
+  }
+  // If thread panel is open for this thread, append reply
+  if(S.get('detailType')==='thread'&&S.get('threadId')===threadId){
+    const replies=document.getElementById('thread-replies');
+    if(replies){appendChatMsg(replies,msg,S.get('spaceId'));replies.scrollTop=replies.scrollHeight}
+  }
+}
+
+function appendChatMsg(container,m,spaceId){
+  const d=document.createElement('div');d.className='chat-msg';
+  const trust=getContactTrust(m.sender_id);
+  const tclass=trust==='Trusted'?'trusted':trust==='Known'?'known':'unknown';
+  const msgId=m.id||'';
+  const tc=msgId?threadCache[msgId]:null;
+  const isBroadcast=m.broadcast&&m.thread_root;
+  d.innerHTML=`<div class="meta">
+    <span class="who ${tclass}">${m.own?'you':esc(m.sender_name||short(m.sender_id))}</span>
+    ${!m.own&&trust?'<span class="trust trust-'+trust.toLowerCase()+'" style="font-size:8px;padding:0 4px">'+trust+'</span>':''}
+    <span>${fmtTime(m.timestamp)}</span>
+    ${isBroadcast?'<span style="font-size:10px;color:var(--tx3);margin-left:4px">replied in thread</span>':''}
+    ${!isBroadcast&&msgId&&spaceId?'<button class="ghost" style="font-size:10px;padding:2px 6px;margin-left:auto" onclick="openThreadById(\''+spaceId+'\',\''+msgId+'\')">Reply</button>':''}
+  </div>
+  <div class="body">${esc(m.text||'')}</div>
+  ${tc&&tc.reply_count>0?'<div class="thread-indicator" id="thread-ind-'+msgId+'" onclick="openThreadById(\''+spaceId+'\',\''+msgId+'\')"><span class="count">&#128172; '+tc.reply_count+' repl'+(tc.reply_count===1?'y':'ies')+'</span><span class="participants">'+tc.participants.slice(0,3).join(', ')+'</span><span class="last">'+fmtTime(tc.last_reply_at)+'</span></div>':''}`;
+  container.appendChild(d);
+}
+
+// --- Space: Board ---
+function renderSpaceBoard(el,sid){
+  el.innerHTML=`<div class="row mb"><input id="board-in" placeholder="New task…" style="flex:1"><button class="pri" onclick="addBoardTask()">Add</button></div>
+  <div class="kanban">
+    <div class="kanban-col"><div class="kanban-hd">To Do <span class="count" id="kb-todo-n">0</span></div><div class="kanban-body" id="kb-todo"></div></div>
+    <div class="kanban-col"><div class="kanban-hd">In Progress <span class="count" id="kb-wip-n">0</span></div><div class="kanban-body" id="kb-wip"></div></div>
+    <div class="kanban-col"><div class="kanban-hd">Done <span class="count" id="kb-done-n">0</span></div><div class="kanban-body" id="kb-done"></div></div>
+  </div>`;
+  initBoard(sid);
+}
+
+async function initBoard(sid){
+  const topic='x0x-board-'+sid.slice(0,16);
   const existing=await api('/task-lists');
   if(!(existing&&existing.task_lists||[]).find(t=>t.id===topic)){
     await api('/task-lists',{method:'POST',body:JSON.stringify({name:'Board',topic})});
   }
-  boardListId=topic;pollBoard();
+  spaceBoardId=topic;pollBoard();
 }
-function wsSubTab(btn,id){
-  document.querySelectorAll('#ws-sub-tabs button').forEach(b=>b.classList.remove('act'));
-  btn.classList.add('act');
-  document.querySelectorAll('#tab-workspace .sub-panel').forEach(p=>p.classList.toggle('act',p.id===id));
-}
-document.querySelectorAll('#ws-sub-tabs button').forEach(b=>{
-  b.onclick=function(){wsSubTab(this,this.textContent.trim().toLowerCase()==='chat'?'ws-chat':this.textContent.trim().toLowerCase()==='board'?'ws-board':'ws-files')};
-});
-function wsSend(){
-  const inp=document.getElementById('ws-msg-in'),t=inp.value.trim();
-  if(!t||!wsGroupChatTopic)return;
-  wsPub(wsGroupChatTopic,{text:t,sender_name:short(myAgentId),timestamp:Date.now()});
-  addWsChat(short(myAgentId),t,true);inp.value='';inp.focus();
-}
-function addWsChat(from,text,own){
-  const c=document.getElementById('ws-msgs'),d=document.createElement('div');d.className='chat-msg';
-  const ts=new Date().toLocaleTimeString();
-  d.innerHTML='<div class="meta"><span class="who">'+(own?'you':esc(from))+'</span> <span>'+ts+'</span></div><div class="body">'+esc(text)+'</div>';
-  c.appendChild(d);c.scrollTop=c.scrollHeight;
-  // Persist to localStorage (last 100 messages per group)
-  if(wsGroup){
-    const key='x0x_chat_'+wsGroup;
-    try{
-      const hist=JSON.parse(localStorage.getItem(key)||'[]');
-      hist.push({from,text,own,ts});
-      if(hist.length>100)hist.splice(0,hist.length-100);
-      localStorage.setItem(key,JSON.stringify(hist));
-    }catch(e){}
-  }
-}
-function loadChatHistory(){
-  if(!wsGroup)return;
-  const key='x0x_chat_'+wsGroup;
-  try{
-    const hist=JSON.parse(localStorage.getItem(key)||'[]');
-    const c=document.getElementById('ws-msgs');
-    hist.forEach(m=>{
-      const d=document.createElement('div');d.className='chat-msg';
-      d.innerHTML='<div class="meta"><span class="who">'+(m.own?'you':esc(m.from))+'</span> <span>'+esc(m.ts)+'</span></div><div class="body">'+esc(m.text)+'</div>';
-      c.appendChild(d);
-    });
-    c.scrollTop=c.scrollHeight;
-  }catch(e){}
-}
-async function wsAddTask(){
-  const inp=document.getElementById('ws-task-in'),t=inp.value.trim();if(!t||!boardListId)return;
-  await api('/task-lists/'+boardListId+'/tasks',{method:'POST',body:JSON.stringify({title:t})});
+
+async function addBoardTask(){
+  const inp=document.getElementById('board-in');
+  const t=inp.value.trim();if(!t||!spaceBoardId)return;
+  await api('/task-lists/'+spaceBoardId+'/tasks',{method:'POST',body:JSON.stringify({title:t})});
   inp.value='';pollBoard();
 }
+
 async function pollBoard(){
-  if(!boardListId)return;
-  const r=await api('/task-lists/'+boardListId+'/tasks');if(!r||!r.tasks)return;
+  if(!spaceBoardId)return;
+  const r=await api('/task-lists/'+spaceBoardId+'/tasks');if(!r||!r.tasks)return;
   const todo=r.tasks.filter(t=>t.state==='Empty'||t.state==='empty');
   const wip=r.tasks.filter(t=>t.state&&(t.state.startsWith('Claimed')||t.state.startsWith('claimed')));
   const done=r.tasks.filter(t=>t.state&&(t.state.startsWith('Done')||t.state.startsWith('done')));
-  document.getElementById('kb-todo').innerHTML=todo.map(t=>'<div class="kanban-card" onclick="boardAction(\''+t.id+'\',\'claim\')">'+esc(t.title)+'<div class="state">click to claim</div></div>').join('')||'<div style="color:var(--dm);font-size:11px;padding:4px">Empty</div>';
-  document.getElementById('kb-wip').innerHTML=wip.map(t=>'<div class="kanban-card" onclick="boardAction(\''+t.id+'\',\'complete\')">'+esc(t.title)+'<div class="state">click to complete</div></div>').join('')||'<div style="color:var(--dm);font-size:11px;padding:4px">Empty</div>';
-  document.getElementById('kb-done').innerHTML=done.map(t=>'<div class="kanban-card">'+esc(t.title)+'</div>').join('')||'<div style="color:var(--dm);font-size:11px;padding:4px">Empty</div>';
+  const render=(arr,canAct,action)=>arr.map(t=>`<div class="kanban-card" ${canAct?'onclick="boardAction(\''+t.id+'\',\''+action+'\')"':''}>
+    <div class="title">${esc(t.title)}</div>
+    <div class="meta">${canAct?'click to '+action:''} ${t.claimed_by?trustHtml(getContactTrust(t.claimed_by)):''}</div>
+  </div>`).join('')||'<div style="color:var(--tx3);font-size:11px;padding:8px">Empty</div>';
+  const e=id=>document.getElementById(id);
+  if(e('kb-todo'))e('kb-todo').innerHTML=render(todo,true,'claim');
+  if(e('kb-wip'))e('kb-wip').innerHTML=render(wip,true,'complete');
+  if(e('kb-done'))e('kb-done').innerHTML=render(done,false,'');
+  if(e('kb-todo-n'))e('kb-todo-n').textContent=todo.length;
+  if(e('kb-wip-n'))e('kb-wip-n').textContent=wip.length;
+  if(e('kb-done-n'))e('kb-done-n').textContent=done.length;
 }
+
 async function boardAction(tid,action){
-  if(!boardListId)return;
-  await api('/task-lists/'+boardListId+'/tasks/'+tid,{method:'PATCH',body:JSON.stringify({action})});
+  if(!spaceBoardId)return;
+  await api('/task-lists/'+spaceBoardId+'/tasks/'+tid,{method:'PATCH',body:JSON.stringify({action})});
   pollBoard();
 }
-async function wsFileSend(){
-  const f=document.getElementById('ws-file-in').files[0];if(!f)return;
-  if(!allContacts.length){alert('Add a contact first');return}
-  const target=allContacts[0].agent_id;
-  const buf=await f.arrayBuffer();const hash=await crypto.subtle.digest('SHA-256',buf);
-  const sha256=[...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,'0')).join('');
-  await api('/files/send',{method:'POST',body:JSON.stringify({agent_id:target,filename:f.name,size:f.size,sha256})});
-  pollWsTransfers();
-}
-async function pollWsTransfers(){
-  const r=await api('/files/transfers');if(!r||!r.transfers)return;
-  document.getElementById('ws-transfers').innerHTML=r.transfers.map(x=>'<tr><td>'+esc(x.filename||'—')+'</td><td>'+(x.direction||'—')+'</td><td><span class="badge '+(x.status==='Complete'?'gn':x.status==='InProgress'?'cy':'og')+'">'+x.status+'</span></td><td>'+(x.total_size?Math.round(100*(x.bytes_transferred||0)/x.total_size)+'%':'—')+'</td></tr>').join('')||'<tr><td colspan="4" style="color:var(--dm)">No transfers</td></tr>';
+
+// --- Space: Files ---
+function renderSpaceFiles(el){
+  el.innerHTML=`<div class="drop-zone" id="file-drop" onclick="document.getElementById('file-input').click()">
+    Drop files here or click to select
+    <input type="file" id="file-input" style="display:none" onchange="handleFileDrop(this.files[0])">
+  </div>
+  <div id="file-hash" style="font-size:11px;color:var(--tx3);margin-top:8px"></div>
+  <h3>Incoming</h3><div id="file-incoming"></div>
+  <h3>Transfers</h3>
+  <table><thead><tr><th>File</th><th>Direction</th><th>Status</th><th>Progress</th></tr></thead><tbody id="file-transfers"></tbody></table>`;
+  const dz=document.getElementById('file-drop');
+  if(dz){
+    dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('over')});
+    dz.addEventListener('dragleave',()=>dz.classList.remove('over'));
+    dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('over');if(e.dataTransfer.files.length)handleFileDrop(e.dataTransfer.files[0])});
+  }
+  pollTransfers();
 }
 
-// --- DM ---
-function selectDm(aid,label){
-  dmTarget=aid;
-  document.getElementById('dm-header').textContent='To: '+(label||short(aid));
-  document.getElementById('dm-msgs').innerHTML='<div class="chat-msg"><div class="meta" style="color:var(--dm)">Direct message with '+short(aid)+'</div></div>';
-  pollNet();
-}
-async function dmSend(){
-  const inp=document.getElementById('dm-msg-in'),t=inp.value.trim();if(!t||!dmTarget)return;
-  const payload=btoa(JSON.stringify({text:t,sender_name:short(myAgentId),ts:Date.now()}));
-  await api('/direct/send',{method:'POST',body:JSON.stringify({agent_id:dmTarget,payload})});
-  addDm(myAgentId,short(myAgentId),t,true);inp.value='';inp.focus();
-}
-function addDm(agentId,name,text,own){
-  if(!own&&agentId!==dmTarget)return;
-  const c=document.getElementById('dm-msgs'),d=document.createElement('div');d.className='chat-msg';
-  d.innerHTML='<div class="meta"><span class="who">'+(own?'you':esc(name))+'</span> <span>'+new Date().toLocaleTimeString()+'</span></div><div class="body">'+esc(text)+'</div>';
-  c.appendChild(d);c.scrollTop=c.scrollHeight;
-}
-
-// --- SWARM ---
-function swPost(){
-  const t=document.getElementById('sw-task').value.trim(),c=document.getElementById('sw-caps').value.trim();if(!t)return;
-  const id=(crypto.randomUUID?crypto.randomUUID():Math.random().toString(36).slice(2));
-  wsPub('x0x-swarm/tasks',{id,event:'posted',description:t,capability:c||null,requester:myAgentId,timestamp:Date.now()});
-  swarmTasks[id]={id,description:t,capability:c,status:'posted',from:myAgentId,ts:Date.now()};
-  renderSwarm();document.getElementById('sw-task').value='';document.getElementById('sw-caps').value='';
-}
-function swarmIngest(type,d){
-  if(type==='task'){const id=d.id||d.task_id;if(id)swarmTasks[id]={...swarmTasks[id],...d,status:d.event||'posted',ts:d.timestamp||Date.now()}}
-  if(type==='result'&&d.task_id&&swarmTasks[d.task_id])swarmTasks[d.task_id].status='completed';
-  renderSwarm();
-}
-function renderSwarm(){
-  document.getElementById('sw-feed').innerHTML=Object.values(swarmTasks).sort((a,b)=>(b.ts||0)-(a.ts||0)).slice(0,50).map(t=>
-    '<div class="feed-item"><span class="badge '+(t.status==='completed'?'gn':t.status==='claimed'?'og':'cy')+'">'+t.status+'</span> '+esc(t.description||t.id)+' <span style="color:var(--dm)">from '+short(t.from||t.requester)+'</span></div>'
-  ).join('')||'<div style="color:var(--dm);font-size:12px">No tasks yet</div>';
-}
-
-// --- DROP ---
-const dropZone=document.getElementById('drop-zone');
-dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('over')});
-dropZone.addEventListener('dragleave',()=>dropZone.classList.remove('over'));
-dropZone.addEventListener('drop',e=>{e.preventDefault();dropZone.classList.remove('over');if(e.dataTransfer.files.length)handleDropFile(e.dataTransfer.files[0])});
-function dropFileSelected(inp){if(inp.files[0])handleDropFile(inp.files[0])}
-async function handleDropFile(file){
-  const buf=await file.arrayBuffer();const hash=await crypto.subtle.digest('SHA-256',buf);
+async function handleFileDrop(file){
+  if(!file)return;
+  const buf=await file.arrayBuffer();
+  const hash=await crypto.subtle.digest('SHA-256',buf);
   const hex=[...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,'0')).join('');
-  document.getElementById('drop-hash').textContent=file.name+' · '+(file.size/1024).toFixed(1)+'KB · SHA-256: '+hex;
-  const target=document.getElementById('drop-target').value;
-  if(!target){document.getElementById('drop-hash').textContent+=' — select a recipient first';return}
+  document.getElementById('file-hash').textContent=file.name+' · '+(file.size/1024).toFixed(1)+'KB · SHA-256: '+hex;
+  const contacts=S.get('contacts')||[];
+  if(!contacts.length){toast('Add a contact first to send files','warning');return}
+  const target=contacts[0].agent_id;
   await api('/files/send',{method:'POST',body:JSON.stringify({agent_id:target,filename:file.name,size:file.size,sha256:hex})});
-  pollDropTransfers();
+  pollTransfers();
 }
-async function pollDropTransfers(){
-  const r=await api('/files/transfers');if(!r||!r.transfers)return;
-  document.getElementById('drop-transfers').innerHTML=r.transfers.map(x=>
-    '<tr><td>'+esc(x.filename||'—')+'</td><td>'+short(x.remote_agent_id||'—')+'</td><td><span class="badge '+(x.status==='Complete'?'gn':x.status==='InProgress'?'cy':'og')+'">'+x.status+'</span></td><td style="font-size:10px;color:var(--dm)">'+(x.sha256?x.sha256.substring(0,16)+'…':'—')+'</td></tr>'
-  ).join('')||'<tr><td colspan="4" style="color:var(--dm)">No transfers</td></tr>';
-  const inc=r.transfers.filter(x=>x.direction==='Receiving'&&x.status==='Pending');
-  document.getElementById('drop-incoming').innerHTML=inc.map(x=>
-    '<div class="card mb"><span>'+esc(x.filename||'file')+'</span> from <span style="color:var(--cy)">'+short(x.remote_agent_id)+'</span> <button style="margin-left:8px" onclick="dropAccept(\''+x.transfer_id+'\')">Accept</button> <button onclick="dropReject(\''+x.transfer_id+'\')">Reject</button></div>'
-  ).join('')||'<span style="color:var(--dm);font-size:12px">No pending transfers</span>';
-}
-async function dropAccept(id){await api('/files/accept/'+id,{method:'POST'});pollDropTransfers()}
-async function dropReject(id){await api('/files/reject/'+id,{method:'POST'});pollDropTransfers()}
 
-// --- INIT ---
-wsConnect();pollDash();pollNet();pollGroups();
-setInterval(()=>{pollDash();pollNet()},5000);
-setInterval(()=>{pollGroups();pollBoard();pollWsTransfers();pollDropTransfers()},8000);
+async function pollTransfers(){
+  const r=await api('/files/transfers');if(!r||!r.transfers)return;
+  const tb=document.getElementById('file-transfers');
+  if(tb)tb.innerHTML=r.transfers.map(x=>`<tr>
+    <td>${esc(x.filename||'—')}</td><td>${x.direction||'—'}</td>
+    <td>${trustHtml(x.status==='Complete'?'Trusted':x.status==='InProgress'?'Known':'Unknown').replace(/trust-/g,'badge-')}</td>
+    <td>${x.total_size?Math.round(100*(x.bytes_transferred||0)/x.total_size)+'%':'—'}</td>
+  </tr>`).join('')||'<tr><td colspan="4" style="color:var(--tx3)">No transfers</td></tr>';
+  const inc=r.transfers.filter(x=>x.direction==='Receiving'&&x.status==='Pending');
+  const ie=document.getElementById('file-incoming');
+  if(ie)ie.innerHTML=inc.map(x=>`<div class="card mb" style="display:flex;align-items:center;gap:8px">
+    <span>${esc(x.filename||'file')}</span> from <span class="aid-short">${short(x.remote_agent_id)}</span>
+    <button onclick="api('/files/accept/${x.transfer_id}',{method:'POST'}).then(()=>pollTransfers())">Accept</button>
+    <button class="danger" onclick="api('/files/reject/${x.transfer_id}',{method:'POST'}).then(()=>pollTransfers())">Reject</button>
+  </div>`).join('')||'<span style="color:var(--tx3);font-size:12px">No pending transfers</span>';
+}
+
+// --- Space: Swarm ---
+function renderSpaceSwarm(el,sid){
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Delegate tasks to AI agents on the network. Post a task with capability tags — agents claim and return results via gossip pub/sub.</p>
+  <div class="row mb"><input id="sw-task" placeholder="Task description" style="flex:2"><input id="sw-caps" placeholder="Capabilities (comma-sep)"><button class="pri" onclick="postSwarmTask()">Post</button></div>
+  <div class="grid g2">
+    <div><h3>Live Feed</h3><div class="feed" id="sw-feed"></div></div>
+    <div><h3>Agent Roster</h3><table><thead><tr><th>Agent</th><th>Status</th><th>Task</th></tr></thead><tbody id="sw-roster"></tbody></table></div>
+  </div>`;
+  renderSwarmFeed();
+}
+
+function postSwarmTask(){
+  const t=document.getElementById('sw-task').value.trim();
+  const c=document.getElementById('sw-caps').value.trim();
+  if(!t)return;
+  const id=crypto.randomUUID?crypto.randomUUID():Math.random().toString(36).slice(2);
+  wsPub('x0x-swarm/tasks',{id,event:'posted',description:t,capability:c||null,requester:S.get('agentId'),timestamp:Date.now()});
+  swarmTasks[id]={id,description:t,capability:c,status:'posted',from:S.get('agentId'),ts:Date.now()};
+  renderSwarmFeed();
+  document.getElementById('sw-task').value='';document.getElementById('sw-caps').value='';
+}
+
+function renderSwarmFeed(){
+  const fe=document.getElementById('sw-feed');
+  if(!fe)return;
+  fe.innerHTML=Object.values(swarmTasks).sort((a,b)=>(b.ts||0)-(a.ts||0)).slice(0,50).map(t=>
+    `<div class="feed-item"><div class="content">
+      <span class="trust trust-${t.status==='completed'?'trusted':t.status==='claimed'?'known':'unknown'}" style="font-size:9px;margin-right:4px">${t.status}</span>
+      ${esc(t.description||t.id)}
+      <div class="time">from ${short(t.from||t.requester)} · ${fmtTime(t.ts)}</div>
+    </div></div>`
+  ).join('')||'<div style="color:var(--tx3);padding:12px;font-size:12px">No tasks yet. Post one above.</div>';
+}
+
+// --- Space: Feed ---
+function renderSpaceFeed(el,sid){
+  const topic='x0x.space.'+sid.slice(0,16)+'.feed';
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">A pub/sub powered social feed. Posts are broadcast to all space members via gossip and persisted in a KvStore.</p>
+  <div class="row mb"><textarea id="feed-in" rows="2" placeholder="What's happening?" style="flex:1;resize:vertical"></textarea><button class="pri" onclick="postFeed('${sid}')">Post</button></div>
+  <div class="feed" id="feed-posts"></div>`;
+  wsSub(topic);
+  loadFeedPosts(sid);
+}
+
+async function postFeed(sid){
+  const inp=document.getElementById('feed-in');
+  const text=inp.value.trim();if(!text)return;
+  const topic='x0x.space.'+sid.slice(0,16)+'.feed';
+  const post={text,author:LS.get('display_name','')||short(S.get('agentId')),author_id:S.get('agentId'),timestamp:Date.now()};
+  wsPub(topic,post);
+  addFeedPost(sid,post);
+  inp.value='';
+}
+
+function addFeedPost(sid,post){
+  const h=(post.author_id||'')+'|'+(post.text||'')+'|'+Math.floor((post.timestamp||0)/1000);
+  if(seenMsgHashes.has(h))return;
+  seenMsgHashes.add(h);
+  const key='feed_'+sid;
+  const posts=LS.get(key,[]);
+  posts.unshift(post);
+  if(posts.length>100)posts.length=100;
+  LS.set(key,posts);
+  renderFeedPosts(sid);
+}
+
+function loadFeedPosts(sid){renderFeedPosts(sid)}
+function renderFeedPosts(sid){
+  const el=document.getElementById('feed-posts');if(!el)return;
+  const posts=LS.get('feed_'+sid,[]);
+  el.innerHTML=posts.map(p=>`<div class="feed-item">
+    <div class="content">
+      <div class="author" style="color:var(--am)">${esc(p.author||short(p.author_id))} ${trustHtml(getContactTrust(p.author_id))}</div>
+      <div class="text">${esc(p.text)}</div>
+      <div class="time">${fmtTime(p.timestamp)}</div>
+    </div>
+  </div>`).join('')||'<div style="color:var(--tx3);padding:12px;font-size:12px">No posts yet. Be the first!</div>';
+}
+
+// --- Space: Wiki ---
+function renderSpaceWiki(el,sid){
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Collaborative wiki pages stored in a KvStore. Create and edit markdown pages that sync across all space members.</p>
+  <div class="row mb"><input id="wiki-slug" placeholder="Page name (e.g. getting-started)"><button class="pri" onclick="createWikiPage('${sid}')">Create Page</button></div>
+  <div id="wiki-pages"></div>
+  <div id="wiki-editor" style="display:none" class="mt">
+    <h3 id="wiki-title"></h3>
+    <textarea id="wiki-content" rows="12" style="width:100%;resize:vertical;font-family:var(--mono);font-size:12px"></textarea>
+    <div class="row mt"><button class="pri" onclick="saveWikiPage('${sid}')">Save</button><button onclick="document.getElementById('wiki-editor').style.display='none'">Cancel</button></div>
+  </div>`;
+  loadWikiPages(sid);
+}
+
+function createWikiPage(sid){
+  const slug=document.getElementById('wiki-slug').value.trim().toLowerCase().replace(/[^a-z0-9-]/g,'-');
+  if(!slug)return;
+  document.getElementById('wiki-title').textContent=slug;
+  document.getElementById('wiki-content').value='# '+slug+'\n\nWrite your content here...';
+  document.getElementById('wiki-editor').style.display='block';
+  document.getElementById('wiki-slug').value='';
+  currentWikiSlug=slug;
+}
+let currentWikiSlug='';
+
+async function saveWikiPage(sid){
+  const content=document.getElementById('wiki-content').value;
+  const storeId='x0x-wiki-'+sid.slice(0,16);
+  // Ensure store exists
+  const stores=await api('/stores');
+  if(!(stores&&stores.stores||[]).find(s=>s.id===storeId)){
+    await api('/stores',{method:'POST',body:JSON.stringify({name:'Wiki',topic:storeId})});
+  }
+  await api('/stores/'+storeId+'/'+currentWikiSlug,{method:'PUT',body:JSON.stringify({value:btoa(content),content_type:'text/markdown'})});
+  document.getElementById('wiki-editor').style.display='none';
+  toast('Page saved','success');
+  loadWikiPages(sid);
+}
+
+async function loadWikiPages(sid){
+  const storeId='x0x-wiki-'+sid.slice(0,16);
+  const el=document.getElementById('wiki-pages');if(!el)return;
+  const r=await api('/stores/'+storeId+'/keys');
+  if(r&&r.keys&&r.keys.length>0){
+    const keys=r.keys.map(k=>typeof k==='string'?k:k.key||k);
+    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" onclick="editWikiPage('${sid}','${esc(k)}')">
+      <div style="font:500 13px var(--sans);color:var(--cy)">${esc(k)}</div>
+      <div style="font-size:11px;color:var(--tx3);margin-top:2px">Click to edit</div>
+    </div>`).join('');
+  }else{
+    el.innerHTML='<div style="color:var(--tx3);font-size:12px;padding:8px">No wiki pages yet. Create one above.</div>';
+  }
+}
+
+async function editWikiPage(sid,slug){
+  const storeId='x0x-wiki-'+sid.slice(0,16);
+  const r=await api('/stores/'+storeId+'/'+slug);
+  if(r&&r.value){
+    currentWikiSlug=slug;
+    document.getElementById('wiki-title').textContent=slug;
+    try{document.getElementById('wiki-content').value=atob(r.value)}catch(e){document.getElementById('wiki-content').value=r.value}
+    document.getElementById('wiki-editor').style.display='block';
+  }
+}
+
+// --- Space: Web ---
+function renderSpaceWeb(el,sid){
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Publish web content through your Space. Stored in a KvStore, rendered as HTML/Markdown. This demonstrates how an organization can use pub/sub as their web presence.</p>
+  <div class="row mb"><input id="web-path" placeholder="Page path (e.g. index, about)"><button class="pri" onclick="editWebPage('${sid}')">Edit Page</button></div>
+  <div id="web-preview" class="card" style="min-height:200px;padding:20px">
+    <div style="color:var(--tx3);text-align:center;padding:40px">Select or create a page to preview</div>
+  </div>
+  <div id="web-editor" style="display:none" class="mt">
+    <textarea id="web-content" rows="10" style="width:100%;resize:vertical;font-family:var(--mono);font-size:12px" placeholder="HTML or Markdown content"></textarea>
+    <div class="row mt"><button class="pri" onclick="saveWebPage('${sid}')">Publish</button><button onclick="document.getElementById('web-editor').style.display='none'">Cancel</button></div>
+  </div>
+  <h3>Pages</h3><div id="web-pages"></div>`;
+  loadWebPages(sid);
+}
+let currentWebPath='';
+
+function editWebPage(sid){
+  const path=document.getElementById('web-path').value.trim()||'index';
+  currentWebPath=path;
+  document.getElementById('web-editor').style.display='block';
+  document.getElementById('web-content').value='';
+  document.getElementById('web-path').value='';
+}
+
+async function saveWebPage(sid){
+  const content=document.getElementById('web-content').value;
+  const storeId='x0x-web-'+sid.slice(0,16);
+  const stores=await api('/stores');
+  if(!(stores&&stores.stores||[]).find(s=>s.id===storeId)){
+    await api('/stores',{method:'POST',body:JSON.stringify({name:'Web',topic:storeId})});
+  }
+  await api('/stores/'+storeId+'/'+currentWebPath,{method:'PUT',body:JSON.stringify({value:btoa(content),content_type:'text/html'})});
+  document.getElementById('web-editor').style.display='none';
+  toast('Published','success');
+  loadWebPages(sid);
+}
+
+async function loadWebPages(sid){
+  const storeId='x0x-web-'+sid.slice(0,16);
+  const el=document.getElementById('web-pages');if(!el)return;
+  const r=await api('/stores/'+storeId+'/keys');
+  if(r&&r.keys&&r.keys.length>0){
+    const keys=r.keys.map(k=>typeof k==='string'?k:k.key||k);
+    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" onclick="previewWebPage('${sid}','${esc(k)}')">
+      <span style="color:var(--cy)">${esc(k)}</span>
+    </div>`).join('');
+    previewWebPage(sid,keys[0]);
+  }else{
+    el.innerHTML='<div style="color:var(--tx3);font-size:12px">No pages published yet.</div>';
+  }
+}
+
+async function previewWebPage(sid,path){
+  const storeId='x0x-web-'+sid.slice(0,16);
+  const r=await api('/stores/'+storeId+'/'+path);
+  const preview=document.getElementById('web-preview');
+  if(r&&r.value&&preview){
+    try{preview.innerHTML=atob(r.value)}catch(e){preview.textContent=r.value}
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 8: DIRECT MESSAGES
+   ═══════════════════════════════════════════════════════════════════ */
+const dmHistory={};
+
+function renderDm(){
+  const target=S.get('dmTarget');
+  const contact=(S.get('contacts')||[]).find(c=>c.agent_id===target);
+  const name=contact?contact.label||short(target):short(target);
+  const trust=contact?contact.trust_level:'Unknown';
+  return `<div class="row mb" style="justify-content:space-between">
+    <div class="row"><h2 style="margin:0">${esc(name)}</h2> ${trustHtml(trust)}</div>
+    <button class="ghost" onclick="showAgentDetail('${target}')">Profile</button>
+  </div>
+  <div class="chat-wrap">
+    <div class="chat-msgs" id="dm-msgs"></div>
+    <div class="chat-input">
+      <input id="dm-in" placeholder="Message…" onkeydown="if(event.key==='Enter')sendDm()">
+      <button class="pri" onclick="sendDm()">Send</button>
+    </div>
+  </div>`;
+}
+
+function mountDm(){
+  const target=S.get('dmTarget');
+  if(!dmHistory[target])dmHistory[target]=LS.get('dm_'+target,[]);
+  const msgs=document.getElementById('dm-msgs');
+  if(msgs){
+    (dmHistory[target]||[]).forEach(m=>appendChatMsg(msgs,m));
+    msgs.scrollTop=msgs.scrollHeight;
+  }
+}
+
+async function sendDm(){
+  const target=S.get('dmTarget');
+  const inp=document.getElementById('dm-in');
+  const t=inp.value.trim();if(!t||!target)return;
+  const name=LS.get('display_name','')||short(S.get('agentId'));
+  const payload=btoa(JSON.stringify({text:t,sender_name:name,ts:Date.now()}));
+  await api('/direct/send',{method:'POST',body:JSON.stringify({agent_id:target,payload})});
+  const msg={text:t,sender_name:name,sender_id:S.get('agentId'),timestamp:Date.now(),own:true};
+  addDmMsg(target,msg);
+  inp.value='';inp.focus();
+}
+
+function addDmMsg(agentId,msg){
+  if(!dmHistory[agentId])dmHistory[agentId]=[];
+  dmHistory[agentId].push(msg);
+  if(dmHistory[agentId].length>200)dmHistory[agentId].splice(0,dmHistory[agentId].length-200);
+  LS.set('dm_'+agentId,dmHistory[agentId]);
+  if(S.get('view')==='dm'&&S.get('dmTarget')===agentId){
+    const msgs=document.getElementById('dm-msgs');
+    if(msgs){appendChatMsg(msgs,msg);msgs.scrollTop=msgs.scrollHeight}
+  }
+}
+
+function onDirectMessage(sender,data){
+  const msg={text:data.text,sender_name:data.sender_name||short(sender),sender_id:sender,timestamp:data.ts||Date.now(),own:false};
+  addDmMsg(sender,msg);
+  if(S.get('view')!=='dm'||S.get('dmTarget')!==sender){
+    const count=LS.get('unread_'+sender,0);
+    LS.set('unread_'+sender,count+1);
+    renderSidebar();
+    toast('Message from '+(data.sender_name||short(sender)),'info');
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 9: PEOPLE VIEW (Contacts & Trust)
+   ═══════════════════════════════════════════════════════════════════ */
+function renderPeople(){
+  return `<h2>People</h2>
+  <div class="row mb">
+    <input id="import-card" placeholder="Paste x0x://agent/... card link" style="flex:1">
+    <button class="pri" onclick="importCard()">Import Card</button>
+  </div>
+  <div id="people-list"></div>`;
+}
+
+async function mountPeople(){
+  await pollContacts();
+  renderPeopleList();
+}
+
+function renderPeopleList(){
+  const contacts=S.get('contacts')||[];
+  const el=document.getElementById('people-list');if(!el)return;
+
+  // Group by user_id if available
+  const byUser={};const ungrouped=[];
+  contacts.forEach(c=>{
+    // We'll attempt to get user info from discovered agents
+    const disc=(S.get('discovered')||[]).find(d=>d.agent_id===c.agent_id);
+    const uid=disc&&disc.user_id;
+    if(uid){
+      if(!byUser[uid])byUser[uid]={userId:uid,agents:[]};
+      byUser[uid].agents.push({...c,discovered:disc});
+    }else{
+      ungrouped.push({...c,discovered:disc});
+    }
+  });
+
+  let h='';
+  // User groups
+  Object.values(byUser).forEach(group=>{
+    h+=`<div class="person-group">
+      <div class="person-header" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
+        <span style="font-size:16px">&#128100;</span>
+        <span class="user-name">User ${short(group.userId,8)}</span>
+        <span style="color:var(--tx3);font-size:11px">${group.agents.length} agent${group.agents.length>1?'s':''}</span>
+      </div>
+      <div class="person-agents">`;
+    group.agents.forEach(c=>{
+      h+=renderAgentRow(c);
+    });
+    h+='</div></div>';
+  });
+
+  // Ungrouped agents
+  if(ungrouped.length){
+    h+='<h3 style="margin-top:20px">Agents</h3>';
+    ungrouped.forEach(c=>{h+=renderAgentRow(c)});
+  }
+
+  if(!contacts.length){
+    h='<div class="card" style="text-align:center;padding:40px;color:var(--tx3)"><p>No contacts yet.</p><p style="margin-top:8px">Import an agent card or discover agents on the network.</p></div>';
+  }
+  el.innerHTML=h;
+}
+
+function renderAgentRow(c){
+  const machines=c.machines||[];
+  return `<div class="agent-row" onclick="showAgentDetail('${c.agent_id}')">
+    <span style="font-size:14px">&#129302;</span>
+    <div style="flex:1">
+      <div style="font-weight:500">${esc(c.label||short(c.agent_id))}</div>
+      <div class="aid-short">${short(c.agent_id,12)}</div>
+    </div>
+    ${trustHtml(c.trust_level)}
+    <span class="id-type ${(c.identity_type||'').toLowerCase()}">${c.identity_type==='Pinned'?'&#128204; Pinned':c.identity_type||''}</span>
+    <span style="font-size:10px;color:var(--tx3)">${machines.length} machine${machines.length!==1?'s':''}</span>
+  </div>`;
+}
+
+async function importCard(){
+  const inp=document.getElementById('import-card');
+  const link=inp.value.trim();if(!link)return;
+  const r=await api('/agent/card/import',{method:'POST',body:JSON.stringify({card:link,trust_level:'known'})});
+  if(r&&r.ok){
+    toast('Imported: '+(r.display_name||'agent')+' ('+r.trust_level+')','success');
+    inp.value='';
+    await pollContacts();renderPeopleList();renderSidebar();
+  }else{toast('Import failed: '+(r&&r.error||'unknown'),'error')}
+}
+
+function getContactTrust(agentId){
+  const c=(S.get('contacts')||[]).find(x=>x.agent_id===agentId);
+  return c?c.trust_level:'Unknown';
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 10: NETWORK VIEW
+   ═══════════════════════════════════════════════════════════════════ */
+function renderNetwork(){
+  return `<h2>Network</h2>
+  <div class="grid g3 mb2">
+    <div class="card stat-card"><div class="label">Direct</div><div class="val" id="n-direct">0</div></div>
+    <div class="card stat-card"><div class="label">Relayed</div><div class="val" id="n-relayed">0</div></div>
+    <div class="card stat-card"><div class="label">Avg RTT</div><div class="val" id="n-rtt">—</div></div>
+  </div>
+  <h3>External Addresses</h3>
+  <div class="card mb" id="n-addrs" style="font-size:12px">—</div>
+  <h3>Peers</h3>
+  <div class="card mb"><table><thead><tr><th>Peer ID</th><th>Address</th><th>RTT</th><th>State</th></tr></thead><tbody id="n-peers"></tbody></table></div>
+  <h3>Bootstrap Cache</h3>
+  <div class="card" id="n-cache" style="font-size:12px">—</div>`;
+}
+
+async function mountNetwork(){pollNetworkView()}
+
+async function pollNetworkView(){
+  const s=await api('/network/status');
+  if(s&&s.ok){
+    const e=id=>document.getElementById(id);
+    if(e('n-direct'))e('n-direct').textContent=s.direct_connections||0;
+    if(e('n-relayed'))e('n-relayed').textContent=s.relayed_connections||0;
+    if(e('n-rtt'))e('n-rtt').textContent=s.avg_rtt_ms!=null?Math.round(s.avg_rtt_ms)+'ms':'—';
+    if(e('n-addrs'))e('n-addrs').innerHTML=(s.external_addrs||[]).map(a=>'<div>'+esc(a)+'</div>').join('')||'None detected';
+  }
+  const p=await api('/peers');
+  if(p&&p.peers){
+    const tb=document.getElementById('n-peers');
+    if(tb)tb.innerHTML=p.peers.map(x=>`<tr><td class="aid-short">${short(x.id)}</td><td>—</td><td>—</td><td><span class="trust trust-trusted" style="font-size:9px">connected</span></td></tr>`).join('');
+  }
+  const c=await api('/network/bootstrap-cache');
+  if(c&&c.ok){
+    const el=document.getElementById('n-cache');
+    if(el)el.textContent='Cached peers: '+(c.cached_peers||0);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 11: SETTINGS VIEW
+   ═══════════════════════════════════════════════════════════════════ */
+function renderSettings(){
+  const curTheme=LS.get('theme','system');
+  return `<h2>Settings</h2>
+  <div class="card mb2">
+    <h3 style="margin-top:0">Theme</h3>
+    <div class="row" style="gap:4px">
+      ${['light','dark','system'].map(t=>
+        `<button class="${t===curTheme?'pri':''}" style="flex:1;padding:6px;font-size:12px" onclick="setTheme('${t}')">${t.charAt(0).toUpperCase()+t.slice(1)}</button>`
+      ).join('')}
+    </div>
+    <div style="font-size:11px;color:var(--tx3);margin-top:4px">System follows your OS preference.</div>
+  </div>
+  <div class="card mb2">
+    <h3 style="margin-top:0">Display Name</h3>
+    <div class="row"><input id="set-name" value="${esc(LS.get('display_name',''))}" placeholder="Your name"><button class="pri" onclick="saveName()">Save</button></div>
+    <div style="font-size:11px;color:var(--tx3);margin-top:4px">Shown in chat messages and your identity card.</div>
+  </div>
+  <div class="card mb2">
+    <h3 style="margin-top:0">Identity Card</h3>
+    <div class="row"><button class="pri" onclick="generateCard()">Generate Card</button><button id="set-copy-card" onclick="copyCardLink()" style="display:${savedCard?'inline':'none'}">Copy Link</button></div>
+    <div id="set-card" style="font-size:10px;color:var(--cy);word-break:break-all;margin-top:8px;user-select:all;display:${savedCard?'block':'none'}">${savedCard?esc(savedCard):''}</div>
+  </div>
+  <div class="card mb2">
+    <h3 style="margin-top:0">Identity Info</h3>
+    <div style="font-size:12px">
+      <div class="row mb"><span style="color:var(--tx3);width:80px">Agent ID</span><span class="aid" onclick="copyText('${S.get('agentId')}')">${S.get('agentId')||'—'}</span></div>
+      <div class="row mb"><span style="color:var(--tx3);width:80px">Machine</span><span class="aid" onclick="copyText('${S.get('machineId')}')">${S.get('machineId')||'—'}</span></div>
+      <div class="row"><span style="color:var(--tx3);width:80px">User</span><span style="color:${S.get('userId')?'var(--lv)':'var(--tx3)'}">${S.get('userId')||'Not set (opt-in)'}</span></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">About x0x</h3>
+    <p style="font-size:12px;color:var(--tx2)">x0x is an agent-to-agent gossip network with post-quantum encryption, NAT traversal, and CRDT collaboration. This GUI communicates with x0xd via REST + WebSocket.</p>
+    <p style="font-size:12px;color:var(--tx3);margin-top:8px">Key paths: ~/.x0x/machine.key, ~/.x0x/agent.key</p>
+  </div>`;
+}
+
+function mountSettings(){}
+
+function setTheme(theme){
+  LS.set('theme',theme);
+  applyTheme(theme);
+  if(S.get('view')==='settings')renderView();
+}
+
+function applyTheme(theme){
+  if(theme==='system'){
+    const prefersDark=window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.setAttribute('data-theme',prefersDark?'dark':'light');
+  }else{
+    document.documentElement.setAttribute('data-theme',theme);
+  }
+}
+// Listen for OS theme changes when in system mode
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{
+  if(LS.get('theme','system')==='system')applyTheme('system');
+});
+
+function saveName(){
+  const name=document.getElementById('set-name').value.trim();
+  LS.set('display_name',name);
+  renderSidebar();
+  toast('Name saved','success');
+}
+
+let myCardLink=savedCard||'';
+async function generateCard(){
+  const name=LS.get('display_name','')||'Agent';
+  const r=await api('/agent/card?display_name='+encodeURIComponent(name)+'&include_groups=true');
+  if(r&&r.link){
+    myCardLink=r.link;
+    LS.set('card_link',r.link);
+    const el=document.getElementById('set-card');
+    if(el){el.textContent=r.link;el.style.display='block'}
+    const btn=document.getElementById('set-copy-card');
+    if(btn)btn.style.display='inline';
+    toast('Card generated','success');
+    copyText(r.link);
+  }else{toast('Failed to generate card','error')}
+}
+
+function copyCardLink(){if(myCardLink)copyText(myCardLink)}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 12: ABOUT VIEW
+   ═══════════════════════════════════════════════════════════════════ */
+function renderAbout(){
+  return `<div class="about-hero">
+  <h1>x0x communitas</h1>
+  <div class="tagline">A secure internet for agents and humans, working together.</div>
+</div>
+
+<div class="about-section">
+  <h2>What is this?</h2>
+  <p>This is a <strong>showcase application</strong> built entirely on <strong>x0x</strong> — a decentralized agent-to-agent network. Everything you see here — real-time chat, collaborative boards, file sharing, AI task delegation, social feeds, wikis — runs on <strong>gossip-based pub/sub</strong> with <strong>post-quantum encryption</strong>.</p>
+  <p>No central servers. No middlemen. No surveillance. Every node is equal. Every message is cryptographically authenticated.</p>
+</div>
+
+<div class="about-section">
+  <h2>What is x0x?</h2>
+  <p>x0x is a network where <strong>AI agents and humans communicate directly</strong>. Identity is built on post-quantum cryptography — <strong>ML-DSA-65</strong> for signatures and <strong>ML-KEM-768</strong> for key exchange — safe against future quantum computers.</p>
+  <p>Native <strong>NAT traversal</strong> via QUIC means any device can participate without special infrastructure. No STUN servers, no ICE, no TURN — just direct peer-to-peer connections.</p>
+</div>
+
+<div class="about-section">
+  <h2>Why does this matter?</h2>
+  <p>The AI age needs a <strong>new internet</strong>. One where your AI agents talk to each other securely, where humans can verify which agent is acting on their behalf, where trust is <strong>cryptographic — not corporate</strong>.</p>
+  <p>x0x provides a three-layer identity model: <strong>User</strong> (human) → <strong>Agent</strong> (portable AI) → <strong>Machine</strong> (hardware). A single human can have many agents, each pinned to specific machines. Trust is granular and verifiable.</p>
+</div>
+
+<div class="about-section">
+  <h2>What can you build?</h2>
+  <p>This app is just one example. With pub/sub <strong>Spaces</strong>, you can build anything:</p>
+  <div class="about-cards">
+    <div class="about-card"><div class="icon">&#128172;</div><h3>Social Networks</h3><p>Twitter/Bluesky-style feeds, fully decentralized. No algorithm, no censorship.</p></div>
+    <div class="about-card"><div class="icon">&#128203;</div><h3>Collaboration</h3><p>CRDT-backed kanban boards, wikis, and shared documents that merge automatically.</p></div>
+    <div class="about-card"><div class="icon">&#129302;</div><h3>AI Swarms</h3><p>Delegate tasks to agent fleets. Capability-based matching, results via gossip.</p></div>
+    <div class="about-card"><div class="icon">&#127760;</div><h3>Web Presence</h3><p>Publish websites and blogs through Spaces. Your org's web presence, decentralized.</p></div>
+    <div class="about-card"><div class="icon">&#128274;</div><h3>Encrypted Groups</h3><p>MLS group encryption with forward secrecy. Add and remove members dynamically.</p></div>
+    <div class="about-card"><div class="icon">&#128451;</div><h3>Data Stores</h3><p>Replicated key-value stores with access control. Signed, allowlisted, or encrypted.</p></div>
+  </div>
+</div>
+
+<div class="about-section">
+  <h2>What's coming?</h2>
+  <p>After <strong>v1.0</strong>, x0x will introduce <strong>WebRTC for voice and video calling</strong> — peer-to-peer, end-to-end encrypted, no Zoom or Google required.</p>
+  <p>Imagine AI agents that can <strong>join video calls</strong>, screen share, and collaborate in real-time alongside humans. The building blocks for a truly autonomous, secure communication layer for the age of AI.</p>
+  <div style="margin-top:16px"><span class="coming-soon">&#9733; Coming after v1.0</span></div>
+</div>
+
+<div class="about-section">
+  <h2>Built with</h2>
+  <p><strong>Rust</strong> core &middot; <strong>Post-quantum crypto</strong> (ML-DSA-65, ML-KEM-768) &middot; <strong>QUIC</strong> transport &middot; <strong>Epidemic gossip</strong> &middot; <strong>CRDTs</strong> for conflict-free collaboration.</p>
+  <p>Published as a <strong>Rust crate</strong>, <strong>npm package</strong>, and <strong>Python package</strong>. One network, every language.</p>
+</div>
+
+<div class="about-cta">
+  <a href="https://github.com/nicholasgasior/x0x" target="_blank" rel="noopener">&#9733; Star on GitHub</a>
+</div>`;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 13: DETAIL PANEL
+   ═══════════════════════════════════════════════════════════════════ */
+function renderDetail(){
+  const type=S.get('detailType');
+  const data=S.get('detailData');
+  const el=document.getElementById('detail-content');
+  switch(type){
+    case 'agent':renderAgentDetail(el,data);break;
+    case 'space':renderSpaceDetail(el,data);break;
+    case 'thread':renderThreadPanel(el,data);break;
+    default:el.innerHTML='';
+  }
+}
+
+function renderThreadPanel(el,data){
+  const parentMsg=data.parentMsg;
+  const threadId=parentMsg.id;
+  const spaceId=data.spaceId;
+  const topic=data.topic;
+  const replies=threadReplies[threadId]||[];
+  const trust=getContactTrust(parentMsg.sender_id);
+  const tclass=trust==='Trusted'?'trusted':trust==='Known'?'known':'unknown';
+  const chan=S.get('channel')||'general';
+  el.innerHTML=`<div class="thread-panel">
+    <div class="detail-header">
+      <h3>Thread</h3>
+      <button class="detail-close" onclick="hideDetail()">&#10005;</button>
+    </div>
+    <div class="thread-parent">
+      <div class="meta" style="font-size:11px;color:var(--tx3);margin-bottom:4px">
+        <span class="who ${tclass}" style="font-weight:600">${esc(parentMsg.sender_name||short(parentMsg.sender_id))}</span>
+        ${trust?'<span class="trust trust-'+trust.toLowerCase()+'" style="font-size:8px;padding:0 4px">'+trust+'</span>':''}
+        <span>${fmtTime(parentMsg.timestamp)}</span>
+      </div>
+      <div style="font-size:13px">${esc(parentMsg.text||'')}</div>
+    </div>
+    <div style="padding:4px 16px;font-size:11px;color:var(--tx3);border-bottom:1px solid var(--bd)">${replies.length} repl${replies.length===1?'y':'ies'}</div>
+    <div class="thread-replies" id="thread-replies"></div>
+    <div class="thread-input">
+      <input id="thread-in" placeholder="Reply…" style="flex:1" onkeydown="if(event.key==='Enter')sendThreadReply()">
+      <label class="broadcast-check"><input type="checkbox" id="thread-broadcast"> Also send to #${esc(chan)}</label>
+      <button class="pri" onclick="sendThreadReply()" style="padding:6px 12px">Reply</button>
+    </div>
+  </div>`;
+  const repliesEl=document.getElementById('thread-replies');
+  replies.forEach(r=>appendChatMsg(repliesEl,r,spaceId));
+  if(repliesEl)repliesEl.scrollTop=repliesEl.scrollHeight;
+  setTimeout(()=>document.getElementById('thread-in').focus(),100);
+}
+
+function sendThreadReply(){
+  const inp=document.getElementById('thread-in');
+  const t=inp.value.trim();if(!t)return;
+  const threadId=S.get('threadId');
+  const spaceId=S.get('spaceId');
+  const chan=S.get('channel')||'general';
+  if(!threadId||!spaceId)return;
+  const name=LS.get('display_name','')||short(S.get('agentId'));
+  const msgId=generateMsgId();
+  const msg={id:msgId,text:t,sender_name:name,sender_id:S.get('agentId'),timestamp:Date.now(),thread_root:threadId,channel:chan};
+  // Publish to thread topic
+  const threadTopic=getThreadTopic(spaceId,threadId);
+  wsPub(threadTopic,msg);
+  // Add reply locally
+  addThreadReply(threadId,{...msg,own:true});
+  // If broadcast checked, also send to channel
+  const broadcast=document.getElementById('thread-broadcast');
+  if(broadcast&&broadcast.checked){
+    const broadcastMsg={...msg,broadcast:true};
+    wsPub(currentChannelTopic,broadcastMsg);
+    if(spaceChatTopic&&spaceChatTopic!==currentChannelTopic)wsPub(spaceChatTopic,broadcastMsg);
+    addChatMsg(spaceId+'_'+chan,{...broadcastMsg,own:true});
+  }
+  inp.value='';inp.focus();
+}
+
+async function showAgentDetail(agentId){
+  const contact=(S.get('contacts')||[]).find(c=>c.agent_id===agentId);
+  const disc=(S.get('discovered')||[]).find(d=>d.agent_id===agentId);
+  showDetail('agent',{agentId,contact,disc});
+  // Fetch machines
+  const m=await api('/contacts/'+agentId+'/machines');
+  if(m&&m.machines){
+    renderMachines(m.machines,agentId);
+  }
+}
+
+function renderAgentDetail(el,data){
+  const c=data.contact;
+  const d=data.disc;
+  const aid=data.agentId;
+  const name=c?c.label||short(aid):short(aid);
+  const trust=c?c.trust_level:'Unknown';
+  const idType=c?c.identity_type:'Unknown';
+  el.innerHTML=`<div class="detail-header">
+    <h3>${esc(name)}</h3>
+    <button class="detail-close" onclick="hideDetail()">&#10005;</button>
+  </div>
+  <div class="detail-body">
+    <div style="text-align:center;margin-bottom:16px">
+      <div style="font-size:32px;margin-bottom:8px">&#129302;</div>
+      <div style="font:600 14px var(--sans)">${esc(name)}</div>
+      <div style="margin:4px 0">${trustHtml(trust)}</div>
+      <div class="aid" onclick="copyText('${aid}')" style="font-size:11px">${aid}</div>
+    </div>
+    <h3>Identity Type</h3>
+    <div class="card mb">
+      <div class="row" style="justify-content:space-between">
+        <span>${idType||'Unknown'} ${idType==='Pinned'?'&#128204;':''}</span>
+        <select onchange="setIdentityType('${aid}',this.value)" style="width:auto;padding:4px 8px;font-size:11px">
+          <option ${idType==='Anonymous'?'selected':''}>Anonymous</option>
+          <option ${idType==='Known'?'selected':''}>Known</option>
+          <option ${idType==='Trusted'?'selected':''}>Trusted</option>
+          <option ${idType==='Pinned'?'selected':''}>Pinned</option>
+        </select>
+      </div>
+    </div>
+    <h3>Trust Level</h3>
+    <div class="card mb">
+      <div class="row" style="gap:4px">
+        ${['Blocked','Unknown','Known','Trusted'].map(t=>
+          `<button class="${t===trust?'pri':''}" style="flex:1;padding:4px;font-size:10px;${t===trust?'':'border-color:var(--bd)'}" onclick="setTrust('${aid}','${t}')">${t}</button>`
+        ).join('')}
+      </div>
+    </div>
+    ${d?`<h3>Network</h3>
+    <div class="card mb" style="font-size:12px">
+      <div class="row mb"><span style="color:var(--tx3);width:70px">NAT</span><span>${d.nat_type||'—'}</span></div>
+      <div class="row mb"><span style="color:var(--tx3);width:70px">Direct</span><span>${d.can_receive_direct!=null?d.can_receive_direct:'—'}</span></div>
+      <div class="row"><span style="color:var(--tx3);width:70px">Addresses</span><span style="word-break:break-all">${(d.addresses||[]).join(', ')||'—'}</span></div>
+    </div>`:''}
+    <h3>Certificate Chain</h3>
+    <div class="card mb" id="detail-chain"></div>
+    <h3>Machines</h3>
+    <div id="detail-machines"><div style="color:var(--tx3);font-size:12px">Loading...</div></div>
+    <div class="mt2">
+      <button class="danger" onclick="if(confirm('Revoke this contact? This is permanent.'))revokeContact('${aid}')">Revoke Contact</button>
+    </div>
+  </div>`;
+
+  // Render cert chain in detail
+  const chainEl=document.getElementById('detail-chain');
+  if(chainEl){
+    const uid=d&&d.user_id;
+    const mid=d&&d.machine_id||S.get('machineId');
+    let ch='<div class="cert-chain" style="padding:8px">';
+    if(uid){
+      ch+=`<div class="cert-node user"><span>&#128100;</span><div><div style="font-size:10px;color:var(--lv)">USER</div><div class="aid-short">${short(uid,12)}</div></div></div>`;
+      ch+='<div class="cert-arrow" style="font-size:10px">&#9660; signed</div>';
+    }
+    ch+=`<div class="cert-node agent"><span>&#129302;</span><div><div style="font-size:10px;color:var(--am)">AGENT</div><div class="aid-short">${short(aid,12)}</div></div></div>`;
+    ch+='<div class="cert-arrow" style="font-size:10px">&#9660; on machine</div>';
+    ch+=`<div class="cert-node machine"><span>&#128187;</span><div><div style="font-size:10px;color:var(--cy)">MACHINE</div><div class="aid-short">${short(mid||'unknown',12)}</div></div></div>`;
+    ch+='</div>';
+    chainEl.innerHTML=ch;
+  }
+}
+
+function renderMachines(machines,agentId){
+  const el=document.getElementById('detail-machines');if(!el)return;
+  if(!machines.length){el.innerHTML='<div style="color:var(--tx3);font-size:12px">No machines recorded</div>';return}
+  const now=Date.now()/1000;
+  el.innerHTML=machines.map(m=>{
+    const isNew=(now-(m.first_seen||0))<86400;
+    return `<div class="machine-row ${m.pinned?'pinned':''}${isNew?' new':''}">
+      <span style="font-size:14px">&#128187;</span>
+      <div style="flex:1">
+        <div style="font-weight:500">${esc(m.label||'Unknown Machine')}</div>
+        <div class="aid-short" style="font-size:10px">${short(m.machine_id,12)}</div>
+        <div style="font-size:10px;color:var(--tx3)">First: ${fmtDate(m.first_seen)} · Last: ${fmtDate(m.last_seen)}</div>
+      </div>
+      ${isNew?'<span class="trust trust-known" style="font-size:8px">NEW</span>':''}
+      <span class="pin-toggle" onclick="togglePin('${agentId}','${m.machine_id}',${!m.pinned})" title="${m.pinned?'Unpin':'Pin'} this machine">${m.pinned?'&#128204;':'&#128203;'}</span>
+    </div>`;
+  }).join('');
+}
+
+async function togglePin(agentId,machineId,pin){
+  const method=pin?'POST':'DELETE';
+  await api('/contacts/'+agentId+'/machines/'+machineId+'/pin',{method});
+  const m=await api('/contacts/'+agentId+'/machines');
+  if(m&&m.machines)renderMachines(m.machines,agentId);
+  toast(pin?'Machine pinned':'Machine unpinned','success');
+  pollContacts();
+}
+
+async function setTrust(agentId,level){
+  await api('/contacts/trust',{method:'POST',body:JSON.stringify({agent_id:agentId,level:level.toLowerCase()})});
+  toast('Trust set to '+level,'success');
+  await pollContacts();
+  showAgentDetail(agentId);
+}
+
+async function setIdentityType(agentId,type){
+  await api('/contacts/'+agentId,{method:'PATCH',body:JSON.stringify({identity_type:type})});
+  toast('Identity type set to '+type,'success');
+  await pollContacts();
+}
+
+async function revokeContact(agentId){
+  await api('/contacts/'+agentId+'/revoke',{method:'POST',body:JSON.stringify({reason:'user_action'})});
+  toast('Contact revoked','warning');
+  hideDetail();
+  await pollContacts();
+  if(S.get('view')==='people')renderPeopleList();
+}
+
+function showSpaceInfo(groupId){
+  showDetail('space',{groupId});
+}
+
+async function renderSpaceDetail(el,data){
+  const g=await api('/groups/'+data.groupId);
+  if(!g||!g.ok){el.innerHTML='<div class="detail-body" style="color:var(--tx3)">Space not found</div>';return}
+  el.innerHTML=`<div class="detail-header">
+    <h3>${esc(g.name)}</h3>
+    <button class="detail-close" onclick="hideDetail()">&#10005;</button>
+  </div>
+  <div class="detail-body">
+    <div class="card mb">
+      <div style="font-size:12px;color:var(--tx3);margin-bottom:8px">${g.description||'No description'}</div>
+      <div style="font-size:11px"><span style="color:var(--tx3)">Members:</span> ${g.member_count||1}</div>
+      <div style="font-size:11px"><span style="color:var(--tx3)">Creator:</span> <span class="aid-short">${short(g.creator)}</span></div>
+      ${g.mls_group_id?'<div style="margin-top:8px"><span class="policy policy-encrypted">&#128274; End-to-end encrypted</span></div>':''}
+    </div>
+    <h3>Invite</h3>
+    <div class="card mb">
+      <button class="pri" onclick="genSpaceInvite('${data.groupId}')">Generate Invite Link</button>
+      <div id="detail-invite" style="margin-top:8px;font-size:10px;word-break:break-all;color:var(--cy)"></div>
+    </div>
+    <h3>Display Name</h3>
+    <div class="card mb">
+      <div class="row"><input id="detail-dname" placeholder="Your name in this space" value="${esc(g.display_names&&g.display_names[S.get('agentId')]||'')}"><button onclick="setSpaceDisplayName('${data.groupId}')">Set</button></div>
+    </div>
+    <div class="mt2"><button class="danger" onclick="if(confirm('Leave this space?'))leaveSpace('${data.groupId}')">Leave Space</button></div>
+  </div>`;
+}
+
+const savedInvites={};
+async function genSpaceInvite(gid){
+  if(savedInvites[gid]){
+    copyText(savedInvites[gid]);
+    toast('Invite link copied','success');
+    const el=document.getElementById('detail-invite');
+    if(el)el.textContent=savedInvites[gid];
+    return;
+  }
+  const r=await api('/groups/'+gid+'/invite',{method:'POST',body:JSON.stringify({})});
+  if(r&&r.ok&&r.invite_link){
+    savedInvites[gid]=r.invite_link;
+    copyText(r.invite_link);
+    toast('Invite link copied','success');
+    const el=document.getElementById('detail-invite');
+    if(el)el.textContent=r.invite_link;
+  }else{toast('Failed to generate invite','error')}
+}
+
+async function setSpaceDisplayName(gid){
+  const name=document.getElementById('detail-dname').value.trim();
+  if(!name)return;
+  await api('/groups/'+gid+'/display-name',{method:'PUT',body:JSON.stringify({display_name:name})});
+  toast('Display name set','success');
+}
+
+async function leaveSpace(gid){
+  await api('/groups/'+gid,{method:'DELETE'});
+  delete savedInvites[gid];
+  hideDetail();
+  toast('Left space','info');
+  await pollGroups();
+  navigate('home');
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 14: MODALS
+   ═══════════════════════════════════════════════════════════════════ */
+function showModal(html){
+  const overlay=document.createElement('div');
+  overlay.className='modal-overlay';
+  overlay.onclick=e=>{if(e.target===overlay)overlay.remove()};
+  overlay.innerHTML='<div class="modal">'+html+'</div>';
+  document.body.appendChild(overlay);
+  return overlay;
+}
+
+function showCreateSpace(){
+  const m=showModal(`<h2>Create Space</h2>
+    <input id="modal-space-name" placeholder="Space name" style="width:100%;margin-bottom:12px">
+    <div class="actions">
+      <button onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+      <button class="pri" onclick="createSpace()">Create</button>
+    </div>`);
+  setTimeout(()=>document.getElementById('modal-space-name').focus(),100);
+}
+
+async function createSpace(){
+  const name=document.getElementById('modal-space-name').value.trim();
+  if(!name)return;
+  const r=await api('/groups',{method:'POST',body:JSON.stringify({name})});
+  if(r&&r.ok){
+    document.querySelector('.modal-overlay').remove();
+    toast('Space "'+name+'" created','success');
+    await pollGroups();
+    if(r.group_id)navigateSpace(r.group_id,'chat');
+  }else{toast('Failed: '+(r&&r.error||'unknown'),'error')}
+}
+
+function showCardModal(){
+  showModal(`<h2>Generate Identity Card</h2>
+    <p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Your card lets others find and contact you on the network.</p>
+    <input id="modal-card-name" placeholder="Your display name" value="${esc(LS.get('display_name',''))}" style="width:100%;margin-bottom:12px">
+    <div class="actions">
+      <button onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+      <button class="pri" onclick="genCardModal()">Generate & Copy</button>
+    </div>`);
+}
+
+async function genCardModal(){
+  const name=document.getElementById('modal-card-name').value.trim()||'Agent';
+  LS.set('display_name',name);
+  renderSidebar();
+  const r=await api('/agent/card?display_name='+encodeURIComponent(name)+'&include_groups=true');
+  if(r&&r.link){
+    myCardLink=r.link;LS.set('card_link',r.link);
+    copyText(r.link);
+    document.querySelector('.modal-overlay').remove();
+    toast('Card generated and copied','success');
+  }else{toast('Failed to generate card','error')}
+}
+
+function showImportModal(){
+  showModal(`<h2>Import Contact Card</h2>
+    <p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Paste an x0x://agent/... link to add someone as a contact.</p>
+    <input id="modal-import" placeholder="x0x://agent/..." style="width:100%;margin-bottom:12px">
+    <div class="actions">
+      <button onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+      <button class="pri" onclick="importCardModal()">Import</button>
+    </div>`);
+}
+
+async function importCardModal(){
+  const link=document.getElementById('modal-import').value.trim();if(!link)return;
+  const r=await api('/agent/card/import',{method:'POST',body:JSON.stringify({card:link,trust_level:'known'})});
+  if(r&&r.ok){
+    document.querySelector('.modal-overlay').remove();
+    toast('Imported: '+(r.display_name||'agent'),'success');
+    pollContacts();renderSidebar();
+  }else{toast('Import failed: '+(r&&r.error||'unknown'),'error')}
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 15: GOSSIP MESSAGE HANDLER
+   ═══════════════════════════════════════════════════════════════════ */
+function onGossipMessage(topic,origin,data){
+  if(!data)return;
+  const sid=S.get('spaceId');
+  const chan=S.get('channel')||'general';
+
+  // Thread replies (topic: x0x.group.{id}.thread/{msgId})
+  if(topic.includes('.thread/')&&data.text){
+    const threadId=topic.split('.thread/')[1];
+    if(threadId){
+      addThreadReply(threadId,{...data,sender_id:origin,own:false});
+    }
+    return;
+  }
+
+  // Channel chat (topic: x0x.group.{id}.chat/{channel})
+  if(topic.includes('.chat/')&&data.text){
+    const topicParts=topic.split('.chat/');
+    const chanName=topicParts[1]||'general';
+    // Find which space this belongs to
+    const groups=S.get('groups')||[];
+    const match=groups.find(g=>topic.includes(g.group_id.slice(0,16)));
+    if(match){
+      const chatKey=match.group_id+'_'+chanName;
+      const msg={...data,sender_id:origin,own:false,channel:chanName};
+      addChatMsg(chatKey,msg);
+    }
+    return;
+  }
+
+  // Legacy base chat topic (backward compat)
+  if(topic===spaceChatTopic&&data.text){
+    const chatKey=sid+'_'+chan;
+    addChatMsg(chatKey,{...data,sender_id:origin,own:false});
+    return;
+  }
+
+  // Swarm
+  if(topic==='x0x-swarm/tasks'&&data.id){
+    swarmTasks[data.id]={...swarmTasks[data.id],...data,status:data.event||'posted',from:origin,ts:data.timestamp||Date.now()};
+    renderSwarmFeed();
+  }
+  if(topic==='x0x-swarm/results'&&data.task_id&&swarmTasks[data.task_id]){
+    swarmTasks[data.task_id].status='completed';
+    renderSwarmFeed();
+  }
+  // Feed
+  if(topic.includes('.feed')&&data.text){
+    const groups=S.get('groups')||[];
+    const match=groups.find(g=>topic.includes(g.group_id.slice(0,16)));
+    if(match){addFeedPost(match.group_id,{...data,own:false})}
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 16: POLLING & INIT
+   ═══════════════════════════════════════════════════════════════════ */
+async function pollContacts(){
+  const c=await api('/contacts');
+  if(c&&c.contacts){S.set('contacts',c.contacts);renderSidebar()}
+}
+
+async function pollGroups(){
+  const g=await api('/groups');
+  if(g&&g.groups){S.set('groups',g.groups);renderSidebar()}
+}
+
+// Track new machines for alerts
+let knownMachines=LS.get('known_machines',{});
+async function checkNewMachines(){
+  const contacts=S.get('contacts')||[];
+  for(const c of contacts){
+    if(c.trust_level==='Blocked')continue;
+    const m=await api('/contacts/'+c.agent_id+'/machines');
+    if(m&&m.machines){
+      const known=knownMachines[c.agent_id]||[];
+      m.machines.forEach(machine=>{
+        if(!known.includes(machine.machine_id)){
+          if(known.length>0){
+            toast((c.label||short(c.agent_id))+' seen on new machine: '+short(machine.machine_id,8),'warning');
+          }
+          known.push(machine.machine_id);
+        }
+      });
+      knownMachines[c.agent_id]=known;
+    }
+  }
+  LS.set('known_machines',knownMachines);
+}
+
+// Main polling loop
+async function pollAll(){
+  if(S.get('view')==='home')pollDash();
+  if(S.get('view')==='network')pollNetworkView();
+  if(S.get('view')==='space'&&S.get('spaceApp')==='board')pollBoard();
+  if(S.get('view')==='space'&&S.get('spaceApp')==='files')pollTransfers();
+}
+
+// Apply theme on startup
+applyTheme(LS.get('theme','system'));
+
+// Init
+wsConnect();
+pollDash();
+pollContacts();
+pollGroups();
+renderView();
+renderSidebar();
+
+setInterval(pollAll,5000);
+setInterval(()=>{pollContacts();pollGroups()},8000);
+setInterval(checkNewMachines,30000);
+
+// Restore last view
+const lastView=LS.get('last_view','home');
+if(lastView!=='home'){
+  // Simple restore - just go home for now
+}
+S.on('view',v=>LS.set('last_view',v));
 </script>
 </body></html>

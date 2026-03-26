@@ -1144,8 +1144,12 @@ impl Agent {
         } else {
             self.announcement_addresses()
         };
-        // Detect global IPv6 locally (same trick as heartbeat)
+        // Detect addresses locally via UDP socket tricks.
+        // ant-quic discovers public IPv4 via OBSERVED_ADDRESS from peers.
+        // IPv6 is globally routable (no NAT), so we probe locally.
         let port = addresses.first().map(|a| a.port()).unwrap_or(5483);
+
+        // IPv6 probe
         if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
             if sock.connect("[2001:4860:4860::8888]:80").is_ok() {
                 if let Ok(local) = sock.local_addr() {

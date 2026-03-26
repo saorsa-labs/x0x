@@ -34,9 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tokio::signal;
-use tokio::sync::{broadcast, mpsc, RwLock};
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tower_http::cors::CorsLayer;
 use x0x::contacts::{ContactStore, IdentityType, MachineRecord, TrustLevel};
 use x0x::identity::AgentId;
@@ -124,7 +122,10 @@ fn default_bootstrap_peers() -> Vec<SocketAddr> {
 }
 
 fn default_bind_address() -> SocketAddr {
-    SocketAddr::from(([0, 0, 0, 0], DEFAULT_QUIC_PORT))
+    // Bind to IPv6 unspecified ([::]) which accepts both IPv4 and IPv6
+    // via dual-stack sockets. This avoids port conflicts on macOS where
+    // binding 0.0.0.0:port prevents a subsequent [::]:port bind.
+    SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], DEFAULT_QUIC_PORT))
 }
 
 fn default_api_address() -> SocketAddr {
@@ -295,6 +296,8 @@ struct AppState {
     file_transfers: RwLock<HashMap<String, x0x::files::TransferState>>,
     /// Channel to trigger graceful shutdown from the /shutdown endpoint.
     shutdown_tx: mpsc::Sender<()>,
+    /// Broadcasts daemon shutdown so long-lived SSE/WS connections can close.
+    shutdown_notify: watch::Sender<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -768,7 +771,26 @@ async fn main() -> Result<()> {
         tracing::info!("Instance name: {name}");
     }
     tracing::info!("API address: {}", config.api_address);
-    tracing::info!("Bind address: {}", config.bind_address);
+
+    // Promote IPv4 unspecified (0.0.0.0) to IPv6 unspecified (::) for dual-stack.
+    // An IPv6 socket with IPV6_V6ONLY=false accepts both IPv4 and IPv6 traffic,
+    // avoiding port conflicts when multiple instances run on the same machine.
+    let bind_address = if config.bind_address.ip().is_unspecified() && config.bind_address.is_ipv4()
+    {
+        let promoted = SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            config.bind_address.port(),
+        );
+        tracing::info!(
+            "Bind address: {} (promoted to {} for dual-stack)",
+            config.bind_address,
+            promoted
+        );
+        promoted
+    } else {
+        tracing::info!("Bind address: {}", config.bind_address);
+        config.bind_address
+    };
 
     // Derive instance-scoped identity directory
     let identity_dir = match &instance_name {
@@ -787,7 +809,7 @@ async fn main() -> Result<()> {
 
     // Create agent
     let network_config = NetworkConfig {
-        bind_addr: Some(config.bind_address),
+        bind_addr: Some(bind_address),
         bootstrap_nodes: config.bootstrap_peers.clone(),
         max_connections: 50,
         connection_timeout: std::time::Duration::from_secs(30),
@@ -880,11 +902,19 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Bind the API listener early so the daemon can report the actual bound
+    // address even when configured with an ephemeral port.
+    let listener = tokio::net::TcpListener::bind(config.api_address)
+        .await
+        .context("failed to bind API address")?;
+    let actual_api_addr = listener.local_addr()?;
+
     // Build shared state BEFORE joining network so the API server can
     // start immediately. Network-dependent endpoints will return errors
     // until join completes, which is better than blocking the entire API.
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let (shutdown_notify, _) = watch::channel(false);
     let agent = Arc::new(agent);
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
@@ -898,11 +928,12 @@ async fn main() -> Result<()> {
         mls_groups_path,
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
-        api_address: config.api_address,
+        api_address: actual_api_addr,
         start_time: Instant::now(),
         broadcast_tx,
         file_transfers: RwLock::new(HashMap::new()),
         shutdown_tx,
+        shutdown_notify,
     });
 
     // Join network in background — API is available immediately
@@ -1094,10 +1125,6 @@ async fn main() -> Result<()> {
         .with_state(Arc::clone(&state));
 
     // Start server
-    let listener = tokio::net::TcpListener::bind(config.api_address)
-        .await
-        .context("failed to bind API address")?;
-    let actual_api_addr = listener.local_addr()?;
     let port_file = config.data_dir.join("api.port");
     tokio::fs::write(&port_file, actual_api_addr.to_string()).await?;
     tracing::info!(
@@ -1105,19 +1132,38 @@ async fn main() -> Result<()> {
         port_file.display()
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = signal::ctrl_c() => {
-                    tracing::info!("Received Ctrl+C shutdown signal");
-                }
-                _ = shutdown_rx.recv() => {
-                    tracing::info!("Received API shutdown request");
-                }
-            }
-        })
-        .await
-        .context("API server error")?;
+    let mut server_shutdown_rx = state.shutdown_notify.subscribe();
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = server_shutdown_rx.changed().await;
+            })
+            .await
+    });
+
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            tracing::info!("Received Ctrl+C shutdown signal");
+        }
+        _ = shutdown_rx.recv() => {
+            tracing::info!("Received API shutdown request");
+        }
+    }
+
+    let _ = state.shutdown_notify.send(true);
+
+    match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => return Err(anyhow::Error::new(e).context("API server error")),
+        Ok(Err(e)) => return Err(anyhow::Error::new(e).context("API server task failed")),
+        Err(_) => {
+            tracing::warn!(
+                "API server did not shut down within 2s; aborting lingering connections"
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
 
     // Clean up port file on shutdown
     let _ = tokio::fs::remove_file(&port_file).await;
@@ -1206,6 +1252,7 @@ async fn list_instances() -> Result<()> {
 /// POST /shutdown — trigger graceful daemon shutdown.
 async fn shutdown_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     tracing::info!("Shutdown requested via API");
+    let _ = state.shutdown_notify.send(true);
     let _ = state.shutdown_tx.send(()).await;
     (
         StatusCode::OK,
@@ -1957,8 +2004,27 @@ async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .collect();
 
     let port = status.local_addr.port();
+
+    // Discover global IPv4 address using UDP socket trick.
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local) = sock.local_addr() {
+                if let std::net::IpAddr::V4(v4) = local.ip() {
+                    if !v4.is_loopback() && !v4.is_unspecified() {
+                        // Use the external IPv4 we saw in ant-quic logs, or local if no NAT
+                        // For now, include our local IPv4 — NAT traversal will handle the rest
+                        let addr_str = format!("{v4}:{port}");
+                        if !all_addrs.contains(&addr_str) {
+                            all_addrs.push(addr_str);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Discover global IPv6 address using UDP socket trick.
     if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
-        // Connect to a well-known IPv6 address to discover our source addr
         if sock.connect("[2001:4860:4860::8888]:80").is_ok() {
             if let Ok(local) = sock.local_addr() {
                 if let std::net::IpAddr::V6(v6) = local.ip() {
@@ -2335,18 +2401,34 @@ async fn events_sse(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     tracing::info!("[6/6 x0xd] SSE client connected to /events");
-    let rx = state.broadcast_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
-        Ok(event) => {
-            tracing::info!(
-                event_type = %event.event_type,
-                "[6/6 x0xd] SSE delivering event to client"
-            );
-            let data = serde_json::to_string(&event).unwrap_or_default();
-            Some(Ok(Event::default().event(event.event_type).data(data)))
+    let mut rx = state.broadcast_tx.subscribe();
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
+    let stream = async_stream::stream! {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("[6/6 x0xd] SSE client closing due to daemon shutdown");
+                    break;
+                }
+                result = rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            tracing::info!(
+                                event_type = %event.event_type,
+                                "[6/6 x0xd] SSE delivering event to client"
+                            );
+                            let data = serde_json::to_string(&event).unwrap_or_default();
+                            yield Ok(Event::default().event(event.event_type).data(data));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "[6/6 x0xd] SSE client lagged behind broadcast stream");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
         }
-        Err(_) => None,
-    });
+    };
     Sse::new(stream)
 }
 
@@ -3817,19 +3899,31 @@ async fn direct_events_sse(
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     tracing::info!("[6/6 x0xd] SSE client connected to /direct/events");
     let mut rx = state.agent.subscribe_direct();
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
 
     let stream = async_stream::stream! {
-        while let Some(msg) = rx.recv().await {
-            let data = serde_json::json!({
-                "sender": hex::encode(msg.sender.as_bytes()),
-                "machine_id": hex::encode(msg.machine_id.as_bytes()),
-                "payload": base64::engine::general_purpose::STANDARD.encode(&msg.payload),
-                "received_at": msg.received_at
-            });
-            let event = Event::default()
-                .event("direct_message")
-                .data(data.to_string());
-            yield Ok(event);
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("[6/6 x0xd] direct SSE client closing due to daemon shutdown");
+                    break;
+                }
+                maybe_msg = rx.recv() => {
+                    let Some(msg) = maybe_msg else {
+                        break;
+                    };
+                    let data = serde_json::json!({
+                        "sender": hex::encode(msg.sender.as_bytes()),
+                        "machine_id": hex::encode(msg.machine_id.as_bytes()),
+                        "payload": base64::engine::general_purpose::STANDARD.encode(&msg.payload),
+                        "received_at": msg.received_at
+                    });
+                    let event = Event::default()
+                        .event("direct_message")
+                        .data(data.to_string());
+                    yield Ok(event);
+                }
+            }
         }
     };
 
@@ -4687,13 +4781,25 @@ async fn handle_ws_connection(
     });
 
     // Reader loop: ws_rx → dispatch commands
-    while let Some(Ok(msg)) = futures::StreamExt::next(&mut ws_rx).await {
-        match msg {
-            Message::Text(text) => {
-                handle_ws_command(&state, &session_id, &text, &outbound_tx).await;
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                tracing::info!(session_id = %session_id, "Closing WebSocket session due to daemon shutdown");
+                break;
             }
-            Message::Close(_) => break,
-            _ => {}
+            maybe_msg = futures::StreamExt::next(&mut ws_rx) => {
+                let Some(Ok(msg)) = maybe_msg else {
+                    break;
+                };
+                match msg {
+                    Message::Text(text) => {
+                        handle_ws_command(&state, &session_id, &text, &outbound_tx).await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
         }
     }
 
