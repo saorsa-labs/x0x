@@ -40,7 +40,7 @@ jobs:
           import sys
 
           text = Path("SKILL.md").read_text(encoding="utf-8")
-          match = re.search(r"\A---\n.*?^version:\s*([^\n]+)\n.*?^---\n", text, re.MULTILINE | re.DOTALL)
+          match = re.search(r"\A---\n.*?^version:\s*([^\n]+)\n.*?^---(?:\n|$)", text, re.MULTILINE | re.DOTALL)
           if not match:
               print("ERROR: Could not read the 'version:' field from SKILL.md frontmatter.", file=sys.stderr)
               sys.exit(1)
