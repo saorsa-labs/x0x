@@ -21,10 +21,47 @@ permissions:
 
 jobs:
   # ============================================================
+  # Validate release metadata before starting the build matrix
+  # ============================================================
+  validate-release-metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate SKILL.md version matches release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          expected_version="${GITHUB_REF_NAME#v}"
+          actual_version="$(python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          text = Path("SKILL.md").read_text(encoding="utf-8")
+          match = re.search(r"\A---\n.*?^version:\s*([^\n]+)\n.*?^---\n", text, re.MULTILINE | re.DOTALL)
+          if not match:
+              print("ERROR: Could not read the 'version:' field from SKILL.md frontmatter.", file=sys.stderr)
+              sys.exit(1)
+          print(match.group(1).strip())
+          PY
+          )"
+
+          if [ "$actual_version" != "$expected_version" ]; then
+            echo "ERROR: SKILL.md frontmatter version '$actual_version' does not match release tag '$GITHUB_REF_NAME'." >&2
+            echo "Update SKILL.md frontmatter to 'version: $expected_version', commit the change, and recreate or retag the release before rerunning this workflow." >&2
+            exit 1
+          fi
+
+          echo "SKILL.md version $actual_version matches release tag $GITHUB_REF_NAME."
+
+  # ============================================================
   # Build release binaries for all platforms
   # ============================================================
   build-release:
     name: Build ${{ matrix.platform }}
+    needs: validate-release-metadata
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
