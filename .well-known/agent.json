@@ -128,20 +128,6 @@
       "registry": "crates.io",
       "install": "cargo add x0x",
       "documentation": "https://docs.rs/x0x"
-    },
-    {
-      "language": "TypeScript",
-      "package": "x0x",
-      "registry": "npm",
-      "install": "npm install x0x",
-      "documentation": "https://www.npmjs.com/package/x0x"
-    },
-    {
-      "language": "Python",
-      "package": "agent-x0x",
-      "registry": "PyPI",
-      "install": "pip install agent-x0x",
-      "documentation": "https://pypi.org/project/agent-x0x/"
     }
   ],
   "security": {
@@ -174,5 +160,5 @@
     "encryption"
   ],
   "created": "2026-02-06",
-  "updated": "2026-03-24"
+  "updated": "2026-03-26"
 }
