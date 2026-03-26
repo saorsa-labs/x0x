@@ -928,6 +928,9 @@ function renderSpaceChat(el,sid){
   const chatKey=sid+'_'+chan;
   const hist=LS.get('chat_'+chatKey,[]);
   if(!chatHistory[chatKey])chatHistory[chatKey]=hist;
+  // Reset unread count for this channel
+  LS.set('unread_ch_'+sid+'_'+chan,0);
+  renderSidebar();
   el.innerHTML=`<div class="channel-header">
     <span class="hash" style="font-size:18px;color:var(--tx3)">#</span>
     <div>
@@ -1005,7 +1008,7 @@ function addThreadReply(threadId,msg){
   const indicator=document.getElementById('thread-ind-'+threadId);
   if(indicator){
     const tc=threadCache[threadId];
-    indicator.innerHTML='<span class="count">&#128172; '+tc.reply_count+' repl'+(tc.reply_count===1?'y':'ies')+'</span><span class="participants">'+tc.participants.slice(0,3).join(', ')+'</span><span class="last">'+fmtTime(tc.last_reply_at)+'</span>';
+    indicator.innerHTML='<span class="count">&#128172; '+tc.reply_count+' repl'+(tc.reply_count===1?'y':'ies')+'</span><span class="participants">'+tc.participants.slice(0,3).map(esc).join(', ')+'</span><span class="last">'+fmtTime(tc.last_reply_at)+'</span>';
   }
   // If thread panel is open for this thread, append reply
   if(S.get('detailType')==='thread'&&S.get('threadId')===threadId){
@@ -1026,10 +1029,10 @@ function appendChatMsg(container,m,spaceId){
     ${!m.own&&trust?'<span class="trust trust-'+trust.toLowerCase()+'" style="font-size:8px;padding:0 4px">'+trust+'</span>':''}
     <span>${fmtTime(m.timestamp)}</span>
     ${isBroadcast?'<span style="font-size:10px;color:var(--tx3);margin-left:4px">replied in thread</span>':''}
-    ${!isBroadcast&&msgId&&spaceId?'<button class="ghost" style="font-size:10px;padding:2px 6px;margin-left:auto" onclick="openThreadById(\''+spaceId+'\',\''+msgId+'\')">Reply</button>':''}
+    ${!isBroadcast&&msgId&&spaceId?'<button class="ghost" style="font-size:10px;padding:2px 6px;margin-left:auto" onclick="openThreadById(\''+esc(spaceId)+'\',\''+esc(msgId)+'\')">Reply</button>':''}
   </div>
   <div class="body">${esc(m.text||'')}</div>
-  ${tc&&tc.reply_count>0?'<div class="thread-indicator" id="thread-ind-'+msgId+'" onclick="openThreadById(\''+spaceId+'\',\''+msgId+'\')"><span class="count">&#128172; '+tc.reply_count+' repl'+(tc.reply_count===1?'y':'ies')+'</span><span class="participants">'+tc.participants.slice(0,3).join(', ')+'</span><span class="last">'+fmtTime(tc.last_reply_at)+'</span></div>':''}`;
+  ${tc&&tc.reply_count>0?'<div class="thread-indicator" id="thread-ind-'+esc(msgId)+'" onclick="openThreadById(\''+esc(spaceId)+'\',\''+esc(msgId)+'\')"><span class="count">&#128172; '+tc.reply_count+' repl'+(tc.reply_count===1?'y':'ies')+'</span><span class="participants">'+tc.participants.slice(0,3).map(esc).join(', ')+'</span><span class="last">'+fmtTime(tc.last_reply_at)+'</span></div>':''}`;
   container.appendChild(d);
 }
 
@@ -1122,7 +1125,7 @@ async function pollTransfers(){
   const tb=document.getElementById('file-transfers');
   if(tb)tb.innerHTML=r.transfers.map(x=>`<tr>
     <td>${esc(x.filename||'—')}</td><td>${x.direction||'—'}</td>
-    <td>${trustHtml(x.status==='Complete'?'Trusted':x.status==='InProgress'?'Known':'Unknown').replace(/trust-/g,'badge-')}</td>
+    <td><span class="trust ${x.status==='Complete'?'trust-trusted':x.status==='InProgress'?'trust-known':'trust-unknown'}">${esc(x.status||'Pending')}</span></td>
     <td>${x.total_size?Math.round(100*(x.bytes_transferred||0)/x.total_size)+'%':'—'}</td>
   </tr>`).join('')||'<tr><td colspan="4" style="color:var(--tx3)">No transfers</td></tr>';
   const inc=r.transfers.filter(x=>x.direction==='Receiving'&&x.status==='Pending');
@@ -1257,7 +1260,7 @@ async function loadWikiPages(sid){
   const r=await api('/stores/'+storeId+'/keys');
   if(r&&r.keys&&r.keys.length>0){
     const keys=r.keys.map(k=>typeof k==='string'?k:k.key||k);
-    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" onclick="editWikiPage('${sid}','${esc(k)}')">
+    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" data-wiki-sid="${esc(sid)}" data-wiki-slug="${esc(k)}" onclick="editWikiPage(this.dataset.wikiSid,this.dataset.wikiSlug)">
       <div style="font:500 13px var(--sans);color:var(--cy)">${esc(k)}</div>
       <div style="font-size:11px;color:var(--tx3);margin-top:2px">Click to edit</div>
     </div>`).join('');
@@ -1320,7 +1323,7 @@ async function loadWebPages(sid){
   const r=await api('/stores/'+storeId+'/keys');
   if(r&&r.keys&&r.keys.length>0){
     const keys=r.keys.map(k=>typeof k==='string'?k:k.key||k);
-    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" onclick="previewWebPage('${sid}','${esc(k)}')">
+    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" data-web-sid="${esc(sid)}" data-web-path="${esc(k)}" onclick="previewWebPage(this.dataset.webSid,this.dataset.webPath)">
       <span style="color:var(--cy)">${esc(k)}</span>
     </div>`).join('');
     previewWebPage(sid,keys[0]);
@@ -1334,7 +1337,15 @@ async function previewWebPage(sid,path){
   const r=await api('/stores/'+storeId+'/'+path);
   const preview=document.getElementById('web-preview');
   if(r&&r.value&&preview){
-    try{preview.innerHTML=atob(r.value)}catch(e){preview.textContent=r.value}
+    // Render in a sandboxed iframe to prevent XSS from stored HTML
+    let content='';
+    try{content=atob(r.value)}catch(e){content=esc(r.value)}
+    const iframe=document.createElement('iframe');
+    iframe.sandbox='allow-same-origin'; // no allow-scripts
+    iframe.style.cssText='width:100%;min-height:200px;border:none;background:var(--bg)';
+    iframe.srcdoc=content;
+    preview.innerHTML='';
+    preview.appendChild(iframe);
   }
 }
 
@@ -1364,6 +1375,9 @@ function renderDm(){
 function mountDm(){
   const target=S.get('dmTarget');
   if(!dmHistory[target])dmHistory[target]=LS.get('dm_'+target,[]);
+  // Reset unread count when viewing this DM
+  LS.set('unread_'+target,0);
+  renderSidebar();
   const msgs=document.getElementById('dm-msgs');
   if(msgs){
     (dmHistory[target]||[]).forEach(m=>appendChatMsg(msgs,m));
@@ -2051,13 +2065,16 @@ function onGossipMessage(topic,origin,data){
     return;
   }
 
-  // Channel chat (topic: x0x.group.{id}.chat/{channel})
+  // Channel chat (topic: x0x.group.{id_prefix}.chat/{channel})
   if(topic.includes('.chat/')&&data.text){
     const topicParts=topic.split('.chat/');
     const chanName=topicParts[1]||'general';
-    // Find which space this belongs to
+    // Extract the group ID prefix from the topic (between 'x0x.group.' and '.chat/')
+    const topicPrefix=topicParts[0];
+    const idPrefix=topicPrefix.replace('x0x.group.','');
+    // Match against groups using startsWith for safety
     const groups=S.get('groups')||[];
-    const match=groups.find(g=>topic.includes(g.group_id.slice(0,16)));
+    const match=groups.find(g=>g.group_id.startsWith(idPrefix));
     if(match){
       const chatKey=match.group_id+'_'+chanName;
       const msg={...data,sender_id:origin,own:false,channel:chanName};
@@ -2084,8 +2101,9 @@ function onGossipMessage(topic,origin,data){
   }
   // Feed
   if(topic.includes('.feed')&&data.text){
+    const idPrefix=topic.replace('x0x.space.','').replace('.feed','');
     const groups=S.get('groups')||[];
-    const match=groups.find(g=>topic.includes(g.group_id.slice(0,16)));
+    const match=groups.find(g=>g.group_id.startsWith(idPrefix));
     if(match){addFeedPost(match.group_id,{...data,own:false})}
   }
 }

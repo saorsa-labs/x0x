@@ -1121,7 +1121,20 @@ async fn main() -> Result<()> {
         .route("/gui", get(serve_gui))
         .route("/gui/", get(serve_gui))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
-        .layer(CorsLayer::permissive())
+        .layer({
+            // Restrict CORS to localhost origins only.
+            // The daemon API is a local control plane — external origins must not access it.
+            use tower_http::cors::{AllowOrigin, AllowMethods, AllowHeaders};
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(|origin, _| {
+                    let o = origin.as_bytes();
+                    o.starts_with(b"http://127.0.0.1")
+                        || o.starts_with(b"http://localhost")
+                        || o.starts_with(b"http://[::1]")
+                }))
+                .allow_methods(AllowMethods::any())
+                .allow_headers(AllowHeaders::any())
+        })
         .with_state(Arc::clone(&state));
 
     // Start server
