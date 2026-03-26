@@ -453,16 +453,6 @@ jobs:
             cargo add x0x
             ```
 
-            **TypeScript/Node.js:**
-            ```bash
-            npm install x0x
-            ```
-
-            **Python:**
-            ```bash
-            pip install agent-x0x
-            ```
-
             ### Platform Binaries
 
             | Platform | File | Code Signed |
@@ -537,8 +527,10 @@ jobs:
 
   # ============================================================
   # Publish to npm (with provenance)
+  # Re-enable when npm/PyPI smoke tests pass
   # ============================================================
   publish-npm:
+    if: false
     name: Publish to npm
     needs: create-release
     runs-on: ubuntu-latest
@@ -561,8 +553,10 @@ jobs:
 
   # ============================================================
   # Publish to PyPI (via maturin)
+  # Re-enable when npm/PyPI smoke tests pass
   # ============================================================
   publish-pypi:
+    if: false
     name: Publish to PyPI
     needs: create-release
     runs-on: ubuntu-latest
