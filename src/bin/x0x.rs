@@ -186,6 +186,24 @@ enum Commands {
     },
     /// List active and recent file transfers.
     Transfers,
+    /// Show status for a single file transfer.
+    TransferStatus {
+        /// Transfer ID.
+        transfer_id: String,
+    },
+    /// Accept an incoming file transfer.
+    AcceptFile {
+        /// Transfer ID.
+        transfer_id: String,
+    },
+    /// Reject an incoming file transfer.
+    RejectFile {
+        /// Transfer ID.
+        transfer_id: String,
+        /// Rejection reason.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 // ── Nested subcommands ──────────────────────────────────────────────────
@@ -901,6 +919,16 @@ async fn run(
                 .await
         }
         Commands::Transfers => commands::files::transfers(&client).await,
+        Commands::TransferStatus { transfer_id } => {
+            commands::files::transfer_status(&client, &transfer_id).await
+        }
+        Commands::AcceptFile { transfer_id } => {
+            commands::files::accept_file(&client, &transfer_id).await
+        }
+        Commands::RejectFile {
+            transfer_id,
+            reason,
+        } => commands::files::reject_file(&client, &transfer_id, reason.as_deref()).await,
         Commands::Routes
         | Commands::Start { .. }
         | Commands::Instances

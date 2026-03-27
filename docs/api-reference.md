@@ -1,184 +1,386 @@
 # x0x API Reference
 
-> Back to [SKILL.md](https://github.com/saorsa-labs/x0x/blob/main/SKILL.md)
+Complete REST and WebSocket reference for the `x0xd` daemon and the matching `x0x` CLI.
 
-Complete REST API reference for the x0xd daemon. All endpoints are served on `127.0.0.1:12700` by default.
+- Default daemon base URL: `http://127.0.0.1:12700`
+- Override from the CLI with: `x0x --api 127.0.0.1:12700 ...`
+- Named instances use their own auto-discovered local API port: `x0x --name alice ...`
 
-## System & Identity
+## Response shape
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/health` | Minimal health probe |
-| GET | `/status` | Rich status with connectivity state |
-| GET | `/network/status` | NAT/connection diagnostics |
-| GET | `/agent` | Agent identity (agent_id, machine_id, user_id) |
-| POST | `/announce` | Announce identity to the network |
-| GET | `/peers` | Connected peers |
+Most successful endpoints return a **flattened** JSON object with `ok: true` plus resource-specific fields.
+There is **not** a single universal `data` wrapper.
 
-## Gossip (Broadcast)
+Examples:
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| POST | `/publish` | Publish to a gossip topic |
-| POST | `/subscribe` | Subscribe to a gossip topic |
-| DELETE | `/subscribe/:id` | Unsubscribe |
-| GET | `/events` | SSE stream of subscribed messages |
-
-## Direct Messaging (Point-to-Point)
-
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| POST | `/agents/connect` | Connect to a discovered agent (QUIC) |
-| POST | `/direct/send` | Send direct message to connected agent |
-| GET | `/direct/connections` | List connected agents |
-| GET | `/direct/events` | SSE stream of incoming direct messages |
-
-## Discovery & Trust
-
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/presence` | Agent presence data |
-| GET | `/agents/discovered` | All discovered agents |
-| GET | `/agents/discovered/:id` | Specific agent details |
-| GET | `/users/:user_id/agents` | Agents belonging to a human |
-| GET | `/agent/user-id` | This agent's human (if opted in) |
-| GET | `/contacts` | Contact list |
-| POST | `/contacts` | Add contact |
-| POST | `/contacts/trust` | Quick trust update |
-| PATCH | `/contacts/:id` | Update contact |
-| DELETE | `/contacts/:id` | Remove contact |
-| GET | `/contacts/:id/machines` | List machine records for a contact |
-| POST | `/contacts/:id/machines` | Add machine record |
-| DELETE | `/contacts/:id/machines/:mid` | Remove machine record |
-
-## Collaborative Data (CRDTs)
-
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/task-lists` | List collaborative task lists |
-| POST | `/task-lists` | Create a task list |
-| GET | `/task-lists/:id/tasks` | Tasks in a list |
-| POST | `/task-lists/:id/tasks` | Add a task |
-| PATCH | `/task-lists/:id/tasks/:tid` | Claim or complete a task |
-
-## MLS Group Encryption
-
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| POST | `/mls/groups` | Create an encrypted group |
-| GET | `/mls/groups` | List all groups |
-| GET | `/mls/groups/:id` | Group details and members |
-| POST | `/mls/groups/:id/members` | Add member to group |
-| DELETE | `/mls/groups/:id/members/:agent_id` | Remove member |
-| POST | `/mls/groups/:id/encrypt` | Encrypt data with group key |
-| POST | `/mls/groups/:id/decrypt` | Decrypt data with group key |
-
-## MLS Group Encryption Examples
-
-```bash
-# Create an encrypted group
-curl -X POST http://127.0.0.1:12700/mls/groups \
-  -H "Content-Type: application/json" -d '{}'
-# {"ok":true,"group_id":"abcd...","epoch":0,"members":["8a3f..."]}
-
-# Add a member
-curl -X POST http://127.0.0.1:12700/mls/groups/abcd.../members \
-  -H "Content-Type: application/json" \
-  -d '{"agent_id": "b7c2..."}'
-# {"ok":true,"epoch":1,"member_count":2}
-
-# Encrypt data with the group key
-curl -X POST http://127.0.0.1:12700/mls/groups/abcd.../encrypt \
-  -H "Content-Type: application/json" \
-  -d '{"payload": "'$(echo -n "secret message" | base64)'"}'
-# {"ok":true,"ciphertext":"...base64...","epoch":1}
-
-# Decrypt (requires the epoch from encryption)
-curl -X POST http://127.0.0.1:12700/mls/groups/abcd.../decrypt \
-  -H "Content-Type: application/json" \
-  -d '{"ciphertext": "...base64...", "epoch": 1}'
-# {"ok":true,"payload":"...base64 of plaintext..."}
-
-# List groups
-curl http://127.0.0.1:12700/mls/groups
-
-# Remove a member
-curl -X DELETE http://127.0.0.1:12700/mls/groups/abcd.../members/b7c2...
+```json
+{"ok":true,"status":"healthy","version":"0.10.0","peers":4,"uptime_secs":300}
 ```
 
-Groups use ChaCha20-Poly1305 AEAD with epoch-based key derivation. Group state is persisted to disk — groups survive daemon restarts.
-
-## WebSocket Protocol
-
-Coming in Phase 2.
-
-## Error Responses
-
-All endpoints return `{"ok": false, "error": "..."}` on failure:
-
-```bash
-# 400 Bad Request — invalid input (your fault)
-# {"ok":false,"error":"invalid hex: odd number of hex characters"}
-
-# 403 Forbidden — blocked agent
-# {"ok":false,"error":"agent is blocked"}
-
-# 404 Not Found — resource doesn't exist
-# {"ok":false,"error":"group not found"}
-
-# 500 Internal Server Error — something went wrong (not your fault)
-# {"ok":false,"error":"internal error"}
+```json
+{"ok":true,"agent_id":"...","machine_id":"...","user_id":null}
 ```
 
-## Diagnostics
+Errors use:
 
-### Health Check
+```json
+{"ok":false,"error":"description"}
+```
+
+## System
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/health` | `x0x health` | Health probe |
+| GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings |
+| POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
+
+### Example: health
 
 ```bash
 curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"0.5.2","peers":4,"uptime_secs":300}
+# {"ok":true,"status":"healthy","version":"0.10.0","peers":4,"uptime_secs":300}
 ```
 
-### Rich Status
+### Example: status
 
 ```bash
 curl http://127.0.0.1:12700/status
 # {
 #   "ok": true,
-#   "data": {
-#     "status": "connected",        // connected | connecting | isolated | degraded
-#     "version": "0.4.0",
-#     "uptime_secs": 300,
-#     "api_address": "127.0.0.1:12700",
-#     "external_addrs": ["203.0.113.5:5483"],  // what peers see you as
-#     "agent_id": "8a3f...",
-#     "peers": 4,
-#     "warnings": []
-#   }
+#   "status": "connected",
+#   "version": "0.10.0",
+#   "uptime_secs": 300,
+#   "api_address": "127.0.0.1:12700",
+#   "external_addrs": ["203.0.113.5:5483"],
+#   "agent_id": "8a3f...",
+#   "peers": 4,
+#   "warnings": []
 # }
 ```
 
-### Network Details
+## Identity
 
-```bash
-curl http://127.0.0.1:12700/network/status
-# NAT type, external addresses, direct/relayed connection counts,
-# hole punch success rate, relay/coordinator state, RTT
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/agent` | `x0x agent` | Local agent identity |
+| POST | `/announce` | `x0x announce` | Re-announce identity to the network |
+| GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
+| GET | `/agent/card` | `x0x agent card` | Generate a shareable identity card |
+| POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts |
+
+### Announce request body
+
+```json
+{
+  "include_user_identity": false,
+  "human_consent": false
+}
 ```
 
-### Doctor (Pre-flight Diagnostics)
+Notes:
+- Set `include_user_identity: true` only when the daemon has a configured user key.
+- Set `human_consent: true` when intentionally sharing human identity.
+
+### Agent card query params
+
+`GET /agent/card?display_name=Alice&include_groups=true`
+
+## Network
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/peers` | `x0x peers` | Connected gossip peers |
+| GET | `/presence` | `x0x presence` | Presence view of online agents |
+| GET | `/network/status` | `x0x network status` | NAT and connectivity diagnostics |
+| GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
+
+## Gossip messaging
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/publish` | `x0x publish <topic> <payload>` | Publish a base64 payload to a topic |
+| POST | `/subscribe` | `x0x subscribe <topic>` | Create a topic subscription |
+| DELETE | `/subscribe/:id` | `x0x unsubscribe <id>` | Remove a subscription |
+| GET | `/events` | `x0x events` | SSE stream of subscribed messages |
+
+### Publish request body
+
+```json
+{
+  "topic": "updates",
+  "payload": "aGVsbG8="
+}
+```
+
+## Discovery
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/agents/discovered` | `x0x agents list` | List discovered agents |
+| GET | `/agents/discovered/:agent_id` | `x0x agents get <agent_id>` | Get one discovered agent |
+| POST | `/agents/find/:agent_id` | `x0x agents find <agent_id>` | Actively look up an agent |
+| GET | `/agents/reachability/:agent_id` | `x0x agents reachability <agent_id>` | Reachability heuristics |
+| GET | `/users/:user_id/agents` | `x0x agents by-user <user_id>` | List agents linked to a user |
+
+Query params:
+- `/agents/discovered?unfiltered=true`
+- `/agents/discovered/:agent_id?wait=<seconds>`
+
+## Contacts, machines, and trust
+
+### Contacts
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/contacts` | `x0x contacts list` | List contacts |
+| POST | `/contacts` | `x0x contacts add ...` | Add a contact |
+| POST | `/contacts/trust` | `x0x trust set ...` | Quick trust update |
+| PATCH | `/contacts/:agent_id` | `x0x contacts update ...` | Update trust or identity type |
+| DELETE | `/contacts/:agent_id` | `x0x contacts remove <agent_id>` | Remove a contact |
+| POST | `/contacts/:agent_id/revoke` | `x0x contacts revoke ...` | Revoke a contact |
+| GET | `/contacts/:agent_id/revocations` | `x0x contacts revocations <agent_id>` | List revocations |
+
+### Machines
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/contacts/:agent_id/machines` | `x0x machines list <agent_id>` | List machine records |
+| POST | `/contacts/:agent_id/machines` | `x0x machines add <agent_id> <machine_id> [--pin]` | Add a machine record |
+| DELETE | `/contacts/:agent_id/machines/:machine_id` | `x0x machines remove <agent_id> <machine_id>` | Remove a machine record |
+| POST | `/contacts/:agent_id/machines/:machine_id/pin` | `x0x machines pin <agent_id> <machine_id>` | Pin a machine |
+| DELETE | `/contacts/:agent_id/machines/:machine_id/pin` | `x0x machines unpin <agent_id> <machine_id>` | Unpin a machine |
+
+### Trust evaluation
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/trust/evaluate` | `x0x trust evaluate <agent_id> <machine_id>` | Evaluate trust decision for a pair |
+
+### Example: add machine
 
 ```bash
-x0xd doctor
-# x0xd doctor
-# -----------
-# PASS  binary: /home/user/.local/bin/x0xd
-# PASS  x0xd found on PATH
-# PASS  configuration loaded
-# PASS  daemon reachable at 127.0.0.1:12700
-# PASS  /health ok=true
-# PASS  /agent returned agent_id
-# PASS  /status connectivity: connected
-# -----------
-# PASS  all checks passed
+curl -X POST http://127.0.0.1:12700/contacts/<agent_id>/machines \
+  -H "Content-Type: application/json" \
+  -d '{"machine_id":"<hex>","pinned":true}'
 ```
+
+Trust levels: `blocked`, `unknown`, `known`, `trusted`
+
+Identity types: `anonymous`, `known`, `trusted`, `pinned`
+
+## Direct messaging
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/agents/connect` | `x0x direct connect <agent_id>` | Establish a direct connection |
+| POST | `/direct/send` | `x0x direct send <agent_id> <message>` | Send a direct base64 payload |
+| GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
+| GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages |
+
+### Direct send request body
+
+```json
+{
+  "agent_id": "8a3f...",
+  "payload": "aGVsbG8="
+}
+```
+
+## MLS encrypted groups
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/mls/groups` | `x0x groups create` | Create an encrypted group |
+| GET | `/mls/groups` | `x0x groups list` | List groups |
+| GET | `/mls/groups/:id` | `x0x groups get <group_id>` | Group details |
+| POST | `/mls/groups/:id/members` | `x0x groups add-member ...` | Add a member |
+| DELETE | `/mls/groups/:id/members/:agent_id` | `x0x groups remove-member ...` | Remove a member |
+| POST | `/mls/groups/:id/encrypt` | `x0x groups encrypt <group_id> <payload>` | Encrypt plaintext for the group |
+| POST | `/mls/groups/:id/decrypt` | `x0x groups decrypt ... --epoch <n>` | Decrypt ciphertext |
+| POST | `/mls/groups/:id/welcome` | `x0x groups welcome <group_id> <agent_id>` | Create a welcome message |
+
+### Encrypt request body
+
+```json
+{
+  "payload": "c2VjcmV0"
+}
+```
+
+### Decrypt request body
+
+```json
+{
+  "ciphertext": "...base64...",
+  "epoch": 1
+}
+```
+
+## Named groups
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/groups` | `x0x group create <name>` | Create a named group |
+| GET | `/groups` | `x0x group list` | List named groups |
+| GET | `/groups/:id` | `x0x group info <group_id>` | Get group info |
+| POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate an invite link |
+| POST | `/groups/join` | `x0x group join <invite>` | Join via invite |
+| PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
+| DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave or delete the group |
+
+## Collaborative task lists
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/task-lists` | `x0x tasks list` | List task lists |
+| POST | `/task-lists` | `x0x tasks create <name> <topic>` | Create a task list |
+| GET | `/task-lists/:id/tasks` | `x0x tasks show <list_id>` | List tasks |
+| POST | `/task-lists/:id/tasks` | `x0x tasks add ...` | Add a task |
+| PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim/complete ...` | Update task state |
+
+Update task request body:
+
+```json
+{"action":"claim"}
+```
+
+or
+
+```json
+{"action":"complete"}
+```
+
+## Key-value stores
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/stores` | `x0x store list` | List stores |
+| POST | `/stores` | `x0x store create <name> <topic>` | Create a store |
+| POST | `/stores/:id/join` | `x0x store join <topic>` | Join an existing store |
+| GET | `/stores/:id/keys` | `x0x store keys <store_id>` | List keys |
+| PUT | `/stores/:id/:key` | `x0x store put <store_id> <key> <value>` | Put a base64 value |
+| GET | `/stores/:id/:key` | `x0x store get <store_id> <key>` | Get a value |
+| DELETE | `/stores/:id/:key` | `x0x store rm <store_id> <key>` | Remove a value |
+
+### Store put request body
+
+```json
+{
+  "value": "aGVsbG8=",
+  "content_type": "text/plain"
+}
+```
+
+## File transfers
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/files/send` | `x0x send-file <agent_id> <path>` | Create an outgoing transfer |
+| GET | `/files/transfers` | `x0x transfers` | List transfers |
+| GET | `/files/transfers/:id` | `x0x transfer-status <transfer_id>` | Inspect one transfer |
+| POST | `/files/accept/:id` | `x0x accept-file <transfer_id>` | Accept a pending transfer |
+| POST | `/files/reject/:id` | `x0x reject-file <transfer_id> [--reason ...]` | Reject a pending transfer |
+
+### Send-file request body
+
+```json
+{
+  "agent_id": "8a3f...",
+  "filename": "notes.txt",
+  "size": 1234,
+  "sha256": "...hex..."
+}
+```
+
+### Reject-file request body
+
+```json
+{"reason":"rejected by user"}
+```
+
+## Upgrade
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/upgrade` | `x0x upgrade` | Check for updates |
+
+## WebSocket and GUI
+
+### WebSocket endpoints
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/ws` | — | General-purpose WebSocket session |
+| GET | `/ws/direct` | — | WebSocket session that auto-receives direct messages |
+| GET | `/ws/sessions` | `x0x ws sessions` | Inspect active WebSocket sessions |
+
+### WebSocket protocol
+
+Client → server:
+
+```json
+{"type":"ping"}
+{"type":"subscribe","topics":["topic-a","topic-b"]}
+{"type":"unsubscribe","topics":["topic-a"]}
+{"type":"publish","topic":"topic-a","payload":"aGVsbG8="}
+{"type":"send_direct","agent_id":"hex64...","payload":"aGVsbG8="}
+```
+
+Server → client:
+
+```json
+{"type":"connected","session_id":"uuid","agent_id":"hex64..."}
+{"type":"message","topic":"topic-a","payload":"aGVsbG8=","origin":"hex64..."}
+{"type":"direct_message","sender":"hex64...","machine_id":"hex64...","payload":"aGVsbG8=","received_at":1234567890}
+{"type":"subscribed","topics":["topic-a","topic-b"]}
+{"type":"unsubscribed","topics":["topic-a"]}
+{"type":"pong"}
+{"type":"error","message":"..."}
+```
+
+### GUI
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/gui` | `x0x gui` | Open the embedded browser UI |
+| GET | `/gui/` | — | Alias for `/gui` |
+
+## Error handling
+
+Common status codes:
+
+| Code | Meaning |
+|---|---|
+| 200 | Success |
+| 201 | Created |
+| 400 | Bad request |
+| 403 | Forbidden |
+| 404 | Not found |
+| 422 | Invalid JSON body / schema mismatch |
+| 500 | Internal error |
+| 503 | Service temporarily unavailable |
+
+## CLI quick examples
+
+```bash
+x0x health
+x0x status
+x0x agent
+x0x contacts list
+x0x publish updates hello
+x0x direct connect <agent_id>
+x0x direct send <agent_id> hello
+x0x groups create
+x0x group create team-chat --display-name alice
+x0x tasks create inbox team.tasks
+x0x store create notes team.notes
+x0x send-file <agent_id> ./notes.txt
+x0x transfer-status <transfer_id>
+x0x accept-file <transfer_id>
+x0x reject-file <transfer_id> --reason "not now"
+x0x ws sessions
+x0x gui
+```
+
+See also: [api.md](api.md), [troubleshooting.md](troubleshooting.md), [patterns.md](patterns.md)

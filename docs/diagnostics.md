@@ -6,7 +6,7 @@
 
 ```bash
 curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"0.5.5","peers":4,"uptime_secs":300}
+# {"ok":true,"status":"healthy","version":"<current_version>","peers":4,"uptime_secs":300}
 ```
 
 ## Rich Status
@@ -16,7 +16,7 @@ curl http://127.0.0.1:12700/status
 # {
 #   "ok": true,
 #   "status": "connected",        // connected | connecting | isolated | degraded
-#   "version": "0.5.5",
+#   "version": "<current_version>",
 #   "uptime_secs": 300,
 #   "api_address": "127.0.0.1:12700",
 #   "external_addrs": ["203.0.113.5:5483"],
@@ -35,6 +35,14 @@ curl http://127.0.0.1:12700/network/status
 ```
 
 ## Doctor (Pre-flight Diagnostics)
+
+Human-friendly CLI path:
+
+```bash
+x0x doctor
+```
+
+Daemon-native path:
 
 ```bash
 x0xd doctor

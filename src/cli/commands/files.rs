@@ -76,6 +76,7 @@ pub async fn receive_file(
             println!("  {id}  {name}  ({size} bytes)");
         }
         println!("\nAccept with: x0x accept-file <transfer_id>");
+        println!("Reject with: x0x reject-file <transfer_id> [--reason <text>]");
     }
     Ok(())
 }
@@ -84,6 +85,43 @@ pub async fn receive_file(
 pub async fn transfers(client: &DaemonClient) -> Result<()> {
     client.ensure_running().await?;
     let resp = client.get("/files/transfers").await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x transfer-status` — GET /files/transfers/:id
+pub async fn transfer_status(client: &DaemonClient, transfer_id: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client
+        .get(&format!("/files/transfers/{transfer_id}"))
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x accept-file` — POST /files/accept/:id
+pub async fn accept_file(client: &DaemonClient, transfer_id: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client
+        .post_empty(&format!("/files/accept/{transfer_id}"))
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x reject-file` — POST /files/reject/:id
+pub async fn reject_file(
+    client: &DaemonClient,
+    transfer_id: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({
+        "reason": reason.unwrap_or("rejected by user"),
+    });
+    let resp = client
+        .post(&format!("/files/reject/{transfer_id}"), &body)
+        .await?;
     print_value(client.format(), &resp);
     Ok(())
 }

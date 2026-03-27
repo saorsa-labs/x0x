@@ -294,6 +294,107 @@ tr:hover td{background:rgba(255,255,255,.01)}
 .agent-row:hover{background:rgba(255,255,255,.02)}
 
 /* ═══════════════════════════════════════════════════════════════════
+   SECTION 4B: CHAT ENHANCEMENTS — reactions, hover actions, markdown,
+   search, typing, mentions, pins, quotes, edit/delete
+   ═══════════════════════════════════════════════════════════════════ */
+/* Message hover action bar */
+.chat-msg{position:relative}
+.chat-msg .msg-actions{position:absolute;top:-8px;right:4px;display:none;gap:2px;background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r-sm);padding:2px;box-shadow:0 2px 8px rgba(0,0,0,.3);z-index:10}
+.chat-msg:hover .msg-actions{display:flex}
+.chat-msg .msg-actions button{border:none;padding:3px 6px;font-size:13px;color:var(--tx3);background:transparent;border-radius:3px;line-height:1;min-width:26px}
+.chat-msg .msg-actions button:hover{background:var(--cy-dim);color:var(--cy)}
+.chat-msg .msg-actions button.danger-act:hover{background:var(--rd-dim);color:var(--rd)}
+
+/* Reaction badges */
+.msg-reactions{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.msg-reactions .rxn{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;font-size:12px;border:1px solid var(--bd);border-radius:var(--r-full);cursor:pointer;background:transparent;color:var(--tx2);transition:all var(--t-fast);line-height:1.4}
+.msg-reactions .rxn:hover{border-color:var(--cy);background:var(--cy-dim)}
+.msg-reactions .rxn.mine{border-color:var(--cy);background:var(--cy-dim);color:var(--cy)}
+.msg-reactions .rxn .cnt{font-size:11px;font-weight:600}
+
+/* Emoji picker */
+.emoji-picker{position:absolute;bottom:100%;right:0;width:320px;max-height:340px;background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r-md);box-shadow:0 8px 24px rgba(0,0,0,.4);z-index:50;display:none;flex-direction:column;overflow:hidden}
+.emoji-picker.open{display:flex}
+.emoji-picker .ep-search{padding:8px;border-bottom:1px solid var(--bd)}
+.emoji-picker .ep-search input{width:100%;padding:6px 10px;font-size:12px}
+.emoji-picker .ep-tabs{display:flex;border-bottom:1px solid var(--bd);overflow-x:auto}
+.emoji-picker .ep-tabs button{flex:1;border:none;padding:6px 4px;font-size:15px;background:transparent;color:var(--tx3);border-bottom:2px solid transparent;min-width:36px}
+.emoji-picker .ep-tabs button:hover{color:var(--tx)}
+.emoji-picker .ep-tabs button.active{color:var(--cy);border-bottom-color:var(--cy)}
+.emoji-picker .ep-grid{display:grid;grid-template-columns:repeat(8,1fr);gap:2px;padding:8px;overflow-y:auto;flex:1;max-height:220px}
+.emoji-picker .ep-grid button{border:none;padding:4px;font-size:20px;background:transparent;border-radius:4px;cursor:pointer;line-height:1.2;text-align:center}
+.emoji-picker .ep-grid button:hover{background:var(--cy-dim)}
+
+/* Quick reaction bar (on hover) */
+.quick-react{display:flex;gap:1px}
+.quick-react button{font-size:14px;padding:2px 4px;min-width:22px}
+
+/* Markdown rendering */
+.chat-msg .body code{font:12px var(--mono);background:var(--bg3);padding:1px 5px;border-radius:3px;color:var(--cy)}
+.chat-msg .body pre{background:var(--bg3);border:1px solid var(--bd);border-radius:var(--r-sm);padding:var(--sp3);margin:6px 0;overflow-x:auto}
+.chat-msg .body pre code{background:transparent;padding:0;font-size:12px;color:var(--tx)}
+.chat-msg .body strong{font-weight:600;color:var(--tx)}
+.chat-msg .body em{font-style:italic;color:var(--tx2)}
+.chat-msg .body blockquote{border-left:3px solid var(--bd2);padding-left:var(--sp3);color:var(--tx2);margin:4px 0}
+
+/* Edited / deleted indicators */
+.chat-msg .edited-tag{font-size:10px;color:var(--tx3);font-style:italic;margin-left:6px}
+.chat-msg.deleted .body{color:var(--tx3);font-style:italic;font-size:12px}
+
+/* Quote / reply preview in message */
+.msg-quote{border-left:3px solid var(--cy);padding:4px 8px;margin-bottom:4px;background:rgba(0,212,255,.04);border-radius:0 var(--r-sm) var(--r-sm) 0;font-size:12px;color:var(--tx2);cursor:pointer;max-height:48px;overflow:hidden}
+.msg-quote .q-who{font-weight:600;color:var(--cy);font-size:11px}
+
+/* Composer quote preview */
+.compose-quote{display:flex;align-items:center;gap:var(--sp2);padding:6px var(--sp3);border-left:3px solid var(--cy);background:rgba(0,212,255,.04);border-radius:0 var(--r-sm) var(--r-sm) 0;margin-bottom:6px;font-size:12px;color:var(--tx2)}
+.compose-quote .cq-text{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.compose-quote .cq-close{border:none;padding:2px 6px;font-size:14px;color:var(--tx3);background:transparent;cursor:pointer}
+.compose-quote .cq-close:hover{color:var(--rd)}
+
+/* Typing indicator */
+.typing-indicator{height:20px;padding:2px var(--sp2);font-size:11px;color:var(--tx3);font-style:italic;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.typing-dots{display:inline-flex;gap:2px;margin-left:4px;vertical-align:middle}
+.typing-dots span{width:4px;height:4px;border-radius:50%;background:var(--tx3);animation:typingBounce .8s ease-in-out infinite}
+.typing-dots span:nth-child(2){animation-delay:.15s}
+.typing-dots span:nth-child(3){animation-delay:.3s}
+
+/* @mention highlights */
+.mention{background:var(--cy-dim);color:var(--cy);padding:0 3px;border-radius:3px;font-weight:500;cursor:pointer}
+.mention:hover{background:var(--cy-glow)}
+
+/* Mention autocomplete */
+.mention-ac{position:absolute;bottom:100%;left:0;right:0;max-height:200px;overflow-y:auto;background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r-sm);box-shadow:0 -4px 16px rgba(0,0,0,.3);z-index:40;display:none}
+.mention-ac.open{display:block}
+.mention-ac .ac-item{display:flex;align-items:center;gap:var(--sp2);padding:6px var(--sp3);cursor:pointer;font-size:12px}
+.mention-ac .ac-item:hover,.mention-ac .ac-item.selected{background:var(--cy-dim);color:var(--cy)}
+.mention-ac .ac-item .ac-name{font-weight:500}
+.mention-ac .ac-item .ac-id{font:10px var(--mono);color:var(--tx3)}
+
+/* Search panel */
+.search-overlay{position:absolute;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:30;display:flex;flex-direction:column;padding:var(--sp4)}
+.search-overlay .search-header{display:flex;gap:var(--sp2);margin-bottom:var(--sp4)}
+.search-overlay .search-header input{flex:1;font-size:14px;padding:10px 14px}
+.search-overlay .search-results{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:2px}
+.search-result{padding:var(--sp3);border:1px solid var(--bd);border-radius:var(--r-sm);cursor:pointer;transition:all var(--t-fast)}
+.search-result:hover{border-color:var(--cy);background:var(--cy-dim)}
+.search-result .sr-meta{font-size:11px;color:var(--tx3);display:flex;gap:var(--sp2)}
+.search-result .sr-meta .sr-who{font-weight:600;color:var(--tx2)}
+.search-result .sr-meta .sr-where{color:var(--cy)}
+.search-result .sr-text{font-size:12px;color:var(--tx);margin-top:2px}
+.search-result .sr-text mark{background:var(--cy-dim);color:var(--cy);padding:0 2px;border-radius:2px}
+.search-empty{text-align:center;color:var(--tx3);padding:40px;font-size:13px}
+
+/* Pinned messages */
+.pinned-bar{display:flex;align-items:center;gap:var(--sp2);padding:6px var(--sp3);background:var(--am-dim);border:1px solid rgba(245,158,11,.2);border-radius:var(--r-sm);margin-bottom:var(--sp2);font-size:12px;color:var(--am);cursor:pointer;transition:all var(--t-fast)}
+.pinned-bar:hover{border-color:var(--am)}
+.pinned-panel{max-height:300px;overflow-y:auto;border:1px solid var(--bd);border-radius:var(--r-sm);margin-bottom:var(--sp3);background:var(--bg2)}
+.pinned-panel .pinned-msg{padding:var(--sp3);border-bottom:1px solid var(--bd);font-size:12px}
+.pinned-panel .pinned-msg:last-child{border-bottom:none}
+.pinned-panel .pinned-msg .pin-who{font-weight:600;color:var(--tx);font-size:11px}
+.pinned-panel .pinned-msg .pin-text{color:var(--tx2);margin-top:2px}
+.pinned-panel .pinned-msg .pin-actions{margin-top:4px;display:flex;gap:var(--sp2)}
+
+/* ═══════════════════════════════════════════════════════════════════
    SECTION 5: ABOUT PAGE
    ═══════════════════════════════════════════════════════════════════ */
 .about-hero{position:relative;padding:60px var(--sp8) 40px;text-align:center;overflow:hidden}
@@ -326,6 +427,7 @@ tr:hover td{background:rgba(255,255,255,.01)}
 @keyframes glow{0%,100%{box-shadow:0 0 4px var(--cy-glow)}50%{box-shadow:0 0 12px var(--cy-glow)}}
 .animate-in{animation:fadeIn .3s ease-out}
 .pulse{animation:pulse 2s ease-in-out infinite}
+@keyframes typingBounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-4px)}}
 
 /* ═══════════════════════════════════════════════════════════════════
    SECTION 7: DETAIL PANEL
@@ -503,13 +605,17 @@ const savedCard=LS.get('card_link','');
    JS SECTION 2: API & WEBSOCKET
    ═══════════════════════════════════════════════════════════════════ */
 const BASE=location.origin;
-const WS_URL=BASE.replace(/^http/,'ws')+'/ws';
+// API token injected by x0xd at serve time (see X0X_TOKEN global)
+const API_TOKEN=typeof X0X_TOKEN!=='undefined'?X0X_TOKEN:'';
+const WS_URL=BASE.replace(/^http/,'ws')+'/ws'+(API_TOKEN?'?token='+API_TOKEN:'');
 let ws=null;
 const wsSubs=new Set();
 
 async function api(path,opt){
   try{
-    const r=await fetch(BASE+path,{...opt,headers:{'Content-Type':'application/json',...(opt||{}).headers}});
+    const hdrs={'Content-Type':'application/json',...(opt||{}).headers};
+    if(API_TOKEN)hdrs['Authorization']='Bearer '+API_TOKEN;
+    const r=await fetch(BASE+path,{...opt,headers:hdrs});
     return r.json();
   }catch(e){return null}
 }
@@ -580,6 +686,42 @@ function toast(msg,type){
   document.getElementById('toasts').appendChild(el);
   setTimeout(()=>el.remove(),4000);
 }
+
+// ── Markdown renderer (lightweight subset) ──
+function renderMd(text){
+  if(!text)return'';
+  // Escape HTML first
+  let s=esc(text);
+  // Code blocks (triple backtick) — must come before inline code
+  s=s.replace(/```(\w*)\n?([\s\S]*?)```/g,(_,lang,code)=>'<pre><code>'+code.trim()+'</code></pre>');
+  // Inline code
+  s=s.replace(/`([^`\n]+)`/g,'<code>$1</code>');
+  // Bold
+  s=s.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+  // Italic (single * but not inside **)
+  s=s.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g,'<em>$1</em>');
+  // Blockquote lines
+  s=s.replace(/^&gt; ?(.*)$/gm,'<blockquote>$1</blockquote>');
+  // Merge adjacent blockquotes
+  s=s.replace(/<\/blockquote>\n?<blockquote>/g,'\n');
+  // @mentions
+  s=s.replace(/@(\w[\w.-]{0,30})/g,'<span class="mention" onclick="mentionClick(\'$1\')">@$1</span>');
+  // Line breaks
+  s=s.replace(/\n/g,'<br>');
+  return s;
+}
+
+// ── Emoji data ──
+const EMOJI_QUICK=['👍','❤️','😂','😮','😢','🔥'];
+const EMOJI_CATS={
+  'Smileys':['😀','😃','😄','😁','😂','🤣','😅','😊','😇','🙂','😉','😌','😍','🥰','😘','😋','😛','😜','🤪','😎','🤩','🥳','😏','😒','😔','😟','😕','🙁','😮','😯','😲','😳','🥺','😢','😭','😤','😡','🤬','😈','💀','💩','🤡','👻','👽','🤖','😺','😸','😻'],
+  'People':['👋','🤚','✋','🖖','👌','🤌','🤏','✌️','🤞','🤟','🤘','🤙','👈','👉','👆','👇','☝️','👍','👎','✊','👊','🤛','🤜','👏','🙌','👐','🤲','🤝','🙏','💪','🦾','🧠','👀','👁️','👅','👄','💋'],
+  'Nature':['🐶','🐱','🐭','🐹','🐰','🦊','🐻','🐼','🐨','🐯','🦁','🐮','🐷','🐸','🐵','🐔','🐧','🐦','🦅','🦉','🐺','🐗','🐴','🦄','🐝','🐛','🦋','🌸','🌹','🌻','🌳','🌲','🍀','🌈','⭐','🌙','☀️','🔥','💧','🌊'],
+  'Food':['🍎','🍊','🍋','🍌','🍉','🍇','🍓','🫐','🍒','🍑','🥭','🍍','🥝','🍅','🥑','🌽','🍕','🍔','🍟','🌮','🍩','🍪','🎂','🍰','🧁','☕','🍺','🍷','🥂','🧃'],
+  'Activity':['⚽','🏀','🏈','⚾','🎾','🏐','🎱','🏓','🎮','🕹️','🎲','🧩','🎯','🏆','🥇','🎵','🎶','🎤','🎸','🥁','🎬','🎨','🎭','🎪'],
+  'Objects':['💡','🔦','🕯️','📱','💻','⌨️','🖥️','🖨️','📷','🔍','🔒','🔑','🔨','💎','📦','📫','📝','📌','📎','✂️','🗂️','📁','💼','🛠️','⚙️','🔧','💰','💳'],
+  'Symbols':['❤️','🧡','💛','💚','💙','💜','🖤','🤍','💯','💢','💥','✨','🔴','🟠','🟡','🟢','🔵','🟣','⚪','⚫','✅','❌','⭕','❓','❗','➕','➖','🔺','🔻','♻️','🚩','🏁']
+};
 
 function showDetail(type,data){
   S.set('detailOpen',true);S.set('detailType',type);S.set('detailData',data);
@@ -696,6 +838,504 @@ function cacheMsg(m){if(m&&m.id)msgCache[m.id]=m}
 function openThreadById(spaceId,msgId){
   const m=msgCache[msgId]||{id:msgId,text:'(loading...)',sender_name:'',sender_id:'',timestamp:Date.now()};
   openThread(spaceId,m);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   JS SECTION 3C: REACTIONS, EDIT/DELETE, TYPING, SEARCH, PINS, MENTIONS, EMOJI PICKER
+   ═══════════════════════════════════════════════════════════════════ */
+
+// ── Reactions ──
+// Storage: { chatKey: { msgId: { emoji: [senderId,...] } } }
+const reactionStore={};
+function getReactions(chatKey,msgId){return(reactionStore[chatKey]||{})[msgId]||{}}
+function loadReactions(chatKey){reactionStore[chatKey]=LS.get('rxn_'+chatKey,{});return reactionStore[chatKey]}
+function saveReactions(chatKey){LS.set('rxn_'+chatKey,reactionStore[chatKey]||{})}
+
+function toggleReaction(chatKey,msgId,emoji){
+  if(!reactionStore[chatKey])reactionStore[chatKey]={};
+  if(!reactionStore[chatKey][msgId])reactionStore[chatKey][msgId]={};
+  const r=reactionStore[chatKey][msgId];
+  const me=S.get('agentId');
+  if(!r[emoji])r[emoji]=[];
+  const idx=r[emoji].indexOf(me);
+  if(idx>=0)r[emoji].splice(idx,1); else r[emoji].push(me);
+  if(r[emoji].length===0)delete r[emoji];
+  saveReactions(chatKey);
+  // Publish reaction event via gossip
+  if(currentChannelTopic){
+    wsPub(currentChannelTopic,{type:'reaction',msg_id:msgId,emoji,sender_id:me,sender_name:LS.get('display_name','')||short(me),action:idx>=0?'remove':'add',timestamp:Date.now()});
+  }
+  // Re-render reactions on this message
+  renderReactionsOnMsg(chatKey,msgId);
+}
+
+function applyRemoteReaction(chatKey,msgId,emoji,senderId,action){
+  if(!reactionStore[chatKey])reactionStore[chatKey]={};
+  if(!reactionStore[chatKey][msgId])reactionStore[chatKey][msgId]={};
+  const r=reactionStore[chatKey][msgId];
+  if(!r[emoji])r[emoji]=[];
+  const idx=r[emoji].indexOf(senderId);
+  if(action==='add'&&idx<0)r[emoji].push(senderId);
+  if(action==='remove'&&idx>=0)r[emoji].splice(idx,1);
+  if(r[emoji].length===0)delete r[emoji];
+  saveReactions(chatKey);
+  renderReactionsOnMsg(chatKey,msgId);
+}
+
+function renderReactionsOnMsg(chatKey,msgId){
+  const el=document.getElementById('rxn-'+msgId);
+  if(!el)return;
+  const r=getReactions(chatKey,msgId);
+  const me=S.get('agentId');
+  el.innerHTML=Object.entries(r).map(([emoji,users])=>
+    '<button class="rxn'+(users.includes(me)?' mine':'')+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(emoji)+'\')">'
+    +emoji+'<span class="cnt">'+users.length+'</span></button>'
+  ).join('');
+}
+
+function showEmojiPickerForMsg(chatKey,msgId){
+  // Close any existing picker
+  document.querySelectorAll('.emoji-picker.open').forEach(p=>p.classList.remove('open'));
+  const existing=document.getElementById('ep-msg-'+msgId);
+  if(existing){existing.classList.toggle('open');return}
+  const msgEl=document.getElementById('msg-'+msgId);
+  if(!msgEl)return;
+  const picker=document.createElement('div');
+  picker.className='emoji-picker open';
+  picker.id='ep-msg-'+msgId;
+  picker.style.cssText='position:absolute;top:-8px;right:0;bottom:auto;z-index:60';
+  const cats=Object.keys(EMOJI_CATS);
+  picker.innerHTML=`<div class="ep-search"><input placeholder="Search emoji…" oninput="filterEmojiPicker(this,'${escJs(msgId)}')"></div>
+    <div class="ep-tabs">${cats.map((c,i)=>'<button class="'+(i===0?'active':'')+'" onclick="switchEmojiTab(this,\''+escJs(c)+'\',\''+escJs(msgId)+'\')" title="'+esc(c)+'">'+EMOJI_CATS[c][0]+'</button>').join('')}</div>
+    <div class="ep-grid" id="epg-${esc(msgId)}">${EMOJI_CATS[cats[0]].map(e=>'<button onclick="pickMsgEmoji(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(e)+'\')">'+e+'</button>').join('')}</div>`;
+  msgEl.style.position='relative';
+  msgEl.appendChild(picker);
+  // Close on outside click
+  setTimeout(()=>document.addEventListener('click',function cl(ev){
+    if(!picker.contains(ev.target)&&!ev.target.closest('.msg-actions')){picker.remove();document.removeEventListener('click',cl)}
+  }),10);
+}
+
+function pickMsgEmoji(chatKey,msgId,emoji){
+  toggleReaction(chatKey,msgId,emoji);
+  const picker=document.getElementById('ep-msg-'+msgId);
+  if(picker)picker.remove();
+}
+
+function switchEmojiTab(btn,cat,msgId){
+  btn.parentElement.querySelectorAll('button').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  const grid=document.getElementById('epg-'+msgId);
+  if(!grid)return;
+  const chatKey=getChatKeyFromContext();
+  grid.innerHTML=EMOJI_CATS[cat].map(e=>'<button onclick="pickMsgEmoji(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(e)+'\')">'+e+'</button>').join('');
+}
+
+function filterEmojiPicker(input,msgId){
+  const q=input.value.toLowerCase();
+  const grid=document.getElementById('epg-'+msgId);
+  if(!grid)return;
+  const chatKey=getChatKeyFromContext();
+  if(!q){switchEmojiTab(input.closest('.emoji-picker').querySelector('.ep-tabs .active'),Object.keys(EMOJI_CATS)[0],msgId);return}
+  // Simple filter — show all emojis that conceptually match (just show all for now, search is hard with emoji)
+  const all=Object.values(EMOJI_CATS).flat();
+  grid.innerHTML=all.map(e=>'<button onclick="pickMsgEmoji(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(e)+'\')">'+e+'</button>').join('');
+}
+
+function getChatKeyFromContext(){
+  if(S.get('view')==='dm')return S.get('dmTarget');
+  return S.get('spaceId')+'_'+(S.get('channel')||'general');
+}
+
+// ── Composer emoji picker ──
+let composerPickerOpen=false;
+function toggleComposerEmoji(){
+  const picker=document.getElementById('composer-emoji');
+  if(!picker)return;
+  composerPickerOpen=!composerPickerOpen;
+  picker.classList.toggle('open',composerPickerOpen);
+  if(composerPickerOpen){
+    const grid=picker.querySelector('.ep-grid');
+    const cats=Object.keys(EMOJI_CATS);
+    grid.innerHTML=EMOJI_CATS[cats[0]].map(e=>'<button onclick="insertComposerEmoji(\''+escJs(e)+'\')">'+e+'</button>').join('');
+  }
+}
+
+function insertComposerEmoji(emoji){
+  const inp=document.getElementById('chat-in')||document.getElementById('dm-in');
+  if(!inp)return;
+  const start=inp.selectionStart||inp.value.length;
+  inp.value=inp.value.slice(0,start)+emoji+inp.value.slice(inp.selectionEnd||start);
+  inp.focus();
+  inp.selectionStart=inp.selectionEnd=start+emoji.length;
+  composerPickerOpen=false;
+  const picker=document.getElementById('composer-emoji');
+  if(picker)picker.classList.remove('open');
+}
+
+function switchComposerEmojiTab(btn,cat){
+  btn.parentElement.querySelectorAll('button').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  const grid=btn.closest('.emoji-picker').querySelector('.ep-grid');
+  if(!grid)return;
+  grid.innerHTML=EMOJI_CATS[cat].map(e=>'<button onclick="insertComposerEmoji(\''+escJs(e)+'\')">'+e+'</button>').join('');
+}
+
+// ── Edit / Delete ──
+const editedMsgs={};  // { chatKey: { msgId: {text, timestamp} } }
+const deletedMsgs={}; // { chatKey: Set(msgId) }
+function loadEditsDeletes(chatKey){
+  editedMsgs[chatKey]=LS.get('edits_'+chatKey,{});
+  deletedMsgs[chatKey]=new Set(LS.get('dels_'+chatKey,[]));
+}
+function saveEditsDeletes(chatKey){
+  LS.set('edits_'+chatKey,editedMsgs[chatKey]||{});
+  LS.set('dels_'+chatKey,[...(deletedMsgs[chatKey]||[])]);
+}
+
+function startEditMsg(chatKey,msgId){
+  const msgs=chatHistory[chatKey]||[];
+  const msg=msgs.find(m=>m.id===msgId);
+  if(!msg)return;
+  const body=document.querySelector('#msg-'+msgId+' .body');
+  if(!body)return;
+  body.innerHTML='<input class="edit-input" id="edit-'+esc(msgId)+'" value="'+esc(msg.text).replace(/"/g,'&quot;')+'" style="width:100%;font-size:13px" onkeydown="if(event.key===\'Enter\')confirmEdit(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\');if(event.key===\'Escape\')cancelEdit(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">'
+    +'<div style="font-size:10px;color:var(--tx3);margin-top:2px">Enter to save · Escape to cancel</div>';
+  document.getElementById('edit-'+msgId).focus();
+}
+
+function confirmEdit(chatKey,msgId){
+  const inp=document.getElementById('edit-'+msgId);
+  if(!inp)return;
+  const newText=inp.value.trim();
+  if(!newText)return;
+  // Update local
+  const msgs=chatHistory[chatKey]||[];
+  const msg=msgs.find(m=>m.id===msgId);
+  if(msg)msg.text=newText;
+  if(!editedMsgs[chatKey])editedMsgs[chatKey]={};
+  editedMsgs[chatKey][msgId]={text:newText,timestamp:Date.now()};
+  saveEditsDeletes(chatKey);
+  LS.set('chat_'+chatKey,chatHistory[chatKey]);
+  // Publish edit event
+  if(currentChannelTopic){
+    wsPub(currentChannelTopic,{type:'edit',msg_id:msgId,text:newText,sender_id:S.get('agentId'),timestamp:Date.now()});
+  }
+  // Re-render message body
+  const body=document.querySelector('#msg-'+msgId+' .body');
+  if(body)body.innerHTML=renderMd(newText)+'<span class="edited-tag">(edited)</span>';
+}
+
+function cancelEdit(chatKey,msgId){
+  const msgs=chatHistory[chatKey]||[];
+  const msg=msgs.find(m=>m.id===msgId);
+  const body=document.querySelector('#msg-'+msgId+' .body');
+  if(body&&msg){
+    const isEdited=editedMsgs[chatKey]&&editedMsgs[chatKey][msgId];
+    body.innerHTML=renderMd(msg.text)+(isEdited?'<span class="edited-tag">(edited)</span>':'');
+  }
+}
+
+function deleteMsg(chatKey,msgId){
+  if(!deletedMsgs[chatKey])deletedMsgs[chatKey]=new Set();
+  deletedMsgs[chatKey].add(msgId);
+  saveEditsDeletes(chatKey);
+  // Publish delete event
+  if(currentChannelTopic){
+    wsPub(currentChannelTopic,{type:'delete',msg_id:msgId,sender_id:S.get('agentId'),timestamp:Date.now()});
+  }
+  // Update DOM
+  const msgEl=document.getElementById('msg-'+msgId);
+  if(msgEl){
+    msgEl.classList.add('deleted');
+    const body=msgEl.querySelector('.body');
+    if(body)body.innerHTML='<em>This message was deleted</em>';
+    const actions=msgEl.querySelector('.msg-actions');
+    if(actions)actions.remove();
+    const rxn=msgEl.querySelector('.msg-reactions');
+    if(rxn)rxn.innerHTML='';
+  }
+}
+
+function applyRemoteEdit(chatKey,msgId,newText){
+  const msgs=chatHistory[chatKey]||[];
+  const msg=msgs.find(m=>m.id===msgId);
+  if(msg)msg.text=newText;
+  if(!editedMsgs[chatKey])editedMsgs[chatKey]={};
+  editedMsgs[chatKey][msgId]={text:newText,timestamp:Date.now()};
+  saveEditsDeletes(chatKey);
+  LS.set('chat_'+chatKey,chatHistory[chatKey]);
+  const body=document.querySelector('#msg-'+msgId+' .body');
+  if(body)body.innerHTML=renderMd(newText)+'<span class="edited-tag">(edited)</span>';
+}
+
+function applyRemoteDelete(chatKey,msgId){
+  if(!deletedMsgs[chatKey])deletedMsgs[chatKey]=new Set();
+  deletedMsgs[chatKey].add(msgId);
+  saveEditsDeletes(chatKey);
+  const msgEl=document.getElementById('msg-'+msgId);
+  if(msgEl){
+    msgEl.classList.add('deleted');
+    const body=msgEl.querySelector('.body');
+    if(body)body.innerHTML='<em>This message was deleted</em>';
+    const actions=msgEl.querySelector('.msg-actions');
+    if(actions)actions.remove();
+  }
+}
+
+// ── Typing indicators ──
+const typingState={};  // { topic: { senderId: {name, expires} } }
+let typingTimer=null;
+let lastTypingSent=0;
+
+function sendTypingEvent(){
+  if(!currentChannelTopic)return;
+  const now=Date.now();
+  if(now-lastTypingSent<2000)return; // Throttle to every 2s
+  lastTypingSent=now;
+  wsPub(currentChannelTopic,{type:'typing',sender_id:S.get('agentId'),sender_name:LS.get('display_name','')||short(S.get('agentId')),timestamp:now});
+}
+
+function applyTypingEvent(topic,senderId,senderName){
+  if(senderId===S.get('agentId'))return;
+  if(!typingState[topic])typingState[topic]={};
+  typingState[topic][senderId]={name:senderName||short(senderId),expires:Date.now()+3500};
+  renderTypingIndicator();
+}
+
+function renderTypingIndicator(){
+  const el=document.getElementById('typing-indicator');
+  if(!el)return;
+  const topic=currentChannelTopic;
+  if(!topic||!typingState[topic]){el.innerHTML='';return}
+  const now=Date.now();
+  const typers=Object.entries(typingState[topic]).filter(([_,v])=>v.expires>now).map(([_,v])=>v.name);
+  // Clean expired
+  Object.entries(typingState[topic]).forEach(([k,v])=>{if(v.expires<=now)delete typingState[topic][k]});
+  if(typers.length===0){el.innerHTML='';return}
+  const names=typers.length<=2?typers.join(' and '):typers.slice(0,2).join(', ')+' and others';
+  el.innerHTML=esc(names)+' '+(typers.length===1?'is':'are')+' typing<span class="typing-dots"><span></span><span></span><span></span></span>';
+}
+// Refresh typing indicators every second
+setInterval(renderTypingIndicator,1000);
+
+// ── Quote / Reply ──
+let quoteMsg=null; // {id, text, sender_name, sender_id}
+function setQuote(msgId){
+  const m=msgCache[msgId];
+  if(!m)return;
+  quoteMsg={id:m.id,text:(m.text||'').slice(0,120),sender_name:m.sender_name||short(m.sender_id),sender_id:m.sender_id};
+  renderComposeQuote();
+}
+function clearQuote(){
+  quoteMsg=null;
+  renderComposeQuote();
+}
+function renderComposeQuote(){
+  const el=document.getElementById('compose-quote');
+  if(!el){return}
+  if(!quoteMsg){el.style.display='none';el.innerHTML='';return}
+  el.style.display='flex';
+  el.innerHTML='<div class="cq-text"><strong>'+esc(quoteMsg.sender_name)+'</strong> '+esc(quoteMsg.text)+'</div><button class="cq-close" onclick="clearQuote()">✕</button>';
+}
+
+// ── Pinned messages ──
+const pinnedCache={}; // { chatKey: [msgId,...] }
+function getPinned(chatKey){return pinnedCache[chatKey]||LS.get('pins_'+chatKey,[])}
+function savePinned(chatKey){LS.set('pins_'+chatKey,pinnedCache[chatKey]||[])}
+
+async function togglePin(chatKey,msgId){
+  if(!pinnedCache[chatKey])pinnedCache[chatKey]=getPinned(chatKey);
+  const idx=pinnedCache[chatKey].indexOf(msgId);
+  if(idx>=0)pinnedCache[chatKey].splice(idx,1); else{
+    if(pinnedCache[chatKey].length>=25){toast('Max 25 pins per channel','warning');return}
+    pinnedCache[chatKey].push(msgId);
+  }
+  savePinned(chatKey);
+  // Publish pin event via gossip
+  if(currentChannelTopic){
+    wsPub(currentChannelTopic,{type:'pin',msg_id:msgId,action:idx>=0?'unpin':'pin',sender_id:S.get('agentId'),timestamp:Date.now()});
+  }
+  renderPinnedBar();
+  toast(idx>=0?'Message unpinned':'Message pinned','info');
+}
+
+function applyRemotePin(chatKey,msgId,action){
+  if(!pinnedCache[chatKey])pinnedCache[chatKey]=getPinned(chatKey);
+  const idx=pinnedCache[chatKey].indexOf(msgId);
+  if(action==='pin'&&idx<0)pinnedCache[chatKey].push(msgId);
+  if(action==='unpin'&&idx>=0)pinnedCache[chatKey].splice(idx,1);
+  savePinned(chatKey);
+  renderPinnedBar();
+}
+
+function renderPinnedBar(){
+  const el=document.getElementById('pinned-bar');
+  if(!el)return;
+  const chatKey=getChatKeyFromContext();
+  const pins=getPinned(chatKey);
+  if(pins.length===0){el.style.display='none';el.innerHTML='';return}
+  el.style.display='flex';
+  el.innerHTML='📌 <strong>'+pins.length+'</strong> pinned message'+(pins.length>1?'s':'');
+}
+
+let pinnedPanelOpen=false;
+function togglePinnedPanel(){
+  pinnedPanelOpen=!pinnedPanelOpen;
+  const el=document.getElementById('pinned-panel');
+  if(!el)return;
+  if(!pinnedPanelOpen){el.style.display='none';return}
+  const chatKey=getChatKeyFromContext();
+  const pins=getPinned(chatKey);
+  const msgs=chatHistory[chatKey]||[];
+  el.style.display='block';
+  if(pins.length===0){el.innerHTML='<div class="search-empty">No pinned messages</div>';return}
+  el.innerHTML=pins.map(pid=>{
+    const m=msgs.find(x=>x.id===pid)||msgCache[pid];
+    if(!m)return'';
+    return '<div class="pinned-msg"><div class="pin-who">'+esc(m.sender_name||short(m.sender_id||''))+'</div><div class="pin-text">'+esc((m.text||'').slice(0,200))+'</div>'
+      +'<div class="pin-actions"><button class="ghost" style="font-size:10px" onclick="togglePin(\''+escJs(chatKey)+'\',\''+escJs(pid)+'\')">Unpin</button></div></div>';
+  }).join('');
+}
+
+// ── Search ──
+let searchOpen=false;
+function toggleSearch(){
+  searchOpen=!searchOpen;
+  const el=document.getElementById('search-overlay');
+  if(!el)return;
+  if(!searchOpen){el.style.display='none';return}
+  el.style.display='flex';
+  el.innerHTML=`<div class="search-header"><input id="search-input" placeholder="Search messages…" oninput="doSearch(this.value)" autofocus><button class="ghost" onclick="toggleSearch()">✕</button></div><div class="search-results" id="search-results"><div class="search-empty">Type to search across all messages</div></div>`;
+  setTimeout(()=>{const i=document.getElementById('search-input');if(i)i.focus()},50);
+}
+
+function doSearch(query){
+  const results=document.getElementById('search-results');
+  if(!results)return;
+  const q=query.trim().toLowerCase();
+  if(q.length<2){results.innerHTML='<div class="search-empty">Type at least 2 characters</div>';return}
+  const hits=[];
+  // Search chat history
+  Object.entries(chatHistory).forEach(([chatKey,msgs])=>{
+    (msgs||[]).forEach(m=>{
+      if(m.text&&m.text.toLowerCase().includes(q)){
+        const parts=chatKey.split('_');
+        hits.push({...m,chatKey,channel:parts[1]||'',spaceId:parts[0]||''});
+      }
+    });
+  });
+  // Search DM history
+  Object.entries(dmHistory).forEach(([agentId,msgs])=>{
+    (msgs||[]).forEach(m=>{
+      if(m.text&&m.text.toLowerCase().includes(q)){
+        hits.push({...m,chatKey:agentId,channel:'DM',spaceId:'',isDm:true,dmTarget:agentId});
+      }
+    });
+  });
+  // Sort by timestamp desc
+  hits.sort((a,b)=>(b.timestamp||0)-(a.timestamp||0));
+  if(hits.length===0){results.innerHTML='<div class="search-empty">No results found</div>';return}
+  results.innerHTML=hits.slice(0,50).map(h=>{
+    const highlighted=esc(h.text||'').replace(new RegExp('('+q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi'),'<mark>$1</mark>');
+    const where=h.isDm?'DM':'#'+(h.channel||'general');
+    return '<div class="search-result" onclick="jumpToSearchResult(\''+escJs(h.chatKey)+'\','+JSON.stringify(!!h.isDm)+',\''+escJs(h.dmTarget||'')+'\',\''+escJs(h.spaceId)+'\',\''+escJs(h.channel)+'\')">'
+      +'<div class="sr-meta"><span class="sr-who">'+esc(h.sender_name||short(h.sender_id||''))+'</span><span class="sr-where">'+esc(where)+'</span><span>'+fmtTime(h.timestamp)+'</span></div>'
+      +'<div class="sr-text">'+highlighted+'</div></div>';
+  }).join('');
+}
+
+function jumpToSearchResult(chatKey,isDm,dmTarget,spaceId,channel){
+  searchOpen=false;
+  const el=document.getElementById('search-overlay');
+  if(el)el.style.display='none';
+  if(isDm){navigateDm(dmTarget)}
+  else{S.set('channel',channel||'general');navigateSpace(spaceId,'chat')}
+}
+
+// ── @mention autocomplete ──
+let mentionAcOpen=false;
+let mentionAcIdx=0;
+let mentionQuery='';
+
+function onChatInput(e){
+  const inp=e.target;
+  const val=inp.value;
+  const pos=inp.selectionStart||0;
+  // Check if we're in a @mention context
+  const before=val.slice(0,pos);
+  const atMatch=before.match(/@(\w*)$/);
+  if(atMatch){
+    mentionQuery=atMatch[1].toLowerCase();
+    showMentionAc(mentionQuery);
+  } else {
+    hideMentionAc();
+  }
+  // Send typing event
+  sendTypingEvent();
+}
+
+function showMentionAc(query){
+  const el=document.getElementById('mention-ac');
+  if(!el)return;
+  const contacts=S.get('contacts')||[];
+  const discovered=S.get('discovered')||[];
+  const all=[...contacts.map(c=>({name:c.label||'',id:c.agent_id})),...discovered.filter(d=>!contacts.find(c=>c.agent_id===d.agent_id)).map(d=>({name:d.display_name||'',id:d.agent_id}))].filter(c=>c.name);
+  const filtered=query?all.filter(c=>c.name.toLowerCase().includes(query)):all;
+  if(filtered.length===0){hideMentionAc();return}
+  mentionAcOpen=true;
+  mentionAcIdx=0;
+  el.classList.add('open');
+  el.innerHTML=filtered.slice(0,10).map((c,i)=>
+    '<div class="ac-item'+(i===0?' selected':'')+'" onmousedown="pickMention(\''+escJs(c.name)+'\')" data-idx="'+i+'"><span class="ac-name">'+esc(c.name)+'</span><span class="ac-id">'+short(c.id,8)+'</span></div>'
+  ).join('');
+}
+
+function hideMentionAc(){
+  mentionAcOpen=false;
+  const el=document.getElementById('mention-ac');
+  if(el)el.classList.remove('open');
+}
+
+function pickMention(name){
+  const inp=document.getElementById('chat-in')||document.getElementById('dm-in');
+  if(!inp)return;
+  const val=inp.value;
+  const pos=inp.selectionStart||0;
+  const before=val.slice(0,pos);
+  const after=val.slice(pos);
+  const newBefore=before.replace(/@\w*$/,'@'+name+' ');
+  inp.value=newBefore+after;
+  inp.focus();
+  inp.selectionStart=inp.selectionEnd=newBefore.length;
+  hideMentionAc();
+}
+
+function handleMentionKey(e){
+  if(!mentionAcOpen)return false;
+  const el=document.getElementById('mention-ac');
+  if(!el)return false;
+  const items=el.querySelectorAll('.ac-item');
+  if(e.key==='ArrowDown'){e.preventDefault();mentionAcIdx=Math.min(mentionAcIdx+1,items.length-1);items.forEach((it,i)=>it.classList.toggle('selected',i===mentionAcIdx));return true}
+  if(e.key==='ArrowUp'){e.preventDefault();mentionAcIdx=Math.max(mentionAcIdx-1,0);items.forEach((it,i)=>it.classList.toggle('selected',i===mentionAcIdx));return true}
+  if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();const sel=items[mentionAcIdx];if(sel){const name=sel.querySelector('.ac-name').textContent;pickMention(name)}return true}
+  if(e.key==='Escape'){e.preventDefault();hideMentionAc();return true}
+  return false;
+}
+
+function mentionClick(name){
+  // Navigate to people view and highlight this person
+  const contacts=S.get('contacts')||[];
+  const match=contacts.find(c=>(c.label||'').toLowerCase()===name.toLowerCase());
+  if(match)showAgentDetail(match.agent_id);
+}
+
+// ── Check if message mentions current user ──
+function isMentioned(text){
+  if(!text)return false;
+  const myName=(LS.get('display_name','')||'').toLowerCase();
+  if(!myName)return false;
+  return text.toLowerCase().includes('@'+myName);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1057,26 +1697,53 @@ function renderSpaceChat(el,sid){
   const chatKey=sid+'_'+chan;
   const hist=LS.get('chat_'+chatKey,[]);
   if(!chatHistory[chatKey])chatHistory[chatKey]=hist;
+  loadReactions(chatKey);loadEditsDeletes(chatKey);
+  pinnedCache[chatKey]=getPinned(chatKey);
   // Reset unread count for this channel
   LS.set('unread_ch_'+sid+'_'+chan,0);
   renderSidebar();
+  const cats=Object.keys(EMOJI_CATS);
+  const pins=getPinned(chatKey);
   el.innerHTML=`<div class="channel-header">
     <span class="hash" style="font-size:18px;color:var(--tx3)">#</span>
-    <div>
+    <div style="flex:1">
       <div class="name">${esc(chan)}</div>
       ${chanMeta.description?'<div class="desc">'+esc(chanMeta.description)+'</div>':''}
     </div>
+    <button class="ghost" title="Search messages" onclick="toggleSearch()" style="font-size:16px">🔍</button>
   </div>
-  <div class="chat-wrap">
+  <div id="pinned-bar" class="pinned-bar" style="${pins.length?'':'display:none'}" onclick="togglePinnedPanel()">${pins.length?'📌 <strong>'+pins.length+'</strong> pinned message'+(pins.length>1?'s':''):''}</div>
+  <div id="pinned-panel" class="pinned-panel" style="display:none"></div>
+  <div class="chat-wrap" style="position:relative">
+    <div id="search-overlay" class="search-overlay" style="display:none"></div>
     <div class="chat-msgs" id="chat-msgs"></div>
-    <div class="chat-input">
-      <input id="chat-in" placeholder="Message #${esc(chan)}…" onkeydown="if(event.key==='Enter')sendSpaceChat()">
+    <div id="typing-indicator" class="typing-indicator"></div>
+    <div id="compose-quote" class="compose-quote" style="display:none"></div>
+    <div class="chat-input" style="position:relative">
+      <div id="mention-ac" class="mention-ac"></div>
+      <button class="ghost" title="Emoji" onclick="toggleComposerEmoji()" style="font-size:16px;padding:6px">😀</button>
+      <input id="chat-in" placeholder="Message #${esc(chan)}…" oninput="onChatInput(event)" onkeydown="if(handleMentionKey(event))return;if(event.key==='Enter')sendSpaceChat()">
       <button class="pri" onclick="sendSpaceChat()">Send</button>
+      <div id="composer-emoji" class="emoji-picker" style="bottom:100%;right:0;left:auto">
+        <div class="ep-search"><input placeholder="Search emoji…" oninput="filterComposerEmoji(this)"></div>
+        <div class="ep-tabs">${cats.map((c,i)=>'<button class="'+(i===0?'active':'')+'" onclick="switchComposerEmojiTab(this,\''+escJs(c)+'\')" title="'+esc(c)+'">'+EMOJI_CATS[c][0]+'</button>').join('')}</div>
+        <div class="ep-grid"></div>
+      </div>
     </div>
   </div>`;
   const msgs=document.getElementById('chat-msgs');
   (chatHistory[chatKey]||[]).forEach(m=>appendChatMsg(msgs,m,sid));
   msgs.scrollTop=msgs.scrollHeight;
+  clearQuote();
+}
+
+function filterComposerEmoji(input){
+  const grid=input.closest('.emoji-picker').querySelector('.ep-grid');
+  if(!grid)return;
+  const q=input.value.toLowerCase();
+  if(!q){const cats=Object.keys(EMOJI_CATS);grid.innerHTML=EMOJI_CATS[cats[0]].map(e=>'<button onclick="insertComposerEmoji(\''+escJs(e)+'\')">'+e+'</button>').join('');return}
+  const all=Object.values(EMOJI_CATS).flat();
+  grid.innerHTML=all.map(e=>'<button onclick="insertComposerEmoji(\''+escJs(e)+'\')">'+e+'</button>').join('');
 }
 
 function sendSpaceChat(){
@@ -1087,11 +1754,16 @@ function sendSpaceChat(){
   const chan=S.get('channel')||'general';
   const msgId=generateMsgId();
   const msg={id:msgId,text:t,sender_name:name,sender_id:S.get('agentId'),timestamp:Date.now(),channel:chan};
+  // Attach quote if replying
+  if(quoteMsg){msg.quote_id=quoteMsg.id;msg.quote_text=quoteMsg.text;msg.quote_name=quoteMsg.sender_name}
   wsPub(currentChannelTopic,msg);
   // Also pub to legacy base topic for backward compat
   if(spaceChatTopic&&spaceChatTopic!==currentChannelTopic)wsPub(spaceChatTopic,msg);
   addChatMsg(sid+'_'+chan,{...msg,own:true});
   inp.value='';inp.focus();
+  clearQuote();
+  // Check for mentions and notify
+  if(isMentioned(t))toast('You mentioned yourself','info');
 }
 
 const seenMsgHashes=new Set();
@@ -1155,22 +1827,51 @@ function addThreadReply(threadId,msg){
 }
 
 function appendChatMsg(container,m,spaceId){
-  const d=document.createElement('div');d.className='chat-msg';
+  const d=document.createElement('div');
+  const msgId=m.id||'';
+  const chatKey=getChatKeyFromContext();
+  const isDeleted=deletedMsgs[chatKey]&&deletedMsgs[chatKey].has(msgId);
+  d.className='chat-msg'+(isDeleted?' deleted':'');
+  if(msgId)d.id='msg-'+msgId;
   const trust=getContactTrust(m.sender_id);
   const tclass=trust==='Trusted'?'trusted':trust==='Known'?'known':'unknown';
-  const msgId=m.id||'';
   const tc=msgId?threadCache[msgId]:null;
   const isBroadcast=m.broadcast&&m.thread_root;
-  d.innerHTML=`<div class="meta">
-    <span class="who ${tclass}">${m.own?'you':esc(m.sender_name||short(m.sender_id))}</span>
-    ${!m.own&&trust?'<span class="trust trust-'+trust.toLowerCase()+'" style="font-size:8px;padding:0 4px">'+trust+'</span>':''}
+  const isOwn=m.own||(m.sender_id===S.get('agentId'));
+  const isEdited=editedMsgs[chatKey]&&editedMsgs[chatKey][msgId];
+  const bodyText=isDeleted?'<em>This message was deleted</em>':renderMd(m.text||'')+(isEdited?'<span class="edited-tag">(edited)</span>':'');
+  // Quote preview if this message quotes another
+  const quoteHtml=m.quote_id&&m.quote_text?'<div class="msg-quote" onclick="scrollToMsg(\''+escJs(m.quote_id)+'\')"><div class="q-who">'+esc(m.quote_name||'')+'</div>'+esc(m.quote_text)+'</div>':'';
+  // Hover action bar (reactions + quote + thread + edit/delete + pin)
+  const actionsHtml=msgId&&!isDeleted?`<div class="msg-actions"><div class="quick-react">${EMOJI_QUICK.map(e=>'<button title="'+e+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(e)+'\')">'+e+'</button>').join('')}<button title="More emoji" onclick="showEmojiPickerForMsg(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">+</button></div>`
+    +(msgId&&spaceId?'<button title="Quote" onclick="setQuote(\''+escJs(msgId)+'\')">↩</button>':'')
+    +(msgId&&spaceId?'<button title="Thread" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')">💬</button>':'')
+    +(msgId?'<button title="Pin" onclick="togglePin(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">📌</button>':'')
+    +(isOwn&&msgId?'<button title="Edit" onclick="startEditMsg(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">✏️</button>':'')
+    +(isOwn&&msgId?'<button class="danger-act" title="Delete" onclick="deleteMsg(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\')">🗑</button>':'')
+    +'</div>':'';
+  // Reactions
+  const rxns=getReactions(chatKey,msgId);
+  const me=S.get('agentId');
+  const rxnHtml=msgId?'<div class="msg-reactions" id="rxn-'+esc(msgId)+'">'+Object.entries(rxns).map(([emoji,users])=>
+    '<button class="rxn'+(users.includes(me)?' mine':'')+'" onclick="toggleReaction(\''+escJs(chatKey)+'\',\''+escJs(msgId)+'\',\''+escJs(emoji)+'\')">'+emoji+'<span class="cnt">'+users.length+'</span></button>'
+  ).join('')+'</div>':'';
+
+  d.innerHTML=`${actionsHtml}${quoteHtml}<div class="meta">
+    <span class="who ${tclass}">${isOwn?'you':esc(m.sender_name||short(m.sender_id))}</span>
+    ${!isOwn&&trust?'<span class="trust trust-'+trust.toLowerCase()+'" style="font-size:8px;padding:0 4px">'+trust+'</span>':''}
     <span>${fmtTime(m.timestamp)}</span>
     ${isBroadcast?'<span style="font-size:10px;color:var(--tx3);margin-left:4px">replied in thread</span>':''}
-    ${!isBroadcast&&msgId&&spaceId?'<button class="ghost" style="font-size:10px;padding:2px 6px;margin-left:auto" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')">Reply</button>':''}
   </div>
-  <div class="body">${esc(m.text||'')}</div>
+  <div class="body">${bodyText}</div>
+  ${rxnHtml}
   ${tc&&tc.reply_count>0?'<div class="thread-indicator" id="thread-ind-'+esc(msgId)+'" onclick="openThreadById(\''+escJs(spaceId)+'\',\''+escJs(msgId)+'\')"><span class="count">&#128172; '+tc.reply_count+' repl'+(tc.reply_count===1?'y':'ies')+'</span><span class="participants">'+tc.participants.slice(0,3).map(esc).join(', ')+'</span><span class="last">'+fmtTime(tc.last_reply_at)+'</span></div>':''}`;
   container.appendChild(d);
+}
+
+function scrollToMsg(msgId){
+  const el=document.getElementById('msg-'+msgId);
+  if(el){el.scrollIntoView({behavior:'smooth',block:'center'});el.style.background='var(--cy-dim)';setTimeout(()=>el.style.background='',1500)}
 }
 
 // --- Space: Board ---
@@ -1496,15 +2197,26 @@ function renderDm(){
   const contact=(S.get('contacts')||[]).find(c=>c.agent_id===target);
   const name=contact?contact.label||short(target):short(target);
   const trust=contact?contact.trust_level:'Unknown';
+  const cats=Object.keys(EMOJI_CATS);
   return `<div class="row mb" style="justify-content:space-between">
     <div class="row"><h2 style="margin:0">${esc(name)}</h2> ${trustHtml(trust)}</div>
-    <button class="ghost" onclick="showAgentDetail('${target}')">Profile</button>
+    <div class="row"><button class="ghost" title="Search" onclick="toggleSearch()" style="font-size:16px">🔍</button><button class="ghost" onclick="showAgentDetail('${target}')">Profile</button></div>
   </div>
-  <div class="chat-wrap">
+  <div class="chat-wrap" style="position:relative">
+    <div id="search-overlay" class="search-overlay" style="display:none"></div>
     <div class="chat-msgs" id="dm-msgs"></div>
-    <div class="chat-input">
-      <input id="dm-in" placeholder="Message…" onkeydown="if(event.key==='Enter')sendDm()">
+    <div id="typing-indicator" class="typing-indicator"></div>
+    <div id="compose-quote" class="compose-quote" style="display:none"></div>
+    <div class="chat-input" style="position:relative">
+      <div id="mention-ac" class="mention-ac"></div>
+      <button class="ghost" title="Emoji" onclick="toggleComposerEmoji()" style="font-size:16px;padding:6px">😀</button>
+      <input id="dm-in" placeholder="Message…" oninput="onChatInput(event)" onkeydown="if(handleMentionKey(event))return;if(event.key==='Enter')sendDm()">
       <button class="pri" onclick="sendDm()">Send</button>
+      <div id="composer-emoji" class="emoji-picker" style="bottom:100%;right:0;left:auto">
+        <div class="ep-search"><input placeholder="Search emoji…" oninput="filterComposerEmoji(this)"></div>
+        <div class="ep-tabs">${cats.map((c,i)=>'<button class="'+(i===0?'active':'')+'" onclick="switchComposerEmojiTab(this,\''+escJs(c)+'\')" title="'+esc(c)+'">'+EMOJI_CATS[c][0]+'</button>').join('')}</div>
+        <div class="ep-grid"></div>
+      </div>
     </div>
   </div>`;
 }
@@ -2226,28 +2938,58 @@ function onGossipMessage(topic,origin,data){
   }
 
   // Channel chat (topic: x0x.group.{id_prefix}.chat/{channel})
-  if(topic.includes('.chat/')&&data.text){
+  if(topic.includes('.chat/')){
     const topicParts=topic.split('.chat/');
     const chanName=topicParts[1]||'general';
-    // Extract the group ID prefix from the topic (between 'x0x.group.' and '.chat/')
     const topicPrefix=topicParts[0];
     const idPrefix=topicPrefix.replace('x0x.group.','');
-    // Match against groups using startsWith for safety
     const groups=S.get('groups')||[];
     const match=groups.find(g=>g.group_id.startsWith(idPrefix));
     if(match){
       const chatKey=match.group_id+'_'+chanName;
-      const msg={...data,sender_id:origin,own:false,channel:chanName};
-      addChatMsg(chatKey,msg);
+      // Handle special event types
+      if(data.type==='reaction'&&data.msg_id){
+        applyRemoteReaction(chatKey,data.msg_id,data.emoji,data.sender_id||origin,data.action);
+        return;
+      }
+      if(data.type==='edit'&&data.msg_id){
+        applyRemoteEdit(chatKey,data.msg_id,data.text);
+        return;
+      }
+      if(data.type==='delete'&&data.msg_id){
+        applyRemoteDelete(chatKey,data.msg_id);
+        return;
+      }
+      if(data.type==='typing'){
+        applyTypingEvent(topic,data.sender_id||origin,data.sender_name);
+        return;
+      }
+      if(data.type==='pin'&&data.msg_id){
+        applyRemotePin(chatKey,data.msg_id,data.action);
+        return;
+      }
+      // Regular chat message
+      if(data.text){
+        const msg={...data,sender_id:origin,own:false,channel:chanName};
+        addChatMsg(chatKey,msg);
+        // Mention notification
+        if(isMentioned(data.text)){
+          toast((data.sender_name||short(origin))+' mentioned you in #'+chanName,'info');
+        }
+      }
     }
     return;
   }
 
   // Legacy base chat topic (backward compat)
-  if(topic===spaceChatTopic&&data.text){
+  if(topic===spaceChatTopic){
     const chatKey=sid+'_'+chan;
-    addChatMsg(chatKey,{...data,sender_id:origin,own:false});
-    return;
+    if(data.type==='reaction'&&data.msg_id){applyRemoteReaction(chatKey,data.msg_id,data.emoji,data.sender_id||origin,data.action);return}
+    if(data.type==='edit'&&data.msg_id){applyRemoteEdit(chatKey,data.msg_id,data.text);return}
+    if(data.type==='delete'&&data.msg_id){applyRemoteDelete(chatKey,data.msg_id);return}
+    if(data.type==='typing'){applyTypingEvent(topic,data.sender_id||origin,data.sender_name);return}
+    if(data.type==='pin'&&data.msg_id){applyRemotePin(chatKey,data.msg_id,data.action);return}
+    if(data.text){addChatMsg(chatKey,{...data,sender_id:origin,own:false});return}
   }
 
   // Swarm

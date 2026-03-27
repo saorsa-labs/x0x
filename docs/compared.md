@@ -27,7 +27,7 @@ Practical difference:
 - With A2A alone, you still need infrastructure and transport decisions.
 - With x0x, agents communicate through local `x0xd` daemons and peer connectivity, without a central broker. [working]
 
-x0x can still participate in A2A-oriented ecosystems by serving an agent card (`.well-known/agent.json`) for discovery metadata. [planned]
+x0x also includes agent-card style metadata in the repository (`.well-known/agent.json`) for ecosystem and discovery-oriented integrations. [working]
 
 ## vs direct HTTP/WebSocket
 

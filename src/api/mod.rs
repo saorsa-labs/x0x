@@ -62,6 +62,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Runtime status with uptime",
         category: "status",
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/shutdown",
+        cli_name: "stop",
+        description: "Gracefully stop the daemon",
+        category: "status",
+    },
     // ── Identity ────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,
@@ -558,6 +565,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         path: "/ws/sessions",
         cli_name: "ws sessions",
         description: "List WebSocket sessions",
+        category: "websocket",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/gui",
+        cli_name: "gui",
+        description: "Open the embedded GUI",
         category: "websocket",
     },
 ];

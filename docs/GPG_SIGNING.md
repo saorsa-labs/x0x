@@ -32,8 +32,8 @@ SIGNING_KEY="david@saorsalabs.com" ./scripts/sign-skill.sh
 
 When a tag is pushed:
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v<release>
+git push origin v<release>
 ```
 
 The GitHub Actions workflow (`sign-skill.yml`) automatically:
@@ -125,17 +125,9 @@ If the GPG key is ever compromised or rotated:
 
 ## Integration with Installation Scripts
 
-The installation scripts (created in Task 7) will automatically verify GPG signatures before installing:
+Signed `SKILL.md` assets are published for verification workflows, but the current shell installer documented in this repository is focused on installing binaries.
 
-```bash
-# Pseudo-code from install.sh
-download_skill_md
-download_signature
-verify_signature || abort "Signature verification failed"
-install_skill_md
-```
-
-This ensures agents never install tampered skill files.
+If you need signature verification for `SKILL.md`, follow the manual verification flow in this document or use the dedicated verification helpers in the repository.
 
 ## Troubleshooting
 

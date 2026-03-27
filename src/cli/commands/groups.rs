@@ -57,7 +57,7 @@ pub async fn remove_member(client: &DaemonClient, group_id: &str, agent_id: &str
 pub async fn encrypt(client: &DaemonClient, group_id: &str, payload: &str) -> Result<()> {
     client.ensure_running().await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
-    let body = serde_json::json!({ "plaintext": encoded });
+    let body = serde_json::json!({ "payload": encoded });
     let resp = client
         .post(&format!("/mls/groups/{group_id}/encrypt"), &body)
         .await?;

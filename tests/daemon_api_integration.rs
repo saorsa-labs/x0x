@@ -9,8 +9,9 @@ use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+use tempfile::TempDir;
 use tokio::sync::OnceCell;
 
 // Re-exports for WebSocket tests
@@ -202,6 +203,85 @@ async fn daemon_api_announce() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_shutdown_with_sse_client() {
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("x0xd-test.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = \"{}\"\n",
+            temp.path().display()
+        ),
+    )
+    .unwrap();
+
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/x0xd");
+    assert!(
+        binary.exists(),
+        "Build x0xd first: cargo build --release --bin x0xd"
+    );
+
+    let mut process = Command::new(&binary)
+        .arg("--config")
+        .arg(&config_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start x0xd");
+
+    let port_file = temp.path().join("api.port");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let api_addr = loop {
+        if tokio::time::Instant::now() > deadline {
+            let _ = process.kill();
+            panic!("Timeout waiting for port file");
+        }
+        if let Ok(s) = std::fs::read_to_string(&port_file) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                break s;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let sse_client = reqwest::Client::new();
+    let sse_response = sse_client
+        .get(format!("http://{api_addr}/events"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse_response.status(), StatusCode::OK);
+
+    let shutdown_response = reqwest::Client::new()
+        .post(format!("http://{api_addr}/shutdown"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shutdown_response.status(), StatusCode::OK);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = process.try_wait().unwrap() {
+            assert!(status.success(), "daemon exited with {status}");
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            let _ = process.kill();
+            panic!("daemon did not exit with an active SSE client");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    drop(sse_response);
+    assert!(
+        !port_file.exists(),
+        "port file should be removed on shutdown"
+    );
 }
 
 // ===========================================================================
@@ -974,7 +1054,7 @@ async fn daemon_api_bootstrap_cache() {
 async fn daemon_api_upgrade_check() {
     let d = daemon().await;
     let r: Value = c()
-        .get(d.url("/upgrade/check"))
+        .get(d.url("/upgrade"))
         .send()
         .await
         .unwrap()

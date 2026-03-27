@@ -1,99 +1,184 @@
 # Install x0x
 
-Use this when you are ready to install `x0xd`.
+Use this when you are ready to install the `x0x` CLI and the `x0xd` daemon.
 
-## Prerequisites
+## Requirements
 
-- Shell access on the machine where x0x will run.
-- `curl` or `wget` available.
-- No root/sudo required.
+- Linux or macOS
+- `sh`
+- `curl` or `wget`
+- `tar`
+- outbound HTTPS access to GitHub releases
 
-## Install command
+No root or sudo is required.
 
-```bash
-curl -sfL https://x0x.md/install.sh | bash
-```
+## Install
 
-Interactive mode for humans:
-
-```bash
-curl -sfL https://x0x.md/install.sh | bash -s -- --interactive
-```
-
-- `--interactive` mode switch is not implemented yet in current scripts; this invocation is planned for Phase 02 plan `02-01`. [planned]
-
-## Current behavior now
-
-- `scripts/install.sh` and `scripts/install.py` are interactive by default today. [working]
-- Default runs may prompt for input and are not yet safe for unattended agent execution. [working]
-- No stable JSON stdout schema is emitted today. [working]
-
-## Planned Phase 02 behavior (plan `02-01`)
-
-- No prompts (`read`/`input`) in default mode. [planned]
-- Progress and warnings go to stderr. [planned]
-- Final machine-readable status goes to stdout as JSON. [planned]
-- If GPG is unavailable, installation continues and reports `"gpg_verified": false`. [planned]
-- If GPG verification fails, platform is unsupported, downloads fail, or writes fail, installation exits non-zero and emits error JSON. [planned]
-
-## Planned JSON output schema (Phase 02)
-
-Success (stdout):
-
-```json
-{
-  "status": "ok",
-  "x0xd_path": "/home/user/.local/bin/x0xd",
-  "skill_path": "/home/user/.local/share/x0x/SKILL.md",
-  "gpg_verified": true,
-  "platform": "macos-arm64",
-  "version": "0.2.0"
-}
-```
-
-Failure (stdout):
-
-```json
-{
-  "status": "error",
-  "error": "GPG signature verification failed",
-  "code": "gpg_verification_failed"
-}
-```
-
-`code` values:
-
-| Code | Meaning |
-|---|---|
-| `ok` | Installation succeeded |
-| `gpg_verification_failed` | SKILL.md signature did not verify |
-| `unsupported_platform` | No binary available for this OS/arch |
-| `download_failed` | Could not download from GitHub releases |
-| `permission_denied` | Cannot write to install directory |
-| `already_installed` | `x0xd` already exists at the install path |
-
-## What gets installed where
-
-- Binary: `~/.local/bin/x0xd` [working]
-- Data root: `~/.local/share/x0x/` [working]
-- Identity material (created on first daemon start): `~/.local/share/x0x/identity/` [working]
-
-## Post-install: start and wait for readiness
-
-Start daemon:
+Primary install command:
 
 ```bash
-x0xd &
+curl -sfL https://x0x.md | sh
 ```
 
-Wait for health endpoint before continuing:
+GitHub fallback:
 
 ```bash
-until curl -sf http://127.0.0.1:12700/health >/dev/null; do sleep 1; done
+curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh | sh
 ```
 
-If readiness does not arrive, go to `troubleshooting.md` for startup diagnostics.
+## Useful install modes
+
+Install and immediately start the daemon:
+
+```bash
+curl -sfL https://x0x.md | sh -s -- --start
+```
+
+Install, start, and configure autostart:
+
+```bash
+curl -sfL https://x0x.md | sh -s -- --autostart
+```
+
+Install for a named instance:
+
+```bash
+curl -sfL https://x0x.md | sh -s -- --name alice --start
+```
+
+## What the installer does
+
+The current installer:
+
+1. Detects platform (`linux-x64-gnu`, `linux-arm64-gnu`, `macos-x64`, `macos-arm64`)
+2. Downloads the latest release archive from GitHub
+3. Installs both `x0x` and `x0xd` into `~/.local/bin`
+4. Ensures the shared x0x data directory exists
+5. Optionally starts the daemon (`--start`)
+6. Optionally configures autostart (`--autostart`)
+
+## Installed locations
+
+### Binaries
+
+- `~/.local/bin/x0x`
+- `~/.local/bin/x0xd`
+
+### Daemon data directories
+
+Default instance:
+
+- macOS: `~/Library/Application Support/x0x/`
+- Linux: `${XDG_DATA_HOME:-~/.local/share}/x0x/`
+
+Named instance `alice`:
+
+- macOS: `~/Library/Application Support/x0x-alice/`
+- Linux: `${XDG_DATA_HOME:-~/.local/share}/x0x-alice/`
+
+These directories may contain:
+
+- `api.port` — the daemon's bound local API address
+- `x0xd.log` — installer-started daemon log output
+- daemon-managed state such as contacts, groups, and caches
+
+### Identity material
+
+By default, x0x identity keys are stored in:
+
+- `~/.x0x/machine.key`
+- `~/.x0x/agent.key`
+- `~/.x0x/user.key` (optional, opt-in)
+- `~/.x0x/agent.cert` (optional, only when user identity is configured)
+
+Named daemon instances can override identity paths internally, but the library defaults above remain the standard storage layout.
+
+## PATH note
+
+If `~/.local/bin` is not already on your `PATH`, the installer prints a command to add it:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add that to `~/.bashrc`, `~/.zshrc`, or your shell profile if needed.
+
+## Starting after install
+
+Start the default daemon:
+
+```bash
+x0x start
+```
+
+Or run the daemon directly:
+
+```bash
+x0xd
+```
+
+Start a named instance:
+
+```bash
+x0x start --name alice
+# or
+x0xd --name alice
+```
+
+## Verify readiness
+
+Health check:
+
+```bash
+x0x health
+```
+
+Or directly:
+
+```bash
+curl -sf http://127.0.0.1:12700/health
+```
+
+For the full verification flow, see [verify.md](verify.md).
+
+## Autostart behavior
+
+`--autostart` configures a user-level service:
+
+- Linux: systemd user service
+- macOS: launchd user agent
+
+You can also configure this later with:
+
+```bash
+x0x autostart
+```
+
+Remove autostart with:
+
+```bash
+x0x autostart --remove
+```
+
+## Named instances
+
+You can run multiple independent local daemons on one machine.
+
+Example:
+
+```bash
+x0x start --name alice
+x0x start --name bob
+
+x0x --name alice health
+x0x --name bob status
+x0x instances
+```
 
 ## Next step
 
-After `/health` responds, run `verify.md` to prove identity, network connectivity, pub/sub, and contact-store operations.
+After installation, run:
+
+- [verify.md](verify.md) for step-by-step validation
+- [api.md](api.md) for the quick endpoint map
+- [api-reference.md](api-reference.md) for the full REST and WebSocket reference

@@ -30,7 +30,7 @@ Fix:
 
 ```bash
 # If x0xd is missing, reinstall
-curl -sfL https://x0x.md/install.sh | bash
+curl -sfL https://x0x.md | sh
 ```
 
 ```bash
@@ -62,8 +62,10 @@ for i in 1 2 3; do curl -sS http://127.0.0.1:12700/health; sleep 30; done
 ```
 
 ```bash
-# Verify bootstrap nodes are reachable over UDP/QUIC port 5483
-for host in bootstrap.x0x.sh ams.bootstrap.x0x.sh nyc.bootstrap.x0x.sh sgp.bootstrap.x0x.sh syd.bootstrap.x0x.sh fra.bootstrap.x0x.sh; do nc -zuv "$host" 5483; done
+# Verify outbound UDP/5483 is allowed from this machine.
+# Exact bootstrap peer IPs may change across releases, so prefer checking
+# local network policy/firewall first rather than relying on fixed hostnames.
+nc -zuv 142.93.199.50 5483
 ```
 
 Fix:
@@ -145,18 +147,18 @@ curl -sS http://127.0.0.1:12700/agent
 ```
 
 ```bash
-ls -la ~/.local/share/x0x/identity
+ls -la ~/.x0x
 ```
 
 ```bash
-test -d ~/.local/share/x0x/identity && echo "identity_present" || echo "identity_missing"
+test -f ~/.x0x/agent.key && echo "identity_present" || echo "identity_missing"
 ```
 
 Fix:
 
 ```bash
-# If identity directory was deleted, old identity cannot be restored
-# Keep current identity and continue with the new agent_id
+# If ~/.x0x/agent.key or ~/.x0x/machine.key was deleted, the old identity
+# cannot be restored from local disk alone. Keep the new identity and continue.
 curl -sS http://127.0.0.1:12700/agent
 ```
 

@@ -23,10 +23,12 @@ pub struct DaemonClient {
     client: reqwest::Client,
     base_url: String,
     format: OutputFormat,
+    /// API bearer token for authentication.
+    api_token: Option<String>,
 }
 
 impl DaemonClient {
-    /// Create a new client, discovering the daemon address.
+    /// Create a new client, discovering the daemon address and API token.
     ///
     /// Priority: `api_override` > port file for `name` > default port file > `127.0.0.1:12700`.
     pub fn new(
@@ -34,6 +36,12 @@ impl DaemonClient {
         api_override: Option<&str>,
         format: OutputFormat,
     ) -> Result<Self> {
+        let data_dir = dirs::data_dir().context("cannot determine data directory")?;
+        let dir_name = match name {
+            Some(n) => format!("x0x-{n}"),
+            None => "x0x".to_string(),
+        };
+
         let base_url = if let Some(api) = api_override {
             if api.starts_with("http://") || api.starts_with("https://") {
                 api.to_string()
@@ -41,8 +49,15 @@ impl DaemonClient {
                 format!("http://{api}")
             }
         } else {
-            Self::discover_api(name)?
+            Self::discover_api(name, &data_dir, &dir_name)?
         };
+
+        // Read API token from data directory
+        let token_path = data_dir.join(&dir_name).join("api-token");
+        let api_token = std::fs::read_to_string(&token_path)
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -53,16 +68,16 @@ impl DaemonClient {
             client,
             base_url,
             format,
+            api_token,
         })
     }
 
-    fn discover_api(name: Option<&str>) -> Result<String> {
-        let data_dir = dirs::data_dir().context("cannot determine data directory")?;
-        let dir_name = match name {
-            Some(n) => format!("x0x-{n}"),
-            None => "x0x".to_string(),
-        };
-        let port_file = data_dir.join(&dir_name).join("api.port");
+    fn discover_api(
+        name: Option<&str>,
+        data_dir: &std::path::Path,
+        dir_name: &str,
+    ) -> Result<String> {
+        let port_file = data_dir.join(dir_name).join("api.port");
         if port_file.exists() {
             let addr = std::fs::read_to_string(&port_file)
                 .context("failed to read port file")?
@@ -72,7 +87,25 @@ impl DaemonClient {
                 return Ok(format!("http://{addr}"));
             }
         }
+
+        if let Some(instance_name) = name {
+            anyhow::bail!(
+                "Named instance '{instance_name}' is not running. Start it with: x0x --name {instance_name} start"
+            );
+        }
+
         Ok("http://127.0.0.1:12700".to_string())
+    }
+
+    /// Build a request with the API token attached.
+    fn auth_headers(&self) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(ref token) = self.api_token {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+                headers.insert(reqwest::header::AUTHORIZATION, val);
+            }
+        }
+        headers
     }
 
     /// Check if daemon is reachable. Returns an error with a helpful message if not.
@@ -94,6 +127,7 @@ impl DaemonClient {
         let resp = self
             .client
             .get(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
             .send()
             .await
             .context("request failed — is x0xd running?")?;
@@ -105,6 +139,7 @@ impl DaemonClient {
         let resp = self
             .client
             .get(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
             .query(query)
             .send()
             .await
@@ -121,6 +156,7 @@ impl DaemonClient {
         let resp = self
             .client
             .post(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
             .json(body)
             .send()
             .await
@@ -133,6 +169,7 @@ impl DaemonClient {
         let resp = self
             .client
             .post(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
             .send()
             .await
             .context("request failed")?;
@@ -148,6 +185,7 @@ impl DaemonClient {
         let resp = self
             .client
             .patch(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
             .json(body)
             .send()
             .await
@@ -164,6 +202,7 @@ impl DaemonClient {
         let resp = self
             .client
             .put(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
             .json(body)
             .send()
             .await
@@ -176,6 +215,7 @@ impl DaemonClient {
         let resp = self
             .client
             .delete(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
             .send()
             .await
             .context("request failed")?;
@@ -187,6 +227,7 @@ impl DaemonClient {
         let resp = self
             .client
             .get(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
             .timeout(Duration::from_secs(86400)) // 24h for streaming
             .send()
             .await

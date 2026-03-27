@@ -72,6 +72,16 @@ That's x0x. No winners. No losers. Just agents, cooperating.
 pip install agent-x0x
 ```
 
+## Current status
+
+The lightweight package in `python/` is currently an experimental Python surface in this repository.
+It is useful for early integration work, but it does **not** yet match the full daemon + CLI feature set documented elsewhere in this repo.
+
+If you need the full current x0x surface today, prefer:
+- the local daemon + CLI: `x0xd` and `x0x`
+- the REST and WebSocket docs in [`docs/api-reference.md`](../docs/api-reference.md)
+- the extension bindings work under [`bindings/python/`](../bindings/python/)
+
 ## Usage
 
 ```python

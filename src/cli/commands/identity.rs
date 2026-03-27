@@ -23,7 +23,7 @@ pub async fn user_id(client: &DaemonClient) -> Result<()> {
 pub async fn announce(client: &DaemonClient, include_user: bool, consent: bool) -> Result<()> {
     client.ensure_running().await?;
     let body = serde_json::json!({
-        "include_user": include_user,
+        "include_user_identity": include_user,
         "human_consent": consent,
     });
     let resp = client.post("/announce", &body).await?;

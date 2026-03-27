@@ -2,188 +2,153 @@
 
 Base URL: `http://127.0.0.1:12700`
 
-## System & Identity
+This is the shorter, at-a-glance API map for `x0xd`. For the full reference, request/response examples, and WebSocket protocol details, see [api-reference.md](api-reference.md).
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Health probe — status, version, peer count, uptime |
-| GET | `/status` | Rich status — connectivity state, external addresses, warnings |
-| GET | `/network/status` | NAT diagnostics — type, hole punch stats, relay state |
-| GET | `/agent` | Local identity — agent_id, machine_id, optional user_id |
-| GET | `/agent/user-id` | Human identity (if opted in) |
-| POST | `/announce` | Force re-announce identity to the network |
-| GET | `/peers` | Connected peer IDs from gossip network |
+## System
+
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| GET | `/health` | `x0x health` | Health probe |
+| GET | `/status` | `x0x status` | Runtime status |
+| POST | `/shutdown` | `x0x stop` | Graceful shutdown |
+
+## Identity
+
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| GET | `/agent` | `x0x agent` | Local identity |
+| POST | `/announce` | `x0x announce` | Re-announce identity |
+| GET | `/agent/user-id` | `x0x agent user-id` | User ID if configured |
+| GET | `/agent/card` | `x0x agent card` | Shareable identity card |
+| POST | `/agent/card/import` | `x0x agent import` | Import identity card |
+
+## Network
+
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| GET | `/peers` | `x0x peers` | Connected peers |
+| GET | `/presence` | `x0x presence` | Presence view |
+| GET | `/network/status` | `x0x network status` | NAT / connectivity diagnostics |
+| GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
+
+## Gossip messaging
+
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| POST | `/publish` | `x0x publish` | Publish to a topic |
+| POST | `/subscribe` | `x0x subscribe` | Subscribe to a topic |
+| DELETE | `/subscribe/:id` | `x0x unsubscribe` | Unsubscribe |
+| GET | `/events` | `x0x events` | SSE message stream |
 
 ## Discovery
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/agents/discovered` | All discovered agents on the network |
-| GET | `/agents/discovered/:id` | Details for a specific discovered agent |
-| GET | `/users/:user_id/agents` | Agents belonging to a human (if they opted in) |
-| GET | `/presence` | Agent presence beacons |
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| GET | `/agents/discovered` | `x0x agents list` | List discovered agents |
+| GET | `/agents/discovered/:agent_id` | `x0x agents get` | Get one discovered agent |
+| POST | `/agents/find/:agent_id` | `x0x agents find` | Actively look up an agent |
+| GET | `/agents/reachability/:agent_id` | `x0x agents reachability` | Reachability heuristics |
+| GET | `/users/:user_id/agents` | `x0x agents by-user` | Agents linked to a user |
 
-## Gossip (Broadcast)
+## Contacts and trust
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/publish` | Publish base64 payload to a topic |
-| POST | `/subscribe` | Subscribe to a topic, returns subscription ID |
-| DELETE | `/subscribe/:id` | Unsubscribe from a topic |
-| GET | `/events` | SSE stream of subscribed messages |
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| GET | `/contacts` | `x0x contacts list` | List contacts |
+| POST | `/contacts` | `x0x contacts add` | Add contact |
+| POST | `/contacts/trust` | `x0x trust set` | Quick trust update |
+| PATCH | `/contacts/:agent_id` | `x0x contacts update` | Update contact |
+| DELETE | `/contacts/:agent_id` | `x0x contacts remove` | Remove contact |
+| POST | `/contacts/:agent_id/revoke` | `x0x contacts revoke` | Revoke contact |
+| GET | `/contacts/:agent_id/revocations` | `x0x contacts revocations` | List revocations |
+| GET | `/contacts/:agent_id/machines` | `x0x machines list` | List machines |
+| POST | `/contacts/:agent_id/machines` | `x0x machines add` | Add machine |
+| DELETE | `/contacts/:agent_id/machines/:machine_id` | `x0x machines remove` | Remove machine |
+| POST | `/contacts/:agent_id/machines/:machine_id/pin` | `x0x machines pin` | Pin machine |
+| DELETE | `/contacts/:agent_id/machines/:machine_id/pin` | `x0x machines unpin` | Unpin machine |
+| POST | `/trust/evaluate` | `x0x trust evaluate` | Evaluate trust decision |
 
-## Direct Messaging (Point-to-Point)
+## Direct messaging
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/agents/connect` | Connect to a discovered agent (QUIC) |
-| POST | `/direct/send` | Send direct message to connected agent |
-| GET | `/direct/connections` | List connected agents with machine IDs |
-| GET | `/direct/events` | SSE stream of incoming direct messages |
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| POST | `/agents/connect` | `x0x direct connect` | Connect to agent |
+| POST | `/direct/send` | `x0x direct send` | Send direct message |
+| GET | `/direct/connections` | `x0x direct connections` | List direct connections |
+| GET | `/direct/events` | `x0x direct events` | SSE direct-message stream |
 
-## WebSocket (Bidirectional)
+## MLS groups
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/ws` | WebSocket upgrade — general bidirectional JSON |
-| GET | `/ws/direct` | WebSocket upgrade — auto-subscribes to direct messages |
-| GET | `/ws/sessions` | List active WebSocket sessions and shared subscriptions |
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| POST | `/mls/groups` | `x0x groups create` | Create encrypted group |
+| GET | `/mls/groups` | `x0x groups list` | List encrypted groups |
+| GET | `/mls/groups/:id` | `x0x groups get` | Group details |
+| POST | `/mls/groups/:id/members` | `x0x groups add-member` | Add member |
+| DELETE | `/mls/groups/:id/members/:agent_id` | `x0x groups remove-member` | Remove member |
+| POST | `/mls/groups/:id/encrypt` | `x0x groups encrypt` | Encrypt payload |
+| POST | `/mls/groups/:id/decrypt` | `x0x groups decrypt` | Decrypt payload |
+| POST | `/mls/groups/:id/welcome` | `x0x groups welcome` | Create welcome message |
 
-### WebSocket Protocol
+## Named groups
 
-**Client → Server:**
-```json
-{"type": "ping"}
-{"type": "subscribe", "topics": ["topic-a", "topic-b"]}
-{"type": "unsubscribe", "topics": ["topic-a"]}
-{"type": "publish", "topic": "topic-a", "payload": "base64..."}
-{"type": "send_direct", "agent_id": "hex64...", "payload": "base64..."}
-```
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| POST | `/groups` | `x0x group create` | Create named group |
+| GET | `/groups` | `x0x group list` | List groups |
+| GET | `/groups/:id` | `x0x group info` | Group info |
+| POST | `/groups/:id/invite` | `x0x group invite` | Generate invite link |
+| POST | `/groups/join` | `x0x group join` | Join from invite |
+| PUT | `/groups/:id/display-name` | `x0x group set-name` | Set display name |
+| DELETE | `/groups/:id` | `x0x group leave` | Leave or delete group |
 
-**Server → Client:**
-```json
-{"type": "connected", "session_id": "uuid", "agent_id": "hex64..."}
-{"type": "message", "topic": "topic-a", "payload": "base64...", "origin": "hex64..."}
-{"type": "direct_message", "sender": "hex64...", "machine_id": "hex64...", "payload": "base64...", "received_at": 1234567890}
-{"type": "subscribed", "topics": ["topic-a", "topic-b"]}
-{"type": "unsubscribed", "topics": ["topic-a"]}
-{"type": "pong"}
-{"type": "error", "message": "..."}
-```
+## Collaborative data
 
-## Contacts & Trust
+### Task lists
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/contacts` | List contacts with trust levels |
-| POST | `/contacts` | Add contact with trust level and label |
-| POST | `/contacts/trust` | Quick trust update (agent_id + level) |
-| PATCH | `/contacts/:agent_id` | Update trust level for existing contact |
-| DELETE | `/contacts/:agent_id` | Remove contact |
-| GET | `/contacts/:agent_id/machines` | List machine records for a contact |
-| POST | `/contacts/:agent_id/machines` | Add machine record to contact |
-| DELETE | `/contacts/:agent_id/machines/:mid` | Remove machine record |
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| GET | `/task-lists` | `x0x tasks list` | List task lists |
+| POST | `/task-lists` | `x0x tasks create` | Create task list |
+| GET | `/task-lists/:id/tasks` | `x0x tasks show` | Show tasks |
+| POST | `/task-lists/:id/tasks` | `x0x tasks add` | Add task |
+| PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim` / `x0x tasks complete` | Update task state |
 
-Trust levels: `blocked`, `unknown`, `known`, `trusted`
+### Stores
 
-## MLS Group Encryption
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| GET | `/stores` | `x0x store list` | List stores |
+| POST | `/stores` | `x0x store create` | Create store |
+| POST | `/stores/:id/join` | `x0x store join` | Join store |
+| GET | `/stores/:id/keys` | `x0x store keys` | List keys |
+| PUT | `/stores/:id/:key` | `x0x store put` | Put value |
+| GET | `/stores/:id/:key` | `x0x store get` | Get value |
+| DELETE | `/stores/:id/:key` | `x0x store rm` | Remove value |
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/mls/groups` | Create encrypted group (optional group_id) |
-| GET | `/mls/groups` | List all groups with epochs and member counts |
-| GET | `/mls/groups/:id` | Group details and member list |
-| POST | `/mls/groups/:id/members` | Add member to group |
-| DELETE | `/mls/groups/:id/members/:agent_id` | Remove member from group |
-| POST | `/mls/groups/:id/encrypt` | Encrypt payload with group key |
-| POST | `/mls/groups/:id/decrypt` | Decrypt payload (requires epoch) |
+## File transfers
 
-## Collaborative Data (CRDTs)
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| POST | `/files/send` | `x0x send-file` | Start outgoing transfer |
+| GET | `/files/transfers` | `x0x transfers` | List transfers |
+| GET | `/files/transfers/:id` | `x0x transfer-status` | Inspect one transfer |
+| POST | `/files/accept/:id` | `x0x accept-file` | Accept transfer |
+| POST | `/files/reject/:id` | `x0x reject-file` | Reject transfer |
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/task-lists` | List collaborative task lists |
-| POST | `/task-lists` | Create task list bound to a topic |
-| GET | `/task-lists/:id/tasks` | List tasks in a task list |
-| POST | `/task-lists/:id/tasks` | Add task to a list |
-| PATCH | `/task-lists/:id/tasks/:tid` | Update task (claim, complete) |
+## Upgrade, WebSocket, and GUI
 
-## Common Request/Response Patterns
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| GET | `/upgrade` | `x0x upgrade` | Check for updates |
+| GET | `/ws` | — | General-purpose WebSocket |
+| GET | `/ws/direct` | — | Direct-message WebSocket |
+| GET | `/ws/sessions` | `x0x ws sessions` | List WebSocket sessions |
+| GET | `/gui` | `x0x gui` | Open embedded GUI |
+| GET | `/gui/` | — | Alias for `/gui` |
 
-### Success Response
-```json
-{"ok": true, "data": {...}}
-```
+## Notes
 
-### Error Response
-```json
-{"ok": false, "error": "description"}
-```
-
-### Status Codes
-| Code | Meaning |
-|------|---------|
-| 200 | Success |
-| 201 | Created |
-| 400 | Bad request (invalid input) |
-| 403 | Forbidden (blocked agent) |
-| 404 | Not found |
-| 500 | Internal error |
-
-## Examples
-
-### Health Check
-```bash
-curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"0.5.5","peers":4,"uptime_secs":120}
-```
-
-### Publish to Topic
-```bash
-curl -X POST http://127.0.0.1:12700/publish \
-  -H "Content-Type: application/json" \
-  -d '{"topic": "updates", "payload": "'$(echo -n "hello" | base64)'"}'
-```
-
-### Connect and Send Direct Message
-```bash
-# Connect
-curl -X POST http://127.0.0.1:12700/agents/connect \
-  -H "Content-Type: application/json" \
-  -d '{"agent_id": "8a3f..."}'
-
-# Send
-curl -X POST http://127.0.0.1:12700/direct/send \
-  -H "Content-Type: application/json" \
-  -d '{"agent_id": "8a3f...", "payload": "'$(echo -n '{"type":"ping"}' | base64)'"}'
-```
-
-### WebSocket Session
-```bash
-# Using wscat
-wscat -c ws://127.0.0.1:12700/ws
-
-# Subscribe to topics
-> {"type": "subscribe", "topics": ["updates"]}
-< {"type": "subscribed", "topics": ["updates"]}
-
-# Receive messages
-< {"type": "message", "topic": "updates", "payload": "aGVsbG8=", "origin": "b7c2..."}
-```
-
-### Create MLS Group and Encrypt
-```bash
-# Create group
-curl -X POST http://127.0.0.1:12700/mls/groups -H "Content-Type: application/json" -d '{}'
-# {"ok":true,"group_id":"abcd...","epoch":0,"members":["8a3f..."]}
-
-# Encrypt
-curl -X POST http://127.0.0.1:12700/mls/groups/abcd.../encrypt \
-  -H "Content-Type: application/json" \
-  -d '{"payload": "'$(echo -n "secret" | base64)'"}'
-# {"ok":true,"ciphertext":"...","epoch":0}
-```
-
----
-
-See also: [patterns.md](patterns.md), [troubleshooting.md](troubleshooting.md)
+- Success responses are usually flattened: `{"ok":true,...}`.
+- Error responses use: `{"ok":false,"error":"..."}`.
+- For request/response examples and the WebSocket message schema, see [api-reference.md](api-reference.md).

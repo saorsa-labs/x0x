@@ -298,6 +298,8 @@ struct AppState {
     shutdown_tx: mpsc::Sender<()>,
     /// Broadcasts daemon shutdown so long-lived SSE/WS connections can close.
     shutdown_notify: watch::Sender<bool>,
+    /// API bearer token for authenticating local clients.
+    api_token: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +904,9 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Load or generate API bearer token for local authentication.
+    let api_token = load_or_generate_api_token(&config.data_dir).await?;
+
     // Bind the API listener early so the daemon can report the actual bound
     // address even when configured with an ephemeral port.
     let listener = tokio::net::TcpListener::bind(config.api_address)
@@ -934,6 +939,7 @@ async fn main() -> Result<()> {
         file_transfers: RwLock::new(HashMap::new()),
         shutdown_tx,
         shutdown_notify,
+        api_token,
     });
 
     // Join network in background — API is available immediately
@@ -1135,6 +1141,11 @@ async fn main() -> Result<()> {
                 .allow_methods(AllowMethods::any())
                 .allow_headers(AllowHeaders::any())
         })
+        // Bearer-token authentication: all endpoints except /health and /gui
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth_middleware,
+        ))
         .with_state(Arc::clone(&state));
 
     // Start server
@@ -1183,6 +1194,104 @@ async fn main() -> Result<()> {
     state.agent.shutdown().await;
     tracing::info!("Shutdown complete");
     Ok(())
+}
+
+/// Bearer-token authentication middleware.
+///
+/// Exempts `/health`, `/gui`, and `/gui/` (the GUI is served by the daemon and
+/// must be accessible without a pre-existing token). For WebSocket upgrade
+/// endpoints (`/ws`, `/ws/direct`), accepts the token as a `?token=` query
+/// parameter since browsers cannot set custom headers on WebSocket connections.
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+
+    // Exempt: health check and GUI serving
+    if path == "/health" || path == "/gui" || path == "/gui/" {
+        return next.run(req).await;
+    }
+
+    // WebSocket endpoints: accept token from query parameter
+    if path == "/ws" || path == "/ws/direct" {
+        if let Some(query) = req.uri().query() {
+            for pair in query.split('&') {
+                if let Some(token) = pair.strip_prefix("token=") {
+                    if token == state.api_token {
+                        return next.run(req).await;
+                    }
+                }
+            }
+        }
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({"error": "missing or invalid token query parameter"})),
+        )
+            .into_response();
+    }
+
+    // All other endpoints: check Authorization: Bearer header
+    if let Some(auth) = req.headers().get(axum::http::header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                if token == state.api_token {
+                    return next.run(req).await;
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({"error": "missing or invalid Authorization: Bearer token"})),
+    )
+        .into_response()
+}
+
+/// Load or generate an API bearer token.
+///
+/// Reads from `<data_dir>/api-token`. If the file does not exist, generates a
+/// random 32-byte hex token and writes it with 0600 permissions.
+async fn load_or_generate_api_token(data_dir: &std::path::Path) -> Result<String> {
+    let token_path = data_dir.join("api-token");
+
+    // Try to load existing token
+    if token_path.exists() {
+        let token = tokio::fs::read_to_string(&token_path)
+            .await
+            .context("failed to read api-token")?
+            .trim()
+            .to_string();
+        if token.len() >= 32 {
+            tracing::info!("API token loaded from {}", token_path.display());
+            return Ok(token);
+        }
+    }
+
+    // Generate new token
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token = hex::encode(bytes);
+
+    tokio::fs::write(&token_path, &token)
+        .await
+        .context("failed to write api-token")?;
+
+    // Set permissions to 0600 (owner read/write only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        tokio::fs::set_permissions(&token_path, perms)
+            .await
+            .context("failed to set api-token permissions")?;
+    }
+
+    tracing::info!("API token generated at {}", token_path.display());
+    Ok(token)
 }
 
 fn validate_instance_name(name: &str) -> Result<()> {
@@ -3565,9 +3674,17 @@ async fn update_task(
 /// The embedded GUI HTML, compiled into the binary.
 const GUI_HTML: &str = include_str!("../gui/x0x-gui.html");
 
-/// GET /gui — serve the embedded GUI.
-async fn serve_gui() -> impl IntoResponse {
-    axum::response::Html(GUI_HTML)
+/// GET /gui — serve the embedded GUI with API token injected.
+///
+/// Injects `const X0X_TOKEN='<token>';` into the HTML so the GUI can
+/// authenticate API calls and WebSocket connections automatically.
+async fn serve_gui(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let injected = format!(
+        "<script>const X0X_TOKEN='{}';</script>",
+        state.api_token
+    );
+    let html = GUI_HTML.replacen("<script>", &format!("{injected}\n<script>"), 1);
+    axum::response::Html(html)
 }
 
 // ---------------------------------------------------------------------------

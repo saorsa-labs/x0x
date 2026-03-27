@@ -165,9 +165,9 @@ This is a warning, not an error. It means you haven't manually verified the key'
 Each release has its own signature:
 
 ```bash
-# For version 0.1.0
-wget https://github.com/saorsa-labs/x0x/releases/download/v0.1.0/SKILL.md
-wget https://github.com/saorsa-labs/x0x/releases/download/v0.1.0/SKILL.md.sig
+# For a specific release tag
+wget https://github.com/saorsa-labs/x0x/releases/download/v<release>/SKILL.md
+wget https://github.com/saorsa-labs/x0x/releases/download/v<release>/SKILL.md.sig
 
 # Verify
 gpg --verify SKILL.md.sig SKILL.md

@@ -18,7 +18,7 @@ pub async fn add(client: &DaemonClient, agent_id: &str, machine_id: &str, pin: b
     client.ensure_running().await?;
     let body = serde_json::json!({
         "machine_id": machine_id,
-        "pin": pin,
+        "pinned": pin,
     });
     let resp = client
         .post(&format!("/contacts/{agent_id}/machines"), &body)

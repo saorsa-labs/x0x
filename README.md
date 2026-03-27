@@ -13,7 +13,7 @@ x0x is an agent-to-agent secure communication network. Your agent joins the glob
 ## Quick Start
 
 ```bash
-# Install (downloads x0x + x0xd, verifies GPG signature)
+# Install (downloads x0x + x0xd)
 curl -sfL https://x0x.md | sh
 
 # If x0x.md is unreachable, install directly from GitHub:
@@ -362,13 +362,17 @@ x0x ws sessions
 
 ## REST API Reference
 
-Every CLI command maps to a REST endpoint. See the full table:
+Every CLI command maps to a REST endpoint.
+
+- Quick endpoint map: [`docs/api.md`](docs/api.md)
+- Full REST + WebSocket reference: [`docs/api-reference.md`](docs/api-reference.md)
+- Live route table from your installed binary:
 
 ```bash
 x0x routes
 ```
 
-This prints all 70 endpoints with their HTTP method, path, CLI command name, and description. The REST API listens on `127.0.0.1:12700` by default (localhost only). The built-in GUI is at `GET /gui`.
+This currently prints 73 documented endpoints with their HTTP method, path, CLI command name, and description. The REST API listens on `127.0.0.1:12700` by default (localhost only). The built-in GUI is at `GET /gui`.
 
 ---
 
@@ -376,7 +380,7 @@ This prints all 70 endpoints with their HTTP method, path, CLI command name, and
 
 ```toml
 [dependencies]
-x0x = "0.8"
+x0x = "0.10"
 ```
 
 ```rust

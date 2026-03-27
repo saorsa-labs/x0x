@@ -12,7 +12,7 @@ Secure, decentralized peer-to-peer communication for AI agents with CRDT-based c
 - **CRDT Task Lists**: Conflict-free collaborative task management with automatic synchronization
 - **Event-Driven**: Node.js EventEmitter pattern for async operations
 - **Type Safe**: Full TypeScript type definitions with JSDoc documentation
-- **Multi-Platform**: Native bindings for 6 platforms + WASM fallback
+- **Multi-Platform**: Native bindings for 6 platforms plus a WASM fallback
 
 ## Installation
 
@@ -256,7 +256,7 @@ const { Agent } = require('x0x');
 
 **Solutions**:
 1. Ensure both agents are running on the same network
-2. Check firewall settings for UDP port 11000 (default QUIC port)
+2. Check local firewall and outbound UDP policy, especially for bootstrap traffic on UDP/5483
 3. Enable verbose logging by setting `DEBUG=x0x:*`
 
 ### Performance issues with WASM
@@ -349,13 +349,15 @@ All layers are transparent to the application.
 
 ## Contributing
 
-Contributions welcome! See [CONTRIBUTING.md](../../CONTRIBUTING.md) for guidelines.
+Contributions are welcome through the main repository:
+- Open an issue: https://github.com/saorsa-labs/x0x/issues
+- Send a pull request: https://github.com/saorsa-labs/x0x/pulls
 
 ## License
 
-Dual licensed under AGPL-3.0-or-later and Commercial License.
+Repository source is licensed under MIT OR Apache-2.0.
 
-See [LICENSE](../../LICENSE) for details.
+See [LICENSE-MIT](../../LICENSE-MIT) and [LICENSE-APACHE](../../LICENSE-APACHE).
 
 ## Support
 

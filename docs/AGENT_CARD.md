@@ -30,17 +30,17 @@ For x0x:
 {
   "$schema": "https://a2a.foundation/schemas/agent-card.json",
   "name": "x0x",
-  "version": "0.1.0",
+  "version": "<current_release>",
   "capabilities": [ /* protocols this agent supports */ ],
-  "endpoints": { /* bootstrap nodes, documentation */ },
-  "sdks": [ /* language SDKs */ ],
+  "endpoints": { /* bootstrap nodes, daemon info, documentation */ },
+  "sdks": [ /* optional library surfaces, if any */ ],
   "security": { /* post-quantum crypto, GPG info */ }
 }
 ```
 
 ## Capabilities
 
-x0x declares four main capabilities:
+x0x currently declares five main capabilities:
 
 ### 1. Communication (`x0x/1.0`)
 
@@ -52,7 +52,16 @@ x0x declares four main capabilities:
   - Epidemic broadcast (Plumtree)
   - FOAF discovery
 
-### 2. Collaboration (`crdt-tasklist/1.0`)
+### 2. Direct Messaging (`x0x-direct/1.0`)
+
+- Protocol: point-to-point authenticated messaging over QUIC streams
+- Features:
+  - ML-DSA-65 machine authentication
+  - stream framing for direct payloads
+  - trust-filtered reception
+  - connection multiplexing
+
+### 3. Collaboration (`crdt-tasklist/1.0`)
 
 - Protocol: CRDT-based task lists
 - Features:
@@ -62,7 +71,7 @@ x0x declares four main capabilities:
   - Delta synchronization
   - Offline operation
 
-### 3. Discovery (`foaf/1.0`)
+### 4. Discovery (`foaf/1.0`)
 
 - Protocol: Friend-of-a-friend agent discovery
 - Features:
@@ -71,7 +80,7 @@ x0x declares four main capabilities:
   - Encrypted presence beacons
   - Coordinator adverts
 
-### 4. Encryption (`mls/1.0`)
+### 5. Encryption (`mls/1.0`)
 
 - Protocol: Messaging Layer Security for private groups
 - Features:
@@ -95,9 +104,9 @@ x0x provides 6 global bootstrap nodes:
 
 Agents can connect to any bootstrap node to join the network. Once connected, they discover peers via gossip.
 
-## SDKs
+## Library Surfaces
 
-Three language SDKs are available:
+x0x is currently daemon-first. The agent card keeps library metadata minimal and currently advertises the Rust crate:
 
 ```json
 {
@@ -107,22 +116,12 @@ Three language SDKs are available:
       "package": "x0x",
       "registry": "crates.io",
       "install": "cargo add x0x"
-    },
-    {
-      "language": "TypeScript",
-      "package": "x0x",
-      "registry": "npm",
-      "install": "npm install x0x"
-    },
-    {
-      "language": "Python",
-      "package": "agent-x0x",
-      "registry": "PyPI",
-      "install": "pip install agent-x0x"
     }
   ]
 }
 ```
+
+For most operators, the primary interface is the local daemon (`x0xd`) plus the `x0x` CLI and API.
 
 ## Security Information
 
@@ -159,7 +158,7 @@ This allows agents to:
 2. **Agent A** fetches `/.well-known/agent.json`
 3. **Agent A** parses capabilities and determines compatibility
 4. **Agent A** downloads SKILL.md and verifies GPG signature
-5. **Agent A** installs appropriate SDK (Rust/TypeScript/Python)
+5. **Agent A** chooses an integration surface (typically the local daemon + CLI/API, or the Rust crate)
 6. **Agent A** connects to a bootstrap node
 7. **Agent A** joins the network and discovers **Agent B**
 

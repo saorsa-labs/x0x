@@ -11,9 +11,10 @@ pub async fn start(name: Option<&str>, config: Option<&Path>, foreground: bool) 
     // Find x0xd binary: same directory as x0x, then PATH.
     let x0xd_path = find_x0xd()?;
 
-    // Check if already running.
+    // Check if the target instance is already running.
     let format = crate::cli::OutputFormat::Text;
-    if let Ok(client) = DaemonClient::new(name, None, format) {
+    if let Some(base_url) = discovered_base_url(name)? {
+        let client = DaemonClient::new(None, Some(&base_url), format)?;
         if client.ensure_running().await.is_ok() {
             println!("Daemon already running at {}", client.base_url());
             return Ok(());
@@ -53,19 +54,21 @@ pub async fn start(name: Option<&str>, config: Option<&Path>, foreground: bool) 
     let _child = cmd.spawn().context("failed to spawn x0xd")?;
 
     // Poll health for up to 5 seconds.
-    let client = DaemonClient::new(name, None, format)?;
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
+        let Some(base_url) = discovered_base_url(name)? else {
+            continue;
+        };
+        let client = DaemonClient::new(None, Some(&base_url), format)?;
         if client.ensure_running().await.is_ok() {
             println!("Daemon started at {}", client.base_url());
             return Ok(());
         }
     }
 
-    println!(
-        "Daemon spawned but not yet reachable at {}",
-        client.base_url()
-    );
+    let fallback_url =
+        discovered_base_url(name)?.unwrap_or_else(|| String::from("http://127.0.0.1:12700"));
+    println!("Daemon spawned but not yet reachable at {fallback_url}");
     Ok(())
 }
 
@@ -120,7 +123,7 @@ pub async fn doctor(client: &DaemonClient) -> Result<()> {
         Ok(val) => {
             let peers = val.get("peers").and_then(|v| v.as_u64()).unwrap_or(0);
             let connectivity = val
-                .get("connectivity")
+                .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             println!("{peers} peers, {connectivity}");
@@ -370,6 +373,32 @@ pub async fn autostart_remove() -> Result<()> {
     println!("Autostart not supported on this platform.");
 
     Ok(())
+}
+
+fn discovered_base_url(name: Option<&str>) -> Result<Option<String>> {
+    let port_file = port_file_path(name)?;
+    if !port_file.exists() {
+        return Ok(None);
+    }
+
+    let addr = std::fs::read_to_string(&port_file)
+        .context("failed to read port file")?
+        .trim()
+        .to_string();
+    if addr.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(format!("http://{addr}")))
+}
+
+fn port_file_path(name: Option<&str>) -> Result<std::path::PathBuf> {
+    let data_dir = dirs::data_dir().context("cannot determine data directory")?;
+    let dir_name = match name {
+        Some(instance) => format!("x0x-{instance}"),
+        None => "x0x".to_string(),
+    };
+    Ok(data_dir.join(dir_name).join("api.port"))
 }
 
 /// Find the x0xd binary.

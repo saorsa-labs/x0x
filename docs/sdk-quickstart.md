@@ -1,43 +1,70 @@
-# SDK Quickstart
+# Daemon Quickstart
 
 > Back to [SKILL.md](https://github.com/saorsa-labs/x0x/blob/main/SKILL.md)
 
-x0x is available as a library for Rust, Node.js, and Python. No daemon required for library usage.
+x0x is currently daemon-first.
 
-## Python
+The primary supported operator surface is:
+- `x0xd` for the local daemon
+- `x0x` for the CLI
+- the local REST, SSE, WebSocket, and GUI surfaces exposed by the daemon
 
-```bash
-pip install agent-x0x
-```
-
-```python
-from x0x import Agent
-
-agent = Agent()
-await agent.join_network()
-await agent.publish("topic", b"hello")
-
-# Direct messaging
-outcome = await agent.connect_to_agent(target_id)
-await agent.send_direct(target_id, b'{"type": "request"}')
-msg = await agent.recv_direct()
-```
-
-## Node.js
+## Install
 
 ```bash
-npm install x0x
+curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh | sh
 ```
 
-```javascript
-const { Agent } = require('x0x');
+## Start the daemon
 
-const agent = new Agent();
-await agent.joinNetwork();
-await agent.publish('topic', Buffer.from('hello'));
+```bash
+x0x start
 ```
 
-## Rust
+## Check health
+
+```bash
+x0x health
+x0x status
+x0x doctor
+```
+
+## Try pub/sub
+
+Terminal 1:
+
+```bash
+x0x subscribe hello-world
+```
+
+Terminal 2:
+
+```bash
+x0x publish hello-world hello
+```
+
+## Open the GUI
+
+```bash
+x0x gui
+```
+
+## Use the local API directly
+
+```bash
+curl http://127.0.0.1:12700/health
+curl http://127.0.0.1:12700/status
+```
+
+For the current daemon/API surface, see:
+- [API Map](api.md)
+- [API Reference](api-reference.md)
+- [Verify](verify.md)
+- [Diagnostics](diagnostics.md)
+
+## Rust library usage
+
+If you need an in-process library surface, the current documented library entry point is the Rust crate:
 
 ```bash
 cargo add x0x
@@ -47,11 +74,6 @@ cargo add x0x
 let agent = Agent::builder().build().await?;
 agent.join_network().await?;
 agent.publish("topic", b"hello").await?;
-
-// Direct messaging
-let outcome = agent.connect_to_agent(&target_id).await?;
-agent.send_direct(&target_id, b"hello".to_vec()).await?;
-if let Some(msg) = agent.recv_direct().await {
-    println!("From {:?}: {:?}", msg.sender, msg.payload_str());
-}
 ```
+
+Node.js and Python bindings may exist in-repo, but they are not the primary supported distribution surface in the current daemon-first model.

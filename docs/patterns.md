@@ -423,4 +423,4 @@ Example incoming event:
 Notes:
 
 - Trust values accepted by `x0xd`: `blocked`, `unknown`, `known`, `trusted`.
-- Presence endpoint exists (`GET /presence`) but is currently a placeholder and may return an empty list. [stub]
+- `GET /presence` returns TTL-filtered discovered agent IDs; use `GET /agents/discovered` when you need richer per-agent details like machine ID, addresses, and timestamps.

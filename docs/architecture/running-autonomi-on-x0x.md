@@ -35,7 +35,7 @@ There is no transport barrier. We verified that `saorsa-transport` and `ant-quic
 | CRDT collaboration | **Live** | OR-Set task lists with conflict-free merge |
 | CLI tooling | **Live** | `x0x` binary with 55 commands, REST + WebSocket APIs |
 | Self-update | **Live** | Signed manifests propagated via gossip |
-| SDKs | **Live** | Rust crate, npm package, PyPI package |
+| Developer surfaces | **Live** | Local daemon (`x0xd`), CLI (`x0x`), REST + WebSocket APIs, and Rust crate |
 | LinkTransport trait | **Live** | Overlay abstraction — saorsa-core's interface already exists in ant-quic |
 
 551 tests passing. Zero clippy warnings. Deployed and serving real traffic.
@@ -359,7 +359,7 @@ This is aggressive but realistic because:
 
 ## Why Now
 
-1. **x0x is production-tested.** 6 bootstrap nodes live, 551 tests, CLI shipped, SDKs published. It's not a proposal — it's deployed infrastructure.
+1. **x0x is production-tested.** 6 bootstrap nodes live, 551 tests, daemon + CLI shipped, and the local API is live. It's not a proposal — it's deployed infrastructure.
 
 2. **The transport is already unified.** We verified: ant-quic and saorsa-transport are the same codebase. There is no migration. saorsa-core can switch its Cargo.toml dependency and everything works.
 

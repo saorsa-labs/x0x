@@ -1,10 +1,12 @@
 # x0x Python Bindings
 
-Python bindings for x0x - A post-quantum secure P2P communication network for AI agents.
+Python bindings for x0x — a post-quantum secure P2P communication network for AI agents.
+
+> Status: experimental. The Python binding surface may lag behind the daemon and CLI while the bindings continue to mature.
 
 ## Installation
 
-### From PyPI (when published)
+### From PyPI
 ```bash
 pip install agent-x0x
 ```
@@ -77,7 +79,9 @@ For API reference, see [API.md](API.md).
 
 ## License
 
-Dual-licensed under AGPL-3.0-or-later OR Commercial. See [LICENSE](../../LICENSE) for details.
+Repository source is licensed under MIT OR Apache-2.0.
+
+See [LICENSE-MIT](../../LICENSE-MIT) and [LICENSE-APACHE](../../LICENSE-APACHE).
 
 ## Support
 
