@@ -4,7 +4,16 @@ After starting `x0xd`, run these checks in order. This sequence uses current end
 
 Base URL: `http://127.0.0.1:12700`
 
-## 1) Health check
+**Authentication setup** — all endpoints except `/health` require a bearer token:
+
+```bash
+# macOS
+TOKEN=$(cat ~/Library/Application\ Support/x0x/api-token)
+# Linux
+# TOKEN=$(cat ~/.local/share/x0x/api-token)
+```
+
+## 1) Health check (no auth required)
 
 Call:
 
@@ -45,7 +54,7 @@ Failure handling:
 Call:
 
 ```bash
-curl -sS http://127.0.0.1:12700/agent
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/agent
 ```
 
 Expected shape:
@@ -77,6 +86,7 @@ Choose:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:12700/subscribe \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"topic":"x0x.selftest"}'
 ```
@@ -90,13 +100,14 @@ Expected response:
 ### 3b. Start SSE listener in another terminal
 
 ```bash
-curl -N -sS http://127.0.0.1:12700/events
+curl -N -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/events
 ```
 
 ### 3c. Publish
 
 ```bash
 curl -sS -X POST http://127.0.0.1:12700/publish \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"topic":"x0x.selftest","payload":"aGVsbG8="}'
 ```
@@ -135,7 +146,7 @@ Success condition:
 Optional cleanup:
 
 ```bash
-curl -sS -X DELETE http://127.0.0.1:12700/subscribe/<subscription_id>
+curl -sS -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:12700/subscribe/<subscription_id>
 ```
 
 Expected cleanup response:
@@ -152,6 +163,7 @@ Use your own `agent_id` from step 2.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:12700/contacts \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"agent_id":"<agent_id>","trust_level":"trusted","label":"self"}'
 ```
@@ -165,7 +177,7 @@ Expected add response:
 ### 4b. List contacts
 
 ```bash
-curl -sS http://127.0.0.1:12700/contacts
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/contacts
 ```
 
 Expected list shape:
@@ -188,7 +200,7 @@ Expected list shape:
 ### 4c. Delete contact
 
 ```bash
-curl -sS -X DELETE http://127.0.0.1:12700/contacts/<agent_id>
+curl -sS -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:12700/contacts/<agent_id>
 ```
 
 Expected delete response:

@@ -52,12 +52,20 @@ impl DaemonClient {
             Self::discover_api(name, &data_dir, &dir_name)?
         };
 
-        // Read API token from data directory
-        let token_path = data_dir.join(&dir_name).join("api-token");
-        let api_token = std::fs::read_to_string(&token_path)
+        // Read API token.
+        // Priority: X0X_API_TOKEN env var > data directory file.
+        // When --api overrides the address, the local token file may not match
+        // the target daemon — the env var is the escape hatch.
+        let api_token = std::env::var("X0X_API_TOKEN")
             .ok()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                let token_path = data_dir.join(&dir_name).join("api-token");
+                std::fs::read_to_string(&token_path)
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+            });
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))

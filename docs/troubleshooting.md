@@ -97,7 +97,8 @@ Check:
 
 ```bash
 # Terminal 1: confirm SSE stream is connected
-curl -N -sS http://127.0.0.1:12700/events
+TOKEN=$(cat ~/Library/Application\ Support/x0x/api-token)  # macOS
+curl -N -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/events
 ```
 
 ```bash

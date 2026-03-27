@@ -14,7 +14,7 @@ pub async fn start(name: Option<&str>, config: Option<&Path>, foreground: bool) 
     // Check if the target instance is already running.
     let format = crate::cli::OutputFormat::Text;
     if let Some(base_url) = discovered_base_url(name)? {
-        let client = DaemonClient::new(None, Some(&base_url), format)?;
+        let client = DaemonClient::new(name, Some(&base_url), format)?;
         if client.ensure_running().await.is_ok() {
             println!("Daemon already running at {}", client.base_url());
             return Ok(());
@@ -59,7 +59,7 @@ pub async fn start(name: Option<&str>, config: Option<&Path>, foreground: bool) 
         let Some(base_url) = discovered_base_url(name)? else {
             continue;
         };
-        let client = DaemonClient::new(None, Some(&base_url), format)?;
+        let client = DaemonClient::new(name, Some(&base_url), format)?;
         if client.ensure_running().await.is_ok() {
             println!("Daemon started at {}", client.base_url());
             return Ok(());

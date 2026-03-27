@@ -347,8 +347,8 @@ x0x upgrade
 Multiple applications can share a single daemon through WebSocket:
 
 ```
-ws://127.0.0.1:12700/ws          # General-purpose
-ws://127.0.0.1:12700/ws/direct   # Auto-subscribe to DMs
+ws://127.0.0.1:12700/ws?token=<TOKEN>          # General-purpose
+ws://127.0.0.1:12700/ws/direct?token=<TOKEN>   # Auto-subscribe to DMs
 ```
 
 Subscribe, publish, and receive direct messages over a single persistent connection. Shared fan-out means multiple WebSocket clients subscribing to the same topic share one gossip subscription.

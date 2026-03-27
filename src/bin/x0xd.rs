@@ -1198,15 +1198,25 @@ async fn main() -> Result<()> {
 
 /// Bearer-token authentication middleware.
 ///
-/// Exempts `/health`, `/gui`, and `/gui/` (the GUI is served by the daemon and
-/// must be accessible without a pre-existing token). For WebSocket upgrade
-/// endpoints (`/ws`, `/ws/direct`), accepts the token as a `?token=` query
-/// parameter since browsers cannot set custom headers on WebSocket connections.
+/// Exempts:
+/// - `OPTIONS` (CORS preflight — browsers send these without auth headers)
+/// - `/health`, `/gui`, `/gui/` (must be accessible without a token)
+///
+/// Accepts `?token=` query parameter on endpoints that browsers cannot send
+/// headers on: WebSocket (`/ws`, `/ws/direct`) and SSE (`/events`,
+/// `/direct/events`).
+///
+/// All other endpoints require `Authorization: Bearer <token>`.
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // CORS preflight: browsers send OPTIONS without auth headers
+    if req.method() == axum::http::Method::OPTIONS {
+        return next.run(req).await;
+    }
+
     let path = req.uri().path();
 
     // Exempt: health check and GUI serving
@@ -1214,30 +1224,27 @@ async fn auth_middleware(
         return next.run(req).await;
     }
 
-    // WebSocket endpoints: accept token from query parameter
-    if path == "/ws" || path == "/ws/direct" {
+    // Check Authorization: Bearer header first (works everywhere)
+    if let Some(auth) = req.headers().get(axum::http::header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                if token == state.api_token {
+                    return next.run(req).await;
+                }
+            }
+        }
+    }
+
+    // Endpoints where browsers cannot set headers: accept ?token= query param.
+    // WebSocket upgrades and SSE (EventSource API has no header support).
+    let accepts_query_token = matches!(path, "/ws" | "/ws/direct" | "/events" | "/direct/events");
+    if accepts_query_token {
         if let Some(query) = req.uri().query() {
             for pair in query.split('&') {
                 if let Some(token) = pair.strip_prefix("token=") {
                     if token == state.api_token {
                         return next.run(req).await;
                     }
-                }
-            }
-        }
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({"error": "missing or invalid token query parameter"})),
-        )
-            .into_response();
-    }
-
-    // All other endpoints: check Authorization: Bearer header
-    if let Some(auth) = req.headers().get(axum::http::header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if token == state.api_token {
-                    return next.run(req).await;
                 }
             }
         }
@@ -3680,7 +3687,8 @@ const GUI_HTML: &str = include_str!("../gui/x0x-gui.html");
 /// authenticate API calls and WebSocket connections automatically.
 async fn serve_gui(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let injected = format!("<script>const X0X_TOKEN='{}';</script>", state.api_token);
-    let html = GUI_HTML.replacen("<script>", &format!("{injected}\n<script>"), 1);
+    // Replace the dedicated marker rather than relying on the first <script> tag.
+    let html = GUI_HTML.replace("<!-- X0X_TOKEN_INJECTION_POINT -->", &injected);
     axum::response::Html(html)
 }
 
