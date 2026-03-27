@@ -1130,7 +1130,7 @@ async fn main() -> Result<()> {
         .layer({
             // Restrict CORS to localhost origins only.
             // The daemon API is a local control plane — external origins must not access it.
-            use tower_http::cors::{AllowOrigin, AllowMethods, AllowHeaders};
+            use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin};
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(|origin, _| {
                     let o = origin.as_bytes();
@@ -3679,10 +3679,7 @@ const GUI_HTML: &str = include_str!("../gui/x0x-gui.html");
 /// Injects `const X0X_TOKEN='<token>';` into the HTML so the GUI can
 /// authenticate API calls and WebSocket connections automatically.
 async fn serve_gui(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let injected = format!(
-        "<script>const X0X_TOKEN='{}';</script>",
-        state.api_token
-    );
+    let injected = format!("<script>const X0X_TOKEN='{}';</script>", state.api_token);
     let html = GUI_HTML.replacen("<script>", &format!("{injected}\n<script>"), 1);
     axum::response::Html(html)
 }
