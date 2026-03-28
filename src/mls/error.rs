@@ -37,6 +37,10 @@ pub enum MlsError {
     /// General MLS operation failed.
     #[error("MLS operation failed: {0}")]
     MlsOperation(String),
+
+    /// Error from the saorsa-mls backend.
+    #[error("saorsa-mls: {0}")]
+    SaorsaMls(String),
 }
 
 /// Type alias for Results using MlsError.
@@ -92,6 +96,12 @@ mod tests {
             err.to_string(),
             "MLS operation failed: commit validation failed"
         );
+    }
+
+    #[test]
+    fn test_saorsa_mls_display() {
+        let err = MlsError::SaorsaMls("backend error".to_string());
+        assert_eq!(err.to_string(), "saorsa-mls: backend error");
     }
 
     #[test]

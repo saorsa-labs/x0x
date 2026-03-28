@@ -14,7 +14,9 @@ async fn test_group_creation() {
     let agent_id = identity.agent_id();
     let group_id = b"test-group".to_vec();
 
-    let group = MlsGroup::new(group_id.clone(), agent_id).expect("group creation failed");
+    let group = MlsGroup::new(group_id.clone(), agent_id)
+        .await
+        .expect("group creation failed");
 
     assert_eq!(group.context().group_id(), &group_id);
     assert_eq!(group.current_epoch(), 0);
@@ -29,7 +31,9 @@ async fn test_member_addition() {
     let initiator = Identity::generate().expect("identity generation failed");
     let initiator_id = initiator.agent_id();
     let group_id = b"test-group".to_vec();
-    let mut group = MlsGroup::new(group_id.clone(), initiator_id).expect("group creation failed");
+    let mut group = MlsGroup::new(group_id.clone(), initiator_id)
+        .await
+        .expect("group creation failed");
 
     // Create invitee
     let invitee = Identity::generate().expect("identity generation failed");
@@ -47,6 +51,7 @@ async fn test_member_addition() {
     // Add member to group
     let _commit = group
         .add_member(invitee_id)
+        .await
         .expect("member addition failed");
     assert!(group.members().contains_key(&invitee_id));
     assert_eq!(group.members().len(), 2);
@@ -59,17 +64,23 @@ async fn test_member_removal() {
     let initiator = Identity::generate().expect("identity generation failed");
     let initiator_id = initiator.agent_id();
     let group_id = b"test-group".to_vec();
-    let mut group = MlsGroup::new(group_id, initiator_id).expect("group creation failed");
+    let mut group = MlsGroup::new(group_id, initiator_id)
+        .await
+        .expect("group creation failed");
 
     let member = Identity::generate().expect("identity generation failed");
     let member_id = member.agent_id();
-    let _add_commit = group.add_member(member_id).expect("add member failed");
+    let _add_commit = group
+        .add_member(member_id)
+        .await
+        .expect("add member failed");
 
     assert_eq!(group.members().len(), 2);
 
     // Remove member
     let _remove_commit = group
         .remove_member(member_id)
+        .await
         .expect("remove member failed");
 
     assert!(!group.members().contains_key(&member_id));
@@ -82,7 +93,9 @@ async fn test_key_rotation() {
     let identity = Identity::generate().expect("identity generation failed");
     let agent_id = identity.agent_id();
     let group_id = b"test-group".to_vec();
-    let mut group = MlsGroup::new(group_id, agent_id).expect("group creation failed");
+    let mut group = MlsGroup::new(group_id, agent_id)
+        .await
+        .expect("group creation failed");
 
     // Derive keys at epoch 0
     let schedule1 = MlsKeySchedule::from_group(&group).expect("key schedule failed");
@@ -109,7 +122,9 @@ async fn test_forward_secrecy() {
     let identity = Identity::generate().expect("identity generation failed");
     let agent_id = identity.agent_id();
     let group_id = b"test-group".to_vec();
-    let mut group = MlsGroup::new(group_id, agent_id).expect("group creation failed");
+    let mut group = MlsGroup::new(group_id, agent_id)
+        .await
+        .expect("group creation failed");
 
     // Create a delta and encrypt at epoch 0
     let delta1 = TaskListDelta::new(1);
@@ -141,7 +156,9 @@ async fn test_encrypted_task_list_sync() {
     let initiator = Identity::generate().expect("identity generation failed");
     let initiator_id = initiator.agent_id();
     let group_id = b"collaboration-group".to_vec();
-    let group = MlsGroup::new(group_id.clone(), initiator_id).expect("group creation failed");
+    let group = MlsGroup::new(group_id.clone(), initiator_id)
+        .await
+        .expect("group creation failed");
 
     // Create and encrypt a task list delta
     let delta = TaskListDelta::new(1);
@@ -169,16 +186,18 @@ async fn test_multi_agent_group_operations() {
     let initiator = Identity::generate().expect("identity generation failed");
     let initiator_id = initiator.agent_id();
     let group_id = b"multi-agent-group".to_vec();
-    let mut group = MlsGroup::new(group_id.clone(), initiator_id).expect("group creation failed");
+    let mut group = MlsGroup::new(group_id.clone(), initiator_id)
+        .await
+        .expect("group creation failed");
 
     // Add multiple members
     let agent2 = Identity::generate().expect("identity generation failed");
     let agent2_id = agent2.agent_id();
-    let _commit1 = group.add_member(agent2_id).expect("add failed");
+    let _commit1 = group.add_member(agent2_id).await.expect("add failed");
 
     let agent3 = Identity::generate().expect("identity generation failed");
     let agent3_id = agent3.agent_id();
-    let _commit2 = group.add_member(agent3_id).expect("add failed");
+    let _commit2 = group.add_member(agent3_id).await.expect("add failed");
 
     // Verify all members present
     assert_eq!(group.members().len(), 3);
@@ -217,7 +236,7 @@ async fn test_invalid_group_creation() {
     let agent_id = identity.agent_id();
 
     // Empty group ID should still work (it's allowed)
-    let empty_group = MlsGroup::new(vec![], agent_id);
+    let empty_group = MlsGroup::new(vec![], agent_id).await;
     assert!(empty_group.is_ok());
 }
 
@@ -227,7 +246,9 @@ async fn test_welcome_wrong_recipient() {
     let initiator = Identity::generate().expect("identity generation failed");
     let initiator_id = initiator.agent_id();
     let group_id = b"test-group".to_vec();
-    let group = MlsGroup::new(group_id, initiator_id).expect("group creation failed");
+    let group = MlsGroup::new(group_id, initiator_id)
+        .await
+        .expect("group creation failed");
 
     let invitee = Identity::generate().expect("identity generation failed");
     let invitee_id = invitee.agent_id();
@@ -249,7 +270,9 @@ async fn test_encryption_authentication() {
     let identity = Identity::generate().expect("identity generation failed");
     let agent_id = identity.agent_id();
     let group_id = b"test-group".to_vec();
-    let group = MlsGroup::new(group_id, agent_id).expect("group creation failed");
+    let group = MlsGroup::new(group_id, agent_id)
+        .await
+        .expect("group creation failed");
 
     let delta = TaskListDelta::new(1);
     let encrypted =
@@ -282,7 +305,9 @@ async fn test_epoch_consistency() {
     let identity = Identity::generate().expect("identity generation failed");
     let agent_id = identity.agent_id();
     let group_id = b"test-group".to_vec();
-    let mut group = MlsGroup::new(group_id, agent_id).expect("group creation failed");
+    let mut group = MlsGroup::new(group_id, agent_id)
+        .await
+        .expect("group creation failed");
 
     let initial_epoch = group.current_epoch();
     assert_eq!(initial_epoch, 0);

@@ -302,11 +302,13 @@ mod tests {
     use super::*;
     use crate::identity::Identity;
 
-    fn create_test_group() -> (MlsGroup, AgentId) {
+    async fn create_test_group() -> (MlsGroup, AgentId) {
         let identity = Identity::generate().expect("identity generation failed");
         let agent_id = identity.agent_id();
         let group_id = b"test-group".to_vec();
-        let group = MlsGroup::new(group_id, agent_id).expect("group creation failed");
+        let group = MlsGroup::new(group_id, agent_id)
+            .await
+            .expect("group creation failed");
         (group, agent_id)
     }
 
@@ -315,9 +317,9 @@ mod tests {
         identity.agent_id()
     }
 
-    #[test]
-    fn test_welcome_creation() {
-        let (group, _creator) = create_test_group();
+    #[tokio::test]
+    async fn test_welcome_creation() {
+        let (group, _creator) = create_test_group().await;
         let invitee = create_test_invitee();
 
         let welcome = MlsWelcome::create(&group, &invitee).expect("welcome creation failed");
@@ -329,9 +331,9 @@ mod tests {
         assert_eq!(welcome.confirmation_tag.len(), 32);
     }
 
-    #[test]
-    fn test_welcome_verification() {
-        let (group, _creator) = create_test_group();
+    #[tokio::test]
+    async fn test_welcome_verification() {
+        let (group, _creator) = create_test_group().await;
         let invitee = create_test_invitee();
 
         let welcome = MlsWelcome::create(&group, &invitee).expect("welcome creation failed");
@@ -340,9 +342,9 @@ mod tests {
         assert!(welcome.verify().is_ok());
     }
 
-    #[test]
-    fn test_welcome_verification_rejects_empty_group_id() {
-        let (group, _creator) = create_test_group();
+    #[tokio::test]
+    async fn test_welcome_verification_rejects_empty_group_id() {
+        let (group, _creator) = create_test_group().await;
         let invitee = create_test_invitee();
 
         let mut welcome = MlsWelcome::create(&group, &invitee).expect("welcome creation failed");
@@ -351,9 +353,9 @@ mod tests {
         assert!(welcome.verify().is_err());
     }
 
-    #[test]
-    fn test_welcome_verification_rejects_empty_tree() {
-        let (group, _creator) = create_test_group();
+    #[tokio::test]
+    async fn test_welcome_verification_rejects_empty_tree() {
+        let (group, _creator) = create_test_group().await;
         let invitee = create_test_invitee();
 
         let mut welcome = MlsWelcome::create(&group, &invitee).expect("welcome creation failed");
@@ -362,9 +364,9 @@ mod tests {
         assert!(welcome.verify().is_err());
     }
 
-    #[test]
-    fn test_welcome_verification_rejects_invalid_tag() {
-        let (group, _creator) = create_test_group();
+    #[tokio::test]
+    async fn test_welcome_verification_rejects_invalid_tag() {
+        let (group, _creator) = create_test_group().await;
         let invitee = create_test_invitee();
 
         let mut welcome = MlsWelcome::create(&group, &invitee).expect("welcome creation failed");
@@ -373,9 +375,9 @@ mod tests {
         assert!(welcome.verify().is_err());
     }
 
-    #[test]
-    fn test_welcome_accept_by_invitee() {
-        let (group, _creator) = create_test_group();
+    #[tokio::test]
+    async fn test_welcome_accept_by_invitee() {
+        let (group, _creator) = create_test_group().await;
         let invitee = create_test_invitee();
 
         let welcome = MlsWelcome::create(&group, &invitee).expect("welcome creation failed");
@@ -387,9 +389,9 @@ mod tests {
         assert_eq!(context.epoch(), group.current_epoch());
     }
 
-    #[test]
-    fn test_welcome_accept_rejects_wrong_agent() {
-        let (group, _creator) = create_test_group();
+    #[tokio::test]
+    async fn test_welcome_accept_rejects_wrong_agent() {
+        let (group, _creator) = create_test_group().await;
         let invitee = create_test_invitee();
         let wrong_agent = create_test_invitee();
 
@@ -414,8 +416,8 @@ mod tests {
         assert_eq!(key1.len(), 32);
     }
 
-    #[test]
-    fn test_invitee_key_varies_with_epoch() {
+    #[tokio::test]
+    async fn test_invitee_key_varies_with_epoch() {
         let invitee = create_test_invitee();
         let group_id = b"test-group";
 
@@ -425,8 +427,8 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
-    #[test]
-    fn test_invitee_key_varies_with_agent() {
+    #[tokio::test]
+    async fn test_invitee_key_varies_with_agent() {
         let invitee1 = create_test_invitee();
         let invitee2 = create_test_invitee();
         let group_id = b"test-group";
@@ -438,9 +440,9 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
-    #[test]
-    fn test_welcome_serialization() {
-        let (group, _creator) = create_test_group();
+    #[tokio::test]
+    async fn test_welcome_serialization() {
+        let (group, _creator) = create_test_group().await;
         let invitee = create_test_invitee();
 
         let welcome = MlsWelcome::create(&group, &invitee).expect("welcome creation failed");

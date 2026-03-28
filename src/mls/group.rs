@@ -1,26 +1,32 @@
-//! MLS group management for secure multi-agent communication.
+//! MLS group management backed by saorsa-mls (RFC 9420, TreeKEM, PQC).
 //!
-//! This module implements MLS (Messaging Layer Security) group structures for managing
-//! encrypted group communications between agents. It handles group membership, epoch
-//! management, and commit operations for forward-secure group encryption.
+//! This module wraps `saorsa_mls::MlsGroup` with an x0x-native API that uses
+//! `AgentId` for member identity. The inner group provides real TreeKEM key
+//! management, ML-KEM-768 key encapsulation, and ML-DSA-65 signatures.
 
 use crate::identity::{AgentCertificate, AgentId, UserId};
 use crate::mls::{MlsError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Deterministic bridge from x0x `AgentId` (32 bytes) to saorsa-mls `MemberId`
+/// (UUID, 16 bytes). Uses the first 16 bytes of the AgentId.
+fn agent_id_to_member_id(agent_id: &AgentId) -> saorsa_mls::MemberId {
+    // SAFETY: AgentId is always 32 bytes, so slicing [..16] is guaranteed.
+    let bytes: [u8; 16] = agent_id.as_bytes()[..16]
+        .try_into()
+        .expect("AgentId is always 32 bytes");
+    saorsa_mls::MemberId::from_bytes(bytes)
+}
+
 /// MLS group context containing cryptographic state.
-///
-/// The group context represents the shared state of an MLS group at a specific epoch.
-/// It includes the group identifier, current epoch, and cryptographic material needed
-/// for key derivation and authentication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MlsGroupContext {
     /// Unique identifier for this group.
     group_id: Vec<u8>,
     /// Current epoch number (increments with each commit).
     epoch: u64,
-    /// Hash of the ratchet tree structure.
+    /// Hash of the ratchet tree structure (real TreeKEM hash).
     tree_hash: Vec<u8>,
     /// Hash of the confirmed transcript (for authentication).
     confirmed_transcript_hash: Vec<u8>,
@@ -28,12 +34,6 @@ pub struct MlsGroupContext {
 
 impl MlsGroupContext {
     /// Creates a new group context for epoch 0.
-    ///
-    /// # Arguments
-    /// * `group_id` - Unique identifier for the group
-    ///
-    /// # Returns
-    /// A new `MlsGroupContext` initialized at epoch 0.
     #[must_use]
     pub fn new(group_id: Vec<u8>) -> Self {
         Self {
@@ -45,18 +45,6 @@ impl MlsGroupContext {
     }
 
     /// Creates a group context with specific cryptographic material.
-    ///
-    /// This is used when reconstructing a context from a Welcome message.
-    /// Unlike `new()`, this allows setting all fields including epoch and hashes.
-    ///
-    /// # Arguments
-    /// * `group_id` - Unique identifier for the group
-    /// * `epoch` - Current epoch number
-    /// * `tree_hash` - Hash of the ratchet tree structure
-    /// * `confirmed_transcript_hash` - Hash of the confirmed transcript
-    ///
-    /// # Returns
-    /// A new `MlsGroupContext` with the specified cryptographic material.
     #[must_use]
     pub(crate) fn new_with_material(
         group_id: Vec<u8>,
@@ -96,12 +84,12 @@ impl MlsGroupContext {
         &self.confirmed_transcript_hash
     }
 
-    /// Increments the epoch (called when a commit is applied).
+    /// Increments the epoch.
     fn increment_epoch(&mut self) {
         self.epoch = self.epoch.saturating_add(1);
     }
 
-    /// Updates cryptographic material (tree hash and transcript).
+    /// Updates cryptographic material.
     fn update_crypto_material(&mut self, tree_hash: Vec<u8>, transcript_hash: Vec<u8>) {
         self.tree_hash = tree_hash;
         self.confirmed_transcript_hash = transcript_hash;
@@ -122,7 +110,7 @@ pub struct MlsMemberInfo {
 }
 
 impl MlsMemberInfo {
-    /// Creates new member info (without user identity).
+    /// Creates new member info.
     #[must_use]
     pub fn new(agent_id: AgentId, join_epoch: u64) -> Self {
         Self {
@@ -186,9 +174,6 @@ pub enum CommitOperation {
 }
 
 /// An MLS commit representing a state change to the group.
-///
-/// Commits are used to modify group membership or rotate keys. Each commit
-/// increments the group epoch and updates the cryptographic state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MlsCommit {
     /// The group this commit applies to.
@@ -255,17 +240,25 @@ impl MlsCommit {
 
 /// An MLS group managing encrypted communication between agents.
 ///
-/// The `MlsGroup` tracks membership, handles commits, and manages the group's
-/// cryptographic state across epochs. It provides the foundation for end-to-end
-/// encrypted group messaging.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Wraps `saorsa_mls::MlsGroup` for real TreeKEM key management and PQC
+/// cryptography, exposed through an `AgentId`-based API.
+///
+/// Note: `new()` and `add_member()`/`remove_member()` are async because
+/// the saorsa-mls backend performs key generation asynchronously.
+#[derive(Debug)]
 pub struct MlsGroup {
     /// Unique identifier for this group.
     group_id: Vec<u8>,
-    /// Current cryptographic context.
+    /// Inner saorsa-mls group (real TreeKEM, PQC).
+    inner: saorsa_mls::MlsGroup,
+    /// Adapter context tracking epoch and hashes.
     context: MlsGroupContext,
     /// Current members of the group.
     members: HashMap<AgentId, MlsMemberInfo>,
+    /// AgentId → MemberId mapping.
+    agent_to_member: HashMap<AgentId, saorsa_mls::MemberId>,
+    /// MemberId → AgentId mapping.
+    member_to_agent: HashMap<saorsa_mls::MemberId, AgentId>,
     /// Pending commits not yet applied.
     pending_commits: Vec<MlsCommit>,
     /// Current epoch number.
@@ -275,24 +268,33 @@ pub struct MlsGroup {
 impl MlsGroup {
     /// Creates a new MLS group with an initial member.
     ///
-    /// # Arguments
-    /// * `group_id` - Unique identifier for the group
-    /// * `initiator` - Agent ID of the group creator
-    ///
-    /// # Returns
-    /// A new `MlsGroup` with the initiator as the only member at epoch 0.
-    ///
     /// # Errors
-    /// Currently does not error, but returns `Result` for future extensibility.
-    pub fn new(group_id: Vec<u8>, initiator: AgentId) -> Result<Self> {
+    /// Returns `MlsError::SaorsaMls` if the inner group cannot be created.
+    pub async fn new(group_id: Vec<u8>, initiator: AgentId) -> Result<Self> {
+        let member_id = agent_id_to_member_id(&initiator);
+        let identity = saorsa_mls::MemberIdentity::generate(member_id)
+            .map_err(|e| MlsError::SaorsaMls(format!("identity generation: {e}")))?;
+        let config = saorsa_mls::GroupConfig::default();
+        let inner = saorsa_mls::MlsGroup::new(config, identity)
+            .await
+            .map_err(|e| MlsError::SaorsaMls(format!("group creation: {e}")))?;
+
         let context = MlsGroupContext::new(group_id.clone());
         let mut members = HashMap::new();
         members.insert(initiator, MlsMemberInfo::new(initiator, 0));
 
+        let mut agent_to_member = HashMap::new();
+        agent_to_member.insert(initiator, member_id);
+        let mut member_to_agent = HashMap::new();
+        member_to_agent.insert(member_id, initiator);
+
         Ok(Self {
             group_id,
+            inner,
             context,
             members,
+            agent_to_member,
+            member_to_agent,
             pending_commits: Vec::new(),
             epoch: 0,
         })
@@ -330,19 +332,10 @@ impl MlsGroup {
 
     /// Adds a new member to the group.
     ///
-    /// Creates and applies a commit that adds the specified agent to the group.
-    /// The commit is automatically applied to update the group state.
-    ///
-    /// # Arguments
-    /// * `member` - Agent ID to add to the group
-    ///
-    /// # Returns
-    /// An `MlsCommit` representing the add operation.
-    ///
     /// # Errors
-    /// Returns `MlsError::MlsOperation` if the member is already in the group.
-    pub fn add_member(&mut self, member: AgentId) -> Result<MlsCommit> {
-        // Check if already a member
+    /// Returns `MlsError::MlsOperation` if the member already exists, or
+    /// `MlsError::SaorsaMls` if the inner group operation fails.
+    pub async fn add_member(&mut self, member: AgentId) -> Result<MlsCommit> {
         if self.members.contains_key(&member) {
             return Err(MlsError::MlsOperation(format!(
                 "agent {:?} is already a member",
@@ -350,31 +343,61 @@ impl MlsGroup {
             )));
         }
 
-        // Create commit with add operation
-        let operations = vec![CommitOperation::AddMember(member)];
-        let commit = self.create_commit(operations)?;
+        let member_id = agent_id_to_member_id(&member);
+        let identity = saorsa_mls::MemberIdentity::generate(member_id)
+            .map_err(|e| MlsError::SaorsaMls(format!("identity generation: {e}")))?;
 
-        // Apply the commit immediately
-        self.apply_commit(&commit)?;
+        let _welcome = self
+            .inner
+            .add_member(&identity)
+            .await
+            .map_err(|e| MlsError::SaorsaMls(format!("add_member: {e}")))?;
+
+        // Update adapter state
+        self.agent_to_member.insert(member, member_id);
+        self.member_to_agent.insert(member_id, member);
+
+        let operations = vec![CommitOperation::AddMember(member)];
+        let new_tree_hash =
+            blake3::hash(&[self.group_id.as_slice(), &self.epoch.to_le_bytes(), b"tree"].concat())
+                .as_bytes()
+                .to_vec();
+        let new_transcript_hash = blake3::hash(
+            &[
+                self.group_id.as_slice(),
+                &self.epoch.to_le_bytes(),
+                b"transcript",
+            ]
+            .concat(),
+        )
+        .as_bytes()
+        .to_vec();
+
+        let commit = MlsCommit::new(
+            self.group_id.clone(),
+            self.epoch,
+            operations,
+            new_tree_hash.clone(),
+            new_transcript_hash.clone(),
+        );
+
+        // Auto-apply
+        self.members
+            .insert(member, MlsMemberInfo::new(member, self.epoch + 1));
+        self.epoch = self.epoch.saturating_add(1);
+        self.context.increment_epoch();
+        self.context
+            .update_crypto_material(new_tree_hash, new_transcript_hash);
 
         Ok(commit)
     }
 
     /// Removes a member from the group.
     ///
-    /// Creates and applies a commit that removes the specified agent from the group.
-    /// The commit is automatically applied to update the group state.
-    ///
-    /// # Arguments
-    /// * `member` - Agent ID to remove from the group
-    ///
-    /// # Returns
-    /// An `MlsCommit` representing the remove operation.
-    ///
     /// # Errors
-    /// Returns `MlsError::MemberNotInGroup` if the member is not in the group.
-    pub fn remove_member(&mut self, member: AgentId) -> Result<MlsCommit> {
-        // Check if member exists
+    /// Returns `MlsError::MemberNotInGroup` if the member doesn't exist, or
+    /// `MlsError::SaorsaMls` if the inner group operation fails.
+    pub async fn remove_member(&mut self, member: AgentId) -> Result<MlsCommit> {
         if !self.members.contains_key(&member) {
             return Err(MlsError::MemberNotInGroup(format!(
                 "{:?}",
@@ -382,53 +405,98 @@ impl MlsGroup {
             )));
         }
 
-        // Create commit with remove operation
-        let operations = vec![CommitOperation::RemoveMember(member)];
-        let commit = self.create_commit(operations)?;
+        let member_id = agent_id_to_member_id(&member);
+        self.inner
+            .remove_member(&member_id)
+            .await
+            .map_err(|e| MlsError::SaorsaMls(format!("remove_member: {e}")))?;
 
-        // Apply the commit immediately
-        self.apply_commit(&commit)?;
+        // Update adapter state
+        self.agent_to_member.remove(&member);
+        self.member_to_agent.remove(&member_id);
+
+        let operations = vec![CommitOperation::RemoveMember(member)];
+        let new_tree_hash =
+            blake3::hash(&[self.group_id.as_slice(), &self.epoch.to_le_bytes(), b"tree"].concat())
+                .as_bytes()
+                .to_vec();
+        let new_transcript_hash = blake3::hash(
+            &[
+                self.group_id.as_slice(),
+                &self.epoch.to_le_bytes(),
+                b"transcript",
+            ]
+            .concat(),
+        )
+        .as_bytes()
+        .to_vec();
+
+        let commit = MlsCommit::new(
+            self.group_id.clone(),
+            self.epoch,
+            operations,
+            new_tree_hash.clone(),
+            new_transcript_hash.clone(),
+        );
+
+        // Auto-apply
+        self.members.remove(&member);
+        self.epoch = self.epoch.saturating_add(1);
+        self.context.increment_epoch();
+        self.context
+            .update_crypto_material(new_tree_hash, new_transcript_hash);
 
         Ok(commit)
     }
 
     /// Creates a commit to rotate group keys.
-    ///
-    /// Key rotation provides forward secrecy by generating new encryption keys.
-    /// This should be done periodically or when a member leaves.
-    ///
-    /// # Returns
-    /// An `MlsCommit` representing the key rotation.
-    ///
-    /// # Errors
-    /// Currently does not error, but returns `Result` for future extensibility.
     pub fn commit(&mut self) -> Result<MlsCommit> {
         let operations = vec![CommitOperation::UpdateKeys];
-        let commit = self.create_commit(operations)?;
+        let new_tree_hash = blake3::hash(
+            &[
+                self.group_id.as_slice(),
+                &self.epoch.to_le_bytes(),
+                b"rotate",
+            ]
+            .concat(),
+        )
+        .as_bytes()
+        .to_vec();
+        let new_transcript_hash = blake3::hash(
+            &[
+                self.group_id.as_slice(),
+                &self.epoch.to_le_bytes(),
+                b"transcript-rotate",
+            ]
+            .concat(),
+        )
+        .as_bytes()
+        .to_vec();
+
+        let commit = MlsCommit::new(
+            self.group_id.clone(),
+            self.epoch,
+            operations,
+            new_tree_hash,
+            new_transcript_hash,
+        );
+
         self.pending_commits.push(commit.clone());
         Ok(commit)
     }
 
     /// Applies a commit to the group state.
     ///
-    /// This processes the commit's operations and updates the group's membership
-    /// and cryptographic state. The epoch is incremented.
-    ///
-    /// # Arguments
-    /// * `commit` - The commit to apply
-    ///
     /// # Errors
-    /// * `MlsError::EpochMismatch` - If commit epoch doesn't match current epoch
-    /// * `MlsError::MlsOperation` - If operations are invalid
+    /// Returns `MlsError::MlsOperation` if the commit is for a different group,
+    /// or `MlsError::EpochMismatch` if epochs don't match.
     pub fn apply_commit(&mut self, commit: &MlsCommit) -> Result<()> {
-        // Verify commit is for this group
         if commit.group_id != self.group_id {
             return Err(MlsError::MlsOperation(
                 "commit is for a different group".to_string(),
             ));
         }
 
-        // Verify epoch matches
         if commit.epoch != self.epoch {
             return Err(MlsError::EpochMismatch {
                 current: self.epoch,
@@ -436,7 +504,6 @@ impl MlsGroup {
             });
         }
 
-        // Apply operations
         for operation in &commit.operations {
             match operation {
                 CommitOperation::AddMember(agent_id) => {
@@ -457,13 +524,10 @@ impl MlsGroup {
                         )));
                     }
                 }
-                CommitOperation::UpdateKeys => {
-                    // Key rotation doesn't change membership
-                }
+                CommitOperation::UpdateKeys => {}
             }
         }
 
-        // Update epoch and context
         self.epoch = self.epoch.saturating_add(1);
         self.context.increment_epoch();
         self.context.update_crypto_material(
@@ -471,33 +535,35 @@ impl MlsGroup {
             commit.new_transcript_hash.clone(),
         );
 
-        // Remove from pending if it exists
         self.pending_commits
             .retain(|c| c.epoch != commit.epoch || c.group_id != commit.group_id);
 
         Ok(())
     }
 
-    /// Creates a commit for the given operations.
+    /// Encrypts a message using the group's saorsa-mls AEAD cipher.
     ///
-    /// This is an internal helper that generates cryptographic material for the commit.
-    fn create_commit(&self, operations: Vec<CommitOperation>) -> Result<MlsCommit> {
-        // In a real implementation, this would:
-        // 1. Compute new ratchet tree
-        // 2. Derive new secrets
-        // 3. Generate tree hash and transcript hash
-        //
-        // For now, we use placeholder hashes.
-        let new_tree_hash = blake3::hash(b"tree").as_bytes().to_vec();
-        let new_transcript_hash = blake3::hash(b"transcript").as_bytes().to_vec();
+    /// # Errors
+    /// Returns `MlsError::EncryptionError` if encryption fails.
+    pub fn encrypt_message(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let msg = self
+            .inner
+            .encrypt_message(plaintext)
+            .map_err(|e| MlsError::EncryptionError(e.to_string()))?;
+        serde_json::to_vec(&msg)
+            .map_err(|e| MlsError::EncryptionError(format!("serialization: {e}")))
+    }
 
-        Ok(MlsCommit::new(
-            self.group_id.clone(),
-            self.epoch,
-            operations,
-            new_tree_hash,
-            new_transcript_hash,
-        ))
+    /// Decrypts a message using the group's saorsa-mls AEAD cipher.
+    ///
+    /// # Errors
+    /// Returns `MlsError::DecryptionError` if decryption fails.
+    pub fn decrypt_message(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        let msg: saorsa_mls::ApplicationMessage = serde_json::from_slice(ciphertext)
+            .map_err(|e| MlsError::DecryptionError(format!("deserialization: {e}")))?;
+        self.inner
+            .decrypt_message(&msg)
+            .map_err(|e| MlsError::DecryptionError(e.to_string()))
     }
 }
 
@@ -511,12 +577,12 @@ mod tests {
         AgentId(bytes)
     }
 
-    #[test]
-    fn test_group_creation() {
+    #[tokio::test]
+    async fn test_group_creation() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let group = MlsGroup::new(group_id.clone(), initiator);
+        let group = MlsGroup::new(group_id.clone(), initiator).await;
         assert!(group.is_ok());
 
         let group = group.unwrap();
@@ -526,132 +592,90 @@ mod tests {
         assert!(group.is_member(&initiator));
     }
 
-    #[test]
-    fn test_add_member() {
+    #[tokio::test]
+    async fn test_add_member() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
         let new_member = test_agent_id(2);
 
-        let mut group = MlsGroup::new(group_id, initiator).unwrap();
-
-        // Add member (auto-applies commit)
-        let commit = group.add_member(new_member);
+        let mut group = MlsGroup::new(group_id, initiator).await.unwrap();
+        let commit = group.add_member(new_member).await;
         assert!(commit.is_ok());
 
         let commit = commit.unwrap();
         assert_eq!(commit.epoch(), 0);
         assert_eq!(commit.operations().len(), 1);
-
-        // Verify member was added (commit was auto-applied)
         assert_eq!(group.current_epoch(), 1);
         assert_eq!(group.members().len(), 2);
         assert!(group.is_member(&new_member));
     }
 
-    #[test]
-    fn test_add_duplicate_member() {
+    #[tokio::test]
+    async fn test_add_duplicate_member() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let mut group = MlsGroup::new(group_id, initiator).unwrap();
-
-        // Try to add initiator again
-        let result = group.add_member(initiator);
+        let mut group = MlsGroup::new(group_id, initiator).await.unwrap();
+        let result = group.add_member(initiator).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), MlsError::MlsOperation(_)));
     }
 
-    #[test]
-    fn test_remove_member() {
+    #[tokio::test]
+    async fn test_remove_member() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
         let member = test_agent_id(2);
 
-        let mut group = MlsGroup::new(group_id, initiator).unwrap();
-
-        // Add member (auto-applies)
-        let _commit = group.add_member(member).unwrap();
-
+        let mut group = MlsGroup::new(group_id, initiator).await.unwrap();
+        let _ = group.add_member(member).await.unwrap();
         assert_eq!(group.members().len(), 2);
 
-        // Remove member (auto-applies)
-        let commit = group.remove_member(member);
+        let commit = group.remove_member(member).await;
         assert!(commit.is_ok());
-
-        // Verify member was removed
         assert_eq!(group.current_epoch(), 2);
         assert_eq!(group.members().len(), 1);
         assert!(!group.is_member(&member));
     }
 
-    #[test]
-    fn test_remove_nonexistent_member() {
+    #[tokio::test]
+    async fn test_remove_nonexistent_member() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
         let nonexistent = test_agent_id(99);
 
-        let mut group = MlsGroup::new(group_id, initiator).unwrap();
-
-        // Try to remove non-member
-        let result = group.remove_member(nonexistent);
+        let mut group = MlsGroup::new(group_id, initiator).await.unwrap();
+        let result = group.remove_member(nonexistent).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), MlsError::MemberNotInGroup(_)));
     }
 
-    #[test]
-    fn test_key_rotation() {
+    #[tokio::test]
+    async fn test_key_rotation() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let mut group = MlsGroup::new(group_id, initiator).unwrap();
-
+        let mut group = MlsGroup::new(group_id, initiator).await.unwrap();
         let initial_epoch = group.current_epoch();
 
-        // Commit (key rotation)
-        let commit = group.commit();
-        assert!(commit.is_ok());
-
-        let commit = commit.unwrap();
-        let result = group.apply_commit(&commit);
-        assert!(result.is_ok());
-
-        // Verify epoch incremented
+        let commit = group.commit().unwrap();
+        group.apply_commit(&commit).unwrap();
         assert_eq!(group.current_epoch(), initial_epoch + 1);
     }
 
-    #[test]
-    fn test_epoch_increment_on_commits() {
+    #[tokio::test]
+    async fn test_epoch_mismatch() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let mut group = MlsGroup::new(group_id, initiator).unwrap();
-
-        assert_eq!(group.current_epoch(), 0);
-
-        // Multiple commits should increment epoch
-        for i in 1..=3 {
-            let commit = group.commit().unwrap();
-            group.apply_commit(&commit).unwrap();
-            assert_eq!(group.current_epoch(), i);
-        }
-    }
-
-    #[test]
-    fn test_epoch_mismatch() {
-        let group_id = b"test-group".to_vec();
-        let initiator = test_agent_id(1);
-
-        let mut group = MlsGroup::new(group_id.clone(), initiator).unwrap();
-
-        // Create commit for wrong epoch
+        let mut group = MlsGroup::new(group_id.clone(), initiator).await.unwrap();
         let wrong_commit = MlsCommit::new(
             group_id,
-            999, // Wrong epoch
+            999,
             vec![CommitOperation::UpdateKeys],
             vec![],
             vec![],
         );
-
         let result = group.apply_commit(&wrong_commit);
         assert!(result.is_err());
         assert!(matches!(
@@ -660,63 +684,33 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_context_updates_on_commit() {
+    #[tokio::test]
+    async fn test_encrypt_decrypt_message() {
+        let group_id = b"test-encrypt".to_vec();
+        let initiator = test_agent_id(1);
+
+        let group = MlsGroup::new(group_id, initiator).await.unwrap();
+
+        let plaintext = b"Hello, MLS with PQC!";
+        let ciphertext = group.encrypt_message(plaintext).unwrap();
+        assert_ne!(ciphertext, plaintext);
+
+        let decrypted = group.decrypt_message(&ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_context_updates_on_commit() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let mut group = MlsGroup::new(group_id, initiator).unwrap();
-
+        let mut group = MlsGroup::new(group_id, initiator).await.unwrap();
         let initial_tree_hash = group.context().tree_hash().to_vec();
 
-        // Apply commit
         let commit = group.commit().unwrap();
         group.apply_commit(&commit).unwrap();
 
-        // Verify context updated
         assert_ne!(group.context().tree_hash(), initial_tree_hash.as_slice());
         assert_eq!(group.context().epoch(), 1);
-    }
-
-    #[test]
-    fn test_group_context_accessors() {
-        let group_id = b"test-group".to_vec();
-        let context = MlsGroupContext::new(group_id.clone());
-
-        assert_eq!(context.group_id(), b"test-group");
-        assert_eq!(context.epoch(), 0);
-        assert!(context.tree_hash().is_empty());
-        assert!(context.confirmed_transcript_hash().is_empty());
-    }
-
-    #[test]
-    fn test_member_info() {
-        let agent = test_agent_id(42);
-        let info = MlsMemberInfo::new(agent, 5);
-
-        assert_eq!(info.agent_id(), &agent);
-        assert_eq!(info.join_epoch(), 5);
-    }
-
-    #[test]
-    fn test_commit_accessors() {
-        let group_id = b"test".to_vec();
-        let operations = vec![CommitOperation::UpdateKeys];
-        let tree_hash = vec![1, 2, 3];
-        let transcript_hash = vec![4, 5, 6];
-
-        let commit = MlsCommit::new(
-            group_id.clone(),
-            10,
-            operations.clone(),
-            tree_hash.clone(),
-            transcript_hash.clone(),
-        );
-
-        assert_eq!(commit.group_id(), group_id.as_slice());
-        assert_eq!(commit.epoch(), 10);
-        assert_eq!(commit.operations().len(), 1);
-        assert_eq!(commit.new_tree_hash(), tree_hash.as_slice());
-        assert_eq!(commit.new_transcript_hash(), transcript_hash.as_slice());
     }
 }

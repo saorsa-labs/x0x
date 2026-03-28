@@ -204,11 +204,13 @@ mod tests {
     use crate::mls::MlsGroup;
     use saorsa_gossip_types::PeerId;
 
-    fn create_test_group() -> (MlsGroup, Vec<u8>) {
+    async fn create_test_group() -> (MlsGroup, Vec<u8>) {
         let identity = Identity::generate().expect("identity generation failed");
         let agent_id = identity.agent_id();
         let group_id = b"test-encryption-group".to_vec();
-        let group = MlsGroup::new(group_id.clone(), agent_id).expect("group creation failed");
+        let group = MlsGroup::new(group_id.clone(), agent_id)
+            .await
+            .expect("group creation failed");
         (group, group_id)
     }
 
@@ -239,9 +241,9 @@ mod tests {
         delta
     }
 
-    #[test]
-    fn test_encrypt_decrypt_roundtrip() {
-        let (group, _group_id) = create_test_group();
+    #[tokio::test]
+    async fn test_encrypt_decrypt_roundtrip() {
+        let (group, _group_id) = create_test_group().await;
         let delta = create_test_delta();
 
         // Encrypt
@@ -262,9 +264,9 @@ mod tests {
         assert_eq!(decrypted.added_tasks.len(), delta.added_tasks.len());
     }
 
-    #[test]
-    fn test_encrypted_delta_includes_group_metadata() {
-        let (group, group_id) = create_test_group();
+    #[tokio::test]
+    async fn test_encrypted_delta_includes_group_metadata() {
+        let (group, group_id) = create_test_group().await;
         let delta = create_test_delta();
 
         let encrypted =
@@ -274,9 +276,9 @@ mod tests {
         assert_eq!(encrypted.epoch(), 0);
     }
 
-    #[test]
-    fn test_decryption_fails_with_wrong_epoch() {
-        let (mut group, _) = create_test_group();
+    #[tokio::test]
+    async fn test_decryption_fails_with_wrong_epoch() {
+        let (mut group, _) = create_test_group().await;
         let delta = create_test_delta();
 
         // Encrypt at epoch 0
@@ -296,17 +298,21 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_decryption_fails_with_wrong_group() {
+    #[tokio::test]
+    async fn test_decryption_fails_with_wrong_group() {
         let identity1 = Identity::generate().expect("identity generation failed");
         let agent_id1 = identity1.agent_id();
         let group_id1 = b"test-group-1".to_vec();
-        let group1 = MlsGroup::new(group_id1, agent_id1).expect("group creation failed");
+        let group1 = MlsGroup::new(group_id1, agent_id1)
+            .await
+            .expect("group creation failed");
 
         let identity2 = Identity::generate().expect("identity generation failed");
         let agent_id2 = identity2.agent_id();
         let group_id2 = b"test-group-2".to_vec(); // Different group ID
-        let group2 = MlsGroup::new(group_id2, agent_id2).expect("group creation failed");
+        let group2 = MlsGroup::new(group_id2, agent_id2)
+            .await
+            .expect("group creation failed");
 
         let delta = create_test_delta();
 
@@ -324,9 +330,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_authentication_prevents_tampering() {
-        let (group, _) = create_test_group();
+    #[tokio::test]
+    async fn test_authentication_prevents_tampering() {
+        let (group, _) = create_test_group().await;
         let delta = create_test_delta();
 
         let mut encrypted =
@@ -341,9 +347,9 @@ mod tests {
         assert!(matches!(result.unwrap_err(), MlsError::DecryptionError(_)));
     }
 
-    #[test]
-    fn test_different_epochs_produce_different_ciphertexts() {
-        let (mut group, _) = create_test_group();
+    #[tokio::test]
+    async fn test_different_epochs_produce_different_ciphertexts() {
+        let (mut group, _) = create_test_group().await;
         let delta = create_test_delta();
 
         // Encrypt at epoch 0
@@ -363,9 +369,9 @@ mod tests {
         assert_ne!(encrypted1.epoch(), encrypted2.epoch());
     }
 
-    #[test]
-    fn test_empty_delta_encryption() {
-        let (group, _) = create_test_group();
+    #[tokio::test]
+    async fn test_empty_delta_encryption() {
+        let (group, _) = create_test_group().await;
         let delta = TaskListDelta::new(1); // Empty delta
 
         let encrypted =
@@ -379,9 +385,9 @@ mod tests {
         assert!(decrypted.added_tasks.is_empty());
     }
 
-    #[test]
-    fn test_large_delta_encryption() {
-        let (group, _) = create_test_group();
+    #[tokio::test]
+    async fn test_large_delta_encryption() {
+        let (group, _) = create_test_group().await;
         let mut delta = TaskListDelta::new(1);
 
         let identity = Identity::generate().expect("identity generation failed");
@@ -417,9 +423,9 @@ mod tests {
         assert_eq!(decrypted.added_tasks.len(), 100);
     }
 
-    #[test]
-    fn test_encrypted_delta_serialization() {
-        let (group, _) = create_test_group();
+    #[tokio::test]
+    async fn test_encrypted_delta_serialization() {
+        let (group, _) = create_test_group().await;
         let delta = create_test_delta();
 
         let encrypted =
@@ -435,9 +441,9 @@ mod tests {
         assert_eq!(deserialized.ciphertext(), encrypted.ciphertext());
     }
 
-    #[test]
-    fn test_aad_includes_group_and_epoch() {
-        let (group, _) = create_test_group();
+    #[tokio::test]
+    async fn test_aad_includes_group_and_epoch() {
+        let (group, _) = create_test_group().await;
         let delta = create_test_delta();
 
         let encrypted =

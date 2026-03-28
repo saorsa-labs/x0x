@@ -168,12 +168,12 @@ mod tests {
         AgentId(bytes)
     }
 
-    #[test]
-    fn test_key_derivation_from_group() {
+    #[tokio::test]
+    async fn test_key_derivation_from_group() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let group = MlsGroup::new(group_id, initiator).unwrap();
+        let group = MlsGroup::new(group_id, initiator).await.unwrap();
         let schedule = MlsKeySchedule::from_group(&group);
 
         assert!(schedule.is_ok());
@@ -185,12 +185,12 @@ mod tests {
         assert_eq!(schedule.epoch(), 0);
     }
 
-    #[test]
-    fn test_key_derivation_is_deterministic() {
+    #[tokio::test]
+    async fn test_key_derivation_is_deterministic() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let group = MlsGroup::new(group_id, initiator).unwrap();
+        let group = MlsGroup::new(group_id, initiator).await.unwrap();
 
         // Derive keys twice
         let schedule1 = MlsKeySchedule::from_group(&group).unwrap();
@@ -203,12 +203,12 @@ mod tests {
         assert_eq!(schedule1.psk_id_hash(), schedule2.psk_id_hash());
     }
 
-    #[test]
-    fn test_different_epochs_produce_different_keys() {
+    #[tokio::test]
+    async fn test_different_epochs_produce_different_keys() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let mut group = MlsGroup::new(group_id, initiator).unwrap();
+        let mut group = MlsGroup::new(group_id, initiator).await.unwrap();
 
         // Get keys at epoch 0
         let schedule_epoch0 = MlsKeySchedule::from_group(&group).unwrap();
@@ -231,12 +231,12 @@ mod tests {
         assert_ne!(schedule_epoch0.epoch(), schedule_epoch1.epoch());
     }
 
-    #[test]
-    fn test_nonce_derivation_is_deterministic() {
+    #[tokio::test]
+    async fn test_nonce_derivation_is_deterministic() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let group = MlsGroup::new(group_id, initiator).unwrap();
+        let group = MlsGroup::new(group_id, initiator).await.unwrap();
         let schedule = MlsKeySchedule::from_group(&group).unwrap();
 
         let counter = 42;
@@ -247,12 +247,12 @@ mod tests {
         assert_eq!(nonce1.len(), 12);
     }
 
-    #[test]
-    fn test_nonce_unique_per_counter() {
+    #[tokio::test]
+    async fn test_nonce_unique_per_counter() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let group = MlsGroup::new(group_id, initiator).unwrap();
+        let group = MlsGroup::new(group_id, initiator).await.unwrap();
         let schedule = MlsKeySchedule::from_group(&group).unwrap();
 
         let nonce0 = schedule.derive_nonce(0);
@@ -270,12 +270,12 @@ mod tests {
         assert_eq!(nonce100.len(), 12);
     }
 
-    #[test]
-    fn test_nonce_xor_with_counter() {
+    #[tokio::test]
+    async fn test_nonce_xor_with_counter() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let group = MlsGroup::new(group_id, initiator).unwrap();
+        let group = MlsGroup::new(group_id, initiator).await.unwrap();
         let schedule = MlsKeySchedule::from_group(&group).unwrap();
 
         let base = schedule.base_nonce();
@@ -289,12 +289,12 @@ mod tests {
         assert_ne!(base, nonce1.as_slice());
     }
 
-    #[test]
-    fn test_different_groups_produce_different_keys() {
+    #[tokio::test]
+    async fn test_different_groups_produce_different_keys() {
         let initiator = test_agent_id(1);
 
-        let group1 = MlsGroup::new(b"group-1".to_vec(), initiator).unwrap();
-        let group2 = MlsGroup::new(b"group-2".to_vec(), initiator).unwrap();
+        let group1 = MlsGroup::new(b"group-1".to_vec(), initiator).await.unwrap();
+        let group2 = MlsGroup::new(b"group-2".to_vec(), initiator).await.unwrap();
 
         let schedule1 = MlsKeySchedule::from_group(&group1).unwrap();
         let schedule2 = MlsKeySchedule::from_group(&group2).unwrap();
@@ -305,12 +305,12 @@ mod tests {
         assert_ne!(schedule1.psk_id_hash(), schedule2.psk_id_hash());
     }
 
-    #[test]
-    fn test_key_schedule_accessors() {
+    #[tokio::test]
+    async fn test_key_schedule_accessors() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let group = MlsGroup::new(group_id, initiator).unwrap();
+        let group = MlsGroup::new(group_id, initiator).await.unwrap();
         let schedule = MlsKeySchedule::from_group(&group).unwrap();
 
         // Verify all accessors work
@@ -321,12 +321,12 @@ mod tests {
         assert!(!schedule.secret().is_empty());
     }
 
-    #[test]
-    fn test_key_schedule_clone() {
+    #[tokio::test]
+    async fn test_key_schedule_clone() {
         let group_id = b"test-group".to_vec();
         let initiator = test_agent_id(1);
 
-        let group = MlsGroup::new(group_id, initiator).unwrap();
+        let group = MlsGroup::new(group_id, initiator).await.unwrap();
         let schedule1 = MlsKeySchedule::from_group(&group).unwrap();
         let schedule2 = schedule1.clone();
 

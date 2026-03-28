@@ -284,6 +284,7 @@ struct AppState {
     named_groups_path: PathBuf,
     contacts: Arc<RwLock<ContactStore>>,
     mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
+    #[allow(dead_code)]
     mls_groups_path: PathBuf,
     /// Active WebSocket sessions.
     ws_sessions: RwLock<HashMap<String, WsSession>>,
@@ -862,28 +863,9 @@ async fn main() -> Result<()> {
         config.data_dir.join("contacts.json").display()
     );
 
-    // Load MLS groups from disk (if any)
+    // MLS groups are session-scoped (saorsa-mls groups are not serializable)
     let mls_groups_path = config.data_dir.join("mls_groups.bin");
-    let mls_groups = match tokio::fs::read(&mls_groups_path).await {
-        Ok(bytes) => match bincode::deserialize::<HashMap<String, x0x::mls::MlsGroup>>(&bytes) {
-            Ok(groups) => {
-                tracing::info!(
-                    "Loaded {} MLS groups from {}",
-                    groups.len(),
-                    mls_groups_path.display()
-                );
-                groups
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse MLS groups file, starting fresh: {e}");
-                HashMap::new()
-            }
-        },
-        Err(_) => {
-            tracing::info!("No MLS groups file found, starting fresh");
-            HashMap::new()
-        }
-    };
+    let mls_groups: HashMap<String, x0x::mls::MlsGroup> = HashMap::new();
 
     // Load named groups from disk (if any)
     let named_groups_path = config.data_dir.join("named_groups.json");
@@ -3348,7 +3330,7 @@ async fn create_named_group(
     let agent_id = state.agent.agent_id();
 
     // Create MLS group
-    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id) {
+    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id).await {
         Ok(group) => {
             // Create group metadata
             let mut info = x0x::groups::GroupInfo::new(
@@ -3563,7 +3545,7 @@ async fn join_group_via_invite(
         }
     };
 
-    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id) {
+    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id).await {
         Ok(group) => {
             // Store MLS group
             state
@@ -4284,7 +4266,7 @@ async fn create_mls_group(
     let agent_id = state.agent.agent_id();
     let group_id_hex = hex::encode(&group_id_bytes);
 
-    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id) {
+    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id).await {
         Ok(group) => {
             let epoch = group.current_epoch();
             let members: Vec<String> = group
@@ -4394,7 +4376,7 @@ async fn add_mls_member(
         );
     };
 
-    match group.add_member(agent_id) {
+    match group.add_member(agent_id).await {
         Ok(commit) => match group.apply_commit(&commit) {
             Ok(()) => {
                 let resp = (
@@ -4450,7 +4432,7 @@ async fn remove_mls_member(
         );
     };
 
-    match group.remove_member(agent_id) {
+    match group.remove_member(agent_id).await {
         Ok(commit) => match group.apply_commit(&commit) {
             Ok(()) => {
                 let resp = (
@@ -5337,17 +5319,10 @@ async fn handle_ws_command(
 // Shared helpers for new endpoints
 // ---------------------------------------------------------------------------
 
-/// Persist MLS groups to disk (bincode format — handles non-string map keys).
-async fn save_mls_groups(state: &AppState) {
-    let groups = state.mls_groups.read().await;
-    match bincode::serialize(&*groups) {
-        Ok(bytes) => {
-            if let Err(e) = tokio::fs::write(&state.mls_groups_path, bytes).await {
-                tracing::error!("Failed to save MLS groups: {e}");
-            }
-        }
-        Err(e) => tracing::error!("Failed to serialize MLS groups: {e}"),
-    }
+/// MLS groups are session-scoped — no persistence (saorsa-mls groups not serializable).
+async fn save_mls_groups(_state: &AppState) {
+    // MLS groups backed by saorsa-mls are not serializable.
+    // They are recreated each session.
 }
 
 async fn save_named_groups(state: &AppState) {
