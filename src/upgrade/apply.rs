@@ -11,7 +11,7 @@ use super::{UpgradeError, UpgradeResult, Upgrader};
 
 /// Auto-apply upgrader that handles the full download → verify → extract → replace → restart flow.
 pub struct AutoApplyUpgrader {
-    /// Which binary to extract from the archive ("x0xd" or "x0x-bootstrap").
+    /// Which binary to extract from the archive (e.g. "x0xd", "x0x").
     binary_name: String,
     /// Exit cleanly for service manager restart instead of spawning new process.
     stop_on_upgrade: bool,
@@ -281,7 +281,7 @@ async fn download_to_file(url: &str, destination: &Path) -> Result<(), UpgradeEr
 }
 
 /// Extract a binary from an archive (tar.gz or zip, detected by magic bytes).
-fn extract_binary_from_archive(
+pub fn extract_binary_from_archive(
     archive_path: &Path,
     output_path: &Path,
     binary_name: &str,
@@ -466,12 +466,12 @@ mod tests {
     #[test]
     fn test_extract_nested_path() {
         let dir = TempDir::new().unwrap();
-        // create_test_tar_gz puts it at x0x-linux-x64-gnu/x0xd
-        let archive = create_test_tar_gz(dir.path(), "x0x-bootstrap", b"bootstrap binary");
+        // create_test_tar_gz puts it at x0x-linux-x64-gnu/x0x
+        let archive = create_test_tar_gz(dir.path(), "x0x", b"cli binary");
         let output = dir.path().join("extracted");
 
-        extract_binary_from_archive(&archive, &output, "x0x-bootstrap").unwrap();
-        assert_eq!(std::fs::read(&output).unwrap(), b"bootstrap binary");
+        extract_binary_from_archive(&archive, &output, "x0x").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"cli binary");
     }
 
     #[test]

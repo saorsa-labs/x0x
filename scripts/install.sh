@@ -105,6 +105,12 @@ for bin in x0xd x0x; do
 done
 echo "Installed:$INSTALLED"
 
+# Clean up stale x0x-bootstrap binary (removed in v0.8.0)
+if [ -f "$BIN/x0x-bootstrap" ]; then
+    rm -f "$BIN/x0x-bootstrap"
+    echo "Removed stale x0x-bootstrap (no longer needed since v0.8.0)"
+fi
+
 # Check PATH
 case ":$PATH:" in
     *":$BIN:"*) ;;

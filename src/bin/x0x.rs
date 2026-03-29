@@ -158,9 +158,15 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<TasksSub>,
     },
-    /// Check for upgrades.
-    /// Check for updates and upgrade.
-    Upgrade,
+    /// Check for updates and upgrade (no daemon needed).
+    Upgrade {
+        /// Just check for updates, don't apply.
+        #[arg(long)]
+        check: bool,
+        /// Skip version comparison, download and install latest.
+        #[arg(long)]
+        force: bool,
+    },
     /// WebSocket session info. [dev]
     #[command(hide = true)]
     Ws {
@@ -661,6 +667,9 @@ async fn run(
         Commands::Constitution { raw, json } => {
             return commands::constitution::display(*raw, *json);
         }
+        Commands::Upgrade { check, force } => {
+            return commands::upgrade::run(*check, *force).await;
+        }
         Commands::Instances => return commands::daemon::instances().await,
         Commands::Start { config, foreground } => {
             return commands::daemon::start(name, config.as_deref(), *foreground).await;
@@ -927,7 +936,7 @@ async fn run(
                 commands::tasks::update(&client, &list_id, &task_id, "complete").await
             }
         },
-        Commands::Upgrade => commands::upgrade::check(&client).await,
+        Commands::Upgrade { .. } => unreachable!(),
         Commands::Ws { sub } => match sub {
             WsSub::Sessions => commands::ws::sessions(&client).await,
         },
@@ -1069,7 +1078,9 @@ x0x (v{VERSION})
 |
 +-- System
     +-- constitution       Display the x0x Constitution
-    +-- upgrade            Check for updates
+    +-- upgrade            Check for updates and upgrade (no daemon needed)
+    |   +-- --check        Just check, don't apply
+    |   +-- --force        Force reinstall latest version
     +-- gui                Open embedded web GUI
     +-- routes             Print all 70 REST API routes
     +-- tree               This command tree

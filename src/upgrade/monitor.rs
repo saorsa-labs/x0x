@@ -43,7 +43,6 @@ pub struct VerifiedRelease {
 
 /// Monitors GitHub releases for updates.
 ///
-/// Primary update mechanism for x0x-bootstrap (1h poll).
 /// Fallback mechanism for x0xd (startup check + 48h poll).
 pub struct UpgradeMonitor {
     repo: String,
@@ -57,7 +56,7 @@ impl UpgradeMonitor {
     ///
     /// # Arguments
     /// * `repo` - GitHub repo in "owner/repo" format (e.g. "saorsa-labs/x0x")
-    /// * `binary_name` - Name of the binary to extract from archives ("x0xd" or "x0x-bootstrap")
+    /// * `binary_name` - Name of the binary to extract from archives (e.g. "x0xd", "x0x")
     /// * `current_version` - The currently running version string
     pub fn new(repo: &str, binary_name: &str, current_version: &str) -> Result<Self, String> {
         let version =

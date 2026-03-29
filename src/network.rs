@@ -63,7 +63,7 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Default bootstrap nodes for the x0x network.
 ///
-/// These are Saorsa Labs VPS nodes running x0x-bootstrap with coordinator/reflector
+/// These are Saorsa Labs VPS nodes running x0xd with coordinator/reflector
 /// roles. They form a globally distributed mesh providing bootstrap, NAT traversal,
 /// and rendezvous services.
 ///
