@@ -2526,6 +2526,37 @@ async fn import_agent_card(
 
     state.contacts.write().await.add(contact);
 
+    // Also populate the identity discovery cache so connect_to_agent / send_direct
+    // can find this agent without waiting for gossip announcements.
+    let machine_id_bytes: [u8; 32] = hex::decode(&card.machine_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .unwrap_or([0u8; 32]);
+    let addresses: Vec<std::net::SocketAddr> = card
+        .addresses
+        .iter()
+        .filter_map(|a| a.parse().ok())
+        .collect();
+
+    if machine_id_bytes != [0u8; 32] || !addresses.is_empty() {
+        state
+            .agent
+            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+                agent_id,
+                machine_id: x0x::identity::MachineId(machine_id_bytes),
+                user_id: None,
+                addresses,
+                announced_at: now,
+                last_seen: now,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+            })
+            .await;
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({

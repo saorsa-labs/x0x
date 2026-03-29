@@ -797,15 +797,25 @@ impl Agent {
         if info.likely_direct() {
             for addr in &info.addresses {
                 match network.connect_addr(*addr).await {
-                    Ok(_peer_id) => {
+                    Ok(connected_peer_id) => {
+                        // Use the real PeerId from the QUIC handshake (may differ
+                        // from a zeroed placeholder in the discovery cache).
+                        let real_machine_id = identity::MachineId(connected_peer_id.0);
                         // Enrich bootstrap cache with this successful address
                         if let Some(ref bc) = self.bootstrap_cache {
-                            let peer_id = ant_quic::PeerId(agent.machine_id.0);
-                            bc.add_from_connection(peer_id, vec![*addr], None).await;
+                            bc.add_from_connection(connected_peer_id, vec![*addr], None)
+                                .await;
+                        }
+                        // Update discovery cache with real machine_id
+                        {
+                            let mut cache = self.identity_discovery_cache.write().await;
+                            if let Some(entry) = cache.get_mut(agent_id) {
+                                entry.machine_id = real_machine_id;
+                            }
                         }
                         // Register agent mapping for direct messaging
                         self.direct_messaging
-                            .mark_connected(agent.agent_id, agent.machine_id)
+                            .mark_connected(agent.agent_id, real_machine_id)
                             .await;
                         return Ok(connectivity::ConnectOutcome::Direct(*addr));
                     }
@@ -821,14 +831,22 @@ impl Agent {
         if info.needs_coordination() || !info.likely_direct() {
             for addr in &info.addresses {
                 match network.connect_addr(*addr).await {
-                    Ok(_peer_id) => {
+                    Ok(connected_peer_id) => {
+                        let real_machine_id = identity::MachineId(connected_peer_id.0);
                         if let Some(ref bc) = self.bootstrap_cache {
-                            let peer_id = ant_quic::PeerId(agent.machine_id.0);
-                            bc.add_from_connection(peer_id, vec![*addr], None).await;
+                            bc.add_from_connection(connected_peer_id, vec![*addr], None)
+                                .await;
+                        }
+                        // Update discovery cache with real machine_id
+                        {
+                            let mut cache = self.identity_discovery_cache.write().await;
+                            if let Some(entry) = cache.get_mut(agent_id) {
+                                entry.machine_id = real_machine_id;
+                            }
                         }
                         // Register agent mapping for direct messaging
                         self.direct_messaging
-                            .mark_connected(agent.agent_id, agent.machine_id)
+                            .mark_connected(agent.agent_id, real_machine_id)
                             .await;
                         return Ok(connectivity::ConnectOutcome::Coordinated(*addr));
                     }
@@ -898,17 +916,28 @@ impl Agent {
         // Look up machine_id from discovery cache, falling back to DirectMessaging registry
         let cached_machine_id = {
             let cache = self.identity_discovery_cache.read().await;
-            cache.get(agent_id).map(|d| d.machine_id)
+            cache
+                .get(agent_id)
+                .map(|d| d.machine_id)
+                .filter(|m| m.0 != [0u8; 32]) // Ignore placeholder zeroed IDs
         };
         let machine_id = match cached_machine_id {
             Some(id) => id,
             None => {
                 // Fallback: check DirectMessaging agent→machine registry
-                // (populated when we receive direct messages from this agent)
-                self.direct_messaging
-                    .get_machine_id(agent_id)
-                    .await
-                    .ok_or(error::NetworkError::AgentNotFound(agent_id.0))?
+                // (populated when we receive direct messages or after connect_to_agent)
+                match self.direct_messaging.get_machine_id(agent_id).await {
+                    Some(id) => id,
+                    None => {
+                        // Last resort: try connect_to_agent which may discover the
+                        // machine_id via QUIC handshake and update the cache.
+                        let _ = self.connect_to_agent(agent_id).await;
+                        self.direct_messaging
+                            .get_machine_id(agent_id)
+                            .await
+                            .ok_or(error::NetworkError::AgentNotFound(agent_id.0))?
+                    }
+                }
             }
         };
 
@@ -1968,7 +1997,28 @@ impl Agent {
         }
 
         // Stage 3: rendezvous shard subscription — wait up to 5 s.
+        // Cache the result so subsequent connect_to_agent / send_direct can find it.
         if let Some(addrs) = self.find_agent_rendezvous(agent_id, 5).await? {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            cache
+                .write()
+                .await
+                .entry(agent_id)
+                .or_insert_with(|| DiscoveredAgent {
+                    agent_id,
+                    machine_id: identity::MachineId([0u8; 32]),
+                    user_id: None,
+                    addresses: addrs.clone(),
+                    announced_at: now,
+                    last_seen: now,
+                    machine_public_key: Vec::new(),
+                    nat_type: None,
+                    can_receive_direct: None,
+                    is_relay: None,
+                    is_coordinator: None,
+                });
             return Ok(Some(addrs));
         }
 
