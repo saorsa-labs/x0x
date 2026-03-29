@@ -850,9 +850,42 @@ impl Agent {
             }
         }
 
-        // 3. If direct failed and coordination may help, try remaining addresses
+        // 3. If direct failed and coordination may help, ensure a coordinator is
+        //    connected first (gives ant-quic a relay path), then retry addresses.
         //    The network layer handles NAT traversal internally via QUIC extension frames.
         if info.needs_coordination() || !info.likely_direct() {
+            // Pre-connect to a coordinator so ant-quic has a relay/rendezvous path.
+            // Uses ant-quic's quality-scored bootstrap cache for coordinator selection.
+            if let Some(ref adapter) = self.gossip_cache_adapter {
+                let coordinators = adapter.select_coordinators(3).await;
+                for (cached_peer, _advert) in &coordinators {
+                    for addr in &cached_peer.addresses {
+                        if network.connect_addr(*addr).await.is_ok() {
+                            tracing::debug!(
+                                peer = ?cached_peer.peer_id,
+                                addr = %addr,
+                                "Connected to coordinator for NAT coordination"
+                            );
+                            break;
+                        }
+                    }
+                }
+            } else if let Some(ref cache) = self.bootstrap_cache {
+                // Fallback: use ant-quic's bootstrap cache directly
+                let coordinators = cache.select_coordinators(3).await;
+                for cached_peer in &coordinators {
+                    for addr in &cached_peer.addresses {
+                        if network.connect_addr(*addr).await.is_ok() {
+                            tracing::debug!(
+                                addr = %addr,
+                                "Connected to cached coordinator for NAT coordination"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+
             for addr in &info.addresses {
                 match network.connect_addr(*addr).await {
                     Ok(connected_peer_id) => {
@@ -1663,18 +1696,19 @@ impl Agent {
         let mut all_connected: Vec<std::net::SocketAddr> = Vec::new();
 
         // Phase 0: Try coordinator cache (seedless bootstrap via gossip-discovered coordinators).
+        // Uses ant-quic's quality-scored bootstrap cache for coordinator selection.
         if let Some(ref adapter) = self.gossip_cache_adapter {
-            let coordinator_addrs: Vec<std::net::SocketAddr> = adapter
-                .get_all_adverts()
-                .into_iter()
-                .flat_map(|advert| advert.addr_hints.into_iter().map(|h| h.addr))
+            let coordinators = adapter.select_coordinators(6).await;
+            let coordinator_addrs: Vec<std::net::SocketAddr> = coordinators
+                .iter()
+                .flat_map(|(peer, _advert)| peer.addresses.clone())
                 .collect();
 
             if !coordinator_addrs.is_empty() {
                 tracing::info!(
-                    "Phase 0: Trying {} addresses from {} cached coordinator adverts",
+                    "Phase 0: Trying {} addresses from {} quality-scored coordinators",
                     coordinator_addrs.len(),
-                    adapter.advert_count()
+                    coordinators.len()
                 );
                 let (succeeded, _failed) = self
                     .connect_peers_parallel_tracked(network, &coordinator_addrs)
@@ -1685,6 +1719,24 @@ impl Agent {
                     succeeded.len(),
                     coordinator_addrs.len()
                 );
+            } else {
+                // Fallback: try raw adverts if bootstrap cache has no coordinator-tagged peers
+                let advert_addrs: Vec<std::net::SocketAddr> = adapter
+                    .get_all_adverts()
+                    .into_iter()
+                    .flat_map(|advert| advert.addr_hints.into_iter().map(|h| h.addr))
+                    .collect();
+                if !advert_addrs.is_empty() {
+                    tracing::info!(
+                        "Phase 0: Trying {} addresses from {} gossip adverts (fallback)",
+                        advert_addrs.len(),
+                        adapter.advert_count()
+                    );
+                    let (succeeded, _failed) = self
+                        .connect_peers_parallel_tracked(network, &advert_addrs)
+                        .await;
+                    all_connected.extend(&succeeded);
+                }
             }
         }
 
