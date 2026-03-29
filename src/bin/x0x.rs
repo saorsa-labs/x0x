@@ -239,9 +239,8 @@ enum AgentSub {
     UserId,
     /// Generate a shareable identity card.
     Card {
-        /// Your display name.
-        #[arg(long)]
-        name: Option<String>,
+        /// Your display name (e.g. "David").
+        display_name: Option<String>,
         /// Include group invite links in the card.
         #[arg(long)]
         include_groups: bool,
@@ -730,9 +729,9 @@ async fn run(
             None => commands::identity::agent(&client).await,
             Some(AgentSub::UserId) => commands::identity::user_id(&client).await,
             Some(AgentSub::Card {
-                name,
+                display_name,
                 include_groups,
-            }) => commands::identity::card(&client, name.as_deref(), include_groups).await,
+            }) => commands::identity::card(&client, display_name.as_deref(), include_groups).await,
             Some(AgentSub::Import { card, trust }) => {
                 commands::identity::import_card(&client, &card, Some(trust.as_str())).await
             }
