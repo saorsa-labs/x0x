@@ -4372,29 +4372,22 @@ async fn add_mls_member(
         );
     };
 
+    // add_member() auto-applies the commit internally (increments epoch).
+    // Do NOT call apply_commit() again — it would fail with epoch mismatch.
     match group.add_member(agent_id).await {
-        Ok(commit) => match group.apply_commit(&commit) {
-            Ok(()) => {
-                let resp = (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "ok": true,
-                        "epoch": group.current_epoch(),
-                        "member_count": group.members().len()
-                    })),
-                );
-                drop(groups);
-                save_mls_groups(&state).await;
-                resp
-            }
-            Err(e) => {
-                tracing::error!("apply commit: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": "operation failed" })),
-                )
-            }
-        },
+        Ok(_commit) => {
+            let resp = (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "epoch": group.current_epoch(),
+                    "member_count": group.members().len()
+                })),
+            );
+            drop(groups);
+            save_mls_groups(&state).await;
+            resp
+        }
         Err(e) => {
             tracing::error!("add_mls_member failed: {e}");
             (
@@ -4428,29 +4421,21 @@ async fn remove_mls_member(
         );
     };
 
+    // remove_member() auto-applies the commit internally.
     match group.remove_member(agent_id).await {
-        Ok(commit) => match group.apply_commit(&commit) {
-            Ok(()) => {
-                let resp = (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "ok": true,
-                        "epoch": group.current_epoch(),
-                        "member_count": group.members().len()
-                    })),
-                );
-                drop(groups);
-                save_mls_groups(&state).await;
-                resp
-            }
-            Err(e) => {
-                tracing::error!("apply commit: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": "operation failed" })),
-                )
-            }
-        },
+        Ok(_commit) => {
+            let resp = (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "epoch": group.current_epoch(),
+                    "member_count": group.members().len()
+                })),
+            );
+            drop(groups);
+            save_mls_groups(&state).await;
+            resp
+        }
         Err(e) => {
             tracing::error!("remove_mls_member failed: {e}");
             (
