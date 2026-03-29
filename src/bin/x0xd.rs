@@ -1104,10 +1104,6 @@ async fn main() -> Result<()> {
         .route("/contacts/:agent_id/revoke", post(revoke_contact))
         .route("/contacts/:agent_id/revocations", get(list_revocations))
         .route(
-            "/contacts/:agent_id/machines",
-            get(list_machines).post(add_machine),
-        )
-        .route(
             "/contacts/:agent_id/machines/:machine_id/pin",
             post(pin_machine).delete(unpin_machine),
         )
