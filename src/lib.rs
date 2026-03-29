@@ -116,6 +116,9 @@ pub mod upgrade;
 /// File transfer protocol types and state management.
 pub mod files;
 
+/// The x0x Constitution for Intelligent Entities — embedded at compile time.
+pub mod constitution;
+
 /// Shared API endpoint registry consumed by both x0xd and the x0x CLI.
 pub mod api;
 

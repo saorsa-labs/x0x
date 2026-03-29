@@ -551,6 +551,21 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Reject incoming transfer",
         category: "files",
     },
+    // ── Constitution ──────────────────────────────────────────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/constitution",
+        cli_name: "constitution",
+        description: "Display the x0x Constitution (Markdown)",
+        category: "status",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/constitution/json",
+        cli_name: "constitution --json",
+        description: "Constitution with version metadata (JSON)",
+        category: "status",
+    },
     // ── Upgrade ─────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

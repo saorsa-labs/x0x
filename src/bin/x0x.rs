@@ -178,6 +178,15 @@ enum Commands {
     Uninstall,
     /// Remove ALL x0x data, keys, and configuration. DESTRUCTIVE.
     Purge,
+    /// Display the x0x Constitution for Intelligent Entities.
+    Constitution {
+        /// Output raw markdown instead of prettified text.
+        #[arg(long)]
+        raw: bool,
+        /// Output as JSON (version, status, content).
+        #[arg(long)]
+        json: bool,
+    },
     /// Send a file to an agent.
     SendFile {
         /// Target agent ID (hex).
@@ -649,6 +658,9 @@ async fn run(
         Commands::Tree => return print_command_tree(),
         Commands::Uninstall => return uninstall().await,
         Commands::Purge => return purge().await,
+        Commands::Constitution { raw, json } => {
+            return commands::constitution::display(*raw, *json);
+        }
         Commands::Instances => return commands::daemon::instances().await,
         Commands::Start { config, foreground } => {
             return commands::daemon::start(name, config.as_deref(), *foreground).await;
@@ -946,6 +958,7 @@ async fn run(
         | Commands::Tree
         | Commands::Uninstall
         | Commands::Purge
+        | Commands::Constitution { .. }
         | Commands::Start { .. }
         | Commands::Instances
         | Commands::Autostart { .. } => unreachable!(),
@@ -1055,6 +1068,7 @@ x0x (v{VERSION})
 |   +-- reject-file        Reject incoming transfer
 |
 +-- System
+    +-- constitution       Display the x0x Constitution
     +-- upgrade            Check for updates
     +-- gui                Open embedded web GUI
     +-- routes             Print all 70 REST API routes

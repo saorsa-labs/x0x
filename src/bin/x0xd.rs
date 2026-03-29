@@ -1126,6 +1126,9 @@ async fn main() -> Result<()> {
         .route("/files/transfers/:id", get(file_transfer_status_handler))
         .route("/files/accept/:id", post(file_accept_handler))
         .route("/files/reject/:id", post(file_reject_handler))
+        // Constitution
+        .route("/constitution", get(get_constitution))
+        .route("/constitution/json", get(get_constitution_json))
         // Embedded GUI
         .route("/gui", get(serve_gui))
         .route("/gui/", get(serve_gui))
@@ -1222,8 +1225,8 @@ async fn auth_middleware(
 
     let path = req.uri().path();
 
-    // Exempt: health check and GUI serving
-    if path == "/health" || path == "/gui" || path == "/gui/" {
+    // Exempt: health check, GUI serving, and constitution
+    if path == "/health" || path == "/gui" || path == "/gui/" || path.starts_with("/constitution") {
         return next.run(req).await;
     }
 
@@ -4908,6 +4911,28 @@ async fn create_mls_welcome(
             )
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Constitution handlers
+// ---------------------------------------------------------------------------
+
+/// GET /constitution — returns the raw markdown text.
+async fn get_constitution() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/markdown; charset=utf-8")],
+        x0x::constitution::CONSTITUTION_MD,
+    )
+}
+
+/// GET /constitution/json — returns structured JSON with version metadata.
+async fn get_constitution_json() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "version": x0x::constitution::CONSTITUTION_VERSION,
+        "status": x0x::constitution::CONSTITUTION_STATUS,
+        "content": x0x::constitution::CONSTITUTION_MD,
+    }))
 }
 
 // ---------------------------------------------------------------------------
