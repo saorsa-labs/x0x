@@ -961,6 +961,15 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Coordinator advert subscriber — listens for adverts from peers
+    // and stores them in the gossip cache for seedless bootstrap.
+    {
+        let coord_sub_agent = Arc::clone(&state.agent);
+        tokio::spawn(async move {
+            run_coordinator_subscriber(coord_sub_agent).await;
+        });
+    }
+
     // Gossip-based release subscription (primary update mechanism)
     if config.update.enabled && config.update.gossip_updates {
         let update_config = config.update.clone();
@@ -6193,4 +6202,49 @@ async fn publish_coordinator_advert_if_eligible(
 
     tracing::info!("Published coordinator advert to gossip");
     Ok(())
+}
+
+/// Subscribes to the coordinator gossip topic and stores received adverts.
+async fn run_coordinator_subscriber(agent: std::sync::Arc<x0x::Agent>) {
+    // Wait for gossip to be ready
+    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+
+    let topic = coordinator_topic_string();
+
+    let mut rx = match agent.subscribe(&topic).await {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::warn!("Failed to subscribe to coordinator topic: {e}");
+            return;
+        }
+    };
+
+    tracing::info!("Subscribed to coordinator gossip topic");
+
+    while let Some(msg) = rx.recv().await {
+        match saorsa_gossip_coordinator::CoordinatorAdvert::from_bytes(&msg.payload) {
+            Ok(advert) => {
+                if !advert.is_valid() {
+                    tracing::debug!("Ignoring expired coordinator advert from {:?}", advert.peer);
+                    continue;
+                }
+
+                let peer_id = advert.peer;
+
+                // Store in local cache
+                if let Some(adapter) = agent.gossip_cache_adapter() {
+                    if adapter.insert_advert(advert).await {
+                        tracing::info!(
+                            peer = ?peer_id,
+                            "Stored coordinator advert ({} total)",
+                            adapter.advert_count()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Failed to decode coordinator advert: {e}");
+            }
+        }
+    }
 }
