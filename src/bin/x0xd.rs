@@ -6113,23 +6113,36 @@ async fn handle_file_complete(
 }
 
 // ---------------------------------------------------------------------------
-// Coordinator advert publisher
+// Coordinator protocol (adverts, FOAF discovery, seedless bootstrap)
 // ---------------------------------------------------------------------------
 
-/// Well-known gossip topic for coordinator adverts.
-/// Hex-encoded BLAKE3("saorsa-coordinator-topic") — matches saorsa_gossip_coordinator::coordinator_topic().
+/// Well-known gossip topic for coordinator messages (adverts + FOAF queries/responses).
+/// Hex-encoded BLAKE3("saorsa-coordinator-topic").
 fn coordinator_topic_string() -> String {
     let hash = blake3::hash(b"saorsa-coordinator-topic");
     hex::encode(hash.as_bytes())
 }
 
-/// Periodically publishes coordinator adverts if this node is acting as a coordinator.
+/// Message type tags for the coordinator topic wire format.
+/// First byte of payload discriminates message type.
+const COORD_TAG_ADVERT: u8 = 0x01;
+const COORD_TAG_QUERY: u8 = 0x02;
+const COORD_TAG_RESPONSE: u8 = 0x03;
+
+/// Encode a coordinator message with a type tag prefix.
+fn encode_coord_message(tag: u8, cbor_data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + cbor_data.len());
+    buf.push(tag);
+    buf.extend_from_slice(cbor_data);
+    buf
+}
+
+/// Periodically publishes coordinator adverts if this node is eligible.
 async fn run_coordinator_publisher(agent: std::sync::Arc<x0x::Agent>) {
-    // Wait for network to stabilize before checking coordinator status
     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
     let topic = coordinator_topic_string();
-    let interval = std::time::Duration::from_secs(300); // 5 minutes
+    let interval = std::time::Duration::from_secs(300);
 
     loop {
         if let Err(e) = publish_coordinator_advert_if_eligible(&agent, &topic).await {
@@ -6139,7 +6152,7 @@ async fn run_coordinator_publisher(agent: std::sync::Arc<x0x::Agent>) {
     }
 }
 
-/// Publish a coordinator advert if this node is coordinating.
+/// Publish a coordinator advert if this node is coordinating or has a public IP.
 async fn publish_coordinator_advert_if_eligible(
     agent: &x0x::Agent,
     topic: &str,
@@ -6147,13 +6160,11 @@ async fn publish_coordinator_advert_if_eligible(
     let network = agent.network().ok_or("no network")?;
     let status = network.node_status().await.ok_or("no node status")?;
 
-    // Only publish if we're coordinating or have a public IP (VPS nodes)
     if !status.is_coordinating && !status.has_public_ip {
         return Err("not a coordinator and no public IP".into());
     }
 
-    let machine_id = agent.machine_id();
-    let peer_id = saorsa_gossip_types::PeerId::new(machine_id.0);
+    let peer_id = saorsa_gossip_types::PeerId::new(agent.machine_id().0);
 
     let roles = saorsa_gossip_coordinator::CoordinatorRoles {
         coordinator: status.is_coordinating || status.has_public_ip,
@@ -6181,21 +6192,19 @@ async fn publish_coordinator_advert_if_eligible(
     };
 
     let advert = saorsa_gossip_coordinator::CoordinatorAdvert::new(
-        peer_id, roles, addr_hints, nat_class, 600_000, // 10 minute validity
+        peer_id, roles, addr_hints, nat_class, 600_000,
     );
 
-    // Serialize to CBOR for gossip transport
-    let payload = advert
+    let cbor = advert
         .to_bytes()
         .map_err(|e| format!("serialize failed: {e}"))?;
+    let payload = encode_coord_message(COORD_TAG_ADVERT, &cbor);
 
-    // Publish to gossip network
     agent
-        .publish(topic, payload.to_vec())
+        .publish(topic, payload)
         .await
         .map_err(|e| format!("publish failed: {e}"))?;
 
-    // Also insert into local cache
     if let Some(adapter) = agent.gossip_cache_adapter() {
         adapter.insert_advert(advert).await;
     }
@@ -6204,9 +6213,9 @@ async fn publish_coordinator_advert_if_eligible(
     Ok(())
 }
 
-/// Subscribes to the coordinator gossip topic and stores received adverts.
+/// Subscribes to the coordinator topic and handles all message types:
+/// adverts (cache), FOAF queries (respond + forward), FOAF responses (process).
 async fn run_coordinator_subscriber(agent: std::sync::Arc<x0x::Agent>) {
-    // Wait for gossip to be ready
     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
 
     let topic = coordinator_topic_string();
@@ -6221,30 +6230,135 @@ async fn run_coordinator_subscriber(agent: std::sync::Arc<x0x::Agent>) {
 
     tracing::info!("Subscribed to coordinator gossip topic");
 
+    let local_peer_id = saorsa_gossip_types::PeerId::new(agent.machine_id().0);
+    let handler = if let Some(adapter) = agent.gossip_cache_adapter() {
+        saorsa_gossip_coordinator::CoordinatorHandler::with_cache(local_peer_id, adapter.clone())
+    } else {
+        saorsa_gossip_coordinator::CoordinatorHandler::new(local_peer_id)
+    };
+
     while let Some(msg) = rx.recv().await {
-        match saorsa_gossip_coordinator::CoordinatorAdvert::from_bytes(&msg.payload) {
-            Ok(advert) => {
-                if !advert.is_valid() {
-                    tracing::debug!("Ignoring expired coordinator advert from {:?}", advert.peer);
-                    continue;
-                }
+        if msg.payload.is_empty() {
+            continue;
+        }
 
-                let peer_id = advert.peer;
+        let tag = msg.payload[0];
+        let data = &msg.payload[1..];
 
-                // Store in local cache
-                if let Some(adapter) = agent.gossip_cache_adapter() {
-                    if adapter.insert_advert(advert).await {
-                        tracing::info!(
-                            peer = ?peer_id,
-                            "Stored coordinator advert ({} total)",
-                            adapter.advert_count()
-                        );
-                    }
-                }
+        match tag {
+            COORD_TAG_ADVERT => {
+                handle_coord_advert(data, &agent).await;
             }
-            Err(e) => {
-                tracing::debug!("Failed to decode coordinator advert: {e}");
+            COORD_TAG_QUERY => {
+                handle_coord_query(data, &agent, &handler, &topic).await;
+            }
+            COORD_TAG_RESPONSE => {
+                handle_coord_response(data, &agent).await;
+            }
+            _ => {
+                // Backward compat: try parsing as raw advert (pre-envelope format)
+                handle_coord_advert(&msg.payload, &agent).await;
             }
         }
     }
+}
+
+/// Handle a received coordinator advert.
+async fn handle_coord_advert(data: &[u8], agent: &x0x::Agent) {
+    let advert = match saorsa_gossip_coordinator::CoordinatorAdvert::from_bytes(data) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::debug!("Failed to decode coordinator advert: {e}");
+            return;
+        }
+    };
+    if !advert.is_valid() {
+        return;
+    }
+    let peer_id = advert.peer;
+    if let Some(adapter) = agent.gossip_cache_adapter() {
+        if adapter.insert_advert(advert).await {
+            tracing::info!(
+                peer = ?peer_id,
+                "Stored coordinator advert ({} total)",
+                adapter.advert_count()
+            );
+        }
+    }
+}
+
+/// Handle a received FOAF query: respond with known coordinators.
+async fn handle_coord_query(
+    data: &[u8],
+    agent: &x0x::Agent,
+    handler: &saorsa_gossip_coordinator::CoordinatorHandler,
+    topic: &str,
+) {
+    let query: saorsa_gossip_coordinator::FindCoordinatorQuery = match coord_cbor_decode(data) {
+        Some(q) => q,
+        None => {
+            tracing::debug!("Failed to decode FOAF query");
+            return;
+        }
+    };
+
+    if let Some(response) = handler.handle_find_query(query) {
+        if let Some(cbor) = coord_cbor_encode(&response) {
+            let payload = encode_coord_message(COORD_TAG_RESPONSE, &cbor);
+            if let Err(e) = agent.publish(topic, payload).await {
+                tracing::debug!("Failed to publish FOAF response: {e}");
+            } else {
+                tracing::info!(
+                    adverts = response.adverts.len(),
+                    "Published FOAF response with {} coordinator adverts",
+                    response.adverts.len()
+                );
+            }
+        }
+    }
+}
+
+/// Handle a received FOAF response: store adverts in cache.
+async fn handle_coord_response(data: &[u8], agent: &x0x::Agent) {
+    let response: saorsa_gossip_coordinator::FindCoordinatorResponse = match coord_cbor_decode(data)
+    {
+        Some(r) => r,
+        None => {
+            tracing::debug!("Failed to decode FOAF response");
+            return;
+        }
+    };
+
+    let adapter = match agent.gossip_cache_adapter() {
+        Some(a) => a,
+        None => return,
+    };
+
+    let mut stored = 0;
+    for advert in response.adverts {
+        if advert.is_valid() && adapter.insert_advert(advert).await {
+            stored += 1;
+        }
+    }
+
+    if stored > 0 {
+        tracing::info!(
+            stored = stored,
+            total = adapter.advert_count(),
+            "Processed FOAF response: stored {} coordinator adverts",
+            stored
+        );
+    }
+}
+
+/// CBOR decode helper.
+fn coord_cbor_decode<T: serde::de::DeserializeOwned>(data: &[u8]) -> Option<T> {
+    ciborium::from_reader(data).ok()
+}
+
+/// CBOR encode helper.
+fn coord_cbor_encode<T: serde::Serialize>(value: &T) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(value, &mut buf).ok()?;
+    Some(buf)
 }

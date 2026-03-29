@@ -112,7 +112,48 @@ fn coordinator_topic_is_deterministic() {
     let hash1 = blake3::hash(b"saorsa-coordinator-topic");
     let hash2 = blake3::hash(b"saorsa-coordinator-topic");
     assert_eq!(hash1, hash2);
-    // The hex-encoded topic string used by x0xd
     let topic = hex::encode(hash1.as_bytes());
-    assert_eq!(topic.len(), 64); // 32 bytes = 64 hex chars
+    assert_eq!(topic.len(), 64);
+}
+
+#[test]
+fn message_envelope_round_trip() {
+    // Test the tag-prefixed wire format used on the coordinator topic
+    let peer_id = PeerId::new([11u8; 32]);
+    let advert = CoordinatorAdvert::new(
+        peer_id,
+        CoordinatorRoles::default(),
+        vec![AddrHint::new("10.0.0.1:5483".parse().unwrap())],
+        NatClass::Eim,
+        60_000,
+    );
+
+    let cbor = advert.to_bytes().unwrap();
+
+    // Envelope: tag byte + CBOR payload
+    let mut envelope = Vec::with_capacity(1 + cbor.len());
+    envelope.push(0x01); // COORD_TAG_ADVERT
+    envelope.extend_from_slice(&cbor);
+
+    // Decode: strip tag, parse CBOR
+    assert_eq!(envelope[0], 0x01);
+    let decoded = CoordinatorAdvert::from_bytes(&envelope[1..]).unwrap();
+    assert_eq!(decoded.peer, peer_id);
+    assert!(decoded.is_valid());
+}
+
+#[test]
+fn foaf_query_cbor_round_trip() {
+    let origin = PeerId::new([55u8; 32]);
+    let query = saorsa_gossip_coordinator::FindCoordinatorQuery::new(origin);
+
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&query, &mut cbor).unwrap();
+
+    let decoded: saorsa_gossip_coordinator::FindCoordinatorQuery =
+        ciborium::from_reader(&cbor[..]).unwrap();
+
+    assert_eq!(decoded.origin, origin);
+    assert_eq!(decoded.ttl, 3);
+    assert!(!decoded.is_expired());
 }
