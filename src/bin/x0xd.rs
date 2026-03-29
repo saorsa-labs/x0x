@@ -6160,14 +6160,22 @@ async fn publish_coordinator_advert_if_eligible(
     let network = agent.network().ok_or("no network")?;
     let status = network.node_status().await.ok_or("no node status")?;
 
-    if !status.is_coordinating && !status.has_public_ip {
-        return Err("not a coordinator and no public IP".into());
+    // A node is eligible to publish coordinator adverts if it:
+    // - Is actively coordinating (ant-quic reports is_coordinating), OR
+    // - Has a public IP (local_addr matches external), OR
+    // - Has routable external addresses (discovered via OBSERVED_ADDRESS)
+    // - Can receive direct connections
+    let has_routable_addrs = !status.external_addrs.is_empty() && status.can_receive_direct;
+    let is_eligible = status.is_coordinating || status.has_public_ip || has_routable_addrs;
+
+    if !is_eligible {
+        return Err("not eligible: no coordination role and no routable addresses".into());
     }
 
     let peer_id = saorsa_gossip_types::PeerId::new(agent.machine_id().0);
 
     let roles = saorsa_gossip_coordinator::CoordinatorRoles {
-        coordinator: status.is_coordinating || status.has_public_ip,
+        coordinator: is_eligible,
         reflector: status.can_receive_direct,
         rendezvous: status.can_receive_direct,
         relay: status.is_relaying,
