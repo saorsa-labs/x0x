@@ -394,14 +394,16 @@ Multiple WebSocket clients subscribing to the same topic share one gossip subscr
 
 ### SSE (Server-Sent Events)
 
-For simpler one-way streaming (no WebSocket library needed):
+For simpler one-way streaming (no WebSocket library needed). `127.0.0.1:12700` is the default API address, but using `api.port` is more correct for named instances and custom configs:
 
 ```bash
+# Using $API and $TOKEN from the REST API section above
+
 # Stream all gossip events
-curl -N -H "Authorization: Bearer $TOKEN" http://localhost:12700/events
+curl -N -H "Authorization: Bearer $TOKEN" "http://$API/events"
 
 # Stream incoming direct messages
-curl -N -H "Authorization: Bearer $TOKEN" http://localhost:12700/direct/events
+curl -N -H "Authorization: Bearer $TOKEN" "http://$API/direct/events"
 ```
 
 ### Example: Minimal Chat App (HTML)
