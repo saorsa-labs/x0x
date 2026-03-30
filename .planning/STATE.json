@@ -7,21 +7,21 @@
     "name": "SOTA Presence Integration"
   },
   "phase": {
-    "number": "1.1",
-    "name": "Foundation Wiring",
-    "plan": "PLAN-phase-1.1.md"
+    "number": "1.2",
+    "name": "Public API — FOAF Discovery & Events",
+    "plan": "PLAN-phase-1.2-sota-presence.md"
   },
   "progress": {
     "total_tasks": 7,
-    "completed_tasks": 7,
-    "current_task": 7
+    "completed_tasks": 0,
+    "current_task": 1
   },
-  "status": "reviewing",
+  "status": "executing",
   "review": {
-    "status": "passed",
-    "iteration": 2,
+    "status": "pending",
+    "iteration": 0,
     "last_verdict": null
   },
-  "last_action": "all_tasks_complete",
-  "last_updated": "2026-03-30T12:30:00Z"
+  "last_action": "plan_created",
+  "last_updated": "2026-03-30T13:05:00Z"
 }

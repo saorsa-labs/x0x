@@ -1866,6 +1866,13 @@ impl Agent {
                     );
                 }
             }
+
+            // Start the presence event-emission loop so that subscribers
+            // automatically receive AgentOnline/AgentOffline events after
+            // join_network() returns.
+            pw.start_event_loop(std::sync::Arc::clone(&self.identity_discovery_cache))
+                .await;
+            tracing::debug!("Presence event loop started");
         }
 
         if let Err(e) = self.announce_identity(false, false).await {
@@ -2043,6 +2050,120 @@ impl Agent {
             .collect();
         agents.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(agents)
+    }
+
+    /// Subscribe to presence events (agent online/offline notifications).
+    ///
+    /// Returns a [`tokio::sync::broadcast::Receiver<PresenceEvent>`] that yields
+    /// [`presence::PresenceEvent`] values as agents come online or go offline.
+    ///
+    /// The diff-based event emission loop is started lazily on the first call to this
+    /// method (or when [`join_network`](Agent::join_network) is called). Subsequent
+    /// calls return independent receivers on the same broadcast channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`error::NetworkError::NodeCreation`] if this agent was built
+    /// without a network configuration (i.e. no `with_network_config` on the builder).
+    pub async fn subscribe_presence(
+        &self,
+    ) -> error::NetworkResult<tokio::sync::broadcast::Receiver<presence::PresenceEvent>> {
+        let pw = self.presence.as_ref().ok_or_else(|| {
+            error::NetworkError::NodeCreation("presence system not initialized".to_string())
+        })?;
+        // Ensure the event loop is running.
+        pw.start_event_loop(std::sync::Arc::clone(&self.identity_discovery_cache))
+            .await;
+        Ok(pw.subscribe_events())
+    }
+
+    /// Discover agents via Friend-of-a-Friend (FOAF) random walk.
+    ///
+    /// Initiates a FOAF query on the global presence topic with the given `ttl`
+    /// (maximum hop count) and `timeout_ms` (response collection window).
+    ///
+    /// Returned entries are resolved against the local identity discovery cache
+    /// so that known agents are returned with full identity data.  Unknown peers
+    /// are included with a minimal entry (addresses only) that will be enriched
+    /// once their identity heartbeat arrives.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl` — Maximum hop count for the random walk (`1`–`5`). Typical: `2`.
+    /// * `timeout_ms` — Query timeout in milliseconds. Typical: `5000`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`error::NetworkError::NodeCreation`] if no network config was provided.
+    pub async fn discover_agents_foaf(
+        &self,
+        ttl: u8,
+        timeout_ms: u64,
+    ) -> error::NetworkResult<Vec<DiscoveredAgent>> {
+        let pw = self.presence.as_ref().ok_or_else(|| {
+            error::NetworkError::NodeCreation("presence system not initialized".to_string())
+        })?;
+
+        let topic = presence::global_presence_topic();
+        let raw_results: Vec<(
+            saorsa_gossip_types::PeerId,
+            saorsa_gossip_types::PresenceRecord,
+        )> = pw
+            .manager()
+            .initiate_foaf_query(topic, ttl, timeout_ms)
+            .await
+            .map_err(|e| error::NetworkError::NodeError(e.to_string()))?;
+
+        let cache = self.identity_discovery_cache.read().await;
+
+        // Convert and deduplicate by agent_id.
+        let mut seen: std::collections::HashSet<identity::AgentId> =
+            std::collections::HashSet::new();
+        let mut agents: Vec<DiscoveredAgent> = Vec::with_capacity(raw_results.len());
+
+        for (peer_id, record) in &raw_results {
+            if let Some(agent) =
+                presence::presence_record_to_discovered_agent(*peer_id, record, &cache)
+            {
+                if seen.insert(agent.agent_id) {
+                    agents.push(agent);
+                }
+            }
+        }
+
+        Ok(agents)
+    }
+
+    /// Discover a specific agent by their [`identity::AgentId`] via FOAF random walk.
+    ///
+    /// Fast-path: checks the local identity discovery cache first and returns
+    /// immediately if the agent is already known.
+    ///
+    /// Slow-path: performs a FOAF random walk (see [`discover_agents_foaf`](Agent::discover_agents_foaf))
+    /// and searches the results for a matching `AgentId`.
+    ///
+    /// Returns `None` if the agent is not found within the given `ttl` and `timeout_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`error::NetworkError::NodeCreation`] if no network config was provided.
+    pub async fn discover_agent_by_id(
+        &self,
+        target_id: identity::AgentId,
+        ttl: u8,
+        timeout_ms: u64,
+    ) -> error::NetworkResult<Option<DiscoveredAgent>> {
+        // Fast path: already in local cache.
+        {
+            let cache = self.identity_discovery_cache.read().await;
+            if let Some(agent) = cache.get(&target_id) {
+                return Ok(Some(agent.clone()));
+            }
+        }
+
+        // Slow path: FOAF random walk.
+        let agents = self.discover_agents_foaf(ttl, timeout_ms).await?;
+        Ok(agents.into_iter().find(|a| a.agent_id == target_id))
     }
 
     /// Find an agent by ID, returning its known addresses.
