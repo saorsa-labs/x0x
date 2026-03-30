@@ -2,7 +2,6 @@
 
 pub mod constitution;
 pub mod contacts;
-pub mod presence;
 pub mod daemon;
 pub mod direct;
 pub mod discovery;
@@ -13,6 +12,7 @@ pub mod identity;
 pub mod machines;
 pub mod messaging;
 pub mod network;
+pub mod presence;
 pub mod store;
 pub mod tasks;
 pub mod upgrade;

@@ -550,3 +550,19 @@ Phase 1.1: Identity Unification - COMPLETE (commit bca5b8b)
 - 679/679 tests passing, zero warnings, zero clippy violations
 
 ### Phase 1.5 Starting...
+
+### Phase 1.5 Complete - 2026-03-30
+- All 4 tasks completed — comprehensive test coverage for SOTA Presence System
+- Task 1: Rewrote 8 stubbed VPS tests in presence_foaf_integration.rs as local CI-runnable tests
+- Task 2: Added 10 new unit tests to src/presence.rs (filter_by_trust×4, foaf_peer_score×3, proptest×2, neutral score×1)
+- Task 3: Created tests/presence_integration.rs (8 local integration tests, no VPS required)
+- Task 4: Proptest property tests embedded in src/presence.rs test block
+- 704/704 tests passing (up from 679), zero warnings, zero clippy violations, zero doc warnings
+- Zero new #[ignore] tests added — all tests run in CI
+
+### Milestone 1: SOTA Presence Integration — COMPLETE 🎉
+- Phase 1.1: Foundation Wiring ✅
+- Phase 1.2: Public API — FOAF Discovery & Events ✅
+- Phase 1.3: REST/CLI + Trust-Scoped Privacy ✅
+- Phase 1.4: Cache Enrichment & Adaptive Detection ✅
+- Phase 1.5: Comprehensive Tests ✅

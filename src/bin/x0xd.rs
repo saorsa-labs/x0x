@@ -2905,7 +2905,9 @@ async fn presence_find(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid agent id (expected 64 hex chars)" })),
+                Json(
+                    serde_json::json!({ "ok": false, "error": "invalid agent id (expected 64 hex chars)" }),
+                ),
             );
         }
     };
@@ -2946,7 +2948,9 @@ async fn presence_status(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid agent id (expected 64 hex chars)" })),
+                Json(
+                    serde_json::json!({ "ok": false, "error": "invalid agent id (expected 64 hex chars)" }),
+                ),
             );
         }
     };
@@ -2968,14 +2972,10 @@ async fn presence_events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     // If presence is not initialized, rx will immediately close — the stream exits cleanly.
-    let rx = state
-        .agent
-        .subscribe_presence()
-        .await
-        .unwrap_or_else(|_| {
-            // Create a dummy channel that is immediately closed so the stream exits.
-            tokio::sync::broadcast::channel::<x0x::presence::PresenceEvent>(1).1
-        });
+    let rx = state.agent.subscribe_presence().await.unwrap_or_else(|_| {
+        // Create a dummy channel that is immediately closed so the stream exits.
+        tokio::sync::broadcast::channel::<x0x::presence::PresenceEvent>(1).1
+    });
     let mut rx = rx;
     let stream = async_stream::stream! {
         loop {

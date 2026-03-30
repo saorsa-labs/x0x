@@ -781,9 +781,11 @@ async fn run(
             PresenceSub::Foaf { ttl, timeout_ms } => {
                 commands::presence::foaf(&client, ttl, timeout_ms).await
             }
-            PresenceSub::Find { id, ttl, timeout_ms } => {
-                commands::presence::find(&client, &id, ttl, timeout_ms).await
-            }
+            PresenceSub::Find {
+                id,
+                ttl,
+                timeout_ms,
+            } => commands::presence::find(&client, &id, ttl, timeout_ms).await,
             PresenceSub::Status { id } => commands::presence::status(&client, &id).await,
         },
         Commands::Network { sub } => match sub {

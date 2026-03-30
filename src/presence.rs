@@ -997,4 +997,215 @@ mod tests {
             "Legacy coexistence must be enabled by default"
         );
     }
+
+    // ── Phase 1.5: filter_by_trust tests ─────────────────────────────────────
+
+    fn make_temp_contact_store() -> (crate::contacts::ContactStore, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = crate::contacts::ContactStore::new(tmp.path().join("contacts.json"));
+        (store, tmp)
+    }
+
+    #[test]
+    fn test_filter_by_trust_blocks_blocked_agents() {
+        let (mut store, _tmp) = make_temp_contact_store();
+        let blocked_id = AgentId([2u8; 32]);
+        let blocked_machine = MachineId([22u8; 32]);
+        let allowed_id = AgentId([3u8; 32]);
+        let allowed_machine = MachineId([33u8; 32]);
+
+        store.set_trust(&blocked_id, crate::contacts::TrustLevel::Blocked);
+
+        let agents = vec![
+            make_discovered_agent(blocked_id, blocked_machine),
+            make_discovered_agent(allowed_id, allowed_machine),
+        ];
+
+        let filtered = filter_by_trust(agents, &store, PresenceVisibility::Network);
+        // Blocked agent must be removed; unknown-trust agent must remain.
+        assert_eq!(filtered.len(), 1, "Blocked agent must be filtered out");
+        assert_eq!(
+            filtered[0].agent_id, allowed_id,
+            "Non-blocked agent must survive filtering"
+        );
+    }
+
+    #[test]
+    fn test_filter_by_trust_passes_trusted_agents() {
+        let (mut store, _tmp) = make_temp_contact_store();
+        let trusted_id = AgentId([4u8; 32]);
+        let trusted_machine = MachineId([44u8; 32]);
+
+        store.set_trust(&trusted_id, crate::contacts::TrustLevel::Trusted);
+
+        let agents = vec![make_discovered_agent(trusted_id, trusted_machine)];
+        let filtered = filter_by_trust(agents, &store, PresenceVisibility::Network);
+        assert_eq!(filtered.len(), 1, "Trusted agent must not be filtered");
+    }
+
+    #[test]
+    fn test_filter_by_trust_passes_unknown_agents() {
+        let (store, _tmp) = make_temp_contact_store();
+        // Agent is not in the store at all (Unknown trust).
+        let unknown_id = AgentId([5u8; 32]);
+        let unknown_machine = MachineId([55u8; 32]);
+
+        let agents = vec![make_discovered_agent(unknown_id, unknown_machine)];
+        let filtered = filter_by_trust(agents, &store, PresenceVisibility::Network);
+        assert_eq!(
+            filtered.len(),
+            1,
+            "Unknown-trust agent must pass Network visibility filter"
+        );
+    }
+
+    #[test]
+    fn test_filter_by_trust_social_keeps_only_known_or_trusted() {
+        let (mut store, _tmp) = make_temp_contact_store();
+        let trusted_id = AgentId([6u8; 32]);
+        let trusted_machine = MachineId([66u8; 32]);
+        let known_id = AgentId([7u8; 32]);
+        let known_machine = MachineId([77u8; 32]);
+        let unknown_id = AgentId([8u8; 32]);
+        let unknown_machine = MachineId([88u8; 32]);
+
+        store.set_trust(&trusted_id, crate::contacts::TrustLevel::Trusted);
+        store.set_trust(&known_id, crate::contacts::TrustLevel::Known);
+
+        let agents = vec![
+            make_discovered_agent(trusted_id, trusted_machine),
+            make_discovered_agent(known_id, known_machine),
+            make_discovered_agent(unknown_id, unknown_machine),
+        ];
+        let filtered = filter_by_trust(agents, &store, PresenceVisibility::Social);
+        // Social visibility: only Known + Trusted pass.
+        assert_eq!(
+            filtered.len(),
+            2,
+            "Social filter must keep only Known/Trusted agents"
+        );
+        let ids: Vec<_> = filtered.iter().map(|a| a.agent_id).collect();
+        assert!(ids.contains(&trusted_id), "Trusted must pass Social filter");
+        assert!(ids.contains(&known_id), "Known must pass Social filter");
+    }
+
+    // ── Phase 1.5: foaf_peer_score ordering tests ─────────────────────────────
+
+    #[test]
+    fn test_foaf_peer_score_empty_stats_is_neutral() {
+        let empty = PeerBeaconStats::new();
+        let score = foaf_peer_score(&empty);
+        // No inter-arrival data → neutral score of 0.5
+        assert!(
+            (score - 0.5_f64).abs() < f64::EPSILON,
+            "Empty stats must return neutral score 0.5, got {score}"
+        );
+    }
+
+    #[test]
+    fn test_foaf_peer_score_stable_beats_jittery() {
+        let base = 1_000_000_u64;
+
+        // Stable: constant 30 s interval
+        let mut stable = PeerBeaconStats::new();
+        for i in 0..10_u64 {
+            stable.record(base + i * 30);
+        }
+        let stable_score = foaf_peer_score(&stable);
+
+        // Jittery: highly variable interval
+        let mut jittery = PeerBeaconStats::new();
+        for i in 0..10_u64 {
+            jittery.record(base + i * i * 15 + i * 30);
+        }
+        let jittery_score = foaf_peer_score(&jittery);
+
+        assert!(
+            stable_score >= jittery_score,
+            "Stable peer score ({stable_score}) must be >= jittery peer score ({jittery_score})"
+        );
+    }
+
+    #[test]
+    fn test_foaf_peer_score_sorted_ordering() {
+        // Build a small set of stats and verify sort order matches the scoring function.
+        let base = 1_000_000_u64;
+
+        let mut very_stable = PeerBeaconStats::new();
+        for i in 0..10_u64 {
+            very_stable.record(base + i * 30);
+        }
+
+        let mut moderate = PeerBeaconStats::new();
+        for i in 0..10_u64 {
+            moderate.record(base + i * 60 + (i % 3) * 10);
+        }
+
+        let mut chaotic = PeerBeaconStats::new();
+        for i in 0..10_u64 {
+            chaotic.record(base + i * i * 20);
+        }
+
+        let s_vs = foaf_peer_score(&very_stable);
+        let s_m = foaf_peer_score(&moderate);
+        let s_c = foaf_peer_score(&chaotic);
+
+        // All scores in [0, 1]
+        for &s in &[s_vs, s_m, s_c] {
+            assert!(
+                (0.0_f64..=1.0_f64).contains(&s),
+                "Score {s} must be in [0.0, 1.0]"
+            );
+        }
+        // Most-stable should score highest
+        assert!(s_vs >= s_c, "Very stable ({s_vs}) must beat chaotic ({s_c})");
+    }
+
+    // ── Phase 1.5: proptest property tests ────────────────────────────────────
+
+    mod proptest_presence {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config {
+                cases: 100,
+                ..Default::default()
+            })]
+
+            #[test]
+            fn proptest_foaf_peer_score_in_range(
+                timestamps in proptest::collection::vec(0_u64..10_000_000_u64, 1..=20)
+            ) {
+                let mut stats = PeerBeaconStats::new();
+                let mut sorted = timestamps.clone();
+                sorted.sort_unstable();
+                for t in sorted {
+                    stats.record(t);
+                }
+                let score = foaf_peer_score(&stats);
+                prop_assert!(
+                    (0.0_f64..=1.0_f64).contains(&score),
+                    "foaf_peer_score must be in [0.0, 1.0], got {score}"
+                );
+            }
+
+            #[test]
+            fn proptest_adaptive_timeout_clamped(
+                timestamps in proptest::collection::vec(0_u64..10_000_000_u64, 2..=20)
+            ) {
+                let mut stats = PeerBeaconStats::new();
+                let mut sorted = timestamps.clone();
+                sorted.sort_unstable();
+                for t in sorted {
+                    stats.record(t);
+                }
+                let timeout = stats.adaptive_timeout_secs(300);
+                prop_assert!(
+                    (180..=600).contains(&timeout),
+                    "adaptive_timeout_secs must be in [180, 600], got {timeout}"
+                );
+            }
+        }
+    }
 }

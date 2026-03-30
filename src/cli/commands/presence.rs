@@ -23,7 +23,10 @@ pub async fn foaf(client: &DaemonClient, ttl: u8, timeout_ms: u64) -> Result<()>
     let ttl_str = ttl.to_string();
     let timeout_str = timeout_ms.to_string();
     let resp = client
-        .get_query("/presence/foaf", &[("ttl", &ttl_str), ("timeout_ms", &timeout_str)])
+        .get_query(
+            "/presence/foaf",
+            &[("ttl", &ttl_str), ("timeout_ms", &timeout_str)],
+        )
         .await?;
     print_value(client.format(), &resp);
     Ok(())

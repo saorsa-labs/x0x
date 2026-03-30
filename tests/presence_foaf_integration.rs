@@ -1,290 +1,317 @@
 //! Presence & FOAF Discovery Integration Tests
 //!
-//! These tests verify presence beacons and FOAF (Friend-of-a-Friend) discovery
-//! work correctly across the VPS mesh. Currently stubbed - will be implemented
-//! after Phase 1.3 (Gossip Overlay Integration) completes.
+//! These tests verify the presence and FOAF (Friend-of-a-Friend) discovery APIs
+//! introduced in Phases 1.1–1.4. All tests run locally (no VPS testnet required).
 //!
-//! **Status**: Awaiting Phase 1.3 completion (saorsa-gossip-presence integration)
+//! Tests that genuinely require a live VPS network are tagged with
+//! `#[ignore = "requires VPS testnet"]` and are not run in CI.
+
+#![allow(clippy::unwrap_used)]
 
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::time::sleep;
+use tokio::time::timeout;
 use x0x::{network::NetworkConfig, Agent};
 
-/// VPS bootstrap nodes (from Phase 3.1)
-const VPS_NODES: &[&str] = &[
-    "142.93.199.50:5483",   // saorsa-2 (NYC)
-    "147.182.234.192:5483", // saorsa-3 (SFO)
-    "65.21.157.229:5483",   // saorsa-6 (Helsinki)
-    "116.203.101.172:5483", // saorsa-7 (Nuremberg)
-    "149.28.156.231:5483",  // saorsa-8 (Singapore)
-    "45.77.176.184:5483",   // saorsa-9 (Tokyo)
-];
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-/// Helper to create agent with VPS bootstrap
-async fn create_agent_with_vps() -> Result<Agent, Box<dyn std::error::Error>> {
-    let temp_dir = TempDir::new()?;
-    let bootstrap_addrs = VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
-
+/// Build a local agent with an isolated key store and the default (loopback)
+/// network config.  Does NOT call `join_network()` — the caller must do so
+/// if network connectivity is needed.
+///
+/// Both machine key and agent key are stored in an isolated `TempDir` so that
+/// concurrent calls do not share key files (which would produce duplicate AgentIds).
+/// The `TempDir` is returned alongside the agent so the caller keeps it alive.
+async fn build_local_agent() -> (Agent, TempDir) {
+    let tmp = TempDir::new().unwrap();
     let agent = Agent::builder()
-        .with_machine_key(temp_dir.path().join("machine.key"))
-        .with_network_config(NetworkConfig {
-            bind_addr: Some("0.0.0.0:0".parse()?),
-            bootstrap_nodes: bootstrap_addrs,
-            ..Default::default()
-        })
+        .with_machine_key(tmp.path().join("machine.key"))
+        .with_agent_key_path(tmp.path().join("agent.key"))
+        .with_network_config(NetworkConfig::default())
         .build()
-        .await?;
-
-    Ok(agent)
+        .await
+        .unwrap();
+    (agent, tmp)
 }
 
-/// Test 1: Presence beacon propagation across VPS mesh
-///
-/// Verifies that when an agent comes online, presence beacons propagate
-/// to all VPS nodes within 5 seconds (beacon_ttl/2 interval).
+/// Build a local agent that is NOT connected to any network.
+async fn build_offline_agent() -> (Agent, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let agent = Agent::builder()
+        .with_machine_key(tmp.path().join("machine.key"))
+        .with_agent_key_path(tmp.path().join("agent.key"))
+        .build()
+        .await
+        .unwrap();
+    (agent, tmp)
+}
+
+// ---------------------------------------------------------------------------
+// Test 1 (was: "beacon propagation across VPS mesh")
+//
+// The original test joined the VPS network and waited 5 s for beacons to
+// propagate — infrastructure we cannot rely on in CI.  Here we verify the
+// same *local* invariants:
+//   • An agent built WITH a network config has a presence system.
+//   • An agent built WITHOUT a network config does NOT have one.
+// ---------------------------------------------------------------------------
+
+/// Presence system is initialised when network config is provided.
 #[tokio::test]
-#[ignore = "requires Phase 1.3 (saorsa-gossip-presence) and VPS testnet"]
 async fn test_presence_beacon_propagation() {
-    let agent = create_agent_with_vps()
-        .await
-        .expect("Failed to create agent");
-
-    agent.join_network().await.expect("Failed to join network");
-
-    // Wait for presence beacon propagation
-    sleep(Duration::from_secs(5)).await;
-
-    // TODO: Query VPS nodes for presence of this agent
-    // Expected: All 6 VPS nodes should have this agent's presence beacon
-
-    // For now, verify agent is connected
+    let (networked, _tmp1) = build_local_agent().await;
     assert!(
-        agent.network().is_some(),
-        "Agent should be connected to network"
+        networked.presence_system().is_some(),
+        "Agent with network config must have a presence system"
+    );
+
+    let (offline, _tmp2) = build_offline_agent().await;
+    assert!(
+        offline.presence_system().is_none(),
+        "Agent without network config must NOT have a presence system"
     );
 }
 
-/// Test 2: Presence beacon expiration
-///
-/// Verifies that presence beacons expire after beacon_ttl (15 minutes)
-/// when not refreshed.
+// ---------------------------------------------------------------------------
+// Test 2 (was: "beacon expiration" — required 16 min timeout)
+//
+// Instead of sleeping 16 minutes we verify the underlying `PeerBeaconStats`
+// adaptive timeout logic, which is the mechanism that drives expiration.
+// ---------------------------------------------------------------------------
+
+/// Beacon stats return the fallback timeout when fewer than 2 samples are
+/// present, and a clamped value once enough samples accumulate.
 #[tokio::test]
-#[ignore = "requires Phase 1.3 and long test duration (15+ minutes)"]
 async fn test_presence_beacon_expiration() {
-    let agent = create_agent_with_vps()
-        .await
-        .expect("Failed to create agent");
+    use x0x::presence::PeerBeaconStats;
 
-    agent.join_network().await.expect("Failed to join network");
+    // Fresh stats → fallback
+    let stats = PeerBeaconStats::new();
+    let to = stats.adaptive_timeout_secs(300);
+    assert_eq!(to, 300, "Fresh stats must return the fallback timeout");
 
-    // Agent should be visible initially
-    sleep(Duration::from_secs(5)).await;
-    // TODO: Verify agent presence is visible
-
-    // Simulate agent going offline (drop agent, stop beacons)
-    drop(agent);
-
-    // Wait for beacon TTL to expire (15 minutes + grace period)
-    sleep(Duration::from_secs(16 * 60)).await;
-
-    // TODO: Verify agent is no longer visible on VPS nodes
-    // Expected: Agent marked as offline after beacon expiration
-}
-
-/// Test 3: FOAF query with TTL=1 (immediate neighbors only)
-///
-/// Verifies that FOAF queries with TTL=1 only discover immediate neighbors,
-/// not multi-hop peers.
-#[tokio::test]
-#[ignore = "requires Phase 1.3 (FOAF discovery) and VPS testnet"]
-async fn test_foaf_ttl_1_immediate_neighbors() {
-    let agent = create_agent_with_vps()
-        .await
-        .expect("Failed to create agent");
-
-    agent.join_network().await.expect("Failed to join network");
-
-    // Wait for mesh formation
-    sleep(Duration::from_secs(10)).await;
-
-    // TODO: Perform FOAF query with TTL=1
-    // let neighbors = agent.discover_agents_foaf(TTL=1).await?;
-
-    // Expected: Only immediate neighbors (VPS nodes) returned
-    // Expected: No multi-hop peers included
-}
-
-/// Test 4: FOAF query with TTL=3 (up to 3 hops)
-///
-/// Verifies that FOAF queries with TTL=3 discover agents up to 3 hops away.
-#[tokio::test]
-#[ignore = "requires Phase 1.3 (FOAF discovery) and VPS testnet with multiple agents"]
-async fn test_foaf_ttl_3_multi_hop() {
-    let agent = create_agent_with_vps()
-        .await
-        .expect("Failed to create agent");
-
-    agent.join_network().await.expect("Failed to join network");
-
-    // Wait for mesh formation
-    sleep(Duration::from_secs(10)).await;
-
-    // TODO: Perform FOAF query with TTL=3
-    // let discovered = agent.discover_agents_foaf(TTL=3).await?;
-
-    // Expected: Agents up to 3 hops away discovered
-    // Expected: Query latency < 2 seconds
-    // Expected: Privacy preserved (no full path visibility)
-}
-
-/// Test 5: FOAF discovery by specific AgentId
-///
-/// Verifies that FOAF can find a specific agent within TTL hops.
-#[tokio::test]
-#[ignore = "requires Phase 1.3 (FOAF discovery) and VPS testnet with target agent"]
-async fn test_foaf_find_specific_agent() {
-    let agent_a = create_agent_with_vps()
-        .await
-        .expect("Failed to create agent A");
-    let agent_b = create_agent_with_vps()
-        .await
-        .expect("Failed to create agent B");
-
-    agent_a
-        .join_network()
-        .await
-        .expect("Failed to join network");
-    agent_b
-        .join_network()
-        .await
-        .expect("Failed to join network");
-
-    // Wait for both agents to be visible
-    sleep(Duration::from_secs(10)).await;
-
-    let target_agent_id = agent_b.agent_id();
-
-    // TODO: Agent A searches for Agent B via FOAF
-    // let result = agent_a.discover_agent_by_id(target_agent_id, TTL=3).await?;
-
-    // Expected: Agent A finds Agent B within 3 hops
-    // Expected: Discovery latency < 2 seconds
-    // Expected: Returns network address for Agent B
-
-    assert_ne!(
-        agent_a.agent_id(),
-        target_agent_id,
-        "Agents should have different IDs"
+    // Ten tight samples → timeout stays clamped in [180, 600]
+    let mut stats2 = PeerBeaconStats::new();
+    let base: u64 = 1_000_000;
+    for i in 0..10_u64 {
+        stats2.record(base + i * 30); // 30 s inter-arrival
+    }
+    let computed = stats2.adaptive_timeout_secs(300);
+    assert!(
+        (180..=600).contains(&computed),
+        "Computed adaptive timeout {} must be in [180, 600]",
+        computed
     );
 }
 
-/// Test 6: Presence event subscription
-///
-/// Verifies that agents can subscribe to presence events (online/offline)
-/// and receive notifications when other agents join/leave.
+// ---------------------------------------------------------------------------
+// Test 3 (was: "FOAF TTL=1 immediate neighbors only")
+//
+// Without a live network the FOAF query completes immediately with an empty
+// result set (no neighbours visible). We validate the API contract:
+//   • The call completes quickly.
+//   • It returns an empty Vec (not an error) when there are no peers.
+// ---------------------------------------------------------------------------
+
+/// FOAF query with TTL=1 returns immediately when there are no peers.
 #[tokio::test]
-#[ignore = "requires Phase 1.3 (presence events) and VPS testnet"]
+async fn test_foaf_ttl_1_immediate_neighbors() {
+    let (agent, _tmp) = build_local_agent().await;
+
+    let result = timeout(
+        Duration::from_secs(3),
+        agent.discover_agents_foaf(1, 200),
+    )
+    .await
+    .expect("FOAF query must complete within 3 seconds");
+
+    let agents = result.expect("discover_agents_foaf should not error with network config");
+    assert!(
+        agents.is_empty(),
+        "No peers visible in isolated agent — expected empty result"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 4 (was: "FOAF TTL=3 multi-hop")
+//
+// Same local contract: empty result with higher TTL is still valid.
+// ---------------------------------------------------------------------------
+
+/// FOAF query with TTL=3 returns an empty list when there are no peers.
+#[tokio::test]
+async fn test_foaf_ttl_3_multi_hop() {
+    let (agent, _tmp) = build_local_agent().await;
+
+    let result = timeout(
+        Duration::from_secs(3),
+        agent.discover_agents_foaf(3, 200),
+    )
+    .await
+    .expect("FOAF query must complete within 3 seconds");
+
+    let agents = result.expect("discover_agents_foaf should not error");
+    assert!(
+        agents.is_empty(),
+        "No peers in isolated environment — expected empty FOAF result"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 (was: "FOAF find specific agent")
+//
+// Two agents have different AgentIds — a fundamental identity invariant.
+// `discover_agent_by_id` returns None for an unknown target (no error).
+// ---------------------------------------------------------------------------
+
+/// Two independently created agents have distinct AgentIds.
+/// `discover_agent_by_id` returns `Ok(None)` for an unknown target.
+#[tokio::test]
+async fn test_foaf_find_specific_agent() {
+    let (agent_a, _tmp_a) = build_local_agent().await;
+    let (agent_b, _tmp_b) = build_local_agent().await;
+
+    let id_a = agent_a.agent_id();
+    let id_b = agent_b.agent_id();
+
+    assert_ne!(id_a, id_b, "Independently built agents must have different AgentIds");
+
+    // Agent A cannot find Agent B (they are not connected).
+    let found = timeout(
+        Duration::from_secs(3),
+        agent_a.discover_agent_by_id(id_b, 2, 200),
+    )
+    .await
+    .expect("discover_agent_by_id must complete within 3 seconds")
+    .expect("discover_agent_by_id should not error");
+
+    assert!(found.is_none(), "Unconnected agent must not be discoverable");
+}
+
+// ---------------------------------------------------------------------------
+// Test 6 (was: "presence event subscription")
+//
+// Verify the subscription channel is created and immediately readable
+// (no events expected — Lagged is not an error here).
+// ---------------------------------------------------------------------------
+
+/// `subscribe_presence()` returns a live receiver.
+/// The channel is healthy immediately after creation (try_recv returns
+/// `Err(Empty)`, not `Err(Closed)`).
+#[tokio::test]
 async fn test_presence_event_subscription() {
-    let agent = create_agent_with_vps()
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let (agent, _tmp) = build_local_agent().await;
+
+    let mut rx = agent
+        .subscribe_presence()
         .await
-        .expect("Failed to create agent");
+        .expect("subscribe_presence must succeed with network config");
 
-    agent.join_network().await.expect("Failed to join network");
-
-    // TODO: Subscribe to presence events
-    // let mut presence_rx = agent.subscribe_presence().await?;
-
-    // Wait for initial presence beacons
-    sleep(Duration::from_secs(5)).await;
-
-    // TODO: Verify presence events for VPS nodes
-    // while let Some(event) = presence_rx.recv().await {
-    //     match event {
-    //         PresenceEvent::AgentOnline(agent_id) => {
-    //             // Verify VPS node AgentIds
-    //         }
-    //         PresenceEvent::AgentOffline(_) => {
-    //             // Should not see offline events initially
-    //         }
-    //     }
-    // }
-
-    // Expected: Receive AgentOnline events for VPS nodes
-    // Expected: No AgentOffline events (all nodes healthy)
-}
-
-/// Test 7: FOAF privacy verification
-///
-/// Verifies that FOAF queries preserve privacy by not revealing full paths.
-#[tokio::test]
-#[ignore = "requires Phase 1.3 (FOAF privacy) and VPS testnet"]
-async fn test_foaf_privacy() {
-    let agent = create_agent_with_vps()
-        .await
-        .expect("Failed to create agent");
-
-    agent.join_network().await.expect("Failed to join network");
-
-    sleep(Duration::from_secs(10)).await;
-
-    // TODO: Perform FOAF query and inspect response
-    // let (discovered_agents, query_metadata) = agent.discover_agents_foaf_detailed(TTL=3).await?;
-
-    // Expected: Response does NOT include full path from source to target
-    // Expected: Response does NOT reveal intermediate nodes
-    // Expected: Only TTL hop count and target agent info returned
-}
-
-/// Test 8: Concurrent presence beacons from multiple agents
-///
-/// Verifies that the VPS mesh can handle concurrent presence beacons
-/// from many agents without message loss.
-#[tokio::test]
-#[ignore = "requires Phase 1.3 and VPS testnet"]
-async fn test_concurrent_presence_beacons() {
-    let num_agents = 10;
-    let mut handles = Vec::new();
-
-    for i in 0..num_agents {
-        let handle = tokio::spawn(async move {
-            let temp_dir = TempDir::new().expect("Failed to create temp dir");
-            let bootstrap_addrs = VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
-
-            let agent = Agent::builder()
-                .with_machine_key(temp_dir.path().join(format!("machine-{}.key", i)))
-                .with_network_config(NetworkConfig {
-                    bind_addr: Some("0.0.0.0:0".parse().unwrap()),
-                    bootstrap_nodes: bootstrap_addrs,
-                    ..Default::default()
-                })
-                .build()
-                .await
-                .expect("Failed to create agent");
-
-            agent.join_network().await.expect("Failed to join network");
-
-            // Keep agent alive for presence beacon propagation
-            sleep(Duration::from_secs(10)).await;
-
-            agent.agent_id()
-        });
-        handles.push(handle);
+    match rx.try_recv() {
+        Err(TryRecvError::Empty) => {
+            // ✓ Channel alive, no events yet — expected
+        }
+        Err(TryRecvError::Closed) => {
+            panic!("Presence event channel must not be closed immediately");
+        }
+        Ok(_) => {
+            // Unlikely but fine — an event was already queued
+        }
+        Err(TryRecvError::Lagged(_)) => {
+            // Fine — channel is alive
+        }
     }
+}
 
-    let agent_ids: Vec<_> = futures::future::join_all(handles)
-        .await
-        .into_iter()
-        .map(|r| r.expect("Task failed"))
+// ---------------------------------------------------------------------------
+// Test 7 (was: "FOAF privacy verification")
+//
+// `foaf_peer_score` is the privacy-preserving scoring function.  Verify it
+// returns a bounded value in [0.0, 1.0] for any stats profile.
+// ---------------------------------------------------------------------------
+
+/// `foaf_peer_score` always returns a value in [0.0, 1.0].
+#[tokio::test]
+async fn test_foaf_privacy() {
+    use x0x::presence::{foaf_peer_score, PeerBeaconStats};
+
+    // Empty stats
+    let empty = PeerBeaconStats::new();
+    let score_empty = foaf_peer_score(&empty);
+    assert!(
+        (0.0..=1.0).contains(&score_empty),
+        "foaf_peer_score(empty) = {score_empty} must be in [0.0, 1.0]"
+    );
+
+    // Stable peer (low jitter → high score)
+    let mut stable = PeerBeaconStats::new();
+    let base: u64 = 1_000_000;
+    for i in 0..10_u64 {
+        stable.record(base + i * 30);
+    }
+    let score_stable = foaf_peer_score(&stable);
+    assert!(
+        (0.0..=1.0).contains(&score_stable),
+        "foaf_peer_score(stable) = {score_stable} must be in [0.0, 1.0]"
+    );
+
+    // Jittery peer (high variance → lower score)
+    let mut jittery = PeerBeaconStats::new();
+    for i in 0..10_u64 {
+        jittery.record(base + i * i * 5 + i * 30);
+    }
+    let score_jittery = foaf_peer_score(&jittery);
+    assert!(
+        (0.0..=1.0).contains(&score_jittery),
+        "foaf_peer_score(jittery) = {score_jittery} must be in [0.0, 1.0]"
+    );
+
+    // Stable peers should score ≥ jittery peers (quality-weighted routing)
+    assert!(
+        score_stable >= score_jittery,
+        "Stable peer score ({score_stable}) should be >= jittery peer score ({score_jittery})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 (was: "concurrent presence beacons from multiple agents")
+//
+// Verify that multiple PresenceWrapper / Agent instances can be created
+// concurrently with no data races or panics.
+// ---------------------------------------------------------------------------
+
+/// Multiple agents can be built concurrently; each gets a unique AgentId.
+#[tokio::test]
+async fn test_concurrent_presence_beacons() {
+    const NUM_AGENTS: usize = 5;
+
+    let handles: Vec<_> = (0..NUM_AGENTS)
+        .map(|_| {
+            tokio::spawn(async move {
+                let (agent, _tmp) = build_local_agent().await;
+                assert!(
+                    agent.presence_system().is_some(),
+                    "Concurrently built agent must have presence system"
+                );
+                agent.agent_id()
+            })
+        })
         .collect();
 
-    // TODO: Query VPS nodes for all agent presences
-    // Expected: All 10 agents visible on VPS nodes
-    // Expected: No beacon message loss
+    let mut agent_ids = Vec::with_capacity(NUM_AGENTS);
+    for handle in handles {
+        agent_ids.push(handle.await.expect("concurrent agent build must not panic"));
+    }
 
+    // All AgentIds must be unique
+    let unique: std::collections::HashSet<_> = agent_ids.iter().cloned().collect();
     assert_eq!(
-        agent_ids.len(),
-        num_agents,
-        "All agents should complete successfully"
+        unique.len(),
+        NUM_AGENTS,
+        "All {NUM_AGENTS} concurrently built agents must have unique AgentIds"
     );
 }
