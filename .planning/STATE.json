@@ -1,21 +1,27 @@
 {
   "version": 1,
-  "project": "seedless-bootstrap",
+  "project": "sota-presence",
   "active": true,
   "milestone": {
-    "number": 3,
-    "name": "E2E Verification & Hardening"
+    "number": 1,
+    "name": "SOTA Presence Integration"
   },
   "phase": {
-    "number": "3.1",
-    "name": "VPS Deployment & Integration Testing",
-    "plan": null
+    "number": "1.1",
+    "name": "Foundation Wiring",
+    "plan": "PLAN-phase-1.1.md"
   },
   "progress": {
-    "total_tasks": 0,
-    "completed_tasks": 0,
-    "current_task": null
+    "total_tasks": 7,
+    "completed_tasks": 7,
+    "current_task": 7
   },
-  "status": "deployed",
-  "last_updated": "2026-03-29T21:30:00Z"
+  "status": "reviewing",
+  "review": {
+    "status": "passed",
+    "iteration": 2,
+    "last_verdict": null
+  },
+  "last_action": "all_tasks_complete",
+  "last_updated": "2026-03-30T12:30:00Z"
 }

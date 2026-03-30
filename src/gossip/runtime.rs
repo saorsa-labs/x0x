@@ -4,6 +4,7 @@ use super::config::GossipConfig;
 use super::pubsub::{PubSubManager, SigningContext};
 use crate::error::NetworkResult;
 use crate::network::NetworkNode;
+use crate::presence::PresenceWrapper;
 use saorsa_gossip_membership::{HyParViewMembership, MembershipConfig};
 use saorsa_gossip_transport::GossipStreamType;
 use saorsa_gossip_types::PeerId;
@@ -19,6 +20,7 @@ pub struct GossipRuntime {
     membership: Arc<HyParViewMembership<NetworkNode>>,
     pubsub: Arc<PubSubManager>,
     peer_id: PeerId,
+    presence: std::sync::Mutex<Option<Arc<PresenceWrapper>>>,
     dispatcher_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     peer_sync_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     keepalive_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -75,6 +77,7 @@ impl GossipRuntime {
             membership,
             pubsub,
             peer_id,
+            presence: std::sync::Mutex::new(None),
             dispatcher_handle: std::sync::Mutex::new(None),
             peer_sync_handle: std::sync::Mutex::new(None),
             keepalive_handle: std::sync::Mutex::new(None),
@@ -111,6 +114,22 @@ impl GossipRuntime {
         self.peer_id
     }
 
+    /// Set the presence wrapper for Bulk stream dispatch.
+    ///
+    /// Must be called before `start()` so that the dispatcher loop can
+    /// route `GossipStreamType::Bulk` messages to the presence manager.
+    pub fn set_presence(&self, presence: Arc<PresenceWrapper>) {
+        if let Ok(mut guard) = self.presence.lock() {
+            *guard = Some(presence);
+        }
+    }
+
+    /// Get the presence wrapper, if configured.
+    #[must_use]
+    pub fn presence(&self) -> Option<Arc<PresenceWrapper>> {
+        self.presence.lock().ok().and_then(|guard| guard.clone())
+    }
+
     /// Start the gossip runtime.
     ///
     /// This initializes all gossip components and begins protocol operations.
@@ -122,6 +141,7 @@ impl GossipRuntime {
         let network = Arc::clone(&self.network);
         let membership = Arc::clone(&self.membership);
         let pubsub = Arc::clone(&self.pubsub);
+        let presence = self.presence();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -144,8 +164,32 @@ impl GossipRuntime {
                                 );
                             }
                         }
-                        other => {
-                            tracing::debug!("Ignoring {:?} stream (not yet implemented)", other);
+                        GossipStreamType::Bulk => {
+                            if let Some(ref pm) = presence {
+                                match pm.manager().handle_presence_message(&data).await {
+                                    Ok(Some(source)) => {
+                                        tracing::debug!(
+                                            from = %source,
+                                            bytes = data.len(),
+                                            "Handled presence beacon"
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        tracing::trace!(
+                                            bytes = data.len(),
+                                            "Presence message processed (no source)"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            from = %peer,
+                                            "Failed to handle presence message: {e}"
+                                        );
+                                    }
+                                }
+                            } else {
+                                tracing::trace!("Ignoring Bulk stream (presence not configured)");
+                            }
                         }
                     },
                     Err(e) => {

@@ -110,6 +110,9 @@ pub mod mls;
 /// efficient, reliable delivery between connected agents.
 pub mod direct;
 
+/// Presence system — beacons, FOAF discovery, and online/offline events.
+pub mod presence;
+
 /// Self-update system with ML-DSA-65 signature verification and staged rollout.
 pub mod upgrade;
 
@@ -188,6 +191,8 @@ pub struct Agent {
     direct_messaging: std::sync::Arc<direct::DirectMessaging>,
     /// Ensures direct message listener is spawned once.
     direct_listener_started: std::sync::atomic::AtomicBool,
+    /// Presence system wrapper for beacons, FOAF discovery, and events.
+    presence: Option<std::sync::Arc<presence::PresenceWrapper>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -736,6 +741,16 @@ impl Agent {
         self.gossip_cache_adapter.as_ref()
     }
 
+    /// Get the presence system wrapper, if configured.
+    ///
+    /// Returns `None` if this agent was built without a network config.
+    /// The presence wrapper provides beacon broadcasting, FOAF discovery,
+    /// and online/offline event subscriptions.
+    #[must_use]
+    pub fn presence_system(&self) -> Option<&std::sync::Arc<presence::PresenceWrapper>> {
+        self.presence.as_ref()
+    }
+
     /// Get a reference to the contact store.
     ///
     /// The contact store persists trust levels and machine records for known
@@ -915,6 +930,12 @@ impl Agent {
     /// persisted to disk. The background maintenance task saves periodically,
     /// but this guarantees a final save.
     pub async fn shutdown(&self) {
+        // Shut down presence beacons first.
+        if let Some(ref pw) = self.presence {
+            pw.shutdown().await;
+            tracing::info!("Presence system shut down");
+        }
+
         if let Some(ref cache) = self.bootstrap_cache {
             if let Err(e) = cache.save().await {
                 tracing::warn!("Failed to save bootstrap cache on shutdown: {e}");
@@ -1800,6 +1821,49 @@ impl Agent {
             if !seeds.is_empty() {
                 if let Err(e) = runtime.membership().join(seeds).await {
                     tracing::warn!("HyParView membership join failed: {e}");
+                }
+            }
+        }
+
+        // Start presence beacons after membership overlay is established.
+        if let Some(ref pw) = self.presence {
+            // Seed broadcast peers from connected peers so beacons propagate.
+            if let Some(ref runtime) = self.gossip_runtime {
+                let active = runtime.membership().active_view();
+                for peer in active {
+                    pw.manager().add_broadcast_peer(peer).await;
+                }
+                tracing::info!(
+                    "Presence seeded with {} broadcast peers",
+                    pw.manager().broadcast_peer_count().await
+                );
+            }
+
+            // Populate address hints from network status for beacon metadata.
+            if let Some(ref net) = self.network {
+                if let Some(status) = net.node_status().await {
+                    let mut hints: Vec<String> = status
+                        .external_addrs
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect();
+                    hints.push(status.local_addr.to_string());
+                    pw.manager().set_addr_hints(hints).await;
+                }
+            }
+
+            if pw.config().enable_beacons {
+                if let Err(e) = pw
+                    .manager()
+                    .start_beacons(pw.config().beacon_interval_secs)
+                    .await
+                {
+                    tracing::warn!("Failed to start presence beacons: {e}");
+                } else {
+                    tracing::info!(
+                        "Presence beacons started (interval={}s)",
+                        pw.config().beacon_interval_secs
+                    );
                 }
             }
         }
@@ -2951,6 +3015,30 @@ impl AgentBuilder {
         // Initialize direct messaging infrastructure
         let direct_messaging = std::sync::Arc::new(direct::DirectMessaging::new());
 
+        // Create presence wrapper if network exists
+        let presence = if let Some(ref net) = network {
+            let peer_id = saorsa_gossip_transport::GossipTransport::local_peer_id(net.as_ref());
+            let pw = presence::PresenceWrapper::new(
+                peer_id,
+                std::sync::Arc::clone(net),
+                presence::PresenceConfig::default(),
+            )
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "presence initialization failed: {}",
+                    e
+                )))
+            })?;
+            let pw_arc = std::sync::Arc::new(pw);
+            // Wire presence into gossip runtime for Bulk dispatch
+            if let Some(ref rt) = gossip_runtime {
+                rt.set_presence(std::sync::Arc::clone(&pw_arc));
+            }
+            Some(pw_arc)
+        } else {
+            None
+        };
+
         Ok(Agent {
             identity: std::sync::Arc::new(identity),
             network,
@@ -2970,6 +3058,7 @@ impl AgentBuilder {
             contact_store,
             direct_messaging,
             direct_listener_started: std::sync::atomic::AtomicBool::new(false),
+            presence,
         })
     }
 }

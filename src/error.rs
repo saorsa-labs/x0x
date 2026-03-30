@@ -331,6 +331,44 @@ pub enum NetworkError {
 /// ```
 pub type NetworkResult<T> = std::result::Result<T, NetworkError>;
 
+/// Errors that can occur during presence operations.
+///
+/// Covers beacon broadcasting, FOAF discovery queries, event subscriptions,
+/// and general presence system failures.
+#[derive(Error, Debug)]
+pub enum PresenceError {
+    /// The presence manager has not been initialized.
+    #[error("presence manager not initialized")]
+    NotInitialized,
+
+    /// Beacon broadcast failed.
+    #[error("beacon broadcast failed: {0}")]
+    BeaconFailed(String),
+
+    /// Friend-of-a-friend discovery query failed.
+    #[error("FOAF query failed: {0}")]
+    FoafQueryFailed(String),
+
+    /// Presence event subscription failed.
+    #[error("presence subscription failed: {0}")]
+    SubscriptionFailed(String),
+
+    /// Internal presence system error.
+    #[error("presence internal error: {0}")]
+    Internal(String),
+}
+
+/// Converts a [`PresenceError`] into a [`NetworkError`] for integration
+/// with existing error propagation chains.
+impl From<PresenceError> for NetworkError {
+    fn from(e: PresenceError) -> Self {
+        NetworkError::NodeError(e.to_string())
+    }
+}
+
+/// Standard Result type for x0x presence operations.
+pub type PresenceResult<T> = std::result::Result<T, PresenceError>;
+
 #[cfg(test)]
 mod network_tests {
     #![allow(clippy::unwrap_used)]
