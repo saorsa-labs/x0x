@@ -2,6 +2,7 @@
 
 pub mod constitution;
 pub mod contacts;
+pub mod presence;
 pub mod daemon;
 pub mod direct;
 pub mod discovery;

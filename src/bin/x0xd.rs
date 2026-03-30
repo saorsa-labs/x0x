@@ -1043,6 +1043,11 @@ async fn main() -> Result<()> {
         .route("/subscribe/:id", delete(unsubscribe))
         .route("/events", get(events_sse))
         .route("/presence", get(presence))
+        .route("/presence/online", get(presence_online))
+        .route("/presence/foaf", get(presence_foaf))
+        .route("/presence/find/:id", get(presence_find))
+        .route("/presence/status/:id", get(presence_status))
+        .route("/presence/events", get(presence_events))
         .route("/agents/discovered", get(discovered_agents))
         .route("/agents/discovered/:agent_id", get(discovered_agent))
         .route("/users/:user_id/agents", get(agents_by_user_handler))
@@ -2804,6 +2809,205 @@ async fn presence(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
         ),
     }
+}
+
+/// Query parameters for presence endpoints that accept TTL and timeout.
+#[derive(Debug, Deserialize)]
+struct PresenceQueryParams {
+    /// FOAF hop count (default: 3).
+    #[serde(default = "default_foaf_ttl")]
+    ttl: u8,
+    /// Query timeout in milliseconds (default: 5000).
+    #[serde(default = "default_foaf_timeout_ms")]
+    timeout_ms: u64,
+}
+
+fn default_foaf_ttl() -> u8 {
+    3
+}
+
+fn default_foaf_timeout_ms() -> u64 {
+    5000
+}
+
+/// GET /presence/online
+///
+/// List all agents currently online (network view: all non-blocked agents from
+/// the local discovery cache).
+async fn presence_online(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.agent.discovered_agents().await {
+        Ok(agents) => {
+            let contacts = state.agent.contacts().read().await;
+            let filtered = x0x::presence::filter_by_trust(
+                agents,
+                &contacts,
+                x0x::presence::PresenceVisibility::Network,
+            );
+            let entries: Vec<_> = filtered.into_iter().map(discovered_agent_entry).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "agents": entries })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /presence/foaf?ttl=3&timeout_ms=5000
+///
+/// FOAF random-walk discovery of nearby agents (social view: Trusted + Known only).
+async fn presence_foaf(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PresenceQueryParams>,
+) -> impl IntoResponse {
+    match state
+        .agent
+        .discover_agents_foaf(params.ttl, params.timeout_ms)
+        .await
+    {
+        Ok(agents) => {
+            let contacts = state.agent.contacts().read().await;
+            let filtered = x0x::presence::filter_by_trust(
+                agents,
+                &contacts,
+                x0x::presence::PresenceVisibility::Social,
+            );
+            let entries: Vec<_> = filtered.into_iter().map(discovered_agent_entry).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "agents": entries })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /presence/find/:id?ttl=3&timeout_ms=5000
+///
+/// Find a specific agent by hex-encoded AgentId via FOAF random walk.
+async fn presence_find(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<PresenceQueryParams>,
+) -> impl IntoResponse {
+    let bytes = match hex::decode(&id) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid agent id (expected 64 hex chars)" })),
+            );
+        }
+    };
+    let agent_id = x0x::identity::AgentId(bytes);
+    match state
+        .agent
+        .discover_agent_by_id(agent_id, params.ttl, params.timeout_ms)
+        .await
+    {
+        Ok(Some(agent)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "agent": discovered_agent_entry(agent) })),
+        ),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "agent": null })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /presence/status/:id
+///
+/// Local cache lookup for a specific agent — no network I/O.
+async fn presence_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let bytes = match hex::decode(&id) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid agent id (expected 64 hex chars)" })),
+            );
+        }
+    };
+    let agent_id = x0x::identity::AgentId(bytes);
+    let cached = state.agent.cached_agent(&agent_id).await;
+    let online = cached.is_some();
+    let entry = cached.map(discovered_agent_entry);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "online": online, "agent": entry })),
+    )
+}
+
+/// GET /presence/events
+///
+/// Server-Sent Events stream of presence online/offline events.
+/// Each event is a JSON object: `{"event":"online"|"offline","agent_id":"<hex>"}`.
+async fn presence_events(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    // If presence is not initialized, rx will immediately close — the stream exits cleanly.
+    let rx = state
+        .agent
+        .subscribe_presence()
+        .await
+        .unwrap_or_else(|_| {
+            // Create a dummy channel that is immediately closed so the stream exits.
+            tokio::sync::broadcast::channel::<x0x::presence::PresenceEvent>(1).1
+        });
+    let mut rx = rx;
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(x0x::presence::PresenceEvent::AgentOnline { agent_id, .. }) => {
+                    let data = serde_json::json!({
+                        "event": "online",
+                        "agent_id": hex::encode(agent_id.as_bytes())
+                    })
+                    .to_string();
+                    yield Ok::<Event, std::convert::Infallible>(
+                        Event::default().event("presence").data(data),
+                    );
+                }
+                Ok(x0x::presence::PresenceEvent::AgentOffline { agent_id }) => {
+                    let data = serde_json::json!({
+                        "event": "offline",
+                        "agent_id": hex::encode(agent_id.as_bytes())
+                    })
+                    .to_string();
+                    yield Ok::<Event, std::convert::Infallible>(
+                        Event::default().event("presence").data(data),
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Silently skip lagged messages — client was too slow.
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream)
 }
 
 fn discovered_agent_entry(agent: x0x::DiscoveredAgent) -> DiscoveredAgentEntry {

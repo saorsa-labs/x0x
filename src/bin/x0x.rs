@@ -87,8 +87,11 @@ enum Commands {
     },
     /// List connected gossip peers.
     Peers,
-    /// Show online agents (presence).
-    Presence,
+    /// Presence and agent discovery operations.
+    Presence {
+        #[command(subcommand)]
+        sub: PresenceSub,
+    },
     /// Network diagnostics.
     Network {
         #[command(subcommand)]
@@ -261,6 +264,38 @@ enum NetworkSub {
     Status,
     /// Bootstrap peer cache stats.
     Cache,
+}
+
+/// Presence subcommands.
+#[derive(Subcommand)]
+enum PresenceSub {
+    /// List all currently online agents (network view, non-blocked).
+    Online,
+    /// FOAF random-walk discovery of nearby agents (social view: Trusted + Known).
+    Foaf {
+        /// Maximum hop count for the random walk (1–5).
+        #[arg(long, default_value = "3")]
+        ttl: u8,
+        /// Query timeout in milliseconds.
+        #[arg(long, default_value = "5000")]
+        timeout_ms: u64,
+    },
+    /// Find a specific agent by ID via FOAF random walk.
+    Find {
+        /// Agent ID (hex, 64 chars).
+        id: String,
+        /// Maximum hop count for the random walk (1–5).
+        #[arg(long, default_value = "3")]
+        ttl: u8,
+        /// Query timeout in milliseconds.
+        #[arg(long, default_value = "5000")]
+        timeout_ms: u64,
+    },
+    /// Get local cache presence status for an agent (no network I/O).
+    Status {
+        /// Agent ID (hex, 64 chars).
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -741,7 +776,16 @@ async fn run(
             consent,
         } => commands::identity::announce(&client, include_user, consent).await,
         Commands::Peers => commands::network::peers(&client).await,
-        Commands::Presence => commands::network::presence(&client).await,
+        Commands::Presence { sub } => match sub {
+            PresenceSub::Online => commands::presence::online(&client).await,
+            PresenceSub::Foaf { ttl, timeout_ms } => {
+                commands::presence::foaf(&client, ttl, timeout_ms).await
+            }
+            PresenceSub::Find { id, ttl, timeout_ms } => {
+                commands::presence::find(&client, &id, ttl, timeout_ms).await
+            }
+            PresenceSub::Status { id } => commands::presence::status(&client, &id).await,
+        },
         Commands::Network { sub } => match sub {
             NetworkSub::Status => commands::network::network_status(&client).await,
             NetworkSub::Cache => commands::network::bootstrap_cache(&client).await,
@@ -997,9 +1041,14 @@ x0x (v{VERSION})
 |   +-- health             Health check
 |   +-- status             Runtime status (uptime, peers, addresses)
 |   +-- peers              Connected gossip peers
-|   +-- presence           Online agents
 |   +-- network status     NAT type, connectivity diagnostics
 |   +-- network cache      Bootstrap peer cache stats
+|
++-- Presence
+|   +-- presence online    Online agents (network view, non-blocked)
+|   +-- presence foaf      FOAF discovery (social view: Trusted + Known)
+|   +-- presence find      Find agent by ID via FOAF random walk
+|   +-- presence status    Local cache lookup for an agent (no network I/O)
 |
 +-- Discovery
 |   +-- agents list        List discovered agents

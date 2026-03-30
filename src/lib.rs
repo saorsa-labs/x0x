@@ -2077,6 +2077,19 @@ impl Agent {
         Ok(pw.subscribe_events())
     }
 
+    /// Look up a single agent in the local discovery cache.
+    ///
+    /// Returns `None` if the agent is not currently cached.  No network I/O is
+    /// performed — use [`discover_agent_by_id`](Agent::discover_agent_by_id) for
+    /// an active lookup that queries the network.
+    pub async fn cached_agent(&self, id: &identity::AgentId) -> Option<DiscoveredAgent> {
+        self.identity_discovery_cache
+            .read()
+            .await
+            .get(id)
+            .cloned()
+    }
+
     /// Discover agents via Friend-of-a-Friend (FOAF) random walk.
     ///
     /// Initiates a FOAF query on the global presence topic with the given `ttl`

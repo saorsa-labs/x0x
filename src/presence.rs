@@ -20,9 +20,11 @@ use saorsa_gossip_types::{PeerId, PresenceRecord, TopicId};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 
+use crate::contacts::ContactStore;
 use crate::error::NetworkError;
 use crate::identity::{AgentId, MachineId};
 use crate::network::NetworkNode;
+use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use crate::DiscoveredAgent;
 
 /// The global presence topic used for FOAF queries.
@@ -131,6 +133,57 @@ pub fn presence_record_to_discovered_agent(
         is_relay: None,
         is_coordinator: None,
     })
+}
+
+/// Controls which agents are included in a presence response.
+///
+/// - [`Network`](PresenceVisibility::Network) returns all reachable agents that are
+///   not actively blocked — useful for raw connectivity information.
+/// - [`Social`](PresenceVisibility::Social) returns only agents the local user has
+///   designated as Trusted or Known — the "friends" view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceVisibility {
+    /// Return all reachable agents regardless of trust, except blocked ones.
+    Network,
+    /// Return only agents whose trust level is Trusted or Known.
+    Social,
+}
+
+/// Filter a list of discovered agents according to the given trust scope.
+///
+/// Reads the [`ContactStore`] to evaluate each agent via [`TrustEvaluator`].
+///
+/// - [`PresenceVisibility::Network`]: excludes [`TrustDecision::RejectBlocked`] agents.
+/// - [`PresenceVisibility::Social`]: keeps only [`TrustDecision::Accept`] and
+///   [`TrustDecision::AcceptWithFlag`] agents (Trusted + Known).
+///
+/// Agents not in the contact store (`TrustDecision::Unknown`) are:
+/// - included by `Network`
+/// - excluded by `Social`
+#[must_use]
+pub fn filter_by_trust(
+    agents: Vec<DiscoveredAgent>,
+    store: &ContactStore,
+    visibility: PresenceVisibility,
+) -> Vec<DiscoveredAgent> {
+    let evaluator = TrustEvaluator::new(store);
+    agents
+        .into_iter()
+        .filter(|agent| {
+            let ctx = TrustContext {
+                agent_id: &agent.agent_id,
+                machine_id: &agent.machine_id,
+            };
+            let decision = evaluator.evaluate(&ctx);
+            match visibility {
+                PresenceVisibility::Network => !matches!(decision, TrustDecision::RejectBlocked),
+                PresenceVisibility::Social => matches!(
+                    decision,
+                    TrustDecision::Accept | TrustDecision::AcceptWithFlag
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Configuration for the presence system.
