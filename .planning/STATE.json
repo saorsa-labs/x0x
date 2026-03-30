@@ -16,10 +16,10 @@
     "completed_tasks": 0,
     "current_task": null
   },
-  "status": "continuation_spawned",
+  "status": "fixing",
   "review": {
-    "status": "pending",
-    "iteration": 0,
+    "status": "fixing",
+    "iteration": 1,
     "last_verdict": null
   },
   "last_action": "continuation_spawned",

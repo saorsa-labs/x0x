@@ -1,18 +1,26 @@
 # Quality Patterns Review
-**Date**: 2026-03-30
+**Date**: Mon 30 Mar 2026 10:40:55 BST
 
 ## Good Patterns Found
-- `thiserror` derive used for `PresenceError` — consistent with existing `IdentityError` and `NetworkError`
-- Proper `From` conversion (`PresenceError` → `NetworkError`) enables `?` operator use in mixed contexts
-- `broadcast::channel(256)` — bounded capacity prevents unbounded memory growth
-- `Arc<PresenceManager>` passed by clone, not by reference — correct lifetime management for async tasks
-- `tokio::sync::Mutex` used for `beacon_handle` (awaited in `shutdown`) vs `std::sync::Mutex` for `presence` field in runtime (never awaited across lock) — correct mutex type selection
-- `#[must_use]` on `presence_system()` and `presence()` accessors — prevents accidental discard
-- Optional `presence` field (not mandatory) — agents without network don't pay presence cost
-- Presence shutdown before bootstrap cache save in `shutdown()` — correct teardown ordering
+
+### Error handling
+198:        let signing_key = saorsa_gossip_identity::MlDsaKeyPair::generate().map_err(|e| {
+
+## Pattern Analysis
+- [OK] Proper ? operator usage throughout
+- [OK] Arc<RwLock<...>> for shared mutable state
+- [OK] Tokio broadcast channel for multi-subscriber events
+- [OK] Idempotent start_event_loop (guard.is_some() check)
+- [OK] Bounded broadcast channel (256) prevents unbounded memory
+- [OK] shutdown() cleans up both handles
+- [OK] #[must_use] on pure functions
+- [OK] pub const for topic name (testable)
 
 ## Anti-Patterns Found
-- [LOW] `PresenceWrapper::config()` returns `&PresenceConfig` by reference — config is small and `Clone`, could be passed by value for simplicity. Not a real issue.
-- [LOW] `event_tx` field in `PresenceWrapper` is never actually used to send events yet. The channel is "dead" infrastructure at this stage. Acceptable for foundation wiring.
+- [MINOR] NodeCreation error variant used for 'presence not initialized' (semantic mismatch)
+  NodeCreation implies a failure during node construction, not an API precondition
+  Better: expose a PresenceNotAvailable error or use NodeError('presence not configured')
+- [MINOR] O(n) scan in peer_to_agent_id — no index on machine_id field in cache
+  Acceptable at <10K agents but worth noting for scale
 
-## Grade: A
+## Grade: A-

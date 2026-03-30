@@ -45,6 +45,12 @@ pub fn global_presence_topic() -> TopicId {
 /// x0x `MachineId`, we scan the cache for an entry whose `machine_id` matches.
 ///
 /// Returns `None` if the peer is not yet in the cache.
+///
+/// # Complexity
+///
+/// O(n) where n is the number of known agents. This is acceptable for networks
+/// up to ~10 000 agents. A full reverse index (`MachineId → AgentId`) is
+/// planned for a future phase when scale demands it.
 #[must_use]
 pub fn peer_to_agent_id(
     peer_id: PeerId,
@@ -104,6 +110,12 @@ pub fn presence_record_to_discovered_agent(
 
     // Fallback: create a minimal entry using AgentId(peer.0).
     // This will be replaced by a full entry once the identity heartbeat arrives.
+    //
+    // IMPORTANT: `machine_public_key` is intentionally empty here because we do
+    // not yet have the ML-DSA-65 public key bytes for this peer — they are only
+    // available after the normal identity announcement is received.  Callers that
+    // need to verify rendezvous `ProviderSummary` signatures MUST check that
+    // `machine_public_key` is non-empty before attempting verification.
     let agent_id = AgentId(*peer_id.as_bytes());
     let machine_id = MachineId(*peer_id.as_bytes());
     Some(DiscoveredAgent {
@@ -113,7 +125,7 @@ pub fn presence_record_to_discovered_agent(
         addresses,
         announced_at: record.since,
         last_seen: record.since,
-        machine_public_key: Vec::new(),
+        machine_public_key: Vec::new(), // populated when identity heartbeat arrives
         nat_type: None,
         can_receive_direct: None,
         is_relay: None,
@@ -284,17 +296,33 @@ impl PresenceWrapper {
                         .get(&agent_id)
                         .map(|e| e.addresses.iter().map(|a| a.to_string()).collect())
                         .unwrap_or_default();
-                    let _ = event_tx.send(PresenceEvent::AgentOnline {
-                        agent_id,
-                        addresses,
-                    });
+                    if event_tx
+                        .send(PresenceEvent::AgentOnline {
+                            agent_id,
+                            addresses,
+                        })
+                        .is_err()
+                    {
+                        tracing::debug!(
+                            ?agent_id,
+                            "AgentOnline event dropped: no active subscribers"
+                        );
+                    }
                 }
 
                 // Emit AgentOffline for departed peers.
                 for &peer in previous.difference(&current) {
                     let agent_id = peer_to_agent_id(peer, &cache_snapshot)
                         .unwrap_or_else(|| AgentId(*peer.as_bytes()));
-                    let _ = event_tx.send(PresenceEvent::AgentOffline { agent_id });
+                    if event_tx
+                        .send(PresenceEvent::AgentOffline { agent_id })
+                        .is_err()
+                    {
+                        tracing::debug!(
+                            ?agent_id,
+                            "AgentOffline event dropped: no active subscribers"
+                        );
+                    }
                 }
 
                 drop(cache_snapshot);
@@ -318,5 +346,140 @@ impl PresenceWrapper {
         if let Some(h) = event.take() {
             h.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::{AgentId, MachineId};
+    use crate::DiscoveredAgent;
+    use std::collections::HashMap;
+
+    fn make_discovered_agent(agent_id: AgentId, machine_id: MachineId) -> DiscoveredAgent {
+        DiscoveredAgent {
+            agent_id,
+            machine_id,
+            user_id: None,
+            addresses: vec!["127.0.0.1:5000".parse().unwrap()],
+            announced_at: 1000,
+            last_seen: 1000,
+            machine_public_key: vec![1u8; 32],
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+        }
+    }
+
+    #[test]
+    fn test_global_presence_topic_is_deterministic() {
+        let t1 = global_presence_topic();
+        let t2 = global_presence_topic();
+        assert_eq!(t1, t2, "global_presence_topic must be deterministic");
+    }
+
+    #[test]
+    fn test_peer_to_agent_id_found() {
+        let machine_bytes = [42u8; 32];
+        let machine_id = MachineId(machine_bytes);
+        let agent_id = AgentId([7u8; 32]);
+        let peer_id = PeerId::new(machine_bytes);
+
+        let mut cache = HashMap::new();
+        cache.insert(agent_id, make_discovered_agent(agent_id, machine_id));
+
+        let result = peer_to_agent_id(peer_id, &cache);
+        assert_eq!(result, Some(agent_id));
+    }
+
+    #[test]
+    fn test_peer_to_agent_id_not_found() {
+        let cache: HashMap<AgentId, DiscoveredAgent> = HashMap::new();
+        let peer_id = PeerId::new([1u8; 32]);
+        assert_eq!(peer_to_agent_id(peer_id, &cache), None);
+    }
+
+    #[test]
+    fn test_parse_addr_hints_valid() {
+        let hints = vec!["127.0.0.1:5000".to_string(), "[::1]:5001".to_string()];
+        let addrs = parse_addr_hints(&hints);
+        assert_eq!(addrs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_addr_hints_invalid_skipped() {
+        let hints = vec!["not-an-addr".to_string(), "127.0.0.1:5000".to_string()];
+        let addrs = parse_addr_hints(&hints);
+        assert_eq!(addrs.len(), 1);
+    }
+
+    #[test]
+    fn test_presence_record_to_discovered_agent_cache_hit() {
+        use saorsa_gossip_types::PresenceRecord;
+
+        let machine_bytes = [10u8; 32];
+        let machine_id = MachineId(machine_bytes);
+        let agent_id = AgentId([20u8; 32]);
+        let peer_id = PeerId::new(machine_bytes);
+
+        let mut cache = HashMap::new();
+        cache.insert(agent_id, make_discovered_agent(agent_id, machine_id));
+
+        // Create a non-expired presence record.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = PresenceRecord::new([0u8; 32], vec!["192.168.1.1:5000".to_string()], 300);
+        // record.expires = now + 300
+
+        let result = presence_record_to_discovered_agent(peer_id, &record, &cache);
+        assert!(
+            result.is_some(),
+            "Should return Some for non-expired record"
+        );
+        let da = result.unwrap();
+        assert_eq!(da.agent_id, agent_id, "Should use cached agent_id");
+        // Addresses should be updated from the presence record.
+        assert_eq!(da.addresses.len(), 1);
+        // machine_public_key should be preserved from cache (non-empty).
+        assert!(!da.machine_public_key.is_empty());
+        let _ = now; // suppress unused warning
+    }
+
+    #[test]
+    fn test_presence_record_to_discovered_agent_fallback() {
+        use saorsa_gossip_types::PresenceRecord;
+
+        let peer_bytes = [99u8; 32];
+        let peer_id = PeerId::new(peer_bytes);
+        let cache: HashMap<AgentId, DiscoveredAgent> = HashMap::new();
+
+        let record = PresenceRecord::new([0u8; 32], vec!["10.0.0.1:5000".to_string()], 300);
+
+        let result = presence_record_to_discovered_agent(peer_id, &record, &cache);
+        assert!(result.is_some(), "Fallback should produce an entry");
+        let da = result.unwrap();
+        // Fallback: AgentId equals PeerId bytes.
+        assert_eq!(da.agent_id.0, peer_bytes);
+        // machine_public_key is empty in fallback.
+        assert!(da.machine_public_key.is_empty());
+    }
+
+    #[test]
+    fn test_presence_record_to_discovered_agent_expired() {
+        use saorsa_gossip_types::PresenceRecord;
+
+        let peer_id = PeerId::new([1u8; 32]);
+        let cache: HashMap<AgentId, DiscoveredAgent> = HashMap::new();
+
+        // Create an already-expired record (expires in the past).
+        let mut record = PresenceRecord::new([0u8; 32], vec![], 1);
+        // Force expires to 0 (past).
+        record.expires = 0;
+
+        let result = presence_record_to_discovered_agent(peer_id, &record, &cache);
+        assert!(result.is_none(), "Expired record should return None");
     }
 }

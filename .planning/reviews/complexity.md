@@ -1,17 +1,27 @@
 # Complexity Review
-**Date**: 2026-03-30
+**Date**: Mon 30 Mar 2026 10:40:34 BST
 
-## Statistics
-- src/presence.rs: 145 lines (new file)
-- src/gossip/runtime.rs: 378 lines (was 332, +46 lines)
-- src/lib.rs: ~3060 lines (was ~3015, +45 lines for presence wiring + ~6 for shutdown)
+## File sizes
+     322 /Users/davidirvine/Desktop/Devel/projects/x0x/src/presence.rs
+    3895 /Users/davidirvine/Desktop/Devel/projects/x0x/src/lib.rs
+    4217 total
+
+## New function sizes
+start_event_loop: ~55 lines (spawns tokio task with poll loop)
+discover_agents_foaf: ~30 lines
+discover_agent_by_id: ~18 lines
+subscribe_presence: ~8 lines
+presence_record_to_discovered_agent: ~35 lines
+peer_to_agent_id: ~8 lines
+
+## Cyclomatic complexity
+- start_event_loop: low — 1 branch (already running check) + poll loop
+- discover_agents_foaf: low — linear flow with map/filter
+- presence_record_to_discovered_agent: moderate — 3 branches (expired, cache hit, fallback)
 
 ## Findings
-- [OK] `PresenceWrapper` is a thin wrapper — 145 lines for a struct with 4 fields, constructor, and 4 methods. No excessive complexity.
-- [OK] `GossipRuntime::start()` dispatcher extension adds one new `GossipStreamType::Bulk` arm. Nesting is kept flat with early-return pattern.
-- [LOW] src/lib.rs — `join_network()` presence wiring block (~49 lines) has 4 levels of nesting: `if let Some(ref pw)` → `if let Some(ref runtime)` → `for peer in active` and `if let Some(ref net)` → `if let Some(status)`. This is the deepest nesting but still readable.
-- [OK] `AgentBuilder::build()` presence init block (~30 lines) uses the same `if let Some(ref net) = network` pattern already used throughout the function. Consistent.
-- [OK] No function exceeds 100 lines in the new code.
-- [OK] Cyclomatic complexity is low — the new code paths are primarily Option-matching and async delegation.
+- [OK] All new functions are small and focused
+- [OK] No deeply nested code
+- [MINOR] lib.rs is now very large (3000+ lines); could benefit from splitting Agent impl
 
 ## Grade: A

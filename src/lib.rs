@@ -2063,13 +2063,13 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// Returns [`error::NetworkError::NodeCreation`] if this agent was built
+    /// Returns [`error::NetworkError::NodeError`] if this agent was built
     /// without a network configuration (i.e. no `with_network_config` on the builder).
     pub async fn subscribe_presence(
         &self,
     ) -> error::NetworkResult<tokio::sync::broadcast::Receiver<presence::PresenceEvent>> {
         let pw = self.presence.as_ref().ok_or_else(|| {
-            error::NetworkError::NodeCreation("presence system not initialized".to_string())
+            error::NetworkError::NodeError("presence system not initialized".to_string())
         })?;
         // Ensure the event loop is running.
         pw.start_event_loop(std::sync::Arc::clone(&self.identity_discovery_cache))
@@ -2094,14 +2094,14 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// Returns [`error::NetworkError::NodeCreation`] if no network config was provided.
+    /// Returns [`error::NetworkError::NodeError`] if no network config was provided.
     pub async fn discover_agents_foaf(
         &self,
         ttl: u8,
         timeout_ms: u64,
     ) -> error::NetworkResult<Vec<DiscoveredAgent>> {
         let pw = self.presence.as_ref().ok_or_else(|| {
-            error::NetworkError::NodeCreation("presence system not initialized".to_string())
+            error::NetworkError::NodeError("presence system not initialized".to_string())
         })?;
 
         let topic = presence::global_presence_topic();

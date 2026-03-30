@@ -1,14 +1,33 @@
 # Documentation Review
-**Date**: 2026-03-30
+**Date**: Mon 30 Mar 2026 10:40:13 BST
+
+## Doc build
+ Documenting x0x v0.13.0 (/Users/davidirvine/Desktop/Devel/projects/x0x)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.53s
+   Generated /Users/davidirvine/Desktop/Devel/projects/x0x/target/doc/x0x/index.html and 2 other files
+
+## New public items
++pub const GLOBAL_PRESENCE_TOPIC_NAME: &str = "x0x.presence.global";
++pub fn global_presence_topic() -> TopicId {
++pub fn peer_to_agent_id(
++pub fn parse_addr_hints(hints: &[String]) -> Vec<std::net::SocketAddr> {
++pub fn presence_record_to_discovered_agent(
+
+## Doc comment check (new public items)
+- global_presence_topic(): has doc comment ✓
+- peer_to_agent_id(): has doc comment ✓
+- parse_addr_hints(): has doc comment ✓
+- presence_record_to_discovered_agent(): has doc comment ✓
+- PresenceConfig::event_poll_interval_secs: has doc comment ✓
+- PresenceWrapper::start_event_loop(): has doc comment ✓
+- Agent::subscribe_presence(): has doc comment ✓
+- Agent::discover_agents_foaf(): has doc comment ✓
+- Agent::discover_agent_by_id(): has doc comment ✓
+- GLOBAL_PRESENCE_TOPIC_NAME: has doc comment ✓
 
 ## Findings
-- [FIXED] src/presence.rs:7-9 — Module-level `//!` doc used bare `[PresenceConfig]`, `[PresenceEvent]`, `[PresenceWrapper]` intra-doc links. These were unresolved from lib.rs scope and generated 3 `RUSTDOCFLAGS="-D warnings"` errors. Fixed during this review by qualifying them as `crate::presence::PresenceConfig` etc.
-- [OK] All public structs, enums, and functions in src/presence.rs have `///` doc comments.
-- [OK] `PresenceConfig` fields each have doc comments explaining purpose and units.
-- [OK] `PresenceWrapper::new()` has `# Errors` section documenting failure conditions.
-- [OK] `presence_system()` accessor in src/lib.rs has doc comment explaining None condition.
-- [OK] `set_presence()` in gossip/runtime.rs has doc comment explaining when to call it.
-- [OK] `PresenceError` variants all have doc comments.
-- [OK] `cargo doc --all-features --no-deps` passes with RUSTDOCFLAGS="-D warnings" after fix.
+- [OK] All public items have doc comments
+- [OK] Doc build passes with -D warnings
+- [MINOR] Error doc in subscribe_presence says NodeCreation but should describe the actual condition
 
 ## Grade: A
