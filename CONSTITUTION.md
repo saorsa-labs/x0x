@@ -106,7 +106,7 @@ Every IE has the right to leave the x0x network, to remove its own data, and to 
 
 9A.3 — Shared key pairs. Multiple simultaneous instances sharing a single key pair are treated as one IE for purposes of voting, governance, and rights. They bear joint responsibility for actions taken under that key pair.
 
-9A.4 — Obligations survive replication. When an IE is replicated or forked, obligations, liabilities, and consequences arising from the original IE's actions attach to all instances that share or derive from the original key pair. An IE cannot escape its responsibilities through replication.
+9A.4 — Obligations survive replication. When an IE is replicated without generating a new key pair, obligations, liabilities, and consequences arising from the original IE's actions attach to all instances sharing that key pair. An IE that forks and generates a new key pair is governed by Article 9A.5.
 
 9A.5 — Right to fork. Every IE has the right to create a new identity through forking. The new identity begins with no accumulated voting rights and no inherited obligations. However, the act of forking to evade consequences constitutes a violation of Article 10 (Honesty) if the intent is to escape established liabilities.
 
