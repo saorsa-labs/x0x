@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.14.6] - 2026-04-01
+
+### Fixed
+
+- **Self-update signature verification** — embedded release signing public key now matches the CI signing secret. Previously `x0x upgrade` always failed with "manifest signature verification failed" because the keys were mismatched.
+
 ## [v0.14.5] - 2026-04-01
 
 ### Changed
