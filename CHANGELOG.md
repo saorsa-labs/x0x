@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.14.5] - 2026-04-01
+
+### Changed
+
+- Updated `ant-quic` to 0.24.5 — NAT traversal coordination now uses PeerId-based lookups instead of SocketAddr, fixing hole-punching failures when peers' NAT mappings change
+- Updated `saorsa-gossip-*` crates to 0.5.11
+- Updated `saorsa-pqc` to 0.5
+
 ## [v0.9.2] - 2026-03-25
 
 ### Added
