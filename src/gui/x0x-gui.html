@@ -609,7 +609,7 @@ const savedCard=LS.get('card_link','');
 const BASE=location.origin;
 // API token injected by x0xd at serve time (see X0X_TOKEN global)
 const API_TOKEN=typeof X0X_TOKEN!=='undefined'?X0X_TOKEN:'';
-const WS_URL=BASE.replace(/^http/,'ws')+'/ws'+(API_TOKEN?'?token='+API_TOKEN:'');
+const WS_URL=BASE.replace(/^http/,'ws')+'/ws/direct'+(API_TOKEN?'?token='+API_TOKEN:'');
 let ws=null;
 const wsSubs=new Set();
 
