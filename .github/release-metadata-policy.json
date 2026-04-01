@@ -1,0 +1,66 @@
+{
+  "global_triggers": [
+    ".github/release-metadata-policy.json",
+    ".github/scripts/validate_release_metadata.py"
+  ],
+  "exclude": [
+    "CHANGELOG.md",
+    "README.md",
+    "docs/adr/**",
+    "docs/design/**",
+    "docs/2026-03-28-audit-response.md"
+  ],
+  "rules": {
+    "version_sync": {
+      "kind": "version_sync",
+      "level": "blocking",
+      "inputs": [
+        "SKILL.md",
+        "Cargo.toml"
+      ],
+      "modes": {
+        "pull_request": "changed_only",
+        "push_main": "always",
+        "release_tag": "always"
+      }
+    },
+    "openclaw_bins": {
+      "kind": "openclaw_bins",
+      "level": "blocking",
+      "inputs": [
+        "SKILL.md",
+        "scripts/install.sh",
+        ".github/workflows/release.yml"
+      ],
+      "modes": {
+        "pull_request": "changed_only",
+        "push_main": "always",
+        "release_tag": "always"
+      },
+      "expected_bins": {
+        "unix": [
+          "x0xd",
+          "x0x"
+        ],
+        "windows": [
+          "x0xd.exe",
+          "x0x.exe"
+        ]
+      }
+    },
+    "current_release_docs": {
+      "kind": "current_release_docs",
+      "level": "warn_only",
+      "inputs": [
+        "docs/api-reference.md",
+        "docs/overview.md",
+        "docs/primers/*.md"
+      ],
+      "modes": {
+        "pull_request": "changed_only",
+        "push_main": "always",
+        "release_tag": "always"
+      }
+    }
+  }
+}

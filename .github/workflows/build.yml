@@ -11,8 +11,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate-release-metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release metadata (pull request)
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 .github/scripts/validate_release_metadata.py \
+            --mode pull_request \
+            --base-sha "${{ github.event.pull_request.base.sha }}"
+
+      - name: Validate release metadata (push or dispatch)
+        if: github.event_name != 'pull_request'
+        run: |
+          python3 .github/scripts/validate_release_metadata.py \
+            --mode push_main
+
   build-matrix:
     name: Build ${{ matrix.platform }}
+    needs: validate-release-metadata
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

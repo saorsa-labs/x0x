@@ -20,11 +20,33 @@ permissions:
   id-token: write
 
 jobs:
+  validate-release-metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release metadata (tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python3 .github/scripts/validate_release_metadata.py \
+            --mode release_tag \
+            --tag "${GITHUB_REF_NAME}"
+
+      - name: Validate release metadata (manual dispatch)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          python3 .github/scripts/validate_release_metadata.py \
+            --mode push_main
+
   # ============================================================
   # Build release binaries for all platforms
   # ============================================================
   build-release:
     name: Build ${{ matrix.platform }}
+    needs: validate-release-metadata
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
