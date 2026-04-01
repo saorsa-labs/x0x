@@ -279,14 +279,58 @@ def extract_shell_loop_bins(path_str):
     return [item for item in match.group(1).split() if item]
 
 
+def extract_step_run_block(path_str, step_name):
+    lines = read_text(path_str).splitlines()
+
+    for index, line in enumerate(lines):
+        if line.strip() != f"- name: {step_name}":
+            continue
+
+        step_indent = len(line) - len(line.lstrip(" "))
+        run_indent = None
+
+        for next_index in range(index + 1, len(lines)):
+            next_line = lines[next_index]
+            stripped = next_line.strip()
+            indent = len(next_line) - len(next_line.lstrip(" "))
+
+            if stripped.startswith("- name:") and indent == step_indent:
+                break
+
+            if stripped == "run: |" and indent > step_indent:
+                run_indent = indent
+                block = []
+
+                for body_index in range(next_index + 1, len(lines)):
+                    body_line = lines[body_index]
+                    body_stripped = body_line.strip()
+                    body_indent = len(body_line) - len(body_line.lstrip(" "))
+
+                    if body_stripped and body_indent <= run_indent:
+                        break
+
+                    if body_line.startswith(" " * (run_indent + 2)):
+                        block.append(body_line[run_indent + 2 :])
+                    elif not body_stripped:
+                        block.append("")
+
+                return "\n".join(block)
+
+        raise ValueError(
+            f"Could not find run block for workflow step {step_name!r} in {path_str}"
+        )
+
+    raise ValueError(f"Could not find workflow step {step_name!r} in {path_str}")
+
+
 def extract_release_unix_bins(path_str):
-    text = read_text(path_str)
-    matches = re.findall(r"for bin in ([^;]+); do", text)
-    for match in matches:
-        bins = [item for item in match.split() if item]
-        if bins == ["x0xd", "x0x"]:
-            return bins
-    raise ValueError(f"Could not find packaged unix binaries in {path_str}")
+    run_block = extract_step_run_block(path_str, "Package (tar.gz)")
+    match = re.search(r"for bin in ([^;]+); do", run_block)
+    if not match:
+        raise ValueError(
+            f"Could not find packaged unix binaries in Package (tar.gz) step of {path_str}"
+        )
+    return [item for item in match.group(1).split() if item]
 
 
 def extract_release_windows_bins(path_str):
