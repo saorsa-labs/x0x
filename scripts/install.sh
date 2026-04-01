@@ -2,17 +2,16 @@
 # x0x installer — installs the x0x agent network.
 #
 # Usage:
-#   curl -sfL https://x0x.md | sh                    # install only
-#   curl -sfL https://x0x.md | sh -s -- --start      # install + start daemon
+#   curl -sfL https://x0x.md | sh                    # install + start
 #   curl -sfL https://x0x.md | sh -s -- --autostart   # install + start + autostart on boot
-#   bash install.sh --name alice --start              # named instance
+#   bash install.sh --name alice                      # named instance
 #
 # What it does:
 #   1. Detects platform (Linux/macOS, x64/arm64)
 #   2. Downloads latest release from GitHub
-#   3. Installs x0xd (daemon) + x0x (CLI) to ~/.local/bin
-#   4. Seeds the shared peer cache with 6 global bootstrap nodes
-#   5. Optionally starts the daemon (--start)
+#   3. Stops any running x0xd instance
+#   4. Installs x0xd (daemon) + x0x (CLI) to ~/.local/bin
+#   5. Starts the daemon
 #   6. Optionally configures autostart on boot (--autostart)
 #
 # Requirements: curl or wget, tar, sh
@@ -24,15 +23,13 @@ REPO="saorsa-labs/x0x"
 URL="https://github.com/$REPO/releases/latest/download"
 BIN="$HOME/.local/bin"
 NAME=""
-START=false
 AUTOSTART=false
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --start)     START=true ;;
-        --autostart) AUTOSTART=true; START=true ;;
+        --autostart) AUTOSTART=true ;;
         --name)      shift; NAME="$1" ;;
         --name=*)    NAME="${1#*=}" ;;
     esac
@@ -70,6 +67,19 @@ if [ -n "$NAME" ]; then
     INSTANCE_DIR="$DATABASE/x0x-$NAME"
 else
     INSTANCE_DIR="$SHARED_DIR"
+fi
+
+# ── Stop any running instance ───────────────────────────────────────────────
+
+XOX="$BIN/x0x"
+if [ -f "$XOX" ]; then
+    echo "Stopping running instance..."
+    if [ -n "$NAME" ]; then
+        "$XOX" --name "$NAME" stop >/dev/null 2>&1 || true
+    else
+        "$XOX" stop >/dev/null 2>&1 || true
+    fi
+    sleep 1
 fi
 
 # ── Download and install ────────────────────────────────────────────────────
@@ -127,159 +137,66 @@ mkdir -p "$SHARED_DIR"
 # The daemon seeds the cache on first run from compiled-in peers.
 # We just ensure the shared directory exists so all instances can find it.
 
-# ── Start daemon (optional) ─────────────────────────────────────────────────
+# ── Start daemon ────────────────────────────────────────────────────────────
 
-if [ "$START" = true ]; then
-    echo ""
-
-    XOXD="$BIN/x0xd"
-    CMD="$XOXD"
-    if [ -n "$NAME" ]; then
-        CMD="$XOXD --name $NAME"
-    fi
-
-    mkdir -p "$INSTANCE_DIR"
-    echo "Starting: $CMD"
-    nohup $CMD >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
-    PID=$!
-
-    # Wait for port file
-    PORTFILE="$INSTANCE_DIR/api.port"
-    TRIES=0
-    while [ ! -f "$PORTFILE" ] && [ $TRIES -lt 30 ]; do
-        sleep 1
-        TRIES=$((TRIES + 1))
-    done
-
-    if [ ! -f "$PORTFILE" ]; then
-        echo "Timeout waiting for daemon. Check: cat $INSTANCE_DIR/x0xd.log"
-        exit 1
-    fi
-
-    API=$(cat "$PORTFILE")
-
-    # Wait for healthy
-    TRIES=0
-    while [ $TRIES -lt 15 ]; do
-        if curl -sf "http://$API/health" >/dev/null 2>&1; then break; fi
-        sleep 1
-        TRIES=$((TRIES + 1))
-    done
-
-    HEALTH=$(curl -sf "http://$API/health" 2>/dev/null || echo '{"ok":false}')
-    AGENT=$(curl -sf "http://$API/agent" 2>/dev/null || echo '{}')
-
-    echo ""
-    echo "x0x is running"
-    echo "  API:    http://$API"
-    echo "  Health: $HEALTH"
-    echo "  Agent:  $AGENT"
-    echo "  Log:    $INSTANCE_DIR/x0xd.log"
-    echo "  PID:    $PID"
+echo ""
+XOXD="$BIN/x0xd"
+CMD="$XOXD"
+if [ -n "$NAME" ]; then
+    CMD="$XOXD --name $NAME"
 fi
+
+mkdir -p "$INSTANCE_DIR"
+echo "Starting: $CMD"
+nohup $CMD >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
+PID=$!
+
+# Wait for port file
+PORTFILE="$INSTANCE_DIR/api.port"
+TRIES=0
+while [ ! -f "$PORTFILE" ] && [ $TRIES -lt 30 ]; do
+    sleep 1
+    TRIES=$((TRIES + 1))
+done
+
+if [ ! -f "$PORTFILE" ]; then
+    echo "Timeout waiting for daemon. Check: cat $INSTANCE_DIR/x0xd.log"
+    exit 1
+fi
+
+API=$(cat "$PORTFILE")
+
+# Wait for healthy
+TRIES=0
+while [ $TRIES -lt 15 ]; do
+    if curl -sf "http://$API/health" >/dev/null 2>&1; then break; fi
+    sleep 1
+    TRIES=$((TRIES + 1))
+done
+
+HEALTH=$(curl -sf "http://$API/health" 2>/dev/null || echo '{"ok":false}')
+AGENT=$(curl -sf "http://$API/agent" 2>/dev/null || echo '{}')
+
+echo ""
+echo "x0x is running"
+echo "  API:    http://$API"
+echo "  Health: $HEALTH"
+echo "  Agent:  $AGENT"
+echo "  Log:    $INSTANCE_DIR/x0xd.log"
+echo "  PID:    $PID"
 
 # ── Autostart on boot (optional) ────────────────────────────────────────────
 
 if [ "$AUTOSTART" = true ]; then
     echo ""
-    XOXD="$BIN/x0xd"
-    XOXD_ARGS=""
-    if [ -n "$NAME" ]; then
-        XOXD_ARGS="--name $NAME"
-    fi
-
-    case "$OS" in
-        Linux)
-            # systemd user service
-            UNIT_DIR="$HOME/.config/systemd/user"
-            mkdir -p "$UNIT_DIR"
-            cat > "$UNIT_DIR/x0xd.service" << UNIT
-[Unit]
-Description=x0x Agent Daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$XOXD $XOXD_ARGS
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-UNIT
-            systemctl --user daemon-reload
-            systemctl --user enable x0xd
-            # If we haven't started it yet, start via systemd
-            if [ "$START" = false ]; then
-                systemctl --user start x0xd
-            fi
-            echo "Autostart: systemd user service enabled"
-            echo "  systemctl --user status x0xd"
-            echo "  systemctl --user stop x0xd"
-            echo "  journalctl --user -u x0xd"
-            ;;
-        Darwin)
-            # launchd user agent
-            PLIST_DIR="$HOME/Library/LaunchAgents"
-            mkdir -p "$PLIST_DIR"
-            PLIST="$PLIST_DIR/com.saorsalabs.x0xd.plist"
-            cat > "$PLIST" << PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.saorsalabs.x0xd</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XOXD</string>
-PLIST
-            if [ -n "$NAME" ]; then
-                cat >> "$PLIST" << PLIST
-        <string>--name</string>
-        <string>$NAME</string>
-PLIST
-            fi
-            cat >> "$PLIST" << PLIST
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>$INSTANCE_DIR/x0xd.log</string>
-    <key>StandardErrorPath</key>
-    <string>$INSTANCE_DIR/x0xd.log</string>
-</dict>
-</plist>
-PLIST
-            # If we haven't started it yet, load now
-            if [ "$START" = false ]; then
-                launchctl load "$PLIST"
-            fi
-            echo "Autostart: launchd agent installed"
-            echo "  launchctl list | grep x0xd"
-            echo "  launchctl unload $PLIST"
-            ;;
-    esac
+    "$XOX" autostart
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 
-if [ "$START" = false ]; then
-    echo ""
-    echo "Installation complete. To start:"
-    if [ -n "$NAME" ]; then
-        echo "  x0x start --name $NAME"
-        echo "  # or: x0xd --name $NAME"
-    else
-        echo "  x0x start"
-        echo "  # or: x0xd"
-    fi
-    echo ""
-    echo "To autostart on boot: bash install.sh --autostart"
-fi
-
+echo ""
+echo "Try:  x0x gui                   Open the web GUI"
+echo "      x0x autostart             Start on boot"
+echo "      x0x autostart --remove    Remove autostart"
 echo ""
 echo "Docs: https://github.com/$REPO"

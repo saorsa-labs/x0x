@@ -321,10 +321,24 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
         );
         std::fs::write(&plist_path, plist)?;
 
+        // Unload any existing agent first (ignore errors if not loaded).
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .output();
+
+        // Load the agent so it starts now and on boot.
+        let status = std::process::Command::new("launchctl")
+            .args(["load", &plist_path.to_string_lossy()])
+            .status()
+            .context("failed to run launchctl load")?;
+        if !status.success() {
+            anyhow::bail!("launchctl load failed (exit {})", status);
+        }
+
         println!("Autostart enabled (launchd agent)");
-        println!("  launchctl load {}", plist_path.display());
-        println!("  launchctl list | grep x0xd");
-        println!("  launchctl unload {}", plist_path.display());
+        println!("  Plist:  {}", plist_path.display());
+        println!("  Status: launchctl list | grep x0xd");
+        println!("  Remove: x0x autostart --remove");
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
