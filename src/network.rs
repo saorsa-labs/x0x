@@ -316,14 +316,14 @@ impl NetworkNode {
     /// # Returns
     ///
     /// The bind address from config. Note: if the config specifies port 0,
-    /// this returns port 0. Use [`bound_addr`] for the real OS-assigned port.
+    /// this returns port 0. Use `bound_addr()` for the real OS-assigned port.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.config.bind_addr
     }
 
     /// Get the actual bound address from the QUIC endpoint.
     ///
-    /// Unlike [`local_addr`] which returns the config value (possibly port 0),
+    /// Unlike `local_addr()` which returns the config value (possibly port 0),
     /// this queries the running endpoint for the real OS-assigned address.
     /// Falls back to the config bind address if the endpoint is unavailable.
     pub async fn bound_addr(&self) -> Option<SocketAddr> {
