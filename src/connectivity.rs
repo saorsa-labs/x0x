@@ -102,6 +102,9 @@ pub enum ConnectOutcome {
     Direct(std::net::SocketAddr),
     /// Connected via coordinated hole-punch or relay.
     Coordinated(std::net::SocketAddr),
+    /// Already connected via gossip overlay (e.g. LAN peer with no public
+    /// address in their announcement).  Direct messaging is available.
+    AlreadyConnected,
     /// Agent was found but could not be reached.
     Unreachable,
     /// Agent was not found in the discovery cache.
@@ -113,6 +116,7 @@ impl std::fmt::Display for ConnectOutcome {
         match self {
             Self::Direct(addr) => write!(f, "direct({addr})"),
             Self::Coordinated(addr) => write!(f, "coordinated({addr})"),
+            Self::AlreadyConnected => write!(f, "already_connected"),
             Self::Unreachable => write!(f, "unreachable"),
             Self::NotFound => write!(f, "not_found"),
         }

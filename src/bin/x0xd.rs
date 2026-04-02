@@ -815,14 +815,26 @@ async fn main() -> Result<()> {
     };
 
     // Create agent
+    //
+    // Peer cache is scoped per data_dir when a custom data_dir is configured
+    // (e.g., for named instances or test setups). This prevents VPS peer
+    // addresses from previous runs polluting local-only configurations.
+    // When using the default data_dir, the shared cache is used so that the
+    // main daemon benefits from cached peers across restarts.
+    let cache_dir = if config.data_dir != default_data_dir() {
+        let dir = config.data_dir.join("peers");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    } else {
+        shared_cache_dir().join("peers")
+    };
     let network_config = NetworkConfig {
         bind_addr: Some(bind_address),
         bootstrap_nodes: config.bootstrap_peers.clone(),
         max_connections: 50,
         connection_timeout: std::time::Duration::from_secs(30),
         stats_interval: std::time::Duration::from_secs(60),
-        // Shared peer cache across ALL instances (not per-instance)
-        peer_cache_path: Some(shared_cache_dir().join("peers.cache")),
+        peer_cache_path: Some(cache_dir.join("peers.cache")),
         pinned_bootstrap_peers: std::collections::HashSet::new(),
         inbound_allowlist: std::collections::HashSet::new(),
         max_peers_per_ip: 3,
@@ -830,7 +842,7 @@ async fn main() -> Result<()> {
 
     let mut builder = Agent::builder()
         .with_network_config(network_config)
-        .with_peer_cache_dir(shared_cache_dir().join("peers"))
+        .with_peer_cache_dir(cache_dir)
         .with_heartbeat_interval(config.heartbeat_interval_secs)
         .with_identity_ttl(config.identity_ttl_secs);
 
@@ -4363,13 +4375,23 @@ async fn connect_agent(
         }
     };
 
-    match state.agent.connect_to_agent(&agent_id).await {
-        Ok(outcome) => {
+    // Apply a 60-second overall timeout to prevent indefinite hangs when
+    // the agent has multiple unreachable addresses (each with its own 30s
+    // QUIC timeout).
+    let connect_result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        state.agent.connect_to_agent(&agent_id),
+    )
+    .await;
+
+    match connect_result {
+        Ok(Ok(outcome)) => {
             let (outcome_str, addr) = match outcome {
                 x0x::connectivity::ConnectOutcome::Direct(a) => ("Direct", Some(a.to_string())),
                 x0x::connectivity::ConnectOutcome::Coordinated(a) => {
                     ("Coordinated", Some(a.to_string()))
                 }
+                x0x::connectivity::ConnectOutcome::AlreadyConnected => ("AlreadyConnected", None),
                 x0x::connectivity::ConnectOutcome::Unreachable => ("Unreachable", None),
                 x0x::connectivity::ConnectOutcome::NotFound => ("NotFound", None),
             };
@@ -4382,11 +4404,25 @@ async fn connect_agent(
                 })),
             )
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!("connect_agent failed: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "ok": false, "error": "connection failed" })),
+            )
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "connect_agent timed out after 60s for agent {}",
+                req.agent_id
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "outcome": "Unreachable",
+                    "addr": null
+                })),
             )
         }
     }

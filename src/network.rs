@@ -311,13 +311,27 @@ impl NetworkNode {
         &self.config
     }
 
-    /// Get the local socket address.
+    /// Get the configured bind address (may contain port 0 before binding).
     ///
     /// # Returns
     ///
-    /// The local address this node is bound to.
+    /// The bind address from config. Note: if the config specifies port 0,
+    /// this returns port 0. Use [`bound_addr`] for the real OS-assigned port.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.config.bind_addr
+    }
+
+    /// Get the actual bound address from the QUIC endpoint.
+    ///
+    /// Unlike [`local_addr`] which returns the config value (possibly port 0),
+    /// this queries the running endpoint for the real OS-assigned address.
+    /// Falls back to the config bind address if the endpoint is unavailable.
+    pub async fn bound_addr(&self) -> Option<SocketAddr> {
+        if let Some(status) = self.node_status().await {
+            Some(status.local_addr)
+        } else {
+            self.config.bind_addr
+        }
     }
 
     /// Get the external address as observed by remote peers.
@@ -332,16 +346,20 @@ impl NetworkNode {
     /// Get the best routable address for advertising to other peers.
     ///
     /// Prefers the external (observed) address over the local bind address.
-    /// Filters out unroutable addresses like `0.0.0.0`.
+    /// Filters out unroutable addresses (unspecified IP or port 0).
     pub async fn routable_addr(&self) -> Option<SocketAddr> {
         // Prefer observed external address
         if let Some(addr) = self.external_addr().await {
             return Some(addr);
         }
-        // Fall back to bind address only if it's routable
-        self.config
-            .bind_addr
-            .filter(|addr| !addr.ip().is_unspecified())
+        // Fall back to the real bound address (resolves OS-assigned ports),
+        // then to the config bind address. Either way, reject unspecified
+        // IPs and port 0 — those are not connectable.
+        let addr = self.bound_addr().await?;
+        if addr.ip().is_unspecified() || addr.port() == 0 {
+            return None;
+        }
+        Some(addr)
     }
 
     /// Get the full node status from ant-quic, including NAT type,

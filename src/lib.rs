@@ -250,6 +250,35 @@ pub fn rendezvous_shard_topic_for_agent(agent_id: &identity::AgentId) -> String 
     format!("{RENDEZVOUS_SHARD_TOPIC_PREFIX}.{shard}")
 }
 
+/// Returns `true` if the IP address is globally routable (reachable from the
+/// public internet).  Used to filter announcement addresses so that private,
+/// link-local, loopback, and other non-routable addresses never propagate
+/// through gossip — they would create dead-end cache entries on remote nodes.
+///
+/// `IpAddr::is_global()` is nightly-only, so we implement the check manually.
+fn is_globally_routable(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_private()           // 10/8, 172.16/12, 192.168/16
+                && !v4.is_loopback()   // 127/8
+                && !v4.is_link_local() // 169.254/16
+                && !v4.is_unspecified() // 0.0.0.0
+                && !v4.is_broadcast()  // 255.255.255.255
+                && !v4.is_documentation() // 192.0.2/24, 198.51.100/24, 203.0.113/24
+                // Shared address space (100.64/10, RFC 6598 — CGNAT)
+                && !(v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            !v6.is_loopback()                         // ::1
+                && !v6.is_unspecified()               // ::
+                && (segs[0] & 0xffc0) != 0xfe80       // link-local fe80::/10
+                && (segs[0] & 0xfe00) != 0xfc00       // unique-local fc00::/7 (incl. fd00::/8)
+                && (segs[0] & 0xfff0) != 0xfec0 // deprecated site-local fec0::/10
+        }
+    }
+}
+
 /// Default interval between identity heartbeat re-announcements (seconds).
 pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 300;
 
@@ -518,7 +547,17 @@ impl HeartbeatContext {
         // Detect global IPv6 address locally (ant-quic currently only
         // reports IPv4 via OBSERVED_ADDRESS). Uses UDP connect trick —
         // no data is sent, the OS routing table resolves our source addr.
-        let port = addresses.first().map(|a| a.port()).unwrap_or(5483);
+        //
+        // For locally-probed addresses (IPv6 and LAN IPv4), use the actual
+        // bound port from the QUIC endpoint — NOT the first external address
+        // port (which is NAT-mapped) and NOT the config bind port (which may
+        // be 0 for OS-assigned ports).
+        let bind_port = self
+            .network
+            .bound_addr()
+            .await
+            .map(|a| a.port())
+            .unwrap_or(5483);
         if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
             if sock.connect("[2001:4860:4860::8888]:80").is_ok() {
                 if let Ok(local) = sock.local_addr() {
@@ -528,7 +567,8 @@ impl HeartbeatContext {
                             && (segs[0] & 0xff00) != 0xfd00
                             && !v6.is_loopback();
                         if is_global {
-                            let v6_addr = std::net::SocketAddr::new(std::net::IpAddr::V6(v6), port);
+                            let v6_addr =
+                                std::net::SocketAddr::new(std::net::IpAddr::V6(v6), bind_port);
                             if !addresses.contains(&v6_addr) {
                                 addresses.push(v6_addr);
                             }
@@ -537,6 +577,31 @@ impl HeartbeatContext {
                 }
             }
         }
+
+        // Include LAN-reachable private IPv4 address so agents on the same
+        // network can connect directly without NAT hairpinning. Private
+        // addresses are placed AFTER public addresses so connect_to_agent
+        // tries globally-routable addresses first. The persistent bootstrap
+        // cache filters these out to avoid dead-ends across restarts.
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect("8.8.8.8:80").is_ok() {
+                if let Ok(local) = sock.local_addr() {
+                    if let std::net::IpAddr::V4(v4) = local.ip() {
+                        if v4.is_private() {
+                            let lan_addr =
+                                std::net::SocketAddr::new(std::net::IpAddr::V4(v4), bind_port);
+                            if !addresses.contains(&lan_addr) {
+                                addresses.push(lan_addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Strip only truly unusable addresses (port 0, unspecified, loopback).
+        // Private/LAN addresses are kept for same-network connectivity.
+        addresses.retain(|a| a.port() > 0 && !a.ip().is_unspecified() && !a.ip().is_loopback());
 
         // Query NAT and relay status from the network layer.
         let (nat_type, can_receive_direct, is_relay, is_coordinator) =
@@ -812,24 +877,29 @@ impl Agent {
 
         let info = connectivity::ReachabilityInfo::from_discovered(&agent);
 
-        if info.addresses.is_empty() {
-            return Ok(connectivity::ConnectOutcome::Unreachable);
-        }
-
         let Some(ref network) = self.network else {
             return Ok(connectivity::ConnectOutcome::Unreachable);
         };
 
-        // 2. If already connected via gossip, reuse that connection
+        // 2. If already connected via gossip, reuse that connection.
+        //    This check MUST come before the empty-address bail-out because
+        //    LAN/private agents may have no publicly-routable addresses in
+        //    their announcement but are still reachable via the existing
+        //    gossip QUIC connection.
         let machine_peer_id = ant_quic::PeerId(agent.machine_id.0);
         if network.is_connected(&machine_peer_id).await {
             self.direct_messaging
                 .mark_connected(agent.agent_id, agent.machine_id)
                 .await;
-            // Return the first address as the connected address
-            if let Some(addr) = info.addresses.first() {
-                return Ok(connectivity::ConnectOutcome::Direct(*addr));
-            }
+            return if let Some(addr) = info.addresses.first() {
+                Ok(connectivity::ConnectOutcome::Direct(*addr))
+            } else {
+                Ok(connectivity::ConnectOutcome::AlreadyConnected)
+            };
+        }
+
+        if info.addresses.is_empty() {
+            return Ok(connectivity::ConnectOutcome::Unreachable);
         }
 
         // 3. Try direct connection if likely to succeed
@@ -1253,7 +1323,16 @@ impl Agent {
         // Detect addresses locally via UDP socket tricks.
         // ant-quic discovers public IPv4 via OBSERVED_ADDRESS from peers.
         // IPv6 is globally routable (no NAT), so we probe locally.
-        let port = addresses.first().map(|a| a.port()).unwrap_or(5483);
+        //
+        // For locally-probed addresses (IPv6 and LAN IPv4), use the actual
+        // bound port from the QUIC endpoint — NOT the first external address
+        // port (which is NAT-mapped) and NOT the config bind port (which may
+        // be 0 for OS-assigned ports).
+        let bind_port = if let Some(network) = self.network.as_ref() {
+            network.bound_addr().await.map(|a| a.port()).unwrap_or(5483)
+        } else {
+            5483
+        };
 
         // IPv6 probe
         if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
@@ -1265,7 +1344,8 @@ impl Agent {
                             && (segs[0] & 0xff00) != 0xfd00
                             && !v6.is_loopback();
                         if is_global {
-                            let v6_addr = std::net::SocketAddr::new(std::net::IpAddr::V6(v6), port);
+                            let v6_addr =
+                                std::net::SocketAddr::new(std::net::IpAddr::V6(v6), bind_port);
                             if !addresses.contains(&v6_addr) {
                                 addresses.push(v6_addr);
                             }
@@ -1274,6 +1354,32 @@ impl Agent {
                 }
             }
         }
+
+        // Include LAN-reachable private IPv4 address so agents on the same
+        // network can connect directly without NAT hairpinning. Private
+        // addresses are placed AFTER public addresses so connect_to_agent
+        // tries globally-routable addresses first. The persistent bootstrap
+        // cache filters these out to avoid dead-ends across restarts.
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect("8.8.8.8:80").is_ok() {
+                if let Ok(local) = sock.local_addr() {
+                    if let std::net::IpAddr::V4(v4) = local.ip() {
+                        if v4.is_private() {
+                            let lan_addr =
+                                std::net::SocketAddr::new(std::net::IpAddr::V4(v4), bind_port);
+                            if !addresses.contains(&lan_addr) {
+                                addresses.push(lan_addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Strip only truly unusable addresses (port 0, unspecified, loopback).
+        // Private/LAN addresses are kept for same-network connectivity.
+        addresses.retain(|a| a.port() > 0 && !a.ip().is_unspecified() && !a.ip().is_loopback());
+
         let announcement = self.build_identity_announcement_with_addrs(
             include_user_identity,
             human_consent,
@@ -1490,23 +1596,40 @@ impl Agent {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
 
-                // Add announced addresses to the bootstrap cache so auto-dial
-                // can connect to peers discovered via gossip announcements.
-                // After identity unification, machine_id == ant-quic PeerId.
-                if !announcement.addresses.is_empty() {
-                    if let Some(ref bc) = &bootstrap_cache {
-                        let peer_id = ant_quic::PeerId(announcement.machine_id.0);
-                        bc.add_from_connection(peer_id, announcement.addresses.clone(), None)
-                            .await;
-                        tracing::debug!(
-                            "Added {} addresses from identity announcement to bootstrap cache for agent {:?} (machine {:?})",
-                            announcement.addresses.len(),
-                            announcement.agent_id,
-                            hex::encode(&announcement.machine_id.0[..8]),
-                        );
+                // Add only globally-routable addresses to the persistent
+                // bootstrap cache. Private/LAN addresses are kept in the
+                // ephemeral discovery cache (below) for same-network
+                // connectivity, but must not persist across restarts where
+                // they become stale dead-ends for remote nodes.
+                {
+                    let public_addrs: Vec<std::net::SocketAddr> = announcement
+                        .addresses
+                        .iter()
+                        .copied()
+                        .filter(|a| is_globally_routable(a.ip()))
+                        .collect();
+                    if !public_addrs.is_empty() {
+                        if let Some(ref bc) = &bootstrap_cache {
+                            let peer_id = ant_quic::PeerId(announcement.machine_id.0);
+                            bc.add_from_connection(peer_id, public_addrs.clone(), None)
+                                .await;
+                            tracing::debug!(
+                                "Added {} public addresses to bootstrap cache for agent {:?} (machine {:?})",
+                                public_addrs.len(),
+                                announcement.agent_id,
+                                hex::encode(&announcement.machine_id.0[..8]),
+                            );
+                        }
                     }
                 }
 
+                // Cache the announcement as-is. Empty addresses are the
+                // sender's current truth (e.g. LAN-only agent with no public
+                // address). Preserving stale addresses from a previous
+                // announcement would create persistent dead-ends if the agent
+                // moved networks. The `AlreadyConnected` path in
+                // `connect_to_agent` handles reachability for gossip peers
+                // that have no cached addresses.
                 cache.write().await.insert(
                     announcement.agent_id,
                     DiscoveredAgent {
