@@ -45,15 +45,15 @@ use x0x::upgrade::monitor::UpgradeMonitor;
 use x0x::upgrade::signature::verify_manifest_signature;
 use x0x::{Agent, KvStoreHandle, TaskListHandle};
 
-/// Lazily initialised identity encoder for four-word speakable names.
+/// Lazily initialised identity encoder for identity words (hash-derived names).
 fn identity_encoder() -> &'static four_word_networking::IdentityEncoder {
     use std::sync::OnceLock;
     static ENC: OnceLock<four_word_networking::IdentityEncoder> = OnceLock::new();
     ENC.get_or_init(four_word_networking::IdentityEncoder::new)
 }
 
-/// Compute 4-word speakable name from a hex-encoded identity hash.
-fn four_words_for_hex(hex_id: &str) -> Option<String> {
+/// Compute identity words from a hex-encoded identity hash.
+fn identity_words_for_hex(hex_id: &str) -> Option<String> {
     identity_encoder()
         .encode_hex(hex_id)
         .ok()
@@ -661,7 +661,7 @@ struct DiscoveredAgentEntry {
     announced_at: u64,
     last_seen: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    four_words: Option<String>,
+    identity_words: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_words: Option<String>,
 }
@@ -2355,7 +2355,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<StatusDa
     .to_string();
 
     let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let identity_words = four_words_for_hex(&agent_hex);
+    let identity_words = identity_words_for_hex(&agent_hex);
     Json(ApiResponse {
         ok: true,
         data: StatusData {
@@ -2467,8 +2467,8 @@ async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
 async fn agent_info(State(state): State<Arc<AppState>>) -> Json<ApiResponse<AgentData>> {
     let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let user_hex = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
-    let identity_words = four_words_for_hex(&agent_hex);
-    let user_words = user_hex.as_deref().and_then(four_words_for_hex);
+    let identity_words = identity_words_for_hex(&agent_hex);
+    let user_words = user_hex.as_deref().and_then(identity_words_for_hex);
     Json(ApiResponse {
         ok: true,
         data: AgentData {
@@ -2834,7 +2834,7 @@ async fn import_agent_card(
                 can_receive_direct: None,
                 is_relay: None,
                 is_coordinator: None,
-                four_words: None,
+                identity_words: None,
             })
             .await;
     }
@@ -3249,9 +3249,11 @@ async fn presence_events(
 fn discovered_agent_entry(agent: x0x::DiscoveredAgent) -> DiscoveredAgentEntry {
     let agent_hex = hex::encode(agent.agent_id.as_bytes());
     let user_hex = agent.user_id.map(|id| hex::encode(id.as_bytes()));
-    // Use beacon four_words if available, otherwise compute from agent_id.
-    let four_words = agent.four_words.or_else(|| four_words_for_hex(&agent_hex));
-    let user_words = user_hex.as_deref().and_then(four_words_for_hex);
+    // Use beacon identity_words if available, otherwise compute from agent_id.
+    let identity_words = agent
+        .identity_words
+        .or_else(|| identity_words_for_hex(&agent_hex));
+    let user_words = user_hex.as_deref().and_then(identity_words_for_hex);
     DiscoveredAgentEntry {
         agent_id: agent_hex,
         machine_id: hex::encode(agent.machine_id.as_bytes()),
@@ -3259,7 +3261,7 @@ fn discovered_agent_entry(agent: x0x::DiscoveredAgent) -> DiscoveredAgentEntry {
         addresses: agent.addresses.into_iter().map(|a| a.to_string()).collect(),
         announced_at: agent.announced_at,
         last_seen: agent.last_seen,
-        four_words,
+        identity_words,
         user_words,
     }
 }

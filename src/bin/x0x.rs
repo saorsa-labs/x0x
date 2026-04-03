@@ -97,7 +97,7 @@ enum Commands {
         #[command(subcommand)]
         sub: NetworkSub,
     },
-    /// Find agents by 4-word speakable identity.
+    /// Find agents by identity words (permanent hash-derived name).
     Find {
         /// Identity words (4 words for agent, or 8 with @ separator).
         words: Vec<String>,

@@ -359,7 +359,7 @@ fn fake_agent(last_seen: u64) -> DiscoveredAgent {
         can_receive_direct: None,
         is_relay: None,
         is_coordinator: None,
-        four_words: None,
+        identity_words: None,
     }
 }
 

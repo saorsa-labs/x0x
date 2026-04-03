@@ -1402,7 +1402,7 @@ function renderSidebar(){
     dh+='<div class="sb-item'+(active?' active':'')+'" onclick="navigateDm(\''+c.agent_id+'\')" title="'+esc(c.label||c.agent_id)+'">';
     dh+=presenceHtml(false);
     const dmDisc=(S.get('discovered')||[]).find(dx=>dx.agent_id===c.agent_id);
-    const dmFw=dmDisc&&dmDisc.four_words||'';
+    const dmFw=dmDisc&&dmDisc.identity_words||'';
     dh+='<span>'+(c.label||dmFw||short(c.agent_id))+'</span>';
     if(unread>0)dh+='<span class="badge-count">'+unread+'</span>';
     dh+='</div>';
@@ -1563,7 +1563,7 @@ async function pollDash(){
     S.set('discovered',d.agents);
     const tb=document.getElementById('h-agents');
     if(tb)tb.innerHTML=d.agents.map(x=>{
-      const fw=x.four_words||'';
+      const fw=x.identity_words||'';
       const uw=x.user_words||'';
       const isHuman=!!x.user_id;
       const typeLabel=isHuman?'<span style="color:var(--lv)">&#128100; Human</span>':'<span style="color:var(--cy)">&#129302; Auto</span>';
@@ -1591,7 +1591,7 @@ function renderIdentityChain(){
   if(chainEl){
     chainEl.innerHTML=(uid?'<span class="chain-node user">&#128100; User</span><span class="chain-arrow">\u2192</span>':'')+'<span class="chain-node agent">&#129302; Agent</span><span class="chain-arrow">\u2192</span><span class="chain-node machine">&#128187; Machine</span>';
   }
-  // Update ID fields with four-word names
+  // Update ID fields with identity words
   const cardEl=document.getElementById('h-id-card');
   if(cardEl){
     const ids=cardEl.querySelectorAll('.id-row .v');
@@ -2389,7 +2389,7 @@ function renderPeopleList(){
 function renderAgentRow(c){
   const machines=c.machines||[];
   const disc=c.discovered||(S.get('discovered')||[]).find(d=>d.agent_id===c.agent_id);
-  const fw=disc&&disc.four_words||'';
+  const fw=disc&&disc.identity_words||'';
   const isHuman=disc&&disc.user_id;
   const icon=isHuman?'&#128100;':'&#129302;';
   return `<div class="agent-row" onclick="showAgentDetail('${c.agent_id}')">
@@ -2767,7 +2767,7 @@ function renderAgentDetail(el,data){
   const c=data.contact;
   const d=data.disc;
   const aid=data.agentId;
-  const fw=d&&d.four_words||'';
+  const fw=d&&d.identity_words||'';
   const uw=d&&d.user_words||'';
   const isHuman=d&&d.user_id;
   const name=c?c.label||fw||short(aid):fw||short(aid);

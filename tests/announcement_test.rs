@@ -139,7 +139,7 @@ fn announcement_nat_fields_round_trip() {
         can_receive_direct: Some(true),
         is_relay: Some(false),
         is_coordinator: Some(true),
-        four_words: Some("alpha beta gamma delta".to_string()),
+        identity_words: Some("alpha beta gamma delta".to_string()),
     };
 
     let bytes = bincode::serialize(&ann).unwrap();
@@ -206,7 +206,7 @@ async fn discovery_cache_insert_and_retrieve() {
         can_receive_direct: Some(true),
         is_relay: None,
         is_coordinator: None,
-        four_words: None,
+        identity_words: None,
     };
 
     agent
@@ -252,7 +252,7 @@ async fn reachability_info_from_discovery_cache() {
         can_receive_direct: Some(false),
         is_relay: None,
         is_coordinator: None,
-        four_words: None,
+        identity_words: None,
     };
 
     agent.insert_discovered_agent_for_testing(fake).await;

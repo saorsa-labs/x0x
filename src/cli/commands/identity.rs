@@ -4,7 +4,7 @@ use crate::cli::{print_value, DaemonClient};
 use anyhow::Result;
 use four_word_networking::IdentityEncoder;
 
-/// Compute 4-word speakable identity from a hex agent/user ID.
+/// Compute identity words from a hex agent/user ID.
 fn identity_words(encoder: &IdentityEncoder, hex_id: &str) -> Option<String> {
     encoder.encode_hex(hex_id).ok().map(|w| w.to_string())
 }

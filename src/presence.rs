@@ -152,7 +152,7 @@ pub fn presence_record_to_discovered_agent(
         can_receive_direct: None,
         is_relay: None,
         is_coordinator: None,
-        four_words: None,
+        identity_words: None,
     })
 }
 
@@ -456,7 +456,7 @@ impl PresenceWrapper {
             peer_id,
             network,
             groups,
-            None, // four_words populated later from network status
+            None, // identity_words populated later from network status
             signing_key,
         );
 
@@ -686,7 +686,7 @@ mod tests {
             can_receive_direct: None,
             is_relay: None,
             is_coordinator: None,
-            four_words: None,
+            identity_words: None,
         }
     }
 

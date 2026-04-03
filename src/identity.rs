@@ -643,7 +643,7 @@ pub struct IntroductionCard {
     pub certificate: Option<AgentCertificate>,
     /// Optional human-readable display name.
     pub display_name: Option<String>,
-    /// Four-word speakable identity (e.g. "bodily example dismiss galaxy").
+    /// Permanent identity words (e.g. "bodily example dismiss galaxy").
     /// For human-backed agents: "agent words @ user words".
     pub identity_words: String,
     /// Trust-gated services offered by this agent.

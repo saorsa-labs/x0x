@@ -51,7 +51,7 @@ fn fake_discovered(
         can_receive_direct,
         is_relay,
         is_coordinator,
-        four_words: None,
+        identity_words: None,
     }
 }
 

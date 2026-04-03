@@ -1,4 +1,4 @@
-//! Find agents by 4-word speakable identity.
+//! Find agents by identity words (permanent hash-derived name).
 
 use crate::cli::{print_value, DaemonClient};
 use anyhow::{bail, Context, Result};
