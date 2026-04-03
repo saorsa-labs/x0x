@@ -639,6 +639,8 @@ struct DiscoveredAgentEntry {
     addresses: Vec<String>,
     announced_at: u64,
     last_seen: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    four_words: Option<String>,
 }
 
 /// Peer entry.
@@ -2800,6 +2802,7 @@ async fn import_agent_card(
                 can_receive_direct: None,
                 is_relay: None,
                 is_coordinator: None,
+                four_words: None,
             })
             .await;
     }
@@ -3219,6 +3222,7 @@ fn discovered_agent_entry(agent: x0x::DiscoveredAgent) -> DiscoveredAgentEntry {
         addresses: agent.addresses.into_iter().map(|a| a.to_string()).collect(),
         announced_at: agent.announced_at,
         last_seen: agent.last_seen,
+        four_words: agent.four_words,
     }
 }
 

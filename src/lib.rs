@@ -305,6 +305,8 @@ struct IdentityAnnouncementUnsigned {
     is_relay: Option<bool>,
     /// Whether the machine is coordinating NAT traversal for peers.
     is_coordinator: Option<bool>,
+    /// Four-word speakable identity derived from the agent's hash.
+    four_words: Option<String>,
 }
 
 /// Signed identity announcement broadcast by agents.
@@ -341,6 +343,10 @@ pub struct IdentityAnnouncement {
     /// Whether the machine is coordinating NAT traversal hole-punch timing for peers.
     /// `None` when the network is not yet started.
     pub is_coordinator: Option<bool>,
+    /// Four-word speakable identity derived from the agent's SHA-256 hash.
+    /// Populated by the announcing agent so receivers can display it without
+    /// needing the four-word-networking dictionary locally.
+    pub four_words: Option<String>,
 }
 
 impl IdentityAnnouncement {
@@ -357,6 +363,7 @@ impl IdentityAnnouncement {
             can_receive_direct: self.can_receive_direct,
             is_relay: self.is_relay,
             is_coordinator: self.is_coordinator,
+            four_words: self.four_words.clone(),
         }
     }
 
@@ -459,6 +466,9 @@ pub struct DiscoveredAgent {
     /// Whether this agent's machine is coordinating NAT traversal timing for peers.
     /// `None` if not reported.
     pub is_coordinator: Option<bool>,
+    /// Four-word speakable identity from the announcement.
+    /// `None` if the announcing agent did not include it (pre-upgrade nodes).
+    pub four_words: Option<String>,
 }
 
 /// Builder for configuring an [`Agent`] before connecting to the network.
@@ -615,6 +625,11 @@ impl HeartbeatContext {
                 None => (None, None, None, None),
             };
 
+        let four_words = four_word_networking::IdentityEncoder::new()
+            .encode_agent(self.identity.agent_id().as_bytes())
+            .ok()
+            .map(|w| w.to_string());
+
         let unsigned = IdentityAnnouncementUnsigned {
             agent_id: self.identity.agent_id(),
             machine_id: self.identity.machine_id(),
@@ -630,6 +645,7 @@ impl HeartbeatContext {
             can_receive_direct,
             is_relay,
             is_coordinator,
+            four_words: four_words.clone(),
         };
         let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -662,6 +678,7 @@ impl HeartbeatContext {
             can_receive_direct,
             is_relay,
             is_coordinator,
+            four_words,
         };
         let encoded = bincode::serialize(&announcement).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -695,6 +712,7 @@ impl HeartbeatContext {
                 can_receive_direct: announcement.can_receive_direct,
                 is_relay: announcement.is_relay,
                 is_coordinator: announcement.is_coordinator,
+                four_words: announcement.four_words.clone(),
             },
         );
         Ok(())
@@ -1432,6 +1450,7 @@ impl Agent {
                 can_receive_direct: announcement.can_receive_direct,
                 is_relay: announcement.is_relay,
                 is_coordinator: announcement.is_coordinator,
+                four_words: announcement.four_words.clone(),
             },
         );
 
@@ -1644,6 +1663,7 @@ impl Agent {
                         can_receive_direct: announcement.can_receive_direct,
                         is_relay: announcement.is_relay,
                         is_coordinator: announcement.is_coordinator,
+                        four_words: announcement.four_words.clone(),
                     },
                 );
 
@@ -1754,6 +1774,11 @@ impl Agent {
         // NAT status is populated by the heartbeat loop (which is async and has
         // access to NodeStatus). Here we use None for the NAT fields as this
         // sync builder doesn't have async access to the network layer.
+        let four_words = four_word_networking::IdentityEncoder::new()
+            .encode_agent(self.agent_id().as_bytes())
+            .ok()
+            .map(|w| w.to_string());
+
         let unsigned = IdentityAnnouncementUnsigned {
             agent_id: self.agent_id(),
             machine_id: self.machine_id(),
@@ -1766,6 +1791,7 @@ impl Agent {
             can_receive_direct: None,
             is_relay: None,
             is_coordinator: None,
+            four_words: four_words.clone(),
         };
         let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -1798,6 +1824,7 @@ impl Agent {
             can_receive_direct: unsigned.can_receive_direct,
             is_relay: unsigned.is_relay,
             is_coordinator: unsigned.is_coordinator,
+            four_words,
         })
     }
 
@@ -2373,6 +2400,7 @@ impl Agent {
                                     can_receive_direct: ann.can_receive_direct,
                                     is_relay: ann.is_relay,
                                     is_coordinator: ann.is_coordinator,
+                                    four_words: ann.four_words.clone(),
                                 },
                             );
                             return Ok(Some(addrs));
@@ -2405,6 +2433,7 @@ impl Agent {
                     can_receive_direct: None,
                     is_relay: None,
                     is_coordinator: None,
+                    four_words: None,
                 });
             return Ok(Some(addrs));
         }
@@ -3988,6 +4017,7 @@ mod tests {
             can_receive_direct: Some(true),
             is_relay: Some(false),
             is_coordinator: Some(true),
+            four_words: Some("alpha beta gamma delta".to_string()),
         };
         let bytes = bincode::serialize(&unsigned).expect("serialize");
         let decoded: IdentityAnnouncementUnsigned =
@@ -3996,6 +4026,10 @@ mod tests {
         assert_eq!(decoded.can_receive_direct, Some(true));
         assert_eq!(decoded.is_relay, Some(false));
         assert_eq!(decoded.is_coordinator, Some(true));
+        assert_eq!(
+            decoded.four_words.as_deref(),
+            Some("alpha beta gamma delta")
+        );
     }
 
     /// An announcement with None for all NAT fields (e.g. network not started)
@@ -4016,6 +4050,7 @@ mod tests {
             can_receive_direct: None,
             is_relay: None,
             is_coordinator: None,
+            four_words: None,
         };
         let bytes = bincode::serialize(&unsigned).expect("serialize");
         let decoded: IdentityAnnouncementUnsigned =

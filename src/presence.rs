@@ -152,6 +152,7 @@ pub fn presence_record_to_discovered_agent(
         can_receive_direct: None,
         is_relay: None,
         is_coordinator: None,
+        four_words: None,
     })
 }
 
@@ -685,6 +686,7 @@ mod tests {
             can_receive_direct: None,
             is_relay: None,
             is_coordinator: None,
+            four_words: None,
         }
     }
 
