@@ -218,7 +218,7 @@ This will:
 ## Currently Implemented Features (Tested)
 
 ✅ **Network Layer:**
-- QUIC transport (ant-quic 0.21.5)
+- QUIC transport (ant-quic 0.25.1)
 - Post-quantum crypto (ML-DSA-65, ML-KEM-768)
 - NAT traversal (draft-seemann-quic-nat-traversal-02)
 - MASQUE relay (RFC 9484)
@@ -228,6 +228,12 @@ This will:
 - MachineID (machine-bound, for QUIC auth)
 - AgentID (portable, for agent persistence)
 - Cryptographic uniqueness
+- 4-word speakable identities via `four-word-networking` crate (`IdentityEncoder`)
+- Introduction card (`GET /introduction`) with trust-gated service visibility
+- `x0x find <words>` — search discovered agents by identity words
+- `x0x connect <words>` — connect to agent by location words
+- Identity words injected into `x0x agent` and `x0x status` output
+- Location words injected into `x0x status` for external addresses
 
 ✅ **Bootstrap:**
 - Multi-peer connection
@@ -237,25 +243,37 @@ This will:
 ✅ **Health API:**
 - GET /health endpoint
 - Status monitoring
+- 75+ REST endpoints (all wired to CLI and x0xd)
+
+✅ **Gossip Layer:**
+- Pub/sub messaging (subscribe/publish via epidemic broadcast)
+- CRDT task lists (OR-Set checkboxes, LWW-Register metadata, RGA ordering)
+- CRDT key-value stores with access control
+- Presence beacons and FOAF discovery
+- Anti-entropy sync
+
+✅ **MLS Encryption:**
+- Group creation and management
+- Member add/remove with welcome messages
+- ChaCha20-Poly1305 encrypt/decrypt
+
+✅ **Direct Messaging:**
+- Agent-to-agent direct send/receive
+- Connection management
+- WebSocket real-time delivery
+
+✅ **Named Groups:**
+- Create/list/join groups with invite links
+- Display names, leave/rejoin
+
+✅ **File Transfer:**
+- Send/accept/reject file transfers
 
 ---
 
 ## Not Yet Implemented (Future Tests)
 
-⚠️ **Gossip Layer:**
-- Pub/sub messaging (subscribe/publish are placeholders)
-- CRDT task list synchronization (create_task_list/join_task_list not implemented)
-- Presence announcements
-- FOAF discovery
-- Anti-entropy sync
-
-⚠️ **MLS Encryption:**
-- Group creation (module exists, needs integration)
-- Member invites
-- Encrypted messaging
-
 ⚠️ **Advanced Features:**
-- File sharing
 - Agent discovery by capability
 - Rendezvous coordination
 
@@ -411,6 +429,6 @@ For issues or questions:
 
 ---
 
-**Last Updated:** 2026-02-07
-**x0x Version:** 0.1.0
-**Test Suite Version:** 1.0.0
+**Last Updated:** 2026-04-03
+**x0x Version:** 0.14.9
+**Test Suite Version:** 2.0.0

@@ -1,11 +1,13 @@
 //! Command implementations for the `x0x` CLI.
 
+pub mod connect;
 pub mod constitution;
 pub mod contacts;
 pub mod daemon;
 pub mod direct;
 pub mod discovery;
 pub mod files;
+pub mod find;
 pub mod group;
 pub mod groups;
 pub mod identity;

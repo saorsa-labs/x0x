@@ -72,6 +72,22 @@ impl std::str::FromStr for TrustLevel {
     }
 }
 
+impl TrustLevel {
+    /// Numeric rank for ordering: Blocked(0) < Unknown(1) < Known(2) < Trusted(3).
+    ///
+    /// Used by `IntroductionCard` trust gating to decide whether a peer's
+    /// trust level meets or exceeds a service's `min_trust` requirement.
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Blocked => 0,
+            Self::Unknown => 1,
+            Self::Known => 2,
+            Self::Trusted => 3,
+        }
+    }
+}
+
 /// How strongly we identify and constrain this contact's machine.
 ///
 /// Controls whether machine identity is taken into account when accepting

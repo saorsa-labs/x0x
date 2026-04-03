@@ -2,11 +2,46 @@
 
 use crate::cli::{print_value, DaemonClient};
 use anyhow::Result;
+use four_word_networking::IdentityEncoder;
+
+/// Compute 4-word speakable identity from a hex agent/user ID.
+fn identity_words(encoder: &IdentityEncoder, hex_id: &str) -> Option<String> {
+    encoder.encode_hex(hex_id).ok().map(|w| w.to_string())
+}
+
+/// Inject `identity_words` field into a JSON object next to an `agent_id` field.
+pub fn inject_identity_words(encoder: &IdentityEncoder, value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(agent_hex) = obj
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+        {
+            if let Some(words) = identity_words(encoder, &agent_hex) {
+                obj.insert(
+                    "identity_words".to_string(),
+                    serde_json::Value::String(words),
+                );
+            }
+        }
+        if let Some(user_hex) = obj
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+        {
+            if let Some(words) = identity_words(encoder, &user_hex) {
+                obj.insert("user_words".to_string(), serde_json::Value::String(words));
+            }
+        }
+    }
+}
 
 /// `x0x agent` — GET /agent
 pub async fn agent(client: &DaemonClient) -> Result<()> {
     client.ensure_running().await?;
-    let resp = client.get("/agent").await?;
+    let mut resp = client.get("/agent").await?;
+    let encoder = IdentityEncoder::new();
+    inject_identity_words(&encoder, &mut resp);
     print_value(client.format(), &resp);
     Ok(())
 }
@@ -59,6 +94,14 @@ pub async fn card(
         eprintln!("Share this link with anyone — they can import it with:");
         eprintln!("  x0x agent import <link>\n");
     }
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x agent introduction` — GET /introduction
+pub async fn introduction(client: &DaemonClient) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get("/introduction").await?;
     print_value(client.format(), &resp);
     Ok(())
 }
