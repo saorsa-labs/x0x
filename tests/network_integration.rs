@@ -69,11 +69,17 @@ async fn test_agent_publish() {
 }
 
 /// Test agent identity stability across operations.
+///
+/// Verifies that machine_id and agent_id remain constant after performing
+/// various operations on the agent. Uses a no-network agent to avoid
+/// bootstrap connection delays.
 #[tokio::test]
 async fn test_identity_stability() {
-    // Agent needs network for subscribe/publish operations
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
     let agent = Agent::builder()
-        .with_network_config(x0x::network::NetworkConfig::default())
+        .with_machine_key(temp_dir.path().join("machine.key"))
+        .with_agent_key_path(temp_dir.path().join("agent.key"))
         .build()
         .await
         .expect("Failed to create agent");
@@ -81,14 +87,31 @@ async fn test_identity_stability() {
     let machine_id = agent.machine_id();
     let agent_id = agent.agent_id();
 
-    // Perform network operations
-    let _ = agent.join_network().await;
-    let _ = agent.subscribe("test-topic").await;
-    let _ = agent.publish("test-topic", vec![]).await;
+    // Build announcement (exercises key material without network)
+    let _announcement = agent.build_announcement(false, false);
 
-    // Verify IDs are stable
-    assert_eq!(agent.machine_id(), machine_id);
-    assert_eq!(agent.agent_id(), agent_id);
+    // Verify IDs are stable after operations
+    assert_eq!(agent.machine_id(), machine_id, "machine_id changed");
+    assert_eq!(agent.agent_id(), agent_id, "agent_id changed");
+
+    // Create a second agent with the same keys — IDs must match
+    let agent2 = Agent::builder()
+        .with_machine_key(temp_dir.path().join("machine.key"))
+        .with_agent_key_path(temp_dir.path().join("agent.key"))
+        .build()
+        .await
+        .expect("Failed to create agent2");
+
+    assert_eq!(
+        agent2.machine_id(),
+        machine_id,
+        "machine_id not stable across restarts"
+    );
+    assert_eq!(
+        agent2.agent_id(),
+        agent_id,
+        "agent_id not stable across restarts"
+    );
 }
 
 /// Test agent builder with custom machine key path.

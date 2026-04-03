@@ -113,6 +113,9 @@ pub mod direct;
 /// Presence system — beacons, FOAF discovery, and online/offline events.
 pub mod presence;
 
+/// mDNS local network discovery for zero-config LAN agent discovery.
+pub mod mdns;
+
 /// Self-update system with ML-DSA-65 signature verification and staged rollout.
 pub mod upgrade;
 
@@ -193,6 +196,12 @@ pub struct Agent {
     direct_listener_started: std::sync::atomic::AtomicBool,
     /// Presence system wrapper for beacons, FOAF discovery, and events.
     presence: Option<std::sync::Arc<presence::PresenceWrapper>>,
+    /// mDNS local network discovery.
+    mdns: Option<std::sync::Arc<mdns::MdnsDiscovery>>,
+    /// Whether the user has consented to disclosing their identity in
+    /// announcements.  Set by `announce_identity(true, true)` and respected
+    /// by the heartbeat so it doesn't erase a consented disclosure.
+    user_identity_consented: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -511,6 +520,8 @@ pub struct AgentBuilder {
     identity_ttl_secs: Option<u64>,
     /// Custom path for the contacts file.
     contact_store_path: Option<std::path::PathBuf>,
+    /// Whether mDNS local network discovery is enabled (default: true).
+    mdns_enabled: bool,
 }
 
 /// Context captured by the background identity heartbeat task.
@@ -522,6 +533,10 @@ struct HeartbeatContext {
     cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
+    /// Whether the user has consented to identity disclosure.  When true,
+    /// heartbeats include `user_id` and `agent_certificate` so they don't
+    /// erase a consented disclosure.
+    user_identity_consented: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HeartbeatContext {
@@ -615,14 +630,28 @@ impl HeartbeatContext {
                 None => (None, None, None, None),
             };
 
+        // Include user identity ONLY if the user has previously consented
+        // via announce_identity(true, true). This preserves the consented
+        // disclosure across heartbeats without ever escalating on its own.
+        let include_user = self
+            .user_identity_consented
+            .load(std::sync::atomic::Ordering::Acquire);
+        let (user_id, agent_certificate) = if include_user {
+            (
+                self.identity
+                    .user_keypair()
+                    .map(identity::UserKeypair::user_id),
+                self.identity.agent_certificate().cloned(),
+            )
+        } else {
+            (None, None)
+        };
+
         let unsigned = IdentityAnnouncementUnsigned {
             agent_id: self.identity.agent_id(),
             machine_id: self.identity.machine_id(),
-            user_id: self
-                .identity
-                .user_keypair()
-                .map(identity::UserKeypair::user_id),
-            agent_certificate: self.identity.agent_certificate().cloned(),
+            user_id,
+            agent_certificate,
             machine_public_key: machine_public_key.clone(),
             addresses,
             announced_at,
@@ -730,6 +759,7 @@ impl Agent {
             heartbeat_interval_secs: None,
             identity_ttl_secs: None,
             contact_store_path: None,
+            mdns_enabled: true,
         }
     }
 
@@ -814,6 +844,12 @@ impl Agent {
     #[must_use]
     pub fn presence_system(&self) -> Option<&std::sync::Arc<presence::PresenceWrapper>> {
         self.presence.as_ref()
+    }
+
+    /// Get a reference to the mDNS discovery system, if enabled.
+    #[must_use]
+    pub fn mdns_discovery(&self) -> Option<&std::sync::Arc<mdns::MdnsDiscovery>> {
+        self.mdns.as_ref()
     }
 
     /// Get a reference to the contact store.
@@ -1000,7 +1036,12 @@ impl Agent {
     /// persisted to disk. The background maintenance task saves periodically,
     /// but this guarantees a final save.
     pub async fn shutdown(&self) {
-        // Shut down presence beacons first.
+        // Shut down mDNS discovery.
+        if let Some(ref m) = self.mdns {
+            m.shutdown().await;
+        }
+
+        // Shut down presence beacons.
         if let Some(ref pw) = self.presence {
             pw.shutdown().await;
             tracing::info!("Presence system shut down");
@@ -1435,6 +1476,13 @@ impl Agent {
             },
         );
 
+        // Record consent AFTER successful publish so heartbeats don't start
+        // including user identity if this announcement never actually propagated.
+        if include_user_identity && human_consent {
+            self.user_identity_consented
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         Ok(())
     }
 
@@ -1831,6 +1879,47 @@ impl Agent {
         let min_connected = 3;
         let mut all_connected: Vec<std::net::SocketAddr> = Vec::new();
 
+        // Phase mDNS: Discover and connect to LAN peers before trying
+        // remote bootstrap nodes.  This gives instant connectivity on
+        // local networks without any internet access.
+        if let Some(ref m) = self.mdns {
+            if let Err(e) = m.start_browse().await {
+                tracing::warn!("mDNS browse failed (non-fatal): {e}");
+            } else {
+                // Poll for discovered peers with early exit — don't waste
+                // time if peers appear quickly, but cap at 3 seconds.
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if !m.discovered_peers().await.is_empty()
+                        || tokio::time::Instant::now() >= deadline
+                    {
+                        break;
+                    }
+                }
+
+                let lan_peers = m.discovered_peers().await;
+                // Collect all non-loopback addresses from all discovered peers.
+                let addrs: Vec<std::net::SocketAddr> =
+                    lan_peers.iter().flat_map(|p| &p.addrs).copied().collect();
+                if !addrs.is_empty() {
+                    tracing::info!(
+                        "Phase mDNS: discovered {} LAN peer(s) ({} addresses), connecting",
+                        lan_peers.len(),
+                        addrs.len()
+                    );
+                    let (succeeded, _failed) =
+                        self.connect_peers_parallel_tracked(network, &addrs).await;
+                    all_connected.extend(&succeeded);
+                    tracing::info!(
+                        "Phase mDNS: {}/{} LAN addresses connected",
+                        succeeded.len(),
+                        addrs.len()
+                    );
+                }
+            }
+        }
+
         // Phase 0: Try quality-scored coordinator peers from bootstrap cache.
         // The bootstrap cache learns about coordinator-capable peers passively
         // through normal connections — no coordinator gossip topic needed.
@@ -2003,6 +2092,33 @@ impl Agent {
         }
         if let Err(e) = self.start_identity_heartbeat().await {
             tracing::warn!("Failed to start identity heartbeat: {e}");
+        }
+
+        // Schedule a fresh re-announcement after gossip topology stabilizes.
+        // The initial publish fires before PlumTree has formed eager-push links,
+        // so peers that connected after the first announce won't see it.
+        // A fresh announcement (new message ID) is required because PlumTree
+        // deduplicates by message ID — replaying identical bytes would be silently
+        // dropped by peers that already received the first announcement.
+        if let (Some(ref runtime), Some(ref network)) = (&self.gossip_runtime, &self.network) {
+            let ctx = HeartbeatContext {
+                identity: std::sync::Arc::clone(&self.identity),
+                runtime: std::sync::Arc::clone(runtime),
+                network: std::sync::Arc::clone(network),
+                interval_secs: self.heartbeat_interval_secs,
+                cache: std::sync::Arc::clone(&self.identity_discovery_cache),
+                user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if let Err(e) = ctx.announce().await {
+                    tracing::warn!("Delayed identity re-announcement failed: {e}");
+                } else {
+                    tracing::info!(
+                        "Delayed identity re-announcement sent (gossip mesh stabilized)"
+                    );
+                }
+            });
         }
 
         Ok(())
@@ -2444,9 +2560,35 @@ impl Agent {
     ///
     /// Returns `None` if no network has been configured or if the bind address is
     /// not yet known.
+    ///
+    /// **Note:** If the node was configured with port 0, this returns port 0.
+    /// Use [`bound_addr()`](Self::bound_addr) to get the OS-assigned port.
     #[must_use]
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.network.as_ref().and_then(|n| n.local_addr())
+    }
+
+    /// Return the actual bound address from the QUIC endpoint.
+    ///
+    /// Unlike [`local_addr()`](Self::local_addr) which returns the configured value
+    /// (possibly port 0), this queries the running endpoint for the real OS-assigned
+    /// address. Returns `None` if no network has been configured.
+    pub async fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        if let Some(ref network) = self.network {
+            let addr = network.bound_addr().await;
+            // On dual-stack systems, bound_addr may return [::]:port even when
+            // we bound to 127.0.0.1. Normalize to IPv4 if the original config
+            // was IPv4.
+            match (addr, self.local_addr()) {
+                (Some(bound), Some(config)) if config.is_ipv4() && bound.is_ipv6() => {
+                    Some(std::net::SocketAddr::new(config.ip(), bound.port()))
+                }
+                (Some(bound), _) => Some(bound),
+                _ => None,
+            }
+        } else {
+            None
+        }
     }
 
     /// Build a signed [`IdentityAnnouncement`] for this agent.
@@ -2546,6 +2688,7 @@ impl Agent {
             network,
             interval_secs: self.heartbeat_interval_secs,
             cache: std::sync::Arc::clone(&self.identity_discovery_cache),
+            user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
         };
         let handle = tokio::task::spawn(async move {
             let mut ticker =
@@ -3041,6 +3184,17 @@ impl AgentBuilder {
         self
     }
 
+    /// Enable or disable mDNS local network discovery.
+    ///
+    /// When enabled (default), the agent registers itself as a
+    /// `_x0x._udp.local.` DNS-SD service so other agents on the same
+    /// LAN can discover and connect without bootstrap nodes.
+    #[must_use]
+    pub fn with_mdns(mut self, enabled: bool) -> Self {
+        self.mdns_enabled = enabled;
+        self
+    }
+
     /// Build and initialise the agent.
     ///
     /// This performs the following:
@@ -3293,6 +3447,38 @@ impl AgentBuilder {
             None
         };
 
+        // Create mDNS discovery if enabled and network is configured.
+        let mdns_discovery = if self.mdns_enabled && network.is_some() {
+            // Compute four-word identity for TXT records.
+            let encoder = four_word_networking::IdentityEncoder::new();
+            let words = encoder
+                .encode_agent(identity.agent_id().as_bytes())
+                .map(|w| w.to_string())
+                .unwrap_or_default();
+
+            // Use the actual bound QUIC port (may be OS-assigned ephemeral).
+            let quic_port = if let Some(ref net) = network {
+                net.bound_addr().await.map(|a| a.port()).unwrap_or(5483)
+            } else {
+                5483
+            };
+
+            match mdns::MdnsDiscovery::new(
+                &identity.agent_id(),
+                &identity.machine_id(),
+                &words,
+                quic_port,
+            ) {
+                Ok(m) => Some(std::sync::Arc::new(m)),
+                Err(e) => {
+                    tracing::warn!("mDNS initialization failed (non-fatal): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Agent {
             identity: std::sync::Arc::new(identity),
             network,
@@ -3313,6 +3499,8 @@ impl AgentBuilder {
             direct_messaging,
             direct_listener_started: std::sync::atomic::AtomicBool::new(false),
             presence,
+            mdns: mdns_discovery,
+            user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 }

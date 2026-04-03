@@ -363,6 +363,13 @@ impl PubSubManager {
 
         // Refresh locally subscribed topics.
         let subscribed: Vec<String> = self.topic_ref_counts.read().await.keys().cloned().collect();
+        if !peers.is_empty() && !subscribed.is_empty() {
+            tracing::debug!(
+                "[4/6 pubsub] refresh_topic_peers: {} connected peers, {} subscribed topics",
+                peers.len(),
+                subscribed.len()
+            );
+        }
         for topic in &subscribed {
             let topic_id = TopicId::from_entity(topic.as_bytes());
             self.plumtree.set_topic_peers(topic_id, peers.clone()).await;

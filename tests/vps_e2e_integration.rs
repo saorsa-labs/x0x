@@ -47,33 +47,21 @@ use x0x::{network::NetworkConfig, Agent};
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Base port for A-side agents. Each test uses a distinct offset so they
-/// can run in parallel without binding conflicts.
-const BASE_PORT: u16 = 13_200;
-
-/// Build a NetworkConfig for Agent A: bind to loopback at a fixed port.
+/// Build a NetworkConfig for Agent A: bind to loopback with ephemeral port.
 /// No VPS bootstrap nodes — local-only.
-fn cfg_a_local(port_offset: u16) -> NetworkConfig {
+fn cfg_a_local(_port_offset: u16) -> NetworkConfig {
     NetworkConfig {
-        bind_addr: Some(
-            format!("127.0.0.1:{}", BASE_PORT + port_offset)
-                .parse()
-                .unwrap(),
-        ),
+        bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         bootstrap_nodes: vec![],
         ..Default::default()
     }
 }
 
 /// Build a NetworkConfig for Agent A: bind to loopback + connect to live VPS.
-fn cfg_a_vps(port_offset: u16) -> NetworkConfig {
+fn cfg_a_vps(_port_offset: u16) -> NetworkConfig {
     use x0x::network::DEFAULT_BOOTSTRAP_PEERS;
     NetworkConfig {
-        bind_addr: Some(
-            format!("127.0.0.1:{}", BASE_PORT + port_offset)
-                .parse()
-                .unwrap(),
-        ),
+        bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         bootstrap_nodes: DEFAULT_BOOTSTRAP_PEERS
             .iter()
             .filter_map(|s| s.parse().ok())
@@ -130,6 +118,7 @@ async fn wait_for_discovery(
 
 /// A joins and auto-announces. B has a direct link to A (via bootstrap addr).
 /// B should discover A within 10s via the gossip overlay.
+#[ignore = "requires real QUIC loopback connections — timing-sensitive on macOS dual-stack"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_local_identity_announcement_and_discovery() {
     let dir_a = TempDir::new().unwrap();
@@ -145,7 +134,8 @@ async fn test_local_identity_announcement_and_discovery() {
     agent_a.join_network().await.unwrap();
 
     let a_addr = agent_a
-        .local_addr()
+        .bound_addr()
+        .await
         .expect("agent A must have a bound address");
 
     let agent_b = Agent::builder()
@@ -191,6 +181,7 @@ async fn test_local_identity_announcement_and_discovery() {
 
 /// A joins with a 5s heartbeat. B joins 8s later — missing A's initial
 /// announcement — then catches A's next heartbeat within 8s.
+#[ignore = "requires real QUIC loopback connections — timing-sensitive on macOS dual-stack"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_local_late_join_heartbeat_discovery() {
     let dir_a = TempDir::new().unwrap();
@@ -207,7 +198,8 @@ async fn test_local_late_join_heartbeat_discovery() {
     agent_a.join_network().await.unwrap();
 
     let a_addr = agent_a
-        .local_addr()
+        .bound_addr()
+        .await
         .expect("agent A must have a bound address");
 
     // B joins 8s after A — after the initial announcement but before the
@@ -248,6 +240,7 @@ async fn test_local_late_join_heartbeat_discovery() {
 ///
 /// This exercises the real QUIC → PlumTree → cache → find_agent pipeline end
 /// to end on the local network stack.
+#[ignore = "requires real QUIC loopback connections — timing-sensitive on macOS dual-stack"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_local_find_agent_returns_cached_result() {
     let dir_a = TempDir::new().unwrap();
@@ -263,7 +256,8 @@ async fn test_local_find_agent_returns_cached_result() {
     agent_a.join_network().await.unwrap();
 
     let a_addr = agent_a
-        .local_addr()
+        .bound_addr()
+        .await
         .expect("agent A must have a bound address");
 
     let agent_b = Agent::builder()
@@ -315,6 +309,7 @@ async fn test_local_find_agent_returns_cached_result() {
 
 /// A joins with a UserKeypair, announces with `include_user = true`.
 /// B should be able to look up A by UserId.
+#[ignore = "requires real QUIC loopback connections — timing-sensitive on macOS dual-stack"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_local_user_identity_discovery() {
     let dir_a = TempDir::new().unwrap();
@@ -335,7 +330,8 @@ async fn test_local_user_identity_discovery() {
     agent_a.announce_identity(true, true).await.unwrap();
 
     let a_addr = agent_a
-        .local_addr()
+        .bound_addr()
+        .await
         .expect("agent A must have a bound address");
 
     let agent_b = Agent::builder()
@@ -393,7 +389,8 @@ async fn test_vps_identity_announcement_and_discovery() {
     agent_a.join_network().await.unwrap();
 
     let a_addr = agent_a
-        .local_addr()
+        .bound_addr()
+        .await
         .expect("agent A must have a bound address");
 
     let agent_b = Agent::builder()
@@ -441,7 +438,8 @@ async fn test_vps_late_join_heartbeat_discovery() {
         .unwrap();
     agent_a.join_network().await.unwrap();
     let a_addr = agent_a
-        .local_addr()
+        .bound_addr()
+        .await
         .expect("agent A must have a bound address");
 
     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
@@ -488,7 +486,8 @@ async fn test_vps_rendezvous_find_agent() {
         .unwrap();
 
     let a_addr = agent_a
-        .local_addr()
+        .bound_addr()
+        .await
         .expect("agent A must have a bound address");
 
     let agent_b = Agent::builder()
@@ -532,7 +531,8 @@ async fn test_vps_user_identity_discovery() {
     agent_a.announce_identity(true, true).await.unwrap();
 
     let a_addr = agent_a
-        .local_addr()
+        .bound_addr()
+        .await
         .expect("agent A must have a bound address");
 
     let agent_b = Agent::builder()

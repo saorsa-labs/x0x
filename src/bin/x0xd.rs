@@ -673,6 +673,29 @@ struct TaskEntry {
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    // Handle --version and --help before anything else
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("x0xd {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("x0xd {} — x0x agent daemon", env!("CARGO_PKG_VERSION"));
+        println!();
+        println!("USAGE:");
+        println!("    x0xd [OPTIONS]");
+        println!();
+        println!("OPTIONS:");
+        println!("    --config <PATH>       Path to config file (TOML)");
+        println!("    --name <NAME>         Instance name for multi-instance support");
+        println!("    --check               Check configuration and exit");
+        println!("    --check-updates       Check for updates and exit");
+        println!("    --skip-update-check   Skip update check on startup");
+        println!("    --doctor              Run diagnostics");
+        println!("    --version, -V         Print version and exit");
+        println!("    --help, -h            Print this help and exit");
+        return Ok(());
+    }
+
     let config_path = if let Some(idx) = args.iter().position(|a| a == "--config") {
         Some(
             args.get(idx + 1)
@@ -738,6 +761,11 @@ async fn main() -> Result<()> {
         }
         if config.api_address == default_api_address() {
             config.api_address = SocketAddr::from(([127, 0, 0, 1], 0));
+        }
+        // Use ephemeral QUIC port for named instances to avoid conflicts
+        // when running multiple instances on the same machine.
+        if config.bind_address == default_bind_address() {
+            config.bind_address = SocketAddr::from(([0, 0, 0, 0], 0));
         }
         config.instance_name = Some(name.clone());
     }
@@ -4474,10 +4502,17 @@ async fn put_kv_value(
 
     match handle.put(key, value, content_type).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => {
+            let status = if format!("{e}").contains("value too large") {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+            )
+        }
     }
 }
 

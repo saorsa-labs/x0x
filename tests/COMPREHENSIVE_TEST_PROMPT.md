@@ -1291,6 +1291,96 @@ For EACH node (NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo):
 
 ---
 
+## Phase 19: mDNS Local Network Discovery (40 assertions)
+
+mDNS enables zero-config LAN discovery via `_x0x._udp.local.` DNS-SD services. Each agent registers with TXT records containing `agent_id`, `machine_id`, `words`, and `version`. Discovery runs as "Phase mDNS" in `join_network()` before bootstrap.
+
+### Test Infrastructure — Local Machines
+
+| Machine | Tailscale IP | User | Role |
+|---------|-------------|------|------|
+| studio1 | 100.118.167.101 | studio1 | mDNS peer A |
+| studio2 | 100.78.147.60 | studio2 | mDNS peer B |
+
+Deploy x0xd: `scp target/release/x0xd studio1@100.118.167.101:/tmp/x0xd`
+
+### 19.1 mDNS Registration (5×)
+| # | Interface | Action | Expected |
+|---|-----------|--------|----------|
+| 1 | Logs | Start x0xd, check log for `mDNS: registered` | Instance name, port, identity words in log |
+| 2 | Logs | Verify instance name format | `x0x-{16 hex agent}-{16 hex machine}` (37 chars) |
+| 3 | curl | `GET /health` after startup | mDNS registration did not block startup |
+| 4 | Logs | Start with `AgentBuilder::with_mdns(false)` | No `mDNS: registered` log line |
+| 5 | Logs | TXT records contain full agent_id and machine_id | 64-char hex strings in log |
+
+### 19.2 Same-Machine Discovery (5×)
+| # | Interface | Action | Expected |
+|---|-----------|--------|----------|
+| 1 | Logs | Start instance A, then B on same machine | B discovers A: `mDNS: discovered agent` in log |
+| 2 | Logs | B's log shows `Phase mDNS: discovered 1 LAN peer(s)` | Peer count correct |
+| 3 | Logs | B connects to A: `Phase mDNS: X/Y LAN addresses connected` | At least 1 address connected |
+| 4 | Logs | A discovers B via background browse | `mDNS: discovered agent` appears in A's log |
+| 5 | curl | `GET /peers` on B after mDNS connection | A's peer ID in peer list |
+
+### 19.3 Address Filtering (5×)
+| # | Test | Expected |
+|---|------|----------|
+| 1 | Check discovered addresses in logs | No `127.0.0.1` (loopback filtered) |
+| 2 | Check discovered addresses | No `169.254.x.x` (APIPA filtered) |
+| 3 | Check discovered addresses | No `fe80::` (link-local IPv6 filtered) |
+| 4 | Check discovered addresses | LAN IP (192.168.x.x or similar) present |
+| 5 | Check discovered addresses | No duplicate addresses (deduplicated) |
+
+### 19.4 Cross-Machine Discovery (5×)
+
+Requires mDNS multicast between studio1 and studio2 (may need UniFi "Multicast Enhancement" disabled).
+
+| # | Interface | Action | Expected |
+|---|-----------|--------|----------|
+| 1 | Logs | Start on studio1, then studio2 | studio2 discovers studio1 via mDNS |
+| 2 | Logs | studio1 discovers studio2 via background browse | Bidirectional discovery |
+| 3 | Logs | studio2 connects to studio1 via mDNS address | `Phase mDNS: X/Y LAN addresses connected` |
+| 4 | curl | `GET /peers` on studio2 | studio1's peer ID present |
+| 5 | curl | `GET /agents/discovered` on studio1 | studio2's agent_id in discovered list (after identity announce) |
+
+### 19.5 mDNS Idempotency & Lifecycle (5×)
+| # | Test | Expected |
+|---|------|----------|
+| 1 | Call `join_network()` twice (programmatic test) | `start_browse()` only runs once (idempotent) |
+| 2 | Shutdown agent | `mDNS: shut down` in log, service unregistered |
+| 3 | Start new instance after shutdown | Fresh mDNS registration succeeds |
+| 4 | Kill process without graceful shutdown | Drop impl cleans up daemon thread |
+| 5 | Verify no stale mDNS registrations after restart | New instance name replaces old |
+
+### 19.6 mDNS + Bootstrap Coexistence (5×)
+| # | Test | Expected |
+|---|------|----------|
+| 1 | Start with mDNS + bootstrap enabled | mDNS phase runs first, then bootstrap phases |
+| 2 | mDNS finds peers → skips bootstrap if enough connected | Log shows `Phase mDNS: X/Y connected`, bootstrap may not run |
+| 3 | mDNS finds no peers → falls through to bootstrap | Bootstrap phases 0/1/2 execute normally |
+| 4 | mDNS + VPS bootstrap both contribute peers | Total connected includes both sources |
+| 5 | Seedless instance (no bootstrap) with mDNS | mDNS-only discovery works, no bootstrap attempted |
+
+### 19.7 mDNS Self-Filtering & Identity (5×)
+| # | Test | Expected |
+|---|------|----------|
+| 1 | Agent does not discover itself | Own fullname filtered by exact match |
+| 2 | Two agents with same agent key on different machines | Different instance names (machine_id differs) |
+| 3 | Same machine, different agent keys | Different instance names (agent_id differs) |
+| 4 | Invalid TXT records from foreign service | Graceful skip with warning log |
+| 5 | Missing TXT fields from foreign service | Graceful skip with warning log |
+
+### 19.8 mDNS Stress & Edge Cases (5×)
+| # | Test | Expected |
+|---|------|----------|
+| 1 | 5 instances on same machine | All discover each other (N*(N-1) pairs) |
+| 2 | Rapid start/stop cycles | No stale registrations, no daemon leaks |
+| 3 | Instance removed → ServiceRemoved event | Discovered map entry removed |
+| 4 | mDNS browse timeout (no peers on isolated network) | Falls through to bootstrap within 3 seconds |
+| 5 | Large number of non-x0x mDNS services on LAN | Only `_x0x._udp.local.` services processed |
+
+---
+
 ## Assertion Summary
 
 | Phase | Category | Assertions |
@@ -1314,7 +1404,8 @@ For EACH node (NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo):
 | 16 | Cross-Interface Verification | 75 |
 | 17 | VPS Cross-Region | 60 |
 | 18 | Stress & Edge Cases | 30 |
-| **TOTAL** | | **~995** |
+| 19 | mDNS Local Network Discovery | 40 |
+| **TOTAL** | | **~1035** |
 
 ---
 
