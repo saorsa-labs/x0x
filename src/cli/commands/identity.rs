@@ -2,11 +2,41 @@
 
 use crate::cli::{print_value, DaemonClient};
 use anyhow::Result;
+use four_word_networking::IdentityEncoder;
+
+/// Compute 4-word speakable identity from a hex agent/user ID.
+fn identity_words(hex_id: &str) -> Option<String> {
+    let encoder = IdentityEncoder::new();
+    encoder.encode_hex(hex_id).ok().map(|w| w.to_string())
+}
+
+/// Inject `identity_words` field into a JSON object next to an `agent_id` field.
+pub fn inject_identity_words(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(agent_hex) = obj.get("agent_id").and_then(|v| v.as_str()).map(String::from) {
+            if let Some(words) = identity_words(&agent_hex) {
+                obj.insert(
+                    "identity_words".to_string(),
+                    serde_json::Value::String(words),
+                );
+            }
+        }
+        if let Some(user_hex) = obj.get("user_id").and_then(|v| v.as_str()).map(String::from) {
+            if let Some(words) = identity_words(&user_hex) {
+                obj.insert(
+                    "user_words".to_string(),
+                    serde_json::Value::String(words),
+                );
+            }
+        }
+    }
+}
 
 /// `x0x agent` — GET /agent
 pub async fn agent(client: &DaemonClient) -> Result<()> {
     client.ensure_running().await?;
-    let resp = client.get("/agent").await?;
+    let mut resp = client.get("/agent").await?;
+    inject_identity_words(&mut resp);
     print_value(client.format(), &resp);
     Ok(())
 }
