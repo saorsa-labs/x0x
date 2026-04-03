@@ -11,3 +11,4 @@ __pycache__
 .claude/commands
 .gstack/
 tests/.vps-tokens.env
+.config/
