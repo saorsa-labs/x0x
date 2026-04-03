@@ -311,3 +311,48 @@ When running tests that SSH to multiple VPS nodes sequentially, use `-o ControlM
 ## Crate-Level Lint Suppressions
 
 `lib.rs` has `#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]`. These exist because test code uses unwrap/expect. Production code paths should still avoid panics — use `?` with proper error types.
+
+## Code Quality Standards
+
+### Before every commit, run:
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+### Clippy
+- Must pass with ZERO warnings
+- Run with `--all-targets` (not just lib) to catch issues in tests and bins
+- Run with `-- -D warnings` to treat all warnings as errors
+- Fix collapsible if statements — use `if cond && let Ok(x) = expr` (edition 2024)
+- Replace single-arm match with `if let`
+- Never suppress clippy lints without a comment explaining why
+
+### Formatting
+- Always run `cargo fmt --all` before committing
+- CI enforces `cargo fmt --all -- --check`
+
+### Forbidden patterns in production code (NOT tests)
+- No `.unwrap()` — use `?` or `.ok_or()`/`.map_err()`
+- No `.expect()` — same as unwrap, use proper error handling
+- No `panic!()`, `todo!()`, `unimplemented!()`
+- No `#[allow(clippy::*)]` without extreme justification
+- No `#[allow(dead_code)]` — remove unused code instead
+
+### Dependency rules
+- Don't duplicate crates in both `[dependencies]` and `[dev-dependencies]`
+- `sha2` and `hex` are already in `[dependencies]` — use them directly
+
+### Test conventions
+- `.unwrap()` is fine in tests
+- Don't hardcode version strings — use `env!("CARGO_PKG_VERSION")`
+- Doc tests must compile — test them with `cargo test --doc`
+
+### Edition 2024 features available
+- `let_chains`: `if cond && let Some(x) = opt { ... }` is valid
+- Use this instead of nested `if` + `if let`
+
+### GitHub Actions
+- Use `actions/cache@v4`, `actions/upload-artifact@v4` (NOT v3)
+- CI runs on stable, beta, and nightly Rust across Linux/macOS/Windows
