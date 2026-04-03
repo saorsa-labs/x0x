@@ -582,7 +582,7 @@ const S={_d:{},_l:new Map(),
 S.set('view','home');S.set('spaceId','');S.set('spaceApp','chat');
 S.set('channel','general');S.set('threadId','');
 S.set('dmTarget','');S.set('connected',false);S.set('agentId','');
-S.set('machineId','');S.set('userId','');S.set('groups',[]);
+S.set('machineId','');S.set('userId','');S.set('identityWords','');S.set('userWords','');S.set('groups',[]);
 S.set('contacts',[]);S.set('discovered',[]);S.set('sidebarCollapsed',false);
 S.set('detailOpen',false);S.set('detailType','');S.set('detailData',null);
 
@@ -670,7 +670,7 @@ function escJs(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'")
 // Unicode-safe base64 encode/decode for KvStore values (wiki, web, etc.)
 function u8encode(s){return btoa(unescape(encodeURIComponent(s)))}
 function u8decode(s){return decodeURIComponent(escape(atob(s)))}
-function short(s,n){return s?(s.substring(0,n||10)+'…'):'—'}
+function short(s,n){return s?(s.substring(0,n||16)+'…'):'—'}
 function copyId(el){navigator.clipboard.writeText(el.textContent.replace('agent:','').replace('…','')).then(()=>toast('Copied to clipboard','info'))}
 function copyText(text){navigator.clipboard.writeText(text).then(()=>toast('Copied','info'))}
 function fmtTime(ts){return ts?new Date(typeof ts==='number'&&ts<1e12?ts*1000:ts).toLocaleTimeString():'—'}
@@ -1353,9 +1353,10 @@ function renderSidebar(){
   // Identity
   const aid=S.get('agentId');
   const uid=S.get('userId');
+  const iw=S.get('identityWords')||'';
   document.getElementById('sb-name').textContent=LS.get('display_name','')||'Agent';
-  document.getElementById('sb-aid').textContent=aid?short(aid,12):'...';
-  document.getElementById('sb-chain').textContent=uid?'User \u00b7 Agent \u00b7 Machine':'Agent \u00b7 Machine';
+  document.getElementById('sb-aid').textContent=iw||( aid?short(aid):'...');
+  document.getElementById('sb-chain').textContent=uid?'Human-backed \u00b7 Agent + User':'Autonomous agent';
 
   // Spaces — sort by last activity (most recent first)
   const sortedGroups=[...groups].sort((a,b)=>(b.created_at||0)-(a.created_at||0));
@@ -1400,7 +1401,9 @@ function renderSidebar(){
     const unread=LS.get('unread_'+c.agent_id,0);
     dh+='<div class="sb-item'+(active?' active':'')+'" onclick="navigateDm(\''+c.agent_id+'\')" title="'+esc(c.label||c.agent_id)+'">';
     dh+=presenceHtml(false);
-    dh+='<span>'+(c.label||short(c.agent_id))+'</span>';
+    const dmDisc=(S.get('discovered')||[]).find(dx=>dx.agent_id===c.agent_id);
+    const dmFw=dmDisc&&dmDisc.four_words||'';
+    dh+='<span>'+(c.label||dmFw||short(c.agent_id))+'</span>';
     if(unread>0)dh+='<span class="badge-count">'+unread+'</span>';
     dh+='</div>';
   });
@@ -1420,7 +1423,12 @@ S.on('connected',v=>{
   document.getElementById('st-conn').textContent=v?'Connected':'Disconnected';
 });
 S.on('agentId',v=>{
-  document.getElementById('st-aid').textContent=v?'agent:'+short(v,8):'...';
+  const iw=S.get('identityWords')||'';
+  document.getElementById('st-aid').textContent=iw||(v?short(v):'...');
+});
+S.on('identityWords',v=>{
+  const aid=S.get('agentId')||'';
+  document.getElementById('st-aid').textContent=v||(aid?short(aid):'...');
 });
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1451,6 +1459,9 @@ function renderHome(){
   const aid=S.get('agentId')||'';
   const mid=S.get('machineId')||'';
   const uid=S.get('userId')||'';
+  const iw=S.get('identityWords')||'';
+  const uw=S.get('userWords')||'';
+  const agentType=uid?'Human-backed agent':'Autonomous agent';
   return `<div id="h-upgrade-banner" style="display:none" class="mb2"></div>
 <h2>Dashboard</h2>
 <div class="grid g4 mb2" id="home-stats">
@@ -1464,12 +1475,13 @@ function renderHome(){
     <h3>Your Identity</h3>
     <div class="id-card" id="h-id-card">
       <div class="id-card-header">
-        <div class="id-card-avatar">&#129302;</div>
+        <div class="id-card-avatar">${uid?'&#128100;':'&#129302;'}</div>
         <div>
           <div class="id-card-name" id="h-card-name">${esc(name)}</div>
-          <div class="id-card-label">x0x agent</div>
+          <div class="id-card-label" style="font-size:11px;color:${uid?'var(--lv)':'var(--cy)'}">${agentType}</div>
         </div>
       </div>
+      ${iw?'<div style="font:600 13px var(--mono);color:var(--cy);padding:6px 0;letter-spacing:0.5px">'+(uid&&uw?esc(iw)+' @ '+esc(uw):esc(iw))+'</div>':''}
       <div class="id-card-chain" id="h-chain-mini">
         ${uid?'<span class="chain-node user">&#128100; User</span><span class="chain-arrow">\u2192</span>':''}
         <span class="chain-node agent">&#129302; Agent</span>
@@ -1477,9 +1489,9 @@ function renderHome(){
         <span class="chain-node machine">&#128187; Machine</span>
       </div>
       <div class="id-card-ids">
-        <div class="id-row"><span class="k">Agent</span><span class="v" onclick="copyText('${escJs(aid)}')" title="${esc(aid)}">${aid?short(aid,20):'...'}</span></div>
-        <div class="id-row"><span class="k">Machine</span><span class="v" onclick="copyText('${escJs(mid)}')" title="${esc(mid)}">${mid?short(mid,20):'...'}</span></div>
-        ${uid?'<div class="id-row"><span class="k">User</span><span class="v" style="color:var(--lv)" onclick="copyText(\''+escJs(uid)+'\')" title="'+esc(uid)+'">'+short(uid,20)+'</span></div>':''}
+        <div class="id-row"><span class="k">Agent</span><span class="v" onclick="copyText('${escJs(aid)}')" title="${esc(aid)}">${iw?esc(iw)+' \u00b7 ':''}${aid?short(aid):'...'}</span></div>
+        <div class="id-row"><span class="k">Machine</span><span class="v" onclick="copyText('${escJs(mid)}')" title="This device's TLS key: ${esc(mid)}">${mid?short(mid):'...'}</span></div>
+        ${uid?'<div class="id-row"><span class="k">User</span><span class="v" style="color:var(--lv)" onclick="copyText(\''+escJs(uid)+'\')" title="Human identity: '+esc(uid)+'">'+(uw?esc(uw)+' \u00b7 ':'')+short(uid)+'</span></div>':''}
       </div>
       <div class="id-card-actions">
         <button class="pri" onclick="shareIdentity()" style="flex:1">&#128279; Share Identity</button>
@@ -1499,7 +1511,7 @@ function renderHome(){
 </div>
 <h3>Discovered Agents</h3>
 <div class="card">
-  <table><thead><tr><th>Agent</th><th>User</th><th>Addresses</th><th>NAT</th><th>Last Seen</th></tr></thead>
+  <table><thead><tr><th>Agent</th><th>Type</th><th>Addresses</th><th>NAT</th><th>Last Seen</th></tr></thead>
   <tbody id="h-agents"></tbody></table>
 </div>`;
 }
@@ -1531,6 +1543,8 @@ async function pollDash(){
     if(!S.get('agentId'))S.set('agentId',curAgent);
     S.set('machineId',a.machine_id||'');
     S.set('userId',a.user_id||'');
+    S.set('identityWords',a.identity_words||'');
+    S.set('userWords',a.user_words||'');
     renderIdentityChain();
   }
   // Check for updates
@@ -1548,13 +1562,19 @@ async function pollDash(){
   if(d&&d.agents){
     S.set('discovered',d.agents);
     const tb=document.getElementById('h-agents');
-    if(tb)tb.innerHTML=d.agents.map(x=>`<tr>
-      <td><span class="aid-short" style="cursor:pointer" onclick="showAgentDetail('${x.agent_id}')">${short(x.agent_id)}</span></td>
-      <td>${x.user_id?'<span style="color:var(--lv)">'+short(x.user_id,8)+'</span>':'—'}</td>
+    if(tb)tb.innerHTML=d.agents.map(x=>{
+      const fw=x.four_words||'';
+      const uw=x.user_words||'';
+      const isHuman=!!x.user_id;
+      const typeLabel=isHuman?'<span style="color:var(--lv)">&#128100; Human</span>':'<span style="color:var(--cy)">&#129302; Auto</span>';
+      const agentDisplay=fw?'<div style="font:500 12px var(--mono);color:var(--cy)">'+esc(fw)+'</div>':'';
+      return `<tr>
+      <td><span class="aid-short" style="cursor:pointer" onclick="showAgentDetail('${x.agent_id}')">${agentDisplay}${short(x.agent_id)}</span></td>
+      <td>${typeLabel}${isHuman&&uw?' <span class="aid-short" style="color:var(--lv)">'+esc(uw)+'</span>':''}</td>
       <td style="font-size:11px">${(x.addresses||[]).join(', ')||'—'}</td>
       <td>${x.nat_type||'—'}</td>
       <td>${x.last_seen?fmtTime(x.last_seen):'—'}</td>
-    </tr>`).join('')||'<tr><td colspan="5" style="color:var(--tx3)">No agents discovered</td></tr>';
+    </tr>`;}).join('')||'<tr><td colspan="5" style="color:var(--tx3)">No agents discovered</td></tr>';
   }
 }
 
@@ -1562,6 +1582,8 @@ function renderIdentityChain(){
   const aid=S.get('agentId')||'';
   const mid=S.get('machineId')||'';
   const uid=S.get('userId')||'';
+  const iw=S.get('identityWords')||'';
+  const uw=S.get('userWords')||'';
   // Update identity card on home page
   const nameEl=document.getElementById('h-card-name');
   if(nameEl)nameEl.textContent=LS.get('display_name','')||'Agent';
@@ -1569,14 +1591,17 @@ function renderIdentityChain(){
   if(chainEl){
     chainEl.innerHTML=(uid?'<span class="chain-node user">&#128100; User</span><span class="chain-arrow">\u2192</span>':'')+'<span class="chain-node agent">&#129302; Agent</span><span class="chain-arrow">\u2192</span><span class="chain-node machine">&#128187; Machine</span>';
   }
-  // Update ID fields
+  // Update ID fields with four-word names
   const cardEl=document.getElementById('h-id-card');
   if(cardEl){
     const ids=cardEl.querySelectorAll('.id-row .v');
-    if(ids[0]&&aid){ids[0].textContent=short(aid,20);ids[0].title=aid;ids[0].setAttribute('onclick',"copyText('"+escJs(aid)+"')")}
-    if(ids[1]&&mid){ids[1].textContent=short(mid,20);ids[1].title=mid;ids[1].setAttribute('onclick',"copyText('"+escJs(mid)+"')")}
-    if(uid&&ids[2]){ids[2].textContent=short(uid,20);ids[2].title=uid;ids[2].setAttribute('onclick',"copyText('"+escJs(uid)+"')")}
+    if(ids[0]&&aid){ids[0].textContent=(iw?iw+' \u00b7 ':'')+short(aid);ids[0].title=aid;ids[0].setAttribute('onclick',"copyText('"+escJs(aid)+"')")}
+    if(ids[1]&&mid){ids[1].textContent=short(mid);ids[1].title='This device\'s TLS key: '+mid;ids[1].setAttribute('onclick',"copyText('"+escJs(mid)+"')")}
+    if(uid&&ids[2]){ids[2].textContent=(uw?uw+' \u00b7 ':'')+short(uid);ids[2].title='Human identity: '+uid;ids[2].setAttribute('onclick',"copyText('"+escJs(uid)+"')")}
   }
+  // Update agent type label
+  const labelEl=document.querySelector('.id-card-label');
+  if(labelEl){labelEl.textContent=uid?'Human-backed agent':'Autonomous agent';labelEl.style.color=uid?'var(--lv)':'var(--cy)'}
 }
 
 // Share your identity card — generates link and copies to clipboard
@@ -2319,10 +2344,12 @@ function renderPeopleList(){
   let h='';
   // User groups
   Object.values(byUser).forEach(group=>{
+    const firstDisc=group.agents[0]&&group.agents[0].discovered;
+    const groupUw=firstDisc&&firstDisc.user_words||'';
     h+=`<div class="person-group">
       <div class="person-header" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
         <span style="font-size:16px">&#128100;</span>
-        <span class="user-name">User ${short(group.userId,8)}</span>
+        <span class="user-name">${groupUw?esc(groupUw):'User '+short(group.userId)}</span>
         <span style="color:var(--tx3);font-size:11px">${group.agents.length} agent${group.agents.length>1?'s':''}</span>
       </div>
       <div class="person-agents">`;
@@ -2361,11 +2388,15 @@ function renderPeopleList(){
 
 function renderAgentRow(c){
   const machines=c.machines||[];
+  const disc=c.discovered||(S.get('discovered')||[]).find(d=>d.agent_id===c.agent_id);
+  const fw=disc&&disc.four_words||'';
+  const isHuman=disc&&disc.user_id;
+  const icon=isHuman?'&#128100;':'&#129302;';
   return `<div class="agent-row" onclick="showAgentDetail('${c.agent_id}')">
-    <span style="font-size:14px">&#129302;</span>
+    <span style="font-size:14px">${icon}</span>
     <div style="flex:1">
-      <div style="font-weight:500">${esc(c.label||short(c.agent_id))}</div>
-      <div class="aid-short">${short(c.agent_id,12)}</div>
+      <div style="font-weight:500">${esc(c.label||fw||short(c.agent_id))}</div>
+      <div class="aid-short">${fw?esc(fw)+' \u00b7 ':''}${short(c.agent_id)}</div>
     </div>
     ${trustHtml(c.trust_level)}
     <span class="id-type ${(c.identity_type||'').toLowerCase()}">${c.identity_type==='Pinned'?'&#128204; Pinned':c.identity_type||''}</span>
@@ -2421,7 +2452,7 @@ async function pollNetworkView(){
   const p=await api('/peers');
   if(p&&p.peers){
     const tb=document.getElementById('n-peers');
-    if(tb)tb.innerHTML=p.peers.map(x=>`<tr><td class="aid-short">${short(x.id)}</td><td>—</td><td>—</td><td><span class="trust trust-trusted" style="font-size:9px">connected</span></td></tr>`).join('');
+    if(tb)tb.innerHTML=p.peers.map(x=>`<tr><td class="aid-short" title="${esc(x.id)}">${short(x.id)}</td><td>—</td><td>—</td><td><span class="trust trust-trusted" style="font-size:9px">connected</span></td></tr>`).join('');
   }
   const c=await api('/network/bootstrap-cache');
   if(c&&c.ok){
@@ -2453,10 +2484,11 @@ function renderSettings(){
   <div class="card mb2">
     <h3 style="margin-top:0">Your Identity</h3>
     <p style="font-size:12px;color:var(--tx2);margin-bottom:var(--sp3)">Your identity is permanent — derived from your cryptographic keys. Share your link so others can find and contact you.</p>
+    ${S.get('identityWords')?'<div style="font:600 14px var(--mono);color:var(--cy);margin-bottom:var(--sp3)">'+(S.get('userId')&&S.get('userWords')?esc(S.get('identityWords'))+' @ '+esc(S.get('userWords')):esc(S.get('identityWords')))+'</div>':''}
     <div class="id-card-ids" style="margin-bottom:var(--sp3)">
-      <div class="id-row"><span class="k" style="min-width:70px">Agent ID</span><span class="v" onclick="copyText('${escJs(S.get('agentId'))}')">${S.get('agentId')||'—'}</span></div>
-      <div class="id-row"><span class="k" style="min-width:70px">Machine</span><span class="v" onclick="copyText('${escJs(S.get('machineId'))}')">${S.get('machineId')||'—'}</span></div>
-      <div class="id-row"><span class="k" style="min-width:70px">User</span><span class="v" style="color:${S.get('userId')?'var(--lv)':'var(--tx3)'}">${S.get('userId')||'Not set (opt-in)'}</span></div>
+      <div class="id-row"><span class="k" style="min-width:70px">Agent</span><span class="v" onclick="copyText('${escJs(S.get('agentId'))}')" title="Your permanent identity">${(S.get('identityWords')?esc(S.get('identityWords'))+' \u00b7 ':'')+short(S.get('agentId')||'—')}</span></div>
+      <div class="id-row"><span class="k" style="min-width:70px">Machine</span><span class="v" onclick="copyText('${escJs(S.get('machineId'))}')" title="This device's TLS key">${short(S.get('machineId')||'—')}</span></div>
+      <div class="id-row"><span class="k" style="min-width:70px">User</span><span class="v" style="color:${S.get('userId')?'var(--lv)':'var(--tx3)'}" title="Human identity (opt-in)">${S.get('userId')?(S.get('userWords')?esc(S.get('userWords'))+' \u00b7 ':'')+short(S.get('userId')):'Not set (opt-in)'}</span></div>
     </div>
     <div class="row" style="gap:var(--sp2)">
       <button class="pri" onclick="shareIdentity()" style="flex:1">&#128279; Share Identity Link</button>
@@ -2735,19 +2767,25 @@ function renderAgentDetail(el,data){
   const c=data.contact;
   const d=data.disc;
   const aid=data.agentId;
-  const name=c?c.label||short(aid):short(aid);
+  const fw=d&&d.four_words||'';
+  const uw=d&&d.user_words||'';
+  const isHuman=d&&d.user_id;
+  const name=c?c.label||fw||short(aid):fw||short(aid);
   const trust=c?c.trust_level:'Unknown';
   const idType=c?c.identity_type:'Unknown';
+  const agentType=isHuman?'Human-backed agent':'Autonomous agent';
   el.innerHTML=`<div class="detail-header">
     <h3>${esc(name)}</h3>
     <button class="detail-close" onclick="hideDetail()">&#10005;</button>
   </div>
   <div class="detail-body">
     <div style="text-align:center;margin-bottom:16px">
-      <div style="font-size:32px;margin-bottom:8px">&#129302;</div>
+      <div style="font-size:32px;margin-bottom:8px">${isHuman?'&#128100;':'&#129302;'}</div>
       <div style="font:600 14px var(--sans)">${esc(name)}</div>
+      ${fw?'<div style="font:500 13px var(--mono);color:var(--cy);margin:4px 0">'+(isHuman&&uw?esc(fw)+' @ '+esc(uw):esc(fw))+'</div>':''}
+      <div style="font-size:11px;color:${isHuman?'var(--lv)':'var(--cy)'};margin:2px 0">${agentType}</div>
       <div style="margin:4px 0">${trustHtml(trust)}</div>
-      <div class="aid" onclick="copyText('${aid}')" style="font-size:11px">${aid}</div>
+      <div class="aid" onclick="copyText('${aid}')" style="font-size:11px" title="Agent ID (permanent identity)">${short(aid)}</div>
     </div>
     <h3>Identity Type</h3>
     <div class="card mb">
@@ -2792,12 +2830,12 @@ function renderAgentDetail(el,data){
     const mid=d&&d.machine_id||S.get('machineId');
     let ch='<div class="cert-chain" style="padding:8px">';
     if(uid){
-      ch+=`<div class="cert-node user"><span>&#128100;</span><div><div style="font-size:10px;color:var(--lv)">USER</div><div class="aid-short">${short(uid,12)}</div></div></div>`;
+      ch+=`<div class="cert-node user"><span>&#128100;</span><div><div style="font-size:10px;color:var(--lv)">USER (human identity)</div><div class="aid-short" title="${esc(uid)}">${uw||short(uid)}</div></div></div>`;
       ch+='<div class="cert-arrow" style="font-size:10px">&#9660; signed</div>';
     }
-    ch+=`<div class="cert-node agent"><span>&#129302;</span><div><div style="font-size:10px;color:var(--am)">AGENT</div><div class="aid-short">${short(aid,12)}</div></div></div>`;
+    ch+=`<div class="cert-node agent"><span>&#129302;</span><div><div style="font-size:10px;color:var(--am)">AGENT (permanent identity)</div><div class="aid-short" title="${esc(aid)}">${fw||short(aid)}</div></div></div>`;
     ch+='<div class="cert-arrow" style="font-size:10px">&#9660; on machine</div>';
-    ch+=`<div class="cert-node machine"><span>&#128187;</span><div><div style="font-size:10px;color:var(--cy)">MACHINE</div><div class="aid-short">${short(mid||'unknown',12)}</div></div></div>`;
+    ch+=`<div class="cert-node machine"><span>&#128187;</span><div><div style="font-size:10px;color:var(--cy)">MACHINE (this device\u2019s TLS key)</div><div class="aid-short" title="${esc(mid||'')}">${short(mid||'unknown')}</div></div></div>`;
     ch+='</div>';
     chainEl.innerHTML=ch;
   }

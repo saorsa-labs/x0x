@@ -45,6 +45,21 @@ use x0x::upgrade::monitor::UpgradeMonitor;
 use x0x::upgrade::signature::verify_manifest_signature;
 use x0x::{Agent, KvStoreHandle, TaskListHandle};
 
+/// Lazily initialised identity encoder for four-word speakable names.
+fn identity_encoder() -> &'static four_word_networking::IdentityEncoder {
+    use std::sync::OnceLock;
+    static ENC: OnceLock<four_word_networking::IdentityEncoder> = OnceLock::new();
+    ENC.get_or_init(four_word_networking::IdentityEncoder::new)
+}
+
+/// Compute 4-word speakable name from a hex-encoded identity hash.
+fn four_words_for_hex(hex_id: &str) -> Option<String> {
+    identity_encoder()
+        .encode_hex(hex_id)
+        .ok()
+        .map(|w| w.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -516,6 +531,8 @@ struct StatusData {
     api_address: String,
     external_addrs: Vec<String>,
     agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_words: Option<String>,
     peers: usize,
     warnings: Vec<String>,
 }
@@ -526,6 +543,10 @@ struct AgentData {
     agent_id: String,
     machine_id: String,
     user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_words: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_words: Option<String>,
 }
 
 /// Introduction card response (fields vary by trust level).
@@ -641,6 +662,8 @@ struct DiscoveredAgentEntry {
     last_seen: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     four_words: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_words: Option<String>,
 }
 
 /// Peer entry.
@@ -2331,6 +2354,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<StatusDa
     }
     .to_string();
 
+    let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let identity_words = four_words_for_hex(&agent_hex);
     Json(ApiResponse {
         ok: true,
         data: StatusData {
@@ -2339,7 +2364,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<StatusDa
             uptime_secs,
             api_address: state.api_address.to_string(),
             external_addrs,
-            agent_id: hex::encode(state.agent.agent_id().as_bytes()),
+            agent_id: agent_hex,
+            identity_words,
             peers,
             warnings,
         },
@@ -2439,12 +2465,18 @@ async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 /// GET /agent
 async fn agent_info(State(state): State<Arc<AppState>>) -> Json<ApiResponse<AgentData>> {
+    let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let user_hex = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
+    let identity_words = four_words_for_hex(&agent_hex);
+    let user_words = user_hex.as_deref().and_then(four_words_for_hex);
     Json(ApiResponse {
         ok: true,
         data: AgentData {
-            agent_id: hex::encode(state.agent.agent_id().as_bytes()),
+            agent_id: agent_hex,
             machine_id: hex::encode(state.agent.machine_id().as_bytes()),
-            user_id: state.agent.user_id().map(|u| hex::encode(u.as_bytes())),
+            user_id: user_hex,
+            identity_words,
+            user_words,
         },
     })
 }
@@ -3215,14 +3247,20 @@ async fn presence_events(
 }
 
 fn discovered_agent_entry(agent: x0x::DiscoveredAgent) -> DiscoveredAgentEntry {
+    let agent_hex = hex::encode(agent.agent_id.as_bytes());
+    let user_hex = agent.user_id.map(|id| hex::encode(id.as_bytes()));
+    // Use beacon four_words if available, otherwise compute from agent_id.
+    let four_words = agent.four_words.or_else(|| four_words_for_hex(&agent_hex));
+    let user_words = user_hex.as_deref().and_then(four_words_for_hex);
     DiscoveredAgentEntry {
-        agent_id: hex::encode(agent.agent_id.as_bytes()),
+        agent_id: agent_hex,
         machine_id: hex::encode(agent.machine_id.as_bytes()),
-        user_id: agent.user_id.map(|id| hex::encode(id.as_bytes())),
+        user_id: user_hex,
         addresses: agent.addresses.into_iter().map(|a| a.to_string()).collect(),
         announced_at: agent.announced_at,
         last_seen: agent.last_seen,
-        four_words: agent.four_words,
+        four_words,
+        user_words,
     }
 }
 
