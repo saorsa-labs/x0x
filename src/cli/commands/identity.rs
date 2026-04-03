@@ -13,7 +13,11 @@ fn identity_words(hex_id: &str) -> Option<String> {
 /// Inject `identity_words` field into a JSON object next to an `agent_id` field.
 pub fn inject_identity_words(value: &mut serde_json::Value) {
     if let Some(obj) = value.as_object_mut() {
-        if let Some(agent_hex) = obj.get("agent_id").and_then(|v| v.as_str()).map(String::from) {
+        if let Some(agent_hex) = obj
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+        {
             if let Some(words) = identity_words(&agent_hex) {
                 obj.insert(
                     "identity_words".to_string(),
@@ -21,12 +25,13 @@ pub fn inject_identity_words(value: &mut serde_json::Value) {
                 );
             }
         }
-        if let Some(user_hex) = obj.get("user_id").and_then(|v| v.as_str()).map(String::from) {
+        if let Some(user_hex) = obj
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+        {
             if let Some(words) = identity_words(&user_hex) {
-                obj.insert(
-                    "user_words".to_string(),
-                    serde_json::Value::String(words),
-                );
+                obj.insert("user_words".to_string(), serde_json::Value::String(words));
             }
         }
     }
