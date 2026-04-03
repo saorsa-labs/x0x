@@ -528,17 +528,21 @@ struct AgentData {
     user_id: Option<String>,
 }
 
-/// Introduction card response.
+/// Introduction card response (fields vary by trust level).
 #[derive(Debug, Serialize)]
 struct IntroductionCardData {
     agent_id: String,
-    machine_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     certificate: Option<String>,
     display_name: Option<String>,
     identity_words: String,
     services: Vec<ServiceEntryData>,
-    signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 /// Service entry in an introduction card.
@@ -2443,32 +2447,130 @@ async fn agent_info(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Agen
     })
 }
 
-/// GET /introduction — serve this agent's introduction card.
+/// Query parameters for GET /introduction.
+#[derive(Debug, Deserialize)]
+struct IntroductionQuery {
+    /// Connecting peer's agent ID (hex). Determines trust-gated response.
+    #[serde(default)]
+    peer: Option<String>,
+}
+
+/// GET /introduction — serve this agent's introduction card, trust-gated.
+///
+/// Pass `?peer=<hex agent_id>` to receive a card filtered by the peer's
+/// trust level. Without `?peer`, the response is the public (Unknown) view.
+///
+/// - **Blocked**: 403 Forbidden
+/// - **Unknown**: display name, identity words, public services only
+/// - **Known**: above + machine_id, certificate status, broader services
+/// - **Trusted**: everything — all services, full details
 async fn introduction(
     State(state): State<Arc<AppState>>,
-) -> Json<ApiResponse<IntroductionCardData>> {
+    axum::extract::Query(query): axum::extract::Query<IntroductionQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Resolve the peer's trust level.
+    let peer_trust = if let Some(ref peer_hex) = query.peer {
+        let Ok(peer_bytes) = hex::decode(peer_hex) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "invalid peer agent_id hex"})),
+            )
+                .into_response();
+        };
+        if peer_bytes.len() != 32 {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "peer agent_id must be 32 bytes"})),
+            )
+                .into_response();
+        }
+        let mut id_bytes = [0u8; 32];
+        id_bytes.copy_from_slice(&peer_bytes);
+        let peer_id = x0x::identity::AgentId(id_bytes);
+        state.contacts.read().await.trust_level(&peer_id)
+    } else {
+        x0x::contacts::TrustLevel::Unknown
+    };
+
+    // Blocked peers get nothing.
+    if peer_trust == x0x::contacts::TrustLevel::Blocked {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "blocked"})),
+        )
+            .into_response();
+    }
+
     let identity = state.agent.identity();
 
-    // Build default services based on available capabilities.
-    let mut services = vec![x0x::identity::ServiceEntry {
-        name: "direct-message".to_string(),
-        description: "Send and receive direct encrypted messages".to_string(),
-        min_trust: "known".to_string(),
-    }];
-    // Advertise file-transfer if the daemon supports it.
-    services.push(x0x::identity::ServiceEntry {
-        name: "file-transfer".to_string(),
-        description: "Send and receive files".to_string(),
-        min_trust: "trusted".to_string(),
-    });
+    // Full service catalogue — filtered below by peer trust.
+    let all_services = vec![
+        x0x::identity::ServiceEntry {
+            name: "presence".to_string(),
+            description: "Online/offline presence visibility".to_string(),
+            min_trust: "unknown".to_string(),
+        },
+        x0x::identity::ServiceEntry {
+            name: "direct-message".to_string(),
+            description: "Send and receive direct encrypted messages".to_string(),
+            min_trust: "known".to_string(),
+        },
+        x0x::identity::ServiceEntry {
+            name: "mls-group".to_string(),
+            description: "Join MLS encrypted group conversations".to_string(),
+            min_trust: "known".to_string(),
+        },
+        x0x::identity::ServiceEntry {
+            name: "file-transfer".to_string(),
+            description: "Send and receive files".to_string(),
+            min_trust: "trusted".to_string(),
+        },
+        x0x::identity::ServiceEntry {
+            name: "payment".to_string(),
+            description: "Payment address exchange".to_string(),
+            min_trust: "trusted".to_string(),
+        },
+    ];
 
-    let card = x0x::identity::IntroductionCard::from_identity(identity, None, services);
+    // Filter services: only return those where peer trust >= min_trust.
+    let peer_rank = peer_trust.rank();
+    let visible_services: Vec<_> = all_services
+        .into_iter()
+        .filter(|s| {
+            s.min_trust
+                .parse::<x0x::contacts::TrustLevel>()
+                .map(|t| peer_rank >= t.rank())
+                .unwrap_or(false)
+        })
+        .collect();
 
-    Json(ApiResponse {
-        ok: true,
-        data: IntroductionCardData {
+    let card = x0x::identity::IntroductionCard::from_identity(identity, None, visible_services);
+
+    // Build response — Unknown gets a minimal card, Known/Trusted get progressively more.
+    let data = match peer_trust {
+        x0x::contacts::TrustLevel::Unknown => IntroductionCardData {
             agent_id: hex::encode(card.agent_id.as_bytes()),
-            machine_id: hex::encode(card.machine_id.as_bytes()),
+            machine_id: None,
+            user_id: None,
+            certificate: None,
+            display_name: card.display_name,
+            identity_words: card.identity_words,
+            services: card
+                .services
+                .iter()
+                .map(|s| ServiceEntryData {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    min_trust: s.min_trust.clone(),
+                })
+                .collect(),
+            signature: None,
+        },
+        x0x::contacts::TrustLevel::Known => IntroductionCardData {
+            agent_id: hex::encode(card.agent_id.as_bytes()),
+            machine_id: Some(hex::encode(card.machine_id.as_bytes())),
             user_id: card.user_id.map(|u| hex::encode(u.as_bytes())),
             certificate: card.certificate.as_ref().map(|_| "(present)".to_string()),
             display_name: card.display_name,
@@ -2482,9 +2584,30 @@ async fn introduction(
                     min_trust: s.min_trust.clone(),
                 })
                 .collect(),
-            signature: hex::encode(&card.signature[..8]),
+            signature: Some(hex::encode(&card.signature[..8])),
         },
-    })
+        // Trusted — full card.
+        _ => IntroductionCardData {
+            agent_id: hex::encode(card.agent_id.as_bytes()),
+            machine_id: Some(hex::encode(card.machine_id.as_bytes())),
+            user_id: card.user_id.map(|u| hex::encode(u.as_bytes())),
+            certificate: card.certificate.as_ref().map(|_| "(present)".to_string()),
+            display_name: card.display_name,
+            identity_words: card.identity_words,
+            services: card
+                .services
+                .iter()
+                .map(|s| ServiceEntryData {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    min_trust: s.min_trust.clone(),
+                })
+                .collect(),
+            signature: Some(hex::encode(&card.signature[..8])),
+        },
+    };
+
+    axum::Json(ApiResponse { ok: true, data }).into_response()
 }
 
 /// POST /announce
