@@ -258,6 +258,8 @@ enum AgentSub {
         #[arg(long)]
         include_groups: bool,
     },
+    /// Show this agent's introduction card.
+    Introduction,
     /// Import an agent card (add to contacts).
     Import {
         /// Card link (x0x://agent/...) or raw base64.
@@ -777,6 +779,7 @@ async fn run(
                 display_name,
                 include_groups,
             }) => commands::identity::card(&client, display_name.as_deref(), include_groups).await,
+            Some(AgentSub::Introduction) => commands::identity::introduction(&client).await,
             Some(AgentSub::Import { card, trust }) => {
                 commands::identity::import_card(&client, &card, Some(trust.as_str())).await
             }

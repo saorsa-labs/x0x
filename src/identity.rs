@@ -608,6 +608,99 @@ impl Identity {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Introduction card
+// ---------------------------------------------------------------------------
+
+/// A trust-gated service offered by an agent.
+///
+/// Advertised in the agent's `IntroductionCard` so that peers can discover
+/// capabilities before establishing a full connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceEntry {
+    /// Machine-readable service name (e.g. "file-transfer", "mls-group").
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Minimum trust level required to access this service.
+    pub min_trust: String,
+}
+
+/// An introduction card presented to peers during connection setup.
+///
+/// Contains the agent's identity, optional human-owner binding, advertised
+/// services, and a machine signature over the payload so recipients can
+/// verify authenticity without a round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntroductionCard {
+    /// Permanent agent identity (32-byte SHA-256 of ML-DSA-65 public key).
+    pub agent_id: AgentId,
+    /// Current machine identity.
+    pub machine_id: MachineId,
+    /// Human-owner identity, if this agent is human-backed.
+    pub user_id: Option<UserId>,
+    /// Certificate binding agent → user (proves user ownership).
+    pub certificate: Option<AgentCertificate>,
+    /// Optional human-readable display name.
+    pub display_name: Option<String>,
+    /// Four-word speakable identity (e.g. "bodily example dismiss galaxy").
+    /// For human-backed agents: "agent words @ user words".
+    pub identity_words: String,
+    /// Trust-gated services offered by this agent.
+    pub services: Vec<ServiceEntry>,
+    /// ML-DSA-65 signature over all fields above.
+    ///
+    /// TODO: Currently populated with the machine public key as a placeholder.
+    /// Once the signing message format is finalised, this will contain a real
+    /// ML-DSA-65 signature from the machine secret key over a canonical
+    /// serialisation of the card fields.
+    pub signature: Vec<u8>,
+}
+
+impl IntroductionCard {
+    /// Build an introduction card from an `Identity`, computing identity words
+    /// automatically.
+    pub fn from_identity(
+        identity: &Identity,
+        display_name: Option<String>,
+        services: Vec<ServiceEntry>,
+    ) -> Self {
+        let agent_id = identity.agent_id();
+        let machine_id = identity.machine_id();
+        let user_id = identity.user_id();
+        let certificate = identity.agent_certificate().cloned();
+
+        let encoder = four_word_networking::IdentityEncoder::new();
+        let identity_words = if let Some(uid) = user_id {
+            encoder
+                .encode_full(agent_id.as_bytes(), uid.as_bytes())
+                .map(|w| w.to_string())
+                .unwrap_or_default()
+        } else {
+            encoder
+                .encode_agent(agent_id.as_bytes())
+                .map(|w| w.to_string())
+                .unwrap_or_default()
+        };
+
+        // TODO: Replace with real ML-DSA-65 signature over canonical card bytes.
+        // For now, store the machine public key so verifiers can at least identify
+        // which machine produced the card.
+        let signature = identity.machine_keypair().public_key().as_bytes().to_vec();
+
+        Self {
+            agent_id,
+            machine_id,
+            user_id,
+            certificate,
+            display_name,
+            identity_words,
+            services,
+            signature,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
