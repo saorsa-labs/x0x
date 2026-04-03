@@ -15,7 +15,8 @@ pub async fn health(client: &DaemonClient) -> Result<()> {
 pub async fn status(client: &DaemonClient) -> Result<()> {
     client.ensure_running().await?;
     let mut resp = client.get("/status").await?;
-    super::identity::inject_identity_words(&mut resp);
+    let encoder = four_word_networking::IdentityEncoder::new();
+    super::identity::inject_identity_words(&encoder, &mut resp);
     print_value(client.format(), &resp);
     Ok(())
 }

@@ -1,7 +1,7 @@
 //! Find agents by 4-word speakable identity.
 
 use crate::cli::{print_value, DaemonClient};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use four_word_networking::IdentityEncoder;
 
 /// `x0x find <words...>` — decode identity words and search for matching agents.
@@ -10,31 +10,55 @@ pub async fn find(client: &DaemonClient, words: &[String]) -> Result<()> {
 
     let encoder = IdentityEncoder::new();
 
-    // Support "word1 word2 word3 word4" (agent) or "word1 word2 word3 word4 @ word5 word6 word7 word8" (full)
+    // Validate input: exactly 4 words, or 4 + "@" + 4 = 9 tokens.
     let has_separator = words.iter().any(|w| w == "@");
 
-    // Decode the agent prefix (first 4 words, or first 4 before @)
-    let agent_words: String = if has_separator {
-        words
-            .iter()
-            .take_while(|w| w.as_str() != "@")
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        words.iter().take(4).cloned().collect::<Vec<_>>().join(" ")
-    };
+    if has_separator {
+        if words.len() != 9 {
+            bail!(
+                "full identity requires exactly 9 tokens: 4 words @ 4 words (got {})",
+                words.len()
+            );
+        }
+        if words[4] != "@" {
+            bail!(
+                "@ separator must be the 5th token (got {:?} at position 5)",
+                words[4]
+            );
+        }
+    } else if words.len() != 4 {
+        bail!(
+            "agent identity requires exactly 4 words (got {}). \
+             For full identity use: word1 word2 word3 word4 @ word5 word6 word7 word8",
+            words.len()
+        );
+    }
 
+    // Decode agent prefix (first 4 words).
+    let agent_words = words[..4].join(" ");
     let agent_prefix = encoder
         .decode_to_prefix(&agent_words)
-        .context("failed to decode identity words — check spelling")?;
+        .context("failed to decode agent identity words — check spelling")?;
+    let agent_prefix_hex = hex::encode(agent_prefix);
 
-    let prefix_hex = hex::encode(agent_prefix);
+    // Optionally decode user prefix (last 4 words after @).
+    let user_prefix_hex = if has_separator {
+        let user_words = words[5..9].join(" ");
+        let user_prefix = encoder
+            .decode_to_prefix(&user_words)
+            .context("failed to decode user identity words — check spelling")?;
+        Some(hex::encode(user_prefix))
+    } else {
+        None
+    };
 
     eprintln!("Searching for agents matching: {agent_words}");
-    eprintln!("Agent ID prefix: 0x{prefix_hex}");
+    eprintln!("Agent ID prefix: 0x{agent_prefix_hex}");
+    if let Some(ref up) = user_prefix_hex {
+        eprintln!("User ID prefix:  0x{up}");
+    }
 
-    // Fetch all discovered agents (unfiltered to include expired)
+    // Fetch all discovered agents (unfiltered to include expired).
     let resp = client
         .get_query("/agents/discovered", &[("unfiltered", "true")])
         .await?;
@@ -44,13 +68,29 @@ pub async fn find(client: &DaemonClient, words: &[String]) -> Result<()> {
 
     let mut matches: Vec<serde_json::Value> = Vec::new();
     for agent in agents {
-        if let Some(agent_id_hex) = agent.get("agent_id").and_then(|v| v.as_str()) {
-            if agent_id_hex.starts_with(&prefix_hex) {
-                let mut entry = agent.clone();
-                super::identity::inject_identity_words(&mut entry);
-                matches.push(entry);
+        let agent_id_hex = match agent.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => continue,
+        };
+
+        if !agent_id_hex.starts_with(&agent_prefix_hex) {
+            continue;
+        }
+
+        // If user words were provided, also filter by user_id prefix.
+        if let Some(ref up) = user_prefix_hex {
+            let user_match = agent
+                .get("user_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|uid| uid.starts_with(up.as_str()));
+            if !user_match {
+                continue;
             }
         }
+
+        let mut entry = agent.clone();
+        super::identity::inject_identity_words(&encoder, &mut entry);
+        matches.push(entry);
     }
 
     if matches.is_empty() {
