@@ -58,7 +58,7 @@ zip = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 zeroize = "1.8.2"
-four-word-networking = { git = "https://github.com/saorsa-labs/four-word-networking", branch = "feature/identity-encoder" }
+four-word-networking = { git = "https://github.com/saorsa-labs/four-word-networking", tag = "v2.7.0" }
 futures = { version = "0.3", features = ["alloc"] }
 async-stream = "0.3.6"
 uuid = { version = "1.20.0", features = ["v4"] }
