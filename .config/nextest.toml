@@ -1,0 +1,8 @@
+[profile.default]
+# Prevent hanging tests from blocking CI indefinitely.
+# The three known offenders (as of 2026-04-03) are network integration tests
+# that can hang on CI when loopback QUIC/UDP doesn't behave as expected:
+#   - network::test_mesh_connections_are_bidirectional
+#   - vps_e2e_integration::test_local_identity_announcement_and_discovery
+#   - vps_e2e_integration::test_local_user_identity_discovery
+slow-timeout = { period = "60s", terminate-after = 5 }
