@@ -98,6 +98,14 @@ pub async fn card(
     Ok(())
 }
 
+/// `x0x agent introduction` — GET /introduction
+pub async fn introduction(client: &DaemonClient) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get("/introduction").await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x agent import` — POST /agent/card/import
 pub async fn import_card(
     client: &DaemonClient,

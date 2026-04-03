@@ -528,6 +528,27 @@ struct AgentData {
     user_id: Option<String>,
 }
 
+/// Introduction card response.
+#[derive(Debug, Serialize)]
+struct IntroductionCardData {
+    agent_id: String,
+    machine_id: String,
+    user_id: Option<String>,
+    certificate: Option<String>,
+    display_name: Option<String>,
+    identity_words: String,
+    services: Vec<ServiceEntryData>,
+    signature: String,
+}
+
+/// Service entry in an introduction card.
+#[derive(Debug, Serialize)]
+struct ServiceEntryData {
+    name: String,
+    description: String,
+    min_trust: String,
+}
+
 // ---------------------------------------------------------------------------
 // Direct messaging request / response types
 // ---------------------------------------------------------------------------
@@ -1045,6 +1066,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/agent", get(agent_info))
+        .route("/introduction", get(introduction))
         .route("/agent/card", get(get_agent_card))
         .route("/agent/card/import", post(import_agent_card))
         .route("/announce", post(announce_identity))
@@ -2417,6 +2439,50 @@ async fn agent_info(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Agen
             agent_id: hex::encode(state.agent.agent_id().as_bytes()),
             machine_id: hex::encode(state.agent.machine_id().as_bytes()),
             user_id: state.agent.user_id().map(|u| hex::encode(u.as_bytes())),
+        },
+    })
+}
+
+/// GET /introduction — serve this agent's introduction card.
+async fn introduction(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<IntroductionCardData>> {
+    let identity = state.agent.identity();
+
+    // Build default services based on available capabilities.
+    let mut services = vec![x0x::identity::ServiceEntry {
+        name: "direct-message".to_string(),
+        description: "Send and receive direct encrypted messages".to_string(),
+        min_trust: "known".to_string(),
+    }];
+    // Advertise file-transfer if the daemon supports it.
+    services.push(x0x::identity::ServiceEntry {
+        name: "file-transfer".to_string(),
+        description: "Send and receive files".to_string(),
+        min_trust: "trusted".to_string(),
+    });
+
+    let card = x0x::identity::IntroductionCard::from_identity(identity, None, services);
+
+    Json(ApiResponse {
+        ok: true,
+        data: IntroductionCardData {
+            agent_id: hex::encode(card.agent_id.as_bytes()),
+            machine_id: hex::encode(card.machine_id.as_bytes()),
+            user_id: card.user_id.map(|u| hex::encode(u.as_bytes())),
+            certificate: card.certificate.as_ref().map(|_| "(present)".to_string()),
+            display_name: card.display_name,
+            identity_words: card.identity_words,
+            services: card
+                .services
+                .iter()
+                .map(|s| ServiceEntryData {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    min_trust: s.min_trust.clone(),
+                })
+                .collect(),
+            signature: hex::encode(&card.signature[..8]),
         },
     })
 }
