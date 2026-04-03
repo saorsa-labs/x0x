@@ -97,6 +97,11 @@ enum Commands {
         #[command(subcommand)]
         sub: NetworkSub,
     },
+    /// Find agents by 4-word speakable identity.
+    Find {
+        /// Identity words (4 words for agent, or 8 with @ separator).
+        words: Vec<String>,
+    },
     /// Discovered agents.
     Agents {
         #[command(subcommand)]
@@ -792,6 +797,7 @@ async fn run(
             NetworkSub::Status => commands::network::network_status(&client).await,
             NetworkSub::Cache => commands::network::bootstrap_cache(&client).await,
         },
+        Commands::Find { words } => commands::find::find(&client, &words).await,
         Commands::Agents { sub } => match sub {
             None => commands::discovery::list(&client, false).await,
             Some(AgentsSub::List { unfiltered }) => {
