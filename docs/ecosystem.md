@@ -166,17 +166,17 @@ saorsa-pqc ◄── saorsa-mls
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust |
-| Version | 0.15.0 |
-| LoC | ~33,300 |
+| Version | 0.15.1 |
+| LoC | ~33,600 |
 | License | MIT OR Apache-2.0 |
 | Published | crates.io, npm, PyPI |
-| Tests | 704 |
+| Tests | 744 |
 | Depends on | saorsa-pqc, saorsa-mls, ant-quic, all 11 saorsa-gossip crates |
 
 **What it provides**:
 - **Identity**: Three layers — MachineId (hardware-pinned), AgentId (portable), UserId (opt-in human)
 - **Messaging**: Gossip pub/sub (epidemic broadcast) + direct QUIC (point-to-point)
-- **Discovery**: Presence beacons, FOAF friend-of-a-friend walk, rendezvous shards
+- **Discovery**: mDNS zero-config LAN, presence beacons, FOAF friend-of-a-friend walk, rendezvous shards
 - **Collaboration**: CRDT task lists (OR-Set + LWW-Register), KV store with access control
 - **Security**: MLS encrypted groups (RFC 9420), trust/contacts with whitelist-by-default
 - **Operations**: Self-update with ML-DSA-65 signed releases, file transfer with SHA-256 integrity
