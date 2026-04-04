@@ -37,16 +37,20 @@ Spawn **3 named local instances** to test multi-agent scenarios:
 
 ```bash
 # Instance 1: Alice (port 12701)
-x0xd --name alice --api-port 12701 &
-ALICE_TOKEN=$(cat ~/.local/share/x0x-alice/api-token)
+x0xd --name alice --api-port 12701 --no-hard-coded-bootstrap &
+sleep 2
+# macOS: ~/Library/Application Support/x0x-alice/  Linux: ~/.local/share/x0x-alice/
+ALICE_TOKEN=$(cat ~/Library/Application\ Support/x0x-alice/api-token 2>/dev/null || cat ~/.local/share/x0x-alice/api-token)
 
 # Instance 2: Bob (port 12702)
-x0xd --name bob --api-port 12702 &
-BOB_TOKEN=$(cat ~/.local/share/x0x-bob/api-token)
+x0xd --name bob --api-port 12702 --no-hard-coded-bootstrap &
+sleep 2
+BOB_TOKEN=$(cat ~/Library/Application\ Support/x0x-bob/api-token 2>/dev/null || cat ~/.local/share/x0x-bob/api-token)
 
-# Instance 3: Charlie (port 12703, seedless bootstrap for isolation test)
-x0xd --name charlie --api-port 12703 --no-bootstrap &
-CHARLIE_TOKEN=$(cat ~/.local/share/x0x-charlie/api-token)
+# Instance 3: Charlie (port 12703, skips configured bootstrap peers; mDNS/cache may still discover locals)
+x0xd --name charlie --api-port 12703 --no-hard-coded-bootstrap &
+sleep 2
+CHARLIE_TOKEN=$(cat ~/Library/Application\ Support/x0x-charlie/api-token 2>/dev/null || cat ~/.local/share/x0x-charlie/api-token)
 ```
 
 ---

@@ -8,149 +8,27 @@
 use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::Value;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tempfile::TempDir;
-use tokio::sync::OnceCell;
+
+#[path = "harness/src/daemon.rs"]
+mod daemon;
+
+use daemon::DaemonFixture;
 
 // Re-exports for WebSocket tests
 use futures::{SinkExt, StreamExt};
 
-// ---------------------------------------------------------------------------
-// Shared daemon fixture
-// ---------------------------------------------------------------------------
-
-struct DaemonFixture {
-    _process: Child,
-    api_addr: String,
-    api_token: String,
-}
-
-impl DaemonFixture {
-    async fn start() -> Self {
-        let name = format!("api-test-{}", rand::random::<u32>());
-        let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/x0xd");
-        assert!(
-            binary.exists(),
-            "Build x0xd first: cargo build --release --bin x0xd"
-        );
-
-        let process = Command::new(&binary)
-            .arg("--name")
-            .arg(&name)
-            .spawn()
-            .expect("Failed to start x0xd");
-
-        // Determine data dir
-        let data_dir = if cfg!(target_os = "macos") {
-            dirs::home_dir()
-                .unwrap()
-                .join("Library/Application Support")
-                .join(format!("x0x-{name}"))
-        } else {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(format!("x0x-{name}"))
-        };
-
-        // Wait for port file
-        let port_file = data_dir.join("api.port");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let api_addr = loop {
-            if tokio::time::Instant::now() > deadline {
-                panic!("Timeout waiting for port file");
-            }
-            if let Ok(s) = std::fs::read_to_string(&port_file) {
-                let s = s.trim().to_string();
-                if !s.is_empty() {
-                    break s;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        };
-
-        // Wait for health
-        let client = reqwest::Client::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                panic!("Timeout waiting for health");
-            }
-            if let Ok(r) = client.get(format!("http://{api_addr}/health")).send().await {
-                if r.status().is_success() {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-
-        // Read API token
-        let token_file = data_dir.join("api-token");
-        let api_token = {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                if let Ok(t) = std::fs::read_to_string(&token_file) {
-                    let t = t.trim().to_string();
-                    if !t.is_empty() {
-                        break t;
-                    }
-                }
-                if tokio::time::Instant::now() > deadline {
-                    panic!("Timeout waiting for api-token file");
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        };
-
-        Self {
-            _process: process,
-            api_addr,
-            api_token,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://{}{}", self.api_addr, path)
-    }
-    fn ws_url(&self, path: &str) -> String {
-        format!("ws://{}{}?token={}", self.api_addr, path, self.api_token)
-    }
-    fn auth_header(&self) -> String {
-        format!("Bearer {}", self.api_token)
-    }
-}
-
-impl Drop for DaemonFixture {
-    fn drop(&mut self) {
-        let _ = self._process.kill();
-    }
-}
-
-async fn daemon() -> &'static DaemonFixture {
-    static F: OnceCell<DaemonFixture> = OnceCell::const_new();
-    F.get_or_init(|| async { DaemonFixture::start().await })
-        .await
+async fn daemon() -> DaemonFixture {
+    DaemonFixture::start("api-test").await
 }
 
 fn c() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap()
+    DaemonFixture::client(Duration::from_secs(10))
 }
+
 /// Authenticated client with Bearer token in default headers.
 fn ca(d: &DaemonFixture) -> reqwest::Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        reqwest::header::HeaderValue::from_str(&d.auth_header()).unwrap(),
-    );
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .default_headers(headers)
-        .build()
-        .unwrap()
+    d.authed_client(Duration::from_secs(10))
 }
 fn fake_id() -> String {
     hex::encode(rand::random::<[u8; 32]>())
@@ -184,7 +62,7 @@ async fn daemon_api_health() {
 #[ignore]
 async fn daemon_api_status() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url("/status"))
         .send()
         .await
@@ -200,7 +78,7 @@ async fn daemon_api_status() {
 #[ignore]
 async fn daemon_api_agent() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url("/agent"))
         .send()
         .await
@@ -217,7 +95,7 @@ async fn daemon_api_agent() {
 #[ignore]
 async fn daemon_api_peers() {
     let d = daemon().await;
-    let r = ca(d).get(d.url("/peers")).send().await.unwrap();
+    let r = ca(&d).get(d.url("/peers")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 }
 
@@ -225,7 +103,7 @@ async fn daemon_api_peers() {
 #[ignore]
 async fn daemon_api_network_status() {
     let d = daemon().await;
-    let r = ca(d).get(d.url("/network/status")).send().await.unwrap();
+    let r = ca(&d).get(d.url("/network/status")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 }
 
@@ -233,7 +111,7 @@ async fn daemon_api_network_status() {
 #[ignore]
 async fn daemon_api_announce() {
     let d = daemon().await;
-    let r = ca(d)
+    let r = ca(&d)
         .post(d.url("/announce"))
         .json(&serde_json::json!({"include_user_identity": false, "human_consent": false}))
         .send()
@@ -245,57 +123,19 @@ async fn daemon_api_announce() {
 #[tokio::test]
 #[ignore]
 async fn daemon_api_shutdown_with_sse_client() {
-    let temp = TempDir::new().unwrap();
-    let config_path = temp.path().join("x0xd-test.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = \"{}\"\n",
-            temp.path().display()
-        ),
-    )
-    .unwrap();
-
-    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/x0xd");
-    assert!(
-        binary.exists(),
-        "Build x0xd first: cargo build --release --bin x0xd"
-    );
-
-    let mut process = Command::new(&binary)
-        .arg("--config")
-        .arg(&config_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Failed to start x0xd");
-
-    let port_file = temp.path().join("api.port");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let api_addr = loop {
-        if tokio::time::Instant::now() > deadline {
-            let _ = process.kill();
-            panic!("Timeout waiting for port file");
-        }
-        if let Ok(s) = std::fs::read_to_string(&port_file) {
-            let s = s.trim().to_string();
-            if !s.is_empty() {
-                break s;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    let mut d = DaemonFixture::start("shutdown-test").await;
 
     let sse_client = reqwest::Client::new();
     let sse_response = sse_client
-        .get(format!("http://{api_addr}/events"))
+        .get(format!("{}?token={}", d.url("/events"), d.api_token()))
         .send()
         .await
         .unwrap();
     assert_eq!(sse_response.status(), StatusCode::OK);
 
     let shutdown_response = reqwest::Client::new()
-        .post(format!("http://{api_addr}/shutdown"))
+        .post(d.url("/shutdown"))
+        .header("Authorization", d.auth_header())
         .send()
         .await
         .unwrap();
@@ -303,18 +143,18 @@ async fn daemon_api_shutdown_with_sse_client() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(status) = process.try_wait().unwrap() {
+        if let Some(status) = d.try_wait().unwrap() {
             assert!(status.success(), "daemon exited with {status}");
             break;
         }
         if tokio::time::Instant::now() > deadline {
-            let _ = process.kill();
             panic!("daemon did not exit with an active SSE client");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     drop(sse_response);
+    let port_file = d.port_file();
     assert!(
         !port_file.exists(),
         "port file should be removed on shutdown"
@@ -330,7 +170,7 @@ async fn daemon_api_shutdown_with_sse_client() {
 async fn daemon_api_subscribe_publish() {
     let d = daemon().await;
     let topic = format!("test-{}", rand::random::<u32>());
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url("/subscribe"))
         .json(&serde_json::json!({"topic": topic}))
         .send()
@@ -342,7 +182,7 @@ async fn daemon_api_subscribe_publish() {
     assert_eq!(r["ok"], true);
     assert!(r["subscription_id"].is_string());
 
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url("/publish"))
         .json(&serde_json::json!({"topic": topic, "payload": b64(b"hello")}))
         .send()
@@ -358,7 +198,7 @@ async fn daemon_api_subscribe_publish() {
 #[ignore]
 async fn daemon_api_unsubscribe() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url("/subscribe"))
         .json(&serde_json::json!({"topic": "unsub-test"}))
         .send()
@@ -368,7 +208,7 @@ async fn daemon_api_unsubscribe() {
         .await
         .unwrap();
     let sid = r["subscription_id"].as_str().unwrap();
-    let r = ca(d)
+    let r = ca(&d)
         .delete(d.url(&format!("/subscribe/{sid}")))
         .send()
         .await
@@ -380,7 +220,7 @@ async fn daemon_api_unsubscribe() {
 #[ignore]
 async fn daemon_api_events_sse() {
     let d = daemon().await;
-    let r = ca(d).get(d.url("/events")).send().await.unwrap();
+    let r = ca(&d).get(d.url("/events")).send().await.unwrap();
     assert!(r
         .headers()
         .get("content-type")
@@ -394,7 +234,7 @@ async fn daemon_api_events_sse() {
 #[ignore]
 async fn daemon_api_publish_bad_base64() {
     let d = daemon().await;
-    let r = ca(d)
+    let r = ca(&d)
         .post(d.url("/publish"))
         .json(&serde_json::json!({"topic": "t", "payload": "!!!"}))
         .send()
@@ -411,7 +251,7 @@ async fn daemon_api_publish_bad_base64() {
 #[ignore]
 async fn daemon_api_direct_send_not_found() {
     let d = daemon().await;
-    let r = ca(d)
+    let r = ca(&d)
         .post(d.url("/direct/send"))
         .json(&serde_json::json!({"agent_id": fake_id(), "payload": b64(b"hi")}))
         .send()
@@ -424,7 +264,7 @@ async fn daemon_api_direct_send_not_found() {
 #[ignore]
 async fn daemon_api_direct_connections() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url("/direct/connections"))
         .send()
         .await
@@ -440,7 +280,7 @@ async fn daemon_api_direct_connections() {
 #[ignore]
 async fn daemon_api_direct_events_sse() {
     let d = daemon().await;
-    let r = ca(d).get(d.url("/direct/events")).send().await.unwrap();
+    let r = ca(&d).get(d.url("/direct/events")).send().await.unwrap();
     assert!(r
         .headers()
         .get("content-type")
@@ -456,12 +296,13 @@ async fn daemon_api_direct_send_blocked() {
     let d = daemon().await;
     let agent = fake_id();
     // Add as blocked
-    c().post(d.url("/contacts"))
+    ca(&d)
+        .post(d.url("/contacts"))
         .json(&serde_json::json!({"agent_id": agent, "trust_level": "blocked"}))
         .send()
         .await
         .unwrap();
-    let r = ca(d)
+    let r = ca(&d)
         .post(d.url("/direct/send"))
         .json(&serde_json::json!({"agent_id": agent, "payload": b64(b"hi")}))
         .send()
@@ -469,7 +310,8 @@ async fn daemon_api_direct_send_blocked() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
     // Cleanup
-    c().delete(d.url(&format!("/contacts/{agent}")))
+    ca(&d)
+        .delete(d.url(&format!("/contacts/{agent}")))
         .send()
         .await
         .unwrap();
@@ -483,7 +325,7 @@ async fn daemon_api_direct_send_blocked() {
 #[ignore]
 async fn daemon_api_discovered_agents() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url("/agents/discovered"))
         .send()
         .await
@@ -499,7 +341,7 @@ async fn daemon_api_discovered_agents() {
 #[ignore]
 async fn daemon_api_discovered_unfiltered() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url("/agents/discovered?unfiltered=true"))
         .send()
         .await
@@ -517,6 +359,14 @@ async fn daemon_api_find_agent_unknown() {
     // find_agent does 3-stage search (cache→shard→rendezvous) — needs longer timeout
     let long_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&d.auth_header()).unwrap(),
+            );
+            headers
+        })
         .build()
         .unwrap();
     let r: Value = long_client
@@ -535,7 +385,7 @@ async fn daemon_api_find_agent_unknown() {
 #[ignore]
 async fn daemon_api_reachability_unknown() {
     let d = daemon().await;
-    let r = ca(d)
+    let r = ca(&d)
         .get(d.url(&format!("/agents/reachability/{}", fake_id())))
         .send()
         .await
@@ -547,7 +397,7 @@ async fn daemon_api_reachability_unknown() {
 #[ignore]
 async fn daemon_api_agents_by_user() {
     let d = daemon().await;
-    let r = ca(d)
+    let r = ca(&d)
         .get(d.url(&format!("/users/{}/agents", fake_id())))
         .send()
         .await
@@ -564,7 +414,7 @@ async fn daemon_api_agents_by_user() {
 async fn daemon_api_add_contact() {
     let d = daemon().await;
     let agent = fake_id();
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url("/contacts"))
         .json(&serde_json::json!({"agent_id": agent, "trust_level": "known", "label": "test"}))
         .send()
@@ -574,7 +424,8 @@ async fn daemon_api_add_contact() {
         .await
         .unwrap();
     assert_eq!(r["ok"], true);
-    c().delete(d.url(&format!("/contacts/{agent}")))
+    ca(&d)
+        .delete(d.url(&format!("/contacts/{agent}")))
         .send()
         .await
         .unwrap();
@@ -584,7 +435,7 @@ async fn daemon_api_add_contact() {
 #[ignore]
 async fn daemon_api_list_contacts() {
     let d = daemon().await;
-    let r = ca(d).get(d.url("/contacts")).send().await.unwrap();
+    let r = ca(&d).get(d.url("/contacts")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 }
 
@@ -593,12 +444,13 @@ async fn daemon_api_list_contacts() {
 async fn daemon_api_quick_trust() {
     let d = daemon().await;
     let agent = fake_id();
-    c().post(d.url("/contacts"))
+    ca(&d)
+        .post(d.url("/contacts"))
         .json(&serde_json::json!({"agent_id": agent, "trust_level": "unknown"}))
         .send()
         .await
         .unwrap();
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url("/contacts/trust"))
         .json(&serde_json::json!({"agent_id": agent, "level": "trusted"}))
         .send()
@@ -608,7 +460,8 @@ async fn daemon_api_quick_trust() {
         .await
         .unwrap();
     assert_eq!(r["ok"], true);
-    c().delete(d.url(&format!("/contacts/{agent}")))
+    ca(&d)
+        .delete(d.url(&format!("/contacts/{agent}")))
         .send()
         .await
         .unwrap();
@@ -619,12 +472,13 @@ async fn daemon_api_quick_trust() {
 async fn daemon_api_update_contact() {
     let d = daemon().await;
     let agent = fake_id();
-    c().post(d.url("/contacts"))
+    ca(&d)
+        .post(d.url("/contacts"))
         .json(&serde_json::json!({"agent_id": agent, "trust_level": "unknown"}))
         .send()
         .await
         .unwrap();
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .patch(d.url(&format!("/contacts/{agent}")))
         .json(&serde_json::json!({"trust_level": "trusted", "identity_type": "pinned"}))
         .send()
@@ -634,7 +488,8 @@ async fn daemon_api_update_contact() {
         .await
         .unwrap();
     assert_eq!(r["ok"], true);
-    c().delete(d.url(&format!("/contacts/{agent}")))
+    ca(&d)
+        .delete(d.url(&format!("/contacts/{agent}")))
         .send()
         .await
         .unwrap();
@@ -645,12 +500,13 @@ async fn daemon_api_update_contact() {
 async fn daemon_api_delete_contact() {
     let d = daemon().await;
     let agent = fake_id();
-    c().post(d.url("/contacts"))
+    ca(&d)
+        .post(d.url("/contacts"))
         .json(&serde_json::json!({"agent_id": agent, "trust_level": "known"}))
         .send()
         .await
         .unwrap();
-    let r = ca(d)
+    let r = ca(&d)
         .delete(d.url(&format!("/contacts/{agent}")))
         .send()
         .await
@@ -663,12 +519,13 @@ async fn daemon_api_delete_contact() {
 async fn daemon_api_revoke_contact() {
     let d = daemon().await;
     let agent = fake_id();
-    c().post(d.url("/contacts"))
+    ca(&d)
+        .post(d.url("/contacts"))
         .json(&serde_json::json!({"agent_id": agent, "trust_level": "known"}))
         .send()
         .await
         .unwrap();
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url(&format!("/contacts/{agent}/revoke")))
         .json(&serde_json::json!({"reason": "compromised"}))
         .send()
@@ -684,7 +541,7 @@ async fn daemon_api_revoke_contact() {
 #[ignore]
 async fn daemon_api_list_revocations() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url(&format!("/contacts/{}/revocations", fake_id())))
         .send()
         .await
@@ -701,19 +558,21 @@ async fn daemon_api_list_revocations() {
 async fn daemon_api_add_machine() {
     let d = daemon().await;
     let agent = fake_id();
-    c().post(d.url("/contacts"))
+    ca(&d)
+        .post(d.url("/contacts"))
         .json(&serde_json::json!({"agent_id": agent, "trust_level": "known"}))
         .send()
         .await
         .unwrap();
-    let r = ca(d)
+    let r = ca(&d)
         .post(d.url(&format!("/contacts/{agent}/machines")))
         .json(&serde_json::json!({"machine_id": fake_id()}))
         .send()
         .await
         .unwrap();
     assert!(r.status().is_success(), "add_machine: {}", r.status());
-    c().delete(d.url(&format!("/contacts/{agent}")))
+    ca(&d)
+        .delete(d.url(&format!("/contacts/{agent}")))
         .send()
         .await
         .unwrap();
@@ -725,17 +584,19 @@ async fn daemon_api_pin_unpin_machine() {
     let d = daemon().await;
     let agent = fake_id();
     let machine = fake_id();
-    c().post(d.url("/contacts"))
+    ca(&d)
+        .post(d.url("/contacts"))
         .json(&serde_json::json!({"agent_id": agent, "trust_level": "known"}))
         .send()
         .await
         .unwrap();
-    c().post(d.url(&format!("/contacts/{agent}/machines")))
+    ca(&d)
+        .post(d.url(&format!("/contacts/{agent}/machines")))
         .json(&serde_json::json!({"machine_id": machine}))
         .send()
         .await
         .unwrap();
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url(&format!("/contacts/{agent}/machines/{machine}/pin")))
         .send()
         .await
@@ -744,7 +605,7 @@ async fn daemon_api_pin_unpin_machine() {
         .await
         .unwrap();
     assert_eq!(r["ok"], true);
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .delete(d.url(&format!("/contacts/{agent}/machines/{machine}/pin")))
         .send()
         .await
@@ -753,7 +614,8 @@ async fn daemon_api_pin_unpin_machine() {
         .await
         .unwrap();
     assert_eq!(r["ok"], true);
-    c().delete(d.url(&format!("/contacts/{agent}")))
+    ca(&d)
+        .delete(d.url(&format!("/contacts/{agent}")))
         .send()
         .await
         .unwrap();
@@ -763,7 +625,7 @@ async fn daemon_api_pin_unpin_machine() {
 #[ignore]
 async fn daemon_api_evaluate_trust() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url("/trust/evaluate"))
         .json(&serde_json::json!({"agent_id": fake_id(), "machine_id": fake_id()}))
         .send()
@@ -784,7 +646,7 @@ async fn daemon_api_evaluate_trust() {
 #[ignore]
 async fn daemon_api_create_group() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url("/mls/groups"))
         .json(&serde_json::json!({}))
         .send()
@@ -801,12 +663,13 @@ async fn daemon_api_create_group() {
 #[ignore]
 async fn daemon_api_list_groups() {
     let d = daemon().await;
-    c().post(d.url("/mls/groups"))
+    ca(&d)
+        .post(d.url("/mls/groups"))
         .json(&serde_json::json!({}))
         .send()
         .await
         .unwrap();
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url("/mls/groups"))
         .send()
         .await
@@ -822,7 +685,7 @@ async fn daemon_api_list_groups() {
 #[ignore]
 async fn daemon_api_get_group() {
     let d = daemon().await;
-    let cr: Value = ca(d)
+    let cr: Value = ca(&d)
         .post(d.url("/mls/groups"))
         .json(&serde_json::json!({}))
         .send()
@@ -832,7 +695,7 @@ async fn daemon_api_get_group() {
         .await
         .unwrap();
     let gid = cr["group_id"].as_str().unwrap();
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url(&format!("/mls/groups/{gid}")))
         .send()
         .await
@@ -848,7 +711,7 @@ async fn daemon_api_get_group() {
 #[ignore]
 async fn daemon_api_add_member() {
     let d = daemon().await;
-    let cr: Value = ca(d)
+    let cr: Value = ca(&d)
         .post(d.url("/mls/groups"))
         .json(&serde_json::json!({}))
         .send()
@@ -858,7 +721,7 @@ async fn daemon_api_add_member() {
         .await
         .unwrap();
     let gid = cr["group_id"].as_str().unwrap();
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url(&format!("/mls/groups/{gid}/members")))
         .json(&serde_json::json!({"agent_id": fake_id()}))
         .send()
@@ -875,7 +738,7 @@ async fn daemon_api_add_member() {
 #[ignore]
 async fn daemon_api_remove_member() {
     let d = daemon().await;
-    let cr: Value = ca(d)
+    let cr: Value = ca(&d)
         .post(d.url("/mls/groups"))
         .json(&serde_json::json!({}))
         .send()
@@ -886,12 +749,13 @@ async fn daemon_api_remove_member() {
         .unwrap();
     let gid = cr["group_id"].as_str().unwrap();
     let member = fake_id();
-    c().post(d.url(&format!("/mls/groups/{gid}/members")))
+    ca(&d)
+        .post(d.url(&format!("/mls/groups/{gid}/members")))
         .json(&serde_json::json!({"agent_id": member}))
         .send()
         .await
         .unwrap();
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .delete(d.url(&format!("/mls/groups/{gid}/members/{member}")))
         .send()
         .await
@@ -907,7 +771,7 @@ async fn daemon_api_remove_member() {
 #[ignore]
 async fn daemon_api_encrypt_decrypt() {
     let d = daemon().await;
-    let cr: Value = ca(d)
+    let cr: Value = ca(&d)
         .post(d.url("/mls/groups"))
         .json(&serde_json::json!({}))
         .send()
@@ -918,7 +782,7 @@ async fn daemon_api_encrypt_decrypt() {
         .unwrap();
     let gid = cr["group_id"].as_str().unwrap();
     // Encrypt
-    let enc: Value = ca(d)
+    let enc: Value = ca(&d)
         .post(d.url(&format!("/mls/groups/{gid}/encrypt")))
         .json(&serde_json::json!({"payload": b64(b"secret")}))
         .send()
@@ -931,7 +795,7 @@ async fn daemon_api_encrypt_decrypt() {
     let ct = enc["ciphertext"].as_str().unwrap();
     let epoch = enc["epoch"].as_u64().unwrap();
     // Decrypt
-    let dec: Value = ca(d)
+    let dec: Value = ca(&d)
         .post(d.url(&format!("/mls/groups/{gid}/decrypt")))
         .json(&serde_json::json!({"ciphertext": ct, "epoch": epoch}))
         .send()
@@ -951,7 +815,7 @@ async fn daemon_api_encrypt_decrypt() {
 #[ignore]
 async fn daemon_api_mls_welcome() {
     let d = daemon().await;
-    let cr: Value = ca(d)
+    let cr: Value = ca(&d)
         .post(d.url("/mls/groups"))
         .json(&serde_json::json!({}))
         .send()
@@ -962,12 +826,13 @@ async fn daemon_api_mls_welcome() {
         .unwrap();
     let gid = cr["group_id"].as_str().unwrap();
     let invitee = fake_id();
-    c().post(d.url(&format!("/mls/groups/{gid}/members")))
+    ca(&d)
+        .post(d.url(&format!("/mls/groups/{gid}/members")))
         .json(&serde_json::json!({"agent_id": invitee}))
         .send()
         .await
         .unwrap();
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url(&format!("/mls/groups/{gid}/welcome")))
         .json(&serde_json::json!({"agent_id": invitee}))
         .send()
@@ -984,7 +849,7 @@ async fn daemon_api_mls_welcome() {
 #[ignore]
 async fn daemon_api_group_not_found() {
     let d = daemon().await;
-    let r = ca(d)
+    let r = ca(&d)
         .get(d.url("/mls/groups/nonexistent"))
         .send()
         .await
@@ -1000,7 +865,7 @@ async fn daemon_api_group_not_found() {
 #[ignore]
 async fn daemon_api_create_task_list() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .post(d.url("/task-lists"))
         .json(&serde_json::json!({"name": "test", "topic": "test-tasks"}))
         .send()
@@ -1016,7 +881,7 @@ async fn daemon_api_create_task_list() {
 #[ignore]
 async fn daemon_api_add_task() {
     let d = daemon().await;
-    let cr: Value = ca(d)
+    let cr: Value = ca(&d)
         .post(d.url("/task-lists"))
         .json(&serde_json::json!({"name": "t", "topic": "t-tasks"}))
         .send()
@@ -1029,7 +894,7 @@ async fn daemon_api_add_task() {
         .as_str()
         .unwrap_or(cr["task_list_id"].as_str().unwrap_or(""));
     if !lid.is_empty() {
-        let r: Value = ca(d)
+        let r: Value = ca(&d)
             .post(d.url(&format!("/task-lists/{lid}/tasks")))
             .json(&serde_json::json!({"title": "Test task"}))
             .send()
@@ -1046,7 +911,7 @@ async fn daemon_api_add_task() {
 #[ignore]
 async fn daemon_api_list_tasks() {
     let d = daemon().await;
-    let r = ca(d).get(d.url("/task-lists")).send().await.unwrap();
+    let r = ca(&d).get(d.url("/task-lists")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 }
 
@@ -1055,7 +920,7 @@ async fn daemon_api_list_tasks() {
 async fn daemon_api_claim_task() {
     // Tested via the update_task endpoint with action: "claim"
     let d = daemon().await;
-    let r = ca(d).get(d.url("/task-lists")).send().await.unwrap();
+    let r = ca(&d).get(d.url("/task-lists")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 }
 
@@ -1063,7 +928,7 @@ async fn daemon_api_claim_task() {
 #[ignore]
 async fn daemon_api_complete_task() {
     let d = daemon().await;
-    let r = ca(d).get(d.url("/task-lists")).send().await.unwrap();
+    let r = ca(&d).get(d.url("/task-lists")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 }
 
@@ -1075,7 +940,7 @@ async fn daemon_api_complete_task() {
 #[ignore]
 async fn daemon_api_bootstrap_cache() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url("/network/bootstrap-cache"))
         .send()
         .await
@@ -1090,7 +955,7 @@ async fn daemon_api_bootstrap_cache() {
 #[ignore]
 async fn daemon_api_upgrade_check() {
     let d = daemon().await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url("/upgrade"))
         .send()
         .await
@@ -1110,7 +975,7 @@ async fn daemon_api_upgrade_check() {
 #[ignore]
 async fn daemon_api_connect_unknown() {
     let d = daemon().await;
-    let r = ca(d)
+    let r = ca(&d)
         .post(d.url("/agents/connect"))
         .json(&serde_json::json!({"agent_id": fake_id()}))
         .send()
@@ -1185,7 +1050,7 @@ async fn daemon_api_ws_sessions() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let r: Value = ca(d)
+    let r: Value = ca(&d)
         .get(d.url("/ws/sessions"))
         .send()
         .await
@@ -1205,7 +1070,7 @@ async fn daemon_api_ws_sessions() {
 #[ignore]
 async fn daemon_api_invalid_hex() {
     let d = daemon().await;
-    let r = ca(d)
+    let r = ca(&d)
         .get(d.url("/agents/reachability/not-hex"))
         .send()
         .await
@@ -1218,21 +1083,39 @@ async fn daemon_api_invalid_hex() {
 async fn daemon_api_body_too_large() {
     let d = daemon().await;
     let big = "A".repeat(2 * 1024 * 1024);
-    let r = ca(d)
+    let result = ca(&d)
         .post(d.url("/publish"))
         .header("content-type", "application/json")
         .body(format!(r#"{{"topic":"t","payload":"{big}"}}"#))
         .send()
-        .await
-        .unwrap();
-    assert!(r.status() == StatusCode::PAYLOAD_TOO_LARGE || r.status() == StatusCode::BAD_REQUEST);
+        .await;
+
+    match result {
+        Ok(response) => {
+            assert!(
+                response.status() == StatusCode::PAYLOAD_TOO_LARGE
+                    || response.status() == StatusCode::BAD_REQUEST,
+                "unexpected status: {}",
+                response.status()
+            );
+        }
+        Err(err) => {
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("connection reset")
+                    || msg.contains("body write")
+                    || msg.contains("channel closed"),
+                "unexpected transport error for oversized body: {err}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
 #[ignore]
 async fn daemon_api_invalid_json() {
     let d = daemon().await;
-    let r = ca(d)
+    let r = ca(&d)
         .post(d.url("/publish"))
         .header("content-type", "application/json")
         .body("not json")

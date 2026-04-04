@@ -7,137 +7,20 @@
 
 use reqwest::StatusCode;
 use serde_json::Value;
-use std::path::PathBuf;
-use std::process::{Child, Command};
 use std::time::Duration;
-use tokio::sync::OnceCell;
 
-// ---------------------------------------------------------------------------
-// Shared daemon fixture (same pattern as daemon_api_integration.rs)
-// ---------------------------------------------------------------------------
+#[path = "harness/src/daemon.rs"]
+mod daemon;
 
-struct DaemonFixture {
-    _process: Child,
-    api_addr: String,
-    api_token: String,
-}
+use daemon::DaemonFixture;
 
-impl DaemonFixture {
-    async fn start() -> Self {
-        let name = format!("ng-test-{}", rand::random::<u32>());
-        let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/x0xd");
-        assert!(
-            binary.exists(),
-            "Build x0xd first: cargo build --release --bin x0xd"
-        );
-
-        let process = Command::new(&binary)
-            .arg("--name")
-            .arg(&name)
-            .spawn()
-            .expect("Failed to start x0xd");
-
-        // Determine data dir
-        let data_dir = if cfg!(target_os = "macos") {
-            dirs::home_dir()
-                .unwrap()
-                .join("Library/Application Support")
-                .join(format!("x0x-{name}"))
-        } else {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(format!("x0x-{name}"))
-        };
-
-        // Wait for port file
-        let port_file = data_dir.join("api.port");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let api_addr = loop {
-            if tokio::time::Instant::now() > deadline {
-                panic!("Timeout waiting for port file");
-            }
-            if let Ok(s) = std::fs::read_to_string(&port_file) {
-                let s = s.trim().to_string();
-                if !s.is_empty() {
-                    break s;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        };
-
-        // Wait for health
-        let client = reqwest::Client::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                panic!("Timeout waiting for health");
-            }
-            if let Ok(r) = client.get(format!("http://{api_addr}/health")).send().await {
-                if r.status().is_success() {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-
-        // Read API token
-        let token_file = data_dir.join("api-token");
-        let api_token = {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                if let Ok(t) = std::fs::read_to_string(&token_file) {
-                    let t = t.trim().to_string();
-                    if !t.is_empty() {
-                        break t;
-                    }
-                }
-                if tokio::time::Instant::now() > deadline {
-                    panic!("Timeout waiting for api-token file");
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        };
-
-        Self {
-            _process: process,
-            api_addr,
-            api_token,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://{}{}", self.api_addr, path)
-    }
-
-    fn auth_header(&self) -> String {
-        format!("Bearer {}", self.api_token)
-    }
-}
-
-impl Drop for DaemonFixture {
-    fn drop(&mut self) {
-        let _ = self._process.kill();
-    }
-}
-
-async fn daemon() -> &'static DaemonFixture {
-    static F: OnceCell<DaemonFixture> = OnceCell::const_new();
-    F.get_or_init(|| async { DaemonFixture::start().await })
-        .await
+async fn daemon() -> DaemonFixture {
+    DaemonFixture::start("ng-test").await
 }
 
 /// Authenticated client with Bearer token in default headers.
 fn authed_client(d: &DaemonFixture) -> reqwest::Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        reqwest::header::HeaderValue::from_str(&d.auth_header()).unwrap(),
-    );
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .default_headers(headers)
-        .build()
-        .unwrap()
+    d.authed_client(Duration::from_secs(10))
 }
 
 // ===========================================================================
@@ -181,7 +64,7 @@ async fn create_group(
 #[ignore]
 async fn named_group_create() {
     let d = daemon().await;
-    let (group_id, r) = create_group(d, "Alpha Team", "Our first group", Some("Alice")).await;
+    let (group_id, r) = create_group(&d, "Alpha Team", "Our first group", Some("Alice")).await;
 
     assert_eq!(r["ok"], true, "create response: {r:?}");
     assert!(!group_id.is_empty(), "group_id should be non-empty");
@@ -189,7 +72,7 @@ async fn named_group_create() {
     assert!(r["chat_topic"].is_string(), "chat_topic should be returned");
 
     // Cleanup
-    authed_client(d)
+    authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -204,10 +87,10 @@ async fn named_group_create() {
 #[ignore]
 async fn named_group_list() {
     let d = daemon().await;
-    let (g1, _) = create_group(d, "List-Group-A", "", None).await;
-    let (g2, _) = create_group(d, "List-Group-B", "", None).await;
+    let (g1, _) = create_group(&d, "List-Group-A", "", None).await;
+    let (g2, _) = create_group(&d, "List-Group-B", "", None).await;
 
-    let r: Value = authed_client(d)
+    let r: Value = authed_client(&d)
         .get(d.url("/groups"))
         .send()
         .await
@@ -236,7 +119,7 @@ async fn named_group_list() {
 
     // Cleanup
     for gid in [&g1, &g2] {
-        authed_client(d)
+        authed_client(&d)
             .delete(d.url(&format!("/groups/{gid}")))
             .send()
             .await
@@ -252,9 +135,9 @@ async fn named_group_list() {
 #[ignore]
 async fn named_group_info() {
     let d = daemon().await;
-    let (group_id, _) = create_group(d, "Info Group", "detailed info", Some("Creator")).await;
+    let (group_id, _) = create_group(&d, "Info Group", "detailed info", Some("Creator")).await;
 
-    let r: Value = authed_client(d)
+    let r: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -284,7 +167,7 @@ async fn named_group_info() {
     );
 
     // Cleanup
-    authed_client(d)
+    authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -299,9 +182,9 @@ async fn named_group_info() {
 #[ignore]
 async fn named_group_generate_invite() {
     let d = daemon().await;
-    let (group_id, _) = create_group(d, "Invite Group", "", None).await;
+    let (group_id, _) = create_group(&d, "Invite Group", "", None).await;
 
-    let r: Value = authed_client(d)
+    let r: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/invite")))
         .json(&serde_json::json!({"expiry_secs": 3600}))
         .send()
@@ -322,7 +205,7 @@ async fn named_group_generate_invite() {
     assert!(r["expires_at"].is_u64(), "expires_at should be present");
 
     // Cleanup
-    authed_client(d)
+    authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -341,10 +224,10 @@ async fn named_group_generate_invite() {
 #[ignore]
 async fn named_group_join_via_invite() {
     let d = daemon().await;
-    let (group_id, _) = create_group(d, "Join Test Group", "", Some("Alice")).await;
+    let (group_id, _) = create_group(&d, "Join Test Group", "", Some("Alice")).await;
 
     // Generate invite
-    let invite_resp: Value = authed_client(d)
+    let invite_resp: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/invite")))
         .json(&serde_json::json!({"expiry_secs": 3600}))
         .send()
@@ -356,7 +239,7 @@ async fn named_group_join_via_invite() {
     let invite_link = invite_resp["invite_link"].as_str().unwrap().to_string();
 
     // Leave the group first so we can rejoin
-    let leave_r = authed_client(d)
+    let leave_r = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -364,7 +247,7 @@ async fn named_group_join_via_invite() {
     assert_eq!(leave_r.status(), StatusCode::OK);
 
     // Join via invite
-    let join_r: Value = authed_client(d)
+    let join_r: Value = authed_client(&d)
         .post(d.url("/groups/join"))
         .json(&serde_json::json!({
             "invite": invite_link,
@@ -382,7 +265,7 @@ async fn named_group_join_via_invite() {
     assert!(join_r["chat_topic"].is_string());
 
     // Verify group exists after join
-    let info_r: Value = authed_client(d)
+    let info_r: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -393,7 +276,7 @@ async fn named_group_join_via_invite() {
     assert_eq!(info_r["ok"], true);
 
     // Cleanup
-    authed_client(d)
+    authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -408,10 +291,10 @@ async fn named_group_join_via_invite() {
 #[ignore]
 async fn named_group_display_name() {
     let d = daemon().await;
-    let (group_id, _) = create_group(d, "Display Name Group", "", None).await;
+    let (group_id, _) = create_group(&d, "Display Name Group", "", None).await;
 
     // Set display name
-    let r: Value = authed_client(d)
+    let r: Value = authed_client(&d)
         .put(d.url(&format!("/groups/{group_id}/display-name")))
         .json(&serde_json::json!({"name": "Fancy Alice"}))
         .send()
@@ -425,7 +308,7 @@ async fn named_group_display_name() {
     assert_eq!(r["display_name"], "Fancy Alice");
 
     // Verify via group info
-    let info: Value = authed_client(d)
+    let info: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -442,7 +325,7 @@ async fn named_group_display_name() {
     );
 
     // Cleanup
-    authed_client(d)
+    authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -457,10 +340,10 @@ async fn named_group_display_name() {
 #[ignore]
 async fn named_group_leave() {
     let d = daemon().await;
-    let (group_id, _) = create_group(d, "Leave Group", "", None).await;
+    let (group_id, _) = create_group(&d, "Leave Group", "", None).await;
 
     // Leave
-    let r: Value = authed_client(d)
+    let r: Value = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -473,7 +356,7 @@ async fn named_group_leave() {
     assert_eq!(r["left"], "Leave Group");
 
     // Verify group is gone
-    let info_r = authed_client(d)
+    let info_r = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -493,10 +376,10 @@ async fn named_group_leave() {
 #[ignore]
 async fn named_group_rejoin_after_leave() {
     let d = daemon().await;
-    let (group_id, _) = create_group(d, "Rejoin Group", "", Some("Alice")).await;
+    let (group_id, _) = create_group(&d, "Rejoin Group", "", Some("Alice")).await;
 
     // Generate invite before leaving
-    let invite_resp: Value = authed_client(d)
+    let invite_resp: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/invite")))
         .json(&serde_json::json!({"expiry_secs": 3600}))
         .send()
@@ -508,7 +391,7 @@ async fn named_group_rejoin_after_leave() {
     let invite_link = invite_resp["invite_link"].as_str().unwrap().to_string();
 
     // Leave
-    let leave_r: Value = authed_client(d)
+    let leave_r: Value = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -519,7 +402,7 @@ async fn named_group_rejoin_after_leave() {
     assert_eq!(leave_r["ok"], true);
 
     // Verify gone
-    let gone_r = authed_client(d)
+    let gone_r = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -527,7 +410,7 @@ async fn named_group_rejoin_after_leave() {
     assert_eq!(gone_r.status(), StatusCode::NOT_FOUND);
 
     // Rejoin via invite
-    let join_r: Value = authed_client(d)
+    let join_r: Value = authed_client(&d)
         .post(d.url("/groups/join"))
         .json(&serde_json::json!({
             "invite": invite_link,
@@ -544,7 +427,7 @@ async fn named_group_rejoin_after_leave() {
     assert_eq!(join_r["group_name"], "Rejoin Group");
 
     // Verify group info is restored
-    let info: Value = authed_client(d)
+    let info: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -565,7 +448,7 @@ async fn named_group_rejoin_after_leave() {
     );
 
     // Cleanup
-    authed_client(d)
+    authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -587,10 +470,10 @@ async fn named_group_rejoin_after_leave() {
 #[ignore]
 async fn named_group_multiple_display_names() {
     let d = daemon().await;
-    let (group_id, _) = create_group(d, "Multi-Name Group", "", Some("Alice")).await;
+    let (group_id, _) = create_group(&d, "Multi-Name Group", "", Some("Alice")).await;
 
     // Verify initial member
-    let info: Value = authed_client(d)
+    let info: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -606,7 +489,7 @@ async fn named_group_multiple_display_names() {
     );
 
     // Update display name to "Bob" (simulating a different persona)
-    let r: Value = authed_client(d)
+    let r: Value = authed_client(&d)
         .put(d.url(&format!("/groups/{group_id}/display-name")))
         .json(&serde_json::json!({"name": "Bob"}))
         .send()
@@ -618,7 +501,7 @@ async fn named_group_multiple_display_names() {
     assert_eq!(r["ok"], true);
 
     // Verify the updated name appears
-    let info2: Value = authed_client(d)
+    let info2: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -631,7 +514,7 @@ async fn named_group_multiple_display_names() {
     assert!(has_bob, "Bob should appear in members: {members2:?}");
 
     // Cleanup
-    authed_client(d)
+    authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -648,7 +531,7 @@ async fn named_group_join_invalid_invite() {
     let d = daemon().await;
 
     // Garbage string
-    let r = authed_client(d)
+    let r = authed_client(&d)
         .post(d.url("/groups/join"))
         .json(&serde_json::json!({"invite": "this-is-not-a-valid-invite!!!"}))
         .send()
@@ -679,7 +562,7 @@ async fn named_group_join_invalid_invite() {
 async fn named_group_invite_nonexistent() {
     let d = daemon().await;
 
-    let r = authed_client(d)
+    let r = authed_client(&d)
         .post(d.url("/groups/nonexistent-group-id/invite"))
         .json(&serde_json::json!({"expiry_secs": 3600}))
         .send()
@@ -702,7 +585,7 @@ async fn named_group_invite_nonexistent() {
 async fn named_group_info_nonexistent() {
     let d = daemon().await;
 
-    let r = authed_client(d)
+    let r = authed_client(&d)
         .get(d.url("/groups/does-not-exist"))
         .send()
         .await
@@ -724,7 +607,7 @@ async fn named_group_info_nonexistent() {
 async fn named_group_leave_nonexistent() {
     let d = daemon().await;
 
-    let r = authed_client(d)
+    let r = authed_client(&d)
         .delete(d.url("/groups/does-not-exist"))
         .send()
         .await
@@ -746,7 +629,7 @@ async fn named_group_leave_nonexistent() {
 async fn named_group_display_name_nonexistent() {
     let d = daemon().await;
 
-    let r = authed_client(d)
+    let r = authed_client(&d)
         .put(d.url("/groups/does-not-exist/display-name"))
         .json(&serde_json::json!({"name": "Nobody"}))
         .send()
@@ -768,10 +651,10 @@ async fn named_group_display_name_nonexistent() {
 #[ignore]
 async fn named_group_invite_no_expiry() {
     let d = daemon().await;
-    let (group_id, _) = create_group(d, "No-Expiry Group", "", None).await;
+    let (group_id, _) = create_group(&d, "No-Expiry Group", "", None).await;
 
     // Generate invite with expiry_secs = 0 (never expires)
-    let r: Value = authed_client(d)
+    let r: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/invite")))
         .json(&serde_json::json!({"expiry_secs": 0}))
         .send()
@@ -788,7 +671,7 @@ async fn named_group_invite_no_expiry() {
     );
 
     // Cleanup
-    authed_client(d)
+    authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -805,7 +688,7 @@ async fn named_group_create_minimal() {
     let d = daemon().await;
 
     // Minimal: only name required
-    let r: Value = authed_client(d)
+    let r: Value = authed_client(&d)
         .post(d.url("/groups"))
         .json(&serde_json::json!({"name": "Minimal Group"}))
         .send()
@@ -820,7 +703,7 @@ async fn named_group_create_minimal() {
     assert!(!group_id.is_empty());
 
     // Cleanup
-    authed_client(d)
+    authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -838,11 +721,11 @@ async fn named_group_full_lifecycle() {
 
     // Step 1: Create
     let (group_id, create_r) =
-        create_group(d, "Lifecycle Group", "full test", Some("Creator")).await;
+        create_group(&d, "Lifecycle Group", "full test", Some("Creator")).await;
     assert_eq!(create_r["ok"], true);
 
     // Step 2: Get info
-    let info: Value = authed_client(d)
+    let info: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -854,7 +737,7 @@ async fn named_group_full_lifecycle() {
     assert_eq!(info["name"], "Lifecycle Group");
 
     // Step 3: Generate invite
-    let invite_r: Value = authed_client(d)
+    let invite_r: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/invite")))
         .json(&serde_json::json!({}))
         .send()
@@ -867,7 +750,7 @@ async fn named_group_full_lifecycle() {
     let invite_link = invite_r["invite_link"].as_str().unwrap().to_string();
 
     // Step 4: Appears in list
-    let list_r: Value = authed_client(d)
+    let list_r: Value = authed_client(&d)
         .get(d.url("/groups"))
         .send()
         .await
@@ -880,7 +763,7 @@ async fn named_group_full_lifecycle() {
     assert!(found, "group should appear in list");
 
     // Step 5: Leave
-    let leave_r: Value = authed_client(d)
+    let leave_r: Value = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -891,7 +774,7 @@ async fn named_group_full_lifecycle() {
     assert_eq!(leave_r["ok"], true);
 
     // Step 6: Rejoin via invite
-    let join_r: Value = authed_client(d)
+    let join_r: Value = authed_client(&d)
         .post(d.url("/groups/join"))
         .json(&serde_json::json!({
             "invite": invite_link,
@@ -906,7 +789,7 @@ async fn named_group_full_lifecycle() {
     assert_eq!(join_r["ok"], true);
 
     // Step 7: Update display name
-    let dn_r: Value = authed_client(d)
+    let dn_r: Value = authed_client(&d)
         .put(d.url(&format!("/groups/{group_id}/display-name")))
         .json(&serde_json::json!({"name": "Final Name"}))
         .send()
@@ -918,7 +801,7 @@ async fn named_group_full_lifecycle() {
     assert_eq!(dn_r["ok"], true);
 
     // Step 8: Verify final state
-    let final_info: Value = authed_client(d)
+    let final_info: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -932,7 +815,7 @@ async fn named_group_full_lifecycle() {
     assert!(has_final, "'Final Name' not in members: {members:?}");
 
     // Step 9: Final leave (cleanup)
-    let final_leave: Value = authed_client(d)
+    let final_leave: Value = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -943,7 +826,7 @@ async fn named_group_full_lifecycle() {
     assert_eq!(final_leave["ok"], true);
 
     // Step 10: Confirm gone
-    let gone = authed_client(d)
+    let gone = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await

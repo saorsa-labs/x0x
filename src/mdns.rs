@@ -69,6 +69,13 @@ impl MdnsDiscovery {
     ) -> Result<Self, String> {
         let daemon = mdns_sd::ServiceDaemon::new().map_err(|e| format!("mDNS daemon: {e}"))?;
 
+        // Enable multicast loopback so that multiple x0x instances on the
+        // same machine can discover each other (mDNS queries are sent to
+        // the multicast group, and loopback ensures they reach other
+        // processes on the same host).
+        let _ = daemon.set_multicast_loop_v4(true);
+        let _ = daemon.set_multicast_loop_v6(true);
+
         // Instance name must be unique per (agent, machine) pair because
         // agent keys are portable across machines.  Use 8 bytes of each ID
         // (16 hex chars each) for 128 bits total, well under the 63-byte
@@ -152,6 +159,7 @@ impl MdnsDiscovery {
 
         let discovered = Arc::clone(&self.discovered);
         let our_fullname = self.instance_fullname.clone();
+        let daemon_clone = self.daemon.clone();
 
         let handle = tokio::task::spawn(async move {
             // The mdns-sd receiver is sync, so we use spawn_blocking
@@ -165,6 +173,21 @@ impl MdnsDiscovery {
                 .await;
 
                 match event {
+                    Ok(Ok(mdns_sd::ServiceEvent::ServiceFound(_service_type, fullname))) => {
+                        // On macOS, browse() emits ServiceFound but the
+                        // automatic SRV/A resolution often never completes.
+                        // Explicitly call verify() to force the daemon to
+                        // query for SRV + address records, which will then
+                        // trigger a ServiceResolved event on this receiver.
+                        if fullname != our_fullname {
+                            tracing::debug!("mDNS: ServiceFound {fullname}, requesting verify");
+                            if let Err(e) =
+                                daemon_clone.verify(fullname, std::time::Duration::from_secs(5))
+                            {
+                                tracing::debug!("mDNS: verify request failed: {e}");
+                            }
+                        }
+                    }
                     Ok(Ok(mdns_sd::ServiceEvent::ServiceResolved(info))) => {
                         // Skip our own registration (exact fullname match).
                         let full_name = info.get_fullname().to_string();
@@ -256,8 +279,8 @@ impl MdnsDiscovery {
                         tracing::info!("mDNS: agent removed: {full_name}");
                         discovered.write().await.remove(&full_name);
                     }
-                    Ok(Ok(_)) => {
-                        // ServiceFound, SearchStarted, SearchStopped — ignore.
+                    Ok(Ok(other)) => {
+                        tracing::debug!("mDNS: browse event: {other:?}");
                     }
                     Ok(Err(_)) => {
                         // Timeout — normal, just loop.

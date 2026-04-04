@@ -12,3 +12,8 @@ __pycache__
 .gstack/
 tests/.vps-tokens.env
 .config/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/

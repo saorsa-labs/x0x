@@ -164,6 +164,22 @@ Keypairs are serialized with **bincode** (compact binary), not JSON. Manual seri
 
 Key commands: `x0x start`, `x0x health`, `x0x agent`, `x0x contacts`, `x0x publish`, `x0x direct send`, `x0x groups`, `x0x tasks`, `x0x presence online|foaf|find|status`, `x0x routes` (prints all 75+ endpoints).
 
+### x0xd Daemon Flags
+
+```
+x0xd [OPTIONS]
+  --config <PATH>       Path to config file (TOML)
+  --name <NAME>         Instance name for multi-instance support
+  --api-port <PORT>               Override API server port (otherwise ephemeral for named instances)
+  --no-hard-coded-bootstrap       Skip configured bootstrap peers
+  --check                         Check configuration and exit
+  --check-updates       Check for updates and exit
+  --skip-update-check   Skip update check on startup
+  --doctor              Run diagnostics
+```
+
+Multi-instance example: `x0xd --name alice --api-port 12701 --no-hard-coded-bootstrap`
+
 ## FFI Bindings
 
 - **Node.js** (`bindings/nodejs/`): napi-rs v3 with 7 platform packages + WASM fallback. Published as `x0x` on npm.

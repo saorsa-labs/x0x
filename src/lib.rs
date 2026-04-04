@@ -516,6 +516,9 @@ pub struct AgentBuilder {
     #[allow(dead_code)]
     network_config: Option<network::NetworkConfig>,
     peer_cache_dir: Option<std::path::PathBuf>,
+    /// When true, skip opening the bootstrap peer cache entirely.
+    /// Useful for fully isolated embedders and test harnesses.
+    disable_peer_cache: bool,
     heartbeat_interval_secs: Option<u64>,
     identity_ttl_secs: Option<u64>,
     /// Custom path for the contacts file.
@@ -756,6 +759,7 @@ impl Agent {
             user_key_path: None,
             network_config: None,
             peer_cache_dir: None,
+            disable_peer_cache: false,
             heartbeat_interval_secs: None,
             identity_ttl_secs: None,
             contact_store_path: None,
@@ -2130,6 +2134,9 @@ impl Agent {
         network: &std::sync::Arc<network::NetworkNode>,
         peers: &[ant_quic::CachedPeer],
     ) -> (Vec<std::net::SocketAddr>, Vec<ant_quic::PeerId>) {
+        use tokio::time::{timeout, Duration};
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
         let handles: Vec<_> = peers
             .iter()
             .map(|peer| {
@@ -2137,13 +2144,21 @@ impl Agent {
                 let peer_id = peer.peer_id;
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to cached peer: {:?}", peer_id);
-                    match net.connect_cached_peer(peer_id).await {
-                        Ok(addr) => {
+                    match timeout(CONNECT_TIMEOUT, net.connect_cached_peer(peer_id)).await {
+                        Ok(Ok(addr)) => {
                             tracing::info!("Connected to cached peer {:?} at {}", peer_id, addr);
                             Ok(addr)
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!("Failed to connect to cached peer {:?}: {}", peer_id, e);
+                            Err(peer_id)
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "Connection to cached peer {:?} timed out after {}s",
+                                peer_id,
+                                CONNECT_TIMEOUT.as_secs()
+                            );
                             Err(peer_id)
                         }
                     }
@@ -2169,6 +2184,12 @@ impl Agent {
         network: &std::sync::Arc<network::NetworkNode>,
         addrs: &[std::net::SocketAddr],
     ) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+        use tokio::time::{timeout, Duration};
+
+        // Per-connection timeout prevents hanging when connecting to
+        // ourselves or to unreachable addresses.
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
         let handles: Vec<_> = addrs
             .iter()
             .map(|addr| {
@@ -2176,13 +2197,21 @@ impl Agent {
                 let addr = *addr;
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to peer: {}", addr);
-                    match net.connect_addr(addr).await {
-                        Ok(_) => {
+                    match timeout(CONNECT_TIMEOUT, net.connect_addr(addr)).await {
+                        Ok(Ok(_)) => {
                             tracing::info!("Connected to peer: {}", addr);
                             Ok(addr)
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!("Failed to connect to {}: {}", addr, e);
+                            Err(addr)
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "Connection to {} timed out after {}s",
+                                addr,
+                                CONNECT_TIMEOUT.as_secs()
+                            );
                             Err(addr)
                         }
                     }
@@ -3099,6 +3128,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Disable the bootstrap peer cache entirely.
+    ///
+    /// When set, the agent will not open or load any cached peers on
+    /// startup. This ensures complete network isolation from previously
+    /// seen peers for embedders and dedicated test harnesses.
+    ///
+    /// Note: the x0xd daemon's `--no-hard-coded-bootstrap` flag does
+    /// not call this; it only clears configured seed peers.
+    pub fn with_peer_cache_disabled(mut self) -> Self {
+        self.disable_peer_cache = true;
+        self
+    }
+
     /// Import a user keypair for three-layer identity.
     ///
     /// This binds a human identity to this agent. When provided, an
@@ -3309,7 +3351,8 @@ impl AgentBuilder {
         };
 
         // Open bootstrap peer cache if network will be configured
-        let bootstrap_cache = if self.network_config.is_some() {
+        // and the cache is not explicitly disabled by the caller.
+        let bootstrap_cache = if self.network_config.is_some() && !self.disable_peer_cache {
             let cache_dir = self.peer_cache_dir.unwrap_or_else(|| {
                 dirs::home_dir()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))

@@ -1,0 +1,116 @@
+name: Integration & Soak Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * 1'  # Weekly Monday 3am UTC (soak)
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ── Guardian: API coverage enforcement (every PR, ~30s) ────────────────
+  api-coverage:
+    name: API Coverage Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run guardian tests
+        run: cargo test --all-features --test api_coverage
+
+  # ── Property tests (every PR, ~2min) ──────────────────────────────────
+  proptest:
+    name: Property Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Run property tests
+        run: cargo nextest run --all-features -E 'test(/^proptest_/) | test(/proptest/)'
+
+  # ── Integration tests (every PR, ~10min) ──────────────────────────────
+  integration:
+    name: Multi-Agent Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Build release binaries
+        run: cargo build --release --bin x0xd --bin x0x
+      - name: Run daemon API integration tests
+        run: cargo nextest run --all-features --test daemon_api_integration -- --ignored
+      - name: Run named group integration tests
+        run: cargo nextest run --all-features --test named_group_integration -- --ignored
+      - name: Run GUI smoke tests
+        run: cargo nextest run --all-features --test gui_smoke
+      - name: Run WebSocket tests
+        run: cargo nextest run --all-features --test ws_integration -- --ignored
+
+  # ── Soak test (weekly, ~90min) ────────────────────────────────────────
+  soak:
+    name: Soak Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: grafana/setup-k6-action@v1
+      - name: Build release binaries
+        run: cargo build --release --bin x0xd
+      - name: Run 1-hour soak
+        run: bash tests/soak/run_soak.sh --duration 1h
+      - name: Upload soak results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-results
+          path: tests/soak/results/

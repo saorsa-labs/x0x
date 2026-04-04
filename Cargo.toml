@@ -1,6 +1,6 @@
 [package]
 name = "x0x"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2021"
 rust-version = "1.75.0"
 license = "MIT OR Apache-2.0"
@@ -93,5 +93,6 @@ members = [
     ".",
     "bindings/nodejs",
     "bindings/python",
+    "tests/harness",
 ]
 

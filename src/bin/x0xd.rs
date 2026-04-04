@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post, put};
@@ -44,6 +45,46 @@ use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, 
 use x0x::upgrade::monitor::UpgradeMonitor;
 use x0x::upgrade::signature::verify_manifest_signature;
 use x0x::{Agent, KvStoreHandle, TaskListHandle};
+
+// ---------------------------------------------------------------------------
+// Optional JSON body helper
+// ---------------------------------------------------------------------------
+
+/// Parse an optional JSON body: returns `Ok(T::default())` when the body is
+/// empty (no Content-Type or zero-length), but returns an axum 400 error if
+/// Content-Type is `application/json` and the body is malformed.
+fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> std::result::Result<T, (StatusCode, Json<serde_json::Value>)> {
+    if body.is_empty() {
+        return Ok(T::default());
+    }
+    let is_json = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        // Non-JSON content type with a body — reject
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "Content-Type must be application/json"
+            })),
+        ));
+    }
+    serde_json::from_slice(body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("invalid JSON: {e}")
+            })),
+        )
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -400,7 +441,7 @@ struct SubscribeRequest {
 }
 
 /// POST /announce request body.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct AnnounceIdentityRequest {
     #[serde(default)]
     include_user_identity: bool,
@@ -435,9 +476,15 @@ struct AddContactRequest {
     /// Agent ID as 64-character hex string.
     agent_id: String,
     /// Trust level: "blocked", "unknown", "known", or "trusted".
+    /// Defaults to "known" when omitted.
+    #[serde(default = "default_trust_level")]
     trust_level: String,
     /// Optional human-readable label.
     label: Option<String>,
+}
+
+fn default_trust_level() -> String {
+    "known".to_string()
 }
 
 /// PATCH /contacts/:agent_id request body.
@@ -685,9 +732,11 @@ async fn main() -> Result<()> {
         println!("    x0xd [OPTIONS]");
         println!();
         println!("OPTIONS:");
-        println!("    --config <PATH>       Path to config file (TOML)");
-        println!("    --name <NAME>         Instance name for multi-instance support");
-        println!("    --check               Check configuration and exit");
+        println!("    --config <PATH>                 Path to config file (TOML)");
+        println!("    --name <NAME>                   Instance name for multi-instance support");
+        println!("    --api-port <PORT>               Override API server port");
+        println!("    --no-hard-coded-bootstrap       Skip configured bootstrap peers");
+        println!("    --check                         Check configuration and exit");
         println!("    --check-updates       Check for updates and exit");
         println!("    --skip-update-check   Skip update check on startup");
         println!("    --doctor              Run diagnostics");
@@ -710,6 +759,25 @@ async fn main() -> Result<()> {
     let check_updates_only = args.contains(&"--check-updates".to_string());
     let skip_update_check = args.contains(&"--skip-update-check".to_string());
     let doctor_mode = args.iter().any(|arg| arg == "doctor" || arg == "--doctor");
+    let no_hard_coded_bootstrap = args.contains(&"--no-hard-coded-bootstrap".to_string());
+    let legacy_no_bootstrap = args.contains(&"--no-bootstrap".to_string());
+    if legacy_no_bootstrap {
+        eprintln!("warning: --no-bootstrap is deprecated; use --no-hard-coded-bootstrap");
+    }
+    let disable_configured_bootstrap = no_hard_coded_bootstrap || legacy_no_bootstrap;
+
+    // Parse --api-port for overriding the API server port
+    let api_port_override = if let Some(idx) = args.iter().position(|a| a == "--api-port") {
+        let port_str = args
+            .get(idx + 1)
+            .context("--api-port requires a port number")?;
+        let port: u16 = port_str
+            .parse()
+            .context("--api-port value must be a valid port number (0-65535)")?;
+        Some(port)
+    } else {
+        None
+    };
 
     // Parse --name for multi-instance support
     let instance_name = if let Some(idx) = args.iter().position(|a| a == "--name") {
@@ -768,6 +836,16 @@ async fn main() -> Result<()> {
             config.bind_address = SocketAddr::from(([0, 0, 0, 0], 0));
         }
         config.instance_name = Some(name.clone());
+    }
+
+    // CLI --api-port overrides config (applied after instance defaults)
+    if let Some(port) = api_port_override {
+        config.api_address.set_port(port);
+    }
+
+    // CLI --no-hard-coded-bootstrap clears configured seed peers only.
+    if disable_configured_bootstrap {
+        config.bootstrap_peers = Vec::new();
     }
 
     init_logging(&config.log_level, &config.log_format)?;
@@ -898,6 +976,12 @@ async fn main() -> Result<()> {
         .with_peer_cache_dir(cache_dir)
         .with_heartbeat_interval(config.heartbeat_interval_secs)
         .with_identity_ttl(config.identity_ttl_secs);
+
+    // NOTE: --no-hard-coded-bootstrap only clears configured seed peers.
+    // mDNS LAN discovery and the peer cache remain active by design so that:
+    //   - Local mesh (two laptops on WiFi) still works via mDNS
+    //   - FOAF presence discovery still finds peers
+    //   - Previously-seen peers can reconnect via cache
 
     if let Some(ref id_dir) = identity_dir {
         builder = builder
@@ -2638,11 +2722,16 @@ async fn introduction(
     axum::Json(ApiResponse { ok: true, data }).into_response()
 }
 
-/// POST /announce
+/// POST /announce — accepts optional JSON body (empty body defaults to no user identity).
 async fn announce_identity(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AnnounceIdentityRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
+    let req: AnnounceIdentityRequest = match parse_optional_json(&headers, &body) {
+        Ok(r) => r,
+        Err(resp) => return resp.into_response(),
+    };
     match state
         .agent
         .announce_identity(req.include_user_identity, req.human_consent)
@@ -2654,11 +2743,13 @@ async fn announce_identity(
                 "ok": true,
                 "include_user_identity": req.include_user_identity,
             })),
-        ),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        )
+            .into_response(),
     }
 }
 
@@ -3807,6 +3898,14 @@ struct CreateInviteRequest {
     expiry_secs: u64,
 }
 
+impl Default for CreateInviteRequest {
+    fn default() -> Self {
+        Self {
+            expiry_secs: default_expiry(),
+        }
+    }
+}
+
 fn default_expiry() -> u64 {
     x0x::groups::invite::DEFAULT_EXPIRY_SECS
 }
@@ -3968,18 +4067,24 @@ async fn get_named_group(
     )
 }
 
-/// POST /groups/:id/invite — generate an invite link.
+/// POST /groups/:id/invite — generate an invite link (body optional).
 async fn create_group_invite(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<CreateInviteRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
+    let req: CreateInviteRequest = match parse_optional_json(&headers, &body) {
+        Ok(r) => r,
+        Err(resp) => return resp.into_response(),
+    };
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        )
+            .into_response();
     };
 
     let agent_id = state.agent.agent_id();
@@ -4002,6 +4107,7 @@ async fn create_group_invite(
             "expires_at": invite.expires_at,
         })),
     )
+        .into_response()
 }
 
 /// POST /groups/join — join a group via invite link.
@@ -5393,6 +5499,7 @@ async fn get_constitution() -> impl IntoResponse {
 /// GET /constitution/json — returns structured JSON with version metadata.
 async fn get_constitution_json() -> impl IntoResponse {
     Json(serde_json::json!({
+        "ok": true,
         "version": x0x::constitution::CONSTITUTION_VERSION,
         "status": x0x::constitution::CONSTITUTION_STATUS,
         "content": x0x::constitution::CONSTITUTION_MD,

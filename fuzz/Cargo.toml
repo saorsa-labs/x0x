@@ -1,0 +1,41 @@
+[package]
+name = "x0x-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dependencies.x0x]
+path = ".."
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_announcement_deser"
+path = "fuzz_targets/fuzz_announcement_deser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_invite_link"
+path = "fuzz_targets/fuzz_invite_link.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_file_offer"
+path = "fuzz_targets/fuzz_file_offer.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_config_toml"
+path = "fuzz_targets/fuzz_config_toml.rs"
+doc = false
