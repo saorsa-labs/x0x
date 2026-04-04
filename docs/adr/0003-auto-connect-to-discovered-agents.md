@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Deferred — The codebase uses topic-based gossip routing via HyParView/Plumtree instead of explicit auto-connect. This ADR remains as a design reference for potential future implementation.
 
 ## Context
 
