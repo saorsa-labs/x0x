@@ -2,7 +2,7 @@
 
 ## Status
 
-Deferred — The codebase uses topic-based gossip routing via HyParView/Plumtree instead of explicit auto-connect. This ADR remains as a design reference for potential future implementation.
+Superseded by HyParView membership — The connectivity gap this ADR addresses (discovered agents can't exchange pub/sub without a direct QUIC connection) is resolved through HyParView's `membership().join(seeds)` in `join_network()`, which establishes overlay routing between agents sharing bootstrap peers. The specific approach described here (identity-listener-triggered `connect_addr()`) was not implemented; HyParView's active view management handles peer connectivity instead.
 
 ## Context
 

@@ -12,6 +12,6 @@ This directory contains architecture decision records for x0x.
 
 - [ADR 0001: Bootstrap Peers Are Seed Hints Only](./0001-bootstrap-peers-are-seed-hints-only.md) — Phase 1 partially complete
 
-## Deferred
+## Superseded
 
-- [ADR 0003: Auto-Connect to Discovered Agents](./0003-auto-connect-to-discovered-agents.md) — design reference; topic-based gossip routing used instead
+- [ADR 0003: Auto-Connect to Discovered Agents](./0003-auto-connect-to-discovered-agents.md) — problem solved by HyParView membership overlay instead
