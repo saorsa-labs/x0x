@@ -553,7 +553,10 @@ impl NetworkNode {
     /// # Errors
     ///
     /// Returns `NetworkError` if connection fails.
-    pub async fn connect_peer(&self, peer_id: AntPeerId) -> NetworkResult<SocketAddr> {
+    pub async fn connect_peer(
+        &self,
+        peer_id: AntPeerId,
+    ) -> NetworkResult<(SocketAddr, AntPeerId)> {
         let node = self.require_node().await?;
         let start = std::time::Instant::now();
         let peer_conn = node
@@ -584,7 +587,7 @@ impl NetworkNode {
             address: addr,
         });
 
-        Ok(addr)
+        Ok((addr, peer_conn.peer_id))
     }
 
     /// Disconnect from a peer.

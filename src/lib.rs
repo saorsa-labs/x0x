@@ -983,23 +983,29 @@ impl Agent {
         //    for QUIC extension-frame hole-punching (PUNCH_ME_NOW). This is fundamentally
         //    different from connect_addr which is raw QUIC with no NAT traversal.
         if info.needs_coordination() || !info.should_attempt_direct() {
-            let peer_id = ant_quic::PeerId(agent.machine_id.0);
-            match network.connect_peer(peer_id).await {
-                Ok(addr) => {
-                    let real_machine_id = agent.machine_id;
-                    // Enrich bootstrap cache with this successful address
+            // Use the machine_id from discovery cache as the peer_id hint.
+            // NOTE: This may be a zeroed placeholder if the peer was discovered via
+            // gossip and hasn't been verified via QUIC handshake yet. After hole-punching
+            // succeeds, we get the real peer_id from the handshake and update the cache.
+            let peer_id_hint = ant_quic::PeerId(agent.machine_id.0);
+            match network.connect_peer(peer_id_hint).await {
+                Ok((addr, real_peer_id)) => {
+                    // The real_peer_id is verified by QUIC TLS handshake — use it
+                    // (may differ from the placeholder machine_id in the discovery cache).
+                    let real_machine_id = identity::MachineId(real_peer_id.0);
+                    // Enrich bootstrap cache with the verified peer_id
                     if let Some(ref bc) = self.bootstrap_cache {
-                        bc.add_from_connection(peer_id, vec![addr], None).await;
-                        bc.record_success(&peer_id, 0).await;
+                        bc.add_from_connection(real_peer_id, vec![addr], None).await;
+                        bc.record_success(&real_peer_id, 0).await;
                     }
-                    // Update discovery cache (machine_id should already be correct from announcement)
+                    // Update discovery cache with the real machine_id from QUIC handshake
                     {
                         let mut cache = self.identity_discovery_cache.write().await;
                         if let Some(entry) = cache.get_mut(agent_id) {
                             entry.machine_id = real_machine_id;
                         }
                     }
-                    // Register agent mapping for direct messaging
+                    // Register agent mapping for direct messaging using verified machine_id
                     self.direct_messaging
                         .mark_connected(agent.agent_id, real_machine_id)
                         .await;
