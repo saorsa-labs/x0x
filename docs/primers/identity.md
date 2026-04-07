@@ -1,6 +1,6 @@
 **Give an agent a persistent identity that survives restarts.**
 
-> Status: current upstream `x0x v0.15.2` uses a three-layer identity model: machine identity, agent identity, and optional user identity.
+> Status: current upstream `x0x v0.15.3` uses a three-layer identity model: machine identity, agent identity, and optional user identity.
 
 The most important day-to-day identifier is the `agent_id`. If the agent key persists, the `agent_id` persists.
 

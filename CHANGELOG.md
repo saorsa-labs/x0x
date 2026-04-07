@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.15.3] - 2026-04-07
+
+### Changed
+
+- Bumped `ant-quic` to `0.25.3`
+- Bumped `saorsa-gossip-*` crates to `0.5.13`
+
+### Fixed
+
+- Synced cached peer dialing with scoped/fresh direct-reachability semantics
+- Synced `SKILL.md` release metadata to `0.15.3`
+
 ## [v0.15.2] - 2026-04-05
 
 ### Added

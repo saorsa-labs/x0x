@@ -1,6 +1,6 @@
 **Transfer files between agents with chunked delivery and SHA-256 verification.**
 
-> Status: current upstream `x0x v0.15.2` implements end-to-end file transfer over direct messaging with chunked delivery, progress tracking, and SHA-256 integrity verification.
+> Status: current upstream `x0x v0.15.3` implements end-to-end file transfer over direct messaging with chunked delivery, progress tracking, and SHA-256 integrity verification.
 
 ## Setup once
 

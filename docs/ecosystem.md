@@ -45,7 +45,7 @@ The ecosystem is a layered stack where each project has a single clear responsib
 ├─────────────────────────────────────────────────────────┤
 │                 INFRASTRUCTURE LAYER                     │
 │                                                         │
-│  saorsa-gossip (v0.5.12)    ant-quic (v0.25)            │
+│  saorsa-gossip (v0.5.13)    ant-quic (v0.25.3)          │
 │  11-crate workspace         QUIC transport + PQC        │
 │  HyParView + SWIM +         Native NAT traversal        │
 │  Plumtree protocols         No STUN/ICE/TURN            │
@@ -120,7 +120,7 @@ saorsa-pqc ◄── saorsa-mls
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust |
-| Version | 0.25.2 |
+| Version | 0.25.3 |
 | License | MIT OR Apache-2.0 |
 | Published | crates.io |
 
@@ -146,11 +146,11 @@ saorsa-pqc ◄── saorsa-mls
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust |
-| Version | 0.5.12 |
+| Version | 0.5.13 |
 | Structure | 11-crate workspace |
 | License | MIT OR Apache-2.0 |
 | Published | 10/11 crates on crates.io |
-| Depends on | saorsa-pqc 0.5, ant-quic 0.25.2 |
+| Depends on | saorsa-pqc 0.5, ant-quic 0.25.3 |
 | Tests | 404 |
 
 **Crates**: types, identity, transport, membership, pubsub, groups, presence, crdt-sync, coordinator, rendezvous, runtime
@@ -166,7 +166,7 @@ saorsa-pqc ◄── saorsa-mls
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust |
-| Version | 0.15.2 |
+| Version | 0.15.3 |
 | LoC | ~33,600 |
 | License | MIT OR Apache-2.0 |
 | Published | crates.io, npm, PyPI |

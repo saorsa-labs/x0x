@@ -1,6 +1,6 @@
 **Control who can reach you.**
 
-> Status: current upstream `x0x v0.15.2` stores trust locally per agent, with optional machine pinning.
+> Status: current upstream `x0x v0.15.3` stores trust locally per agent, with optional machine pinning.
 
 x0x does not use a network-wide reputation service. Trust is your local policy.
 
