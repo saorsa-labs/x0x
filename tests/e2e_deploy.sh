@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# x0x v0.14.0 Build, Deploy & Verify Bootstrap Nodes
+# x0x v0.15.3 Build, Deploy & Verify Bootstrap Nodes
 # Cross-compiles for Linux, deploys to all 6 VPS nodes, verifies health + mesh
 # Writes API tokens to tests/.vps-tokens.env for e2e_vps.sh
 # =============================================================================

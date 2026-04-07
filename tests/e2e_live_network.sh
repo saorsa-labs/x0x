@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# x0x v0.14.0 Live Network End-to-End Test
+# x0x v0.15.3 Live Network End-to-End Test
 # Starts a LOCAL x0xd node that joins the real bootstrap network (6 VPS nodes),
 # then tests bidirectional connectivity, discovery, presence, messaging,
 # groups, KV stores, and more between local node and live VPS nodes.
@@ -11,7 +11,7 @@
 # Prerequisites:
 #   - x0xd binary built (cargo build --release)
 #   - SSH access to VPS nodes (for token retrieval and verification)
-#   - VPS bootstrap nodes running v0.14.0 (run e2e_deploy.sh first)
+#   - VPS bootstrap nodes running v0.15.3 (run e2e_deploy.sh first)
 #
 # Usage:
 #   bash tests/e2e_live_network.sh

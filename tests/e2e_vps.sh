@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# x0x v0.14.0 VPS End-to-End Test
+# x0x v0.15.3 VPS End-to-End Test
 # Tests across ALL 6 bootstrap nodes (NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo)
 # Full coverage: identity, mesh, gossip, MLS, groups, KV, tasks, direct, presence,
 # contacts, trust, constitution, upgrade — cross-continent verification
@@ -338,10 +338,10 @@ R=$(vps_post "$NUR_IP" "$NUR_TK" /task-lists '{"name":"VPS Tasks v014","topic":"
 TL=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('list_id',d.get('id','')))" 2>/dev/null||echo "")
 
 if [ -n "$TL" ]; then
-    R=$(vps_post "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks" '{"title":"Deploy v0.14.0","description":"Verified PQC MLS + FOAF presence"}')
+    R=$(vps_post "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks" '{"title":"Deploy v0.15.3","description":"Verified PQC MLS + FOAF presence"}')
     check_not_error "add task" "$R"
     TID=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('task_id',d.get('id','')))" 2>/dev/null||echo "")
-    R=$(vps_get "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks"); check_contains "show tasks" "$R" "Deploy v0.14.0"
+    R=$(vps_get "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks"); check_contains "show tasks" "$R" "Deploy v0.15.3"
     if [ -n "$TID" ]; then
         R=$(vps_patch "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks/$TID" '{"action":"claim"}'); check_not_error "claim" "$R"
         R=$(vps_patch "$NUR_IP" "$NUR_TK" "/task-lists/$TL/tasks/$TID" '{"action":"complete"}'); check_not_error "complete" "$R"

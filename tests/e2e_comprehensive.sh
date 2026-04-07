@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# x0x v0.15.0 Comprehensive End-to-End Test Suite
+# x0x v0.15.3 Comprehensive End-to-End Test Suite
 # Two named instances (alice + bob) with separate identities + charlie (seedless)
 # Tests ALL 75+ API endpoints across 18 categories with full lifecycle coverage
 # =============================================================================
@@ -100,7 +100,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
-echo -e "${YELLOW}   x0x v0.15.0 Comprehensive E2E Test Suite${NC}"
+echo -e "${YELLOW}   x0x v0.15.3 Comprehensive E2E Test Suite${NC}"
 echo -e "${YELLOW}   ~180 assertions across 18 categories${NC}"
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 
@@ -705,7 +705,7 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[14/18] File Transfer${NC}"
 
-echo "E2E comprehensive test file content for x0x v0.15.0" > /tmp/x0x-e2e-testfile.txt
+echo "E2E comprehensive test file content for x0x v0.15.3" > /tmp/x0x-e2e-testfile.txt
 FILE_SHA=$(shasum -a 256 /tmp/x0x-e2e-testfile.txt | cut -d' ' -f1)
 FILE_SIZE=$(wc -c < /tmp/x0x-e2e-testfile.txt | tr -d ' ')
 
