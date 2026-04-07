@@ -1933,7 +1933,7 @@ impl Agent {
             let coordinators = cache.select_coordinators(6).await;
             let coordinator_addrs: Vec<std::net::SocketAddr> = coordinators
                 .iter()
-                .flat_map(|peer| peer.addresses.clone())
+                .flat_map(|peer| peer.preferred_addresses())
                 .collect();
 
             if !coordinator_addrs.is_empty() {

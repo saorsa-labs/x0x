@@ -460,7 +460,8 @@ impl NetworkNode {
             ))
         })?;
 
-        for addr in &cached_peer.addresses {
+        let candidate_addrs = cached_peer.preferred_addresses();
+        for addr in &candidate_addrs {
             match self.connect_addr(*addr).await {
                 Ok(connected_peer) if connected_peer == peer_id => return Ok(*addr),
                 Ok(connected_peer) => {
@@ -482,7 +483,7 @@ impl NetworkNode {
         Err(NetworkError::ConnectionFailed(format!(
             "peer {:?} not reachable via {} cached addresses",
             peer_id,
-            cached_peer.addresses.len()
+            candidate_addrs.len()
         )))
     }
 
