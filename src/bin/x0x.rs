@@ -542,6 +542,28 @@ enum GroupSub {
         /// Group ID.
         group_id: String,
     },
+    /// List named-group members.
+    Members {
+        /// Group ID.
+        group_id: String,
+    },
+    /// Add a member to a named group.
+    AddMember {
+        /// Group ID.
+        group_id: String,
+        /// Agent ID.
+        agent_id: String,
+        /// Optional display name to store locally for that member.
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+    /// Remove a member from a named group.
+    RemoveMember {
+        /// Group ID.
+        group_id: String,
+        /// Agent ID.
+        agent_id: String,
+    },
     /// Generate an invite link.
     Invite {
         /// Group ID.
@@ -941,6 +963,20 @@ async fn run(
                 .await
             }
             Some(GroupSub::Info { group_id }) => commands::group::info(&client, &group_id).await,
+            Some(GroupSub::Members { group_id }) => {
+                commands::group::members(&client, &group_id).await
+            }
+            Some(GroupSub::AddMember {
+                group_id,
+                agent_id,
+                display_name,
+            }) => {
+                commands::group::add_member(&client, &group_id, &agent_id, display_name.as_deref())
+                    .await
+            }
+            Some(GroupSub::RemoveMember { group_id, agent_id }) => {
+                commands::group::remove_member(&client, &group_id, &agent_id).await
+            }
             Some(GroupSub::Invite { group_id, expiry }) => {
                 commands::group::invite(&client, &group_id, expiry).await
             }
@@ -1113,6 +1149,9 @@ x0x (v{VERSION})
 |   +-- group list         List named groups
 |   +-- group create       Create a named group
 |   +-- group info         Get group info
+|   +-- group members      List named-group members
+|   +-- group add-member   Add named-group member
+|   +-- group remove-member  Remove named-group member
 |   +-- group invite       Generate invite link
 |   +-- group join         Join via invite link
 |   +-- group set-name     Set display name in group

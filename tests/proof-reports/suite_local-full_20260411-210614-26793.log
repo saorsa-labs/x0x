@@ -1,0 +1,300 @@
+
+[0;36m╔══════════════════════════════════════════════════════════════════╗[0m
+[0;36m║    x0x COMPLETE API AUDIT — 83 endpoints + CLI + GUI + WS      ║[0m
+[0;36m║    Run: 20260411_210614_26814                                   ║[0m
+[0;36m╚══════════════════════════════════════════════════════════════════╝[0m
+  [0;33m[PROOF][0m Token: full-audit-20260411_210614_26814
+  [0;33m[PROOF][0m Alice: 10629eac66fea3602a772e0d...  Bob: f7bccc214e04616bff87c1ca...
+  [0;33m[PROOF][0m Machine Alice: 0fe6028c06d9cb7b96c2...  Machine Bob: fef36ac168e15b912668...
+  [0;33m[PROOF][0m Disc peer: f7bccc214e04616bff87c1ca... (bob)
+
+[0;36m━━ [1] UNAUTHENTICATED (3 endpoints / 7 checks) ━━[0m
+  [0;32m✓[0m GET /health                                                   
+  [0;32m✓[0m GET /health → version 0.16.x                                
+  [0;33m[PROOF][0m version=0.16.0 peers=1
+  [0;32m✓[0m GET /constitution (plaintext)                                 
+  [0;32m✓[0m GET /constitution/json                                        
+  [0;32m✓[0m GET /constitution/json → content                            
+  [0;33m[PROOF][0m constitution v=0.91
+  [0;32m✓[0m GET /gui → DOCTYPE html                                     
+  [0;32m✓[0m GET /gui → Content-Type: text/html                          
+  [0;32m✓[0m GET /gui → API token injected in <script>                   
+  [0;33m[PROOF][0m GUI body=161889B  CT=content-type: text/html; charset=utf-8
+  [0;32m✓[0m GET /gui/ → trailing slash alias works                      
+
+[0;36m━━ [1b] AUTH BOUNDARIES (strong proof) ━━[0m
+  [0;32m✓[0m GET /agent requires auth                                      
+  [0;32m✓[0m GET /gui remains unauthenticated                              
+  [0;32m✓[0m GET /constitution/json remains unauthenticated                
+
+[0;36m━━ [2] IDENTITY & STATUS (7 endpoints / 11 checks) ━━[0m
+  [0;32m✓[0m GET /agent                                                    
+  [0;33m[PROOF][0m agent_id=10629eac66fea3602a772e0daff00ae8...
+  [0;32m✓[0m GET /agent/user-id                                            
+  [0;33m[PROOF][0m user_id=None
+  [0;32m✓[0m GET /agent/card                                               
+  [0;33m[PROOF][0m link=x0x://agent/eyJkaXNwbGF5X25hbWUiOiIiLCJhZ2VudF9pZC...
+  [0;32m✓[0m GET /introduction                                             
+  [0;33m[PROOF][0m intro services=1
+  [0;32m✓[0m GET /introduction?peer=:id (trust-scoped)                     
+  [0;32m✓[0m POST /announce (alice)                                        
+  [0;32m✓[0m POST /announce (bob)                                          
+  [0;32m✓[0m POST /agent/card/import (alice imports bob)                   
+  [0;33m[PROOF][0m alice import→agent=f7bccc214e04616bff87...
+  [0;32m✓[0m POST /agent/card/import (bob imports alice)                   
+  [0;33m[PROOF][0m bob import→agent=10629eac66fea3602a77...
+  [0;32m✓[0m GET /status                                                   
+  [0;33m[PROOF][0m uptime=0s daemon=0.16.0
+
+[0;36m━━ [3] NETWORK & DISCOVERY (10 endpoints / 14 checks) ━━[0m
+  [0;32m✓[0m GET /peers                                                    
+  [0;33m[PROOF][0m peers=1
+  [0;32m✓[0m GET /network/status                                           
+  [0;33m[PROOF][0m nat=FullCone has_global=True peers=1
+  [0;32m✓[0m GET /network/bootstrap-cache                                  
+  [0;32m✓[0m GET /agents/discovered                                        
+  [0;33m[PROOF][0m discovered=2
+  [0;32m✓[0m GET /agents/discovered/:id (bob)                              
+  [0;33m[PROOF][0m disc_id=f7bccc214e04616b... last_seen=1775937976
+  [0;32m✓[0m GET /agents/reachability/:id (bob)                            
+  [0;32m✓[0m POST /agents/find/:id                                         
+  [0;33m[PROOF][0m found=True addrs=5
+  [0;33m~[0m GET /users/:uid/agents                                    skip:no user identity configured for this daemon
+  [0;32m✓[0m POST /agents/connect                                          
+  [0;33m[PROOF][0m outcome=Direct
+  [0;32m✓[0m GET /upgrade → HTTP 500 (endpoint wired)                    
+  [0;33m[PROOF][0m upgrade HTTP status=500 (500=GitHub rate-limited, 200=success)
+
+[0;36m━━ [4] PRESENCE (6 endpoints / 7 checks + SSE) ━━[0m
+  [0;32m✓[0m GET /presence (alias)                                         
+  [0;32m✓[0m GET /presence/online                                          
+  [0;33m[PROOF][0m online=2 agents
+  [0;32m✓[0m GET /presence/foaf                                            
+  [0;32m✓[0m GET /presence/find/:id                                        
+  [0;33m[PROOF][0m found=
+  [0;32m✓[0m GET /presence/status/:id                                      
+  [0;32m✓[0m GET /presence/events → SSE 200                              
+
+[0;36m━━ [5] CONTACTS & TRUST — Full Lifecycle (14 endpoints / 19 checks) ━━[0m
+  [0;32m✓[0m GET /contacts                                                 
+  [0;32m✓[0m POST /contacts (add)                                          
+  [0;32m✓[0m GET /contacts/:id/revocations                                 
+  [0;32m✓[0m GET /contacts/:id/machines                                    
+  [0;32m✓[0m POST /contacts/:id/machines                                   
+  [0;32m✓[0m PATCH /contacts/:id                                           
+  [0;32m✓[0m POST /contacts/:id/machines/:mid/pin                          
+  [0;32m✓[0m DELETE /contacts/:id/machines/:mid/pin                        
+  [0;32m✓[0m DELETE /contacts/:id/machines/:mid (HTTP 204)                 
+  [0;32m✓[0m POST /contacts/trust (quick)                                  
+  [0;32m✓[0m POST /trust/evaluate                                          
+  [0;33m[PROOF][0m decision=Accept
+  [0;32m✓[0m POST /contacts (add dummy for delete)                         
+  [0;32m✓[0m DELETE /contacts/:id (HTTP 200)                               
+  [0;33m[PROOF][0m contact delete: added dummy → deleted → HTTP 200
+  [0;32m✓[0m POST /contacts/:id/revoke                                     
+
+[0;36m━━ [6] GOSSIP PUB/SUB + SSE (receive-side proof) ━━[0m
+  [0;32m✓[0m POST /subscribe                                               
+  [0;33m[PROOF][0m subscription_id=94a84841ce1cfc17
+  [0;32m✓[0m GET /events → SSE 200                                       
+  [0;32m✓[0m POST /publish                                                 
+  [0;32m✓[0m GET /events receives published payload                        
+  [0;32m✓[0m DELETE /subscribe/:id                                         
+
+[0;36m━━ [7] DIRECT MESSAGING + SSE (receive-side proof) ━━[0m
+  [0;32m✓[0m GET /direct/events → SSE 200                                
+  [0;32m✓[0m alice connects to bob for direct messaging                    
+  [0;32m✓[0m POST /direct/send                                             
+  [0;32m✓[0m GET /direct/events receives verified alice→bob message      
+  [0;32m✓[0m GET /direct/connections                                       
+  [0;32m✓[0m GET /direct/connections includes bob                          
+  [0;32m✓[0m bob connects to alice for direct messaging                    
+  [0;32m✓[0m POST /direct/send (bob→alice)                               
+  [0;32m✓[0m GET /direct/events receives bob→alice message               
+  [0;33m[PROOF][0m direct tokens: full-audit-20260411_210614_26814-direct-a2b / full-audit-20260411_210614_26814-direct-b2a
+
+[0;36m━━ [8] MLS ENCRYPTION — Post-Quantum ChaCha20 (8 endpoints / 11 checks) ━━[0m
+  [0;32m✓[0m POST /mls/groups (create encrypted group)                     
+  [0;33m[PROOF][0m mls_id=1d3e695d40a000c4bc0f084d...
+  [0;32m✓[0m GET /mls/groups                                               
+  [0;32m✓[0m GET /mls/groups/:id                                           
+  [0;32m✓[0m POST /mls/groups/:id/members                                  
+  [0;32m✓[0m POST /mls/groups/:id/encrypt                                  
+  [0;33m[PROOF][0m ct_len=64 epoch=1
+  [0;32m✓[0m POST /mls/groups/:id/decrypt                                  
+  [0;32m✓[0m   MLS encrypt→decrypt round-trip [PROOF: plaintext matched exactly]
+  [0;33m[PROOF][0m decrypt='proof-mls-20260411_210614_26814'
+  [0;32m✓[0m POST /mls/groups/:id/welcome                                  
+  [0;32m✓[0m DELETE /mls/groups/:id/members/:aid                           
+
+[0;36m━━ [9] NAMED GROUPS / SPACES (7 endpoints / 10 checks) ━━[0m
+  [0;32m✓[0m POST /groups (create)                                         
+  [0;33m[PROOF][0m group_id=5637f2d0cb18232129e05261... chat=x0x.group.5637f2d0cb182321.chat/general
+  [0;32m✓[0m GET /groups                                                   
+  [0;32m✓[0m GET /groups/:id                                               
+  [0;32m✓[0m POST /groups/:id/invite                                       
+  [0;32m✓[0m   invite format: x0x://invite/                                
+  [0;33m[PROOF][0m invite=x0x://invite/eyJncm91cF9pZCI6IjU2MzdmMmQwY2IxODIzMjEyOWUwNTI...
+  [0;32m✓[0m POST /groups/join (bob joins)                                 
+  [0;33m[PROOF][0m bob joined: x0x.group.5637f2d0cb182321.chat/general
+  [0;32m✓[0m PUT /groups/:id/display-name                                  
+  [0;33m[PROOF][0m display_name=AuditSpace
+  [0;32m✓[0m DELETE /groups/:id (leave)                                    
+
+[0;36m━━ [10] TASK LISTS / KANBAN CRDT (5 endpoints / 8 checks) ━━[0m
+  [0;32m✓[0m POST /task-lists (create)                                     
+  [0;33m[PROOF][0m task-list id=x0x.tasks.20260411_210614_26814
+  [0;32m✓[0m GET /task-lists                                               
+  [0;32m✓[0m POST /task-lists/:id/tasks                                    
+  [0;33m[PROOF][0m task_id=b529134bf8ee874807a4d517...
+  [0;32m✓[0m GET /task-lists/:id/tasks                                     
+  [0;32m✓[0m   task title round-trip [PROOF: 'proof-task-20260411_210614_26814']
+  [0;32m✓[0m PATCH /task-lists/:id/tasks/:tid (claim)                      
+  [0;32m✓[0m PATCH /task-lists/:id/tasks/:tid (complete)                   
+
+[0;36m━━ [11] KV STORE CRDT (7 endpoints / 9 checks) ━━[0m
+  [0;32m✓[0m POST /stores (create)                                         
+  [0;33m[PROOF][0m store id=x0x.kv.20260411_210614_26814
+  [0;32m✓[0m GET /stores                                                   
+  [0;32m✓[0m PUT /stores/:id/:key                                          
+  [0;32m✓[0m GET /stores/:id/keys                                          
+  [0;32m✓[0m GET /stores/:id/:key                                          
+  [0;32m✓[0m   KV round-trip [PROOF: 'proof-kv-20260411_210614_26814' exact match]
+  [0;32m✓[0m DELETE /stores/:id/:key                                       
+  [0;32m✓[0m POST /stores/:id/join                                         
+
+[0;36m━━ [12] FILE TRANSFERS — Full Lifecycle (real bytes + accept/reject) ━━[0m
+  [0;32m✓[0m file-transfer reconnect alice→bob                           
+  [0;32m✓[0m file-transfer reconnect bob→alice                           
+  [0;32m✓[0m POST /files/send                                              
+  [0;33m[PROOF][0m transfer_id=7fa4aae2-15e2-4fa0-bd7a-8c9fa7f4daf4 sha256=868433a2016e77e6620e423a5e3869e29ca0ed3d3e383c5f36e3a1e15c69bb1f size=46
+  [0;32m✓[0m GET /files/transfers                                          
+  [0;32m✓[0m GET /files/transfers/:id                                      
+  [0;32m✓[0m recipient sees pending incoming transfer                      
+  [0;32m✓[0m POST /files/accept/:id                                        
+  [0;32m✓[0m sender transfer reaches Complete                              
+  [0;32m✓[0m receiver transfer reaches Complete                            
+  [0;32m✓[0m received file sha256 matches                                  
+  [0;32m✓[0m received file body contains proof token                       
+  [0;32m✓[0m POST /files/send (reject path)                                
+  [0;32m✓[0m recipient sees second pending transfer                        
+  [0;32m✓[0m POST /files/reject/:id                                        
+  [0;32m✓[0m sender sees rejected transfer                                 
+
+[0;36m━━ [13] WEBSOCKET (real WS interaction) ━━[0m
+  [0;32m✓[0m GET /ws → real WebSocket connected frame                    
+  [0;32m✓[0m   /ws session agent_id matches REST [PROOF: exact match]      
+  [0;32m✓[0m GET /ws/sessions                                              
+  [0;32m✓[0m GET /ws/sessions sees active session                          
+  [0;32m✓[0m GET /ws pubsub round-trip                                     
+  [0;32m✓[0m GET /ws pubsub payload matched                                
+  [0;32m✓[0m GET /ws/direct → connected frame via upgrade probe          
+  [0;32m✓[0m GET /ws send_direct command                                   
+  [0;32m✓[0m GET /ws/direct receives direct_message frame                  
+  [0;32m✓[0m GET /ws/direct payload matched                                
+
+[0;36m━━ [13b] GUI INTERACTION (real browser proof) ━━[0m
+  [0;32m✓[0m GUI sends direct message via real browser                     
+  [0;32m✓[0m GUI-driven direct send reached bob                            
+
+[0;36m━━ [14] CLI COMMANDS — expanded coverage ━━[0m
+  [0;32m✓[0m x0x health → ok                                             
+  [0;32m✓[0m x0x status → ok                                             
+  [0;32m✓[0m x0x agent → agent_id                                        
+  [0;32m✓[0m x0x agent card → link                                       
+  [0;32m✓[0m x0x agent user-id → ok                                      
+  [0;32m✓[0m x0x agent introduction → agent_id                           
+  [0;32m✓[0m x0x agent import → ok                                       
+  [0;32m✓[0m x0x announce → ok                                           
+  [0;32m✓[0m x0x network status → ok                                     
+  [0;32m✓[0m x0x network cache → ok                                      
+  [0;32m✓[0m x0x peers → peers                                           
+  [0;32m✓[0m x0x presence online → agents                                
+  [0;32m✓[0m x0x presence foaf → agents                                  
+  [0;32m✓[0m x0x presence find f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b → ok
+  [0;32m✓[0m x0x presence status f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b → ok
+  [0;32m✓[0m x0x contacts list → contacts                                
+  [0;32m✓[0m x0x contacts add --trust trusted f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b → ok
+  [0;32m✓[0m x0x contacts update f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b → ok
+  [0;32m✓[0m x0x contacts revoke dummy → ok                              
+  [0;32m✓[0m x0x contacts revocations dummy → revocations                
+  [0;32m✓[0m x0x contacts add dummy → ok                                 
+  [0;32m✓[0m x0x contacts remove dummy → ok                              
+  [0;32m✓[0m x0x trust set f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b trusted → ok
+  [0;32m✓[0m x0x trust evaluate f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b fef36ac168e15b9126685d19f16e94aee4ae2737de8173240f5b1a03a92d8333 → decision
+  [0;32m✓[0m x0x machines list f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b → machines
+  [0;32m✓[0m x0x machines add/pin fake machine → ok                      
+  [0;32m✓[0m x0x machines unpin fake machine → ok                        
+  [0;32m✓[0m x0x machines remove fake machine → ok                       
+  [0;32m✓[0m x0x agents list → agents                                    
+  [0;32m✓[0m x0x agents get f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b → agent
+  [0;32m✓[0m x0x agents reachability f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b → ok
+  [0;33m~[0m x0x agents by-user                                        skip:no user identity configured
+  [0;32m✓[0m x0x agents find f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b → ok
+  [0;32m✓[0m x0x direct connect f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b → outcome
+  [0;32m✓[0m x0x direct send f7bccc214e04616bff87c1ca74033607047c02989c1ff4a0bf7b468e4fea514b → ok
+  [0;32m✓[0m x0x direct connections → connections                        
+  [0;32m✓[0m x0x groups list → groups                                    
+  [0;32m✓[0m x0x groups create → group_id                                
+  [0;32m✓[0m x0x groups get 1d3e695d40a000c4bc0f084d7e9d4d76ef1c5c1391cc771c61a0ce911d80596e → group data
+  [0;32m✓[0m x0x groups add-member → ok                                  
+  [0;32m✓[0m x0x groups welcome → ok                                     
+  [0;32m✓[0m x0x groups remove-member → ok                               
+  [0;32m✓[0m x0x group list → groups                                     
+  [0;32m✓[0m x0x group create CliAuditSpace → group_id                   
+  [0;32m✓[0m x0x group info 9e607113a7b918e5a7744f3800206f79146bb278c41d22060f6e033d30949c7c → group_id
+  [0;32m✓[0m x0x group invite 9e607113a7b918e5a7744f3800206f79146bb278c41d22060f6e033d30949c7c → invite_link
+  [0;32m✓[0m bob x0x group join invite → ok                              
+  [0;32m✓[0m x0x group set-name 9e607113a7b918e5a7744f3800206f79146bb278c41d22060f6e033d30949c7c → ok
+  [0;32m✓[0m x0x tasks list → task_lists                                 
+  [0;32m✓[0m x0x tasks show x0x.tasks.20260411_210614_26814 → tasks      
+  [0;32m✓[0m x0x tasks add x0x.tasks.20260411_210614_26814 → task_id     
+  [0;32m✓[0m x0x tasks claim 8ecf6da4d1d961cd05a82a9b84ad74c8bb6a0cb93ba2aa86ba2802f10a53d0be → ok
+  [0;32m✓[0m x0x tasks complete 8ecf6da4d1d961cd05a82a9b84ad74c8bb6a0cb93ba2aa86ba2802f10a53d0be → ok
+  [0;32m✓[0m x0x store list → stores                                     
+  [0;32m✓[0m x0x store create → id                                       
+  [0;32m✓[0m bob x0x store join x0x.kv.20260411_210614_26814 → ok        
+  [0;32m✓[0m x0x store keys x0x.kv.20260411_210614_26814 → keys          
+  [0;32m✓[0m x0x store put cli-key → ok                                  
+  [0;32m✓[0m x0x store get cli-key → value                               
+  [0;32m✓[0m x0x store rm cli-key → ok                                   
+  [0;32m✓[0m x0x transfers → transfers                                   
+  [0;32m✓[0m x0x transfer-status 7fa4aae2-15e2-4fa0-bd7a-8c9fa7f4daf4 → transfer
+  [0;32m✓[0m x0x publish → ok                                            
+  [0;32m✓[0m x0x ws sessions → sessions                                  
+  [0;32m✓[0m x0x routes includes GET /shutdown                             
+  [0;32m✓[0m x0x constitution --json → version                           
+  [0;33m~[0m x0x upgrade (CLI)                                         skip:stderr-only output; REST GET /upgrade tested in [3]
+  [0;32m✓[0m x0x gui prints GUI URL                                        
+  [0;32m✓[0m CLI agent_id == REST agent_id [PROOF: '10629eac66fea3602a772e0daff00ae8bc131334a1cbea76753acfc442e14523']
+
+[0;36m━━ [15] PRESENCE EVENTS + SHUTDOWN (real lifecycle proof) ━━[0m
+  [0;32m✓[0m charlie agent online for presence proof                       
+  [0;32m✓[0m charlie announce for presence proof                           
+  [0;32m✓[0m presence online includes charlie                              
+  [0;32m✓[0m POST /shutdown                                                
+True True
+  [0;32m✓[0m GET /presence/events emits online+offline for charlie         
+
+[0;36m━━ [16] SWARM / 3-NODE GOSSIP PROOF ━━[0m
+  [0;32m✓[0m alice subscribes swarm topic                                  
+  [0;32m✓[0m bob subscribes swarm topic                                    
+  [0;32m✓[0m charlie subscribes swarm topic                                
+  [0;32m✓[0m bob has gossip peer for swarm                                 
+  [0;32m✓[0m charlie has gossip peer for swarm                             
+  [0;32m✓[0m swarm publish from alice                                      
+  [0;32m✓[0m swarm publish replay from alice                               
+  [0;32m✓[0m swarm publish replay #2 from alice                            
+  [0;32m✓[0m swarm event delivered to alice                                
+  [0;31m✗[0m swarm event delivered to bob                              
+  [0;32m✓[0m swarm event delivered to charlie                              
+  [0;32m✓[0m alice unsubscribe swarm                                       
+  [0;32m✓[0m bob unsubscribe swarm                                         
+  [0;32m✓[0m charlie unsubscribe swarm                                     
+
+[0;36m╔══════════════════════════════════════════════════════════════════╗[0m
+[0;36m║  FINAL RESULTS                                                   ║[0m
+[0;36m╠══════════════════════════════════════════════════════════════════╣[0m
+[0;36m║  [0;32m✓ 209 PASS[0m[0;36m  ·  [0;31m✗ 1 FAIL[0m[0;36m  ·  [0;33m~ 3 SKIP[0m[0;36m                              ║[0m
+[0;36m║  Total checks: 213 across 83 REST endpoints + CLI + GUI + SSE + WS ║[0m
+[0;36m╚══════════════════════════════════════════════════════════════════╝[0m

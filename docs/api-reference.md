@@ -224,6 +224,9 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/groups` | `x0x group create <name>` | Create a named group |
 | GET | `/groups` | `x0x group list` | List named groups |
 | GET | `/groups/:id` | `x0x group info <group_id>` | Get group info |
+| GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
+| POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id>` | Creator-authored member add (propagates to subscribed peers) |
+| DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Creator-authored member removal (propagates to subscribed peers) |
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate an invite link |
 | POST | `/groups/join` | `x0x group join <invite>` | Join via invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |

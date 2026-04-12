@@ -1,0 +1,298 @@
+[1m[0;36m╔══════════════════════════════════════════════════════════════════╗[0m
+[1m[0;36m║  x0x LAN E2E Test Suite v2 — v0.16.0[0m
+[1m[0;36m║  Nodes: studio1.local, studio2.local[0m
+[1m[0;36m║  PROOF TOKEN: proof-1775896268-64908[0m
+[1m[0;36m╚══════════════════════════════════════════════════════════════════╝[0m
+
+[0;36m[0/18] Prerequisites[0m
+  [0;32mOK[0m   x0xd: /Users/davidirvine/Desktop/Devel/projects/x0x/target/release/x0xd
+  [0;32mOK[0m   x0x:  /Users/davidirvine/Desktop/Devel/projects/x0x/target/release/x0x
+  [0;32mPASS[0m SSH to studio1.local
+  [0;32mPASS[0m SSH to studio2.local
+
+[0;36m[1/18] Deploy x0xd + x0x CLI to LAN nodes[0m
+  [0;32mOK[0m   Deployed to studio1.local
+  [0;32mOK[0m   Deployed to studio2.local
+  Waiting for daemons to start...
+  [0;32mOK[0m   studio1.local daemon ready (2s)
+  [0;32mOK[0m   studio2.local daemon ready (1s)
+  [0;32mOK[0m   Tokens acquired (s1=eb722c8e..., s2=dac2bcec...)
+
+[0;36m[2/18] Health & Identity (PROOF)[0m
+  [0;32mPASS[0m saorsa1 health
+        [0;36mPROOF version: 0.16.0[0m
+  [0;32mPASS[0m saorsa2 health
+        [0;36mPROOF version: 0.16.0[0m
+  [0;32mPASS[0m saorsa1 agent identity
+        [0;36mPROOF agent_id: c1af96a0fd3c0f2d923c3e378c13345d3b5a6a95aacb00b64021999aa1ada3b0[0m
+        [0;36mPROOF machine_id: e9dce117a551148ad3eef684ef9456ab67d8ef63b9dbf00d40c73f5189fa9b6e[0m
+  [0;32mPASS[0m saorsa2 agent identity
+        [0;36mPROOF agent_id: 92d3b466d52f938db4065ed7477c0132cf96f3dcb8ab17449528d8948c117fbd[0m
+        [0;36mPROOF machine_id: 47e5cc3bf18088f4d864e6d807d4d59e9adfcbd14b0111e98860313d25a3f786[0m
+  [0;32mPASS[0m saorsa1 ≠ saorsa2 agent IDs [PROOF: c1af96a0fd3c0f2d... ≠ 92d3b466d52f938d...]
+  [0;32mPASS[0m saorsa1 agent card
+  [0;32mPASS[0m saorsa2 agent card
+  saorsa1: c1af96a0fd3c0f2d...
+  saorsa2: 92d3b466d52f938d...
+
+[0;36m[3/18] Network Status & NAT/UPnP[0m
+  [0;32mPASS[0m saorsa1 network status
+        [0;36mPROOF nat_type: Unknown[0m
+        [0;36mPROOF local_addr: [::]:19601[0m
+        [0;36mPROOF has_global_address: True[0m
+        [0;36mPROOF can_receive_direct: False[0m
+  [0;32mPASS[0m saorsa1 network/external_addrs [PROOF: count=2
+  addr=192.168.1.108:19601
+  addr=[2a0d:3344:32d:2e10:e897:f997:d858:391e]:19601]
+  [0;32mPASS[0m saorsa2 network status
+        [0;36mPROOF nat_type: Unknown[0m
+        [0;36mPROOF external_addrs: ['192.168.1.179:19602', '[2a0d:3344:32d:2e10:1c33:9381:fdea:cba5]:19602'][0m
+  [0;32mPASS[0m saorsa1 bootstrap cache
+  [0;32mPASS[0m saorsa2 bootstrap cache
+
+[0;36m[4/18] GUI Endpoint[0m
+  [0;32mPASS[0m saorsa1 /gui serves HTML [PROOF: HTML response confirmed]
+  [0;32mPASS[0m saorsa1 /gui contains 'x0x'
+  [0;32mPASS[0m saorsa1 /gui Content-Type: text/html
+  [0;32mPASS[0m saorsa1 /gui includes API token
+  [0;32mPASS[0m saorsa1 /constitution markdown
+  [0;32mPASS[0m saorsa1 /constitution/json
+        [0;36mPROOF version: 0.91[0m
+
+[0;36m[5/18] x0x CLI on LAN Nodes[0m
+  [0;32mPASS[0m saorsa1 CLI: x0x health
+        [0;36mPROOF ok: True[0m
+  [0;32mPASS[0m saorsa1 CLI: x0x agent
+  [0;32mPASS[0m saorsa1 CLI agent_id matches REST [PROOF: sent='c1af96a0fd3c0f2d923c3e378c13345d3b5a6a95aacb00b64021999aa1ada3b0' received='c1af96a0fd3c0f2d923c3e378c13345d3b5a6a95aacb00b64021999aa1ada3b0']
+  [0;32mPASS[0m saorsa1 CLI: x0x peers
+  [0;32mPASS[0m saorsa1 CLI: x0x agents list
+  [0;32mPASS[0m saorsa2 CLI: x0x health
+  [0;32mPASS[0m saorsa2 CLI: x0x agent
+  [0;32mPASS[0m saorsa1 CLI: x0x status
+
+[0;36m[6/18] mDNS LAN Discovery (zero bootstrap)[0m
+  Waiting up to 90s for mDNS discovery...
+  [0;31mFAIL[0m saorsa1 did not discover saorsa2 within 90s
+  [0;31mFAIL[0m saorsa2 did not discover saorsa1 within 90s
+  [0;32mPASS[0m saorsa1 discovered list
+  [PROOF: saorsa1 sees 1 discovered agents]
+  [0;31mFAIL[0m saorsa1 get discovered saorsa2 — curl_failed (non-2xx)
+        [0;36mPROOF agent_id: <missing>[0m
+  [0;31mFAIL[0m saorsa1 reachability of saorsa2 — curl_failed (non-2xx)
+        [0;36mPROOF can_receive_direct: <missing>[0m
+        [0;36mPROOF likely_direct: <missing>[0m
+
+[0;36m[7/18] Direct Messaging (PROOF round-trip)[0m
+  [0;32mPASS[0m saorsa2 imports saorsa1 card
+  [0;32mPASS[0m saorsa1 imports saorsa2 card
+  [0;31mFAIL[0m saorsa1 connects to saorsa2 — outcome=Unreachable: {"addr":null,"ok":true,"outcome":"Unreachable"}
+  [0;31mFAIL[0m saorsa1 direct send to saorsa2 — {"error":"curl_failed"}
+  [PROOF: sent payload='proof-1775896268-64908-direct-s1-to-s2' (base64: cHJvb2YtMTc3NTg5NjI2...)]
+  [0;32mPASS[0m saorsa1 connections
+  [0;31mFAIL[0m saorsa1 expected ≥1 connection, got 0
+  [0;31mFAIL[0m saorsa2 direct send to saorsa1 — {"error":"curl_failed"}
+  [PROOF: sent payload='proof-1775896268-64908-direct-s2-to-s1']
+  [0;32mPASS[0m saorsa1 CLI: direct connections
+
+[0;36m[8/18] Pub/Sub Messaging (PROOF)[0m
+  [0;32mPASS[0m saorsa2 subscribe to proof-1775896268-64908-pubsub
+  [PROOF: subscription id=02a4b0b46811bad2]
+  [0;32mPASS[0m saorsa1 publish to proof-1775896268-64908-pubsub
+  [PROOF: published payload='proof-1775896268-64908-pubsub-payload' on topic='proof-1775896268-64908-pubsub']
+  [0;32mPASS[0m saorsa1 announce identity
+  [0;32mPASS[0m saorsa2 unsubscribe
+  [0;32mPASS[0m saorsa1 CLI: x0x publish
+
+[0;36m[9/18] Contacts & Trust[0m
+  [0;32mPASS[0m saorsa1 adds saorsa2 as Known
+  [0;32mPASS[0m saorsa1 contacts list
+  [0;32mPASS[0m saorsa1 contact list has saorsa2
+  [0;32mPASS[0m saorsa1 trusts saorsa2
+  [0;32mPASS[0m trust evaluate
+  [0;32mPASS[0m trust evaluate: Trusted → Accept [PROOF: decision=Accept]
+  [0;32mPASS[0m saorsa1 CLI: contacts list
+
+[0;36m[10/18] MLS Group Encryption (Post-Quantum)[0m
+  [0;32mPASS[0m saorsa1 creates MLS group
+  [PROOF: MLS group id=3124215aeee2ab6d188175496bead745f4b0571371b49130dfa17f6185a9fbac name=proof-1775896268-64908-mls]
+  [0;32mPASS[0m saorsa1 adds saorsa2 to MLS group
+  [PROOF: MLS epoch after add=1]
+  [0;32mPASS[0m saorsa1 creates MLS welcome
+  [0;32mPASS[0m saorsa1 MLS encrypt
+  [PROOF: encrypted 72 chars of ciphertext]
+  [0;32mPASS[0m saorsa1 MLS decrypt round-trip
+  [0;32mPASS[0m MLS encrypt→decrypt proof [PROOF: sent='proof-1775896268-64908-mls-encrypted' received='proof-1775896268-64908-mls-encrypted']
+  [0;32mPASS[0m saorsa1 list MLS groups
+
+[0;36m[11/18] Named Groups (Spaces)[0m
+  [0;32mPASS[0m saorsa1 creates named group
+  [PROOF: group id=2e3682feefb1c4d981fc16d25886eb1bc44183550be32346f5f273d8a3e54519 name=proof-1775896268-64908-space]
+  [0;32mPASS[0m saorsa1 creates invite
+  [PROOF: invite_link='x0x://invite/eyJncm91cF9pZCI6IjJlMzY4MmZ...']
+  [0;32mPASS[0m invite link uses x0x://invite/ format [PROOF: x0x://invite/eyJncm91cF9pZCI6IjJlMzY4MmZlZWZiMWM0ZDk4MWZjMTZ...]
+  [0;32mPASS[0m saorsa2 joins named group
+  [0;32mPASS[0m saorsa1 sets group display name
+  [0;32mPASS[0m saorsa1 list groups
+  [0;32mPASS[0m saorsa2 list groups
+
+[0;36m[12/18] Key-Value Store (PROOF)[0m
+  [0;32mPASS[0m saorsa1 creates KV store
+  [PROOF: store id=proof-1775896268-64908-kv topic=proof-1775896268-64908-kv]
+  [0;32mPASS[0m saorsa1 KV put proof-key
+  [PROOF: wrote value='proof-1775896268-64908-value-1775896462' to proof-key]
+  [0;32mPASS[0m saorsa1 KV get proof-key
+  [0;32mPASS[0m KV put→get proof [PROOF: sent='proof-1775896268-64908-value-1775896462' received='proof-1775896268-64908-value-1775896462']
+  [0;32mPASS[0m saorsa1 KV list keys
+  [0;32mPASS[0m saorsa1 KV has 4 keys [PROOF: expected ≥4]
+  [0;32mPASS[0m saorsa1 KV delete key-1
+  [0;32mPASS[0m saorsa2 joins KV store (same topic)
+  Waiting 15s for KV store CRDT sync...
+  [0;31mFAIL[0m saorsa2 sees KV proof-key (CRDT sync) — no key 'value' in: {"error":"curl_failed"}
+  [0;31mFAIL[0m KV CRDT sync saorsa1→saorsa2 — sent='proof-1775896268-64908-value-1775896462' but got=''
+  [0;32mPASS[0m saorsa1 CLI: store list
+
+[0;36m[13/18] Kanban / CRDT Task Lists (LAN sync)[0m
+  [0;32mPASS[0m saorsa1 creates kanban (task list)
+  [PROOF: task-list id=proof-1775896268-64908-kanban topic=proof-1775896268-64908-kanban]
+  [0;32mPASS[0m saorsa1 adds task to kanban
+  [PROOF: task id=5db842669fa690b6c8c9efb9fab466876014b3521bc811cae841fd42c8093063 title='[PROOF] LAN Task proof-1775896268-64908']
+  [0;32mPASS[0m saorsa1 adds second task
+  [0;32mPASS[0m saorsa2 joins kanban (same topic)
+  Waiting 20s for CRDT kanban sync across LAN...
+  [0;32mPASS[0m saorsa2 sees kanban tasks (CRDT)
+  [0;31mFAIL[0m saorsa2 expected ≥2 kanban tasks, got 0
+  [0;31mFAIL[0m saorsa2 claims task (kanban: ToDo→In Progress) — {"error":"curl_failed"}
+  [PROOF: saorsa2 claimed task 5db842669fa690b6c8c9efb9fab466876014b3521bc811cae841fd42c8093063]
+  [0;32mPASS[0m saorsa1 sees updated task (claimed)
+  [0;31mFAIL[0m saorsa2 completes task (kanban: In Progress→Done) — {"error":"curl_failed"}
+  [PROOF: saorsa2 completed task 5db842669fa690b6c8c9efb9fab466876014b3521bc811cae841fd42c8093063]
+  [0;33mPASS[0m task state='empty' (CRDT still converging — expected Done)
+  [0;32mPASS[0m saorsa1 CLI: tasks list
+
+[0;36m[14/18] Presence & FOAF Discovery[0m
+  Waiting 35s for presence beacons...
+  [0;32mPASS[0m saorsa1 presence online
+  [PROOF: saorsa1 sees 2 online agents]
+  [0;32mPASS[0m saorsa2 in saorsa1 presence [PROOF: 92d3b466d52f938db4065ed7477c0132cf96f3dcb8ab17449528d8948c117fbd found]
+  [0;32mPASS[0m saorsa1 presence FOAF
+  [0;32mPASS[0m saorsa1 presence find saorsa2
+        [0;36mPROOF agent_id: <missing>[0m
+  [0;32mPASS[0m saorsa1 presence status saorsa2
+        [0;36mPROOF status: <missing>[0m
+  [0;32mPASS[0m saorsa1 CLI: presence online
+  [0;32mPASS[0m saorsa1 CLI: presence find saorsa2
+
+[0;36m[15/18] Agent Find (all paths)[0m
+  [0;32mPASS[0m saorsa1 announce
+  [0;32mPASS[0m saorsa2 announce
+  [0;32mPASS[0m saorsa1 find saorsa2 by ID
+        [0;36mPROOF found: True[0m
+        [0;36mPROOF addresses: [][0m
+  [0;32mPASS[0m saorsa1 discovered agent by ID
+  [0;32mPASS[0m saorsa1 all discovered agents
+  [0;32mPASS[0m saorsa1 CLI: agents find 92d3b466d52f938db4065ed7477c0132cf96f3dcb8ab17449528d8948c117fbd
+  [0;32mPASS[0m saorsa1 CLI: agents list
+  [PROOF: discovered 2 agents via CLI]
+
+[0;36m[16/18] File Transfer[0m
+  [PROOF: file sha256=3c10dfba0e7ca7184b5b3ae03602fbd5ebc88e20aba34225700e37c5b8193609 size=65]
+  [0;31mFAIL[0m saorsa1 initiate file transfer — {"error":"curl_failed"}
+  [PROOF: transfer_id=]
+  [0;32mPASS[0m saorsa1 file transfers list
+
+[0;36m[17/18] Seedless Bootstrap (3rd agent via mDNS)[0m
+  [0;32mOK[0m   Third instance (saorsa2-b) started (1s)
+  [0;32mPASS[0m saorsa2-b health
+  [PROOF: saorsa2-b agent_id=3450059e1a93abb9...]
+  Waiting 60s for seedless saorsa2-b to join via mDNS...
+  [0;31mFAIL[0m saorsa2-b did not discover saorsa1 within 60s
+
+[0;36m[18/18] Swarm (3-Agent Mesh)[0m
+  Testing full mesh: saorsa1 ↔ saorsa2 ↔ saorsa2-b
+  [0;32mPASS[0m swarm: saorsa1 sees saorsa2
+  [0;32mPASS[0m swarm: saorsa2 sees saorsa1
+  [0;31mFAIL[0m swarm: saorsa2-b missing saorsa1
+  [PROOF: saorsa1 peers=0, saorsa2 peers=0]
+  [0;31mFAIL[0m saorsa1 has 0 gossip peers
+  [0;32mPASS[0m swarm broadcast from saorsa1
+  [PROOF: broadcast 'proof-1775896268-64908-swarm-broadcast' to proof-1775896268-64908-swarm]
+
+[1m[0;33m═══════════════════════════════════════════════════════════════[0m
+[1m[0;33m  x0x LAN E2E Test Results[0m
+[1m[0;33m  PROOF TOKEN: proof-1775896268-64908[0m
+[1m[0;33m  Run at: 2026-04-11 08:37:47 UTC[0m
+[1m[0;33m═══════════════════════════════════════════════════════════════[0m
+[1m[0;31m  ❌ FAILURES: 17/112 FAILED (95 passed, 0 skipped)[0m
+
+  Collecting logs...
+--- saorsa1 log tail ---
+[2m2026-04-11T08:34:24.079996Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mproof-1775896268-64908-kv [3mpayload_len[0m[2m=[0m5570
+[2m2026-04-11T08:34:24.080698Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mproof-1775896268-64908-kv [3mmsg_topic[0m[2m=[0mproof-1775896268-64908-kv
+[2m2026-04-11T08:34:24.357258Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mproof-1775896268-64908-kv [3mpayload_len[0m[2m=[0m5570
+[2m2026-04-11T08:34:24.358003Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mproof-1775896268-64908-kv [3mmsg_topic[0m[2m=[0mproof-1775896268-64908-kv
+[2m2026-04-11T08:34:24.998497Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mproof-1775896268-64908-kv [3mpayload_len[0m[2m=[0m5413
+[2m2026-04-11T08:34:24.999219Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mproof-1775896268-64908-kv [3mmsg_topic[0m[2m=[0mproof-1775896268-64908-kv
+[2m2026-04-11T08:34:29.125294Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m88 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m90
+[2m2026-04-11T08:34:39.125830Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m86 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m88
+[2m2026-04-11T08:34:41.705540Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mproof-1775896268-64908-kanban [3mpayload_len[0m[2m=[0m5695
+[2m2026-04-11T08:34:41.706273Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mproof-1775896268-64908-kanban [3mmsg_topic[0m[2m=[0mproof-1775896268-64908-kanban
+[2m2026-04-11T08:34:42.051467Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mproof-1775896268-64908-kanban [3mpayload_len[0m[2m=[0m5650
+[2m2026-04-11T08:34:42.051866Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mproof-1775896268-64908-kanban [3mmsg_topic[0m[2m=[0mproof-1775896268-64908-kanban
+[2m2026-04-11T08:34:49.124994Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m84 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m86
+[2m2026-04-11T08:34:59.124955Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m82 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m84
+[2m2026-04-11T08:35:09.125960Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m80 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m82
+[2m2026-04-11T08:35:19.137111Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m78 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m80
+[2m2026-04-11T08:35:29.153257Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m76 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m78
+[2m2026-04-11T08:35:39.161160Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m74 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m76
+[2m2026-04-11T08:35:49.165739Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m72 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m74
+[2m2026-04-11T08:35:59.168326Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m70 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m72
+[2m2026-04-11T08:36:09.040341Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mx0x.identity.shard.64410 [3mpayload_len[0m[2m=[0m10719
+[2m2026-04-11T08:36:09.040878Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mx0x.identity.shard.64410 [3mmsg_topic[0m[2m=[0mx0x.identity.shard.64410
+[2m2026-04-11T08:36:09.045053Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mx0x.identity.announce.v1 [3mpayload_len[0m[2m=[0m10719
+[2m2026-04-11T08:36:09.045481Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mx0x.identity.announce.v1 [3mmsg_topic[0m[2m=[0mx0x.identity.announce.v1
+[2m2026-04-11T08:36:09.169275Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m68 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m70
+[2m2026-04-11T08:36:19.165586Z[0m [31mERROR[0m [2mx0xd[0m[2m:[0m Failed to send file offer: agent not connected: [146, 211, 180, 102, 213, 47, 147, 141, 180, 6, 94, 215, 71, 124, 1, 50, 207, 150, 243, 220, 184, 171, 23, 68, 149, 40, 216, 148, 140, 17, 127, 189]
+[2m2026-04-11T08:36:19.169806Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m66 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m68
+[2m2026-04-11T08:36:19.189936Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mx0x.identity.announce.v1 [3mpayload_len[0m[2m=[0m10737
+[2m2026-04-11T08:36:19.190591Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mx0x.identity.announce.v1 [3mmsg_topic[0m[2m=[0mx0x.identity.announce.v1
+[2m2026-04-11T08:36:29.170468Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m64 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m66
+--- saorsa2 log tail ---
+[2m2026-04-11T08:33:19.284624Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m102 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m104
+[2m2026-04-11T08:33:29.284909Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m100 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m102
+[2m2026-04-11T08:33:39.284755Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m98 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m100
+[2m2026-04-11T08:33:49.284504Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m96 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m98
+[2m2026-04-11T08:33:59.285183Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m94 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m96
+[2m2026-04-11T08:34:07.636248Z[0m [31mERROR[0m [2mx0xd[0m[2m:[0m direct_send failed: agent not connected: [193, 175, 150, 160, 253, 60, 15, 45, 146, 60, 62, 55, 140, 19, 52, 93, 59, 90, 106, 149, 170, 203, 0, 182, 64, 33, 153, 154, 161, 173, 163, 176]
+[2m2026-04-11T08:34:09.285270Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m92 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m94
+[2m2026-04-11T08:34:19.285087Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m90 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m92
+[2m2026-04-11T08:34:21.597191Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mx0x.group.2e3682feefb1c4d9.chat/general [3mpayload_len[0m[2m=[0m5620
+[2m2026-04-11T08:34:21.597878Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mx0x.group.2e3682feefb1c4d9.chat/general [3mmsg_topic[0m[2m=[0mx0x.group.2e3682feefb1c4d9.chat/general
+[2m2026-04-11T08:34:21.597990Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] subscriber channel closed [3mtopic[0m[2m=[0mx0x.group.2e3682feefb1c4d9.chat/general
+[2m2026-04-11T08:34:29.285169Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m88 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m90
+[2m2026-04-11T08:34:39.284990Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m86 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m88
+[2m2026-04-11T08:34:49.284508Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m84 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m86
+[2m2026-04-11T08:34:59.284888Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m82 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m84
+[2m2026-04-11T08:35:09.285345Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m80 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m82
+[2m2026-04-11T08:35:19.285757Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m78 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m80
+[2m2026-04-11T08:35:29.285044Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m76 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m78
+[2m2026-04-11T08:35:39.285602Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m74 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m76
+[2m2026-04-11T08:35:49.285254Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m72 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m74
+[2m2026-04-11T08:35:59.285366Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m70 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m72
+[2m2026-04-11T08:36:09.284871Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m68 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m70
+[2m2026-04-11T08:36:09.419058Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mx0x.identity.shard.14448 [3mpayload_len[0m[2m=[0m10719
+[2m2026-04-11T08:36:09.419924Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mx0x.identity.shard.14448 [3mmsg_topic[0m[2m=[0mx0x.identity.shard.14448
+[2m2026-04-11T08:36:09.422123Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mx0x.identity.announce.v1 [3mpayload_len[0m[2m=[0m10719
+[2m2026-04-11T08:36:09.422995Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mx0x.identity.announce.v1 [3mmsg_topic[0m[2m=[0mx0x.identity.announce.v1
+[2m2026-04-11T08:36:19.286012Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m66 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m68
+[2m2026-04-11T08:36:19.312487Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mx0x.identity.announce.v1 [3mpayload_len[0m[2m=[0m10737
+[2m2026-04-11T08:36:19.313043Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mx0x.identity.announce.v1 [3mmsg_topic[0m[2m=[0mx0x.identity.announce.v1
+[2m2026-04-11T08:36:29.286157Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m64 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m66
+
+  Agents tested:
+    saorsa1: c1af96a0fd3c0f2d923c3e378c13345d3b5a6a95aacb00b64021999aa1ada3b0
+    saorsa2: 92d3b466d52f938db4065ed7477c0132cf96f3dcb8ab17449528d8948c117fbd
+    saorsa2-b: 3450059e1a93abb9e85f1d81408144d22ef5fe863d6b7089a57f742c949d0ff9
+
+[1m[0;33m═══════════════════════════════════════════════════════════════[0m
+
+[0;33mCleaning up...[0m

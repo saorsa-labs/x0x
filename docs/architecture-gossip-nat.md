@@ -65,6 +65,32 @@ full mesh, with each agent connected to a small subset of peers. The bootstrap
 cache persists known peer addresses across restarts, so returning agents can
 rejoin without contacting bootstrap nodes at all.
 
+## Partition tolerance and data locality
+
+This architecture is intentionally designed so that user/group data availability
+follows **reachable peers**, not a globally healthy overlay.
+
+- If Alice can still reach Bob, Alice↔Bob data should still work.
+- If members of a group can still reach one another inside a partition, that
+  group should still function inside the partition.
+- Bootstrap loss or degraded discovery should reduce convenience, not erase
+  already-held data.
+
+This is why x0x does **not** treat a global DHT as the authoritative location for
+user-to-user or group collaboration data. A DHT can place data on arbitrary nodes
+outside the currently reachable partition, which means users might still be able
+to reach their friends but lose access to their data because the storage/routing
+layer is elsewhere.
+
+x0x prefers the opposite tradeoff: keep data with the relevant peers and explicit
+replicas, and accept that unreachable peers remain unreachable until connectivity
+returns. If a path exists today — over QUIC in the current implementation, or via
+future alternate bearers/bridges such as Bluetooth- or LoRa-style links — the
+partition-tolerant data model still holds, without claiming those are all native
+x0x transports today.
+
+See also [ADR 0006](./adr/0006-no-global-dht-for-user-and-group-data.md).
+
 **Key:**
 - `◄════►` Direct agent-to-agent QUIC connections
 

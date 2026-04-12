@@ -1,0 +1,298 @@
+[1m[0;36m╔══════════════════════════════════════════════════════════════════╗[0m
+[1m[0;36m║  x0x LAN E2E Test Suite v2 — v0.16.0[0m
+[1m[0;36m║  Nodes: studio1.local, studio2.local[0m
+[1m[0;36m║  PROOF TOKEN: proof-1775911388-29718[0m
+[1m[0;36m╚══════════════════════════════════════════════════════════════════╝[0m
+
+[0;36m[0/18] Prerequisites[0m
+  [0;32mOK[0m   x0xd: /Users/davidirvine/Desktop/Devel/projects/x0x/target/release/x0xd
+  [0;32mOK[0m   x0x:  /Users/davidirvine/Desktop/Devel/projects/x0x/target/release/x0x
+  [0;32mPASS[0m SSH to studio1.local
+  [0;32mPASS[0m SSH to studio2.local
+
+[0;36m[1/18] Deploy x0xd + x0x CLI to LAN nodes[0m
+  [0;32mOK[0m   Deployed to studio1.local
+  [0;32mOK[0m   Deployed to studio2.local
+  Waiting for daemons to start...
+  [0;32mOK[0m   studio1.local daemon ready (1s)
+  [0;32mOK[0m   studio2.local daemon ready (1s)
+  [0;32mOK[0m   Tokens acquired (s1=f19eb080..., s2=d586fc90...)
+
+[0;36m[2/18] Health & Identity (PROOF)[0m
+  [0;32mPASS[0m saorsa1 health
+        [0;36mPROOF version: 0.16.0[0m
+  [0;32mPASS[0m saorsa2 health
+        [0;36mPROOF version: 0.16.0[0m
+  [0;32mPASS[0m saorsa1 agent identity
+        [0;36mPROOF agent_id: c1af96a0fd3c0f2d923c3e378c13345d3b5a6a95aacb00b64021999aa1ada3b0[0m
+        [0;36mPROOF machine_id: e9dce117a551148ad3eef684ef9456ab67d8ef63b9dbf00d40c73f5189fa9b6e[0m
+  [0;32mPASS[0m saorsa2 agent identity
+        [0;36mPROOF agent_id: 92d3b466d52f938db4065ed7477c0132cf96f3dcb8ab17449528d8948c117fbd[0m
+        [0;36mPROOF machine_id: 47e5cc3bf18088f4d864e6d807d4d59e9adfcbd14b0111e98860313d25a3f786[0m
+  [0;32mPASS[0m saorsa1 ≠ saorsa2 agent IDs [PROOF: c1af96a0fd3c0f2d... ≠ 92d3b466d52f938d...]
+  [0;32mPASS[0m saorsa1 agent card
+  [0;32mPASS[0m saorsa2 agent card
+  saorsa1: c1af96a0fd3c0f2d...
+  saorsa2: 92d3b466d52f938d...
+
+[0;36m[3/18] Network Status & NAT/UPnP[0m
+  [0;32mPASS[0m saorsa1 network status
+        [0;36mPROOF nat_type: Unknown[0m
+        [0;36mPROOF local_addr: [::]:19601[0m
+        [0;36mPROOF has_global_address: True[0m
+        [0;36mPROOF can_receive_direct: False[0m
+  [0;32mPASS[0m saorsa1 network/external_addrs [PROOF: count=2
+  addr=192.168.1.73:19601
+  addr=[2a0d:3344:32d:2e10:c962:d935:ddc6:6857]:19601]
+  [0;32mPASS[0m saorsa2 network status
+        [0;36mPROOF nat_type: Unknown[0m
+        [0;36mPROOF external_addrs: ['192.168.1.179:19602', '[2a0d:3344:32d:2e10:7c8c:daf3:33fe:611f]:19602'][0m
+  [0;32mPASS[0m saorsa1 bootstrap cache
+  [0;32mPASS[0m saorsa2 bootstrap cache
+
+[0;36m[4/18] GUI Endpoint[0m
+  [0;32mPASS[0m saorsa1 /gui serves HTML [PROOF: HTML response confirmed]
+  [0;32mPASS[0m saorsa1 /gui contains 'x0x'
+  [0;32mPASS[0m saorsa1 /gui Content-Type: text/html
+  [0;32mPASS[0m saorsa1 /gui includes API token
+  [0;32mPASS[0m saorsa1 /constitution markdown
+  [0;32mPASS[0m saorsa1 /constitution/json
+        [0;36mPROOF version: 0.91[0m
+
+[0;36m[5/18] x0x CLI on LAN Nodes[0m
+  [0;32mPASS[0m saorsa1 CLI: x0x health
+        [0;36mPROOF ok: True[0m
+  [0;32mPASS[0m saorsa1 CLI: x0x agent
+  [0;32mPASS[0m saorsa1 CLI agent_id matches REST [PROOF: sent='c1af96a0fd3c0f2d923c3e378c13345d3b5a6a95aacb00b64021999aa1ada3b0' received='c1af96a0fd3c0f2d923c3e378c13345d3b5a6a95aacb00b64021999aa1ada3b0']
+  [0;32mPASS[0m saorsa1 CLI: x0x peers
+  [0;32mPASS[0m saorsa1 CLI: x0x agents list
+  [0;32mPASS[0m saorsa2 CLI: x0x health
+  [0;32mPASS[0m saorsa2 CLI: x0x agent
+  [0;32mPASS[0m saorsa1 CLI: x0x status
+
+[0;36m[6/18] mDNS LAN Discovery (zero bootstrap)[0m
+  Waiting up to 90s for mDNS discovery...
+  [0;31mFAIL[0m saorsa1 did not discover saorsa2 within 90s
+  [0;31mFAIL[0m saorsa2 did not discover saorsa1 within 90s
+  [0;32mPASS[0m saorsa1 discovered list
+  [PROOF: saorsa1 sees 1 discovered agents]
+  [0;31mFAIL[0m saorsa1 get discovered saorsa2 — curl_failed (non-2xx)
+        [0;36mPROOF agent_id: <missing>[0m
+  [0;31mFAIL[0m saorsa1 reachability of saorsa2 — curl_failed (non-2xx)
+        [0;36mPROOF can_receive_direct: <missing>[0m
+        [0;36mPROOF likely_direct: <missing>[0m
+
+[0;36m[7/18] Direct Messaging (PROOF round-trip)[0m
+  [0;32mPASS[0m saorsa2 imports saorsa1 card
+  [0;32mPASS[0m saorsa1 imports saorsa2 card
+  [0;32mPASS[0m saorsa1 connects to saorsa2 [PROOF: outcome=Coordinated]
+  [0;32mPASS[0m saorsa1 direct send to saorsa2
+  [PROOF: sent payload='proof-1775911388-29718-direct-s1-to-s2' (base64: cHJvb2YtMTc3NTkxMTM4...)]
+  [0;32mPASS[0m saorsa1 connections
+  [0;32mPASS[0m saorsa1 connected to saorsa2 [PROOF: agent_id=92d3b466d52f938db4065ed7477c0132cf96f3dcb8ab17449528d8948c117fbd]
+  [0;32mPASS[0m saorsa2 direct send to saorsa1
+  [PROOF: sent payload='proof-1775911388-29718-direct-s2-to-s1']
+  [0;32mPASS[0m saorsa1 CLI: direct connections
+
+[0;36m[8/18] Pub/Sub Messaging (PROOF)[0m
+  [0;32mPASS[0m saorsa2 subscribe to proof-1775911388-29718-pubsub
+  [PROOF: subscription id=be396be3eabb394e]
+  [0;32mPASS[0m saorsa1 publish to proof-1775911388-29718-pubsub
+  [PROOF: published payload='proof-1775911388-29718-pubsub-payload' on topic='proof-1775911388-29718-pubsub']
+  [0;32mPASS[0m saorsa1 announce identity
+  [0;32mPASS[0m saorsa2 unsubscribe
+  [0;32mPASS[0m saorsa1 CLI: x0x publish
+
+[0;36m[9/18] Contacts & Trust[0m
+  [0;32mPASS[0m saorsa1 adds saorsa2 as Known
+  [0;32mPASS[0m saorsa1 contacts list
+  [0;32mPASS[0m saorsa1 contact list has saorsa2
+  [0;32mPASS[0m saorsa1 trusts saorsa2
+  [0;32mPASS[0m trust evaluate
+  [0;32mPASS[0m trust evaluate: Trusted → Accept [PROOF: decision=Accept]
+  [0;32mPASS[0m saorsa1 CLI: contacts list
+
+[0;36m[10/18] MLS Group Encryption (Post-Quantum)[0m
+  [0;32mPASS[0m saorsa1 creates MLS group
+  [PROOF: MLS group id=47b19034685fac6047b8ae88d73af39a71dcc2e50a584b307d4559c2ab27648a name=proof-1775911388-29718-mls]
+  [0;32mPASS[0m saorsa1 adds saorsa2 to MLS group
+  [PROOF: MLS epoch after add=1]
+  [0;32mPASS[0m saorsa1 creates MLS welcome
+  [0;32mPASS[0m saorsa1 MLS encrypt
+  [PROOF: encrypted 72 chars of ciphertext]
+  [0;32mPASS[0m saorsa1 MLS decrypt round-trip
+  [0;32mPASS[0m MLS encrypt→decrypt proof [PROOF: sent='proof-1775911388-29718-mls-encrypted' received='proof-1775911388-29718-mls-encrypted']
+  [0;32mPASS[0m saorsa1 list MLS groups
+
+[0;36m[11/18] Named Groups (Spaces)[0m
+  [0;32mPASS[0m saorsa1 creates named group
+  [PROOF: group id=dc0b8a834c22d42fafc60f69c6b693294a090bf9f70c5509c84431875dbf8309 name=proof-1775911388-29718-space]
+  [0;32mPASS[0m saorsa1 creates invite
+  [PROOF: invite_link='x0x://invite/eyJncm91cF9pZCI6ImRjMGI4YTg...']
+  [0;32mPASS[0m invite link uses x0x://invite/ format [PROOF: x0x://invite/eyJncm91cF9pZCI6ImRjMGI4YTgzNGMyMmQ0MmZhZmM2MGY...]
+  [0;32mPASS[0m saorsa2 joins named group
+  [0;32mPASS[0m saorsa1 sets group display name
+  [0;32mPASS[0m saorsa1 list groups
+  [0;32mPASS[0m saorsa2 list groups
+
+[0;36m[12/18] Key-Value Store (PROOF)[0m
+  [0;32mPASS[0m saorsa1 creates KV store
+  [PROOF: store id=proof-1775911388-29718-kv topic=proof-1775911388-29718-kv]
+  [0;32mPASS[0m saorsa2 joins KV store by topic
+  [0;32mPASS[0m saorsa1 KV put proof-key
+  [PROOF: wrote value='proof-1775911388-29718-value-1775911959' to proof-key]
+  [0;32mPASS[0m saorsa1 KV get proof-key
+  [0;32mPASS[0m KV put→get proof [PROOF: sent='proof-1775911388-29718-value-1775911959' received='proof-1775911388-29718-value-1775911959']
+  [0;32mPASS[0m saorsa1 KV list keys
+  [0;32mPASS[0m saorsa1 KV has 4 keys [PROOF: expected ≥4]
+  [0;32mPASS[0m saorsa1 KV delete key-1
+  Waiting 15s for KV store CRDT sync...
+  [0;32mPASS[0m saorsa2 sees KV proof-key (CRDT sync)
+  [0;32mPASS[0m KV CRDT sync saorsa1→saorsa2 [PROOF: sent='proof-1775911388-29718-value-1775911959' received='proof-1775911388-29718-value-1775911959']
+  [0;32mPASS[0m saorsa1 CLI: store list
+
+[0;36m[13/18] Kanban / CRDT Task Lists (LAN sync)[0m
+  [0;32mPASS[0m saorsa1 creates kanban (task list)
+  [PROOF: task-list id=proof-1775911388-29718-kanban topic=proof-1775911388-29718-kanban]
+  [0;32mPASS[0m saorsa2 joins kanban (same topic)
+  [0;32mPASS[0m saorsa1 adds task to kanban
+  [PROOF: task id=4a8ab8f3a060d5ba3b41405c5ef0da4b8321d96a421bbfbb3d803f1080990890 title='[PROOF] LAN Task proof-1775911388-29718']
+  [0;32mPASS[0m saorsa1 adds second task
+  Waiting 20s for CRDT kanban sync across LAN...
+  [0;32mPASS[0m saorsa2 sees kanban tasks (CRDT)
+  [0;32mPASS[0m saorsa2 kanban has 2 tasks [PROOF: CRDT sync worked]
+  [0;32mPASS[0m saorsa2 claims task (kanban: ToDo→In Progress)
+  [PROOF: saorsa2 claimed task 4a8ab8f3a060d5ba3b41405c5ef0da4b8321d96a421bbfbb3d803f1080990890]
+  [0;32mPASS[0m saorsa1 sees updated task (claimed)
+  [0;32mPASS[0m saorsa2 completes task (kanban: In Progress→Done)
+  [PROOF: saorsa2 completed task 4a8ab8f3a060d5ba3b41405c5ef0da4b8321d96a421bbfbb3d803f1080990890]
+  [0;32mPASS[0m task CRDT state converged to Done [PROOF: state=done:92d3b466d52f938db4065ed7477c0132cf96f3dcb8ab17449528d8948c117fbd]
+  [0;32mPASS[0m saorsa1 CLI: tasks list
+
+[0;36m[14/18] Presence & FOAF Discovery[0m
+  Waiting 35s for presence beacons...
+  [0;32mPASS[0m saorsa1 presence online
+  [PROOF: saorsa1 sees 2 online agents]
+  [0;32mPASS[0m saorsa2 in saorsa1 presence [PROOF: 92d3b466d52f938db4065ed7477c0132cf96f3dcb8ab17449528d8948c117fbd found]
+  [0;32mPASS[0m saorsa1 presence FOAF
+  [0;32mPASS[0m saorsa1 presence find saorsa2
+        [0;36mPROOF agent_id: <missing>[0m
+  [0;32mPASS[0m saorsa1 presence status saorsa2
+        [0;36mPROOF status: <missing>[0m
+  [0;32mPASS[0m saorsa1 CLI: presence online
+  [0;32mPASS[0m saorsa1 CLI: presence find saorsa2
+
+[0;36m[15/18] Agent Find (all paths)[0m
+  [0;32mPASS[0m saorsa1 announce
+  [0;32mPASS[0m saorsa2 announce
+  [0;32mPASS[0m saorsa1 find saorsa2 by ID
+        [0;36mPROOF found: True[0m
+        [0;36mPROOF addresses: ['100.78.147.60:19602', '[2a0d:3344:32d:2e10:6468:e35a:db4e:f1aa]:19602', '192.168.0.2:19602', '192.168.1.179:19602', '[2a0d:3344:32d:2e10:1c33:9381:fdea:cba5]:19602', '[fd14:a7f0:2914:10:ca0:3b05:be27:b2a8]:19602', '[fd7a:115c:a1e0::301:93b9]:19602'][0m
+  [0;32mPASS[0m saorsa1 discovered agent by ID
+  [0;32mPASS[0m saorsa1 all discovered agents
+  [0;32mPASS[0m saorsa1 CLI: agents find 92d3b466d52f938db4065ed7477c0132cf96f3dcb8ab17449528d8948c117fbd
+  [0;32mPASS[0m saorsa1 CLI: agents list
+  [PROOF: discovered 2 agents via CLI]
+
+[0;36m[16/18] File Transfer[0m
+  [PROOF: file sha256=09d73cda4162911d6171fd9d319f24403a8beb6a4d6ad28908c1194de5d7e4a9 size=65]
+  [0;32mPASS[0m saorsa1 initiate file transfer
+  [PROOF: transfer_id=124ec576-cfed-445b-9726-901f72836748]
+  [0;32mPASS[0m saorsa1 file transfers list
+
+[0;36m[17/18] Seedless Bootstrap (3rd agent via mDNS)[0m
+  [0;32mOK[0m   Third instance (saorsa2-b) started (1s)
+  [0;32mPASS[0m saorsa2-b health
+  [PROOF: saorsa2-b agent_id=3450059e1a93abb9...]
+  Waiting 60s for seedless saorsa2-b to join via mDNS...
+  [0;31mFAIL[0m saorsa2-b did not discover saorsa1 within 60s
+
+[0;36m[18/18] Swarm (3-Agent Mesh)[0m
+  Testing full mesh: saorsa1 ↔ saorsa2 ↔ saorsa2-b
+  [0;32mPASS[0m swarm: saorsa1 sees saorsa2
+  [0;32mPASS[0m swarm: saorsa2 sees saorsa1
+  [0;31mFAIL[0m swarm: saorsa2-b missing saorsa1
+  [PROOF: saorsa1 peers=1, saorsa2 peers=1]
+  [0;32mPASS[0m saorsa1 has 1 gossip peer(s)
+  [0;32mPASS[0m swarm broadcast from saorsa1
+  [PROOF: broadcast 'proof-1775911388-29718-swarm-broadcast' to proof-1775911388-29718-swarm]
+
+[1m[0;33m═══════════════════════════════════════════════════════════════[0m
+[1m[0;33m  x0x LAN E2E Test Results[0m
+[1m[0;33m  PROOF TOKEN: proof-1775911388-29718[0m
+[1m[0;33m  Run at: 2026-04-11 12:58:36 UTC[0m
+[1m[0;33m═══════════════════════════════════════════════════════════════[0m
+[1m[0;31m  ❌ FAILURES: 6/112 FAILED (106 passed, 0 skipped)[0m
+
+  Collecting logs...
+--- saorsa1 log tail ---
+[2m2026-04-11T12:58:30.868979Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:30.896273Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:31.487663Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:31.557286Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:31.922127Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:31.922531Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:31.922561Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:32.057605Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:32.489554Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:32.711963Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:33.028231Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:33.028271Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:33.498729Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:33.592766Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:33.930523Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:33.930535Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:34.451623Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:34.559211Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:34.864757Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:34.905236Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:35.474540Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:35.551657Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:35.917792Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:35.917858Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:36.443470Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:36.496892Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:36.762349Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 10703 bytes (PubSub) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:37.115049Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+[2m2026-04-11T12:58:37.118338Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(47e5cc3bf18088f4)
+[2m2026-04-11T12:58:37.495685Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([71, 229, 204, 59, 241, 128, 136, 244, 216, 100, 230, 216, 7, 212, 213, 158, 154, 223, 203, 209, 75, 1, 17, 233, 136, 96, 49, 61, 37, 163, 247, 134])
+--- saorsa2 log tail ---
+[2m2026-04-11T12:58:34.546681Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:34.546685Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:34.896442Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:35.025808Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:35.537112Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:35.566920Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:35.894047Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:36.170636Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:36.491024Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:36.536762Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:36.737001Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 10702 bytes (PubSub) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:36.737142Z[0m [32m INFO[0m [2mx0x::gossip::runtime[0m[2m:[0m [2/6 runtime] dispatching PubSub message to handle_incoming [3mfrom[0m[2m=[0me9dce117a551148a [3mbytes[0m[2m=[0m10702
+[2m2026-04-11T12:58:36.737939Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mproof-1775911388-29718-swarm [3mpayload_len[0m[2m=[0m5366
+[2m2026-04-11T12:58:36.738766Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mproof-1775911388-29718-swarm [3mmsg_topic[0m[2m=[0mproof-1775911388-29718-swarm
+[2m2026-04-11T12:58:36.738859Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m [5/6 x0xd] received from subscriber channel, broadcasting to SSE [3mtopic[0m[2m=[0mproof-1775911388-29718-swarm [3msub_id[0m[2m=[0ma1c01e3ac26816c0 [3mpayload_len[0m[2m=[0m38
+[2m2026-04-11T12:58:36.738904Z[0m [33m WARN[0m [2mx0xd[0m[2m:[0m [5/6 x0xd] broadcast send failed (no SSE receivers) [3mtopic[0m[2m=[0mproof-1775911388-29718-swarm
+[2m2026-04-11T12:58:36.972398Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:37.234979Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:37.561224Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:37.593257Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:37.942796Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:38.294837Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:38.613041Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:38.613087Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:38.966003Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:39.100416Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:39.421812Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+[2m2026-04-11T12:58:39.561480Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:39.561507Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(e9dce117a551148a)
+[2m2026-04-11T12:58:39.561509Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([233, 220, 225, 23, 165, 81, 20, 138, 211, 238, 246, 132, 239, 148, 86, 171, 103, 216, 239, 99, 185, 219, 240, 13, 64, 199, 63, 81, 137, 250, 155, 110])
+
+  Agents tested:
+    saorsa1: c1af96a0fd3c0f2d923c3e378c13345d3b5a6a95aacb00b64021999aa1ada3b0
+    saorsa2: 92d3b466d52f938db4065ed7477c0132cf96f3dcb8ab17449528d8948c117fbd
+    saorsa2-b: 3450059e1a93abb9e85f1d81408144d22ef5fe863d6b7089a57f742c949d0ff9
+
+[1m[0;33m═══════════════════════════════════════════════════════════════[0m
+
+[0;33mCleaning up...[0m

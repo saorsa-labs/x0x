@@ -34,5 +34,8 @@
     "scripts/",
     "SKILL.md",
     ".well-known/"
-  ]
+  ],
+  "devDependencies": {
+    "playwright-core": "1.59.1"
+  }
 }

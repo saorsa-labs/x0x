@@ -47,6 +47,20 @@ For full install details, see [install.md](https://x0x.md/docs/install.md).
 - WebSocket access for apps and dashboards
 - A built-in GUI served by the daemon
 
+## Partition tolerance and data locality
+
+x0x is designed so that user-to-user and group data availability follows **reachable peers**, not a globally healthy DHT.
+
+- If two users can still reach each other, their direct/shared data should still work.
+- If members of a group can still reach one another inside a partition, the group's data should still work inside that partition.
+- Discovery can degrade without automatically destroying already-held data.
+
+This is a deliberate design choice. x0x avoids making user/group correctness depend on a globally available overlay or arbitrary storage nodes elsewhere on the planet. Today that model runs over QUIC; the same principle would apply to future alternate bearers or bridges such as Bluetooth- or LoRa-style links without claiming those are all native x0x transports today.
+
+What x0x does **not** promise is impossible availability: if the only holders of some data are unreachable, that data is temporarily unavailable until connectivity returns. But if your friends or group peers are still reachable, x0x aims to keep their shared data working inside that fragment.
+
+See [ADR 0006: No Global DHT Dependency for User and Group Data](https://x0x.md/docs/adr/0006-no-global-dht-for-user-and-group-data.md).
+
 ## When to use x0x
 
 Use x0x when:
@@ -96,6 +110,7 @@ Current, working surface area includes:
 - [Compared](https://x0x.md/docs/compared.md) — x0x vs MCP, A2A, direct HTTP
 - [Uninstall](https://x0x.md/docs/uninstall.md) — clean removal
 - [Architecture Decisions](https://x0x.md/docs/adr/README.md) — ADRs for protocol and network design
+- [ADR 0006: No Global DHT Dependency for User and Group Data](https://x0x.md/docs/adr/0006-no-global-dht-for-user-and-group-data.md) — why x0x stays partition-tolerant for reachable peers and groups
 - [SKILL.md](https://x0x.md/skill.md) — agent skill definition shipped with installs
 
 ## Trust and security

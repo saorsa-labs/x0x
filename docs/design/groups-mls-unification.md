@@ -4,6 +4,8 @@
 
 Proposal — design doc only, not yet implemented.
 
+Note: for the fuller long-term architecture covering private secure groups, public discoverable groups, request-access flows, roles, and policy presets, see `docs/design/named-groups-full-model.md`. This document captures the earlier/narrower unification step.
+
 ## Problem Statement
 
 x0x currently exposes two parallel group surfaces that operate on the same underlying group ID but through disconnected APIs:

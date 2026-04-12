@@ -97,6 +97,9 @@ This is the shorter, at-a-glance API map for `x0xd`. For the full reference, req
 | POST | `/groups` | `x0x group create` | Create named group |
 | GET | `/groups` | `x0x group list` | List groups |
 | GET | `/groups/:id` | `x0x group info` | Group info |
+| GET | `/groups/:id/members` | `x0x group members` | List named-group members |
+| POST | `/groups/:id/members` | `x0x group add-member` | Creator-authored member add |
+| DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member` | Creator-authored member removal |
 | POST | `/groups/:id/invite` | `x0x group invite` | Generate invite link |
 | POST | `/groups/join` | `x0x group join` | Join from invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name` | Set display name |

@@ -285,6 +285,71 @@ fn is_globally_routable(ip: std::net::IpAddr) -> bool {
     }
 }
 
+pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
+    fn is_cgnat(v4: std::net::Ipv4Addr) -> bool {
+        v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64
+    }
+
+    fn addr_priority(ip: std::net::IpAddr) -> u8 {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if is_globally_routable(std::net::IpAddr::V4(v4)) {
+                    0
+                } else if is_cgnat(v4) {
+                    1
+                } else {
+                    2
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if is_globally_routable(std::net::IpAddr::V6(v6)) {
+                    3
+                } else {
+                    4
+                }
+            }
+        }
+    }
+
+    let mut ranked = Vec::new();
+
+    let interfaces = match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces,
+        Err(_) => return Vec::new(),
+    };
+
+    for iface in interfaces {
+        let ip = iface.ip();
+        if ip.is_unspecified() || ip.is_loopback() {
+            continue;
+        }
+
+        let addr = match ip {
+            std::net::IpAddr::V4(v4) => {
+                if v4.is_link_local() {
+                    continue;
+                }
+                std::net::SocketAddr::new(std::net::IpAddr::V4(v4), port)
+            }
+            std::net::IpAddr::V6(v6) => {
+                let segs = v6.segments();
+                let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+                if is_link_local {
+                    continue;
+                }
+                std::net::SocketAddr::new(std::net::IpAddr::V6(v6), port)
+            }
+        };
+
+        if !ranked.iter().any(|(_, existing)| *existing == addr) {
+            ranked.push((addr_priority(addr.ip()), addr));
+        }
+    }
+
+    ranked.sort_by_key(|(priority, addr)| (*priority, addr.is_ipv6()));
+    ranked.into_iter().map(|(_, addr)| addr).collect()
+}
+
 /// Default interval between identity heartbeat re-announcements (seconds).
 pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 300;
 
@@ -518,6 +583,9 @@ pub struct AgentBuilder {
     disable_peer_cache: bool,
     heartbeat_interval_secs: Option<u64>,
     identity_ttl_secs: Option<u64>,
+    presence_beacon_interval_secs: Option<u64>,
+    presence_event_poll_interval_secs: Option<u64>,
+    presence_offline_timeout_secs: Option<u64>,
     /// Custom path for the contacts file.
     contact_store_path: Option<std::path::PathBuf>,
 }
@@ -591,24 +659,9 @@ impl HeartbeatContext {
             }
         }
 
-        // Include LAN-reachable private IPv4 address so agents on the same
-        // network can connect directly without NAT hairpinning. Private
-        // addresses are placed AFTER public addresses so connect_to_agent
-        // tries globally-routable addresses first. The persistent bootstrap
-        // cache filters these out to avoid dead-ends across restarts.
-        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-            if sock.connect("8.8.8.8:80").is_ok() {
-                if let Ok(local) = sock.local_addr() {
-                    if let std::net::IpAddr::V4(v4) = local.ip() {
-                        if v4.is_private() {
-                            let lan_addr =
-                                std::net::SocketAddr::new(std::net::IpAddr::V4(v4), bind_port);
-                            if !addresses.contains(&lan_addr) {
-                                addresses.push(lan_addr);
-                            }
-                        }
-                    }
-                }
+        for addr in collect_local_interface_addrs(bind_port) {
+            if !addresses.contains(&addr) {
+                addresses.push(addr);
             }
         }
 
@@ -757,6 +810,9 @@ impl Agent {
             disable_peer_cache: false,
             heartbeat_interval_secs: None,
             identity_ttl_secs: None,
+            presence_beacon_interval_secs: None,
+            presence_event_poll_interval_secs: None,
+            presence_offline_timeout_secs: None,
             contact_store_path: None,
         }
     }
@@ -1083,13 +1139,69 @@ impl Agent {
             return Ok(connectivity::ConnectOutcome::Unreachable);
         }
 
-        // 3. Try direct connection whenever the peer is not explicitly known
+        let dial_timeout = std::time::Duration::from_secs(8);
+
+        // 3. If we know the peer's machine ID, prefer a peer-authenticated dial
+        //    with explicit address hints first. This is more reliable for agent
+        //    cards and other out-of-band discoveries than a raw address dial.
+        if agent.machine_id.0 != [0u8; 32] {
+            let peer_id_hint = ant_quic::PeerId(agent.machine_id.0);
+            self.seed_transport_peer_hints_for_target(network, &agent)
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "failed to seed transport peer hints: {e}"
+                    )))
+                })?;
+
+            match tokio::time::timeout(
+                dial_timeout,
+                network.connect_peer_with_addrs(peer_id_hint, info.addresses.clone()),
+            )
+            .await
+            {
+                Ok(Ok((addr, verified_peer_id))) => {
+                    let verified_machine_id = identity::MachineId(verified_peer_id.0);
+                    if let Some(ref bc) = self.bootstrap_cache {
+                        bc.add_from_connection(verified_peer_id, vec![addr], None)
+                            .await;
+                        bc.record_success(&verified_peer_id, 0).await;
+                    }
+                    {
+                        let mut cache = self.identity_discovery_cache.write().await;
+                        if let Some(entry) = cache.get_mut(agent_id) {
+                            entry.machine_id = verified_machine_id;
+                        }
+                    }
+                    self.direct_messaging
+                        .mark_connected(agent.agent_id, verified_machine_id)
+                        .await;
+                    return Ok(connectivity::ConnectOutcome::Coordinated(addr));
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        "Hinted peer connect to {:?} failed: {}",
+                        agent.machine_id,
+                        e
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "Hinted peer connect to {:?} timed out after {:?}",
+                        agent.machine_id,
+                        dial_timeout
+                    );
+                }
+            }
+        }
+
+        // 4. Try direct connection whenever the peer is not explicitly known
         //    to require coordination. Unknown reachability still deserves a
         //    direct probe, especially for the first nodes in a new network.
         if info.should_attempt_direct() {
             for addr in &info.addresses {
-                match network.connect_addr(*addr).await {
-                    Ok(connected_peer_id) => {
+                match tokio::time::timeout(dial_timeout, network.connect_addr(*addr)).await {
+                    Ok(Ok(connected_peer_id)) => {
                         // Use the real PeerId from the QUIC handshake (may differ
                         // from a zeroed placeholder in the discovery cache).
                         let real_machine_id = identity::MachineId(connected_peer_id.0);
@@ -1111,14 +1223,21 @@ impl Agent {
                             .await;
                         return Ok(connectivity::ConnectOutcome::Direct(*addr));
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::debug!("Direct connect to {} failed: {}", addr, e);
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            "Direct connect to {} timed out after {:?}",
+                            addr,
+                            dial_timeout
+                        );
                     }
                 }
             }
         }
 
-        // 4. If direct failed and coordination may help, use peer-ID dialing
+        // 5. If direct failed and coordination may help, use peer-ID dialing
         //    with explicit address hints. This lets ant-quic combine the
         //    authenticated peer ID with known addresses from x0x discovery /
         //    imported cards, unlocking the full direct → hole-punch → relay path.
@@ -1135,11 +1254,13 @@ impl Agent {
                         "failed to seed transport peer hints: {e}"
                     )))
                 })?;
-            let coordinated_result = network
-                .connect_peer_with_addrs(peer_id_hint, info.addresses.clone())
-                .await;
+            let coordinated_result = tokio::time::timeout(
+                dial_timeout,
+                network.connect_peer_with_addrs(peer_id_hint, info.addresses.clone()),
+            )
+            .await;
             match coordinated_result {
-                Ok((addr, verified_peer_id)) => {
+                Ok(Ok((addr, verified_peer_id))) => {
                     let verified_machine_id = identity::MachineId(verified_peer_id.0);
 
                     // Only update caches if the original hint was not zeroed.
@@ -1174,11 +1295,18 @@ impl Agent {
                     }
                     return Ok(connectivity::ConnectOutcome::Coordinated(addr));
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::debug!(
                         "Coordinated connect to {:?} failed: {}",
                         agent.machine_id,
                         e
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "Coordinated connect to {:?} timed out after {:?}",
+                        agent.machine_id,
+                        dial_timeout
                     );
                 }
             }
@@ -1539,24 +1667,9 @@ impl Agent {
             }
         }
 
-        // Include LAN-reachable private IPv4 address so agents on the same
-        // network can connect directly without NAT hairpinning. Private
-        // addresses are placed AFTER public addresses so connect_to_agent
-        // tries globally-routable addresses first. The persistent bootstrap
-        // cache filters these out to avoid dead-ends across restarts.
-        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-            if sock.connect("8.8.8.8:80").is_ok() {
-                if let Ok(local) = sock.local_addr() {
-                    if let std::net::IpAddr::V4(v4) = local.ip() {
-                        if v4.is_private() {
-                            let lan_addr =
-                                std::net::SocketAddr::new(std::net::IpAddr::V4(v4), bind_port);
-                            if !addresses.contains(&lan_addr) {
-                                addresses.push(lan_addr);
-                            }
-                        }
-                    }
-                }
+        for addr in collect_local_interface_addrs(bind_port) {
+            if !addresses.contains(&addr) {
+                addresses.push(addr);
             }
         }
 
@@ -1907,10 +2020,8 @@ impl Agent {
     }
 
     fn announcement_addresses(&self) -> Vec<std::net::SocketAddr> {
-        // Try routable_addr synchronously via local_addr fallback.
-        // The async routable_addr is used in HeartbeatContext::announce().
         match self.network.as_ref().and_then(|n| n.local_addr()) {
-            Some(addr) if addr.port() > 0 && !addr.ip().is_unspecified() => vec![addr],
+            Some(addr) if addr.port() > 0 => collect_local_interface_addrs(addr.port()),
             _ => Vec::new(),
         }
     }
@@ -3466,6 +3577,27 @@ impl AgentBuilder {
         self
     }
 
+    /// Override the presence beacon broadcast interval in seconds.
+    #[must_use]
+    pub fn with_presence_beacon_interval(mut self, secs: u64) -> Self {
+        self.presence_beacon_interval_secs = Some(secs);
+        self
+    }
+
+    /// Override the presence event poll interval in seconds.
+    #[must_use]
+    pub fn with_presence_event_poll_interval(mut self, secs: u64) -> Self {
+        self.presence_event_poll_interval_secs = Some(secs);
+        self
+    }
+
+    /// Override the fallback offline timeout used by presence events.
+    #[must_use]
+    pub fn with_presence_offline_timeout(mut self, secs: u64) -> Self {
+        self.presence_offline_timeout_secs = Some(secs);
+        self
+    }
+
     /// Set a custom path for the contacts file.
     ///
     /// The contacts file persists trust levels and machine records for known
@@ -3711,10 +3843,20 @@ impl AgentBuilder {
         // Create presence wrapper if network exists
         let presence = if let Some(ref net) = network {
             let peer_id = saorsa_gossip_transport::GossipTransport::local_peer_id(net.as_ref());
+            let mut presence_config = presence::PresenceConfig::default();
+            if let Some(secs) = self.presence_beacon_interval_secs {
+                presence_config.beacon_interval_secs = secs;
+            }
+            if let Some(secs) = self.presence_event_poll_interval_secs {
+                presence_config.event_poll_interval_secs = secs;
+            }
+            if let Some(secs) = self.presence_offline_timeout_secs {
+                presence_config.adaptive_timeout_fallback_secs = secs;
+            }
             let pw = presence::PresenceWrapper::new(
                 peer_id,
                 std::sync::Arc::clone(net),
-                presence::PresenceConfig::default(),
+                presence_config,
                 bootstrap_cache.clone(),
             )
             .map_err(|e| {

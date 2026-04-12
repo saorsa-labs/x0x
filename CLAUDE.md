@@ -61,6 +61,7 @@ All IDs are SHA-256 hashes of ML-DSA-65 public keys (32 bytes).
 5. **Presence** (`presence.rs`): SOTA presence system via `saorsa-gossip-presence`. Beacons propagate on `GossipStreamType::Bulk`. Phi-Accrual lite adaptive failure detection (180–600s), FOAF random-walk discovery with trust-scoped privacy (`PresenceVisibility::Network` vs `Social`), bootstrap cache enrichment from beacons, quality-weighted FOAF peer selection. Surpasses libp2p presence; matches Tailscale for NAT-aware discovery.
 6. **CRDT** (`crdt/`): Collaborative task lists with OR-Set checkboxes (Empty/Claimed/Done), LWW-Register metadata, RGA ordering. Deltas can be encrypted via MLS groups.
 7. **MLS** (`mls/`): Group encryption using ChaCha20-Poly1305. `MlsGroup` manages membership, `MlsKeySchedule` derives epoch keys, `MlsWelcome` onboards new members.
+8. **Group Discovery** (`groups/`): DHT-free distributed discovery via three tiers: social propagation (agents share cards in conversation), tag shards (BLAKE3-hashed tags → 65,536 PlumTree topics with CRDT OR-Set anti-entropy), and presence-social browsing (groups nearby agents are in). Path caching on relay nodes provides hot-shard mitigation. Fully partition-tolerant — each network fragment maintains complete shard state independently, merges automatically on reconnection. See `docs/design/named-groups-full-model.md`.
 
 ### Self-Update System (`upgrade/`)
 
@@ -93,7 +94,7 @@ lib.rs (Agent, AgentBuilder, TaskListHandle, KvStoreHandle)
   ├── gossip/      ← Wraps saorsa-gossip-* crates
   ├── crdt/        ← TaskList, TaskItem, CheckboxState, Delta, Sync
   ├── kv/          ← KvStore, KvEntry, KvStoreDelta, KvStoreSync, AccessPolicy
-  ├── groups/      ← GroupInfo, SignedInvite, AgentCard (high-level group mgmt)
+  ├── groups/      ← GroupInfo, GroupPolicy, GroupMember, GroupCard, SignedInvite, AgentCard, discovery index
   ├── mls/         ← MlsGroup, MlsCipher, MlsKeySchedule, MlsWelcome
   ├── presence.rs  ← SOTA presence: beacons, FOAF, adaptive detection, trust privacy
   ├── upgrade/     ← Self-update: manifest, monitor, apply, rollout, signature
@@ -332,7 +333,8 @@ When running tests that SSH to multiple VPS nodes sequentially, use `-o ControlM
 75+ REST endpoints, all wired to x0xd and CLI:
 - Identity + AgentCard: `GET /agent`, `GET /agent/card`, `POST /agent/card/import`
 - Presence: `GET /presence/online`, `GET /presence/foaf`, `GET /presence/find/:id`, `GET /presence/status/:id`, `GET /presence/events` (SSE)
-- Named groups: `POST/GET /groups`, `POST /groups/:id/invite`, `POST /groups/join`
+- Named groups: `POST/GET /groups`, `POST /groups/:id/invite`, `POST /groups/join`, policy, roles, join requests, ban/unban
+- Group discovery: `GET /groups/discover?q=`, `GET /groups/discover/nearby`, shard subscriptions (Phase C.2, designed not yet implemented)
 - KvStore: `POST/GET /stores`, `PUT/GET/DELETE /stores/:id/:key` (with access control)
 - Direct messaging: `send_direct()`, `recv_direct()`, `connect_to_agent()`
 - MLS groups: `MlsGroup::new()`, `add_member()`, `remove_member()`, `MlsCipher::encrypt/decrypt()`

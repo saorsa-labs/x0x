@@ -1,0 +1,15 @@
+
+x0x API Coverage Report
+==================================================
+Routes in x0xd.rs:      87
+Tested in full audit:     87
+Tested in comprehensive:  72
+Tested in full:           51
+Tested in vps:            69
+Tested in lan:            60
+Tested in live:            2
+Tested in stress:         22
+Tested in ANY suite:    87
+UNTESTED anywhere:       0
+Coverage:              100.0%
+

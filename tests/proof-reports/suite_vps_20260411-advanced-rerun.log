@@ -1,0 +1,265 @@
+Loading tokens from .vps-tokens.env...
+[0;33m═══════════════════════════════════════════════════════════════[0m
+[0;33m   x0x v0.16.0 VPS E2E Test — All-Pairs Matrix[0m
+[0;33m   NYC · SFO · Helsinki · Nuremberg · Singapore · Tokyo[0m
+[0;33m   Proof: vps-proof-1775951833-1863[0m
+[0;33m═══════════════════════════════════════════════════════════════[0m
+
+[0;36m[1/20] Health & Version (6 nodes)[0m
+  [0;32mPASS[0m NYC health
+        [0;36mPROOF version: 0.16.0[0m
+  [0;31mFAIL[0m SFO health — no key 'ok': {"error":"curl_failed"}
+        [0;36mPROOF version: <missing>[0m
+  [0;32mPASS[0m Helsinki health
+        [0;36mPROOF version: 0.16.0[0m
+  [0;31mFAIL[0m Nuremberg health — no key 'ok': {"error":"curl_failed"}
+        [0;36mPROOF version: <missing>[0m
+  [0;32mPASS[0m Singapore health
+        [0;36mPROOF version: 0.16.0[0m
+  [0;32mPASS[0m Tokyo health
+        [0;36mPROOF version: 0.16.0[0m
+  Live nodes: nyc sfo helsinki nuremberg singapore tokyo
+
+[0;36m[2/20] Identity (distinct agents)[0m
+  [0;32mPASS[0m NYC agent
+    NYC: da2233d6ba2f9569...
+  [0;31mFAIL[0m SFO agent — no key 'agent_id': {"error":"curl_failed"}
+    SFO: ...
+  [0;32mPASS[0m Helsinki agent
+    Helsinki: 5ec81c4cee5a22fb...
+  [0;31mFAIL[0m Nuremberg agent — no key 'agent_id': {"error":"curl_failed"}
+    Nuremberg: ...
+  [0;32mPASS[0m Singapore agent
+    Singapore: 4b338897360e362a...
+  [0;32mPASS[0m Tokyo agent
+    Tokyo: 290602eb4ea84afb...
+  [0;32mPASS[0m all agents distinct
+  [0;32mPASS[0m NYC introduction
+  [0;32mPASS[0m NYC agent user-id
+  [0;32mPASS[0m NYC peers
+
+[0;36m[3/20] Network Mesh[0m
+  [0;32mPASS[0m NYC network
+    NYC peers: 0
+  [0;32mPASS[0m SFO network
+    SFO peers: 10
+  [0;32mPASS[0m Helsinki network
+    Helsinki peers: 10
+  [0;31mFAIL[0m Nuremberg network — no key 'connected_peers': {"error":"curl_failed"}
+    Nuremberg peers: 0
+  [0;32mPASS[0m Singapore network
+    Singapore peers: 20
+  [0;32mPASS[0m Tokyo network
+    Tokyo peers: 13
+
+[0;36m[4/20] Agent Cards (all nodes)[0m
+  [0;32mPASS[0m NYC card
+    NYC: 3 addresses in card
+  [0;32mPASS[0m SFO card
+    SFO: 5 addresses in card
+  [0;32mPASS[0m Helsinki card
+    Helsinki: 3 addresses in card
+  [0;31mFAIL[0m Nuremberg card — no key 'link': {"error":"curl_failed"}
+    Nuremberg: 0 addresses in card
+  [0;32mPASS[0m Singapore card
+    Singapore: 3 addresses in card
+  [0;32mPASS[0m Tokyo card
+    Tokyo: 2 addresses in card
+
+[0;36m[5/20] Announce & Discovery[0m
+  [0;32mPASS[0m NYC announce
+  [0;32mPASS[0m SFO announce
+  [0;32mPASS[0m Helsinki announce
+  [0;31mFAIL[0m Nuremberg announce — curl_failed
+  [0;32mPASS[0m Singapore announce
+  [0;32mPASS[0m Tokyo announce
+  Waiting 20s for gossip propagation...
+  [0;32mPASS[0m NYC discovered >= 1 agents
+    NYC: discovered 1 agents
+  [0;32mPASS[0m SFO discovered >= 1 agents
+    SFO: discovered 1 agents
+  [0;32mPASS[0m Helsinki discovered >= 1 agents
+    Helsinki: discovered 1 agents
+  [0;31mFAIL[0m Nuremberg discovered >= 1 agents
+    Nuremberg: discovered 0 agents
+  [0;32mPASS[0m Singapore discovered >= 1 agents
+    Singapore: discovered 1 agents
+  [0;32mPASS[0m Tokyo discovered >= 1 agents
+    Tokyo: discovered 1 agents
+  [0;31mFAIL[0m NYC discovered Helsinki by ID — no key 'agent': {"error":"curl_failed"}
+  [0;32mPASS[0m NYC reachability Helsinki
+  [0;32mPASS[0m NYC find Helsinki
+
+[0;36m[6/20] All-Pairs Card Import[0m
+    [0;31mFAIL[0m NYC import Helsinki card
+    [0;31mFAIL[0m Nuremberg import NYC card
+    [0;31mFAIL[0m Nuremberg import SFO card
+    [0;31mFAIL[0m Nuremberg import Helsinki card
+    [0;31mFAIL[0m Nuremberg import Singapore card
+    [0;31mFAIL[0m Nuremberg import Tokyo card
+  [0;31mFAIL[0m all card imports succeeded (19 pairs) — got '6', want '0'
+  Imported 19 card pairs
+  Waiting 10s for discovery cache population...
+
+[0;36m[7/20] All-Pairs Connect[0m
+    [0;31mFAIL[0m Nuremberg→NYC: missing
+    [0;31mFAIL[0m Nuremberg→Helsinki: missing
+    [0;31mFAIL[0m Nuremberg→Singapore: missing
+    [0;31mFAIL[0m Nuremberg→Tokyo: missing
+    [0;31mFAIL[0m Tokyo→NYC: missing
+  [0;31mFAIL[0m 5/20 pairs failed to connect
+
+[0;36m[8/20] All-Pairs Direct Messaging — REST API[0m
+  Testing all 6-node round-robin + cross-continent pairs...
+    [0;31mFAIL[0m NYC→Singapore send: {"error":"curl_failed"}
+    [0;31mFAIL[0m NYC→Tokyo send: {"error":"curl_failed"}
+    [0;31mFAIL[0m SFO→NYC send: {"error":"curl_failed"}
+  [0;31mFAIL[0m 3/15 REST sends failed
+  Waiting 15s for direct-event delivery...
+    [0;31mFAIL[0m NYC did not receive from SFO
+    [0;31mFAIL[0m NYC did not receive from Helsinki
+    [0;31mFAIL[0m NYC did not receive from Singapore
+    [0;31mFAIL[0m Helsinki did not receive from NYC
+    [0;31mFAIL[0m Helsinki did not receive from SFO
+    [0;31mFAIL[0m Helsinki did not receive from Singapore
+    [0;31mFAIL[0m Helsinki did not receive from Tokyo
+    [0;31mFAIL[0m Singapore did not receive from NYC
+    [0;31mFAIL[0m Singapore did not receive from SFO
+    [0;31mFAIL[0m Singapore did not receive from Helsinki
+    [0;31mFAIL[0m Singapore did not receive from Tokyo
+    [0;31mFAIL[0m Tokyo did not receive from NYC
+    [0;31mFAIL[0m Tokyo did not receive from SFO
+    [0;31mFAIL[0m Tokyo did not receive from Helsinki
+    [0;31mFAIL[0m Tokyo did not receive from Singapore
+  [0;31mFAIL[0m 15/15 REST deliveries missing after retry
+
+[0;36m[9/20] CLI Interface Proof (x0x direct send)[0m
+  [0;32mPASS[0m CLI NYC→Helsinki send
+  [0;31mFAIL[0m CLI NYC→Helsinki missing recipient proof
+  [0;33mSKIP[0m CLI Tokyo→SFO — no agent_id
+
+[0;36m[10/20] GUI Interface Proof[0m
+  [0;31mFAIL[0m GET /gui missing expected injected chat markers
+  [0;32mPASS[0m real GUI browser send visible locally
+  [0;31mFAIL[0m GUI direct message missing on Helsinki recipient side
+
+[0;36m[11/20] Direct Connections State[0m
+  [0;32mPASS[0m NYC connections
+    NYC: 6 active connections
+  [0;32mPASS[0m SFO connections
+    SFO: 8 active connections
+  [0;32mPASS[0m Helsinki connections
+    Helsinki: 10 active connections
+  [0;32mPASS[0m Nuremberg connections
+    Nuremberg: 1 active connections
+  [0;32mPASS[0m Singapore connections
+    Singapore: 20 active connections
+  [0;32mPASS[0m Tokyo connections
+    Tokyo: 13 active connections
+
+[0;36m[12/20] Contacts & Trust[0m
+  [0;32mPASS[0m NYC contacts has Helsinki
+  [0;32mPASS[0m NYC trust eval Helsinki → Accept
+  [0;32mPASS[0m NYC blocks Singapore
+  [0;32mPASS[0m blocked eval → RejectBlocked
+  [0;32mPASS[0m NYC unblocks Singapore
+
+[0;36m[13/20] Pub/Sub (global gossip)[0m
+  [0;32mPASS[0m Helsinki subscribe
+  [0;32mPASS[0m Tokyo subscribe
+  [0;32mPASS[0m NYC publish to vps-e2e-vps-proof-1775951833-1863
+
+[0;36m[14/20] MLS Groups (multi-continent PQC)[0m
+  [0;32mPASS[0m NYC list MLS groups
+  [0;32mPASS[0m NYC create MLS group
+    MLS group: 01162c13a4c80110...
+  [0;32mPASS[0m NYC get MLS group
+  [0;32mPASS[0m add Helsinki to MLS
+  [0;32mPASS[0m add Singapore to MLS
+  [0;32mPASS[0m add Tokyo to MLS
+  [0;32mPASS[0m MLS encrypt
+  [0;32mPASS[0m MLS decrypt
+  [0;32mPASS[0m MLS decrypt round-trip
+  [0;32mPASS[0m remove Helsinki from MLS
+
+[0;36m[15/20] Named Groups / Spaces[0m
+  [0;32mPASS[0m create group
+  [0;32mPASS[0m generate invite
+  [0;32mPASS[0m invite is x0x://invite/
+  [0;32mPASS[0m Tokyo joins via invite
+  [0;32mPASS[0m Tokyo group info
+  [0;32mPASS[0m Tokyo space member list includes self
+  [0;32mPASS[0m Tokyo space member display name persisted
+  [0;32mPASS[0m Tokyo leaves space
+  [0;32mPASS[0m Tokyo group list cleared after leave
+  [0;32mPASS[0m Singapore joins via invite
+  [0;32mPASS[0m get single group
+  [0;32mPASS[0m NYC set group display name
+  [0;32mPASS[0m list groups
+
+[0;36m[16/20] KV Stores (cross-continent)[0m
+  [0;32mPASS[0m Nuremberg list stores
+  [0;32mPASS[0m Nuremberg create store
+  [0;32mPASS[0m Nuremberg put proof-key-1
+  [0;32mPASS[0m Nuremberg put proof-key-2
+  [0;32mPASS[0m Nuremberg put proof-key-3
+  [0;32mPASS[0m Nuremberg get proof-key-2
+  [0;32mPASS[0m KV round-trip proof-key-2
+  [0;32mPASS[0m keys has proof-key-1
+  [0;32mPASS[0m keys has proof-key-3
+  [0;32mPASS[0m delete proof-key-1
+
+[0;36m[17/20] Task Lists (CRDT)[0m
+  [0;31mFAIL[0m SFO list task-lists — no key 'task_lists': {"error":"curl_failed"}
+  [0;32mPASS[0m SFO create task list
+  [0;31mFAIL[0m add task — curl_failed
+  [0;31mFAIL[0m show tasks — want 'Deploy-vps-proof-1775951833-1863': {"error":"curl_failed"}
+
+[0;36m[18/20] File Transfer[0m
+  [0;32mPASS[0m Singapore→Tokyo file offer
+  [0;32mPASS[0m Singapore transfers list
+  [0;31mFAIL[0m Tokyo sees incoming transfer
+  [0;31mFAIL[0m Tokyo accepts incoming transfer — curl_failed
+  [0;31mFAIL[0m sender transfer reaches Complete
+  [0;31mFAIL[0m receiver transfer reaches Complete
+  [0;31mFAIL[0m received file sha256 matches — got '', want '4959781b9e767fe4bbca3233d3ddc6c4c4167ceb87b8dcfc7e29f13c77f97d84'
+  [0;31mFAIL[0m received file body contains proof token — want 'vps-proof-1775951833-1863': 
+
+[0;36m[19/20] Presence (all nodes)[0m
+  [0;32mPASS[0m NYC presence online
+  [0;31mFAIL[0m SFO presence online — curl_failed
+  [0;32mPASS[0m Helsinki presence online
+  [0;32mPASS[0m Nuremberg presence online
+  [0;32mPASS[0m Singapore presence online
+  [0;32mPASS[0m Tokyo presence online
+  [0;32mPASS[0m NYC base presence
+  [0;31mFAIL[0m NYC FOAF — curl_failed
+  [0;32mPASS[0m NYC find Helsinki presence
+  [0;32mPASS[0m NYC Helsinki status
+
+[0;36m[20/20] Constitution, Upgrade, WebSocket, Status[0m
+  [0;32mPASS[0m NYC constitution
+  [0;31mFAIL[0m SFO constitution — no key 'version': {"error":"curl_failed"}
+  [0;32mPASS[0m Helsinki constitution
+  [0;32mPASS[0m Nuremberg constitution
+  [0;32mPASS[0m Singapore constitution
+  [0;32mPASS[0m Tokyo constitution
+  [0;32mPASS[0m NYC status
+  [0;31mFAIL[0m SFO status — no key 'uptime_secs': {"error":"curl_failed"}
+  [0;32mPASS[0m Helsinki status
+  [0;32mPASS[0m Nuremberg status
+  [0;32mPASS[0m Singapore status
+  [0;32mPASS[0m Tokyo status
+  [0;32mPASS[0m NYC WS sessions
+  [0;31mFAIL[0m NYC upgrade check — curl_failed
+  [0;32mPASS[0m NYC bootstrap cache
+  [0;31mFAIL[0m NYC /events SSE responds — want '200': 
+  [0;31mFAIL[0m NYC /presence/events SSE responds — want '200': 
+
+[0;33m═══════════════════════════════════════════════════════════════[0m
+[0;33m   PROOF TOKEN: vps-proof-1775951833-1863[0m
+[0;33m   Interfaces tested: REST API, CLI (x0x direct send), GUI[0m
+[0;33m   All-pairs: 15 connections, 12 messages sent[0m
+[0;33m═══════════════════════════════════════════════════════════════[0m
+[0;31m  32 FAILED / 139 TOTAL[0m (106 passed, 1 skipped)
+[0;33m═══════════════════════════════════════════════════════════════[0m

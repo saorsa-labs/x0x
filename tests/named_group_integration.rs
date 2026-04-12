@@ -9,9 +9,12 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use std::time::Duration;
 
+#[path = "harness/src/cluster.rs"]
+mod cluster;
 #[path = "harness/src/daemon.rs"]
 mod daemon;
 
+use cluster::pair;
 use daemon::DaemonFixture;
 
 async fn daemon() -> DaemonFixture {
@@ -54,6 +57,27 @@ async fn create_group(
     let group_id = r["group_id"].as_str().unwrap_or_default().to_string();
 
     (group_id, r)
+}
+
+fn fake_agent_id(fill: u8) -> String {
+    hex::encode([fill; 32])
+}
+
+async fn wait_until<F, Fut>(timeout: Duration, mut check: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if check().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 // ===========================================================================
@@ -175,7 +199,103 @@ async fn named_group_info() {
 }
 
 // ===========================================================================
-// 4. Generate Invite
+// 4. Named-group members endpoint
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn named_group_members_endpoint() {
+    let d = daemon().await;
+    let (group_id, _) = create_group(&d, "Members Group", "", Some("Creator")).await;
+
+    let r: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/members")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(r["ok"], true, "members response: {r:?}");
+    assert!(r["member_count"].as_u64().unwrap_or(0) >= 1);
+    let members = r["members"].as_array().unwrap();
+    assert!(members.iter().any(|m| m["display_name"] == "Creator"));
+
+    authed_client(&d)
+        .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+}
+
+// ===========================================================================
+// 5. Add/remove named-group member (local roster semantics)
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn named_group_add_remove_member_local() {
+    let d = daemon().await;
+    let (group_id, _) = create_group(&d, "Roster Group", "", Some("Owner")).await;
+    let fake_member = fake_agent_id(0x42);
+
+    let add_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/members")))
+        .json(&serde_json::json!({
+            "agent_id": fake_member,
+            "display_name": "Remote Bob"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(add_r["ok"], true, "add member response: {add_r:?}");
+
+    let members_r: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/members")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let members = members_r["members"].as_array().unwrap();
+    assert!(members.iter().any(|m| m["agent_id"] == fake_member));
+    assert!(members.iter().any(|m| m["display_name"] == "Remote Bob"));
+
+    let del_r: Value = authed_client(&d)
+        .delete(d.url(&format!("/groups/{group_id}/members/{fake_member}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(del_r["ok"], true, "remove member response: {del_r:?}");
+
+    let members_after: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/members")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let after = members_after["members"].as_array().unwrap();
+    assert!(!after.iter().any(|m| m["agent_id"] == fake_member));
+
+    authed_client(&d)
+        .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+}
+
+// ===========================================================================
+// 6. Generate Invite
 // ===========================================================================
 
 #[tokio::test]
@@ -832,4 +952,196 @@ async fn named_group_full_lifecycle() {
         .await
         .unwrap();
     assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+}
+
+// ===========================================================================
+// 20. Creator removal propagates to removed peer
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn named_group_creator_removal_propagates_to_removed_peer() {
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let alice_create: Value = alice
+        .post(
+            "/groups",
+            serde_json::json!({"name":"Authoritative Removal","display_name":"Alice"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(alice_create["ok"], true);
+    let group_id = alice_create["group_id"].as_str().unwrap().to_string();
+
+    let invite: Value = alice
+        .post(&format!("/groups/{group_id}/invite"), serde_json::json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let invite_link = invite["invite_link"].as_str().unwrap().to_string();
+
+    let bob_join: Value = bob
+        .post(
+            "/groups/join",
+            serde_json::json!({"invite": invite_link, "display_name": "Bob Local"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bob_join["ok"], true);
+
+    let bob_agent_id = bob.agent_id().await;
+    let add_resp: Value = alice
+        .post(
+            &format!("/groups/{group_id}/members"),
+            serde_json::json!({"agent_id": bob_agent_id, "display_name": "Bob Authoritative"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(add_resp["ok"], true, "add response: {add_resp:?}");
+
+    let added_seen = wait_until(Duration::from_secs(15), || async {
+        let info: Value = bob
+            .get(&format!("/groups/{group_id}/members"))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        info["members"]
+            .as_array()
+            .map(|members| {
+                members
+                    .iter()
+                    .any(|m| m["display_name"] == "Bob Authoritative")
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        added_seen,
+        "bob never observed creator-authored membership update"
+    );
+
+    let remove_resp: Value = alice
+        .delete(&format!("/groups/{group_id}/members/{bob_agent_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(remove_resp["ok"], true, "remove response: {remove_resp:?}");
+
+    let removed_seen = wait_until(Duration::from_secs(15), || async {
+        let resp = bob.get(&format!("/groups/{group_id}")).await;
+        resp.status() == StatusCode::NOT_FOUND
+    })
+    .await;
+    assert!(
+        removed_seen,
+        "bob never observed creator removal of the space"
+    );
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
+
+// ===========================================================================
+// 21. Creator delete propagates to peers
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn named_group_creator_delete_propagates_to_peer() {
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let alice_create: Value = alice
+        .post(
+            "/groups",
+            serde_json::json!({"name":"Authoritative Delete","display_name":"Alice"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(alice_create["ok"], true);
+    let group_id = alice_create["group_id"].as_str().unwrap().to_string();
+
+    let invite: Value = alice
+        .post(&format!("/groups/{group_id}/invite"), serde_json::json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let invite_link = invite["invite_link"].as_str().unwrap().to_string();
+
+    let bob_join: Value = bob
+        .post(
+            "/groups/join",
+            serde_json::json!({"invite": invite_link, "display_name": "Bob Local"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bob_join["ok"], true);
+
+    let bob_agent_id = bob.agent_id().await;
+    let add_resp: Value = alice
+        .post(
+            &format!("/groups/{group_id}/members"),
+            serde_json::json!({"agent_id": bob_agent_id, "display_name": "Bob Authoritative"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(add_resp["ok"], true, "add response: {add_resp:?}");
+
+    let added_seen = wait_until(Duration::from_secs(15), || async {
+        let info: Value = bob
+            .get(&format!("/groups/{group_id}/members"))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        info["members"]
+            .as_array()
+            .map(|members| {
+                members
+                    .iter()
+                    .any(|m| m["display_name"] == "Bob Authoritative")
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        added_seen,
+        "bob never observed creator-authored membership update before delete"
+    );
+
+    let delete_resp: Value = alice
+        .delete(&format!("/groups/{group_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(delete_resp["ok"], true, "delete response: {delete_resp:?}");
+
+    let deleted_seen = wait_until(Duration::from_secs(15), || async {
+        let resp = bob.get(&format!("/groups/{group_id}")).await;
+        resp.status() == StatusCode::NOT_FOUND
+    })
+    .await;
+    assert!(
+        deleted_seen,
+        "bob never observed creator deletion of the space"
+    );
 }

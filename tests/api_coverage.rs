@@ -28,6 +28,7 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Post, "/announce"),
     (Method::Get, "/agent/user-id"),
     (Method::Get, "/agent/card"),
+    (Method::Get, "/introduction"),
     (Method::Post, "/agent/card/import"),
     // ── Network ─────────────────────────────────────────────────────────
     (Method::Get, "/peers"),
@@ -89,10 +90,31 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Post, "/groups"),
     (Method::Get, "/groups"),
     (Method::Get, "/groups/:id"),
+    (Method::Get, "/groups/:id/members"),
+    (Method::Post, "/groups/:id/members"),
+    (Method::Delete, "/groups/:id/members/:agent_id"),
     (Method::Post, "/groups/:id/invite"),
     (Method::Post, "/groups/join"),
     (Method::Put, "/groups/:id/display-name"),
     (Method::Delete, "/groups/:id"),
+    // ── Named groups: policy/roles/requests/discovery ───────────────────
+    (Method::Patch, "/groups/:id"),
+    (Method::Patch, "/groups/:id/policy"),
+    (Method::Patch, "/groups/:id/members/:agent_id/role"),
+    (Method::Post, "/groups/:id/ban/:agent_id"),
+    (Method::Delete, "/groups/:id/ban/:agent_id"),
+    (Method::Get, "/groups/:id/requests"),
+    (Method::Post, "/groups/:id/requests"),
+    (Method::Post, "/groups/:id/requests/:request_id/approve"),
+    (Method::Post, "/groups/:id/requests/:request_id/reject"),
+    (Method::Delete, "/groups/:id/requests/:request_id"),
+    (Method::Get, "/groups/discover"),
+    (Method::Get, "/groups/cards/:id"),
+    (Method::Post, "/groups/cards/import"),
+    (Method::Post, "/groups/:id/secure/encrypt"),
+    (Method::Post, "/groups/:id/secure/decrypt"),
+    (Method::Post, "/groups/:id/secure/reseal"),
+    (Method::Post, "/groups/secure/open-envelope"),
     // ── Task lists ──────────────────────────────────────────────────────
     (Method::Get, "/task-lists"),
     (Method::Post, "/task-lists"),
@@ -232,37 +254,48 @@ fn cli_names_unique() {
     );
 }
 
-/// Verifies the route count in x0xd.rs matches the ENDPOINTS registry.
-///
-/// This catches routes added directly to the axum router without updating
-/// the ENDPOINTS registry.
+/// Verifies the route set in x0xd.rs matches the ENDPOINTS registry exactly,
+/// excluding documented aliases.
 #[test]
-fn route_count_matches_registry() {
+fn route_set_matches_registry() {
     let source = include_str!("../src/bin/x0xd.rs");
-    let route_count = source.matches(".route(").count();
+    let routes = extract_route_defs(source);
 
-    // Known extras: routes registered in x0xd that are NOT in ENDPOINTS
-    // (e.g., trailing-slash aliases, internal routes)
-    // Update this number if you add routes that intentionally aren't in ENDPOINTS.
-    let known_extras = 0;
+    let endpoints: HashSet<(String, String)> = ENDPOINTS
+        .iter()
+        .map(|ep| (format!("{}", ep.method), ep.path.to_string()))
+        .collect();
 
-    // Allow a small tolerance — if this fails, either:
-    // 1. A route was added to x0xd without updating ENDPOINTS (fix: add to ENDPOINTS)
-    // 2. A known extra was added (fix: increment known_extras and document why)
-    let expected = ENDPOINTS.len() + known_extras;
+    let known_extras: HashSet<(String, String)> = [(String::from("GET"), String::from("/gui/"))]
+        .into_iter()
+        .collect();
 
-    // We check that route_count >= expected (routes may have duplicates for
-    // trailing slashes, but should never be fewer than ENDPOINTS)
+    let missing_from_registry: Vec<String> = routes
+        .difference(&endpoints)
+        .filter(|route| !known_extras.contains(*route))
+        .map(|(method, path)| format!("  {} {}", method, path))
+        .collect();
+
+    let missing_from_router: Vec<String> = endpoints
+        .difference(&routes)
+        .map(|(method, path)| format!("  {} {}", method, path))
+        .collect();
+
     assert!(
-        route_count >= expected,
-        "x0xd has {} .route() calls but ENDPOINTS has {} entries + {} known extras = {}.\n\
-         This means ENDPOINTS is missing {} route(s).\n\
-         Fix: add the missing endpoint(s) to src/api/mod.rs ENDPOINTS.",
-        route_count,
-        ENDPOINTS.len(),
-        known_extras,
-        expected,
-        route_count - expected + 1
+        missing_from_registry.is_empty() && missing_from_router.is_empty(),
+        "\n\nRegistry/router drift detected.\n\
+         Routes in x0xd.rs missing from ENDPOINTS:\n{}\n\n\
+         ENDPOINTS entries missing from x0xd.rs:\n{}\n",
+        if missing_from_registry.is_empty() {
+            String::from("  <none>")
+        } else {
+            missing_from_registry.join("\n")
+        },
+        if missing_from_router.is_empty() {
+            String::from("  <none>")
+        } else {
+            missing_from_router.join("\n")
+        }
     );
 }
 
@@ -415,4 +448,71 @@ fn matches_any_endpoint(path: &str, endpoints: &HashSet<&str>) -> bool {
         }
     }
     false
+}
+
+fn extract_route_defs(source: &str) -> HashSet<(String, String)> {
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut routes = HashSet::new();
+    let marker = ".route(";
+    let mut i = 0usize;
+
+    while let Some(pos) = flat[i..].find(marker) {
+        let start = i + pos + marker.len();
+        let mut depth = 1usize;
+        let mut j = start;
+        let bytes = flat.as_bytes();
+        while j < flat.len() && depth > 0 {
+            match bytes[j] as char {
+                '"' => {
+                    j += 1;
+                    while j < flat.len() {
+                        match bytes[j] as char {
+                            '\\' => j += 2,
+                            '"' => {
+                                j += 1;
+                                break;
+                            }
+                            _ => j += 1,
+                        }
+                    }
+                    continue;
+                }
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+
+        if j <= start {
+            break;
+        }
+
+        let inner = flat[start..j - 1].trim();
+        i = j;
+
+        let Some(path_start) = inner.find('"') else {
+            continue;
+        };
+        let rest = &inner[path_start + 1..];
+        let Some(path_end) = rest.find('"') else {
+            continue;
+        };
+        let path = &rest[..path_end];
+        let methods_src = &rest[path_end + 1..];
+
+        for (needle, method) in [
+            ("get(", "GET"),
+            ("post(", "POST"),
+            ("put(", "PUT"),
+            ("patch(", "PATCH"),
+            ("delete(", "DELETE"),
+        ] {
+            if methods_src.contains(needle) {
+                routes.insert((method.to_string(), path.to_string()));
+            }
+        }
+    }
+
+    routes
 }

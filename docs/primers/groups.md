@@ -43,6 +43,11 @@ x0x group invite <group_id>
 # Join from another agent
 x0x group join <invite_link> --display-name "Worker"
 
+# Inspect or mutate the current local space roster
+x0x group members <group_id>
+x0x group add-member <group_id> <agent_id> --display-name "Worker"
+x0x group remove-member <group_id> <agent_id>
+
 # Change your display name or leave
 x0x group set-name <group_id> "Worker-1"
 x0x group leave <group_id>
@@ -83,6 +88,8 @@ curl -X POST "http://$API/groups/join" \
 ```
 
 Important: x0xd does not currently expose a named-group `send` endpoint. If you want group messaging, use the returned `chat_topic` with the normal `/publish` and `/subscribe` APIs, or use direct messaging between members.
+
+Important: creator-authored member add/remove and creator delete now propagate across subscribed peers, so removed members drop the space locally. That said, this is still not yet a complete distributed admin/ACL system on its own.
 
 ## MLS helpers: encrypt, decrypt, and manage key material
 
@@ -136,7 +143,7 @@ Treat these MLS endpoints as app-building primitives. They are useful when your 
 ## Current limits
 
 - Named groups are not yet a full secure group-chat surface.
-- Named-group member views should be validated in your own environment before treating them as authoritative distributed access control.
+- Named-group member views now converge across subscribed peers for creator-authored membership changes, but they should still not yet be treated as complete distributed access control.
 - There is no built-in named-group send/receive API in x0xd.
 - No backlog/history sync for new members.
 - No admin-role model in the current named-group daemon surface.

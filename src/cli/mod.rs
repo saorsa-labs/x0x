@@ -254,7 +254,12 @@ impl DaemonClient {
 
     async fn handle_response(&self, resp: reqwest::Response) -> Result<serde_json::Value> {
         let status = resp.status();
-        let body: serde_json::Value = resp.json().await.context("failed to parse response")?;
+        let text = resp.text().await.context("failed to read response body")?;
+        let body = if text.trim().is_empty() {
+            serde_json::json!({ "ok": status.is_success() })
+        } else {
+            serde_json::from_str(&text).context("failed to parse response")?
+        };
 
         if !status.is_success() {
             let msg = body

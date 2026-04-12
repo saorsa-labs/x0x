@@ -1,0 +1,88 @@
+
+[0;36m╔══════════════════════════════════════════════════════════════════╗[0m
+[0;36m║    x0x NAMED GROUPS — Dedicated Proof Runner                   ║[0m
+[0;36m║    Run: 20260412_115036_99647                                 ║[0m
+[0;36m╚══════════════════════════════════════════════════════════════════╝[0m
+  [0;33m[INFO][0m Starting 3 daemons...
+  [0;33m[INFO][0m Alice: 87442f73f01d2d148119dc43...  Bob: aafab6d602eb0bb2055bdf83...  Charlie: bd93388d4b54cad674f22ab2...
+  [0;33m[INFO][0m Bootstrapping full mesh via agent-card exchange...
+
+[0;36m━━ 1. private_secure preset ━━[0m
+  [0;32m✓[0m create private_secure
+  [0;32m✓[0m priv: discoverability=hidden
+  [0;32m✓[0m priv: admission=invite_only
+  [0;32m✓[0m priv: confidentiality=mls_encrypted
+  [0;32m✓[0m priv: read_access=members_only
+  [0;32m✓[0m priv: write_access=members_only
+  [0;32m✓[0m priv: hidden group NOT in bob's discover
+  [0;32m✓[0m priv: alice generates invite
+  [0;32m✓[0m priv: bob joins via invite
+  [0;32m✓[0m priv: delete
+
+[0;36m━━ 2. public_request_secure — REAL discovery + full lifecycle ━━[0m
+  [0;32m✓[0m create public_request_secure
+  [0;32m✓[0m pub-req: policy correct on creator
+  [0;33m[INFO][0m Polling for discovery card (up to 40s)...
+  [0;32m✓[0m P0-1 pub-req: bob sees via real discovery (NO manual import)
+  [0;32m✓[0m P0-1 pub-req: charlie sees via real discovery
+  [0;32m✓[0m P0-2 pub-req: card carries read_access
+  [0;32m✓[0m P0-2 pub-req: card carries write_access
+  [0;32m✓[0m P1-9 pub-req: import returns stub:true
+  [0;32m✓[0m pub-req: bob submits request
+  [0;32m✓[0m pub-req: alice sees bob's pending request via gossip
+  [0;32m✓[0m P0-5 pub-req: duplicate pending request → 409
+  [0;32m✓[0m pub-req: alice approves
+  [0;32m✓[0m pub-req: bob is active member (owner view)
+  [0;32m✓[0m P0-3 pub-req: alice MLS includes bob after approval (yes)
+  [0;32m✓[0m pub-req: charlie submits request
+  [0;32m✓[0m pub-req: alice rejects charlie
+  [0;32m✓[0m pub-req: charlie NOT member after rejection
+  [0;32m✓[0m pub-req: charlie submits second request
+  [0;32m✓[0m pub-req: charlie cancels own request
+  [0;32m✓[0m pub-req: delete
+
+[0;36m━━ 3. public_open preset ━━[0m
+  [0;32m✓[0m create public_open
+  [0;32m✓[0m pub-open: policy correct (signed_public, read=public, write=members)
+  [0;32m✓[0m pub-open: discoverable on bob's daemon
+  [0;32m✓[0m pub-open: delete
+
+[0;36m━━ 4. public_announce preset ━━[0m
+  [0;32m✓[0m create public_announce
+  [0;32m✓[0m pub-announce: write_access=admin_only
+  [0;32m✓[0m pub-announce: discoverable
+  [0;32m✓[0m pub-announce: delete
+
+[0;36m━━ 5. P0-6 metadata PATCH propagates + card refresh ━━[0m
+  [0;32m✓[0m create patch-test group
+  [0;32m✓[0m patch: pre-update discoverable by bob
+  [0;32m✓[0m patch: name updated on alice
+  [0;32m✓[0m P0-6 patch: updated name converges to bob's card
+
+[0;36m━━ 6. P0-7 role change: missing target → 404 ━━[0m
+  [0;32m✓[0m create role-test group
+  [0;32m✓[0m P0-7: role change missing target → 404
+  [0;32m✓[0m P0-7: promote to owner → 400
+
+[0;36m━━ 7. Authz negative paths (deterministic status codes) ━━[0m
+  [0;32m✓[0m authz: non-member PATCH policy → 403
+  [0;32m✓[0m authz: member PATCH policy → 403
+  [0;32m✓[0m authz: member cannot approve → 403
+  [0;32m✓[0m authz: owner approves (sanity)
+  [0;32m✓[0m P0-5 authz: non-requester cannot cancel (403)
+
+[0;36m━━ 8. Ban/unban lifecycle + P0-4 MLS removal ━━[0m
+  [0;32m✓[0m ban: pre-ban MLS has 2 members
+  [0;32m✓[0m ban: alice bans bob
+  [0;32m✓[0m ban: bob state=banned
+  [0;32m✓[0m P0-4 ban: alice MLS removed bob (2 → 1)
+  [0;32m✓[0m ban: alice unbans bob
+  [0;32m✓[0m ban: bob state=active after unban
+  [0;32m✓[0m ban: delete
+
+[0;36m╔══════════════════════════════════════════════════════════════════╗[0m
+[0;36m║  NAMED-GROUPS RESULTS                                            ║[0m
+[0;36m╠══════════════════════════════════════════════════════════════════╣[0m
+[0;36m║  [0;32m✓ 56 PASS[0m[0;36m  ·  [0;31m✗ 0 FAIL[0m[0;36m                                          ║[0m
+[0;36m║  Total: 56                                                          ║[0m
+[0;36m╚══════════════════════════════════════════════════════════════════╝[0m

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Three-agent daemon orchestration for integration tests.
 //!
 //! Provides `AgentCluster` which manages 3 x0xd daemon processes
@@ -21,6 +22,7 @@ pub struct AgentInstance {
     _data_dir: PathBuf,
 }
 
+#[allow(dead_code)]
 impl AgentInstance {
     /// Full URL for a given API path.
     pub fn url(&self, path: &str) -> String {
@@ -108,7 +110,14 @@ impl AgentInstance {
 pub struct AgentCluster {
     pub alice: AgentInstance,
     pub bob: AgentInstance,
+    #[allow(dead_code)]
     pub charlie: AgentInstance,
+}
+
+/// Two-daemon local pair for deterministic cross-peer tests.
+pub struct AgentPair {
+    pub alice: AgentInstance,
+    pub bob: AgentInstance,
 }
 
 impl Drop for AgentInstance {
@@ -127,6 +136,12 @@ impl Drop for AgentCluster {
     }
 }
 
+impl Drop for AgentPair {
+    fn drop(&mut self) {
+        // AgentInstance::drop handles child cleanup.
+    }
+}
+
 static CLUSTER: OnceCell<AgentCluster> = OnceCell::const_new();
 
 /// Returns a shared `AgentCluster` singleton.
@@ -139,7 +154,35 @@ static CLUSTER: OnceCell<AgentCluster> = OnceCell::const_new();
 ///
 /// Panics if x0xd binary is not found or agents fail to start.
 pub async fn cluster() -> &'static AgentCluster {
-    CLUSTER.get_or_init(|| create_cluster()).await
+    CLUSTER.get_or_init(create_cluster).await
+}
+
+/// Start a fresh two-daemon pair with Bob bootstrapping to Alice.
+pub async fn pair() -> AgentPair {
+    let binary = find_x0xd_binary();
+    let suffix = rand::random::<u16>();
+    let base: u16 = 19300 + (suffix % 200) * 2;
+
+    let alice = start_instance(
+        &binary,
+        &format!("pair-alice-{suffix}"),
+        base + 1,
+        base + 101,
+        "",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let bob = start_instance(
+        &binary,
+        &format!("pair-bob-{suffix}"),
+        base + 2,
+        base + 102,
+        &format!("bootstrap_peers = [\"127.0.0.1:{}\"]", base + 101),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    AgentPair { alice, bob }
 }
 
 /// Delay between starting each node to allow connections and the gossip
@@ -275,6 +318,16 @@ async fn start_instance(
 ) -> AgentInstance {
     let config_dir = std::env::temp_dir().join(format!("x0x-test-{name}"));
     let _ = std::fs::create_dir_all(&config_dir);
+
+    // Kill stale daemons from prior failed runs that may still own these fixed ports.
+    for port in [api_port, bind_port] {
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "lsof -ti tcp:{port} 2>/dev/null | xargs kill -9 2>/dev/null || true"
+            ))
+            .status();
+    }
 
     let config_path = config_dir.join("config.toml");
     let config_content = format!(

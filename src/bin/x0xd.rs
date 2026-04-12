@@ -145,6 +145,18 @@ struct DaemonConfig {
     #[serde(default = "default_rendezvous_validity_ms")]
     rendezvous_validity_ms: u64,
 
+    /// Override the presence beacon interval (seconds) for tests / embeddings.
+    #[serde(default)]
+    presence_beacon_interval_secs: Option<u64>,
+
+    /// Override the presence event poll interval (seconds) for tests / embeddings.
+    #[serde(default)]
+    presence_event_poll_interval_secs: Option<u64>,
+
+    /// Override the fallback offline timeout used by presence events (seconds).
+    #[serde(default)]
+    presence_offline_timeout_secs: Option<u64>,
+
     /// Instance name for multi-agent support.
     /// When set, identity and data are scoped to this name.
     #[serde(default)]
@@ -296,6 +308,9 @@ impl Default for DaemonConfig {
             user_key_path: None,
             rendezvous_enabled: default_rendezvous_enabled(),
             rendezvous_validity_ms: default_rendezvous_validity_ms(),
+            presence_beacon_interval_secs: None,
+            presence_event_poll_interval_secs: None,
+            presence_offline_timeout_secs: None,
             instance_name: None,
         }
     }
@@ -323,6 +338,15 @@ struct AppState {
     kv_stores: RwLock<HashMap<String, KvStoreHandle>>,
     named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
     named_groups_path: PathBuf,
+    /// Background metadata listeners for named groups (one per group id).
+    group_metadata_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Cached group cards discovered via gossip or imported from peers.
+    group_card_cache: RwLock<HashMap<String, x0x::groups::GroupCard>>,
+    /// Per-daemon ML-KEM-768 keypair used to open `SecureShareDelivered`
+    /// envelopes addressed to this agent. Public half is published in the
+    /// `/agent` response and in `JoinRequestCreated` so other daemons can
+    /// seal to us. Replaces the earlier publicly-derivable envelope key.
+    agent_kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
     contacts: Arc<RwLock<ContactStore>>,
     mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
     #[allow(dead_code)]
@@ -575,6 +599,9 @@ struct AgentData {
     agent_id: String,
     machine_id: String,
     user_id: Option<String>,
+    /// Base64 of the agent's ML-KEM-768 public key. Used by other daemons to
+    /// seal group-shared-secret envelopes to this agent.
+    kem_public_key_b64: String,
 }
 
 /// Introduction card response (fields vary by trust level).
@@ -979,6 +1006,16 @@ async fn main() -> Result<()> {
         .with_heartbeat_interval(config.heartbeat_interval_secs)
         .with_identity_ttl(config.identity_ttl_secs);
 
+    if let Some(secs) = config.presence_beacon_interval_secs {
+        builder = builder.with_presence_beacon_interval(secs);
+    }
+    if let Some(secs) = config.presence_event_poll_interval_secs {
+        builder = builder.with_presence_event_poll_interval(secs);
+    }
+    if let Some(secs) = config.presence_offline_timeout_secs {
+        builder = builder.with_presence_offline_timeout(secs);
+    }
+
     // NOTE: --no-hard-coded-bootstrap only clears configured seed peers.
     // mDNS LAN discovery and the peer cache remain active by design so that:
     //   - Local mesh (two laptops on WiFi) still works via mDNS
@@ -1022,7 +1059,10 @@ async fn main() -> Result<()> {
     let named_groups_path = config.data_dir.join("named_groups.json");
     let named_groups = match tokio::fs::read_to_string(&named_groups_path).await {
         Ok(json) => match serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&json) {
-            Ok(groups) => {
+            Ok(mut groups) => {
+                for info in groups.values_mut() {
+                    info.migrate_from_v1();
+                }
                 tracing::info!(
                     "Loaded {} named groups from {}",
                     groups.len(),
@@ -1055,6 +1095,21 @@ async fn main() -> Result<()> {
     // start immediately. Network-dependent endpoints will return errors
     // until join completes, which is better than blocking the entire API.
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
+    // Load or generate the per-daemon ML-KEM-768 keypair. Persisted under
+    // `<data_dir>/agent_kem.key` with mode 0600. This keypair is the root of
+    // trust for `SecureShareDelivered` — only the holder of the secret half
+    // can open group-shared-secret envelopes addressed to this agent.
+    let agent_kem_path = config.data_dir.join("agent_kem.key");
+    let agent_kem_keypair = Arc::new(
+        x0x::groups::kem_envelope::AgentKemKeypair::load_or_generate(&agent_kem_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to load/generate agent KEM keypair: {e}"))?,
+    );
+    tracing::info!(
+        "agent KEM-768 public key loaded ({} bytes)",
+        agent_kem_keypair.public_bytes.len()
+    );
+
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (shutdown_notify, _) = watch::channel(false);
     let agent = Arc::new(agent);
@@ -1065,6 +1120,9 @@ async fn main() -> Result<()> {
         kv_stores: RwLock::new(HashMap::new()),
         named_groups: RwLock::new(named_groups),
         named_groups_path,
+        group_metadata_tasks: RwLock::new(HashMap::new()),
+        group_card_cache: RwLock::new(HashMap::new()),
+        agent_kem_keypair,
         contacts,
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
@@ -1080,6 +1138,62 @@ async fn main() -> Result<()> {
         shutdown_notify,
         api_token,
     });
+
+    let existing_group_ids: Vec<String> = {
+        let groups = state.named_groups.read().await;
+        groups.keys().cloned().collect()
+    };
+    for group_id in existing_group_ids {
+        ensure_named_group_metadata_listener(Arc::clone(&state), &group_id).await;
+    }
+
+    // P0-1: subscribe to the global group discovery topic so remote public
+    // groups populate the local card cache without manual import.
+    spawn_global_discovery_listener(Arc::clone(&state)).await;
+
+    // Re-publish our own discoverable group cards after startup so late joiners
+    // pick them up.
+    let discoverable_ids: Vec<String> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .filter(|(_, info)| {
+                info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    let state_for_republish = Arc::clone(&state);
+    tokio::spawn(async move {
+        // First publish after a short warmup so the gossip mesh has a chance
+        // to form. Then republish periodically so late joiners also see cards.
+        // Without this, a peer that starts after another daemon published
+        // would miss the initial card.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut shutdown = state_for_republish.shutdown_notify.subscribe();
+        loop {
+            let current_ids: Vec<String> = {
+                let groups = state_for_republish.named_groups.read().await;
+                groups
+                    .iter()
+                    .filter(|(_, info)| {
+                        info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+            for id in current_ids {
+                publish_group_card_to_discovery(&state_for_republish, &id).await;
+            }
+            // Re-publish every 15s. Also acts as a heartbeat for churning peers.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+                _ = shutdown.changed() => break,
+            }
+        }
+    });
+    // Consume the pre-computed list to avoid the dead-warning.
+    let _ = discoverable_ids;
 
     // Join network in background — API is available immediately
     let join_agent = Arc::clone(&agent);
@@ -1225,9 +1339,49 @@ async fn main() -> Result<()> {
         // Named group endpoints
         .route("/groups", post(create_named_group))
         .route("/groups", get(list_named_groups))
-        .route("/groups/:id", get(get_named_group))
-        .route("/groups/:id/invite", post(create_group_invite))
+        // Static-prefix routes BEFORE /groups/:id so axum matches them first.
+        .route("/groups/discover", get(discover_groups))
+        .route("/groups/cards/import", post(import_group_card))
+        .route("/groups/cards/:id", get(get_group_card))
         .route("/groups/join", post(join_group_via_invite))
+        .route("/groups/:id", get(get_named_group))
+        .route("/groups/:id", patch(update_named_group))
+        .route("/groups/:id/policy", patch(update_group_policy))
+        .route("/groups/:id/members", get(get_named_group_members))
+        .route("/groups/:id/members", post(add_named_group_member))
+        .route(
+            "/groups/:id/members/:agent_id",
+            delete(remove_named_group_member),
+        )
+        .route(
+            "/groups/:id/members/:agent_id/role",
+            patch(update_member_role),
+        )
+        .route("/groups/:id/ban/:agent_id", post(ban_group_member))
+        .route("/groups/:id/ban/:agent_id", delete(unban_group_member))
+        .route("/groups/:id/requests", get(list_join_requests))
+        .route("/groups/:id/requests", post(create_join_request))
+        .route(
+            "/groups/:id/requests/:request_id/approve",
+            post(approve_join_request),
+        )
+        .route(
+            "/groups/:id/requests/:request_id/reject",
+            post(reject_join_request),
+        )
+        .route(
+            "/groups/:id/requests/:request_id",
+            delete(cancel_join_request),
+        )
+        // Phase D.2 — cross-daemon secure encrypt/decrypt.
+        .route("/groups/:id/secure/encrypt", post(secure_group_encrypt))
+        .route("/groups/:id/secure/decrypt", post(secure_group_decrypt))
+        .route("/groups/:id/secure/reseal", post(secure_group_reseal))
+        .route(
+            "/groups/secure/open-envelope",
+            post(secure_open_envelope_adversarial),
+        )
+        .route("/groups/:id/invite", post(create_group_invite))
         .route("/groups/:id/display-name", put(set_group_display_name))
         .route("/groups/:id", delete(leave_group))
         // KvStore endpoints
@@ -2555,12 +2709,15 @@ async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 /// GET /agent
 async fn agent_info(State(state): State<Arc<AppState>>) -> Json<ApiResponse<AgentData>> {
+    use base64::Engine as _;
     Json(ApiResponse {
         ok: true,
         data: AgentData {
             agent_id: hex::encode(state.agent.agent_id().as_bytes()),
             machine_id: hex::encode(state.agent.machine_id().as_bytes()),
             user_id: state.agent.user_id().map(|u| hex::encode(u.as_bytes())),
+            kem_public_key_b64: base64::engine::general_purpose::STANDARD
+                .encode(&state.agent_kem_keypair.public_bytes),
         },
     })
 }
@@ -2784,6 +2941,15 @@ struct CardQuery {
     include_groups: Option<bool>,
 }
 
+fn discover_local_card_addresses(port: u16, addresses: &mut Vec<String>) {
+    for addr in x0x::collect_local_interface_addrs(port) {
+        let s = addr.to_string();
+        if !addresses.contains(&s) {
+            addresses.push(s);
+        }
+    }
+}
+
 /// GET /agent/card — generate a shareable identity card.
 async fn get_agent_card(
     State(state): State<Arc<AppState>>,
@@ -2798,10 +2964,13 @@ async fn get_agent_card(
     // Add user ID if available
     card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
 
-    // Add external addresses from ant-quic NodeStatus
+    // Add external addresses from ant-quic NodeStatus, then augment with local
+    // LAN/global probes so cards remain useful before the first observed-address
+    // frame arrives from another peer.
     if let Some(network) = state.agent.network() {
         if let Some(ns) = network.node_status().await {
             card.addresses = ns.external_addrs.iter().map(|a| a.to_string()).collect();
+            discover_local_card_addresses(ns.local_addr.port(), &mut card.addresses);
         }
     }
 
@@ -3294,43 +3463,64 @@ async fn presence_status(
 ///
 /// Server-Sent Events stream of presence online/offline events.
 /// Each event is a JSON object: `{"event":"online"|"offline","agent_id":"<hex>"}`.
+///
+/// We derive events from the same discovery cache that powers `/presence/online`
+/// so this stream reflects what local callers actually see as "online".
 async fn presence_events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
-    // If presence is not initialized, rx will immediately close — the stream exits cleanly.
-    let rx = state.agent.subscribe_presence().await.unwrap_or_else(|_| {
-        // Create a dummy channel that is immediately closed so the stream exits.
-        tokio::sync::broadcast::channel::<x0x::presence::PresenceEvent>(1).1
-    });
-    let mut rx = rx;
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
     let stream = async_stream::stream! {
+        use std::collections::HashMap;
+
+        let mut previous: HashMap<String, DiscoveredAgentEntry> = HashMap::new();
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
-            match rx.recv().await {
-                Ok(x0x::presence::PresenceEvent::AgentOnline { agent_id, reachable, .. }) => {
-                    let data = serde_json::json!({
-                        "event": "online",
-                        "agent_id": hex::encode(agent_id.as_bytes()),
-                        "reachable": reachable
-                    })
-                    .to_string();
-                    yield Ok::<Event, std::convert::Infallible>(
-                        Event::default().event("presence").data(data),
-                    );
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                _ = interval.tick() => {
+                    let current_entries: Vec<DiscoveredAgentEntry> = match state.agent.discovered_agents().await {
+                        Ok(agents) => agents.into_iter().map(discovered_agent_entry).collect(),
+                        Err(_) => Vec::new(),
+                    };
+
+                    let current: HashMap<String, DiscoveredAgentEntry> = current_entries
+                        .into_iter()
+                        .map(|entry| (entry.agent_id.clone(), entry))
+                        .collect();
+
+                    for (agent_id, entry) in &current {
+                        if !previous.contains_key(agent_id) {
+                            let reachable = Some(!entry.addresses.is_empty());
+                            let data = serde_json::json!({
+                                "event": "online",
+                                "agent_id": agent_id,
+                                "reachable": reachable
+                            })
+                            .to_string();
+                            yield Ok::<Event, std::convert::Infallible>(
+                                Event::default().event("presence").data(data),
+                            );
+                        }
+                    }
+
+                    for agent_id in previous.keys() {
+                        if !current.contains_key(agent_id) {
+                            let data = serde_json::json!({
+                                "event": "offline",
+                                "agent_id": agent_id
+                            })
+                            .to_string();
+                            yield Ok::<Event, std::convert::Infallible>(
+                                Event::default().event("presence").data(data),
+                            );
+                        }
+                    }
+
+                    previous = current;
                 }
-                Ok(x0x::presence::PresenceEvent::AgentOffline { agent_id }) => {
-                    let data = serde_json::json!({
-                        "event": "offline",
-                        "agent_id": hex::encode(agent_id.as_bytes())
-                    })
-                    .to_string();
-                    yield Ok::<Event, std::convert::Infallible>(
-                        Event::default().event("presence").data(data),
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Silently skip lagged messages — client was too slow.
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     };
@@ -3885,6 +4075,10 @@ struct CreateGroupRequest {
     /// Optional display name for the creator in this group.
     #[serde(default)]
     display_name: Option<String>,
+    /// Policy preset name (private_secure / public_request_secure / public_open /
+    /// public_announce). Defaults to `private_secure`.
+    #[serde(default)]
+    preset: Option<String>,
 }
 
 /// Request body for POST /groups/join.
@@ -3923,6 +4117,946 @@ struct SetDisplayNameRequest {
     name: String,
 }
 
+/// Request body for POST /groups/:id/members.
+#[derive(Debug, Deserialize)]
+struct AddNamedGroupMemberRequest {
+    agent_id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum NamedGroupMetadataEvent {
+    MemberAdded {
+        group_id: String,
+        revision: u64,
+        actor: String,
+        agent_id: String,
+        display_name: Option<String>,
+    },
+    MemberRemoved {
+        group_id: String,
+        revision: u64,
+        actor: String,
+        agent_id: String,
+    },
+    GroupDeleted {
+        group_id: String,
+        revision: u64,
+        actor: String,
+    },
+    PolicyUpdated {
+        group_id: String,
+        revision: u64,
+        actor: String,
+        policy: x0x::groups::GroupPolicy,
+    },
+    MemberRoleUpdated {
+        group_id: String,
+        revision: u64,
+        actor: String,
+        agent_id: String,
+        role: x0x::groups::GroupRole,
+    },
+    MemberBanned {
+        group_id: String,
+        revision: u64,
+        actor: String,
+        agent_id: String,
+    },
+    MemberUnbanned {
+        group_id: String,
+        revision: u64,
+        actor: String,
+        agent_id: String,
+    },
+    JoinRequestCreated {
+        group_id: String,
+        request_id: String,
+        requester_agent_id: String,
+        message: Option<String>,
+        ts: u64,
+        /// Base64 of the requester's ML-KEM-768 public key, sent so the
+        /// approver can later seal a `SecureShareDelivered` envelope to them.
+        /// Required for MlsEncrypted groups; optional for others.
+        #[serde(default)]
+        requester_kem_public_key_b64: Option<String>,
+    },
+    JoinRequestApproved {
+        group_id: String,
+        request_id: String,
+        revision: u64,
+        actor: String,
+        requester_agent_id: String,
+    },
+    JoinRequestRejected {
+        group_id: String,
+        request_id: String,
+        actor: String,
+        requester_agent_id: String,
+    },
+    JoinRequestCancelled {
+        group_id: String,
+        request_id: String,
+        requester_agent_id: String,
+    },
+    GroupCardPublished {
+        group_id: String,
+        card: x0x::groups::GroupCard,
+    },
+    GroupMetadataUpdated {
+        group_id: String,
+        revision: u64,
+        actor: String,
+        name: Option<String>,
+        description: Option<String>,
+    },
+    /// Phase D.2 (fixed): Cross-daemon delivery of the group's shared secret,
+    /// sealed with ML-KEM-768 to the recipient's published public key.
+    ///
+    /// **Confidentiality**: a gossip observer who does NOT hold the recipient's
+    /// ML-KEM-768 private key cannot recover `shared_secret`, by ML-KEM
+    /// IND-CCA2 security. The adversarial E2E proof in
+    /// `tests/e2e_named_groups.sh` section 2c verifies this behaviorally.
+    ///
+    /// Fields (all base64):
+    /// - `kem_ciphertext_b64`: ML-KEM-768 encapsulated ciphertext (~1088 bytes).
+    /// - `aead_nonce_b64`: 12-byte ChaCha20-Poly1305 nonce.
+    /// - `aead_ciphertext_b64`: 48-byte AEAD-encrypted 32-byte secret.
+    SecureShareDelivered {
+        group_id: String,
+        /// Hex agent_id of the intended recipient.
+        recipient: String,
+        /// New epoch of the shared secret.
+        secret_epoch: u64,
+        /// Base64 ML-KEM-768 encapsulated ciphertext.
+        kem_ciphertext_b64: String,
+        /// Base64 12-byte AEAD nonce.
+        aead_nonce_b64: String,
+        /// Base64 AEAD ciphertext of the 32-byte shared secret (tag included).
+        aead_ciphertext_b64: String,
+        /// Hex agent_id of the distributor (actor) — for authority checks.
+        actor: String,
+    },
+}
+
+/// Construct the AEAD additional-authenticated-data binding for a
+/// `SecureShareDelivered` envelope. Must match exactly between sealer and
+/// opener.
+fn secure_share_aad(group_id: &str, recipient_hex: &str, secret_epoch: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(128);
+    aad.extend_from_slice(b"x0x.group.share.v2|");
+    aad.extend_from_slice(group_id.as_bytes());
+    aad.push(b'|');
+    aad.extend_from_slice(recipient_hex.as_bytes());
+    aad.push(b'|');
+    aad.extend_from_slice(&secret_epoch.to_le_bytes());
+    aad
+}
+
+/// Build and publish a `SecureShareDelivered` envelope sealed to the named
+/// recipient's ML-KEM-768 public key. Used by approval (new member) and
+/// ban-rekey (remaining members). Returns true iff the envelope was sealed
+/// and broadcast. Returns false if the recipient's KEM pubkey is unknown
+/// locally — in that case the caller should log and proceed without the
+/// envelope rather than crashing.
+#[allow(clippy::too_many_arguments)]
+async fn publish_secure_share(
+    state: &AppState,
+    metadata_topic: &str,
+    group_id: &str,
+    recipient_hex: &str,
+    recipient_kem_public_b64: &str,
+    actor_hex: &str,
+    secret: &[u8; 32],
+    secret_epoch: u64,
+) -> bool {
+    use base64::Engine as _;
+    let recipient_kem_public =
+        match base64::engine::general_purpose::STANDARD.decode(recipient_kem_public_b64) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    recipient = %recipient_hex,
+                    "publish_secure_share: recipient KEM public key not valid base64: {e}"
+                );
+                return false;
+            }
+        };
+    let aad = secure_share_aad(group_id, recipient_hex, secret_epoch);
+    let (kem_ct, aead_nonce, aead_ct) =
+        match x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+            &recipient_kem_public,
+            &aad,
+            secret,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(recipient = %recipient_hex, "KEM seal failed: {e}");
+                return false;
+            }
+        };
+    let event = NamedGroupMetadataEvent::SecureShareDelivered {
+        group_id: group_id.to_string(),
+        recipient: recipient_hex.to_string(),
+        secret_epoch,
+        kem_ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(&kem_ct),
+        aead_nonce_b64: base64::engine::general_purpose::STANDARD.encode(aead_nonce),
+        aead_ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(&aead_ct),
+        actor: actor_hex.to_string(),
+    };
+    publish_named_group_metadata_event(state, metadata_topic, &event).await;
+    true
+}
+
+fn named_group_member_values(info: &x0x::groups::GroupInfo) -> Vec<serde_json::Value> {
+    // Include active + banned (banned members still appear in the roster for
+    // audit / admin view). Removed members are dropped.
+    let mut members: Vec<&x0x::groups::GroupMember> = info
+        .members_v2
+        .values()
+        .filter(|m| !m.is_removed())
+        .collect();
+    members.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    members
+        .into_iter()
+        .map(|m| {
+            serde_json::json!({
+                "agent_id": m.agent_id,
+                "role": m.role,
+                "state": m.state,
+                "display_name": m.display_name.clone().unwrap_or_else(|| info.display_name(&m.agent_id)),
+                "joined_at": m.joined_at,
+                "added_by": m.added_by,
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn named_group_member_values_all(info: &x0x::groups::GroupInfo) -> Vec<serde_json::Value> {
+    let mut members: Vec<&x0x::groups::GroupMember> = info.members_v2.values().collect();
+    members.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    members
+        .into_iter()
+        .map(|m| {
+            serde_json::json!({
+                "agent_id": m.agent_id,
+                "role": m.role,
+                "state": m.state,
+                "display_name": m.display_name.clone().unwrap_or_else(|| info.display_name(&m.agent_id)),
+                "joined_at": m.joined_at,
+                "added_by": m.added_by,
+                "removed_by": m.removed_by,
+                "updated_at": m.updated_at,
+            })
+        })
+        .collect()
+}
+
+/// Well-known gossip topic that every daemon subscribes to for public group card
+/// discovery. Publishing a `GroupCardPublished` event here makes the group
+/// visible in any peer's `/groups/discover` without requiring manual card import.
+const GLOBAL_GROUP_DISCOVERY_TOPIC: &str = "x0x.discovery.groups";
+
+/// Publish a group's card to the global discovery topic when it is discoverable.
+/// No-op if the group is Hidden.
+async fn publish_group_card_to_discovery(state: &AppState, group_id: &str) {
+    let maybe_event = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id)
+            .and_then(|info| info.to_group_card())
+            .map(|card| NamedGroupMetadataEvent::GroupCardPublished {
+                group_id: group_id.to_string(),
+                card,
+            })
+    };
+    if let Some(event) = maybe_event {
+        match serde_json::to_vec(&event) {
+            Ok(bytes) => {
+                match state
+                    .agent
+                    .publish(GLOBAL_GROUP_DISCOVERY_TOPIC, bytes)
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            group_id,
+                            topic = GLOBAL_GROUP_DISCOVERY_TOPIC,
+                            "P0-1: published card to global discovery topic"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            topic = GLOBAL_GROUP_DISCOVERY_TOPIC,
+                            "failed to publish card to discovery topic: {e}"
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::debug!("failed to serialize discovery card: {e}"),
+        }
+    }
+}
+
+/// Subscribe to the global discovery topic and insert incoming cards into the cache.
+/// Listener lives for the daemon's lifetime.
+async fn spawn_global_discovery_listener(state: Arc<AppState>) {
+    let mut sub = match state.agent.subscribe(GLOBAL_GROUP_DISCOVERY_TOPIC).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("failed to subscribe to discovery topic: {e}");
+            return;
+        }
+    };
+    tracing::info!(
+        topic = GLOBAL_GROUP_DISCOVERY_TOPIC,
+        "P0-1: global group discovery listener subscribed"
+    );
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                maybe_msg = sub.recv() => {
+                    let Some(msg) = maybe_msg else { break; };
+                    tracing::info!(
+                        topic = GLOBAL_GROUP_DISCOVERY_TOPIC,
+                        "P0-1: received discovery gossip msg ({} bytes)",
+                        msg.payload.len()
+                    );
+                    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
+                    if let NamedGroupMetadataEvent::GroupCardPublished { card, .. } = event {
+                        tracing::info!(
+                            group_id = %card.group_id,
+                            name = %card.name,
+                            "P0-1: caching discovered group card"
+                        );
+                        // Only accept discoverable cards.
+                        if card.policy_summary.discoverability
+                            != x0x::groups::GroupDiscoverability::Hidden
+                        {
+                            state
+                                .group_card_cache
+                                .write()
+                                .await
+                                .insert(card.group_id.clone(), card);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn publish_named_group_metadata_event(
+    state: &AppState,
+    metadata_topic: &str,
+    event: &NamedGroupMetadataEvent,
+) {
+    match serde_json::to_vec(event) {
+        Ok(bytes) => {
+            if let Err(e) = state.agent.publish(metadata_topic, bytes).await {
+                tracing::warn!(topic = %metadata_topic, "failed to publish named-group metadata event: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("failed to serialize named-group metadata event: {e}"),
+    }
+}
+
+async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
+    let handle = state.group_metadata_tasks.write().await.remove(group_id);
+    if let Some(handle) = handle {
+        handle.abort();
+    }
+}
+
+async fn apply_named_group_metadata_event(
+    state: &Arc<AppState>,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    verified: bool,
+) -> bool {
+    if !verified {
+        return false;
+    }
+
+    let group_id = match &event {
+        NamedGroupMetadataEvent::MemberAdded { group_id, .. }
+        | NamedGroupMetadataEvent::MemberRemoved { group_id, .. }
+        | NamedGroupMetadataEvent::GroupDeleted { group_id, .. }
+        | NamedGroupMetadataEvent::PolicyUpdated { group_id, .. }
+        | NamedGroupMetadataEvent::MemberRoleUpdated { group_id, .. }
+        | NamedGroupMetadataEvent::MemberBanned { group_id, .. }
+        | NamedGroupMetadataEvent::MemberUnbanned { group_id, .. }
+        | NamedGroupMetadataEvent::JoinRequestCreated { group_id, .. }
+        | NamedGroupMetadataEvent::JoinRequestApproved { group_id, .. }
+        | NamedGroupMetadataEvent::JoinRequestRejected { group_id, .. }
+        | NamedGroupMetadataEvent::JoinRequestCancelled { group_id, .. }
+        | NamedGroupMetadataEvent::GroupCardPublished { group_id, .. }
+        | NamedGroupMetadataEvent::GroupMetadataUpdated { group_id, .. }
+        | NamedGroupMetadataEvent::SecureShareDelivered { group_id, .. } => group_id.clone(),
+    };
+
+    let sender_hex = hex::encode(sender.as_bytes());
+    let mut groups = state.named_groups.write().await;
+    let Some(info) = groups.get_mut(&group_id) else {
+        return false;
+    };
+    let creator_hex = hex::encode(info.creator.as_bytes());
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+    match event {
+        NamedGroupMetadataEvent::MemberAdded {
+            revision,
+            actor,
+            agent_id,
+            display_name,
+            ..
+        } => {
+            if sender_hex != creator_hex || actor != sender_hex || revision <= info.roster_revision
+            {
+                return false;
+            }
+            info.roster_revision = revision;
+            info.add_member(
+                agent_id.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(actor.clone()),
+                display_name.clone(),
+            );
+            if let Some(name) = display_name {
+                info.set_display_name(&agent_id, name);
+            }
+            let mut mls_groups = state.mls_groups.write().await;
+            if let Some(group) = mls_groups.get_mut(&group_id) {
+                if let Ok(member_id) = parse_agent_id_hex(&agent_id) {
+                    if !group.is_member(&member_id) {
+                        let _ = group.add_member(member_id).await;
+                    }
+                }
+            }
+            drop(mls_groups);
+            drop(groups);
+            save_named_groups(state).await;
+            save_mls_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::MemberRemoved {
+            revision,
+            actor,
+            agent_id,
+            ..
+        } => {
+            let creator_auth = sender_hex == creator_hex && actor == sender_hex;
+            let self_leave_auth = sender_hex == agent_id && actor == sender_hex;
+            if (!creator_auth && !self_leave_auth) || revision <= info.roster_revision {
+                return false;
+            }
+            info.roster_revision = revision;
+            info.remove_member(&agent_id, Some(actor.clone()));
+            let mut mls_groups = state.mls_groups.write().await;
+            if let Some(group) = mls_groups.get_mut(&group_id) {
+                if let Ok(member_id) = parse_agent_id_hex(&agent_id) {
+                    if group.is_member(&member_id) {
+                        let _ = group.remove_member(member_id).await;
+                    }
+                }
+            }
+            drop(mls_groups);
+
+            let removed_self = agent_id == local_agent_hex;
+            if removed_self {
+                groups.remove(&group_id);
+            }
+            drop(groups);
+            if removed_self {
+                state.mls_groups.write().await.remove(&group_id);
+                save_named_groups(state).await;
+                save_mls_groups(state).await;
+                return true;
+            }
+            save_named_groups(state).await;
+            save_mls_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::GroupDeleted {
+            revision, actor, ..
+        } => {
+            if sender_hex != creator_hex || actor != sender_hex || revision <= info.roster_revision
+            {
+                return false;
+            }
+            groups.remove(&group_id);
+            drop(groups);
+            state.mls_groups.write().await.remove(&group_id);
+            save_named_groups(state).await;
+            save_mls_groups(state).await;
+            true
+        }
+        NamedGroupMetadataEvent::PolicyUpdated {
+            revision,
+            actor,
+            policy,
+            ..
+        } => {
+            let creator_auth = sender_hex == creator_hex && actor == sender_hex;
+            if !creator_auth || revision <= info.policy_revision {
+                return false;
+            }
+            info.policy_revision = revision;
+            info.policy = policy;
+            info.updated_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            drop(groups);
+            save_named_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::MemberRoleUpdated {
+            revision,
+            actor,
+            agent_id,
+            role,
+            ..
+        } => {
+            let actor_role = info.caller_role(&actor);
+            let actor_authorized = actor == sender_hex
+                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+            if !actor_authorized || revision <= info.roster_revision {
+                return false;
+            }
+            // P0-5: target must exist and be active.
+            let Some(target) = info.members_v2.get(&agent_id).cloned() else {
+                return false;
+            };
+            if target.is_removed() || target.is_banned() {
+                return false;
+            }
+            // P0-5: admins cannot promote to/from Owner or peer-to-Admin.
+            let actor_role_val = actor_role.unwrap_or(x0x::groups::GroupRole::Guest);
+            if actor_role_val == x0x::groups::GroupRole::Admin
+                && (target.role == x0x::groups::GroupRole::Owner
+                    || target.role == x0x::groups::GroupRole::Admin
+                    || role == x0x::groups::GroupRole::Owner)
+            {
+                return false;
+            }
+            // P0-5: ownership transfer is explicitly out of scope here.
+            if role == x0x::groups::GroupRole::Owner {
+                return false;
+            }
+            info.roster_revision = revision;
+            info.set_member_role(&agent_id, role);
+            drop(groups);
+            save_named_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::MemberBanned {
+            revision,
+            actor,
+            agent_id,
+            ..
+        } => {
+            let actor_role = info.caller_role(&actor);
+            let actor_authorized = actor == sender_hex
+                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+            if !actor_authorized || revision <= info.roster_revision {
+                return false;
+            }
+            // P0-5: cannot ban Owner.
+            if info.caller_role(&agent_id) == Some(x0x::groups::GroupRole::Owner) {
+                return false;
+            }
+            info.roster_revision = revision;
+            info.ban_member(&agent_id, Some(actor));
+            drop(groups);
+            save_named_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::MemberUnbanned {
+            revision,
+            actor,
+            agent_id,
+            ..
+        } => {
+            let actor_role = info.caller_role(&actor);
+            let actor_authorized = actor == sender_hex
+                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+            if !actor_authorized || revision <= info.roster_revision {
+                return false;
+            }
+            info.roster_revision = revision;
+            info.unban_member(&agent_id);
+            drop(groups);
+            save_named_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::JoinRequestCreated {
+            request_id,
+            requester_agent_id,
+            message,
+            ts,
+            requester_kem_public_key_b64,
+            ..
+        } => {
+            // P0-5 apply-side invariants:
+            // 1. Only the requester themselves may emit their own JoinRequestCreated.
+            if sender_hex != requester_agent_id {
+                return false;
+            }
+            // 2. The group must have admission == RequestAccess.
+            if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
+                return false;
+            }
+            // 3. The requester must not already be an active member.
+            if info.has_active_member(&requester_agent_id) {
+                return false;
+            }
+            // 4. The requester must not be banned.
+            if info.is_banned(&requester_agent_id) {
+                return false;
+            }
+            // 5. Duplicate pending request from same requester is rejected.
+            if info
+                .join_requests
+                .values()
+                .any(|r| r.requester_agent_id == requester_agent_id && r.is_pending())
+            {
+                return false;
+            }
+            // 6. Duplicate request_id is rejected.
+            if info.join_requests.contains_key(&request_id) {
+                return false;
+            }
+            let req = x0x::groups::JoinRequest {
+                request_id: request_id.clone(),
+                group_id: group_id.clone(),
+                requester_agent_id: requester_agent_id.clone(),
+                requester_user_id: None,
+                requested_role: x0x::groups::GroupRole::Member,
+                message,
+                created_at: ts,
+                reviewed_at: None,
+                reviewed_by: None,
+                status: x0x::groups::JoinRequestStatus::Pending,
+            };
+            info.join_requests.insert(request_id, req);
+            // Record the requester's KEM public key as a Pending member stub so
+            // the approver can seal to them immediately on approval.
+            if let Some(kem_b64) = requester_kem_public_key_b64 {
+                // Insert a pending entry with the key — will flip to Active on approval.
+                info.members_v2
+                    .entry(requester_agent_id.clone())
+                    .and_modify(|m| {
+                        m.kem_public_key_b64 = Some(kem_b64.clone());
+                    })
+                    .or_insert_with(|| x0x::groups::GroupMember {
+                        agent_id: requester_agent_id,
+                        user_id: None,
+                        role: x0x::groups::GroupRole::Member,
+                        state: x0x::groups::GroupMemberState::Pending,
+                        display_name: None,
+                        joined_at: ts,
+                        updated_at: ts,
+                        added_by: None,
+                        removed_by: None,
+                        kem_public_key_b64: Some(kem_b64),
+                    });
+            }
+            drop(groups);
+            save_named_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            request_id,
+            revision,
+            actor,
+            requester_agent_id,
+            ..
+        } => {
+            // P0-5: actor must be admin+, same as sender, revision must advance.
+            let actor_role = info.caller_role(&actor);
+            let actor_authorized = actor == sender_hex
+                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+            if !actor_authorized || revision <= info.roster_revision {
+                return false;
+            }
+            // P0-5: the request must exist and be Pending.
+            let Some(req_snapshot) = info.join_requests.get(&request_id).cloned() else {
+                return false;
+            };
+            if !req_snapshot.is_pending() {
+                return false;
+            }
+            if req_snapshot.requester_agent_id != requester_agent_id {
+                return false;
+            }
+            // P0-5: a banned requester cannot be approved.
+            if info.is_banned(&requester_agent_id) {
+                return false;
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if let Some(req) = info.join_requests.get_mut(&request_id) {
+                req.status = x0x::groups::JoinRequestStatus::Approved;
+                req.reviewed_by = Some(actor.clone());
+                req.reviewed_at = Some(now_ms);
+            }
+            info.roster_revision = revision;
+            info.add_member(
+                requester_agent_id,
+                x0x::groups::GroupRole::Member,
+                Some(actor),
+                None,
+            );
+            drop(groups);
+            save_named_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::JoinRequestRejected {
+            request_id, actor, ..
+        } => {
+            // P0-5: actor must be admin+; request must exist and be Pending.
+            let actor_role = info.caller_role(&actor);
+            let actor_authorized = actor == sender_hex
+                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+            if !actor_authorized {
+                return false;
+            }
+            let Some(req) = info.join_requests.get_mut(&request_id) else {
+                return false;
+            };
+            if !req.is_pending() {
+                return false;
+            }
+            req.status = x0x::groups::JoinRequestStatus::Rejected;
+            req.reviewed_by = Some(actor.clone());
+            req.reviewed_at = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            );
+            drop(groups);
+            save_named_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::JoinRequestCancelled {
+            request_id,
+            requester_agent_id,
+            ..
+        } => {
+            // P0-5: only the requester may cancel, request must be Pending.
+            if sender_hex != requester_agent_id {
+                return false;
+            }
+            let Some(req) = info.join_requests.get_mut(&request_id) else {
+                return false;
+            };
+            if req.requester_agent_id != requester_agent_id {
+                return false;
+            }
+            if !req.is_pending() {
+                return false;
+            }
+            req.status = x0x::groups::JoinRequestStatus::Cancelled;
+            drop(groups);
+            save_named_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::GroupCardPublished { card, .. } => {
+            if sender_hex != creator_hex {
+                return false;
+            }
+            state
+                .group_card_cache
+                .write()
+                .await
+                .insert(card.group_id.clone(), card);
+            false
+        }
+        NamedGroupMetadataEvent::GroupMetadataUpdated {
+            revision,
+            actor,
+            name,
+            description,
+            ..
+        } => {
+            // Only an active Admin/Owner may update metadata, and the actor must
+            // be the same agent that signed the payload.
+            let actor_role = info.caller_role(&actor);
+            let actor_authorized = actor == sender_hex
+                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+            if !actor_authorized || revision <= info.roster_revision {
+                return false;
+            }
+            info.roster_revision = revision;
+            if let Some(n) = name {
+                info.name = n;
+            }
+            if let Some(d) = description {
+                info.description = d;
+            }
+            info.updated_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            // If the group is discoverable, refresh the cached card.
+            let refreshed_card = info.to_group_card();
+            drop(groups);
+            if let Some(card) = refreshed_card {
+                state
+                    .group_card_cache
+                    .write()
+                    .await
+                    .insert(card.group_id.clone(), card);
+            }
+            save_named_groups(state).await;
+            false
+        }
+        NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id: ref ev_group_id,
+            recipient,
+            secret_epoch,
+            kem_ciphertext_b64,
+            aead_nonce_b64,
+            aead_ciphertext_b64,
+            actor,
+        } => {
+            // Only process messages addressed to this daemon. A non-recipient
+            // daemon CANNOT open the envelope even if it tried — ML-KEM
+            // decapsulation with the wrong key yields a random shared secret
+            // and the AEAD auth-tag check fails. The early return here is a
+            // performance optimisation, not a security boundary.
+            let self_hex = hex::encode(state.agent.agent_id().as_bytes());
+            if recipient != self_hex {
+                return false;
+            }
+            // Only accept from an active admin+.
+            let actor_role = info.caller_role(&actor);
+            let actor_authorized = actor == sender_hex
+                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+            if !actor_authorized {
+                return false;
+            }
+            // Ignore stale envelopes.
+            if secret_epoch <= info.secret_epoch && info.shared_secret.is_some() {
+                return false;
+            }
+            use base64::Engine as _;
+            let kem_ct = match base64::engine::general_purpose::STANDARD.decode(&kem_ciphertext_b64)
+            {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            let aead_nonce = match base64::engine::general_purpose::STANDARD.decode(&aead_nonce_b64)
+            {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            if aead_nonce.len() != 12 {
+                return false;
+            }
+            let mut nonce_bytes = [0u8; 12];
+            nonce_bytes.copy_from_slice(&aead_nonce);
+            let aead_ct =
+                match base64::engine::general_purpose::STANDARD.decode(&aead_ciphertext_b64) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+            let aad = secure_share_aad(ev_group_id, &recipient, secret_epoch);
+            let opened = x0x::groups::kem_envelope::open_group_secret(
+                &state.agent_kem_keypair,
+                &aad,
+                &kem_ct,
+                &nonce_bytes,
+                &aead_ct,
+            );
+            let secret = match opened {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        group_id = %ev_group_id,
+                        "KEM envelope decap/decrypt failed: {e}"
+                    );
+                    return false;
+                }
+            };
+            info.shared_secret = Some(secret.to_vec());
+            info.secret_epoch = secret_epoch;
+            drop(groups);
+            save_named_groups(state).await;
+            tracing::info!(
+                group_id = %ev_group_id,
+                secret_epoch,
+                "Phase D.2: stored new group shared secret (epoch {secret_epoch}) via KEM-sealed envelope"
+            );
+            false
+        }
+    }
+}
+
+async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &str) {
+    if state
+        .group_metadata_tasks
+        .read()
+        .await
+        .contains_key(group_id)
+    {
+        return;
+    }
+
+    let metadata_topic = {
+        let groups = state.named_groups.read().await;
+        groups.get(group_id).map(|g| g.metadata_topic.clone())
+    };
+    let Some(metadata_topic) = metadata_topic else {
+        return;
+    };
+    let group_id = group_id.to_string();
+    let task_group_id = group_id.clone();
+    let state_for_task = Arc::clone(&state);
+    let handle = tokio::spawn(async move {
+        let mut sub = match state_for_task.agent.subscribe(&metadata_topic).await {
+            Ok(sub) => sub,
+            Err(e) => {
+                tracing::warn!(group_id = %task_group_id, topic = %metadata_topic, "failed to subscribe to named-group metadata topic: {e}");
+                return;
+            }
+        };
+        let mut shutdown_rx = state_for_task.shutdown_notify.subscribe();
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                maybe_msg = sub.recv() => {
+                    let Some(msg) = maybe_msg else { break; };
+                    let Some(sender) = msg.sender else { continue; };
+                    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
+                    let should_exit = apply_named_group_metadata_event(&state_for_task, event, sender, msg.verified).await;
+                    if should_exit { break; }
+                }
+            }
+        }
+        state_for_task
+            .group_metadata_tasks
+            .write()
+            .await
+            .remove(&task_group_id);
+    });
+
+    state
+        .group_metadata_tasks
+        .write()
+        .await
+        .insert(group_id, handle);
+}
+
 /// POST /groups — create a named group.
 async fn create_named_group(
     State(state): State<Arc<AppState>>,
@@ -3936,20 +5070,44 @@ async fn create_named_group(
 
     let agent_id = state.agent.agent_id();
 
+    // Resolve policy preset (defaults to private_secure).
+    let policy = match req.preset.as_deref() {
+        Some(name) => match x0x::groups::GroupPolicyPreset::from_name(name) {
+            Some(preset) => preset.to_policy(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": "unknown preset" })),
+                );
+            }
+        },
+        None => x0x::groups::GroupPolicy::default(),
+    };
+
     // Create MLS group
     match x0x::mls::MlsGroup::new(group_id_bytes, agent_id).await {
         Ok(group) => {
-            // Create group metadata
-            let mut info = x0x::groups::GroupInfo::new(
+            // Create group metadata with explicit policy.
+            let mut info = x0x::groups::GroupInfo::with_policy(
                 req.name,
                 req.description,
                 agent_id,
                 group_id_hex.clone(),
+                policy,
             );
+            // Record the owner's ML-KEM-768 public key so the roster knows
+            // where to seal future group-shared-secret envelopes.
+            {
+                use base64::Engine as _;
+                let owner_hex = hex::encode(agent_id.as_bytes());
+                let owner_kem_b64 = base64::engine::general_purpose::STANDARD
+                    .encode(&state.agent_kem_keypair.public_bytes);
+                info.set_member_kem_public_key(&owner_hex, owner_kem_b64);
+            }
 
             // Set creator's display name if provided
             if let Some(dn) = req.display_name {
-                info.set_display_name(hex::encode(agent_id.as_bytes()), dn);
+                info.set_display_name(&hex::encode(agent_id.as_bytes()), dn);
             }
 
             // Store MLS group
@@ -3961,7 +5119,6 @@ async fn create_named_group(
             save_mls_groups(&state).await;
 
             let chat_topic = info.general_chat_topic();
-            let metadata_topic = info.metadata_topic.clone();
 
             // Store group info and persist to disk
             state
@@ -3970,10 +5127,20 @@ async fn create_named_group(
                 .await
                 .insert(group_id_hex.clone(), info.clone());
             save_named_groups(&state).await;
+            ensure_named_group_metadata_listener(Arc::clone(&state), &group_id_hex).await;
 
-            // Auto-subscribe to group topics so messages flow immediately
-            let _ = state.agent.subscribe(&chat_topic).await;
-            let _ = state.agent.subscribe(&metadata_topic).await;
+            // P0-1: If the group is discoverable, publish its card to the global
+            // discovery topic so other daemons find it without manual import.
+            if info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden {
+                if let Some(card) = info.to_group_card() {
+                    state
+                        .group_card_cache
+                        .write()
+                        .await
+                        .insert(group_id_hex.clone(), card);
+                    publish_group_card_to_discovery(&state, &group_id_hex).await;
+                }
+            }
 
             // Announce creation on the chat topic
             let agent_hex = hex::encode(agent_id.as_bytes());
@@ -4021,13 +5188,14 @@ async fn list_named_groups(State(state): State<Arc<AppState>>) -> impl IntoRespo
     let entries: Vec<serde_json::Value> = groups
         .values()
         .map(|info| {
+            let member_count = named_group_member_values(info).len();
             serde_json::json!({
                 "group_id": info.mls_group_id,
                 "name": info.name,
                 "description": info.description,
                 "creator": hex::encode(info.creator.as_bytes()),
                 "created_at": info.created_at,
-                "member_count": info.display_names.len().max(1),
+                "member_count": member_count,
             })
         })
         .collect();
@@ -4046,17 +5214,7 @@ async fn get_named_group(
             Json(serde_json::json!({ "ok": false, "error": "group not found" })),
         );
     };
-
-    let members: Vec<serde_json::Value> = info
-        .display_names
-        .iter()
-        .map(|(agent_hex, name)| {
-            serde_json::json!({
-                "agent_id": agent_hex,
-                "display_name": name,
-            })
-        })
-        .collect();
+    let members = named_group_member_values(info);
 
     (
         StatusCode::OK,
@@ -4067,8 +5225,37 @@ async fn get_named_group(
             "description": info.description,
             "creator": hex::encode(info.creator.as_bytes()),
             "created_at": info.created_at,
+            "updated_at": info.updated_at,
             "chat_topic": info.general_chat_topic(),
             "metadata_topic": info.metadata_topic,
+            "policy": info.policy,
+            "policy_revision": info.policy_revision,
+            "roster_revision": info.roster_revision,
+            "member_count": members.len(),
+            "members": members,
+        })),
+    )
+}
+
+/// GET /groups/:id/members — list local named-group members.
+async fn get_named_group_members(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+    let members = named_group_member_values(info);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": id,
+            "member_count": members.len(),
             "members": members,
         })),
     )
@@ -4095,6 +5282,13 @@ async fn create_group_invite(
     };
 
     let agent_id = state.agent.agent_id();
+    if agent_id != info.creator {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": "only the creator can generate invites" })),
+        )
+            .into_response();
+    }
     let invite = x0x::groups::invite::SignedInvite::new(
         info.mls_group_id.clone(),
         info.name.clone(),
@@ -4143,6 +5337,15 @@ async fn join_group_via_invite(
 
     let agent_id = state.agent.agent_id();
     let group_id_hex = invite.group_id.clone();
+    let creator = match parse_agent_id_hex(&invite.inviter) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": format!("invalid inviter: {e}") })),
+            );
+        }
+    };
 
     // Create the MLS group locally (in a real flow, the inviter would send
     // a Welcome message; for now, we create a local group and the inviter
@@ -4173,17 +5376,23 @@ async fn join_group_via_invite(
             let mut info = x0x::groups::GroupInfo::new(
                 invite.group_name.clone(),
                 String::new(),
-                agent_id,
+                creator,
                 group_id_hex.clone(),
             );
 
+            let joiner_hex = hex::encode(agent_id.as_bytes());
+            info.add_member(
+                joiner_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(invite.inviter.clone()),
+                req.display_name.clone(),
+            );
             // Set joiner's display name if provided
             if let Some(dn) = req.display_name {
-                info.set_display_name(hex::encode(agent_id.as_bytes()), dn);
+                info.set_display_name(&joiner_hex, dn);
             }
 
             let chat_topic = info.general_chat_topic();
-            let metadata_topic = info.metadata_topic.clone();
 
             state
                 .named_groups
@@ -4191,13 +5400,10 @@ async fn join_group_via_invite(
                 .await
                 .insert(group_id_hex.clone(), info.clone());
             save_named_groups(&state).await;
-
-            // Auto-subscribe to group topics so messages flow immediately
-            let _ = state.agent.subscribe(&chat_topic).await;
-            let _ = state.agent.subscribe(&metadata_topic).await;
+            ensure_named_group_metadata_listener(Arc::clone(&state), &group_id_hex).await;
 
             // Announce join on the chat topic so the creator sees us
-            let agent_hex = hex::encode(agent_id.as_bytes());
+            let agent_hex = joiner_hex;
             let display = info
                 .display_names
                 .get(&agent_hex)
@@ -4252,7 +5458,7 @@ async fn set_group_display_name(
     };
 
     let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    info.set_display_name(agent_hex, req.name.clone());
+    info.set_display_name(&agent_hex, req.name.clone());
     drop(groups); // release write lock before saving
     save_named_groups(&state).await;
 
@@ -4262,30 +5468,1695 @@ async fn set_group_display_name(
     )
 }
 
+/// POST /groups/:id/members — add a member to the named-group roster.
+async fn add_named_group_member(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddNamedGroupMemberRequest>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&req.agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+    let local_agent = state.agent.agent_id();
+
+    let (metadata_topic, event, members, epoch) = {
+        let mut named_groups = state.named_groups.write().await;
+        let Some(info) = named_groups.get_mut(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if local_agent != info.creator {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    serde_json::json!({ "ok": false, "error": "only the creator can add members" }),
+                ),
+            );
+        }
+
+        let agent_hex = hex::encode(agent_id.as_bytes());
+        if info.has_member(&agent_hex) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "ok": false, "error": "member already present" })),
+            );
+        }
+        info.roster_revision = info.roster_revision.saturating_add(1);
+        let actor_hex = hex::encode(local_agent.as_bytes());
+        info.add_member(
+            agent_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(actor_hex),
+            req.display_name.clone(),
+        );
+        if let Some(display_name) = req.display_name.clone() {
+            info.set_display_name(&agent_hex, display_name);
+        }
+        let revision = info.roster_revision;
+        let metadata_topic = info.metadata_topic.clone();
+        let members = named_group_member_values(info);
+        drop(named_groups);
+
+        let mut epoch = None;
+        let mut mls_groups = state.mls_groups.write().await;
+        if let Some(group) = mls_groups.get_mut(&id) {
+            if !group.is_member(&agent_id) {
+                match group.add_member(agent_id).await {
+                    Ok(_) => epoch = Some(group.current_epoch()),
+                    Err(e) => {
+                        tracing::warn!("named-group add member MLS update failed: {e}");
+                    }
+                }
+            } else {
+                epoch = Some(group.current_epoch());
+            }
+        }
+        drop(mls_groups);
+        save_named_groups(&state).await;
+        save_mls_groups(&state).await;
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: id.clone(),
+            revision,
+            actor: hex::encode(local_agent.as_bytes()),
+            agent_id: agent_hex,
+            display_name: req.display_name,
+        };
+        (metadata_topic, event, members, epoch)
+    };
+
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": id,
+            "epoch": epoch,
+            "member_count": members.len(),
+            "members": members,
+        })),
+    )
+}
+
+/// DELETE /groups/:id/members/:agent_id — remove a member from the named-group roster.
+async fn remove_named_group_member(
+    State(state): State<Arc<AppState>>,
+    Path((id, agent_id_hex)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+    let local_agent = state.agent.agent_id();
+    let local_agent_hex = hex::encode(local_agent.as_bytes());
+
+    let (metadata_topic, event, members, epoch) = {
+        let mut named_groups = state.named_groups.write().await;
+        let Some(info) = named_groups.get_mut(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+
+        if agent_id_hex == hex::encode(info.creator.as_bytes()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "ok": false, "error": "cannot remove creator via member API; delete the group instead" }),
+                ),
+            );
+        }
+        if local_agent != info.creator {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    serde_json::json!({ "ok": false, "error": "only the creator can remove other members" }),
+                ),
+            );
+        }
+        if !info.has_member(&agent_id_hex) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "member not found" })),
+            );
+        }
+
+        info.roster_revision = info.roster_revision.saturating_add(1);
+        let revision = info.roster_revision;
+        info.remove_member(&agent_id_hex, Some(hex::encode(local_agent.as_bytes())));
+        let metadata_topic = info.metadata_topic.clone();
+        let members = named_group_member_values(info);
+        drop(named_groups);
+
+        let mut epoch = None;
+        let mut mls_groups = state.mls_groups.write().await;
+        if let Some(group) = mls_groups.get_mut(&id) {
+            if group.is_member(&agent_id) {
+                match group.remove_member(agent_id).await {
+                    Ok(_) => epoch = Some(group.current_epoch()),
+                    Err(e) => tracing::warn!("named-group remove member MLS update failed: {e}"),
+                }
+            } else {
+                epoch = Some(group.current_epoch());
+            }
+        }
+        drop(mls_groups);
+        save_named_groups(&state).await;
+        save_mls_groups(&state).await;
+        let event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: id.clone(),
+            revision,
+            actor: local_agent_hex,
+            agent_id: agent_id_hex.clone(),
+        };
+        (metadata_topic, event, members, epoch)
+    };
+
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": id,
+            "removed_member": agent_id_hex,
+            "epoch": epoch,
+            "member_count": members.len(),
+            "members": members,
+        })),
+    )
+}
+
 /// DELETE /groups/:id — leave or delete a group.
 async fn leave_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Remove from named groups
-    let info = state.named_groups.write().await.remove(&id);
-    if info.is_none() {
+    let local_agent = state.agent.agent_id();
+    let local_agent_hex = hex::encode(local_agent.as_bytes());
+
+    let removed_info = state.named_groups.write().await.remove(&id);
+    let Some(info) = removed_info else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "ok": false, "error": "group not found" })),
         );
-    }
-    save_named_groups(&state).await;
+    };
 
-    // Remove MLS group
+    let revision = info.roster_revision.saturating_add(1);
+    let metadata_topic = info.metadata_topic.clone();
+    let is_creator = local_agent == info.creator;
+    let name = info.name.clone();
+
     state.mls_groups.write().await.remove(&id);
+    save_named_groups(&state).await;
     save_mls_groups(&state).await;
+    stop_named_group_metadata_listener(&state, &id).await;
 
-    let name = info.map(|i| i.name).unwrap_or_default();
+    let event = if is_creator {
+        NamedGroupMetadataEvent::GroupDeleted {
+            group_id: id.clone(),
+            revision,
+            actor: local_agent_hex,
+        }
+    } else {
+        NamedGroupMetadataEvent::MemberRemoved {
+            group_id: id.clone(),
+            revision,
+            actor: local_agent_hex.clone(),
+            agent_id: local_agent_hex,
+        }
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "left": name })),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Full named-group model (Phase A/B/C) — policy, roles, join requests, cards
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct UpdateGroupRequest {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateGroupPolicyRequest {
+    preset: Option<String>,
+    discoverability: Option<x0x::groups::GroupDiscoverability>,
+    admission: Option<x0x::groups::GroupAdmission>,
+    confidentiality: Option<x0x::groups::GroupConfidentiality>,
+    read_access: Option<x0x::groups::GroupReadAccess>,
+    write_access: Option<x0x::groups::GroupWriteAccess>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateMemberRoleRequest {
+    role: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CreateJoinRequestBody {
+    message: Option<String>,
+}
+
+fn now_millis_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Require the caller to be an active Admin or higher.
+fn require_admin_or_above(
+    info: &x0x::groups::GroupInfo,
+    caller_hex: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match info.caller_role(caller_hex) {
+        Some(role) if role.at_least(x0x::groups::GroupRole::Admin) => Ok(()),
+        _ => Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": "admin role required" })),
+        )),
+    }
+}
+
+fn require_owner(
+    info: &x0x::groups::GroupInfo,
+    caller_hex: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match info.caller_role(caller_hex) {
+        Some(x0x::groups::GroupRole::Owner) => Ok(()),
+        _ => Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": "owner role required" })),
+        )),
+    }
+}
+
+/// PATCH /groups/:id — update name/description (admin+).
+async fn update_named_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateGroupRequest>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut groups = state.named_groups.write().await;
+    let Some(info) = groups.get_mut(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+    if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        return e;
+    }
+    let name_update = req.name.clone();
+    let desc_update = req.description.clone();
+    if let Some(name) = req.name {
+        info.name = name;
+    }
+    if let Some(desc) = req.description {
+        info.description = desc;
+    }
+    info.updated_at = now_millis_u64();
+    info.roster_revision = info.roster_revision.saturating_add(1);
+    let revision = info.roster_revision;
+    let updated_name = info.name.clone();
+    let updated_desc = info.description.clone();
+    let metadata_topic = info.metadata_topic.clone();
+    // Refresh the local card cache if the group is discoverable so
+    // /groups/discover immediately reflects the update.
+    let refreshed_card = info.to_group_card();
+    drop(groups);
+    save_named_groups(&state).await;
+    if let Some(card) = refreshed_card {
+        state
+            .group_card_cache
+            .write()
+            .await
+            .insert(card.group_id.clone(), card.clone());
+        // Also republish the card so other peers update their caches.
+        let card_event = NamedGroupMetadataEvent::GroupCardPublished {
+            group_id: id.clone(),
+            card,
+        };
+        publish_named_group_metadata_event(&state, &metadata_topic, &card_event).await;
+        // Also publish to the global discovery topic (P0-1).
+        publish_group_card_to_discovery(&state, &id).await;
+    }
+
+    let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+        group_id: id.clone(),
+        revision,
+        actor: caller_hex,
+        name: name_update,
+        description: desc_update,
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "name": updated_name,
+            "description": updated_desc,
+            "revision": revision,
+        })),
+    )
+}
+
+/// PATCH /groups/:id/policy — update policy (owner-only).
+async fn update_group_policy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateGroupPolicyRequest>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut groups = state.named_groups.write().await;
+    let Some(info) = groups.get_mut(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+    if let Err(e) = require_owner(info, &caller_hex) {
+        return e;
+    }
+
+    let mut new_policy = info.policy.clone();
+    if let Some(preset_name) = req.preset.as_deref() {
+        match x0x::groups::GroupPolicyPreset::from_name(preset_name) {
+            Some(preset) => new_policy = preset.to_policy(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": "unknown preset" })),
+                );
+            }
+        }
+    }
+    if let Some(d) = req.discoverability {
+        new_policy.discoverability = d;
+    }
+    if let Some(a) = req.admission {
+        new_policy.admission = a;
+    }
+    if let Some(c) = req.confidentiality {
+        new_policy.confidentiality = c;
+    }
+    if let Some(r) = req.read_access {
+        new_policy.read_access = r;
+    }
+    if let Some(w) = req.write_access {
+        new_policy.write_access = w;
+    }
+
+    info.policy = new_policy.clone();
+    info.policy_revision = info.policy_revision.saturating_add(1);
+    let revision = info.policy_revision;
+    info.updated_at = now_millis_u64();
+
+    // Establish discovery topic when the group becomes publicly discoverable.
+    if info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
+        && info.discovery_card_topic.is_none()
+    {
+        info.discovery_card_topic = Some(format!(
+            "x0x.group.{}.card",
+            &info.mls_group_id[..16.min(info.mls_group_id.len())]
+        ));
+    }
+
+    let metadata_topic = info.metadata_topic.clone();
+    let policy_clone = info.policy.clone();
+    drop(groups);
+    save_named_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::PolicyUpdated {
+        group_id: id.clone(),
+        revision,
+        actor: caller_hex,
+        policy: policy_clone.clone(),
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
+    // P0-1: if the new policy is discoverable, (re)publish the card to the global
+    // discovery topic so other daemons see the change.
+    if policy_clone.discoverability != x0x::groups::GroupDiscoverability::Hidden {
+        let refreshed_card = {
+            let groups = state.named_groups.read().await;
+            groups.get(&id).and_then(|info| info.to_group_card())
+        };
+        if let Some(card) = refreshed_card {
+            state
+                .group_card_cache
+                .write()
+                .await
+                .insert(card.group_id.clone(), card);
+            publish_group_card_to_discovery(&state, &id).await;
+        }
+    } else {
+        // Hidden again — forget the card locally so `/groups/discover` stops
+        // returning it for the owner.
+        state.group_card_cache.write().await.remove(&id);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "policy": policy_clone, "revision": revision })),
+    )
+}
+
+/// PATCH /groups/:id/members/:agent_id/role — change a member's role.
+async fn update_member_role(
+    State(state): State<Arc<AppState>>,
+    Path((id, agent_id_hex)): Path<(String, String)>,
+    Json(req): Json<UpdateMemberRoleRequest>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let Some(new_role) = x0x::groups::GroupRole::from_name(&req.role) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "invalid role" })),
+        );
+    };
+    if new_role == x0x::groups::GroupRole::Owner {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "ok": false, "error": "ownership transfer not supported yet" }),
+            ),
+        );
+    }
+
+    let mut groups = state.named_groups.write().await;
+    let Some(info) = groups.get_mut(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+
+    // P0-7: target must exist in members_v2 (active, banned, or removed — NOT absent).
+    let target_entry = info.members_v2.get(&agent_id_hex).cloned();
+    let Some(target_entry) = target_entry else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "member not found" })),
+        );
+    };
+    if target_entry.is_removed() || target_entry.is_banned() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "cannot change role of a removed or banned member"
+            })),
+        );
+    }
+
+    let actor_role = info.caller_role(&caller_hex);
+    let target_role = Some(target_entry.role);
+
+    let authorized = match actor_role {
+        Some(x0x::groups::GroupRole::Owner) => true,
+        Some(x0x::groups::GroupRole::Admin) => target_role.is_some_and(|tr| {
+            tr != x0x::groups::GroupRole::Owner && tr != x0x::groups::GroupRole::Admin
+        }),
+        _ => false,
+    };
+    if !authorized {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": "insufficient role" })),
+        );
+    }
+
+    info.set_member_role(&agent_id_hex, new_role);
+    info.roster_revision = info.roster_revision.saturating_add(1);
+    let revision = info.roster_revision;
+    let metadata_topic = info.metadata_topic.clone();
+    drop(groups);
+    save_named_groups(&state).await;
+
+    // Phase D: trigger MLS rekey here when member privilege changes.
+    let event = NamedGroupMetadataEvent::MemberRoleUpdated {
+        group_id: id.clone(),
+        revision,
+        actor: caller_hex,
+        agent_id: agent_id_hex,
+        role: new_role,
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "role": new_role, "revision": revision })),
+    )
+}
+
+/// POST /groups/:id/ban/:agent_id — ban a member (admin+, target must not be owner).
+async fn ban_group_member(
+    State(state): State<Arc<AppState>>,
+    Path((id, agent_id_hex)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut groups = state.named_groups.write().await;
+    let Some(info) = groups.get_mut(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+    if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        return e;
+    }
+    if info.caller_role(&agent_id_hex) == Some(x0x::groups::GroupRole::Owner) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": "cannot ban owner" })),
+        );
+    }
+    info.ban_member(&agent_id_hex, Some(caller_hex.clone()));
+    info.roster_revision = info.roster_revision.saturating_add(1);
+    let revision = info.roster_revision;
+    let metadata_topic = info.metadata_topic.clone();
+
+    // Phase D.2: rotate the group shared secret so banned peer's stale secret
+    // cannot decrypt new-epoch content. Capture remaining active members with
+    // their KEM pubkeys so we can seal the new secret to each.
+    let is_encrypted =
+        info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted;
+    type RekeyBundle = (Option<[u8; 32]>, u64, Vec<(String, Option<String>)>);
+    let (new_secret, new_epoch, remaining_targets): RekeyBundle = if is_encrypted {
+        let (sec_vec, ep) = info.rotate_shared_secret();
+        let mut sec = [0u8; 32];
+        if sec_vec.len() == 32 {
+            sec.copy_from_slice(&sec_vec);
+        }
+        let remaining: Vec<(String, Option<String>)> = info
+            .active_members()
+            .map(|m| (m.agent_id.clone(), m.kem_public_key_b64.clone()))
+            .collect();
+        (Some(sec), ep, remaining)
+    } else {
+        (None, 0, Vec::new())
+    };
+
+    drop(groups);
+    save_named_groups(&state).await;
+
+    // Deliver the rotated secret to each remaining member (skip self). Each
+    // envelope is sealed to that member's published ML-KEM-768 public key
+    // via `seal_group_secret_to_recipient`, so only the recipient's private
+    // key can open it.
+    if let Some(ref secret) = new_secret {
+        for (recipient, recipient_kem_b64) in &remaining_targets {
+            if recipient == &caller_hex {
+                continue;
+            }
+            let Some(kem_b64) = recipient_kem_b64 else {
+                tracing::warn!(
+                    recipient = %recipient,
+                    "rekey: no KEM pubkey on record for remaining member; cannot seal"
+                );
+                continue;
+            };
+            publish_secure_share(
+                &state,
+                &metadata_topic,
+                &id,
+                recipient,
+                kem_b64,
+                &caller_hex,
+                secret,
+                new_epoch,
+            )
+            .await;
+        }
+    }
+
+    // P0-4: drive local MLS remove_member so the banning daemon's MLS state no
+    // longer treats the banned peer as a recipient. Cross-daemon rekey
+    // propagation to existing members remains Phase D.2.
+    if let Ok(target_agent) = parse_agent_id_hex(&agent_id_hex) {
+        let mut mls_groups = state.mls_groups.write().await;
+        if let Some(group) = mls_groups.get_mut(&id) {
+            if group.is_member(&target_agent) {
+                match group.remove_member(target_agent).await {
+                    Ok(_) => {
+                        tracing::debug!(
+                            target: "x0x::groups",
+                            "banned {} → removed from MLS group {}",
+                            &agent_id_hex[..16.min(agent_id_hex.len())],
+                            &id[..16.min(id.len())]
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "MLS remove_member on ban failed: {e} — roster banned anyway"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    save_mls_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::MemberBanned {
+        group_id: id.clone(),
+        revision,
+        actor: caller_hex,
+        agent_id: agent_id_hex,
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "revision": revision })),
+    )
+}
+
+/// DELETE /groups/:id/ban/:agent_id — unban a member (admin+).
+async fn unban_group_member(
+    State(state): State<Arc<AppState>>,
+    Path((id, agent_id_hex)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut groups = state.named_groups.write().await;
+    let Some(info) = groups.get_mut(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+    if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        return e;
+    }
+    if !info.is_banned(&agent_id_hex) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "member is not banned" })),
+        );
+    }
+    info.unban_member(&agent_id_hex);
+    info.roster_revision = info.roster_revision.saturating_add(1);
+    let revision = info.roster_revision;
+    let metadata_topic = info.metadata_topic.clone();
+    drop(groups);
+    save_named_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::MemberUnbanned {
+        group_id: id.clone(),
+        revision,
+        actor: caller_hex,
+        agent_id: agent_id_hex,
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "revision": revision })),
+    )
+}
+
+/// GET /groups/:id/requests — list join requests (admin+).
+async fn list_join_requests(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+    if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        return e;
+    }
+    let mut requests: Vec<&x0x::groups::JoinRequest> = info.join_requests.values().collect();
+    requests.sort_by_key(|r| r.created_at);
+    let list: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "requests": list })),
+    )
+}
+
+/// POST /groups/:id/requests — submit a join request (non-member, non-banned).
+async fn create_join_request(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<CreateJoinRequestBody>>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let req_body = body.map(|b| b.0).unwrap_or_default();
+
+    let (metadata_topic, request, creator_hex) = {
+        let mut groups = state.named_groups.write().await;
+        let Some(info) = groups.get_mut(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    serde_json::json!({ "ok": false, "error": "group admission is not request_access" }),
+                ),
+            );
+        }
+        if info.is_banned(&caller_hex) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "ok": false, "error": "banned" })),
+            );
+        }
+        if info.has_active_member(&caller_hex) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "ok": false, "error": "already a member" })),
+            );
+        }
+        if info
+            .join_requests
+            .values()
+            .any(|r| r.requester_agent_id == caller_hex && r.is_pending())
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "ok": false, "error": "pending request already exists" })),
+            );
+        }
+
+        let request = x0x::groups::JoinRequest::new(
+            info.mls_group_id.clone(),
+            caller_hex.clone(),
+            req_body.message.clone(),
+            now_millis_u64(),
+        );
+        info.join_requests
+            .insert(request.request_id.clone(), request.clone());
+        let creator_hex = hex::encode(info.creator.as_bytes());
+        (info.metadata_topic.clone(), request, creator_hex)
+    };
+
+    save_named_groups(&state).await;
+
+    // Include our ML-KEM-768 public key so the approver can seal the group
+    // shared secret directly to us on approval.
+    use base64::Engine as _;
+    let requester_kem_b64 =
+        base64::engine::general_purpose::STANDARD.encode(&state.agent_kem_keypair.public_bytes);
+    let event = NamedGroupMetadataEvent::JoinRequestCreated {
+        group_id: id.clone(),
+        request_id: request.request_id.clone(),
+        requester_agent_id: request.requester_agent_id.clone(),
+        message: request.message.clone(),
+        ts: request.created_at,
+        requester_kem_public_key_b64: Some(requester_kem_b64),
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    let _ = creator_hex; // reserved for direct-notification future enhancement
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "ok": true,
+            "request_id": request.request_id,
+            "group_id": id,
+        })),
+    )
+}
+
+/// POST /groups/:id/requests/:request_id/approve — approve request (admin+).
+async fn approve_join_request(
+    State(state): State<Arc<AppState>>,
+    Path((id, request_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+    let (metadata_topic, requester_hex, revision) = {
+        let mut groups = state.named_groups.write().await;
+        let Some(info) = groups.get_mut(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+            return e;
+        }
+        let Some(req) = info.join_requests.get_mut(&request_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "request not found" })),
+            );
+        };
+        if !req.is_pending() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "ok": false, "error": "request is not pending" })),
+            );
+        }
+        req.status = x0x::groups::JoinRequestStatus::Approved;
+        req.reviewed_by = Some(caller_hex.clone());
+        req.reviewed_at = Some(now_millis_u64());
+        let requester_hex = req.requester_agent_id.clone();
+        info.add_member(
+            requester_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(caller_hex.clone()),
+            None,
+        );
+        info.roster_revision = info.roster_revision.saturating_add(1);
+        (
+            info.metadata_topic.clone(),
+            requester_hex,
+            info.roster_revision,
+        )
+    };
+
+    save_named_groups(&state).await;
+
+    // Phase D.2: deliver the current group shared secret to the new member
+    // via a `SecureShareDelivered` envelope on the group metadata topic,
+    // sealed with ML-KEM-768 to the requester's published public key. Only
+    // applies to MlsEncrypted groups.
+    let (shared_secret_snapshot, secret_epoch_snapshot, is_encrypted, requester_kem_b64) = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(&id)
+            .map(|g| {
+                let requester_kem = g
+                    .members_v2
+                    .get(&requester_hex)
+                    .and_then(|m| m.kem_public_key_b64.clone());
+                (
+                    g.shared_secret.clone(),
+                    g.secret_epoch,
+                    g.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted,
+                    requester_kem,
+                )
+            })
+            .unwrap_or((None, 0, false, None))
+    };
+    if is_encrypted {
+        match (shared_secret_snapshot.as_ref(), requester_kem_b64.as_ref()) {
+            (Some(sec_vec), Some(kem_b64)) if sec_vec.len() == 32 => {
+                let mut sec = [0u8; 32];
+                sec.copy_from_slice(sec_vec);
+                publish_secure_share(
+                    &state,
+                    &metadata_topic,
+                    &id,
+                    &requester_hex,
+                    kem_b64,
+                    &caller_hex,
+                    &sec,
+                    secret_epoch_snapshot,
+                )
+                .await;
+            }
+            (None, _) => {
+                tracing::warn!(
+                    group_id = %id,
+                    "approval: no group shared secret yet; requester will receive via next rekey"
+                );
+            }
+            (_, None) => {
+                tracing::warn!(
+                    group_id = %id,
+                    requester = %requester_hex,
+                    "approval: requester KEM pubkey unknown; cannot seal secure share"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // P0-3: drive local MLS add_member so the approver's MLS state includes the
+    // new member. Cross-daemon welcome propagation (Bob's daemon receives the
+    // welcome packet and joins the MLS group) is explicit Phase D.2 — tracked
+    // below as "welcome propagation gap".
+    let requester_bytes = parse_agent_id_hex(&requester_hex);
+    {
+        let mut mls_groups = state.mls_groups.write().await;
+        if let Some(group) = mls_groups.get_mut(&id) {
+            if let Ok(member_id) = requester_bytes {
+                if !group.is_member(&member_id) {
+                    match group.add_member(member_id).await {
+                        Ok(_) => {
+                            tracing::debug!(
+                                target: "x0x::groups",
+                                "approved {} → added to MLS group {}",
+                                &requester_hex[..16.min(requester_hex.len())],
+                                &id[..16.min(id.len())]
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "MLS add_member on approval failed: {e} — roster updated anyway"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    save_mls_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::JoinRequestApproved {
+        group_id: id,
+        request_id,
+        revision,
+        actor: caller_hex,
+        requester_agent_id: requester_hex,
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "revision": revision })),
+    )
+}
+
+/// POST /groups/:id/requests/:request_id/reject — reject request (admin+).
+async fn reject_join_request(
+    State(state): State<Arc<AppState>>,
+    Path((id, request_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+    let (metadata_topic, requester_hex) = {
+        let mut groups = state.named_groups.write().await;
+        let Some(info) = groups.get_mut(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+            return e;
+        }
+        let Some(req) = info.join_requests.get_mut(&request_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "request not found" })),
+            );
+        };
+        if !req.is_pending() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "ok": false, "error": "request is not pending" })),
+            );
+        }
+        req.status = x0x::groups::JoinRequestStatus::Rejected;
+        req.reviewed_by = Some(caller_hex.clone());
+        req.reviewed_at = Some(now_millis_u64());
+        (info.metadata_topic.clone(), req.requester_agent_id.clone())
+    };
+
+    save_named_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::JoinRequestRejected {
+        group_id: id,
+        request_id,
+        actor: caller_hex,
+        requester_agent_id: requester_hex,
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
+/// DELETE /groups/:id/requests/:request_id — cancel own pending request.
+async fn cancel_join_request(
+    State(state): State<Arc<AppState>>,
+    Path((id, request_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+    let (metadata_topic, requester_hex) = {
+        let mut groups = state.named_groups.write().await;
+        let Some(info) = groups.get_mut(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        let Some(req) = info.join_requests.get_mut(&request_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "request not found" })),
+            );
+        };
+        if req.requester_agent_id != caller_hex {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "ok": false, "error": "not your request" })),
+            );
+        }
+        if !req.is_pending() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "ok": false, "error": "request is not pending" })),
+            );
+        }
+        req.status = x0x::groups::JoinRequestStatus::Cancelled;
+        (info.metadata_topic.clone(), req.requester_agent_id.clone())
+    };
+
+    save_named_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::JoinRequestCancelled {
+        group_id: id,
+        request_id,
+        requester_agent_id: requester_hex,
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
+/// GET /groups/discover — list locally known discoverable groups.
+async fn discover_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut cards: HashMap<String, x0x::groups::GroupCard> =
+        state.group_card_cache.read().await.clone();
+    // Also synthesize cards for any local groups the caller owns that are discoverable.
+    let groups = state.named_groups.read().await;
+    for info in groups.values() {
+        if let Some(card) = info.to_group_card() {
+            cards.entry(info.mls_group_id.clone()).or_insert(card);
+        }
+    }
+    let list: Vec<&x0x::groups::GroupCard> = cards.values().collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "groups": list })),
+    )
+}
+
+/// GET /groups/cards/:id — fetch a single group card.
+async fn get_group_card(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // Prefer cached card; fall back to synthesising from a locally-owned group.
+    {
+        let cache = state.group_card_cache.read().await;
+        if let Some(card) = cache.get(&id) {
+            return Json(serde_json::to_value(card).unwrap_or(serde_json::Value::Null))
+                .into_response();
+        }
+    }
+    let groups = state.named_groups.read().await;
+    if let Some(info) = groups.get(&id) {
+        if let Some(card) = info.to_group_card() {
+            return Json(serde_json::to_value(&card).unwrap_or(serde_json::Value::Null))
+                .into_response();
+        }
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "ok": false, "error": "card not found" })),
+    )
+        .into_response()
+}
+
+/// POST /groups/cards/import — accept a discoverable card into the local cache.
+///
+/// If no local `GroupInfo` exists for the group_id, creates a minimal "discovered"
+/// stub so that the caller can submit join requests. The stub records the policy
+/// summary (inferred from the card) but has an empty roster (the caller is not a
+/// member yet) and no MLS group. When a `JoinRequestApproved` event arrives, the
+/// stub is upgraded via `apply_named_group_metadata_event`.
+async fn import_group_card(
+    State(state): State<Arc<AppState>>,
+    Json(card): Json<x0x::groups::GroupCard>,
+) -> impl IntoResponse {
+    if card.policy_summary.discoverability == x0x::groups::GroupDiscoverability::Hidden {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "card is hidden" })),
+        );
+    }
+    let group_id = card.group_id.clone();
+
+    // Parse owner hex into an AgentId for the stub.
+    let creator = match parse_agent_id_hex(&card.owner_agent_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid owner_agent_id" })),
+            );
+        }
+    };
+
+    // Full policy is reconstructed from the card summary — all five axes round-trip.
+    let policy = x0x::groups::GroupPolicy::from(&card.policy_summary);
+
+    state
+        .group_card_cache
+        .write()
+        .await
+        .insert(group_id.clone(), card.clone());
+
+    // Create a local stub GroupInfo if none exists.
+    let mut groups = state.named_groups.write().await;
+    if !groups.contains_key(&group_id) {
+        let mut stub = x0x::groups::GroupInfo::with_policy(
+            card.name.clone(),
+            card.description.clone(),
+            creator,
+            group_id.clone(),
+            policy,
+        );
+        // The stub should not treat the caller as the owner — reset members_v2
+        // and store the owner (from card) as the active Owner.
+        stub.members_v2.clear();
+        stub.members_v2.insert(
+            card.owner_agent_id.clone(),
+            x0x::groups::GroupMember::new_owner(card.owner_agent_id.clone(), None, card.created_at),
+        );
+        // Phase D.2: the importer is NOT a member yet. They must not have a
+        // shared secret until a SecureShareDelivered envelope arrives after
+        // approval. Clearing the auto-generated stub secret also prevents the
+        // apply handler from treating "already have a secret at epoch 0" as
+        // a reason to drop alice's delivery.
+        stub.shared_secret = None;
+        stub.secret_epoch = 0;
+        groups.insert(group_id.clone(), stub);
+    }
+    drop(groups);
+    save_named_groups(&state).await;
+    ensure_named_group_metadata_listener(Arc::clone(&state), &group_id).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": group_id,
+            // P1-9: be explicit about what an imported stub actually is. The
+            // importer is not a member; they have no MLS state; admin
+            // operations against this group from this daemon will be denied
+            // until a JoinRequestApproved event promotes them.
+            "stub": true,
+            "discovered": true,
+            "secure_access": false,
+        })),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Phase D.2 — Group shared-secret encrypted content (GSS)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SecureEncryptRequest {
+    /// Base64-encoded plaintext payload.
+    payload_b64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SecureDecryptRequest {
+    ciphertext_b64: String,
+    nonce_b64: String,
+    secret_epoch: u64,
+}
+
+/// POST /groups/:id/secure/encrypt — AEAD-encrypt content using the group's
+/// current shared secret. Member-only.
+///
+/// This is a symmetric-key layer alongside the MLS roster: it gives honest
+/// cross-daemon encrypt/decrypt with rekey-on-ban, but does NOT provide the
+/// per-message forward secrecy that full MLS TreeKEM would. Documented as
+/// Phase D.2 scope.
+async fn secure_group_encrypt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SecureEncryptRequest>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+    if !info.has_active_member(&caller_hex) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": "not a member" })),
+        );
+    }
+    if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "group is not MlsEncrypted — use public send instead"
+            })),
+        );
+    }
+    let Some(key) = info.secure_message_key() else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "no shared secret available — await welcome or ask admin to re-share"
+            })),
+        );
+    };
+    let epoch = info.secret_epoch;
+    let group_id_clone = info.mls_group_id.clone();
+    drop(groups);
+
+    use base64::Engine as _;
+    let plaintext = match base64::engine::general_purpose::STANDARD.decode(&req.payload_b64) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid base64 payload" })),
+            );
+        }
+    };
+
+    // Generate a fresh random nonce per message — epoch-keyed AEAD requires
+    // per-message nonce uniqueness.
+    use rand::RngCore;
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    let cipher = match chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "cipher init failed" })),
+            );
+        }
+    };
+    let aad = format!("x0x.group.secure|{}|{}", group_id_clone, epoch);
+    let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
+    let ciphertext = match cipher.encrypt(
+        nonce,
+        chacha20poly1305::aead::Payload {
+            msg: &plaintext,
+            aad: aad.as_bytes(),
+        },
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("encrypt failed: {e}") })),
+            );
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+            "nonce_b64": base64::engine::general_purpose::STANDARD.encode(nonce_bytes),
+            "secret_epoch": epoch,
+        })),
+    )
+}
+
+/// POST /groups/:id/secure/decrypt — AEAD-decrypt content using the group's
+/// shared secret at the given epoch.
+///
+/// Returns 400 if the caller's local shared-secret epoch differs from the
+/// ciphertext epoch (i.e. they've been rekeyed out, or haven't caught up yet).
+/// A banned peer with a stale secret cannot decrypt new-epoch messages — that
+/// proves the rekey-on-ban semantics.
+async fn secure_group_decrypt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SecureDecryptRequest>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+    if !info.has_active_member(&caller_hex) && !info.is_banned(&caller_hex) {
+        // Removed/never-member callers can't decrypt.
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": "not a member" })),
+        );
+    }
+    let Some(local_secret) = info.shared_secret.clone() else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "no shared secret available"
+            })),
+        );
+    };
+    let local_epoch = info.secret_epoch;
+    let group_id_clone = info.mls_group_id.clone();
+    drop(groups);
+
+    // Caller's local epoch must match the ciphertext epoch. A banned member
+    // keeps their pre-ban secret; they cannot decrypt ciphertexts at higher
+    // epochs because they don't have the new secret.
+    if req.secret_epoch != local_epoch {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "epoch mismatch — re-share required",
+                "local_epoch": local_epoch,
+                "ciphertext_epoch": req.secret_epoch,
+            })),
+        );
+    }
+
+    use base64::Engine as _;
+    let ciphertext = match base64::engine::general_purpose::STANDARD.decode(&req.ciphertext_b64) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid base64 ciphertext" })),
+            );
+        }
+    };
+    let nonce_bytes = match base64::engine::general_purpose::STANDARD.decode(&req.nonce_b64) {
+        Ok(n) => n,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid base64 nonce" })),
+            );
+        }
+    };
+    if nonce_bytes.len() != 12 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "nonce must be 12 bytes" })),
+        );
+    }
+
+    let key = x0x::groups::GroupInfo::derive_message_key(
+        &local_secret,
+        req.secret_epoch,
+        &group_id_clone,
+    );
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    let cipher = match chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "cipher init failed" })),
+            );
+        }
+    };
+    let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
+    let aad = format!("x0x.group.secure|{}|{}", group_id_clone, req.secret_epoch);
+    match cipher.decrypt(
+        nonce,
+        chacha20poly1305::aead::Payload {
+            msg: &ciphertext,
+            aad: aad.as_bytes(),
+        },
+    ) {
+        Ok(plaintext) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "payload_b64": base64::engine::general_purpose::STANDARD.encode(&plaintext),
+                "secret_epoch": req.secret_epoch,
+            })),
+        ),
+        Err(_) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": "decryption failed" })),
+        ),
+    }
+}
+
+/// POST /groups/:id/secure/reseal — produce a real `SecureShareDelivered`-
+/// format envelope sealing the group's CURRENT shared secret to a named
+/// recipient's ML-KEM-768 public key.
+///
+/// Authorization:
+/// - Caller must pass `info.has_active_member(&caller_hex)` (403 otherwise).
+/// - The caller's daemon must already hold `info.shared_secret` locally
+///   (424 FAILED_DEPENDENCY otherwise).
+///
+/// These two checks together ensure the endpoint grants no capability the
+/// caller does not already possess: an active member whose daemon holds the
+/// current secret could re-seal it themselves at the primitive layer using
+/// `seal_group_secret_to_recipient`. Note: the active-member check alone is
+/// not sufficient — a freshly-approved member is Active before their gossip-
+/// delivered envelope arrives; in that window `info.shared_secret` is None
+/// and this endpoint returns 424.
+///
+/// The recipient must be a known member of the group with a published KEM
+/// public key (404 / 424 otherwise).
+///
+/// Used by the D.2 adversarial E2E proof to obtain a **real live-path
+/// envelope** (produced via the same `seal_group_secret_to_recipient` +
+/// `secure_share_aad` path used on the approve/ban hot path) that can then
+/// be posted to another daemon's `POST /groups/secure/open-envelope` to
+/// demonstrate that a non-recipient cannot open it — stronger than the
+/// "random bytes" adversarial check because the envelope is a genuine
+/// sealing-path output bound to the current epoch + AAD.
+#[derive(Debug, Deserialize)]
+struct ResealRequest {
+    /// Agent hex of the recipient whose ML-KEM public key will be used to
+    /// seal the envelope. Must be an active member of the group.
+    recipient: String,
+}
+
+async fn secure_group_reseal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ResealRequest>,
+) -> impl IntoResponse {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+        );
+    };
+    if !info.has_active_member(&caller_hex) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": "not a member" })),
+        );
+    }
+    // Recipient must be a known member with a KEM pubkey.
+    let Some(recipient_member) = info.members_v2.get(&req.recipient) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "recipient is not a member" })),
+        );
+    };
+    let Some(recipient_kem_b64) = recipient_member.kem_public_key_b64.clone() else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "recipient has no published KEM public key"
+            })),
+        );
+    };
+    let Some(secret_vec) = info.shared_secret.clone() else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "no shared secret available on this daemon"
+            })),
+        );
+    };
+    let epoch = info.secret_epoch;
+    let group_id_wire = info.mls_group_id.clone();
+    drop(groups);
+
+    if secret_vec.len() != 32 {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "shared secret has unexpected length"
+            })),
+        );
+    }
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(&secret_vec);
+
+    use base64::Engine as _;
+    let recipient_kem_bytes =
+        match base64::engine::general_purpose::STANDARD.decode(&recipient_kem_b64) {
+            Ok(b) => b,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "recipient KEM public key is not valid base64"
+                    })),
+                );
+            }
+        };
+    let aad = secure_share_aad(&group_id_wire, &req.recipient, epoch);
+    let (kem_ct, aead_nonce, aead_ct) =
+        match x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+            &recipient_kem_bytes,
+            &aad,
+            &secret,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("seal failed: {e}")
+                    })),
+                );
+            }
+        };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": group_id_wire,
+            "recipient": req.recipient,
+            "secret_epoch": epoch,
+            "kem_ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(&kem_ct),
+            "aead_nonce_b64": base64::engine::general_purpose::STANDARD.encode(aead_nonce),
+            "aead_ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(&aead_ct),
+        })),
+    )
+}
+
+/// POST /groups/secure/open-envelope — ADVERSARIAL TEST endpoint.
+///
+/// Attempt to open a `SecureShareDelivered` envelope using THIS daemon's
+/// ML-KEM-768 private key. If the envelope was not sealed to our public
+/// key, this MUST fail. Used by `tests/e2e_named_groups.sh` section 2c to
+/// prove recipient-confidentiality: an observer (different daemon, different
+/// KEM keypair) cannot recover the group secret from a captured envelope.
+#[derive(Debug, Deserialize)]
+struct OpenEnvelopeRequest {
+    group_id: String,
+    recipient: String,
+    secret_epoch: u64,
+    kem_ciphertext_b64: String,
+    aead_nonce_b64: String,
+    aead_ciphertext_b64: String,
+}
+
+async fn secure_open_envelope_adversarial(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OpenEnvelopeRequest>,
+) -> impl IntoResponse {
+    use base64::Engine as _;
+    let kem_ct = match base64::engine::general_purpose::STANDARD.decode(&req.kem_ciphertext_b64) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "bad kem_ciphertext_b64" })),
+            );
+        }
+    };
+    let nonce = match base64::engine::general_purpose::STANDARD.decode(&req.aead_nonce_b64) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "bad aead_nonce_b64" })),
+            );
+        }
+    };
+    if nonce.len() != 12 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "nonce must be 12 bytes" })),
+        );
+    }
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&nonce);
+    let aead_ct = match base64::engine::general_purpose::STANDARD.decode(&req.aead_ciphertext_b64) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "bad aead_ciphertext_b64" })),
+            );
+        }
+    };
+    let aad = secure_share_aad(&req.group_id, &req.recipient, req.secret_epoch);
+    match x0x::groups::kem_envelope::open_group_secret(
+        &state.agent_kem_keypair,
+        &aad,
+        &kem_ct,
+        &nonce_bytes,
+        &aead_ct,
+    ) {
+        Ok(secret) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "opened": true,
+                "secret_b64": base64::engine::general_purpose::STANDARD.encode(secret),
+            })),
+        ),
+        Err(_) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "opened": false,
+                "error": "envelope not decryptable by this daemon's key",
+            })),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

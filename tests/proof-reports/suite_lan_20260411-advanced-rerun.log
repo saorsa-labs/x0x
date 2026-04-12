@@ -1,0 +1,309 @@
+[1m[0;36m╔══════════════════════════════════════════════════════════════════╗[0m
+[1m[0;36m║  x0x LAN E2E Test Suite v2 — v0.16.0[0m
+[1m[0;36m║  Nodes: studio1.local, studio2.local[0m
+[1m[0;36m║  PROOF TOKEN: proof-1775944400-92940[0m
+[1m[0;36m╚══════════════════════════════════════════════════════════════════╝[0m
+
+[0;36m[0/18] Prerequisites[0m
+  [0;32mOK[0m   x0xd: /Users/davidirvine/Desktop/Devel/projects/x0x/target/release/x0xd
+  [0;32mOK[0m   x0x:  /Users/davidirvine/Desktop/Devel/projects/x0x/target/release/x0x
+  [0;32mPASS[0m SSH to studio1.local
+  [0;32mPASS[0m SSH to studio2.local
+
+[0;36m[1/18] Deploy x0xd + x0x CLI to LAN nodes[0m
+  [0;32mOK[0m   Deployed to studio1.local
+  [0;32mOK[0m   Deployed to studio2.local
+  Waiting for daemons to start...
+  [0;32mOK[0m   studio1.local daemon ready (1s)
+  [0;32mOK[0m   studio2.local daemon ready (1s)
+  [0;32mOK[0m   Tokens acquired (s1=3a10176e..., s2=0f6f8bb1...)
+
+[0;36m[2/18] Health & Identity (PROOF)[0m
+  [0;32mPASS[0m studio1 health
+        [0;36mPROOF version: 0.16.0[0m
+  [0;32mPASS[0m studio2 health
+        [0;36mPROOF version: 0.16.0[0m
+  [0;32mPASS[0m studio1 agent identity
+        [0;36mPROOF agent_id: fbf3ddcc6fae718fa2e1e809c96ba877a67015bdeda9be03e701c9094f32d43c[0m
+        [0;36mPROOF machine_id: 5ab0cc0a8c07552a58f5ed7c23c2336b54437d2cc7ef3b64ee8a7c76a0a82f11[0m
+  [0;32mPASS[0m studio2 agent identity
+        [0;36mPROOF agent_id: 1c7f260468e0884e738692f6fb731dbf8501c4cac7036d022f3e13fae8b33a84[0m
+        [0;36mPROOF machine_id: 34eb17edaf5fec2b5ea252ddcad4e37ba64c3fbebb38c8693ffdba2d04d3b654[0m
+  [0;32mPASS[0m studio1 ≠ studio2 agent IDs [PROOF: fbf3ddcc6fae718f... ≠ 1c7f260468e0884e...]
+  [0;32mPASS[0m studio1 agent card
+  [0;32mPASS[0m studio2 agent card
+  studio1: fbf3ddcc6fae718f...
+  studio2: 1c7f260468e0884e...
+
+[0;36m[3/18] Network Status & NAT/UPnP[0m
+  [0;32mPASS[0m studio1 network status
+        [0;36mPROOF nat_type: Unknown[0m
+        [0;36mPROOF local_addr: [::]:19601[0m
+        [0;36mPROOF has_global_address: True[0m
+        [0;36mPROOF can_receive_direct: False[0m
+  [0;32mPASS[0m studio1 network/external_addrs [PROOF: count=2
+  addr=192.168.1.108:19601
+  addr=[2a0d:3344:32d:2e10:a0ac:3306:5258:44fd]:19601]
+  [0;32mPASS[0m studio2 network status
+        [0;36mPROOF nat_type: Unknown[0m
+        [0;36mPROOF external_addrs: ['192.168.1.179:19602', '[2a0d:3344:32d:2e10:39be:eb2e:9805:6342]:19602'][0m
+  [0;32mPASS[0m studio1 bootstrap cache
+  [0;32mPASS[0m studio2 bootstrap cache
+
+[0;36m[4/18] GUI Endpoint[0m
+  [0;32mPASS[0m studio1 /gui serves HTML [PROOF: HTML response confirmed]
+  [0;32mPASS[0m studio1 /gui contains 'x0x'
+  [0;32mPASS[0m studio1 /gui Content-Type: text/html
+  [0;32mPASS[0m studio1 /gui includes API token
+  [0;32mPASS[0m studio1 /constitution markdown
+  [0;32mPASS[0m studio1 /constitution/json
+        [0;36mPROOF version: 0.91[0m
+
+[0;36m[5/18] x0x CLI on LAN Nodes[0m
+  [0;32mPASS[0m studio1 CLI: x0x health
+        [0;36mPROOF ok: True[0m
+  [0;32mPASS[0m studio1 CLI: x0x agent
+  [0;32mPASS[0m studio1 CLI agent_id matches REST [PROOF: sent='fbf3ddcc6fae718fa2e1e809c96ba877a67015bdeda9be03e701c9094f32d43c' received='fbf3ddcc6fae718fa2e1e809c96ba877a67015bdeda9be03e701c9094f32d43c']
+  [0;32mPASS[0m studio1 CLI: x0x peers
+  [0;32mPASS[0m studio1 CLI: x0x agents list
+  [0;32mPASS[0m studio2 CLI: x0x health
+  [0;32mPASS[0m studio2 CLI: x0x agent
+  [0;32mPASS[0m studio1 CLI: x0x status
+
+[0;36m[6/18] mDNS LAN Discovery (zero bootstrap)[0m
+  Waiting up to 90s for mDNS discovery...
+  [0;31mFAIL[0m studio1 did not discover studio2 within 90s
+  [0;31mFAIL[0m studio2 did not discover studio1 within 90s
+  [0;32mPASS[0m studio1 discovered list
+  [PROOF: studio1 sees 1 discovered agents]
+  [0;31mFAIL[0m studio1 get discovered studio2 — curl_failed (non-2xx)
+        [0;36mPROOF agent_id: <missing>[0m
+  [0;31mFAIL[0m studio1 reachability of studio2 — curl_failed (non-2xx)
+        [0;36mPROOF can_receive_direct: <missing>[0m
+        [0;36mPROOF likely_direct: <missing>[0m
+
+[0;36m[7/18] Direct Messaging (PROOF round-trip)[0m
+  [0;32mPASS[0m studio2 imports studio1 card
+  [0;32mPASS[0m studio1 imports studio2 card
+  [0;32mPASS[0m studio1 connects to studio2 [PROOF: outcome=Coordinated]
+  [0;32mPASS[0m studio1 direct send to studio2
+  [PROOF: sent payload='proof-1775944400-92940-direct-s1-to-s2' (base64: cHJvb2YtMTc3NTk0NDQw...)]
+  [0;32mPASS[0m studio1 connections
+  [0;32mPASS[0m studio1 connected to studio2 [PROOF: agent_id=1c7f260468e0884e738692f6fb731dbf8501c4cac7036d022f3e13fae8b33a84]
+  [0;32mPASS[0m studio2 direct send to studio1
+  [PROOF: sent payload='proof-1775944400-92940-direct-s2-to-s1']
+  [0;32mPASS[0m studio1 CLI: direct connections
+
+[0;36m[8/18] Pub/Sub Messaging (PROOF)[0m
+  [0;32mPASS[0m studio2 subscribe to proof-1775944400-92940-pubsub
+  [PROOF: subscription id=63e248e8b28167f2]
+  [0;32mPASS[0m studio1 publish to proof-1775944400-92940-pubsub
+  [PROOF: published payload='proof-1775944400-92940-pubsub-payload' on topic='proof-1775944400-92940-pubsub']
+  [0;32mPASS[0m studio1 announce identity
+  [0;32mPASS[0m studio2 unsubscribe
+  [0;32mPASS[0m studio1 CLI: x0x publish
+
+[0;36m[9/18] Contacts & Trust[0m
+  [0;32mPASS[0m studio1 adds studio2 as Known
+  [0;32mPASS[0m studio1 contacts list
+  [0;32mPASS[0m studio1 contact list has studio2
+  [0;32mPASS[0m studio1 trusts studio2
+  [0;32mPASS[0m trust evaluate
+  [0;32mPASS[0m trust evaluate: Trusted → Accept [PROOF: decision=Accept]
+  [0;32mPASS[0m studio1 CLI: contacts list
+
+[0;36m[10/18] MLS Group Encryption (Post-Quantum)[0m
+  [0;32mPASS[0m studio1 creates MLS group
+  [PROOF: MLS group id=8e2c17f61e701da8ab580418de68076ace9f3649aefac47ab441a01aa871f505 name=proof-1775944400-92940-mls]
+  [0;32mPASS[0m studio1 adds studio2 to MLS group
+  [PROOF: MLS epoch after add=1]
+  [0;32mPASS[0m studio1 creates MLS welcome
+  [0;32mPASS[0m studio1 MLS encrypt
+  [PROOF: encrypted 72 chars of ciphertext]
+  [0;32mPASS[0m studio1 MLS decrypt round-trip
+  [0;32mPASS[0m MLS encrypt→decrypt proof [PROOF: sent='proof-1775944400-92940-mls-encrypted' received='proof-1775944400-92940-mls-encrypted']
+  [0;32mPASS[0m studio1 list MLS groups
+
+[0;36m[11/18] Named Groups (Spaces)[0m
+  [0;32mPASS[0m studio1 creates named group
+  [PROOF: group id=57015b8e2cb747212b7d365faedee5e1b05e2924d9d0253b386557589c639edc name=proof-1775944400-92940-space]
+  [0;32mPASS[0m studio1 creates invite
+  [PROOF: invite_link='x0x://invite/eyJncm91cF9pZCI6IjU3MDE1Yjh...']
+  [0;32mPASS[0m invite link uses x0x://invite/ format [PROOF: x0x://invite/eyJncm91cF9pZCI6IjU3MDE1YjhlMmNiNzQ3MjEyYjdkMzY...]
+  [0;32mPASS[0m studio2 joins named group
+  [0;32mPASS[0m studio1 sets group display name
+  [0;32mPASS[0m studio2 group info
+  [0;32mPASS[0m studio2 space member list includes self
+  [0;32mPASS[0m studio2 space display name persisted
+  [0;32mPASS[0m studio1 list groups
+  [0;32mPASS[0m studio2 list groups
+  [0;32mPASS[0m studio2 leaves named group
+  [0;32mPASS[0m studio2 space removed from group list after leave
+
+[0;36m[12/18] Key-Value Store (PROOF)[0m
+  [0;32mPASS[0m studio1 creates KV store
+  [PROOF: store id=proof-1775944400-92940-kv topic=proof-1775944400-92940-kv]
+  [0;32mPASS[0m studio2 joins KV store by topic
+  [0;32mPASS[0m studio1 KV put proof-key
+  [PROOF: wrote value='proof-1775944400-92940-value-1775944911' to proof-key]
+  [0;32mPASS[0m studio1 KV get proof-key
+  [0;32mPASS[0m KV put→get proof [PROOF: sent='proof-1775944400-92940-value-1775944911' received='proof-1775944400-92940-value-1775944911']
+  [0;32mPASS[0m studio1 KV list keys
+  [0;32mPASS[0m studio1 KV has 4 keys [PROOF: expected ≥4]
+  [0;32mPASS[0m studio1 KV delete key-1
+  Waiting 15s for KV store CRDT sync...
+  [0;32mPASS[0m studio2 sees KV proof-key (CRDT sync)
+  [0;32mPASS[0m KV CRDT sync studio1→studio2 [PROOF: sent='proof-1775944400-92940-value-1775944911' received='proof-1775944400-92940-value-1775944911']
+  [0;32mPASS[0m studio1 CLI: store list
+
+[0;36m[13/18] Kanban / CRDT Task Lists (LAN sync)[0m
+  [0;32mPASS[0m studio1 creates kanban (task list)
+  [PROOF: task-list id=proof-1775944400-92940-kanban topic=proof-1775944400-92940-kanban]
+  [0;32mPASS[0m studio2 joins kanban (same topic)
+  [0;32mPASS[0m studio1 adds task to kanban
+  [PROOF: task id=c427c989c658e9818b732ae3f82598d441520dd1404fdec5431428ea6d96c2bf title='[PROOF] LAN Task proof-1775944400-92940']
+  [0;32mPASS[0m studio1 adds second task
+  Waiting 20s for CRDT kanban sync across LAN...
+  [0;32mPASS[0m studio2 sees kanban tasks (CRDT)
+  [0;32mPASS[0m studio2 kanban has 2 tasks [PROOF: CRDT sync worked]
+  [0;32mPASS[0m studio2 claims task (kanban: ToDo→In Progress)
+  [PROOF: studio2 claimed task c427c989c658e9818b732ae3f82598d441520dd1404fdec5431428ea6d96c2bf]
+  [0;32mPASS[0m studio1 sees updated task (claimed)
+  [0;32mPASS[0m studio2 completes task (kanban: In Progress→Done)
+  [PROOF: studio2 completed task c427c989c658e9818b732ae3f82598d441520dd1404fdec5431428ea6d96c2bf]
+  [0;32mPASS[0m task CRDT state converged to Done [PROOF: state=done:1c7f260468e0884e738692f6fb731dbf8501c4cac7036d022f3e13fae8b33a84]
+  [0;32mPASS[0m studio1 CLI: tasks list
+
+[0;36m[14/18] Presence & FOAF Discovery[0m
+  Waiting 35s for presence beacons...
+  [0;32mPASS[0m studio1 presence online
+  [PROOF: studio1 sees 2 online agents]
+  [0;32mPASS[0m studio2 in studio1 presence [PROOF: 1c7f260468e0884e738692f6fb731dbf8501c4cac7036d022f3e13fae8b33a84 found]
+  [0;32mPASS[0m studio1 presence FOAF
+  [0;32mPASS[0m studio1 presence find studio2
+        [0;36mPROOF agent_id: <missing>[0m
+  [0;32mPASS[0m studio1 presence status studio2
+        [0;36mPROOF status: <missing>[0m
+  [0;32mPASS[0m studio1 CLI: presence online
+  [0;32mPASS[0m studio1 CLI: presence find studio2
+
+[0;36m[15/18] Agent Find (all paths)[0m
+  [0;32mPASS[0m studio1 announce
+  [0;32mPASS[0m studio2 announce
+  [0;32mPASS[0m studio1 find studio2 by ID
+        [0;36mPROOF found: True[0m
+        [0;36mPROOF addresses: ['100.78.147.60:19602', '[2a0d:3344:32d:2e10:39be:eb2e:9805:6342]:19602', '192.168.0.2:19602', '192.168.1.179:19602', '[2a0d:3344:32d:2e10:1c33:9381:fdea:cba5]:19602', '[fd14:a7f0:2914:10:ca0:3b05:be27:b2a8]:19602', '[fd7a:115c:a1e0::301:93b9]:19602'][0m
+  [0;32mPASS[0m studio1 discovered agent by ID
+  [0;32mPASS[0m studio1 all discovered agents
+  [0;32mPASS[0m studio1 CLI: agents find 1c7f260468e0884e738692f6fb731dbf8501c4cac7036d022f3e13fae8b33a84
+  [0;32mPASS[0m studio1 CLI: agents list
+  [PROOF: discovered 2 agents via CLI]
+
+[0;36m[16/18] File Transfer[0m
+  [PROOF: file sha256=37b262922cbc0b0ed636937d2817af8945a84d251ef79a3b2992c7f196a5db43 size=65]
+  [0;32mPASS[0m studio1 initiate file transfer
+  [PROOF: transfer_id=2d2d435b-1490-4c58-a2fd-bf9c2b138f3b]
+  [0;32mPASS[0m studio1 file transfers list
+  [0;32mPASS[0m studio2 sees incoming transfer
+  [0;32mPASS[0m studio2 accepts file transfer
+  [0;32mPASS[0m studio1 sender transfer reaches Complete
+  [0;32mPASS[0m studio2 receiver transfer reaches Complete
+  [0;32mPASS[0m studio2 received file sha256 matches
+  [0;32mPASS[0m studio2 received file body contains proof token
+
+[0;36m[17/18] Seedless Bootstrap (3rd agent via mDNS)[0m
+  [0;32mOK[0m   Third instance (studio2-b) started (1s)
+  [0;32mPASS[0m studio2-b health
+  [PROOF: studio2-b agent_id=fa58368f00c3a7b5...]
+  Waiting 60s for seedless studio2-b to join via mDNS...
+  [0;31mFAIL[0m studio2-b did not discover studio1 within 60s
+
+[0;36m[18/18] Swarm (3-Agent Mesh)[0m
+  Testing full mesh: studio1 ↔ studio2 ↔ studio2-b
+  [0;32mPASS[0m swarm: studio1 sees studio2
+  [0;32mPASS[0m swarm: studio2 sees studio1
+  [0;31mFAIL[0m swarm: studio2-b missing studio1
+  [PROOF: studio1 peers=1, studio2 peers=1]
+  [0;32mPASS[0m studio1 has 1 gossip peer(s)
+  [0;32mPASS[0m swarm broadcast from studio1
+  [PROOF: broadcast 'proof-1775944400-92940-swarm-broadcast' to proof-1775944400-92940-swarm]
+
+[1m[0;33m═══════════════════════════════════════════════════════════════[0m
+[1m[0;33m  x0x LAN E2E Test Results[0m
+[1m[0;33m  PROOF TOKEN: proof-1775944400-92940[0m
+[1m[0;33m  Run at: 2026-04-11 22:07:03 UTC[0m
+[1m[0;33m═══════════════════════════════════════════════════════════════[0m
+[1m[0;31m  ❌ FAILURES: 6/123 FAILED (117 passed, 0 skipped)[0m
+
+  Collecting logs...
+--- studio1 log tail ---
+[2m2026-04-11T22:06:58.469821Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:06:58.469844Z[0m [32m INFO[0m [2mx0x::gossip::runtime[0m[2m:[0m [2/6 runtime] dispatching PubSub message to handle_incoming [3mfrom[0m[2m=[0m34eb17edaf5fec2b [3mbytes[0m[2m=[0m5369
+[2m2026-04-11T22:06:58.538862Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:06:58.541269Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 5498 bytes (PubSub) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:06:58.541314Z[0m [32m INFO[0m [2mx0x::gossip::runtime[0m[2m:[0m [2/6 runtime] dispatching PubSub message to handle_incoming [3mfrom[0m[2m=[0m34eb17edaf5fec2b [3mbytes[0m[2m=[0m5498
+[2m2026-04-11T22:06:58.948681Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:06:59.032695Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:06:59.373944Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:06:59.406821Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:06:59.700621Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:06:59.746793Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:06:59.949892Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:06:59.985222Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:07:00.454191Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:07:00.472978Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:07:01.045633Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:07:01.117208Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:07:01.366840Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:07:01.409952Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:07:01.981483Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:07:02.401594Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:07:02.401653Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:07:02.408371Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:07:02.408452Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:07:02.479565Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:07:02.949188Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:07:03.097727Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:07:03.366491Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 10703 bytes (PubSub) to peer PeerId(34eb17edaf5fec2b)
+[2m2026-04-11T22:07:03.369215Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([52, 235, 23, 237, 175, 95, 236, 43, 94, 162, 82, 221, 202, 212, 227, 123, 166, 76, 63, 190, 187, 56, 200, 105, 63, 253, 186, 45, 4, 211, 182, 84])
+[2m2026-04-11T22:07:03.398152Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(34eb17edaf5fec2b)
+--- studio2 log tail ---
+[2m2026-04-11T22:06:59.569634Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:06:59.613315Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:06:59.827487Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:06:59.856481Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:07:00.307385Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:00.397296Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:07:00.954944Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:00.955003Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:07:01.236357Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:01.277370Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:07:01.883627Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:02.256762Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:02.276961Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:07:02.290618Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:07:02.290691Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:07:02.290787Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:02.843557Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:02.960099Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:07:03.228876Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 10702 bytes (PubSub) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:03.229028Z[0m [32m INFO[0m [2mx0x::gossip::runtime[0m[2m:[0m [2/6 runtime] dispatching PubSub message to handle_incoming [3mfrom[0m[2m=[0m5ab0cc0a8c07552a [3mbytes[0m[2m=[0m10702
+[2m2026-04-11T22:07:03.229565Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] received from PlumTree, decoding [3mtopic[0m[2m=[0mproof-1775944400-92940-swarm [3mpayload_len[0m[2m=[0m5366
+[2m2026-04-11T22:07:03.230237Z[0m [32m INFO[0m [2mx0x::gossip::pubsub[0m[2m:[0m [4/6 pubsub] decoded, forwarding to subscriber channel [3mtopic[0m[2m=[0mproof-1775944400-92940-swarm [3mmsg_topic[0m[2m=[0mproof-1775944400-92940-swarm
+[2m2026-04-11T22:07:03.230334Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m [5/6 x0xd] received from subscriber channel, broadcasting to SSE [3mtopic[0m[2m=[0mproof-1775944400-92940-swarm [3msub_id[0m[2m=[0m5bca24ea5c7e042b [3mpayload_len[0m[2m=[0m38
+[2m2026-04-11T22:07:03.230382Z[0m [33m WARN[0m [2mx0xd[0m[2m:[0m [5/6 x0xd] broadcast send failed (no SSE receivers) [3mtopic[0m[2m=[0mproof-1775944400-92940-swarm
+[2m2026-04-11T22:07:03.239725Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:03.274444Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:07:03.915139Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:03.915155Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+[2m2026-04-11T22:07:04.272019Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([90, 176, 204, 10, 140, 7, 85, 42, 88, 245, 237, 124, 35, 194, 51, 107, 84, 67, 125, 44, 199, 239, 59, 100, 238, 138, 124, 118, 160, 168, 47, 17])
+[2m2026-04-11T22:07:04.432097Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(5ab0cc0a8c07552a)
+
+  Agents tested:
+    studio1: fbf3ddcc6fae718fa2e1e809c96ba877a67015bdeda9be03e701c9094f32d43c
+    studio2: 1c7f260468e0884e738692f6fb731dbf8501c4cac7036d022f3e13fae8b33a84
+    studio2-b: fa58368f00c3a7b514e332ca975627bb5e4fff53fe438c5cae93e6be2a84eeb4
+
+[1m[0;33m═══════════════════════════════════════════════════════════════[0m
+
+[0;33mCleaning up...[0m

@@ -39,6 +39,43 @@ pub async fn info(client: &DaemonClient, group_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// `x0x group members` — GET /groups/:id/members.
+pub async fn members(client: &DaemonClient, group_id: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get(&format!("/groups/{group_id}/members")).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x group add-member` — POST /groups/:id/members.
+pub async fn add_member(
+    client: &DaemonClient,
+    group_id: &str,
+    agent_id: &str,
+    display_name: Option<&str>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let mut body = serde_json::json!({ "agent_id": agent_id });
+    if let Some(dn) = display_name {
+        body["display_name"] = serde_json::Value::String(dn.to_string());
+    }
+    let resp = client
+        .post(&format!("/groups/{group_id}/members"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x group remove-member` — DELETE /groups/:id/members/:agent_id.
+pub async fn remove_member(client: &DaemonClient, group_id: &str, agent_id: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client
+        .delete(&format!("/groups/{group_id}/members/{agent_id}"))
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x group invite` — POST /groups/:id/invite.
 pub async fn invite(client: &DaemonClient, group_id: &str, expiry_secs: u64) -> Result<()> {
     client.ensure_running().await?;
