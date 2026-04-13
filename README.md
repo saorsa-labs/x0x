@@ -413,6 +413,21 @@ curl -H "Authorization: Bearer $TOKEN" "http://$API/groups/discover/nearby"
 
 Subscriptions persist in `~/.x0x/directory-subscriptions.json` and resubscribe with 0–30s jitter at startup.
 
+### Phase E — public-group messaging
+
+`SignedPublic` groups (presets `public_open` and `public_announce`) exchange ML-DSA-65-signed messages on `x0x.groups.public.{group_id}`:
+
+```bash
+# Chat on a public_open group (members-only write)
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  "http://$API/groups/<gid>/send" -d '{"body":"hi","kind":"chat"}'
+
+# Read history (public read; non-members allowed)
+curl -H "Authorization: Bearer $TOKEN" "http://$API/groups/<gid>/messages"
+```
+
+Write-access is enforced **both** at the endpoint and at ingest: `MembersOnly` rejects non-members, `AdminOnly` rejects non-admins, and banned authors are rejected in every mode. Messages carry a `state_hash_at_send` binding to the Phase D.3 chain, are capped at 64 KiB, and the receive-side listener re-validates against the current group view so a ban that lands after a send is still honoured.
+
 ---
 
 ## Build Apps on x0x

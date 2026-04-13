@@ -352,6 +352,11 @@ struct AppState {
     directory_subscriptions_path: PathBuf,
     /// Phase C.2: background shard-listener tasks, keyed by (kind, shard).
     directory_tasks: RwLock<HashMap<(x0x::groups::ShardKind, u32), tokio::task::JoinHandle<()>>>,
+    /// Phase E: per-group ring buffer of validated public messages.
+    /// Keyed by `group_id`. Bounded by `PUBLIC_MESSAGE_HISTORY_CAP`.
+    public_messages: RwLock<HashMap<String, Vec<x0x::groups::GroupPublicMessage>>>,
+    /// Phase E: background listener tasks on public-chat topics.
+    public_message_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Per-daemon ML-KEM-768 keypair used to open `SecureShareDelivered`
     /// envelopes addressed to this agent. Public half is published in the
     /// `/agent` response and in `JoinRequestCreated` so other daemons can
@@ -1136,6 +1141,8 @@ async fn main() -> Result<()> {
         directory_subscriptions: RwLock::new(x0x::groups::SubscriptionSet::default()),
         directory_subscriptions_path: config.data_dir.join("directory-subscriptions.json"),
         directory_tasks: RwLock::new(HashMap::new()),
+        public_messages: RwLock::new(HashMap::new()),
+        public_message_tasks: RwLock::new(HashMap::new()),
         agent_kem_keypair,
         contacts,
         mls_groups: RwLock::new(mls_groups),
@@ -1415,6 +1422,9 @@ async fn main() -> Result<()> {
             "/groups/secure/open-envelope",
             post(secure_open_envelope_adversarial),
         )
+        // Phase E: public-group messaging.
+        .route("/groups/:id/send", post(send_group_public_message))
+        .route("/groups/:id/messages", get(get_group_public_messages))
         .route("/groups/:id/invite", post(create_group_invite))
         .route("/groups/:id/display-name", put(set_group_display_name))
         // Phase D.3 — state-commit chain endpoints.
@@ -5907,6 +5917,346 @@ async fn get_named_group_members(
             "members": members,
         })),
     )
+}
+
+// ──────────────────────── Phase E: public messaging ────────────────────
+
+/// Maximum number of public messages retained per group. Older entries
+/// are dropped on insert (ring-buffer style).
+const PUBLIC_MESSAGE_HISTORY_CAP: usize = 512;
+
+/// Request body for `POST /groups/:id/send`.
+#[derive(Debug, Deserialize)]
+struct SendGroupMessageRequest {
+    /// Message body (UTF-8). Required.
+    body: String,
+    /// Message kind — `"chat"` (default) or `"announcement"`.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// POST /groups/:id/send — publish a message to the group.
+///
+/// Branches on `policy.confidentiality`:
+///
+/// - `SignedPublic` — builds a signed [`GroupPublicMessage`], publishes
+///   to `x0x.groups.public.{group_id}`, and caches it locally.
+///   Write-access is enforced at endpoint time (same rules as
+///   [`x0x::groups::validate_public_message`] applies at ingest).
+/// - `MlsEncrypted` — not supported on this endpoint yet; callers
+///   should use `/groups/:id/secure/encrypt` (Phase D.2).
+async fn send_group_public_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SendGroupMessageRequest>,
+) -> impl IntoResponse {
+    let kind = match req.kind.as_deref().unwrap_or("chat") {
+        "chat" => x0x::groups::GroupPublicMessageKind::Chat,
+        "announcement" => x0x::groups::GroupPublicMessageKind::Announcement,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("unknown kind '{other}' (expected 'chat' or 'announcement')")
+                })),
+            );
+        }
+    };
+
+    if req.body.len() > x0x::groups::MAX_PUBLIC_MESSAGE_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "body exceeds MAX_PUBLIC_MESSAGE_BYTES"
+            })),
+        );
+    }
+
+    let signing_kp = state.agent.identity().agent_keypair();
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Build + endpoint-side authz + sign under the write lock so
+    // concurrent role changes can't race the check.
+    let msg = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "group is not SignedPublic — use /groups/:id/secure/encrypt"
+                })),
+            );
+        }
+        if info.is_banned(&local_hex) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "ok": false, "error": "you are banned" })),
+            );
+        }
+        // Endpoint-side write-access enforcement. Mirror the ingest
+        // validator so we reject locally rather than trust receivers.
+        let caller_role = info.caller_role(&local_hex);
+        match info.policy.write_access {
+            x0x::groups::GroupWriteAccess::MembersOnly => {
+                if caller_role.is_none() {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "error": "members-only write policy"
+                        })),
+                    );
+                }
+            }
+            x0x::groups::GroupWriteAccess::ModeratedPublic => { /* any non-banned */ }
+            x0x::groups::GroupWriteAccess::AdminOnly => {
+                let ok = caller_role
+                    .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
+                    .unwrap_or(false);
+                if !ok {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "error": "admin-only write policy"
+                        })),
+                    );
+                }
+            }
+        }
+
+        match x0x::groups::GroupPublicMessage::sign(
+            info.stable_group_id().to_string(),
+            info.state_hash.clone(),
+            info.state_revision,
+            signing_kp,
+            None,
+            kind,
+            req.body,
+            now_ms,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("sign failed: {e}")
+                    })),
+                );
+            }
+        }
+    };
+
+    // Cache locally so the author sees their own message immediately,
+    // then publish to the public topic.
+    cache_public_message(&state, msg.clone()).await;
+    let topic = x0x::groups::public_topic_for(&msg.group_id);
+    let bytes = match serde_json::to_vec(&msg) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("serialize failed: {e}")
+                })),
+            );
+        }
+    };
+    if let Err(e) = state.agent.publish(&topic, bytes).await {
+        tracing::warn!(topic = %topic, "E: public-send publish failed: {e}");
+    }
+    // Ensure a listener is running on this topic so incoming peer
+    // messages are ingested.
+    spawn_public_message_listener(Arc::clone(&state), msg.group_id.clone()).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": msg.group_id,
+            "topic": topic,
+            "timestamp": msg.timestamp,
+        })),
+    )
+}
+
+/// GET /groups/:id/messages — retrieve cached public messages.
+///
+/// If `policy.read_access == Public`, any caller with a valid API
+/// token receives the history. If `MembersOnly`, only active members
+/// receive it. For `MlsEncrypted` groups, returns 400 — encrypted
+/// history belongs in a different surface.
+async fn get_group_public_messages(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // Resolve the stable_group_id — the public-message cache and topic
+    // are keyed on it, while the URL `:id` is typically the
+    // mls_group_id for a locally-owned group.
+    let (read_access, confidentiality, is_member, stable_id) = {
+        let groups = state.named_groups.read().await;
+        if let Some(info) = groups.get(&id) {
+            (
+                info.policy.read_access,
+                info.policy.confidentiality,
+                info.has_active_member(&local_hex),
+                info.stable_group_id().to_string(),
+            )
+        } else {
+            // Unknown locally — fall through to cache lookup by the
+            // supplied id; this supports non-members reading a
+            // discovered Public group whose mls_group_id == stable.
+            drop(groups);
+            (
+                x0x::groups::GroupReadAccess::Public,
+                x0x::groups::GroupConfidentiality::SignedPublic,
+                false,
+                id.clone(),
+            )
+        }
+    };
+    if confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "MlsEncrypted groups do not publish a plaintext message history"
+            })),
+        );
+    }
+    if read_access == x0x::groups::GroupReadAccess::MembersOnly && !is_member {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "members-only read policy"
+            })),
+        );
+    }
+
+    // Ensure the listener is live on the stable-id topic.
+    spawn_public_message_listener(Arc::clone(&state), stable_id.clone()).await;
+
+    let msgs = state
+        .public_messages
+        .read()
+        .await
+        .get(&stable_id)
+        .cloned()
+        .unwrap_or_default();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "messages": msgs })),
+    )
+}
+
+/// Append a validated message to the per-group ring buffer (capped).
+async fn cache_public_message(state: &AppState, msg: x0x::groups::GroupPublicMessage) {
+    let mut all = state.public_messages.write().await;
+    let slot = all.entry(msg.group_id.clone()).or_default();
+    // Deduplicate by (author_agent_id, timestamp, body) — cheap guard
+    // against double-caching our own just-sent message after the
+    // listener echoes it back.
+    let dup = slot.iter().any(|m| {
+        m.author_agent_id == msg.author_agent_id
+            && m.timestamp == msg.timestamp
+            && m.body == msg.body
+    });
+    if !dup {
+        slot.push(msg);
+        while slot.len() > PUBLIC_MESSAGE_HISTORY_CAP {
+            slot.remove(0);
+        }
+    }
+}
+
+/// Spawn a listener on `x0x.groups.public.{group_id}`. Idempotent — a
+/// duplicate call for the same group_id is a no-op.
+async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
+    {
+        let tasks = state.public_message_tasks.read().await;
+        if tasks.contains_key(&group_id) {
+            return;
+        }
+    }
+    let topic = x0x::groups::public_topic_for(&group_id);
+    let mut sub = match state.agent.subscribe(&topic).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(topic = %topic, "E: failed to subscribe to public chat: {e}");
+            return;
+        }
+    };
+    let state_for_listener = Arc::clone(&state);
+    let group_id_for_listener = group_id.clone();
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                maybe = sub.recv() => {
+                    let Some(gossip_msg) = maybe else { break; };
+                    let msg: x0x::groups::GroupPublicMessage =
+                        match serde_json::from_slice(&gossip_msg.payload) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::debug!("E: dropped malformed public msg: {e}");
+                                continue;
+                            }
+                        };
+                    // Validate against current group view at apply-time.
+                    let snapshot = {
+                        let groups = state_for_listener.named_groups.read().await;
+                        groups.get(&group_id_for_listener).map(|info| (
+                            info.policy.clone(),
+                            info.members_v2.clone(),
+                            info.stable_group_id().to_string(),
+                        ))
+                    };
+                    let Some((policy, members, stable_id)) = snapshot else {
+                        continue;
+                    };
+                    let ctx = x0x::groups::PublicIngestContext {
+                        group_id: &stable_id,
+                        policy: &policy,
+                        members_v2: &members,
+                    };
+                    if let Err(e) = x0x::groups::validate_public_message(&ctx, &msg) {
+                        tracing::warn!(
+                            group_id = %group_id_for_listener,
+                            author = %msg.author_agent_id,
+                            "E: dropped public message: {e}"
+                        );
+                        continue;
+                    }
+                    cache_public_message(&state_for_listener, msg).await;
+                }
+            }
+        }
+    });
+    state
+        .public_message_tasks
+        .write()
+        .await
+        .insert(group_id, handle);
+    tracing::info!(topic = %topic, "E: public-message listener subscribed");
 }
 
 /// POST /groups/:id/invite — generate an invite link (body optional).

@@ -93,6 +93,9 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Get, "/groups/:id/members"),
     (Method::Post, "/groups/:id/members"),
     (Method::Delete, "/groups/:id/members/:agent_id"),
+    // ── Phase E: public-group messaging ─────────────────────────────────
+    (Method::Post, "/groups/:id/send"),
+    (Method::Get, "/groups/:id/messages"),
     (Method::Post, "/groups/:id/invite"),
     (Method::Post, "/groups/join"),
     (Method::Put, "/groups/:id/display-name"),

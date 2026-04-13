@@ -233,6 +233,8 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group state-withdraw <group_id>` | **Phase D.3**: seal terminal withdrawal; evicts public card on peers |
+| POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish a signed message to a SignedPublic group |
+| GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve cached public messages (non-members on Public read) |
 | GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse of PublicDirectory groups |
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
 | POST | `/groups/discover/subscribe` | `x0x group discover-subscribe` | **Phase C.2**: subscribe to a tag/name/id shard |
@@ -272,6 +274,37 @@ Messages on shard topics are `DirectoryMessage::{Card, Digest, Pull}`:
   pairwise to Trusted/Known contacts via direct-message framing
   (`X0X-LTC-CARD-V1\n<card-json>`).
 - `PublicDirectory` — published to tag + name + id shards.
+
+### Phase E — public-group messaging
+
+For groups whose `confidentiality == SignedPublic` (the `public_open`
+and `public_announce` presets), messages are signed ML-DSA-65 artefacts
+on `x0x.groups.public.{group_id}`:
+
+```rust
+GroupPublicMessage {
+    group_id, state_hash_at_send, revision_at_send,
+    author_agent_id, author_public_key, author_user_id,
+    kind: Chat | Announcement,
+    body, timestamp, signature,
+}
+```
+
+Write-access is enforced at both endpoint and ingest:
+
+- `MembersOnly` — only active members may send.
+- `ModeratedPublic` — any non-banned author may send (moderators
+  remove inappropriate content later).
+- `AdminOnly` — only `Admin` or `Owner` may send.
+
+Banned authors are rejected in **every** write-access mode. `POST
+/groups/:id/send` also rejects `MlsEncrypted` groups (route to
+`/secure/encrypt` instead). `GET /groups/:id/messages` returns the
+cached history:
+
+- `read_access == Public` — open to any caller with a valid API token.
+- `read_access == MembersOnly` — requires active membership.
+- `MlsEncrypted` — returns 400 (encrypted history belongs elsewhere).
 
 ### Phase D.3 — state-commit chain
 

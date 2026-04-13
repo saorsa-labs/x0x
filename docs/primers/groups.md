@@ -121,6 +121,46 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
   shard listener defensively drops any received card whose
   discoverability is not `PublicDirectory` (would-be leak).
 
+## Public-group messaging (Phase E)
+
+Groups configured with `SignedPublic` confidentiality (the
+`public_open` and `public_announce` presets) carry signed chat /
+announcement messages on `x0x.groups.public.{group_id}`:
+
+```bash
+# Send a chat message to a public_open group (members-only write).
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "http://$API/groups/<group_id>/send" \
+  -d '{"body":"hello world","kind":"chat"}'
+
+# Publish an announcement (AdminOnly write — owner/admin only).
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "http://$API/groups/<group_id>/send" \
+  -d '{"body":"v1 released","kind":"announcement"}'
+
+# Read the cache. Public read_access: any API client.
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://$API/groups/<group_id>/messages"
+```
+
+**Write-access rules (enforced at endpoint AND ingest):**
+
+| `write_access`       | Who may publish                                      |
+|----------------------|------------------------------------------------------|
+| `MembersOnly`        | active members                                       |
+| `ModeratedPublic`    | any non-banned author (moderators clean up later)    |
+| `AdminOnly`          | active `Admin` or `Owner` only                       |
+
+Banned authors are **always** rejected regardless of write-access mode.
+Every message carries a ML-DSA-65 signature, the signer's public key
+(so verification is standalone), a `state_hash_at_send` + `revision_at_send`
+binding to the D.3 chain, and is capped at 64 KiB body.
+
+`MlsEncrypted` groups do not use this path — use
+`/groups/:id/secure/encrypt` (Phase D.2) for encrypted content.
+
 ## Setup once
 
 Install x0x from the current upstream release or `SKILL.md` flow in the repo: [github.com/saorsa-labs/x0x](https://github.com/saorsa-labs/x0x). Then start the daemon with `x0x start` or `x0xd`.

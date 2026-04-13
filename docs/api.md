@@ -106,6 +106,8 @@ This is the shorter, at-a-glance API map for `x0xd`. For the full reference, req
 | GET | `/groups/:id/state` | `x0x group state` | **Phase D.3**: signed state-commit chain inspection |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal` | **Phase D.3**: advance commit chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group state-withdraw` | **Phase D.3**: seal terminal withdrawal |
+| POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish signed message to SignedPublic group |
+| GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve public-group messages |
 | GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse (PublicDirectory only) |
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
 | POST | `/groups/discover/subscribe` | `x0x group discover-subscribe` | **Phase C.2**: subscribe to a tag/name/id directory shard |

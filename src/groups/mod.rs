@@ -16,6 +16,7 @@ pub mod invite;
 pub mod kem_envelope;
 pub mod member;
 pub mod policy;
+pub mod public_message;
 pub mod request;
 pub mod state_commit;
 
@@ -35,6 +36,11 @@ pub use self::member::{GroupMember, GroupMemberState, GroupRole};
 pub use self::policy::{
     GroupAdmission, GroupConfidentiality, GroupDiscoverability, GroupPolicy, GroupPolicyPreset,
     GroupPolicySummary, GroupReadAccess, GroupWriteAccess,
+};
+pub use self::public_message::{
+    public_topic_for, validate_public_message, GroupPublicMessage, GroupPublicMessageKind,
+    IngestError as PublicMessageIngestError, PublicIngestContext, MAX_PUBLIC_MESSAGE_BYTES,
+    PUBLIC_GROUP_TOPIC_PREFIX, PUBLIC_MESSAGE_DOMAIN,
 };
 pub use self::request::{JoinRequest, JoinRequestStatus};
 pub use self::state_commit::{

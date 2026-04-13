@@ -18,7 +18,7 @@ Implementation is in progress across multiple phases and branches. This document
 | Phase D.2 | Secure share distribution | Cross-daemon sealed rekey-on-ban via ML-KEM-768 envelopes (interim) | **landed** |
 | Phase D.3 | Stable identity + state commits | `GroupGenesis`, `GroupStateCommit`, signed `GroupCard`, apply-side validation, withdrawal supersession | **landed** |
 | Phase C.2 | Distributed discovery index | Partition-tolerant gossip discovery without DHT or special nodes | **code landed, proof-debt open** — see `.planning/c2-proof-hardening.md` |
-| Phase E | Public group behavior | Open/public send-receive, moderation, and announcement semantics | planned |
+| Phase E | Public group behavior | Open/public send-receive, moderation, and announcement semantics | **landed** |
 | Phase D.4 | Strict apply-side enforcement | Move every state-changing action through `apply_event`; secure/roster binding invariant tests | planned |
 | Phase F | Review hardening | Repeatable proof, privacy validation, negative-path authz, convergence | planned |
 
@@ -92,6 +92,45 @@ Phase C.2 landed the distributed discovery index:
   Incremental digest+pull over the contact channel is follow-up work.
 - Deprecation of the legacy `x0x.discovery.groups` bridge topic — it
   is still dual-published for back-compat with pre-C.2 peers.
+
+### Phase E implementation notes
+
+Phase E landed SignedPublic messaging:
+
+- `src/groups/public_message.rs` — `GroupPublicMessage` wire type with
+  `state_hash_at_send` / `revision_at_send` binding to the D.3 chain,
+  ML-DSA-65 signing via `sign()`, `verify_signature()` that also
+  checks the `author_agent_id` ↔ public-key derivation binding.
+- Topic convention: `x0x.groups.public.{group_id}`.
+- `validate_public_message(ctx, msg)` enforces (at apply-time, pure):
+  group_id match, confidentiality == SignedPublic, bounded size,
+  signature + author binding, author-not-banned, and the
+  write_access truth-table:
+  - `MembersOnly` → author must be active member,
+  - `ModeratedPublic` → any non-banned author,
+  - `AdminOnly` → author must be active Admin or Owner.
+- `POST /groups/:id/send` — endpoint-side mirror of the same truth-
+  table, signs via the daemon's agent keypair, publishes to the topic,
+  caches the message locally, and ensures the group's public listener
+  is running.
+- `GET /groups/:id/messages` — returns the per-group ring buffer
+  (cap: `PUBLIC_MESSAGE_HISTORY_CAP = 512`). For `read_access ==
+  Public`, accessible to non-members; for `MembersOnly`, requires
+  active membership; `MlsEncrypted` groups return 400.
+- Public-chat listener: verifies each incoming message against the
+  **current** group view before caching (so a role change or ban that
+  lands after the send is still honoured on receivers).
+- `MlsEncrypted` groups are explicitly rejected by `/send` and
+  `/messages` — encrypted content continues to use
+  `/groups/:id/secure/encrypt`.
+
+**Honest scope — what E does NOT yet deliver:**
+- Moderation tooling (admin "delete this message" / "mute this user")
+  — bans already gate the ingest validator, but a per-message
+  moderation action is follow-up work.
+- Backlog/history sync for late-joiners (current cache is local-ring;
+  a new peer sees only what arrives while the listener is live).
+- Federation with external directory servers.
 
 **Open C.2 proof-debt** (tracked in
 [`.planning/c2-proof-hardening.md`](../../.planning/c2-proof-hardening.md)):

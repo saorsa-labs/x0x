@@ -465,6 +465,21 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Remove named-group member",
         category: "named-groups",
     },
+    // ── Phase E: public-group messaging ──────────────────────────────────
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/send",
+        cli_name: "group send",
+        description: "Publish a signed message to a SignedPublic group",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/messages",
+        cli_name: "group messages",
+        description: "Retrieve cached public messages (non-members on Public read)",
+        category: "named-groups",
+    },
     EndpointDef {
         method: Method::Post,
         path: "/groups/:id/invite",
