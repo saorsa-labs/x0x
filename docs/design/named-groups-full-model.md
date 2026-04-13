@@ -17,7 +17,7 @@ Implementation is in progress across multiple phases and branches. This document
 | Phase C | Discovery cards | Define public/contact-scoped discovery objects and manual import/bootstrap | **landed (bridge-level)** |
 | Phase D.2 | Secure share distribution | Cross-daemon sealed rekey-on-ban via ML-KEM-768 envelopes (interim) | **landed** |
 | Phase D.3 | Stable identity + state commits | `GroupGenesis`, `GroupStateCommit`, signed `GroupCard`, apply-side validation, withdrawal supersession | **landed** |
-| Phase C.2 | Distributed discovery index | Partition-tolerant gossip discovery without DHT or special nodes | **landed** |
+| Phase C.2 | Distributed discovery index | Partition-tolerant gossip discovery without DHT or special nodes | **code landed, proof-debt open** — see `.planning/c2-proof-hardening.md` |
 | Phase E | Public group behavior | Open/public send-receive, moderation, and announcement semantics | planned |
 | Phase D.4 | Strict apply-side enforcement | Move every state-changing action through `apply_event`; secure/roster binding invariant tests | planned |
 | Phase F | Review hardening | Repeatable proof, privacy validation, negative-path authz, convergence | planned |
@@ -92,6 +92,22 @@ Phase C.2 landed the distributed discovery index:
   Incremental digest+pull over the contact channel is follow-up work.
 - Deprecation of the legacy `x0x.discovery.groups` bridge topic — it
   is still dual-published for back-compat with pre-C.2 peers.
+
+**Open C.2 proof-debt** (tracked in
+[`.planning/c2-proof-hardening.md`](../../.planning/c2-proof-hardening.md)):
+
+1. Positive live shard-delivery proof (path-attributed or bridge-
+   disabled) — current `/groups/discover` is path-ambiguous because
+   the bridge topic still dual-publishes.
+2. Live anti-entropy repair proof (late subscriber converges via
+   digest/pull without re-publish).
+3. LTC positive delivery proof (Trusted contact receives via LTC
+   direct path; Unknown/Blocked does not).
+4. Subscription persistence across daemon restart.
+
+Until these close, C.2 is presented as "code landed and well-covered
+by unit/integration tests; live e2e proof incomplete," not as "fully
+proven."
 
 ### Honest v1 secure model
 
