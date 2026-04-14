@@ -1,0 +1,792 @@
+{
+  "endpoint_count": 112,
+  "endpoints": [
+    {
+      "category": "status",
+      "cli_name": "health",
+      "description": "Health check",
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "category": "status",
+      "cli_name": "status",
+      "description": "Runtime status with uptime",
+      "method": "GET",
+      "path": "/status"
+    },
+    {
+      "category": "status",
+      "cli_name": "stop",
+      "description": "Gracefully stop the daemon",
+      "method": "POST",
+      "path": "/shutdown"
+    },
+    {
+      "category": "identity",
+      "cli_name": "agent",
+      "description": "Agent identity info",
+      "method": "GET",
+      "path": "/agent"
+    },
+    {
+      "category": "identity",
+      "cli_name": "announce",
+      "description": "Announce identity to network",
+      "method": "POST",
+      "path": "/announce"
+    },
+    {
+      "category": "identity",
+      "cli_name": "agent user-id",
+      "description": "Current agent user ID",
+      "method": "GET",
+      "path": "/agent/user-id"
+    },
+    {
+      "category": "identity",
+      "cli_name": "agent card",
+      "description": "Generate shareable identity card",
+      "method": "GET",
+      "path": "/agent/card"
+    },
+    {
+      "category": "identity",
+      "cli_name": "agent introduction",
+      "description": "Introduction card with trust-scoped disclosure",
+      "method": "GET",
+      "path": "/introduction"
+    },
+    {
+      "category": "identity",
+      "cli_name": "agent import",
+      "description": "Import agent card to contacts",
+      "method": "POST",
+      "path": "/agent/card/import"
+    },
+    {
+      "category": "network",
+      "cli_name": "peers",
+      "description": "Connected gossip peers",
+      "method": "GET",
+      "path": "/peers"
+    },
+    {
+      "category": "presence",
+      "cli_name": "presence",
+      "description": "Online agents (alias for /presence/online)",
+      "method": "GET",
+      "path": "/presence"
+    },
+    {
+      "category": "presence",
+      "cli_name": "presence online",
+      "description": "List all currently online agents (network view, non-blocked)",
+      "method": "GET",
+      "path": "/presence/online"
+    },
+    {
+      "category": "presence",
+      "cli_name": "presence foaf",
+      "description": "FOAF random-walk discovery of nearby agents (social view)",
+      "method": "GET",
+      "path": "/presence/foaf"
+    },
+    {
+      "category": "presence",
+      "cli_name": "presence find",
+      "description": "Find a specific agent by ID via FOAF random walk",
+      "method": "GET",
+      "path": "/presence/find/:id"
+    },
+    {
+      "category": "presence",
+      "cli_name": "presence status",
+      "description": "Get local cache presence status for an agent",
+      "method": "GET",
+      "path": "/presence/status/:id"
+    },
+    {
+      "category": "presence",
+      "cli_name": "presence events",
+      "description": "Server-Sent Events stream of presence online/offline events",
+      "method": "GET",
+      "path": "/presence/events"
+    },
+    {
+      "category": "network",
+      "cli_name": "network status",
+      "description": "Network connectivity details",
+      "method": "GET",
+      "path": "/network/status"
+    },
+    {
+      "category": "network",
+      "cli_name": "network cache",
+      "description": "Bootstrap peer cache stats",
+      "method": "GET",
+      "path": "/network/bootstrap-cache"
+    },
+    {
+      "category": "messaging",
+      "cli_name": "publish",
+      "description": "Publish message to topic",
+      "method": "POST",
+      "path": "/publish"
+    },
+    {
+      "category": "messaging",
+      "cli_name": "subscribe",
+      "description": "Subscribe to topic",
+      "method": "POST",
+      "path": "/subscribe"
+    },
+    {
+      "category": "messaging",
+      "cli_name": "unsubscribe",
+      "description": "Unsubscribe by ID",
+      "method": "DELETE",
+      "path": "/subscribe/:id"
+    },
+    {
+      "category": "messaging",
+      "cli_name": "events",
+      "description": "SSE event stream",
+      "method": "GET",
+      "path": "/events"
+    },
+    {
+      "category": "discovery",
+      "cli_name": "agents list",
+      "description": "List discovered agents",
+      "method": "GET",
+      "path": "/agents/discovered"
+    },
+    {
+      "category": "discovery",
+      "cli_name": "agents get",
+      "description": "Get discovered agent details",
+      "method": "GET",
+      "path": "/agents/discovered/:agent_id"
+    },
+    {
+      "category": "discovery",
+      "cli_name": "agents find",
+      "description": "Find agent on network",
+      "method": "POST",
+      "path": "/agents/find/:agent_id"
+    },
+    {
+      "category": "discovery",
+      "cli_name": "agents reachability",
+      "description": "Agent reachability info",
+      "method": "GET",
+      "path": "/agents/reachability/:agent_id"
+    },
+    {
+      "category": "discovery",
+      "cli_name": "agents by-user",
+      "description": "Agents by user ID",
+      "method": "GET",
+      "path": "/users/:user_id/agents"
+    },
+    {
+      "category": "contacts",
+      "cli_name": "contacts list",
+      "description": "List contacts",
+      "method": "GET",
+      "path": "/contacts"
+    },
+    {
+      "category": "contacts",
+      "cli_name": "contacts add",
+      "description": "Add contact",
+      "method": "POST",
+      "path": "/contacts"
+    },
+    {
+      "category": "contacts",
+      "cli_name": "trust set",
+      "description": "Quick trust/block",
+      "method": "POST",
+      "path": "/contacts/trust"
+    },
+    {
+      "category": "contacts",
+      "cli_name": "contacts update",
+      "description": "Update contact trust",
+      "method": "PATCH",
+      "path": "/contacts/:agent_id"
+    },
+    {
+      "category": "contacts",
+      "cli_name": "contacts remove",
+      "description": "Remove contact",
+      "method": "DELETE",
+      "path": "/contacts/:agent_id"
+    },
+    {
+      "category": "contacts",
+      "cli_name": "contacts revoke",
+      "description": "Revoke contact",
+      "method": "POST",
+      "path": "/contacts/:agent_id/revoke"
+    },
+    {
+      "category": "contacts",
+      "cli_name": "contacts revocations",
+      "description": "List revocations",
+      "method": "GET",
+      "path": "/contacts/:agent_id/revocations"
+    },
+    {
+      "category": "machines",
+      "cli_name": "machines list",
+      "description": "List machines for contact",
+      "method": "GET",
+      "path": "/contacts/:agent_id/machines"
+    },
+    {
+      "category": "machines",
+      "cli_name": "machines add",
+      "description": "Add machine record",
+      "method": "POST",
+      "path": "/contacts/:agent_id/machines"
+    },
+    {
+      "category": "machines",
+      "cli_name": "machines remove",
+      "description": "Remove machine record",
+      "method": "DELETE",
+      "path": "/contacts/:agent_id/machines/:machine_id"
+    },
+    {
+      "category": "machines",
+      "cli_name": "machines pin",
+      "description": "Pin machine",
+      "method": "POST",
+      "path": "/contacts/:agent_id/machines/:machine_id/pin"
+    },
+    {
+      "category": "machines",
+      "cli_name": "machines unpin",
+      "description": "Unpin machine",
+      "method": "DELETE",
+      "path": "/contacts/:agent_id/machines/:machine_id/pin"
+    },
+    {
+      "category": "trust",
+      "cli_name": "trust evaluate",
+      "description": "Evaluate trust for agent+machine",
+      "method": "POST",
+      "path": "/trust/evaluate"
+    },
+    {
+      "category": "direct",
+      "cli_name": "direct connect",
+      "description": "Connect to agent",
+      "method": "POST",
+      "path": "/agents/connect"
+    },
+    {
+      "category": "direct",
+      "cli_name": "direct send",
+      "description": "Send direct message",
+      "method": "POST",
+      "path": "/direct/send"
+    },
+    {
+      "category": "direct",
+      "cli_name": "direct connections",
+      "description": "List direct connections",
+      "method": "GET",
+      "path": "/direct/connections"
+    },
+    {
+      "category": "direct",
+      "cli_name": "direct events",
+      "description": "Stream direct messages",
+      "method": "GET",
+      "path": "/direct/events"
+    },
+    {
+      "category": "groups",
+      "cli_name": "groups create",
+      "description": "Create encrypted group",
+      "method": "POST",
+      "path": "/mls/groups"
+    },
+    {
+      "category": "groups",
+      "cli_name": "groups list",
+      "description": "List groups",
+      "method": "GET",
+      "path": "/mls/groups"
+    },
+    {
+      "category": "groups",
+      "cli_name": "groups get",
+      "description": "Get group details",
+      "method": "GET",
+      "path": "/mls/groups/:id"
+    },
+    {
+      "category": "groups",
+      "cli_name": "groups add-member",
+      "description": "Add member to group",
+      "method": "POST",
+      "path": "/mls/groups/:id/members"
+    },
+    {
+      "category": "groups",
+      "cli_name": "groups remove-member",
+      "description": "Remove member",
+      "method": "DELETE",
+      "path": "/mls/groups/:id/members/:agent_id"
+    },
+    {
+      "category": "groups",
+      "cli_name": "groups encrypt",
+      "description": "Encrypt for group",
+      "method": "POST",
+      "path": "/mls/groups/:id/encrypt"
+    },
+    {
+      "category": "groups",
+      "cli_name": "groups decrypt",
+      "description": "Decrypt from group",
+      "method": "POST",
+      "path": "/mls/groups/:id/decrypt"
+    },
+    {
+      "category": "groups",
+      "cli_name": "groups welcome",
+      "description": "Create welcome for member",
+      "method": "POST",
+      "path": "/mls/groups/:id/welcome"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group create",
+      "description": "Create named group",
+      "method": "POST",
+      "path": "/groups"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group list",
+      "description": "List groups",
+      "method": "GET",
+      "path": "/groups"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group info",
+      "description": "Get group info",
+      "method": "GET",
+      "path": "/groups/:id"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group members",
+      "description": "List named-group members",
+      "method": "GET",
+      "path": "/groups/:id/members"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group add-member",
+      "description": "Add named-group member",
+      "method": "POST",
+      "path": "/groups/:id/members"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group remove-member",
+      "description": "Remove named-group member",
+      "method": "DELETE",
+      "path": "/groups/:id/members/:agent_id"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group send",
+      "description": "Publish a signed message to a SignedPublic group",
+      "method": "POST",
+      "path": "/groups/:id/send"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group messages",
+      "description": "Retrieve cached public messages (non-members on Public read)",
+      "method": "GET",
+      "path": "/groups/:id/messages"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group invite",
+      "description": "Generate invite link",
+      "method": "POST",
+      "path": "/groups/:id/invite"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group join",
+      "description": "Join group via invite",
+      "method": "POST",
+      "path": "/groups/join"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group set-name",
+      "description": "Set display name in group",
+      "method": "PUT",
+      "path": "/groups/:id/display-name"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group leave",
+      "description": "Leave or delete a group",
+      "method": "DELETE",
+      "path": "/groups/:id"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group state",
+      "description": "Inspect the signed state-commit chain for a group",
+      "method": "GET",
+      "path": "/groups/:id/state"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group state-seal",
+      "description": "Advance the state-commit chain and republish signed card",
+      "method": "POST",
+      "path": "/groups/:id/state/seal"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group state-withdraw",
+      "description": "Seal a terminal withdrawal commit and supersede public card",
+      "method": "POST",
+      "path": "/groups/:id/state/withdraw"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group update",
+      "description": "Update group name/description (admin+)",
+      "method": "PATCH",
+      "path": "/groups/:id"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group policy",
+      "description": "Update group policy (owner only)",
+      "method": "PATCH",
+      "path": "/groups/:id/policy"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group set-role",
+      "description": "Change a member's role (admin+)",
+      "method": "PATCH",
+      "path": "/groups/:id/members/:agent_id/role"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group ban",
+      "description": "Ban a member (admin+)",
+      "method": "POST",
+      "path": "/groups/:id/ban/:agent_id"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group unban",
+      "description": "Unban a member (admin+)",
+      "method": "DELETE",
+      "path": "/groups/:id/ban/:agent_id"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group requests",
+      "description": "List join requests (admin+)",
+      "method": "GET",
+      "path": "/groups/:id/requests"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group request-access",
+      "description": "Submit a join request",
+      "method": "POST",
+      "path": "/groups/:id/requests"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group approve-request",
+      "description": "Approve a join request (admin+)",
+      "method": "POST",
+      "path": "/groups/:id/requests/:request_id/approve"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group reject-request",
+      "description": "Reject a join request (admin+)",
+      "method": "POST",
+      "path": "/groups/:id/requests/:request_id/reject"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group cancel-request",
+      "description": "Cancel own pending join request",
+      "method": "DELETE",
+      "path": "/groups/:id/requests/:request_id"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group discover",
+      "description": "List locally known discoverable groups",
+      "method": "GET",
+      "path": "/groups/discover"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group discover-nearby",
+      "description": "Presence-social browse of PublicDirectory groups",
+      "method": "GET",
+      "path": "/groups/discover/nearby"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group discover-subscriptions",
+      "description": "List active shard subscriptions",
+      "method": "GET",
+      "path": "/groups/discover/subscriptions"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group discover-subscribe",
+      "description": "Subscribe to a tag/name/id directory shard",
+      "method": "POST",
+      "path": "/groups/discover/subscribe"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group discover-unsubscribe",
+      "description": "Unsubscribe from a directory shard",
+      "method": "DELETE",
+      "path": "/groups/discover/subscribe/:kind/:shard"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group card",
+      "description": "Fetch a single group card",
+      "method": "GET",
+      "path": "/groups/cards/:id"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group card-import",
+      "description": "Import a group card into local cache",
+      "method": "POST",
+      "path": "/groups/cards/import"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group secure-encrypt",
+      "description": "Encrypt content with the group's shared secret (member-only)",
+      "method": "POST",
+      "path": "/groups/:id/secure/encrypt"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group secure-decrypt",
+      "description": "Decrypt content with the group's shared secret (member-only, epoch must match)",
+      "method": "POST",
+      "path": "/groups/:id/secure/decrypt"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group secure-reseal",
+      "description": "Re-seal the current group shared secret to a named recipient (produces a real SecureShareDelivered-format envelope)",
+      "method": "POST",
+      "path": "/groups/:id/secure/reseal"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group secure-open-envelope",
+      "description": "Attempt to open a SecureShareDelivered envelope with this daemon's KEM key (adversarial test)",
+      "method": "POST",
+      "path": "/groups/secure/open-envelope"
+    },
+    {
+      "category": "tasks",
+      "cli_name": "tasks list",
+      "description": "List task lists",
+      "method": "GET",
+      "path": "/task-lists"
+    },
+    {
+      "category": "tasks",
+      "cli_name": "tasks create",
+      "description": "Create task list",
+      "method": "POST",
+      "path": "/task-lists"
+    },
+    {
+      "category": "tasks",
+      "cli_name": "tasks show",
+      "description": "Show tasks in list",
+      "method": "GET",
+      "path": "/task-lists/:id/tasks"
+    },
+    {
+      "category": "tasks",
+      "cli_name": "tasks add",
+      "description": "Add task to list",
+      "method": "POST",
+      "path": "/task-lists/:id/tasks"
+    },
+    {
+      "category": "tasks",
+      "cli_name": "tasks claim / tasks complete",
+      "description": "Claim or complete a task (action: claim|complete)",
+      "method": "PATCH",
+      "path": "/task-lists/:id/tasks/:tid"
+    },
+    {
+      "category": "stores",
+      "cli_name": "store list",
+      "description": "List key-value stores",
+      "method": "GET",
+      "path": "/stores"
+    },
+    {
+      "category": "stores",
+      "cli_name": "store create",
+      "description": "Create key-value store",
+      "method": "POST",
+      "path": "/stores"
+    },
+    {
+      "category": "stores",
+      "cli_name": "store join",
+      "description": "Join existing store",
+      "method": "POST",
+      "path": "/stores/:id/join"
+    },
+    {
+      "category": "stores",
+      "cli_name": "store keys",
+      "description": "List keys in store",
+      "method": "GET",
+      "path": "/stores/:id/keys"
+    },
+    {
+      "category": "stores",
+      "cli_name": "store put",
+      "description": "Put value in store",
+      "method": "PUT",
+      "path": "/stores/:id/:key"
+    },
+    {
+      "category": "stores",
+      "cli_name": "store get",
+      "description": "Get value from store",
+      "method": "GET",
+      "path": "/stores/:id/:key"
+    },
+    {
+      "category": "stores",
+      "cli_name": "store rm",
+      "description": "Remove key from store",
+      "method": "DELETE",
+      "path": "/stores/:id/:key"
+    },
+    {
+      "category": "files",
+      "cli_name": "send-file",
+      "description": "Send file to agent",
+      "method": "POST",
+      "path": "/files/send"
+    },
+    {
+      "category": "files",
+      "cli_name": "transfers",
+      "description": "List file transfers",
+      "method": "GET",
+      "path": "/files/transfers"
+    },
+    {
+      "category": "files",
+      "cli_name": "transfer-status",
+      "description": "Transfer status",
+      "method": "GET",
+      "path": "/files/transfers/:id"
+    },
+    {
+      "category": "files",
+      "cli_name": "accept-file",
+      "description": "Accept incoming transfer",
+      "method": "POST",
+      "path": "/files/accept/:id"
+    },
+    {
+      "category": "files",
+      "cli_name": "reject-file",
+      "description": "Reject incoming transfer",
+      "method": "POST",
+      "path": "/files/reject/:id"
+    },
+    {
+      "category": "status",
+      "cli_name": "constitution",
+      "description": "Display the x0x Constitution (Markdown)",
+      "method": "GET",
+      "path": "/constitution"
+    },
+    {
+      "category": "status",
+      "cli_name": "constitution --json",
+      "description": "Constitution with version metadata (JSON)",
+      "method": "GET",
+      "path": "/constitution/json"
+    },
+    {
+      "category": "upgrade",
+      "cli_name": "upgrade",
+      "description": "Check for updates",
+      "method": "GET",
+      "path": "/upgrade"
+    },
+    {
+      "category": "websocket",
+      "cli_name": "ws",
+      "description": "General-purpose WebSocket session",
+      "method": "GET",
+      "path": "/ws"
+    },
+    {
+      "category": "websocket",
+      "cli_name": "ws direct",
+      "description": "WebSocket session for direct messaging",
+      "method": "GET",
+      "path": "/ws/direct"
+    },
+    {
+      "category": "websocket",
+      "cli_name": "ws sessions",
+      "description": "List WebSocket sessions",
+      "method": "GET",
+      "path": "/ws/sessions"
+    },
+    {
+      "category": "websocket",
+      "cli_name": "gui",
+      "description": "Open the embedded GUI",
+      "method": "GET",
+      "path": "/gui"
+    }
+  ],
+  "generator": "tests/api_manifest.rs",
+  "schema": "x0x-api-manifest/v1",
+  "source": "src/api/mod.rs::ENDPOINTS"
+}

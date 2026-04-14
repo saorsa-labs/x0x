@@ -308,6 +308,8 @@ enum PresenceSub {
         /// Agent ID (hex, 64 chars).
         id: String,
     },
+    /// Stream presence online/offline events (Server-Sent Events).
+    Events,
 }
 
 #[derive(Subcommand)]
@@ -536,6 +538,9 @@ enum GroupSub {
         /// Your display name in this group.
         #[arg(long)]
         display_name: Option<String>,
+        /// Policy preset: private_secure | public_request_secure | public_open | public_announce.
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// Get group details.
     Info {
@@ -591,6 +596,195 @@ enum GroupSub {
     Leave {
         /// Group ID.
         group_id: String,
+    },
+    /// Update group name and/or description (admin+).
+    Update {
+        /// Group ID.
+        group_id: String,
+        /// New name.
+        #[arg(long)]
+        name: Option<String>,
+        /// New description.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Update the group's access policy (owner only).
+    Policy {
+        /// Group ID.
+        group_id: String,
+        /// Preset: private_secure | public_request_secure | public_open | public_announce.
+        #[arg(long)]
+        preset: Option<String>,
+        /// Discoverability: hidden | listed_to_contacts | public_directory.
+        #[arg(long)]
+        discoverability: Option<String>,
+        /// Admission: invite_only | request_access | open_join.
+        #[arg(long)]
+        admission: Option<String>,
+        /// Confidentiality: mls_encrypted | signed_public.
+        #[arg(long)]
+        confidentiality: Option<String>,
+        /// Read access: members_only | public.
+        #[arg(long)]
+        read_access: Option<String>,
+        /// Write access: members_only | moderated_public | admin_only.
+        #[arg(long)]
+        write_access: Option<String>,
+    },
+    /// Change a member's role (admin+).
+    SetRole {
+        /// Group ID.
+        group_id: String,
+        /// Target agent hex.
+        agent_id: String,
+        /// Role: owner | admin | moderator | member | guest.
+        role: String,
+    },
+    /// Ban a member (admin+).
+    Ban {
+        /// Group ID.
+        group_id: String,
+        /// Agent hex.
+        agent_id: String,
+    },
+    /// Unban a member (admin+).
+    Unban {
+        /// Group ID.
+        group_id: String,
+        /// Agent hex.
+        agent_id: String,
+    },
+    /// List join requests for a group (admin+).
+    Requests {
+        /// Group ID.
+        group_id: String,
+    },
+    /// Submit a join request for a RequestAccess group.
+    RequestAccess {
+        /// Group ID.
+        group_id: String,
+        /// Optional message to the admins.
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// Approve a pending join request (admin+).
+    ApproveRequest {
+        /// Group ID.
+        group_id: String,
+        /// Request ID.
+        request_id: String,
+    },
+    /// Reject a pending join request (admin+).
+    RejectRequest {
+        /// Group ID.
+        group_id: String,
+        /// Request ID.
+        request_id: String,
+    },
+    /// Cancel your own pending join request.
+    CancelRequest {
+        /// Group ID.
+        group_id: String,
+        /// Request ID.
+        request_id: String,
+    },
+    /// List locally known discoverable groups (optionally filtered by query).
+    Discover {
+        /// Tag or name substring.
+        #[arg(long)]
+        q: Option<String>,
+    },
+    /// Browse PublicDirectory groups observed via shard gossip.
+    DiscoverNearby,
+    /// List active directory-shard subscriptions.
+    DiscoverSubscriptions,
+    /// Subscribe to a tag/name/id directory shard.
+    DiscoverSubscribe {
+        /// Shard kind: tag | name | id.
+        kind: String,
+        /// Key (tag string, name word, or group id). Required unless --shard given.
+        #[arg(long)]
+        key: Option<String>,
+        /// Direct shard id (u32). Skips key normalisation.
+        #[arg(long)]
+        shard: Option<u32>,
+    },
+    /// Unsubscribe from a directory shard.
+    DiscoverUnsubscribe {
+        /// Shard kind: tag | name | id.
+        kind: String,
+        /// Shard id.
+        shard: u32,
+    },
+    /// Fetch a group card by group ID.
+    Card {
+        /// Group ID.
+        group_id: String,
+    },
+    /// Import a signed group card from a JSON file (or `-` for stdin).
+    CardImport {
+        /// Path to signed-card JSON, or `-` for stdin.
+        path: String,
+    },
+    /// Publish a SignedPublic message to a group.
+    Send {
+        /// Group ID.
+        group_id: String,
+        /// Message body (UTF-8).
+        body: String,
+        /// Message kind: chat (default) | announcement.
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Retrieve cached SignedPublic messages for a group.
+    Messages {
+        /// Group ID.
+        group_id: String,
+    },
+    /// Inspect the state-commit chain for a group.
+    State {
+        /// Group ID.
+        group_id: String,
+    },
+    /// Advance the state-commit chain and republish the signed card.
+    StateSeal {
+        /// Group ID.
+        group_id: String,
+    },
+    /// Seal a terminal withdrawal commit (supersedes the public card).
+    StateWithdraw {
+        /// Group ID.
+        group_id: String,
+    },
+    /// Encrypt content with the group's current shared secret (member-only).
+    SecureEncrypt {
+        /// Group ID.
+        group_id: String,
+        /// Payload — either raw UTF-8 or @path-to-file.
+        payload: String,
+    },
+    /// Decrypt group shared-secret ciphertext (member-only).
+    SecureDecrypt {
+        /// Group ID.
+        group_id: String,
+        /// Base64 ciphertext.
+        ciphertext_b64: String,
+        /// Base64 nonce (12 bytes).
+        nonce_b64: String,
+        /// Secret epoch the ciphertext was produced under.
+        secret_epoch: u64,
+    },
+    /// Re-seal the current shared secret to a recipient (admin+).
+    SecureReseal {
+        /// Group ID.
+        group_id: String,
+        /// Recipient agent hex (must be an active member with a KEM public key).
+        recipient: String,
+    },
+    /// Adversarial test: attempt to open an envelope with this daemon's KEM key.
+    SecureOpenEnvelope {
+        /// Path to envelope JSON, or `-` for stdin.
+        path: String,
     },
 }
 
@@ -689,6 +883,8 @@ enum TasksSub {
 enum WsSub {
     /// List active WebSocket sessions.
     Sessions,
+    /// Print the WebSocket URL for the direct-messaging stream.
+    Direct,
 }
 
 // ── Main ────────────────────────────────────────────────────────────────
@@ -822,6 +1018,7 @@ async fn run(
                 timeout_ms,
             } => commands::presence::find(&client, &id, ttl, timeout_ms).await,
             PresenceSub::Status { id } => commands::presence::status(&client, &id).await,
+            PresenceSub::Events => commands::presence::events(&client).await,
         },
         Commands::Network { sub } => match sub {
             NetworkSub::Status => commands::network::network_status(&client).await,
@@ -953,12 +1150,14 @@ async fn run(
                 name,
                 description,
                 display_name,
+                preset,
             }) => {
                 commands::group::create(
                     &client,
                     &name,
                     description.as_deref(),
                     display_name.as_deref(),
+                    preset.as_deref(),
                 )
                 .await
             }
@@ -988,6 +1187,127 @@ async fn run(
                 commands::group::set_name(&client, &group_id, &name).await
             }
             Some(GroupSub::Leave { group_id }) => commands::group::leave(&client, &group_id).await,
+            Some(GroupSub::Update {
+                group_id,
+                name,
+                description,
+            }) => {
+                commands::group::update(&client, &group_id, name.as_deref(), description.as_deref())
+                    .await
+            }
+            Some(GroupSub::Policy {
+                group_id,
+                preset,
+                discoverability,
+                admission,
+                confidentiality,
+                read_access,
+                write_access,
+            }) => {
+                commands::group::policy(
+                    &client,
+                    &group_id,
+                    preset.as_deref(),
+                    discoverability.as_deref(),
+                    admission.as_deref(),
+                    confidentiality.as_deref(),
+                    read_access.as_deref(),
+                    write_access.as_deref(),
+                )
+                .await
+            }
+            Some(GroupSub::SetRole {
+                group_id,
+                agent_id,
+                role,
+            }) => commands::group::set_role(&client, &group_id, &agent_id, &role).await,
+            Some(GroupSub::Ban { group_id, agent_id }) => {
+                commands::group::ban(&client, &group_id, &agent_id).await
+            }
+            Some(GroupSub::Unban { group_id, agent_id }) => {
+                commands::group::unban(&client, &group_id, &agent_id).await
+            }
+            Some(GroupSub::Requests { group_id }) => {
+                commands::group::requests(&client, &group_id).await
+            }
+            Some(GroupSub::RequestAccess { group_id, message }) => {
+                commands::group::request_access(&client, &group_id, message.as_deref()).await
+            }
+            Some(GroupSub::ApproveRequest {
+                group_id,
+                request_id,
+            }) => commands::group::approve_request(&client, &group_id, &request_id).await,
+            Some(GroupSub::RejectRequest {
+                group_id,
+                request_id,
+            }) => commands::group::reject_request(&client, &group_id, &request_id).await,
+            Some(GroupSub::CancelRequest {
+                group_id,
+                request_id,
+            }) => commands::group::cancel_request(&client, &group_id, &request_id).await,
+            Some(GroupSub::Discover { q }) => {
+                commands::group::discover(&client, q.as_deref()).await
+            }
+            Some(GroupSub::DiscoverNearby) => commands::group::discover_nearby(&client).await,
+            Some(GroupSub::DiscoverSubscriptions) => {
+                commands::group::discover_subscriptions(&client).await
+            }
+            Some(GroupSub::DiscoverSubscribe { kind, key, shard }) => {
+                commands::group::discover_subscribe(&client, &kind, key.as_deref(), shard).await
+            }
+            Some(GroupSub::DiscoverUnsubscribe { kind, shard }) => {
+                commands::group::discover_unsubscribe(&client, &kind, shard).await
+            }
+            Some(GroupSub::Card { group_id }) => commands::group::card(&client, &group_id).await,
+            Some(GroupSub::CardImport { path }) => {
+                commands::group::card_import(&client, &path).await
+            }
+            Some(GroupSub::Send {
+                group_id,
+                body,
+                kind,
+            }) => commands::group::send(&client, &group_id, &body, kind.as_deref()).await,
+            Some(GroupSub::Messages { group_id }) => {
+                commands::group::messages(&client, &group_id).await
+            }
+            Some(GroupSub::State { group_id }) => commands::group::state(&client, &group_id).await,
+            Some(GroupSub::StateSeal { group_id }) => {
+                commands::group::state_seal(&client, &group_id).await
+            }
+            Some(GroupSub::StateWithdraw { group_id }) => {
+                commands::group::state_withdraw(&client, &group_id).await
+            }
+            Some(GroupSub::SecureEncrypt { group_id, payload }) => {
+                let bytes = if let Some(path) = payload.strip_prefix('@') {
+                    std::fs::read(path)
+                        .map_err(|e| anyhow::anyhow!("read payload from {path}: {e}"))?
+                } else {
+                    payload.into_bytes()
+                };
+                commands::group::secure_encrypt(&client, &group_id, &bytes).await
+            }
+            Some(GroupSub::SecureDecrypt {
+                group_id,
+                ciphertext_b64,
+                nonce_b64,
+                secret_epoch,
+            }) => {
+                commands::group::secure_decrypt(
+                    &client,
+                    &group_id,
+                    &ciphertext_b64,
+                    &nonce_b64,
+                    secret_epoch,
+                )
+                .await
+            }
+            Some(GroupSub::SecureReseal {
+                group_id,
+                recipient,
+            }) => commands::group::secure_reseal(&client, &group_id, &recipient).await,
+            Some(GroupSub::SecureOpenEnvelope { path }) => {
+                commands::group::secure_open_envelope(&client, &path).await
+            }
         },
         Commands::Store { sub } => match sub {
             None => commands::store::list(&client).await,
@@ -1035,6 +1355,7 @@ async fn run(
         Commands::Upgrade { .. } => unreachable!(),
         Commands::Ws { sub } => match sub {
             WsSub::Sessions => commands::ws::sessions(&client).await,
+            WsSub::Direct => commands::ws::direct(&client).await,
         },
         Commands::Stop => commands::daemon::stop(&client).await,
         Commands::Doctor => commands::daemon::doctor(&client).await,

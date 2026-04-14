@@ -58,3 +58,21 @@ pub async fn status(client: &DaemonClient, id: &str) -> Result<()> {
     print_value(client.format(), &resp);
     Ok(())
 }
+
+/// `x0x presence events` — GET /presence/events (SSE stream).
+///
+/// Streams presence online/offline events as they happen. Each line on
+/// stdout is a raw SSE event from the daemon. The command runs until
+/// the daemon closes the stream or the user presses Ctrl+C.
+pub async fn events(client: &DaemonClient) -> Result<()> {
+    use futures::StreamExt as _;
+    client.ensure_running().await?;
+    let resp = client.get_stream("/presence/events").await?;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| anyhow::anyhow!("stream error: {e}"))?;
+        let s = String::from_utf8_lossy(&bytes);
+        print!("{s}");
+    }
+    Ok(())
+}
