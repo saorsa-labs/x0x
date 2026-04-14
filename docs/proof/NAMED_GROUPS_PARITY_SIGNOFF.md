@@ -202,7 +202,7 @@ not yet proven on which surface. Each maps to either the GUI
 | Rust client method exists for every endpoint | ✅ |
 | Swift client method exists for every Rust method | ✅ |
 | Embedded HTML GUI parity is **manifest-driven** (no hand-picked subset) | ✅ — `gui_named_group_parity.rs` enumerates every endpoint |
-| GUI deferrals are **enumerated with reasons** | ✅ — 13 deferred, 0 unrecorded missing |
+| GUI deferrals are **enumerated with reasons** | ✅ — 11 deferred, 0 unrecorded missing |
 | Create modal surfaces all 4 presets | ✅ (x0x GUI + Dioxus + SwiftUI) |
 | Discover view exists with query, nearby, request-access | ✅ (x0x GUI + Dioxus + SwiftUI) |
 | Admin surfaces exist: policy editor, state readout, roster roles/bans, request approve/reject, rename | ✅ |
@@ -251,9 +251,22 @@ This revision tightened two issues raised in review:
 ## Recommendation
 
 **Approve named-groups feature parity for the surfaces enumerated in
-the matrix above, with the explicitly listed deferrals.** The
-cross-surface chat-view send-path gap is the only known remaining
-parity gap of substance, tracked as Phase 7's primary target.
+the matrix above, with the explicitly listed deferrals.** Phase 7
+closed the last substantive cross-surface gap: SignedPublic chat now
+works end-to-end with sub-second WebSocket push latency on the GUI,
+Dioxus, and SwiftUI, backed by a 30 s `/messages` poll that catches
+messages lost across a WS reconnect. Dioxus's send path no longer
+optimistic-inserts SignedPublic messages — the WS push (or poll
+backstop) delivers the signature-bound envelope with the shared
+`(author, timestamp, signature-prefix)` dedup key, and both Dioxus
+and SwiftUI persist received SignedPublic messages to local channel
+history so a remount replays them alongside MlsEncrypted ones.
+
+The 11 items on the GUI DEFERRED list are all explicitly justified
+(secure-plane primitives consumed implicitly by the chat path,
+power-user shard-subscription APIs handled by the CLI, an
+adversarial test endpoint, and three admin-UX follow-ups). None
+represent a silent gap.
 
 ## Appendix — reproducing this report
 
