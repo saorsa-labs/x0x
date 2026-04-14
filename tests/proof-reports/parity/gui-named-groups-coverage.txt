@@ -5,8 +5,8 @@
   WIRED     GET /groups/:id/members
   DEFERRED  POST /groups/:id/members  // admin flow; GUI currently uses invite links instead of direct add-by-agent
   DEFERRED  DELETE /groups/:id/members/:agent_id  // admin flow; GUI currently uses ban rather than direct remove-by-agent
-  DEFERRED  POST /groups/:id/send  // CROSS-SURFACE GAP: chat view does not yet route SignedPublic groups through /send (same gap as Dioxus + SwiftUI)
-  DEFERRED  GET /groups/:id/messages  // CROSS-SURFACE GAP: paired with /send; message history read-back lives with the chat view rewrite
+  WIRED     POST /groups/:id/send
+  DEFERRED  GET /groups/:id/messages  // GUI gap: signed-message HISTORY read-back from /messages not yet wired (SignedPublic SEND now is)
   WIRED     POST /groups/:id/invite
   WIRED     POST /groups/join
   WIRED     PUT /groups/:id/display-name
@@ -36,4 +36,4 @@
   DEFERRED  POST /groups/:id/secure/reseal  // secure-plane primitive; server-side rekey on approve/ban
   DEFERRED  POST /groups/secure/open-envelope  // adversarial test endpoint, not a user-facing action
 
-Coverage: 23/36 wired; 13 deferred; 0 missing
+Coverage: 24/36 wired; 12 deferred; 0 missing

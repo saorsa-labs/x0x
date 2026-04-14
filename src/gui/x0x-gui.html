@@ -1700,6 +1700,12 @@ function renderIdentityChainLegacy(){
    JS SECTION 7: SPACE VIEW
    ═══════════════════════════════════════════════════════════════════ */
 let spaceChatTopic='',spaceBoardId='',spaceKvId='',currentChannelTopic='';
+// Confidentiality of the currently-mounted space, fetched from
+// `GET /groups/:id`. Used by sendSpaceChat() to route SignedPublic
+// groups through `POST /groups/:id/send` (which produces an
+// authority-signed GroupPublicMessage) instead of the gossip path.
+// 'mls_encrypted' (or empty) keeps the legacy behaviour.
+let currentSpaceConfidentiality='';
 const chatHistory={};
 const swarmTasks={};
 const threadReplies={}; // { threadId: [messages] }
@@ -1734,6 +1740,13 @@ async function mountSpace(){
   if(g&&g.ok){
     spaceChatTopic=g.chat_topic||'';
     if(spaceChatTopic)wsSub(spaceChatTopic);
+    // Capture confidentiality so sendSpaceChat() can branch
+    // between gossip (MlsEncrypted) and the daemon-signed REST path
+    // (SignedPublic). Fall back to '' if the daemon shape changes.
+    currentSpaceConfidentiality=
+      (g.policy && g.policy.confidentiality) ||
+      (g.policy_summary && g.policy_summary.confidentiality) ||
+      '';
   }
   const chan=S.get('channel')||'general';
   currentChannelTopic=getChannelTopic(sid,chan);
@@ -1811,10 +1824,20 @@ function filterComposerEmoji(input){
 
 function sendSpaceChat(){
   const inp=document.getElementById('chat-in');
-  const t=inp.value.trim();if(!currentChannelTopic)return;if(!t)return;
-  const name=LS.get('display_name','')||short(S.get('agentId'));
+  const t=inp.value.trim();if(!t)return;
   const sid=S.get('spaceId');
   const chan=S.get('channel')||'general';
+  // SignedPublic groups must go through `POST /groups/:id/send` so
+  // the daemon authority-signs the message and publishes it on the
+  // public topic. Skip the gossip path for those — non-members would
+  // not be able to verify a raw gossip post anyway, and the daemon
+  // already publishes the signed envelope on its own topic.
+  if(currentSpaceConfidentiality==='signed_public'){
+    sendSpaceChatSignedPublic(sid,t,inp);
+    return;
+  }
+  if(!currentChannelTopic)return;
+  const name=LS.get('display_name','')||short(S.get('agentId'));
   const msgId=generateMsgId();
   const msg={id:msgId,text:t,sender_name:name,sender_id:S.get('agentId'),timestamp:Date.now(),channel:chan};
   // Attach quote if replying
@@ -1827,6 +1850,43 @@ function sendSpaceChat(){
   clearQuote();
   // Check for mentions and notify
   if(isMentioned(t))toast('You mentioned yourself','info');
+}
+
+/// SignedPublic send path (Phase E). Uses the REST endpoint so the
+/// daemon produces a real `GroupPublicMessage` (state-bound,
+/// ML-DSA-signed), publishes it to the public topic, and caches it
+/// locally. Receiving signed messages from non-members is a separate
+/// follow-up — the gossip-driven chat history this view renders does
+/// not yet pull from `GET /groups/:id/messages`.
+async function sendSpaceChatSignedPublic(sid,text,inp){
+  const chan=S.get('channel')||'general';
+  const name=LS.get('display_name','')||short(S.get('agentId'));
+  const r=await api('/groups/'+sid+'/send',{
+    method:'POST',
+    body:JSON.stringify({body:text,kind:'chat'})
+  });
+  if(r&&r.ok){
+    // Mirror the existing chat history so the user sees their own
+    // message immediately. Re-broadcast on the channel topic for
+    // legacy peers; the daemon also publishes a signed envelope on
+    // its own topic so verifying clients can pick that up.
+    const msg={
+      id:generateMsgId(),
+      text,
+      sender_name:name,
+      sender_id:S.get('agentId'),
+      timestamp:Date.now(),
+      channel:chan,
+      signed_public:true,
+    };
+    addChatMsg(sid+'_'+chan,{...msg,own:true});
+    if(currentChannelTopic)wsPub(currentChannelTopic,msg);
+    inp.value='';inp.focus();
+    clearQuote();
+    if(isMentioned(text))toast('You mentioned yourself','info');
+  }else{
+    toast('Send failed: '+(r&&r.error||'unknown'),'error');
+  }
 }
 
 const seenMsgHashes=new Set();

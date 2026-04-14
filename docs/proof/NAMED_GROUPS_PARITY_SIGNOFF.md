@@ -37,7 +37,7 @@ unrecorded gap (zero across all surfaces below).
 |---------|--------------|--------------|---------------|
 | **x0xd REST** | **36 / 36** | `tests/api_coverage.rs` — every route handler in `src/bin/x0xd.rs` is in `ENDPOINTS` and has a test entry. 12 tests. | `tests/e2e_named_groups.sh` — 98 REST-driven assertions over a 3-daemon mesh; 3× clean archived. |
 | **x0x CLI** | **36 / 36** | `tests/parity_cli.rs` — spawns `x0x <cli_name> --help` for every endpoint. | `tests/e2e_feature_parity.sh` — 18 assertions per run, 3× clean archived. |
-| **x0x embedded GUI** (`src/gui/x0x-gui.html`) | **23 / 36** wired, 13 deferred (with reasons) | `tests/gui_named_group_parity.rs` — manifest-driven scan; **fails if a new endpoint is added without either a GUI call site or a `DEFERRED` entry**. Per-endpoint coverage report at `tests/proof-reports/parity/gui-named-groups-coverage.txt`. | Manual; headless harness queued for Phase 7. |
+| **x0x embedded GUI** (`src/gui/x0x-gui.html`) | **24 / 36** wired, 12 deferred (with reasons) | `tests/gui_named_group_parity.rs` — manifest-driven scan; **fails if a new endpoint is added without either a GUI call site or a `DEFERRED` entry**. Per-endpoint coverage report at `tests/proof-reports/parity/gui-named-groups-coverage.txt`. | Manual; headless harness still queued. |
 | **Communitas Rust client** | **36 / 36** named-groups | `parity_manifest.rs` (vendored manifest copy). The IMPLEMENTED list contains 36 entries; the test fails if any named-groups endpoint in the vendored manifest has no client method. 14 tests. | `live_mutation_contract.rs`. |
 | **Communitas Dioxus UI** | consumes the Rust client; UI surfaces `enum SpacePreset`, discover view, admin sheet, requests panel | preset round-trip unit test; 419/419 unit tests | UI driver queued for Phase 7. |
 | **Communitas Swift client** | **36 / 36** named-groups (every Rust method has a Swift counterpart) | `swift_parity.rs` — `parity_map_covers_all_rust_methods` walks `client.rs` for every public method and `swift_client_has_all_rust_methods` greps the Swift source for each one. | `swift test` — 42/42 pass. |
@@ -54,8 +54,7 @@ recorded in `tests/gui_named_group_parity.rs::DEFERRED`:
 |--------|------|--------|
 | POST | `/groups/:id/members` | admin flow; GUI uses invite links instead of direct add-by-agent |
 | DELETE | `/groups/:id/members/:agent_id` | admin flow; GUI uses ban rather than direct remove-by-agent |
-| POST | `/groups/:id/send` | **CROSS-SURFACE GAP**: chat view does not yet route SignedPublic groups through `/send` (same gap as Dioxus + SwiftUI) |
-| GET | `/groups/:id/messages` | **CROSS-SURFACE GAP**: paired with `/send`; message-history read-back lives with the chat view rewrite |
+| GET | `/groups/:id/messages` | GUI gap: signed-message HISTORY read-back from `/messages` not yet wired (SignedPublic SEND now is — see `sendSpaceChatSignedPublic`) |
 | DELETE | `/groups/:id/requests/:request_id` | requester-side cancel-request UI not yet wired (admin approve/reject is) |
 | GET | `/groups/discover/subscriptions` | power-user surface; CLI covers it |
 | POST | `/groups/discover/subscribe` | power-user surface; CLI covers it |
@@ -66,11 +65,15 @@ recorded in `tests/gui_named_group_parity.rs::DEFERRED`:
 | POST | `/groups/:id/secure/reseal` | secure-plane primitive; server-side rekey on approve/ban |
 | POST | `/groups/secure/open-envelope` | adversarial test endpoint, not a user-facing action |
 
-Two of these — **`POST /groups/:id/send` and `GET /groups/:id/messages`** —
-are the same cross-surface gap that exists in Dioxus and SwiftUI: the
-chat view does not yet branch on `confidentiality` to route
-SignedPublic groups through the `/send` REST path. This is the largest
-known remaining parity gap and is the primary target for Phase 7.
+**Phase 7 update:** The `POST /groups/:id/send` cross-surface gap is
+now closed across all three surfaces (GUI, Dioxus, SwiftUI). Each
+chat view fetches the group's `confidentiality` axis on mount and
+routes the send through `POST /groups/:id/send` for SignedPublic
+groups (so the daemon ML-DSA-signs the body and binds it to the
+current state-hash). MlsEncrypted groups keep the existing gossip
+path. The remaining piece — pulling **history** for non-member
+authored signed posts via `GET /groups/:id/messages` so they appear
+in the chat view alongside live-gossip messages — is still queued.
 
 ## Static-proof commands (one-line)
 
@@ -146,18 +149,22 @@ These are non-regressions, listed so a reader can see exactly what is
 not yet proven on which surface. Each maps to either the GUI
 `DEFERRED` entries above or a tracked follow-up.
 
-1. **SignedPublic send-path routing inside chat views** — Dioxus
-   `channel_chat.rs`, SwiftUI `MessagingView.swift`, and the embedded
-   GUI's `sendSpaceChat` all publish via gossip regardless of
-   `confidentiality`. `POST /groups/:id/send` (SignedPublic) and
-   `POST /groups/:id/secure/encrypt` (MlsEncrypted) are wired at
-   every client layer; the chat views just need a branch. Queued for
-   Phase 7 alongside the headless driver work.
+1. ~~**SignedPublic send-path routing inside chat views**~~ —
+   **Closed in Phase 7.** `sendSpaceChat` (GUI), `send_message`
+   (Dioxus `channel_chat.rs`), and `ChannelManager.sendMessage`
+   (SwiftUI) now branch on the group's `confidentiality` axis and
+   route SignedPublic groups through `POST /groups/:id/send`. The
+   `confidentiality` field is fetched once on mount via the
+   per-client `groupInfo`/`get_group` call, which now exposes the
+   full `policy` field on the `GroupInfo` shape.
 2. **Public-message history read-back** in chat views
-   (`GET /groups/:id/messages`). Paired with #1.
+   (`GET /groups/:id/messages`). Sender-side path is closed; reading
+   non-member-authored signed posts from the daemon's history cache
+   is still queued.
 3. **Headless GUI / UI drivers**. Playwright for the embedded HTML
-   GUI, `dioxus-testing` for Dioxus, and XCUITest for SwiftUI are
-   queued for Phase 7 CI.
+   GUI, `dioxus-testing` for Dioxus, and XCUITest for SwiftUI remain
+   queued. Phase 7's CI parity gates close the static-coverage
+   feedback loop; UI-level e2e remains future work.
 4. **GUI-side card inspection by id** (`GET /groups/cards/:id`) — the
    import action is now wired; per-id inspection still queued.
 5. **GUI requester-side cancel-request UI**
@@ -185,6 +192,21 @@ not yet proven on which surface. Each maps to either the GUI
 | Runtime parity test for CLI × 4 presets, with **real 403 authz checks** | ✅ (`e2e_feature_parity.sh`, 3× clean) |
 | 404 from "group unknown locally" no longer counted as authz proof | ✅ (fixed in this revision) |
 | Existing design proofs (C.2, D.3, D.4, E, F) remain green | ✅ |
+
+## Phase 7 additions (2026-04-14)
+
+1. **CI parity gate jobs** added to both repositories' `ci.yml`:
+   - `x0x.parity` — runs `api_manifest`, `parity_cli`, `api_coverage`,
+     `gui_smoke`, `gui_named_group_parity` and uploads the per-endpoint
+     GUI coverage as a CI artifact. Builds only the `x0x` binary.
+     Fails any PR that adds an endpoint without updating each surface.
+   - `communitas.parity` — runs `parity_manifest`, `client_coverage`,
+     `swift_parity`, plus a vendored-manifest schema sanity check.
+3. **SignedPublic chat-view send routing** wired in all three
+   surfaces (GUI, Dioxus, SwiftUI). See "Deferred / known gaps" #1
+   above. To enable the routing, `GroupInfo` on both clients now
+   exposes the full `policy` field from `GET /groups/:id`; the chat
+   views read `policy.confidentiality` on mount.
 
 ## Changes from the previous revision (2026-04-14, before this audit)
 
