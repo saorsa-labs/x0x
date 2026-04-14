@@ -6279,10 +6279,10 @@ struct SendGroupMessageRequest {
 ///
 /// Branches on `policy.confidentiality`:
 ///
-/// - `SignedPublic` — builds a signed [`GroupPublicMessage`], publishes
+/// - `SignedPublic` — builds a signed `GroupPublicMessage`, publishes
 ///   to `x0x.groups.public.{group_id}`, and caches it locally.
 ///   Write-access is enforced at endpoint time (same rules as
-///   [`x0x::groups::validate_public_message`] applies at ingest).
+///   `x0x::groups::validate_public_message` applies at ingest).
 /// - `MlsEncrypted` — not supported on this endpoint yet; callers
 ///   should use `/groups/:id/secure/encrypt` (Phase D.2).
 async fn send_group_public_message(

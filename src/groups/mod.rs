@@ -5,7 +5,7 @@
 //! - A KvStore (group metadata, display names, settings)
 //! - Gossip topics (chat rooms, notifications)
 //! - CRDT task lists (kanban boards)
-//! - A [`GroupPolicy`] that governs discovery/admission/read/write
+//! - A [`GroupPolicy`](crate::groups::policy::GroupPolicy) that governs discovery/admission/read/write
 //!
 //! Groups are the primary collaboration primitive for agents and humans.
 
