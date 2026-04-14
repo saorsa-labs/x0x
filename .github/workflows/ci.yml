@@ -146,3 +146,75 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --all-features --no-deps
+
+  parity:
+    # Phase 7 parity gate. Surfaces a focused subset of the test suite
+    # that proves the named-groups (and broader API) surface stays in
+    # sync across CLI, embedded GUI, REST, and the api-manifest. These
+    # tests are fast (<30 s) and need no daemon — they are deliberately
+    # separated from the broader `test` job so a parity regression
+    # surfaces immediately without waiting for the workspace nextest.
+    #
+    # Adding a new endpoint to `src/api/mod.rs::ENDPOINTS` will fail
+    # this job until:
+    # - tests/api_coverage.rs is updated (REST handler exists + tested)
+    # - the CLI handler exists in src/bin/x0x.rs (parity_cli)
+    # - the embedded GUI either calls it or lists it in
+    #   tests/gui_named_group_parity.rs::DEFERRED with a reason
+    # - docs/design/api-manifest.json is regenerated
+    name: API + GUI Parity Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-target-parity-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-parity-
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      # parity_cli spawns `x0x <cli_name> --help` so the binary must
+      # exist. Build only what's needed.
+      - name: Build x0x CLI binary
+        run: cargo build --bin x0x --all-features
+
+      - name: Run parity gate
+        run: |
+          cargo nextest run --all-features \
+            --test api_manifest \
+            --test parity_cli \
+            --test api_coverage \
+            --test gui_smoke \
+            --test gui_named_group_parity
+
+      - name: Upload GUI coverage report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: gui-named-groups-coverage
+          path: tests/proof-reports/parity/gui-named-groups-coverage.txt
+          if-no-files-found: ignore
