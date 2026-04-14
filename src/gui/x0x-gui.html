@@ -1885,13 +1885,15 @@ function sendSpaceChat(){
 /// SignedPublic send path (Phase E). Uses the REST endpoint so the
 /// daemon produces a real `GroupPublicMessage` (state-bound,
 /// ML-DSA-signed), publishes it to the public topic
-/// (`x0x.groups.public.{group_id}`), and caches it locally.
+/// (`x0x.groups.public.{stable_group_id}`), and caches it locally.
 ///
-/// Own-message rendering is driven by the poll loop in
-/// `signedPublicPoll()` rather than a legacy gossip rebroadcast — all
-/// three surfaces (GUI, Dioxus, SwiftUI) use the same REST-poll path
-/// for SignedPublic receive, so cross-peer visibility is consistent
-/// regardless of which client sent the message.
+/// Own-message rendering is driven by the WebSocket push subscription
+/// on the public topic and, as a reconnect backstop, the 30 s
+/// `signedPublicPoll()` loop. All three surfaces (GUI, Dioxus,
+/// SwiftUI) use the same push + poll architecture for SignedPublic
+/// receive with a shared `(author, timestamp, signature[0..12])`
+/// dedup key, so cross-peer visibility is consistent regardless of
+/// which client sent the message.
 async function sendSpaceChatSignedPublic(sid,text,inp){
   const r=await api('/groups/'+sid+'/send',{
     method:'POST',
@@ -1901,8 +1903,8 @@ async function sendSpaceChatSignedPublic(sid,text,inp){
     inp.value='';inp.focus();
     clearQuote();
     if(isMentioned(text))toast('You mentioned yourself','info');
-    // Trigger an immediate poll so the user sees their own message
-    // without waiting for the background tick.
+    // Trigger one immediate poll tick so the sender's own message
+    // renders even if the WS subscription is still registering.
     signedPublicPoll(sid,true);
   }else{
     toast('Send failed: '+(r&&r.error||'unknown'),'error');
@@ -1912,8 +1914,11 @@ async function sendSpaceChatSignedPublic(sid,text,inp){
 /// Poll `GET /groups/:id/messages` for SignedPublic groups and merge
 /// the result into the chat history. The daemon has already validated
 /// signatures, write-access, and banned-author constraints — we just
-/// render. Runs every 5 s while the user is viewing a SignedPublic
-/// space; torn down in `mountSpace` when leaving the space.
+/// render. Runs as a reconnect backstop every 30 s while the user is
+/// viewing a SignedPublic space; the primary receive path is the
+/// WebSocket subscription to `x0x.groups.public.{stable_group_id}`
+/// armed in `mountSpace`. Torn down in `mountSpace` when leaving the
+/// space.
 let signedPublicPollTimer=null;
 let signedPublicTopic='';
 let signedPublicSpaceId='';

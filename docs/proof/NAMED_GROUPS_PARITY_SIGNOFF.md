@@ -178,15 +178,11 @@ not yet proven on which surface. Each maps to either the GUI
    GUI, `dioxus-testing` for Dioxus, and XCUITest for SwiftUI remain
    queued. Phase 7's CI parity gates close the static-coverage
    feedback loop; UI-level e2e remains future work.
-4. **Requester-side cancel-request UI** in the GUI
-   (`DELETE /groups/:id/requests/:request_id`) — admin
-   approve/reject is wired; requester cancel is the one remaining
-   admin-UX gap in the GUI DEFERRED list.
 4. **GUI-side card inspection by id** (`GET /groups/cards/:id`) — the
-   import action is now wired; per-id inspection still queued.
+   import action is wired; per-id inspection UI still queued.
 5. **GUI requester-side cancel-request UI**
    (`DELETE /groups/:id/requests/:request_id`) — admin approve/reject
-   is wired; requester cancel is queued.
+   is wired; requester-side cancel is queued.
 6. **Cross-daemon convergence of join requests** in this CLI runtime
    matrix — out of scope here (handled by `e2e_named_groups.sh`).
 7. **Moderation tooling**, **backlog sync for late-joiners**, **MLS
@@ -219,7 +215,7 @@ not yet proven on which surface. Each maps to either the GUI
      Fails any PR that adds an endpoint without updating each surface.
    - `communitas.parity` — runs `parity_manifest`, `client_coverage`,
      `swift_parity`, plus a vendored-manifest schema sanity check.
-3. **SignedPublic chat — send + WebSocket-push receive — wired in
+2. **SignedPublic chat — send + WebSocket-push receive — wired in
    all three surfaces** (GUI, Dioxus, SwiftUI). Send branches on
    `policy.confidentiality` and routes through `POST /groups/:id/send`.
    Receive subscribes to `x0x.groups.public.{stable_group_id}` for
@@ -228,6 +224,14 @@ not yet proven on which surface. Each maps to either the GUI
    `(author, timestamp, signature-prefix)` dedup key. No gossip
    rebroadcast remains. To enable the routing, `GroupInfo` on both
    clients now exposes the full `policy` field.
+3. **Dioxus SignedPublic send no longer optimistic-inserts**; the
+   WS push / poll backstop merge is authoritative, which removes
+   the own-message double-render the reviewer caught on the first
+   WS-push pass.
+4. **Received SignedPublic messages are persisted to local channel
+   history** on both Dioxus (`x0x_contract::append_channel_history`)
+   and SwiftUI (`saveHistory(channel:messages:)`), so a remount
+   replays them alongside MlsEncrypted messages.
 
 ## Changes from the previous revision (2026-04-14, before this audit)
 
