@@ -533,7 +533,7 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish -p x0x || echo "x0x already published or publish failed"
+          cargo publish -p x0x
 
   # ============================================================
   # Publish to npm (with provenance)
