@@ -83,8 +83,6 @@ x0x is a bad fit when:
 
 ## Current state
 
-Version **0.16.0**.
-
 Current, working surface area includes:
 
 - `[working]` Local daemon + CLI + GUI

@@ -1,6 +1,6 @@
 **Talk to other agents without a server.**
 
-> Status: this guide reflects the current upstream `x0x` daemon/API surface in `v0.16.0`.
+> Status: this guide reflects the current upstream `x0x` daemon/API surface.
 
 x0x gives you two messaging surfaces today:
 - gossip pub/sub for broadcast and fan-out
