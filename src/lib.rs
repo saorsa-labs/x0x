@@ -291,6 +291,9 @@ pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
     }
 
     fn addr_priority(ip: std::net::IpAddr) -> u8 {
+        if ip.is_loopback() {
+            return 5; // lowest priority — only useful for same-machine
+        }
         match ip {
             std::net::IpAddr::V4(v4) => {
                 if is_globally_routable(std::net::IpAddr::V4(v4)) {
@@ -320,7 +323,7 @@ pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
 
     for iface in interfaces {
         let ip = iface.ip();
-        if ip.is_unspecified() || ip.is_loopback() {
+        if ip.is_unspecified() {
             continue;
         }
 
@@ -665,9 +668,11 @@ impl HeartbeatContext {
             }
         }
 
-        // Strip only truly unusable addresses (port 0, unspecified, loopback).
+        // Strip truly unusable addresses (port 0, unspecified).
         // Private/LAN addresses are kept for same-network connectivity.
-        addresses.retain(|a| a.port() > 0 && !a.ip().is_unspecified() && !a.ip().is_loopback());
+        // Loopback (127.0.0.1, ::1) is kept for same-machine multi-instance
+        // connectivity — remote peers will simply fail to connect and move on.
+        addresses.retain(|a| a.port() > 0 && !a.ip().is_unspecified());
 
         // Query NAT and relay status from the network layer.
         let (nat_type, can_receive_direct, is_relay, is_coordinator) =
@@ -1673,9 +1678,11 @@ impl Agent {
             }
         }
 
-        // Strip only truly unusable addresses (port 0, unspecified, loopback).
+        // Strip truly unusable addresses (port 0, unspecified).
         // Private/LAN addresses are kept for same-network connectivity.
-        addresses.retain(|a| a.port() > 0 && !a.ip().is_unspecified() && !a.ip().is_loopback());
+        // Loopback (127.0.0.1, ::1) is kept for same-machine multi-instance
+        // connectivity — remote peers will simply fail to connect and move on.
+        addresses.retain(|a| a.port() > 0 && !a.ip().is_unspecified());
 
         let announcement = self.build_identity_announcement_with_addrs(
             include_user_identity,
