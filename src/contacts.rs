@@ -132,7 +132,9 @@ impl std::str::FromStr for IdentityType {
             "known" => Ok(Self::Known),
             "trusted" => Ok(Self::Trusted),
             "pinned" => Ok(Self::Pinned),
-            _ => Err(format!("invalid identity type: {s}")),
+            _ => Err(format!(
+                "invalid identity type: {s} (valid values: anonymous, known, trusted, pinned)"
+            )),
         }
     }
 }

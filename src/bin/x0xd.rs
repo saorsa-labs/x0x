@@ -3103,11 +3103,14 @@ async fn import_agent_card(
     };
 
     // Parse trust level
-    let trust = match req.trust_level.to_lowercase().as_str() {
-        "trusted" => x0x::contacts::TrustLevel::Trusted,
-        "known" => x0x::contacts::TrustLevel::Known,
-        "blocked" => x0x::contacts::TrustLevel::Blocked,
-        _ => x0x::contacts::TrustLevel::Known,
+    let trust: x0x::contacts::TrustLevel = match req.trust_level.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
     };
 
     // Parse agent ID
@@ -3255,6 +3258,12 @@ async fn subscribe(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SubscribeRequest>,
 ) -> impl IntoResponse {
+    if req.topic.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "topic must not be empty" })),
+        );
+    }
     match state.agent.subscribe(&req.topic).await {
         Ok(sub) => {
             let id = format!("{:016x}", rand::random::<u64>());
@@ -9143,6 +9152,18 @@ async fn create_task_list(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTaskListRequest>,
 ) -> impl IntoResponse {
+    if req.topic.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "topic must not be empty" })),
+        );
+    }
+    if req.name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "name must not be empty" })),
+        );
+    }
     match state.agent.create_task_list(&req.name, &req.topic).await {
         Ok(handle) => {
             let id = req.topic.clone();
@@ -9342,6 +9363,18 @@ async fn create_kv_store(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateStoreRequest>,
 ) -> impl IntoResponse {
+    if req.topic.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "topic must not be empty" })),
+        );
+    }
+    if req.name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "name must not be empty" })),
+        );
+    }
     match state.agent.create_kv_store(&req.name, &req.topic).await {
         Ok(handle) => {
             let id = req.topic.clone();
@@ -10834,7 +10867,14 @@ fn decode_base64_payload(encoded: &str) -> Result<Vec<u8>, (StatusCode, Json<ser
         .map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": format!("invalid base64: {e}") })),
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "invalid base64 in payload field: {e}. \
+                         The payload must be base64-encoded \
+                         (e.g., use `echo -n \"hello\" | base64`)"
+                    )
+                })),
             )
         })
 }
