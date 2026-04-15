@@ -995,19 +995,30 @@ async fn main() -> Result<()> {
         config.bind_address
     };
 
-    // Derive instance-scoped identity directory
-    let identity_dir = match &instance_name {
-        Some(name) => {
-            let dir = dirs::home_dir()
-                .context("home directory required for instance identity directory")?
-                .join(format!(".x0x-{name}"));
-            tokio::fs::create_dir_all(&dir)
-                .await
-                .context("failed to create instance identity directory")?;
-            tracing::info!("Identity directory: {}", dir.display());
-            Some(dir)
-        }
-        None => None,
+    // Derive instance-scoped identity directory.
+    //
+    // Named instances get their own ~/.x0x-<name>/ directory. When data_dir
+    // is explicitly configured (without --name), store identity keypairs
+    // inside data_dir so that each instance with a separate data_dir gets
+    // its own AgentId instead of sharing ~/.x0x/agent.key.
+    let identity_dir = if let Some(ref name) = instance_name {
+        let dir = dirs::home_dir()
+            .context("home directory required for instance identity directory")?
+            .join(format!(".x0x-{name}"));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .context("failed to create instance identity directory")?;
+        tracing::info!("Identity directory: {}", dir.display());
+        Some(dir)
+    } else if config.data_dir != default_data_dir() {
+        let dir = config.data_dir.clone();
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .context("failed to create data directory for identity keys")?;
+        tracing::info!("Identity directory (from data_dir): {}", dir.display());
+        Some(dir)
+    } else {
+        None
     };
 
     // Create agent
