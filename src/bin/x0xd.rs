@@ -2705,7 +2705,7 @@ async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
         );
     };
 
-    let nat_type_str = format!("{:?}", status.nat_type);
+    let nat_type_str = status.nat_type.to_string();
 
     // Collect all known addresses: ant-quic observed + local global IPv6.
     // ant-quic currently only reports IPv4 via OBSERVED_ADDRESS frames,
@@ -10257,7 +10257,7 @@ async fn evaluate_trust(
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
-            "decision": format!("{:?}", decision)
+            "decision": decision.to_string()
         })),
     )
 }

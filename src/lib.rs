@@ -4375,7 +4375,7 @@ pub struct KvEntrySnapshot {
 ///
 /// This is returned by `TaskListHandle::list_tasks()` and hides CRDT
 /// internals, providing a clean API surface.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TaskSnapshot {
     /// Unique task identifier.
     pub id: crdt::TaskId,
