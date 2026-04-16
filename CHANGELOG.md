@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.17.1] - 2026-04-16
+
+### Fixed
+
+- `DirectMessaging::handle_incoming()` no longer back-pressures the receive pipeline when the pull-API receiver (`Agent::recv_direct()`) is idle. The bounded `internal_tx.send(msg).await` is now a non-blocking `try_send`, so an undrained mpsc can no longer stall the `Node::recv` → `spawn_receiver` → `start_direct_listener` chain. Daemons using only `subscribe_direct()` (x0xd, GUI, CLI) are the primary beneficiaries.
+- `NetworkNode::spawn_receiver` explicitly drops the `node` read-lock guard after `Node::recv().await` returns, so we no longer hold the `RwLock` read lock while awaiting channel sends.
+
+### Changed
+
+- Bumped `ant-quic` to `0.26.12` (includes upstream #165 MASQUE relay target-selection fix: mesh-wide pairwise `/agents/connect` restored to 30/30 on the 6-node VPS bootstrap, vs. 6/30 under 0.26.9).
+- Collapsed the Phase D.3 stable-group-id abstraction onto `mls_group_id`: every x0x group is an MLS group, and `stable_group_id()` now always equals the MLS group id. Removes cross-daemon id drift where owners indexed `named_groups` by MLS id and card-imported stubs indexed by stable id, which caused 404s on `POST /groups/:id/requests` and friends.
+- Added 1 MiB + 16 MiB NYC→SFO large-file-transfer coverage to `tests/e2e_vps.sh` (section §18b).
+
+### Known Issues
+
+- **ant-quic #166**: in the live VPS mesh, a short unidirectional stream can be `[p2p][send] ACKED` on the sender but never surface at the receiver's `accept_uni()`, while larger PubSub streams on the same connection flow normally. Tracked upstream; not reproducible with two daemons on localhost. The 0.17.1 recv-pipeline fix clears x0x's contribution to the symptom; the residual stream-accept drop sits inside ant-quic. Mac-behind-NAT → VPS (the user-facing single-client journey) is not affected — e2e_live_network 66/66 green.
+
 ## [v0.16.0] - 2026-04-09
 
 ### Changed
