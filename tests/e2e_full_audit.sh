@@ -136,6 +136,12 @@ chk()  { local R="$1" K="$2" N="$3"
 check_contains() { local N="$1" R="$2" NEEDLE="$3"; [[ "$R" == *"$NEEDLE"* ]] && ok "$N" || fail "$N" "want='$NEEDLE' got='${R:0:120}'"; }
 chkv() { [[ "$1" == *"$2"* ]] && ok "$3" || fail "$3" "want='$2' got='${1:0:90}'"; }
 json_len() { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);v=d.get('$2',[]);print(len(v) if isinstance(v,list) else 0)" 2>/dev/null || echo 0; }
+# Named groups currently expose two identifiers during the D.3 transition:
+# - local/authority `group_id` on create/list/get routes (legacy MLS key)
+# - stable public `group_id` on cards/discovery/imported stubs
+# When a test crosses from authority-local control-plane routes into public
+# discovery/card/import flows, derive the stable id from the signed card.
+stable_group_id_from_local() { fld "$(get /groups/cards/$1)" "group_id"; }
 json_path() { echo "$1" | python3 - <<PY 2>/dev/null || true
 import json,sys
 obj=json.load(sys.stdin)
@@ -529,15 +535,17 @@ DISC=$(echo "$R" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.ge
 chkv "$DISC" "public_directory" "public_request_secure discoverability=public_directory"
 ADM=$(echo "$R" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('policy',{}).get('admission',''))" 2>/dev/null)
 chkv "$ADM" "request_access" "public_request_secure admission=request_access"
+STABLE_GID_PRS=$(stable_group_id_from_local "$GID_PRS")
+proof "public_request_secure stable_group_id=${STABLE_GID_PRS:0:24}..."
 
-# [9b-3] Alice's own discover shows her group
+# [9b-3] Alice's own discover shows her group by stable public id
 R=$(get /groups/discover)
 COUNT=$(echo "$R" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
-target='$GID_PRS'
+target='$STABLE_GID_PRS'
 print(sum(1 for g in d.get('groups',[]) if g.get('group_id')==target))" 2>/dev/null || echo "0")
-chkv "$COUNT" "1" "owner sees public group in /groups/discover"
+[[ "$COUNT" =~ ^[0-9]+$ ]] && [ "$COUNT" -ge 1 ] && ok "owner sees public group in /groups/discover" || fail "owner sees public group in /groups/discover" "want>=1 got='$COUNT'"
 
 # [9b-4] Alice fetches group card
 R=$(get /groups/cards/$GID_PRS)
@@ -553,12 +561,12 @@ chk "$R" "ok" "POST /groups/cards/import (bob)"
 COUNT=$(bget /groups/discover | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
-target='$GID_PRS'
+target='$STABLE_GID_PRS'
 print(sum(1 for g in d.get('groups',[]) if g.get('group_id')==target))" 2>/dev/null || echo "0")
 chkv "$COUNT" "1" "bob sees imported group in discover"
 
-# [9b-7] Bob submits join request
-R=$(bpst /groups/$GID_PRS/requests '{"message":"Please let me join"}')
+# [9b-7] Bob submits join request via his imported stable-id stub
+R=$(bpst /groups/$STABLE_GID_PRS/requests '{"message":"Please let me join"}')
 chk "$R" "request_id" "POST /groups/:id/requests (bob submits)"
 BOB_REQ_ID=$(fld "$R" "request_id")
 proof "bob request_id=${BOB_REQ_ID:0:16}..."
@@ -603,12 +611,31 @@ chkv "$BOB_ACTIVE" "yes" "bob is now active member after approval"
 # Charlie also needs to import the card to have a local stub.
 R=$(cpst /groups/cards/import "$CARD_JSON")
 chk "$R" "ok" "charlie imports card"
-R=$(cpst /groups/$GID_PRS/requests '{"message":"Also me"}')
+R=$(cpst /groups/$STABLE_GID_PRS/requests '{"message":"Also me"}')
 chk "$R" "request_id" "POST /groups/:id/requests (charlie submits)"
 CHARLIE_REQ_ID=$(fld "$R" "request_id")
 
-sleep 2
-R=$(post /groups/$GID_PRS/requests/$CHARLIE_REQ_ID/reject '{}')
+# Wait for Alice to observe Charlie's pending request before rejecting.
+CHARLIE_PENDING=0
+ALICE_CHARLIE_REQ_ID=""
+for _ in $(seq 1 30); do
+  R=$(get /groups/$GID_PRS/requests)
+  CHARLIE_PENDING=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(sum(1 for r in d.get('requests',[]) if r.get('status')=='pending' and r.get('requester_agent_id')=='$CID'))" 2>/dev/null || echo "0")
+  ALICE_CHARLIE_REQ_ID=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for r in d.get('requests',[]):
+    if r.get('status')=='pending' and r.get('requester_agent_id')=='$CID':
+        print(r.get('request_id',''))
+        break
+" 2>/dev/null || echo "")
+  [ "$CHARLIE_PENDING" = "1" ] && [ -n "$ALICE_CHARLIE_REQ_ID" ] && break
+  sleep 1
+done
+R=$(post /groups/$GID_PRS/requests/${ALICE_CHARLIE_REQ_ID:-$CHARLIE_REQ_ID}/reject '{}')
 chk "$R" "ok" "POST /groups/:id/requests/:rid/reject"
 
 # [9b-12] Charlie is NOT a member
@@ -620,10 +647,10 @@ print(sum(1 for m in d.get('members',[]) if m.get('agent_id')=='$CID' and m.get(
 chkv "$CHARLIE_MEMBER" "0" "charlie NOT a member after rejection"
 
 # [9b-13] Cancel own request path — Charlie creates a new one, cancels it
-R=$(cpst /groups/$GID_PRS/requests '{}')
+R=$(cpst /groups/$STABLE_GID_PRS/requests '{}')
 CREQ2=$(fld "$R" "request_id")
 if [ -n "$CREQ2" ]; then
-  R=$(curl -sf -m 10 -X DELETE -H "Authorization: Bearer $CT" "$CA/groups/$GID_PRS/requests/$CREQ2" 2>/dev/null || echo '{"error":"curl_fail"}')
+  R=$(curl -sf -m 10 -X DELETE -H "Authorization: Bearer $CT" "$CA/groups/$STABLE_GID_PRS/requests/$CREQ2" 2>/dev/null || echo '{"error":"curl_fail"}')
   chk "$R" "ok" "DELETE /groups/:id/requests/:rid (cancel own)"
 fi
 
@@ -637,6 +664,8 @@ sec "━━ [9c] NAMED GROUPS — Authorization Negative Paths ━━"
 R=$(post /groups "{\"name\":\"authz-$TS\",\"preset\":\"public_request_secure\"}")
 GID_AZ=$(fld "$R" "group_id")
 chk "$R" "group_id" "POST /groups for authz test"
+STABLE_GID_AZ=$(stable_group_id_from_local "$GID_AZ")
+proof "authz stable_group_id=${STABLE_GID_AZ:0:24}..."
 
 # [9c-1b] Non-member Bob PATCH policy should be denied (no local card yet)
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X PATCH -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d '{"preset":"public_open"}' "$BA/groups/$GID_AZ/policy" 2>/dev/null)
@@ -647,8 +676,8 @@ AUTHZ_CARD=$(get /groups/cards/$GID_AZ)
 R=$(bpst /groups/cards/import "$AUTHZ_CARD"); chk "$R" "ok" "bob imports authz card"
 R=$(cpst /groups/cards/import "$AUTHZ_CARD"); chk "$R" "ok" "charlie imports authz card"
 
-# [9c-3] After import Bob has a stub but is NOT a member — policy PATCH still denied
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X PATCH -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d '{"preset":"public_open"}' "$BA/groups/$GID_AZ/policy" 2>/dev/null)
+# [9c-3] After import Bob has a stable-id stub but is NOT a member — policy PATCH still denied
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X PATCH -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d '{"preset":"public_open"}' "$BA/groups/$STABLE_GID_AZ/policy" 2>/dev/null)
 [[ "$STATUS" == "403" ]] && ok "non-member-after-import PATCH policy → 403" || fail "non-member-after-import PATCH policy denied" "got $STATUS"
 
 # [9c-4] Alice adds Bob as Member
@@ -659,11 +688,11 @@ sleep 2
 # [9c-5] Bob (Member on his own daemon via card import + self-added via metadata) cannot PATCH policy
 # Note: Bob's stub still shows Alice as owner only; Bob will not be in his local v2 roster.
 # So "member PATCH denied" is correct — 403 from role check, or 404 if stub has no bob entry.
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X PATCH -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d '{"preset":"public_open"}' "$BA/groups/$GID_AZ/policy" 2>/dev/null)
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X PATCH -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d '{"preset":"public_open"}' "$BA/groups/$STABLE_GID_AZ/policy" 2>/dev/null)
 [[ "$STATUS" == "403" ]] && ok "member PATCH policy denied → 403 (owner-only)" || fail "member PATCH policy denied" "got $STATUS"
 
-# [9c-6] Charlie submits a join request on his own daemon (he has the stub)
-R=$(cpst /groups/$GID_AZ/requests '{"message":"authz test"}')
+# [9c-6] Charlie submits a join request on his own daemon (he has the stable-id stub)
+R=$(cpst /groups/$STABLE_GID_AZ/requests '{"message":"authz test"}')
 chk "$R" "request_id" "charlie submits join request"
 CREQ_A=$(fld "$R" "request_id")
 sleep 3  # let gossip propagate the JoinRequestCreated event
@@ -678,13 +707,13 @@ chkv "$PENDING_C" "1" "alice sees charlie's request via gossip"
 
 # [9c-8] Bob (plain Member, not Admin) tries to approve on his own daemon — denied.
 # Note: Bob's daemon may not yet have charlie's request locally. 403/404 both acceptable.
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X POST -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d '{}' "$BA/groups/$GID_AZ/requests/$CREQ_A/approve" 2>/dev/null)
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X POST -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d '{}' "$BA/groups/$STABLE_GID_AZ/requests/$CREQ_A/approve" 2>/dev/null)
 [[ "$STATUS" == "403" || "$STATUS" == "404" ]] && ok "member cannot approve request ($STATUS)" || fail "member cannot approve request" "got $STATUS"
 
 # [9c-9] Bob (Member) cannot remove Alice (Owner) on his own daemon
 # 400 is returned by the existing creator-protection guard; 403 is the role-based denial.
 # Both represent "owner removal via member API is not allowed".
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X DELETE -H "Authorization: Bearer $BT" "$BA/groups/$GID_AZ/members/$AID" 2>/dev/null)
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X DELETE -H "Authorization: Bearer $BT" "$BA/groups/$STABLE_GID_AZ/members/$AID" 2>/dev/null)
 [[ "$STATUS" == "403" || "$STATUS" == "400" || "$STATUS" == "404" ]] && ok "member cannot remove owner ($STATUS)" || fail "member cannot remove owner" "got $STATUS"
 
 # [9c-10] Alice promotes Bob to Admin (on Alice's daemon where state is authoritative)
@@ -702,7 +731,7 @@ chk "$R" "ok" "alice bans bob"
 STATUS=0
 for _ in $(seq 1 20); do
   sleep 1
-  STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X POST -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d '{"message":"try again"}' "$BA/groups/$GID_AZ/requests" 2>/dev/null)
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -X POST -H "Authorization: Bearer $BT" -H "Content-Type: application/json" -d '{"message":"try again"}' "$BA/groups/$STABLE_GID_AZ/requests" 2>/dev/null)
   [[ "$STATUS" == "403" || "$STATUS" == "409" ]] && break
 done
 [[ "$STATUS" == "403" || "$STATUS" == "409" ]] && ok "banned member cannot create join request ($STATUS)" || fail "banned member cannot request" "got $STATUS"

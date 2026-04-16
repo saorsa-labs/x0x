@@ -502,12 +502,21 @@ impl NetworkNode {
     /// Returns `NetworkError` if connection fails or node is not initialized.
     pub async fn connect_addr(&self, addr: SocketAddr) -> NetworkResult<AntPeerId> {
         let node = self.require_node().await?;
+        let family = if addr.is_ipv4() { "v4" } else { "v6" };
+        tracing::debug!(
+            target: "x0x::connect",
+            strategy = "direct_addr",
+            %addr,
+            family,
+            "starting direct dial"
+        );
         let start = std::time::Instant::now();
         let result = node.connect_addr(addr).await;
+        let dur_ms = start.elapsed().as_millis() as u64;
 
         match result {
             Ok(peer_conn) => {
-                let rtt_ms = start.elapsed().as_millis() as u32;
+                let rtt_ms = dur_ms as u32;
                 if let Some(ref cache) = self.bootstrap_cache {
                     cache
                         .add_from_connection(peer_conn.peer_id, vec![addr], None)
@@ -518,6 +527,16 @@ impl NetworkNode {
                     peer_id: peer_conn.peer_id.0,
                     address: addr,
                 });
+                tracing::info!(
+                    target: "x0x::connect",
+                    strategy = "direct_addr",
+                    %addr,
+                    family,
+                    peer_id_prefix = %hex_prefix(&peer_conn.peer_id.0, 4),
+                    dur_ms,
+                    outcome = "ok",
+                    "direct dial succeeded"
+                );
                 Ok(peer_conn.peer_id)
             }
             Err(e) => {
@@ -535,6 +554,16 @@ impl NetworkNode {
                         }
                     }
                 }
+                tracing::info!(
+                    target: "x0x::connect",
+                    strategy = "direct_addr",
+                    %addr,
+                    family,
+                    dur_ms,
+                    outcome = "fail",
+                    error = %e,
+                    "direct dial failed"
+                );
                 Err(NetworkError::ConnectionFailed(e.to_string()))
             }
         }
@@ -599,22 +628,55 @@ impl NetworkNode {
         addrs: Vec<SocketAddr>,
     ) -> NetworkResult<(SocketAddr, AntPeerId)> {
         let node = self.require_node().await?;
+        let v4_count = addrs.iter().filter(|a| a.is_ipv4()).count();
+        let v6_count = addrs.len() - v4_count;
+        tracing::debug!(
+            target: "x0x::connect",
+            strategy = "peer_with_addrs",
+            peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+            addr_count = addrs.len(),
+            v4_count,
+            v6_count,
+            "starting peer-authenticated dial with hints"
+        );
         let start = std::time::Instant::now();
-        let peer_conn = node
-            .connect_peer_with_addrs(peer_id, addrs)
-            .await
-            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        let peer_conn_res = node.connect_peer_with_addrs(peer_id, addrs).await;
+        let dur_ms = start.elapsed().as_millis() as u64;
+
+        let peer_conn = match peer_conn_res {
+            Ok(pc) => pc,
+            Err(e) => {
+                tracing::info!(
+                    target: "x0x::connect",
+                    strategy = "peer_with_addrs",
+                    peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                    dur_ms,
+                    outcome = "fail",
+                    error = %e,
+                    "peer-authenticated dial failed"
+                );
+                return Err(NetworkError::ConnectionFailed(e.to_string()));
+            }
+        };
 
         let addr = match peer_conn.remote_addr {
             TransportAddr::Udp(socket_addr) => socket_addr,
             _ => {
+                tracing::warn!(
+                    target: "x0x::connect",
+                    strategy = "peer_with_addrs",
+                    peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                    dur_ms,
+                    "connected but transport type unsupported"
+                );
                 return Err(NetworkError::ConnectionFailed(
                     "Unsupported transport type".to_string(),
-                ))
+                ));
             }
         };
 
-        let rtt_ms = start.elapsed().as_millis() as u32;
+        let family = if addr.is_ipv4() { "v4" } else { "v6" };
+        let rtt_ms = dur_ms as u32;
         if let Some(ref cache) = self.bootstrap_cache {
             cache
                 .add_from_connection(peer_conn.peer_id, vec![addr], None)
@@ -626,6 +688,18 @@ impl NetworkNode {
             peer_id: peer_conn.peer_id.0,
             address: addr,
         });
+
+        tracing::info!(
+            target: "x0x::connect",
+            strategy = "peer_with_addrs",
+            peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+            verified_prefix = %hex_prefix(&peer_conn.peer_id.0, 4),
+            selected_addr = %addr,
+            family,
+            dur_ms,
+            outcome = "ok",
+            "peer-authenticated dial succeeded"
+        );
 
         Ok((addr, peer_conn.peer_id))
     }
@@ -974,6 +1048,17 @@ impl NetworkNode {
 // ============================================================================
 // PeerId Conversion Helpers
 // ============================================================================
+
+/// Short hex prefix for compact logging of 32-byte peer/machine IDs.
+pub(crate) fn hex_prefix(bytes: &[u8; 32], n: usize) -> String {
+    let n = n.min(32);
+    let mut s = String::with_capacity(n * 2);
+    for b in &bytes[..n] {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
+}
 
 /// Convert ant-quic PeerId to saorsa-gossip PeerId
 fn ant_to_gossip_peer_id(ant_id: &AntPeerId) -> GossipPeerId {

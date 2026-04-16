@@ -89,3 +89,16 @@ pub async fn bootstrap_cache(client: &DaemonClient) -> Result<()> {
     print_value(client.format(), &resp);
     Ok(())
 }
+
+/// `x0x diagnostics connectivity` — GET /diagnostics/connectivity
+///
+/// Prints the ant-quic NodeStatus snapshot as JSON. Includes UPnP port-mapping
+/// state, NAT type, mDNS discovery state, direct vs relayed connection counts,
+/// hole-punch success rate, and advertised external addresses. Primary tool
+/// for answering "is ant-quic's 100%-connectivity promise holding?".
+pub async fn diagnostics_connectivity(client: &DaemonClient) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get("/diagnostics/connectivity").await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}

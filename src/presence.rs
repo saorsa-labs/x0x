@@ -87,10 +87,17 @@ pub fn peer_to_agent_id(
 
 /// Parse a slice of address-hint strings into [`std::net::SocketAddr`]s.
 ///
-/// Invalid or unparseable strings are silently skipped.
+/// Invalid or unparseable strings are silently skipped, and any address that
+/// is not globally advertisable is dropped. This is the inbound defence for
+/// presence beacons — older peers that still advertise RFC1918/ULA/loopback
+/// entries must not force us to dial their unreachable LAN addresses.
 #[must_use]
 pub fn parse_addr_hints(hints: &[String]) -> Vec<std::net::SocketAddr> {
-    hints.iter().filter_map(|h| h.parse().ok()).collect()
+    hints
+        .iter()
+        .filter_map(|h| h.parse::<std::net::SocketAddr>().ok())
+        .filter(|a| crate::is_publicly_advertisable(*a))
+        .collect()
 }
 
 /// Convert a `(PeerId, PresenceRecord)` pair into a [`DiscoveredAgent`].
@@ -740,16 +747,45 @@ mod tests {
 
     #[test]
     fn test_parse_addr_hints_valid() {
-        let hints = vec!["127.0.0.1:5000".to_string(), "[::1]:5001".to_string()];
+        // parse_addr_hints is the inbound defence for presence beacons — it
+        // deliberately drops non-globally-advertisable addresses (loopback,
+        // RFC1918, ULA, link-local, CGNAT, port-0). See is_publicly_advertisable.
+        let hints = vec!["1.2.3.4:5000".to_string(), "[2001:db8::1]:5001".to_string()];
         let addrs = parse_addr_hints(&hints);
-        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs.len(), 2, "two globally-advertisable hints survive");
     }
 
     #[test]
     fn test_parse_addr_hints_invalid_skipped() {
-        let hints = vec!["not-an-addr".to_string(), "127.0.0.1:5000".to_string()];
+        let hints = vec!["not-an-addr".to_string(), "1.2.3.4:5000".to_string()];
         let addrs = parse_addr_hints(&hints);
-        assert_eq!(addrs.len(), 1);
+        assert_eq!(
+            addrs.len(),
+            1,
+            "unparseable hints are dropped, parseable global hints survive"
+        );
+    }
+
+    #[test]
+    fn test_parse_addr_hints_drops_non_global_scopes() {
+        // Regression guard: older peers still ship loopback / RFC1918 / ULA
+        // in presence beacons. We must filter them out on receive so the
+        // discovery cache never points at unreachable LAN addresses.
+        let hints = vec![
+            "127.0.0.1:5000".to_string(),
+            "10.1.2.3:5000".to_string(),
+            "192.168.1.5:5000".to_string(),
+            "[fd00::1]:5000".to_string(),
+            "[::1]:5000".to_string(),
+            "1.2.3.4:5000".to_string(),
+        ];
+        let addrs = parse_addr_hints(&hints);
+        assert_eq!(
+            addrs.len(),
+            1,
+            "only the global v4 entry survives the scope filter"
+        );
+        assert_eq!(addrs[0].to_string(), "1.2.3.4:5000");
     }
 
     #[test]
@@ -769,7 +805,9 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let record = PresenceRecord::new([0u8; 32], vec!["192.168.1.1:5000".to_string()], 300);
+        // Use a globally-advertisable hint: the inbound filter now drops
+        // RFC1918 entries so the test must use a global v4.
+        let record = PresenceRecord::new([0u8; 32], vec!["1.2.3.4:5000".to_string()], 300);
         // record.expires = now + 300
 
         let result = presence_record_to_discovered_agent(peer_id, &record, &cache);

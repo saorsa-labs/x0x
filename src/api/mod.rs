@@ -177,6 +177,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Bootstrap peer cache stats",
         category: "network",
     },
+    EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/connectivity",
+        cli_name: "diagnostics connectivity",
+        description: "Ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS)",
+        category: "network",
+    },
     // ── Messaging ───────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Post,

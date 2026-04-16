@@ -31,9 +31,19 @@ proptest! {
     }
 
     #[test]
-    fn parse_addr_hints_roundtrips_valid_addresses(addrs in prop::collection::vec(arb_addr(), 0..5)) {
+    fn parse_addr_hints_roundtrips_globally_advertisable_addresses(
+        addrs in prop::collection::vec(arb_addr(), 0..5)
+    ) {
+        // parse_addr_hints now drops non-globally-advertisable entries (the
+        // inbound defence against LAN-scope leakage from older peers). The
+        // round-trip only holds for the filtered subset.
         let hints: Vec<String> = addrs.iter().map(std::string::ToString::to_string).collect();
-        prop_assert_eq!(parse_addr_hints(&hints), addrs);
+        let expected: Vec<SocketAddr> = addrs
+            .iter()
+            .copied()
+            .filter(|a| x0x::is_publicly_advertisable(*a))
+            .collect();
+        prop_assert_eq!(parse_addr_hints(&hints), expected);
     }
 
     #[test]
@@ -83,7 +93,14 @@ proptest! {
 
         prop_assert_eq!(discovered.agent_id, AgentId(machine_bytes));
         prop_assert_eq!(discovered.machine_id, MachineId(machine_bytes));
-        prop_assert_eq!(discovered.addresses, addrs);
+        // Inbound filter drops non-globally-advertisable addrs — only the
+        // filtered subset survives into the DiscoveredAgent entry.
+        let expected: Vec<SocketAddr> = addrs
+            .iter()
+            .copied()
+            .filter(|a| x0x::is_publicly_advertisable(*a))
+            .collect();
+        prop_assert_eq!(discovered.addresses, expected);
     }
 }
 
@@ -99,10 +116,12 @@ fn global_presence_topic_is_deterministic() {
 
 #[test]
 fn invalid_addr_hints_are_ignored() {
-    let hints = vec!["127.0.0.1:1234".to_string(), "not-an-addr".to_string()];
+    // `parse_addr_hints` now also drops non-globally-advertisable addrs,
+    // so the loopback entry is filtered out in addition to the malformed one.
+    let hints = vec!["1.2.3.4:1234".to_string(), "not-an-addr".to_string()];
     assert_eq!(
         parse_addr_hints(&hints),
-        vec!["127.0.0.1:1234".parse().unwrap()]
+        vec!["1.2.3.4:1234".parse().unwrap()]
     );
 }
 

@@ -285,6 +285,21 @@ fn is_globally_routable(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Whether an address is safe to publish on a globally-propagating channel
+/// (identity heartbeat, agent card, presence beacon, gossip cache advert).
+///
+/// LAN-scoped discovery is handled by ant-quic's first-party mDNS on link-local
+/// multicast, so we deliberately never share RFC1918, ULA, link-local, CGNAT,
+/// or loopback addresses over global gossip. Remote peers cannot reach them,
+/// and dialing them burns per-attempt connect budget on the receiver side.
+///
+/// This is stricter than `ant_quic::reachability::ReachabilityScope::Global`
+/// because it also excludes CGNAT (100.64/10), documentation ranges, and
+/// port-zero entries.
+pub fn is_publicly_advertisable(addr: std::net::SocketAddr) -> bool {
+    addr.port() > 0 && is_globally_routable(addr.ip())
+}
+
 pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
     fn is_cgnat(v4: std::net::Ipv4Addr) -> bool {
         v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64
@@ -665,9 +680,13 @@ impl HeartbeatContext {
             }
         }
 
-        // Strip only truly unusable addresses (port 0, unspecified, loopback).
-        // Private/LAN addresses are kept for same-network connectivity.
-        addresses.retain(|a| a.port() > 0 && !a.ip().is_unspecified() && !a.ip().is_loopback());
+        // Heartbeat announcements propagate over global gossip. We MUST NOT
+        // include LAN-scope addresses here — LAN-peer discovery is handled by
+        // ant-quic's first-party mDNS, and shipping RFC1918/ULA/link-local
+        // addresses to remote peers causes them to burn ~50s per candidate on
+        // a dial that can never succeed (see investigation 2026-04-15, report
+        // tests/proof-reports/MDNS_VS_GOSSIP_ADDRESS_SCOPE_20260415.md).
+        addresses.retain(|a| is_publicly_advertisable(*a));
 
         // Query NAT and relay status from the network layer.
         let (nat_type, can_receive_direct, is_relay, is_coordinator) =
@@ -1016,7 +1035,11 @@ impl Agent {
                 merge_helper_hint(
                     &mut helper_hints,
                     advert_peer_id,
-                    advert.addr_hints.into_iter().map(|hint| hint.addr),
+                    advert
+                        .addr_hints
+                        .into_iter()
+                        .map(|hint| hint.addr)
+                        .filter(|addr| is_publicly_advertisable(*addr)),
                     advert.roles.coordinator || advert.roles.rendezvous,
                     advert.roles.relay,
                 );
@@ -1082,6 +1105,14 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
     ) -> error::Result<connectivity::ConnectOutcome> {
+        let call_start = std::time::Instant::now();
+        let agent_prefix = network::hex_prefix(&agent_id.0, 4);
+        tracing::debug!(
+            target: "x0x::connect",
+            stage = "connect_to_agent",
+            %agent_prefix,
+            "begin"
+        );
         // 1. Look up in discovery cache
         let discovered = {
             let cache = self.identity_discovery_cache.read().await;
@@ -1090,12 +1121,44 @@ impl Agent {
 
         let agent = match discovered {
             Some(a) => a,
-            None => return Ok(connectivity::ConnectOutcome::NotFound),
+            None => {
+                tracing::info!(
+                    target: "x0x::connect",
+                    stage = "connect_to_agent",
+                    %agent_prefix,
+                    outcome = "not_found",
+                    dur_ms = call_start.elapsed().as_millis() as u64,
+                    "agent not in discovery cache"
+                );
+                return Ok(connectivity::ConnectOutcome::NotFound);
+            }
         };
 
         let info = connectivity::ReachabilityInfo::from_discovered(&agent);
+        let v4_addrs = info.addresses.iter().filter(|a| a.is_ipv4()).count();
+        let v6_addrs = info.addresses.len() - v4_addrs;
+        tracing::info!(
+            target: "x0x::connect",
+            stage = "connect_to_agent",
+            %agent_prefix,
+            machine_prefix = %network::hex_prefix(&agent.machine_id.0, 4),
+            addr_total = info.addresses.len(),
+            v4_addrs,
+            v6_addrs,
+            can_receive_direct = ?info.can_receive_direct,
+            should_attempt_direct = info.should_attempt_direct(),
+            needs_coordination = info.needs_coordination(),
+            "reachability classified"
+        );
 
         let Some(ref network) = self.network else {
+            tracing::warn!(
+                target: "x0x::connect",
+                stage = "connect_to_agent",
+                %agent_prefix,
+                outcome = "unreachable_no_network",
+                "network layer not initialised"
+            );
             return Ok(connectivity::ConnectOutcome::Unreachable);
         };
 
@@ -1128,14 +1191,45 @@ impl Agent {
             self.direct_messaging
                 .mark_connected(agent.agent_id, machine_id)
                 .await;
+            let dur_ms = call_start.elapsed().as_millis() as u64;
             return if let Some(addr) = info.addresses.first() {
+                let family = if addr.is_ipv4() { "v4" } else { "v6" };
+                tracing::info!(
+                    target: "x0x::connect",
+                    stage = "connect_to_agent",
+                    %agent_prefix,
+                    strategy = "already_connected",
+                    outcome = "direct",
+                    selected_addr = %addr,
+                    family,
+                    dur_ms,
+                    "reusing existing connection"
+                );
                 Ok(connectivity::ConnectOutcome::Direct(*addr))
             } else {
+                tracing::info!(
+                    target: "x0x::connect",
+                    stage = "connect_to_agent",
+                    %agent_prefix,
+                    strategy = "already_connected",
+                    outcome = "already_connected",
+                    dur_ms,
+                    "reusing existing connection without known addr"
+                );
                 Ok(connectivity::ConnectOutcome::AlreadyConnected)
             };
         }
 
         if info.addresses.is_empty() {
+            tracing::info!(
+                target: "x0x::connect",
+                stage = "connect_to_agent",
+                %agent_prefix,
+                outcome = "unreachable",
+                reason = "no_addresses",
+                dur_ms = call_start.elapsed().as_millis() as u64,
+                "no known addresses for agent"
+            );
             return Ok(connectivity::ConnectOutcome::Unreachable);
         }
 
@@ -1176,20 +1270,36 @@ impl Agent {
                     self.direct_messaging
                         .mark_connected(agent.agent_id, verified_machine_id)
                         .await;
+                    let family = if addr.is_ipv4() { "v4" } else { "v6" };
+                    tracing::info!(
+                        target: "x0x::connect",
+                        stage = "connect_to_agent",
+                        %agent_prefix,
+                        strategy = "hinted_peer",
+                        outcome = "coordinated",
+                        selected_addr = %addr,
+                        family,
+                        dur_ms = call_start.elapsed().as_millis() as u64,
+                        "hinted peer dial succeeded"
+                    );
                     return Ok(connectivity::ConnectOutcome::Coordinated(addr));
                 }
                 Ok(Err(e)) => {
                     tracing::debug!(
-                        "Hinted peer connect to {:?} failed: {}",
-                        agent.machine_id,
-                        e
+                        target: "x0x::connect",
+                        %agent_prefix,
+                        strategy = "hinted_peer",
+                        error = %e,
+                        "hinted peer dial failed"
                     );
                 }
                 Err(_) => {
                     tracing::debug!(
-                        "Hinted peer connect to {:?} timed out after {:?}",
-                        agent.machine_id,
-                        dial_timeout
+                        target: "x0x::connect",
+                        %agent_prefix,
+                        strategy = "hinted_peer",
+                        timeout_s = dial_timeout.as_secs(),
+                        "hinted peer dial timed out"
                     );
                 }
             }
@@ -1221,16 +1331,38 @@ impl Agent {
                         self.direct_messaging
                             .mark_connected(agent.agent_id, real_machine_id)
                             .await;
+                        let family = if addr.is_ipv4() { "v4" } else { "v6" };
+                        tracing::info!(
+                            target: "x0x::connect",
+                            stage = "connect_to_agent",
+                            %agent_prefix,
+                            strategy = "direct_per_addr",
+                            outcome = "direct",
+                            selected_addr = %addr,
+                            family,
+                            dur_ms = call_start.elapsed().as_millis() as u64,
+                            "direct dial succeeded"
+                        );
                         return Ok(connectivity::ConnectOutcome::Direct(*addr));
                     }
                     Ok(Err(e)) => {
-                        tracing::debug!("Direct connect to {} failed: {}", addr, e);
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            %agent_prefix,
+                            strategy = "direct_per_addr",
+                            %addr,
+                            error = %e,
+                            "direct dial failed"
+                        );
                     }
                     Err(_) => {
                         tracing::debug!(
-                            "Direct connect to {} timed out after {:?}",
-                            addr,
-                            dial_timeout
+                            target: "x0x::connect",
+                            %agent_prefix,
+                            strategy = "direct_per_addr",
+                            %addr,
+                            timeout_s = dial_timeout.as_secs(),
+                            "direct dial timed out"
                         );
                     }
                 }
@@ -1293,25 +1425,53 @@ impl Agent {
                             .mark_connected(agent.agent_id, verified_machine_id)
                             .await;
                     }
+                    let family = if addr.is_ipv4() { "v4" } else { "v6" };
+                    tracing::info!(
+                        target: "x0x::connect",
+                        stage = "connect_to_agent",
+                        %agent_prefix,
+                        strategy = "coordinated_fallback",
+                        outcome = "coordinated",
+                        selected_addr = %addr,
+                        family,
+                        hint_was_zeroed,
+                        dur_ms = call_start.elapsed().as_millis() as u64,
+                        "coordinated dial succeeded"
+                    );
                     return Ok(connectivity::ConnectOutcome::Coordinated(addr));
                 }
                 Ok(Err(e)) => {
                     tracing::debug!(
-                        "Coordinated connect to {:?} failed: {}",
-                        agent.machine_id,
-                        e
+                        target: "x0x::connect",
+                        %agent_prefix,
+                        strategy = "coordinated_fallback",
+                        error = %e,
+                        "coordinated dial failed"
                     );
                 }
                 Err(_) => {
                     tracing::debug!(
-                        "Coordinated connect to {:?} timed out after {:?}",
-                        agent.machine_id,
-                        dial_timeout
+                        target: "x0x::connect",
+                        %agent_prefix,
+                        strategy = "coordinated_fallback",
+                        timeout_s = dial_timeout.as_secs(),
+                        "coordinated dial timed out"
                     );
                 }
             }
         }
 
+        tracing::warn!(
+            target: "x0x::connect",
+            stage = "connect_to_agent",
+            %agent_prefix,
+            outcome = "unreachable",
+            reason = "all_strategies_exhausted",
+            dur_ms = call_start.elapsed().as_millis() as u64,
+            v4_addrs,
+            v6_addrs,
+            "all connection strategies exhausted"
+        );
         Ok(connectivity::ConnectOutcome::Unreachable)
     }
 
@@ -1370,7 +1530,19 @@ impl Agent {
         agent_id: &identity::AgentId,
         payload: Vec<u8>,
     ) -> error::NetworkResult<()> {
+        let send_start = std::time::Instant::now();
+        let agent_prefix = network::hex_prefix(&agent_id.0, 4);
+        let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
+        let bytes = payload.len();
+
         let network = self.network.as_ref().ok_or_else(|| {
+            tracing::warn!(
+                target: "x0x::direct",
+                stage = "send",
+                %agent_prefix,
+                outcome = "err_no_network",
+                "network not initialised"
+            );
             error::NetworkError::NodeCreation("network not initialized".to_string())
         })?;
 
@@ -1387,8 +1559,10 @@ impl Agent {
         };
         let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
 
-        let machine_id = match (cached_machine_id, registry_machine_id) {
-            (Some(id), _) if network.is_connected(&ant_quic::PeerId(id.0)).await => id,
+        let (machine_id, resolution) = match (cached_machine_id, registry_machine_id) {
+            (Some(id), _) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
+                (id, "cached_connected")
+            }
             (_, Some(id)) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
                 if cached_machine_id != Some(id) {
                     let mut cache = self.identity_discovery_cache.write().await;
@@ -1396,40 +1570,94 @@ impl Agent {
                         entry.machine_id = id;
                     }
                 }
-                id
+                (id, "registry_connected")
             }
-            (Some(id), None) => id,
-            (Some(id), Some(_)) => id,
-            (None, Some(id)) => id,
+            (Some(id), None) => (id, "cached_not_connected"),
+            (Some(id), Some(_)) => (id, "cached_both_disconnected"),
+            (None, Some(id)) => (id, "registry_not_connected"),
             (None, None) => {
-                // Last resort: try connect_to_agent which may discover the
-                // machine_id via QUIC handshake and update the cache.
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    %agent_prefix,
+                    resolution = "last_resort_connect",
+                    "no machine_id known; triggering connect_to_agent"
+                );
                 let _ = self.connect_to_agent(agent_id).await;
-                self.direct_messaging
+                let id = self
+                    .direct_messaging
                     .get_machine_id(agent_id)
                     .await
-                    .ok_or(error::NetworkError::AgentNotFound(agent_id.0))?
+                    .ok_or_else(|| {
+                        tracing::warn!(
+                            target: "x0x::direct",
+                            stage = "send",
+                            %agent_prefix,
+                            outcome = "err_agent_not_found",
+                            dur_ms = send_start.elapsed().as_millis() as u64,
+                            "no machine_id after connect_to_agent"
+                        );
+                        error::NetworkError::AgentNotFound(agent_id.0)
+                    })?;
+                (id, "post_connect")
             }
         };
 
         // Check if connected
         let ant_peer_id = ant_quic::PeerId(machine_id.0);
+        let machine_prefix = network::hex_prefix(&machine_id.0, 4);
         if !network.is_connected(&ant_peer_id).await {
+            tracing::warn!(
+                target: "x0x::direct",
+                stage = "send",
+                %agent_prefix,
+                %machine_prefix,
+                resolution,
+                outcome = "err_not_connected",
+                bytes,
+                dur_ms = send_start.elapsed().as_millis() as u64,
+                "machine_id resolved but peer not currently connected"
+            );
             return Err(error::NetworkError::AgentNotConnected(agent_id.0));
         }
 
         // Send via network layer
-        network
+        match network
             .send_direct(&ant_peer_id, &self.identity.agent_id().0, &payload)
-            .await?;
-
-        tracing::info!(
-            "Sent {} bytes directly to agent {:?}",
-            payload.len(),
-            agent_id
-        );
-
-        Ok(())
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    from = %self_prefix,
+                    to = %agent_prefix,
+                    %machine_prefix,
+                    resolution,
+                    bytes,
+                    dur_ms = send_start.elapsed().as_millis() as u64,
+                    outcome = "ok",
+                    "direct message sent"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    from = %self_prefix,
+                    to = %agent_prefix,
+                    %machine_prefix,
+                    resolution,
+                    bytes,
+                    dur_ms = send_start.elapsed().as_millis() as u64,
+                    outcome = "err_transport",
+                    error = %e,
+                    "transport send_direct failed"
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Receive the next direct message from any connected agent.
@@ -1673,9 +1901,10 @@ impl Agent {
             }
         }
 
-        // Strip only truly unusable addresses (port 0, unspecified, loopback).
-        // Private/LAN addresses are kept for same-network connectivity.
-        addresses.retain(|a| a.port() > 0 && !a.ip().is_unspecified() && !a.ip().is_loopback());
+        // Same rule as HeartbeatContext::announce() — gossip is global, so
+        // LAN-scope addresses must never be published here. See the scope
+        // analysis report under tests/proof-reports/ for details.
+        addresses.retain(|a| is_publicly_advertisable(*a));
 
         let announcement = self.build_identity_announcement_with_addrs(
             include_user_identity,
@@ -1928,20 +2157,27 @@ impl Agent {
                     }
                 }
 
-                // Cache the announcement as-is. Empty addresses are the
-                // sender's current truth (e.g. LAN-only agent with no public
-                // address). Preserving stale addresses from a previous
-                // announcement would create persistent dead-ends if the agent
-                // moved networks. The `AlreadyConnected` path in
-                // `connect_to_agent` handles reachability for gossip peers
-                // that have no cached addresses.
+                // Cache the announcement with its address list filtered to
+                // globally-advertisable scope only. Legacy peers that still
+                // ship RFC1918/ULA/loopback entries in their announcements
+                // must not force us to keep dialing their unreachable LAN
+                // addresses — LAN discovery is ant-quic's mDNS job. Empty
+                // address lists are preserved (the `AlreadyConnected` path in
+                // `connect_to_agent` handles gossip peers we only reach by
+                // an existing QUIC connection).
+                let filtered_addresses: Vec<std::net::SocketAddr> = announcement
+                    .addresses
+                    .iter()
+                    .copied()
+                    .filter(|a| is_publicly_advertisable(*a))
+                    .collect();
                 cache.write().await.insert(
                     announcement.agent_id,
                     DiscoveredAgent {
                         agent_id: announcement.agent_id,
                         machine_id: announcement.machine_id,
                         user_id: announcement.user_id,
-                        addresses: announcement.addresses.clone(),
+                        addresses: filtered_addresses,
                         announced_at: announcement.announced_at,
                         last_seen: now,
                         machine_public_key: announcement.machine_public_key.clone(),
@@ -2290,14 +2526,19 @@ impl Agent {
             }
 
             // Populate address hints from network status for beacon metadata.
+            //
+            // Presence beacons propagate over global gossip — filter to only
+            // globally-advertisable addresses. LAN discovery is ant-quic's
+            // mDNS job, not ours. Also exclude `status.local_addr` which is
+            // typically the wildcard `[::]:5483` and never a dialable target.
             if let Some(ref net) = self.network {
                 if let Some(status) = net.node_status().await {
-                    let mut hints: Vec<String> = status
+                    let hints: Vec<String> = status
                         .external_addrs
                         .iter()
+                        .filter(|a| is_publicly_advertisable(**a))
                         .map(|a| a.to_string())
                         .collect();
-                    hints.push(status.local_addr.to_string());
                     pw.manager().set_addr_hints(hints).await;
                 }
             }
@@ -2755,14 +2996,20 @@ impl Agent {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map_or(0, |d| d.as_secs());
-                            let addrs = ann.addresses.clone();
+                            let filtered: Vec<std::net::SocketAddr> = ann
+                                .addresses
+                                .iter()
+                                .copied()
+                                .filter(|a| is_publicly_advertisable(*a))
+                                .collect();
+                            let addrs = filtered.clone();
                             cache.write().await.insert(
                                 ann.agent_id,
                                 DiscoveredAgent {
                                     agent_id: ann.agent_id,
                                     machine_id: ann.machine_id,
                                     user_id: ann.user_id,
-                                    addresses: ann.addresses,
+                                    addresses: filtered,
                                     announced_at: ann.announced_at,
                                     last_seen: now,
                                     machine_public_key: ann.machine_public_key.clone(),
@@ -2989,16 +3236,29 @@ impl Agent {
         let contact_store = std::sync::Arc::clone(&self.contact_store);
 
         tokio::spawn(async move {
-            tracing::info!("Direct message listener started");
+            tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
             loop {
                 let Some((ant_peer_id, payload)) = network.recv_direct().await else {
-                    tracing::debug!("Direct message channel closed");
+                    tracing::warn!(
+                        target: "x0x::direct",
+                        stage = "listener",
+                        "network.recv_direct channel closed — listener exiting"
+                    );
                     break;
                 };
 
+                let raw_bytes = payload.len();
+
                 // Parse: first 32 bytes = sender AgentId, rest = payload
                 if payload.len() < 32 {
-                    tracing::warn!("Direct message too short ({} bytes)", payload.len());
+                    tracing::warn!(
+                        target: "x0x::direct",
+                        stage = "listener",
+                        machine_prefix = %network::hex_prefix(&ant_peer_id.0, 4),
+                        raw_bytes,
+                        outcome = "drop_too_short",
+                        "direct message too short to contain sender id"
+                    );
                     continue;
                 }
 
@@ -3007,6 +3267,7 @@ impl Agent {
                 let sender = identity::AgentId(sender_bytes);
                 let machine_id = identity::MachineId(ant_peer_id.0);
                 let data = payload[32..].to_vec();
+                let payload_bytes = data.len();
 
                 // Verify AgentId→MachineId binding against identity discovery cache.
                 let verified = {
@@ -3028,12 +3289,33 @@ impl Agent {
                     Some(evaluator.evaluate(&ctx))
                 };
 
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "recv",
+                    sender_prefix = %network::hex_prefix(&sender.0, 4),
+                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                    raw_bytes,
+                    payload_bytes,
+                    verified,
+                    trust_decision = ?trust_decision,
+                    "direct message received; dispatching to subscribers"
+                );
+
                 // Register and mark the sender as connected for future reverse direct sends.
                 dm.mark_connected(sender, machine_id).await;
 
                 // Broadcast to all subscribe_direct() receivers with verification info.
                 dm.handle_incoming(machine_id, sender, data, verified, trust_decision)
                     .await;
+
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "recv",
+                    sender_prefix = %network::hex_prefix(&sender.0, 4),
+                    payload_bytes,
+                    subscriber_count = dm.subscriber_count(),
+                    "direct message dispatched"
+                );
             }
         });
     }
@@ -4402,6 +4684,98 @@ pub const NAME: &str = "x0x";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sa(s: &str) -> std::net::SocketAddr {
+        s.parse().expect("valid SocketAddr literal in test")
+    }
+
+    #[test]
+    fn is_publicly_advertisable_rejects_lan_and_special_scopes() {
+        // v4 non-global scopes
+        assert!(
+            !is_publicly_advertisable(sa("127.0.0.1:5483")),
+            "loopback v4"
+        );
+        assert!(!is_publicly_advertisable(sa("10.1.2.3:5483")), "rfc1918 /8");
+        assert!(
+            !is_publicly_advertisable(sa("172.20.0.5:5483")),
+            "rfc1918 /12"
+        );
+        assert!(
+            !is_publicly_advertisable(sa("192.168.1.5:5483")),
+            "rfc1918 /16"
+        );
+        assert!(
+            !is_publicly_advertisable(sa("169.254.1.1:5483")),
+            "link-local v4"
+        );
+        assert!(
+            !is_publicly_advertisable(sa("100.64.1.1:5483")),
+            "CGNAT (unreachable outside carrier)"
+        );
+        assert!(
+            !is_publicly_advertisable(sa("0.0.0.0:5483")),
+            "unspecified v4"
+        );
+
+        // v6 non-global scopes
+        assert!(!is_publicly_advertisable(sa("[::1]:5483")), "loopback v6");
+        assert!(
+            !is_publicly_advertisable(sa("[fe80::1]:5483")),
+            "link-local v6"
+        );
+        assert!(!is_publicly_advertisable(sa("[fd00::1]:5483")), "ULA v6");
+
+        // port 0 never advertisable regardless of ip scope
+        assert!(
+            !is_publicly_advertisable(sa("1.2.3.4:0")),
+            "port 0 on global v4"
+        );
+
+        // Globally-routable positives
+        assert!(is_publicly_advertisable(sa("1.2.3.4:5483")), "global v4");
+        assert!(
+            is_publicly_advertisable(sa("[2001:db8::1]:5483")),
+            "global v6 (documentation doc but is_globally_routable permits)",
+        );
+        assert!(
+            is_publicly_advertisable(sa("8.8.8.8:9000")),
+            "global v4 on non-default port",
+        );
+
+        // Reserved documentation ranges are correctly rejected by
+        // is_globally_routable even though they are not RFC1918.
+        assert!(
+            !is_publicly_advertisable(sa("192.0.2.1:5483")),
+            "TEST-NET-1 documentation range"
+        );
+        assert!(
+            !is_publicly_advertisable(sa("203.0.113.10:5483")),
+            "TEST-NET-3 documentation range"
+        );
+    }
+
+    #[test]
+    fn presence_parse_addr_hints_drops_private_scopes() {
+        // Older peers ship a mix of scopes. parse_addr_hints should return only
+        // globally-advertisable entries so our dial loop never burns budget on
+        // unreachable candidates.
+        let hints = vec![
+            "127.0.0.1:5483".to_string(),
+            "10.200.0.1:5483".to_string(),
+            "[fd00::1]:5483".to_string(),
+            "1.2.3.4:5483".to_string(),
+            "[2001:db8::1]:5483".to_string(),
+            "not-an-address".to_string(),
+        ];
+        let parsed = presence::parse_addr_hints(&hints);
+        let got: Vec<String> = parsed.iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            got,
+            vec!["1.2.3.4:5483".to_string(), "[2001:db8::1]:5483".to_string()],
+            "only globally-advertisable addresses survive inbound parsing"
+        );
+    }
 
     #[test]
     fn name_is_palindrome() {

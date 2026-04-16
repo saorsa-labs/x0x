@@ -953,6 +953,26 @@ async fn daemon_api_bootstrap_cache() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_diagnostics_connectivity() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/diagnostics/connectivity"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    // The snapshot always includes these keys even before any peer is known,
+    // so operators can rely on them for scripted probes.
+    assert!(r["port_mapping"].is_object());
+    assert!(r["mdns"].is_object());
+    assert!(r["connections"].is_object());
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_upgrade_check() {
     let d = daemon().await;
     let r: Value = ca(&d)

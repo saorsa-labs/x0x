@@ -1330,6 +1330,48 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Background connectivity snapshot logger — writes an ant-quic NodeStatus
+    // summary line every 60 seconds at target "x0x::diag::connectivity". This
+    // gives journalctl a tick-by-tick record of UPnP state, external address
+    // observations, direct vs relayed counts, and hole-punch success rate so
+    // long-running deployments have a time series to diagnose from without
+    // polling the HTTP diagnostics endpoint.
+    {
+        let diag_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.tick().await; // skip the immediate tick — node is still warming up
+            loop {
+                ticker.tick().await;
+                let Some(network) = diag_state.agent.network() else {
+                    continue;
+                };
+                let Some(ns) = network.node_status().await else {
+                    continue;
+                };
+                tracing::info!(
+                    target: "x0x::diag::connectivity",
+                    nat_type = ?ns.nat_type,
+                    can_receive_direct = ?ns.can_receive_direct,
+                    has_global_address = ns.has_global_address,
+                    external_addrs = ns.external_addrs.len(),
+                    port_mapping_active = ns.port_mapping_active,
+                    port_mapping_addr = ?ns.port_mapping_addr,
+                    mdns_browsing = ns.mdns_browsing,
+                    mdns_advertising = ns.mdns_advertising,
+                    mdns_discovered = ns.mdns_discovered_peers,
+                    connected_peers = ns.connected_peers,
+                    direct_connections = ns.direct_connections,
+                    relayed_connections = ns.relayed_connections,
+                    hole_punch_success_rate = ns.hole_punch_success_rate,
+                    avg_rtt_ms = ns.avg_rtt.as_millis() as u64,
+                    uptime_s = ns.uptime.as_secs(),
+                    "connectivity snapshot"
+                );
+            }
+        });
+    }
+
     // Background file-message listener — processes FileMessage on the direct channel
     {
         let file_state = Arc::clone(&state);
@@ -1503,6 +1545,7 @@ async fn main() -> Result<()> {
         .route("/upgrade", get(check_upgrade))
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
+        .route("/diagnostics/connectivity", get(connectivity_diagnostics))
         // WebSocket endpoints
         .route("/ws", get(ws_handler))
         .route("/ws/direct", get(ws_direct_handler))
@@ -3018,8 +3061,17 @@ struct CardQuery {
     include_groups: Option<bool>,
 }
 
+/// Populate `addresses` with locally-discovered globally-routable interfaces.
+///
+/// Agent cards are copy-pasteable identity links (`x0x://agent/...`) that can
+/// be shared anywhere. They must only carry globally-advertisable addresses —
+/// a card minted inside a Vultr VPC must not embed `10.200.0.1:5483` or
+/// recipients in London will spend ~50s dialing a black hole.
 fn discover_local_card_addresses(port: u16, addresses: &mut Vec<String>) {
     for addr in x0x::collect_local_interface_addrs(port) {
+        if !x0x::is_publicly_advertisable(addr) {
+            continue;
+        }
         let s = addr.to_string();
         if !addresses.contains(&s) {
             addresses.push(s);
@@ -3041,12 +3093,18 @@ async fn get_agent_card(
     // Add user ID if available
     card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
 
-    // Add external addresses from ant-quic NodeStatus, then augment with local
-    // LAN/global probes so cards remain useful before the first observed-address
-    // frame arrives from another peer.
+    // Add external addresses from ant-quic NodeStatus, filtered to
+    // globally-advertisable scope only (see discover_local_card_addresses
+    // doc-comment), then augment with local probes so cards remain useful
+    // before the first observed-address frame arrives from another peer.
     if let Some(network) = state.agent.network() {
         if let Some(ns) = network.node_status().await {
-            card.addresses = ns.external_addrs.iter().map(|a| a.to_string()).collect();
+            card.addresses = ns
+                .external_addrs
+                .iter()
+                .filter(|a| x0x::is_publicly_advertisable(**a))
+                .map(|a| a.to_string())
+                .collect();
             discover_local_card_addresses(ns.local_addr.port(), &mut card.addresses);
         }
     }
@@ -8263,24 +8321,35 @@ async fn discover_groups(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let mut cards: HashMap<String, x0x::groups::GroupCard> =
-        state.group_card_cache.read().await.clone();
-    // Phase C.2: merge in shard-cache contents. Entries keyed by group_id;
-    // higher-revision wins on collision.
+    let mut cards: HashMap<String, x0x::groups::GroupCard> = HashMap::new();
+    let mut merge_card = |card: &x0x::groups::GroupCard| {
+        let entry = cards.entry(card.group_id.clone());
+        match entry {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(card.clone());
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                if card.supersedes(o.get()) {
+                    o.insert(card.clone());
+                }
+            }
+        }
+    };
+
+    // Phase C.2: merge the local cache by the card's stable public group_id,
+    // not by the cache's internal key. The cache may legitimately contain
+    // the same signed card under both the local MLS id and the stable group id.
+    {
+        let card_cache = state.group_card_cache.read().await;
+        for card in card_cache.values() {
+            merge_card(card);
+        }
+    }
+    // Phase C.2: merge in shard-cache contents. Higher-revision wins on collision.
     {
         let shard_cache = state.directory_cache.read().await;
         for card in shard_cache.iter_all() {
-            let entry = cards.entry(card.group_id.clone());
-            match entry {
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert(card.clone());
-                }
-                std::collections::hash_map::Entry::Occupied(mut o) => {
-                    if card.supersedes(o.get()) {
-                        o.insert(card.clone());
-                    }
-                }
-            }
+            merge_card(card);
         }
     }
     // Also synthesize signed cards for any local groups the caller owns that are discoverable.
@@ -8288,9 +8357,7 @@ async fn discover_groups(
     let signing_kp = state.agent.identity().agent_keypair();
     for info in groups.values() {
         if let Ok(Some(card)) = info.to_signed_group_card(signing_kp) {
-            cards
-                .entry(info.stable_group_id().to_string())
-                .or_insert(card);
+            merge_card(&card);
         }
     }
     let mut list: Vec<x0x::groups::GroupCard> = cards.into_values().collect();
@@ -10427,6 +10494,78 @@ async fn bootstrap_cache_stats(State(state): State<Arc<AppState>>) -> impl IntoR
     }
 }
 
+/// GET /diagnostics/connectivity — ant-quic NodeStatus snapshot.
+///
+/// Returns the full connectivity state so we can answer:
+/// - Is UPnP port mapping active?
+/// - What external addresses have been observed?
+/// - What NAT type has ant-quic detected?
+/// - Direct vs relayed connection counts, hole-punch success rate, avg RTT.
+/// - mDNS browsing/advertising state and discovered peer count.
+///
+/// This is the primary observability surface for the 100%-connectivity
+/// guarantee ant-quic is responsible for.
+async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(network) = state.agent.network() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
+        );
+    };
+
+    match network.node_status().await {
+        Some(ns) => {
+            let snapshot = serde_json::json!({
+                "ok": true,
+                "peer_id": hex::encode(ns.peer_id.0),
+                "local_addr": ns.local_addr.to_string(),
+                "external_addrs": ns.external_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                "nat_type": format!("{:?}", ns.nat_type),
+                "can_receive_direct": ns.can_receive_direct,
+                "direct_reachability_scope": format!("{:?}", ns.direct_reachability_scope),
+                "has_global_address": ns.has_global_address,
+                "port_mapping": {
+                    "active": ns.port_mapping_active,
+                    "external_addr": ns.port_mapping_addr.map(|a| a.to_string()),
+                },
+                "mdns": {
+                    "browsing": ns.mdns_browsing,
+                    "advertising": ns.mdns_advertising,
+                    "discovered_peers": ns.mdns_discovered_peers,
+                },
+                "services": {
+                    "relay_enabled": ns.relay_service_enabled,
+                    "coordinator_enabled": ns.coordinator_service_enabled,
+                    "bootstrap_enabled": ns.bootstrap_service_enabled,
+                },
+                "connections": {
+                    "connected_peers": ns.connected_peers,
+                    "active": ns.active_connections,
+                    "direct": ns.direct_connections,
+                    "relayed": ns.relayed_connections,
+                    "hole_punch_success_rate": ns.hole_punch_success_rate,
+                },
+                "relay": {
+                    "is_relaying": ns.is_relaying,
+                    "sessions": ns.relay_sessions,
+                    "bytes_forwarded": ns.relay_bytes_forwarded,
+                },
+                "coordinator": {
+                    "is_coordinating": ns.is_coordinating,
+                    "sessions": ns.coordination_sessions,
+                },
+                "avg_rtt_ms": ns.avg_rtt.as_millis() as u64,
+                "uptime_s": ns.uptime.as_secs(),
+            });
+            (StatusCode::OK, Json(snapshot))
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "node status unavailable" })),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket handlers
 // ---------------------------------------------------------------------------
@@ -10870,26 +11009,46 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
 }
 
 /// Initialize structured logging.
+///
+/// Filter resolution order:
+/// 1. `RUST_LOG` env var if set (supports targets like `ant_quic=debug,x0x=info`)
+/// 2. Falls back to the `log_level` config value applied as a global directive
+///
+/// The effective filter string is logged at startup so operators can verify
+/// what ended up active.
 fn init_logging(level: &str, format: &str) -> Result<()> {
-    let level_filter = match level.to_lowercase().as_str() {
-        "trace" => tracing::Level::TRACE,
-        "debug" => tracing::Level::DEBUG,
-        "info" => tracing::Level::INFO,
-        "warn" => tracing::Level::WARN,
-        "error" => tracing::Level::ERROR,
-        _ => tracing::Level::INFO,
+    use tracing_subscriber::EnvFilter;
+
+    let fallback = level.to_lowercase();
+    let fallback_directive = match fallback.as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" => fallback.as_str(),
+        _ => "info",
+    };
+
+    let (filter, source) = match std::env::var("RUST_LOG") {
+        Ok(val) if !val.trim().is_empty() => match EnvFilter::try_new(&val) {
+            Ok(f) => (f, format!("RUST_LOG={val}")),
+            Err(e) => (
+                EnvFilter::new(fallback_directive),
+                format!("RUST_LOG invalid ({e}), falling back to {fallback_directive}"),
+            ),
+        },
+        _ => (
+            EnvFilter::new(fallback_directive),
+            format!("config log_level={fallback_directive}"),
+        ),
     };
 
     if format == "json" {
         tracing_subscriber::fmt()
-            .with_max_level(level_filter)
+            .with_env_filter(filter)
             .json()
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_max_level(level_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(filter).init();
     }
+
+    tracing::info!(target: "x0x::startup", source = %source, "tracing subscriber initialised");
 
     Ok(())
 }

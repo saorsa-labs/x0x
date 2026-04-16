@@ -97,6 +97,11 @@ enum Commands {
         #[command(subcommand)]
         sub: NetworkSub,
     },
+    /// Connectivity diagnostics (ant-quic NodeStatus snapshot).
+    Diagnostics {
+        #[command(subcommand)]
+        sub: DiagnosticsSub,
+    },
     /// Find agents by 4-word speakable identity.
     Find {
         /// Identity words (4 words for agent, or 8 with @ separator).
@@ -276,6 +281,12 @@ enum NetworkSub {
     Status,
     /// Bootstrap peer cache stats.
     Cache,
+}
+
+#[derive(Subcommand)]
+enum DiagnosticsSub {
+    /// Print the ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS).
+    Connectivity,
 }
 
 /// Presence subcommands.
@@ -1023,6 +1034,11 @@ async fn run(
         Commands::Network { sub } => match sub {
             NetworkSub::Status => commands::network::network_status(&client).await,
             NetworkSub::Cache => commands::network::bootstrap_cache(&client).await,
+        },
+        Commands::Diagnostics { sub } => match sub {
+            DiagnosticsSub::Connectivity => {
+                commands::network::diagnostics_connectivity(&client).await
+            }
         },
         Commands::Find { words } => commands::find::find(&client, &words).await,
         Commands::Connect { words } => commands::connect::connect(&client, &words).await,

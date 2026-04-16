@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 112,
+  "endpoint_count": 113,
   "endpoints": [
     {
       "category": "status",
@@ -126,6 +126,13 @@
       "description": "Bootstrap peer cache stats",
       "method": "GET",
       "path": "/network/bootstrap-cache"
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics connectivity",
+      "description": "Ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS)",
+      "method": "GET",
+      "path": "/diagnostics/connectivity"
     },
     {
       "category": "messaging",

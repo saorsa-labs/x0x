@@ -301,6 +301,14 @@ impl DirectMessaging {
         DirectMessageReceiver::new(self.message_tx.subscribe())
     }
 
+    /// Current number of live broadcast subscribers.
+    ///
+    /// Used by diagnostics to distinguish "message dispatched to N SSE/WS
+    /// consumers" from "message silently dropped because no one is listening".
+    pub fn subscriber_count(&self) -> usize {
+        self.message_tx.receiver_count()
+    }
+
     /// Process an incoming direct message from the network.
     ///
     /// Called by the network layer when a direct message is received.
@@ -339,9 +347,7 @@ impl DirectMessaging {
         // the internal channel is a convenience for library users that keep
         // calling `recv_direct()`.
         if self.internal_tx.try_send(msg).is_err() {
-            tracing::trace!(
-                "direct internal_tx full or closed, skipping pull-API copy"
-            );
+            tracing::trace!("direct internal_tx full or closed, skipping pull-API copy");
         }
     }
 
