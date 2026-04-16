@@ -48,6 +48,22 @@ Additional scope added by user during session:
 - `Node::connect` deprecated in favour of `connect_peer`, which canonicalises the
   peer-oriented API (x0x switched; no behavioural delta).
 
+## Post-session follow-ups
+
+- ant-quic #163 (NAT traversal storm): commented with 0.26.12 sample —
+  hole-punch success rate still 0 / 10 min on the 6-node mesh, storm
+  cadence unchanged. Still open.
+- ant-quic #164 (MASQUE bytes_forwarded=0): commented with 0.26.12 sample —
+  relay sessions establish and `Starting stream-based relay forwarding`
+  fires, address-reconcile oscillation is gone. Left open pending a
+  dedicated relay-forced measurement since the 0.26.10 #165 fix means
+  typical traffic now takes the direct path.
+- ant-quic **#166** (post-connect DM delivery): new issue filed. Minimal
+  reproducer from this session is a 2-daemon localhost bench — which
+  **passes** — versus the same code on 2 VPS mesh members — which
+  **fails**. So it is a mesh-state / reader-task lifecycle issue, not a
+  raw send/recv path bug. Details below.
+
 ## New regression — post-connect DM delivery
 
 **Symptom**: `/agents/connect` returns `{"ok":true,"outcome":"Direct"}`, but a
@@ -79,11 +95,33 @@ Corroborating evidence from VPS journals during the matrix:
 those sessions are being torn down (or inhibited from accepting new streams)
 faster than x0x's direct plane can open a bi-directional stream per peer.
 
-**Next step**: characterise with a minimal two-daemon reproducer (no 6-node
-mesh pressure). If it reproduces on a 2-node run, it is clearly an ant-quic
-stream/lifecycle regression between 0.26.7 → 0.26.12. If it only appears under
-matrix load, x0x's `Agent::send_direct` needs a connection-reuse path instead
-of relying on fresh streams each call.
+**Follow-up result (2-node localhost bench)**: two x0xd instances on
+127.0.0.1:19901 / 19902 with each other as the only bootstrap peer
+**deliver the DM every time**. SSE on bob receives the full
+`direct_message` envelope, `verified: true`, correct payload, correct
+sender AgentId → MachineId binding. So the regression is **not** in the
+send/recv path itself — it is an interaction with the multi-peer mesh
+state that x0x has on the VPS bootstrap nodes. x0x's `send_direct`
+implementation is the same in both cases, and x0x's sender log shows
+`x0x::network: send_direct: N bytes to peer PeerId(<correct MachineId>)`
+followed by `ant_quic::p2p_endpoint: Sent N+1 bytes to peer … via QUIC`
+on the VPS side — so the send lands in ant-quic with the right target;
+the receiver simply never surfaces it to x0x's `recv_direct` loop.
+
+**Filed**: ant-quic #166 with full reproducer, localhost-vs-VPS
+comparison, and pointers to `spawn_reader_task` /
+`handle_coordinator_control_message` as the suspect area
+(`src/p2p_endpoint.rs:4569`, `:4606-4626`). The comment on line 4653
+already names this failure mode — "zombie reader tasks … causing
+send_direct() to succeed but recv() to hang" — and implements an
+abort-then-replace guard, but the evidence here suggests that guard has
+a race under the VPS mesh's 30-90 s reconnect cadence.
+
+**Release implication**: Mac-behind-NAT → VPS flows (the user-facing
+single-client journey) are fully green. VPS ↔ VPS DM between mesh
+members is the failing surface. x0x 0.17.1 can ship with this as a
+documented known-issue pinned to ant-quic #166 without regressing the
+single-agent user experience.
 
 ## Deep tracing installed on VPS
 
