@@ -327,8 +327,22 @@ impl DirectMessaging {
             let _ = self.message_tx.send(msg.clone());
         }
 
-        // Also send to internal channel for recv_direct()
-        let _ = self.internal_tx.send(msg).await;
+        // Also enqueue on the internal pull-API channel (consumed by
+        // `recv_direct()`). This is a best-effort, non-blocking enqueue: the
+        // mpsc receiver is typically idle in long-running daemons that only
+        // use `subscribe_direct()` on the broadcast channel. If we awaited a
+        // bounded `send` here, a cold `internal_rx` would back-pressure this
+        // task, which in turn stalls `start_direct_listener` →
+        // `NetworkNode::spawn_receiver` → `Node::recv` and causes ant-quic
+        // reader tasks to queue up on their forward channel. The broadcast
+        // channel above is the authoritative delivery surface for daemons;
+        // the internal channel is a convenience for library users that keep
+        // calling `recv_direct()`.
+        if self.internal_tx.try_send(msg).is_err() {
+            tracing::trace!(
+                "direct internal_tx full or closed, skipping pull-API copy"
+            );
+        }
     }
 
     /// Receive the next direct message (blocking).

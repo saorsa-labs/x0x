@@ -819,7 +819,14 @@ impl NetworkNode {
                     }
                 };
 
-                match node_ref.recv().await {
+                let recv_result = node_ref.recv().await;
+                // Explicitly drop the read lock guard so we don't hold it
+                // across channel sends — otherwise a backpressured direct_tx
+                // or recv_tx can stall every other caller that wants the same
+                // read lock and masks as a delivery bug.
+                drop(node_guard);
+
+                match recv_result {
                     Ok((peer_id, data)) => {
                         if data.is_empty() {
                             continue;
