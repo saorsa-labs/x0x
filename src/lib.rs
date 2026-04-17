@@ -1034,7 +1034,7 @@ impl Agent {
 
         if let Some(ref adapter) = self.gossip_cache_adapter {
             let mut adverts = adapter.get_all_adverts();
-            adverts.sort_by(|a, b| b.score.cmp(&a.score));
+            adverts.sort_by_key(|a| std::cmp::Reverse(a.score));
             for advert in adverts.into_iter().take(12) {
                 let advert_peer_id = ant_quic::PeerId(*advert.peer.as_bytes());
                 if advert_peer_id == target_peer_id {
@@ -1995,7 +1995,7 @@ impl Agent {
             .filter(|a| a.announced_at >= cutoff)
             .cloned()
             .collect();
-        agents.sort_by(|a, b| a.agent_id.0.cmp(&b.agent_id.0));
+        agents.sort_by_key(|a| a.agent_id.0);
         Ok(agents)
     }
 
@@ -2016,7 +2016,7 @@ impl Agent {
             .values()
             .cloned()
             .collect();
-        agents.sort_by(|a, b| a.agent_id.0.cmp(&b.agent_id.0));
+        agents.sort_by_key(|a| a.agent_id.0);
         Ok(agents)
     }
 
@@ -2799,7 +2799,7 @@ impl Agent {
             .filter(|a| a.announced_at >= cutoff)
             .map(|a| a.agent_id)
             .collect();
-        agents.sort_by(|a, b| a.0.cmp(&b.0));
+        agents.sort_by_key(|a| a.0);
         Ok(agents)
     }
 
