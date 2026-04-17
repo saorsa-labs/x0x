@@ -504,6 +504,7 @@ impl std::fmt::Display for TimestampValidationError {
 /// || sender_agent_id || sender_machine_id || recipient_agent_id
 /// || created_at_unix_ms.to_be_bytes() || expires_at_unix_ms.to_be_bytes()
 /// || postcard(body)`.
+#[allow(clippy::too_many_arguments)]
 fn build_signed_bytes(
     protocol_version: u16,
     request_id: &[u8; 16],
@@ -516,9 +517,8 @@ fn build_signed_bytes(
 ) -> Result<Vec<u8>> {
     let body_bytes = postcard::to_stdvec(body)
         .map_err(|e| IdentityError::Serialization(format!("DM body postcard: {e}")))?;
-    let mut out = Vec::with_capacity(
-        DM_SIGN_DOMAIN.len() + 2 + 16 + 32 * 3 + 8 * 2 + body_bytes.len(),
-    );
+    let mut out =
+        Vec::with_capacity(DM_SIGN_DOMAIN.len() + 2 + 16 + 32 * 3 + 8 * 2 + body_bytes.len());
     out.extend_from_slice(DM_SIGN_DOMAIN);
     out.extend_from_slice(&protocol_version.to_be_bytes());
     out.extend_from_slice(request_id);
@@ -558,9 +558,8 @@ pub fn encrypt_payload(
     let plaintext_bytes = postcard::to_stdvec(plaintext)
         .map_err(|e| IdentityError::Serialization(format!("DM plaintext postcard: {e}")))?;
 
-    let pk = MlKemPublicKey::from_bytes(KEM_VARIANT, recipient_kem_pubkey_bytes).map_err(|e| {
-        IdentityError::Serialization(format!("recipient KEM pubkey decode: {e}"))
-    })?;
+    let pk = MlKemPublicKey::from_bytes(KEM_VARIANT, recipient_kem_pubkey_bytes)
+        .map_err(|e| IdentityError::Serialization(format!("recipient KEM pubkey decode: {e}")))?;
     let kem = MlKem::new(KEM_VARIANT);
     let (shared, kem_ct) = kem
         .encapsulate(&pk)
@@ -608,9 +607,8 @@ pub fn decrypt_payload(
         )
         .map_err(|e| IdentityError::Serialization(format!("AEAD decrypt: {e}")))?;
 
-    let plaintext: DmPlaintext = postcard::from_bytes(&plaintext_bytes).map_err(|e| {
-        IdentityError::Serialization(format!("DM plaintext postcard decode: {e}"))
-    })?;
+    let plaintext: DmPlaintext = postcard::from_bytes(&plaintext_bytes)
+        .map_err(|e| IdentityError::Serialization(format!("DM plaintext postcard decode: {e}")))?;
     Ok(plaintext)
 }
 
@@ -1007,8 +1005,9 @@ mod tests {
         let rid = [1u8; 16];
         let rx = acks.register(rid);
         assert!(acks.resolve(&rid, DmAckOutcome::Accepted));
-        let received =
-            tokio::runtime::Runtime::new().expect("rt").block_on(async move { rx.await });
+        let received = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(async move { rx.await });
         assert_eq!(received.expect("ok"), DmAckOutcome::Accepted);
         // Second resolve → no-op.
         assert!(!acks.resolve(&rid, DmAckOutcome::Accepted));
