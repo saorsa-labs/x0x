@@ -40,9 +40,7 @@ impl Args {
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--gui" => {
-                    gui = PathBuf::from(
-                        args.next().ok_or("--gui requires a path".to_string())?,
-                    );
+                    gui = PathBuf::from(args.next().ok_or("--gui requires a path".to_string())?);
                 }
                 "--whitelist" => {
                     whitelist = PathBuf::from(
@@ -82,12 +80,8 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("  --gui PATH         Path to GUI HTML (default: {DEFAULT_GUI})");
-    println!(
-        "  --whitelist PATH   Path to exclusion list (default: {DEFAULT_WHITELIST})"
-    );
-    println!(
-        "  --threshold PCT    Minimum coverage percent (default: {DEFAULT_THRESHOLD_PCT:.1})"
-    );
+    println!("  --whitelist PATH   Path to exclusion list (default: {DEFAULT_WHITELIST})");
+    println!("  --threshold PCT    Minimum coverage percent (default: {DEFAULT_THRESHOLD_PCT:.1})");
     println!("  --json             Emit machine-readable JSON");
 }
 
@@ -412,7 +406,12 @@ fn main() -> ExitCode {
 
     let registry: BTreeMap<String, &EndpointDef> = api::ENDPOINTS
         .iter()
-        .map(|ep| (format!("{} {}", method_str(ep.method), registry_key(ep.path)), ep))
+        .map(|ep| {
+            (
+                format!("{} {}", method_str(ep.method), registry_key(ep.path)),
+                ep,
+            )
+        })
         .collect();
 
     let mut called: BTreeMap<String, usize> = BTreeMap::new();
@@ -456,9 +455,29 @@ fn main() -> ExitCode {
     let pass = pct >= args.threshold && unknown.is_empty();
 
     if args.json {
-        print_json_report(total, covered, counted_total, pct, args.threshold, &uncovered, &unknown, &whitelisted, pass);
+        print_json_report(
+            total,
+            covered,
+            counted_total,
+            pct,
+            args.threshold,
+            &uncovered,
+            &unknown,
+            &whitelisted,
+            pass,
+        );
     } else {
-        print_human_report(total, covered, counted_total, pct, args.threshold, &uncovered, &unknown, &whitelisted, pass);
+        print_human_report(
+            total,
+            covered,
+            counted_total,
+            pct,
+            args.threshold,
+            &uncovered,
+            &unknown,
+            &whitelisted,
+            pass,
+        );
     }
 
     if pass {
