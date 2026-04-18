@@ -187,7 +187,7 @@ mod tests {
         let store = CapabilityStore::new();
         let agent_id = AgentId([1u8; 32]);
         let machine_id = MachineId([2u8; 32]);
-        let caps = DmCapabilities::v1_gossip_ready();
+        let caps = DmCapabilities::v1_gossip_ready(vec![0u8; 1184]);
         assert!(store.lookup(&agent_id).is_none());
         store.insert(agent_id, machine_id, caps.clone());
         let got = store.lookup(&agent_id).expect("hit");
@@ -200,7 +200,11 @@ mod tests {
         let store = CapabilityStore::with_ttl(Duration::from_millis(50));
         let agent_id = AgentId([3u8; 32]);
         let machine_id = MachineId([4u8; 32]);
-        store.insert(agent_id, machine_id, DmCapabilities::v1_gossip_ready());
+        store.insert(
+            agent_id,
+            machine_id,
+            DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
+        );
         assert!(store.lookup(&agent_id).is_some());
         std::thread::sleep(Duration::from_millis(100));
         assert!(store.lookup(&agent_id).is_none());
@@ -213,7 +217,7 @@ mod tests {
             agent_id: [7u8; 32],
             machine_id: [8u8; 32],
             created_at_unix_ms: 1_234_567_890_000,
-            capabilities: DmCapabilities::v1_gossip_ready(),
+            capabilities: DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
             signature: vec![0u8; 64],
         };
         let a = advert.signed_bytes().expect("signed bytes");

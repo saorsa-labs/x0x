@@ -103,8 +103,8 @@ async fn test_send_direct_agent_not_found() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(err, x0x::error::NetworkError::AgentNotFound(_)),
-        "Expected AgentNotFound, got: {:?}",
+        matches!(err, x0x::dm::DmError::RecipientKeyUnavailable(_)),
+        "Expected DmError::RecipientKeyUnavailable, got: {:?}",
         err
     );
 }

@@ -1171,7 +1171,7 @@ async fn main() -> Result<()> {
             .unwrap_or(DIRECTORY_RESUBSCRIBE_JITTER_MS),
         public_messages: RwLock::new(HashMap::new()),
         public_message_tasks: RwLock::new(HashMap::new()),
-        agent_kem_keypair,
+        agent_kem_keypair: Arc::clone(&agent_kem_keypair),
         contacts,
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
@@ -1254,12 +1254,22 @@ async fn main() -> Result<()> {
 
     // Join network in background — API is available immediately
     let join_agent = Arc::clone(&agent);
+    let join_kem = Arc::clone(&agent_kem_keypair);
     let rendezvous_enabled = config.rendezvous_enabled;
     let rendezvous_validity_ms = config.rendezvous_validity_ms;
     tokio::spawn(async move {
         match join_agent.join_network().await {
             Ok(()) => {
                 tracing::info!("Network joined");
+                // Start the DM inbox service now that the KEM keypair is
+                // loaded. This upgrades the capability advert so peers
+                // learn about gossip DM support within seconds.
+                if let Err(e) = join_agent
+                    .start_dm_inbox(join_kem, x0x::dm_inbox::DmInboxConfig::default())
+                    .await
+                {
+                    tracing::warn!("Failed to start DM inbox service: {e}");
+                }
                 if rendezvous_enabled {
                     if let Err(e) = join_agent.advertise_identity(rendezvous_validity_ms).await {
                         tracing::warn!("Initial rendezvous advertisement failed: {e}");
@@ -1914,7 +1924,7 @@ async fn file_send_handler(
 
     match serde_json::to_vec(&offer) {
         Ok(payload) => match state.agent.send_direct(&agent_id, payload).await {
-            Ok(()) => {
+            Ok(_receipt) => {
                 tracing::info!("File offer sent: {transfer_id} -> {agent_id_hex}");
                 (
                     StatusCode::OK,
@@ -2023,7 +2033,7 @@ async fn file_accept_handler(
     };
     let delivery_failed = match serde_json::to_vec(&accept_msg) {
         Ok(payload) => match state.agent.send_direct(&agent_id, payload).await {
-            Ok(()) => {
+            Ok(_receipt) => {
                 tracing::info!("File accept sent: {id} -> {remote_agent_hex}");
                 false
             }
@@ -5154,10 +5164,12 @@ async fn publish_listed_to_contacts_card(state: &AppState, card: x0x::groups::Gr
             .send_direct(&contact.agent_id, payload.clone())
             .await
         {
-            Ok(()) => tracing::info!(
+            Ok(receipt) => tracing::info!(
                 group_id = %card.group_id,
                 recipient = %hex_id,
                 trust = ?contact.trust_level,
+                path = ?receipt.path,
+                retries = receipt.retries_used,
                 "C.2/LTC: delivered signed card to contact"
             ),
             Err(e) => tracing::debug!(
@@ -9710,12 +9722,48 @@ async fn direct_send(
     };
 
     match state.agent.send_direct(&agent_id, payload).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
-        Err(e) => {
-            tracing::error!("direct_send failed: {e}");
+        Ok(receipt) => {
+            let path_str = match receipt.path {
+                x0x::dm::DmPath::GossipInbox => "gossip_inbox",
+                x0x::dm::DmPath::RawQuic => "raw_quic",
+            };
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "send failed" })),
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "path": path_str,
+                    "retries_used": receipt.retries_used,
+                    "request_id": hex::encode(receipt.request_id),
+                })),
+            )
+        }
+        Err(e) => {
+            let (status, err_kind) = match &e {
+                x0x::dm::DmError::RecipientRejected { .. } => {
+                    (StatusCode::FORBIDDEN, "recipient_rejected")
+                }
+                x0x::dm::DmError::RecipientKeyUnavailable(_) => {
+                    (StatusCode::NOT_FOUND, "recipient_key_unavailable")
+                }
+                x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+                x0x::dm::DmError::LocalGossipUnavailable(_) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "local_gossip_unavailable")
+                }
+                x0x::dm::DmError::EnvelopeConstruction(_) => {
+                    (StatusCode::BAD_REQUEST, "envelope_construction")
+                }
+                x0x::dm::DmError::PublishFailed(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed")
+                }
+            };
+            tracing::error!("direct_send failed ({err_kind}): {e}");
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": err_kind,
+                    "detail": e.to_string(),
+                })),
             )
         }
     }

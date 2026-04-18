@@ -81,18 +81,22 @@ tempfile = "3.14"
 [[bin]]
 name = "x0xd"
 path = "src/bin/x0xd.rs"
+test = false
 
 [[bin]]
 name = "x0x-keygen"
 path = "src/bin/x0x-keygen.rs"
+test = false
 
 [[bin]]
 name = "x0x"
 path = "src/bin/x0x.rs"
+test = false
 
 [[bin]]
 name = "gui-coverage"
 path = "src/bin/gui_coverage.rs"
+test = false
 
 [workspace]
 members = [

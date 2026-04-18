@@ -89,7 +89,9 @@ impl AgentCard {
             groups: Vec::new(),
             stores: Vec::new(),
             created_at: now,
-            dm_capabilities: Some(crate::dm::DmCapabilities::v1_gossip_ready()),
+            // AgentCard is created without knowing the KEM pubkey; callers
+            // that want a full advert populate via with_kem_public_key.
+            dm_capabilities: Some(crate::dm::DmCapabilities::pending()),
         }
     }
 

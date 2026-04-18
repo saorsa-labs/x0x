@@ -57,9 +57,10 @@ pub struct DmCapabilities {
     /// path. Senders addressing this agent MUST NOT use versions above this.
     pub max_protocol_version: u16,
 
-    /// True if this agent is subscribed to its gossip DM inbox topic. False
-    /// means pre-0.18 / legacy-only — sender should fall back to the
-    /// raw-QUIC path.
+    /// True if this agent is subscribed to its gossip DM inbox topic AND
+    /// has published a KEM public key. False means pre-0.18 / legacy-only
+    /// or a daemon that has not yet wired its KEM keypair — sender should
+    /// fall back to the raw-QUIC path.
     pub gossip_inbox: bool,
 
     /// KEM algorithm identifier for payload encryption. For v1 always
@@ -68,18 +69,49 @@ pub struct DmCapabilities {
 
     /// Maximum envelope size (in bytes) this agent will accept.
     pub max_envelope_bytes: usize,
+
+    /// ML-KEM-768 public key bytes. Senders encapsulate the per-message
+    /// content key to this key. Empty means "not yet available" — senders
+    /// MUST fall back to the raw-QUIC path (or return
+    /// `DmError::RecipientKeyUnavailable` when `require_gossip` is set).
+    #[serde(default)]
+    pub kem_public_key: Vec<u8>,
 }
 
 impl DmCapabilities {
-    /// Capability advert for a fresh x0x 0.18+ agent.
+    /// Placeholder capability advert for agents that have not yet wired
+    /// their KEM keypair. `gossip_inbox` is `false` and `kem_public_key`
+    /// is empty — senders will fall back to the raw-QUIC path.
     #[must_use]
-    pub fn v1_gossip_ready() -> Self {
+    pub fn pending() -> Self {
+        Self {
+            max_protocol_version: DM_PROTOCOL_VERSION,
+            gossip_inbox: false,
+            kem_algorithm: "ML-KEM-768".to_string(),
+            max_envelope_bytes: MAX_ENVELOPE_BYTES,
+            kem_public_key: Vec::new(),
+        }
+    }
+
+    /// Fully-wired capability advert for a v1 / 0.18+ gossip-DM-capable
+    /// agent. `kem_public_key` is the agent's ML-KEM-768 public key bytes.
+    #[must_use]
+    pub fn v1_gossip_ready(kem_public_key: Vec<u8>) -> Self {
         Self {
             max_protocol_version: DM_PROTOCOL_VERSION,
             gossip_inbox: true,
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
+            kem_public_key,
         }
+    }
+
+    /// Return a clone with the given KEM public key and `gossip_inbox=true`.
+    #[must_use]
+    pub fn with_kem_public_key(mut self, kem_public_key: Vec<u8>) -> Self {
+        self.kem_public_key = kem_public_key;
+        self.gossip_inbox = true;
+        self
     }
 }
 
@@ -270,10 +302,13 @@ pub struct DmSendConfig {
 
 impl Default for DmSendConfig {
     fn default() -> Self {
+        // Tuned for REST-handler response times: worst-case 10.5 s
+        // (5 s + 0.5 s backoff + 5 s retry) so callers and downstream
+        // curl-based test harnesses don't hit their own timeouts.
         Self {
-            timeout_per_attempt: Duration::from_secs(10),
-            max_retries: 3,
-            backoff: BackoffPolicy::ExponentialFromTimeout { factor: 2 },
+            timeout_per_attempt: Duration::from_secs(5),
+            max_retries: 1,
+            backoff: BackoffPolicy::Fixed(Duration::from_millis(500)),
             require_gossip: false,
         }
     }

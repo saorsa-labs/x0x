@@ -120,6 +120,19 @@ pub mod dm;
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
 
+/// Background service that publishes this agent's capability advert and
+/// consumes peers' adverts into a shared [`dm_capability::CapabilityStore`].
+pub mod dm_capability_service;
+
+/// Background service that subscribes to this agent's DM inbox topic,
+/// verifies + decrypts incoming envelopes, and bridges them into
+/// [`direct::DirectMessaging`].
+pub mod dm_inbox;
+
+/// Sender-side gossip DM path — envelope construction, publish + retry,
+/// and `InFlightAcks` wait.
+pub mod dm_send;
+
 /// Presence system — beacons, FOAF discovery, and online/offline events.
 pub mod presence;
 
@@ -209,6 +222,23 @@ pub struct Agent {
     /// announcements.  Set by `announce_identity(true, true)` and respected
     /// by the heartbeat so it doesn't erase a consented disclosure.
     user_identity_consented: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Capability store populated by the advert service and consulted by
+    /// `send_direct` to choose between gossip and raw-QUIC paths.
+    capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
+    /// Watch channel that carries this agent's *outgoing* DM capabilities.
+    /// `join_network` spawns the advert service with a placeholder (empty
+    /// KEM pubkey). `start_dm_inbox` upgrades via this sender to trigger
+    /// immediate republish.
+    dm_capabilities_tx: std::sync::Arc<tokio::sync::watch::Sender<dm::DmCapabilities>>,
+    /// In-flight DM ACK waiters shared between `send_direct` and the inbox.
+    dm_inflight_acks: std::sync::Arc<dm::InFlightAcks>,
+    /// Receiver-side dedupe cache.
+    recent_delivery_cache: std::sync::Arc<dm::RecentDeliveryCache>,
+    /// Handle for the running capability advert service.
+    capability_advert_service:
+        tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
+    /// Handle for the running DM inbox service.
+    dm_inbox_service: tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -1552,7 +1582,90 @@ impl Agent {
     /// // Then send data directly
     /// agent.send_direct(&target_agent_id, b"hello".to_vec()).await?;
     /// ```
+    /// Send data directly to an agent — capability-aware dispatch.
+    ///
+    /// Looks up the recipient's `DmCapabilities` in the local
+    /// [`dm_capability::CapabilityStore`]. If the recipient advertises
+    /// `gossip_inbox=true` with a non-empty `kem_public_key`, the send
+    /// goes via the gossip DM path (signed+encrypted envelope published
+    /// to the recipient's inbox topic with an application-layer ACK).
+    /// Otherwise, falls back to the legacy raw-QUIC stream.
+    ///
+    /// # Errors
+    ///
+    /// See [`dm::DmError`].
     pub async fn send_direct(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_config(to, payload, dm::DmSendConfig::default())
+            .await
+    }
+
+    /// Like [`Self::send_direct`] with caller-provided [`dm::DmSendConfig`].
+    ///
+    /// # Errors
+    ///
+    /// See [`dm::DmError`].
+    pub async fn send_direct_with_config(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let cap = self.capability_store.lookup(to);
+        let gossip_ok = cap
+            .as_ref()
+            .map(|c| c.gossip_inbox && !c.kem_public_key.is_empty())
+            .unwrap_or(false);
+
+        if gossip_ok {
+            let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+                dm::DmError::LocalGossipUnavailable(
+                    "send_direct: no gossip runtime configured".to_string(),
+                )
+            })?;
+            let signing = gossip::SigningContext::from_keypair(self.identity.agent_keypair());
+            let kem_pub = cap
+                .as_ref()
+                .map(|c| c.kem_public_key.clone())
+                .unwrap_or_default();
+            return dm_send::send_via_gossip(
+                std::sync::Arc::clone(runtime.pubsub()),
+                &signing,
+                self.identity.agent_id(),
+                self.identity.machine_id(),
+                *to,
+                &kem_pub,
+                payload,
+                &config,
+                std::sync::Arc::clone(&self.dm_inflight_acks),
+            )
+            .await;
+        }
+
+        if config.require_gossip {
+            return Err(dm::DmError::RecipientKeyUnavailable(format!(
+                "recipient {} has no gossip DM capability advert",
+                hex::encode(to.as_bytes())
+            )));
+        }
+
+        self.send_direct_raw_quic(to, payload)
+            .await
+            .map(|_| dm_send::raw_quic_receipt())
+            .map_err(|e| match e {
+                error::NetworkError::AgentNotFound(_)
+                | error::NetworkError::AgentNotConnected(_) => {
+                    dm::DmError::RecipientKeyUnavailable(e.to_string())
+                }
+                other => dm::DmError::PublishFailed(other.to_string()),
+            })
+    }
+
+    /// Legacy raw-QUIC direct-send path. Internal fallback only.
+    async fn send_direct_raw_quic(
         &self,
         agent_id: &identity::AgentId,
         payload: Vec<u8>,
@@ -2255,8 +2368,8 @@ impl Agent {
                         rebroadcast_state.insert(key, std::time::Instant::now());
                         // Prune stale entries to cap memory.
                         if rebroadcast_state.len() > 1024 {
-                            let cutoff = std::time::Instant::now()
-                                - std::time::Duration::from_secs(3600);
+                            let cutoff =
+                                std::time::Instant::now() - std::time::Duration::from_secs(3600);
                             rebroadcast_state.retain(|_, t| *t >= cutoff);
                         }
                         let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
@@ -2266,9 +2379,7 @@ impl Agent {
                                 .publish(IDENTITY_ANNOUNCE_TOPIC.to_string(), payload)
                                 .await
                             {
-                                tracing::debug!(
-                                    "identity announcement re-broadcast failed: {e}"
-                                );
+                                tracing::debug!("identity announcement re-broadcast failed: {e}");
                             }
                         });
                     }
@@ -2679,7 +2790,118 @@ impl Agent {
             });
         }
 
+        // Start the capability advert service. Until start_dm_inbox runs,
+        // the advert declares gossip_inbox=false — senders fall back to
+        // raw-QUIC. Once upgraded, peers learn about gossip DM support.
+        if let Some(ref runtime) = self.gossip_runtime {
+            let signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(
+                self.identity.agent_keypair(),
+            ));
+            let caps_rx = self.dm_capabilities_tx.subscribe();
+            match dm_capability_service::CapabilityAdvertService::spawn_default(
+                std::sync::Arc::clone(runtime.pubsub()),
+                signing,
+                self.identity.agent_id(),
+                self.identity.machine_id(),
+                caps_rx,
+                std::sync::Arc::clone(&self.capability_store),
+            )
+            .await
+            {
+                Ok(service) => {
+                    let mut guard = self.capability_advert_service.lock().await;
+                    if let Some(prev) = guard.take() {
+                        prev.abort();
+                    }
+                    *guard = Some(service);
+                    tracing::info!("Capability advert service started");
+                }
+                Err(e) => tracing::warn!("failed to start capability advert service: {e}"),
+            }
+        }
+
         Ok(())
+    }
+
+    /// Clone the shared capability store.
+    #[must_use]
+    pub fn capability_store(&self) -> std::sync::Arc<dm_capability::CapabilityStore> {
+        std::sync::Arc::clone(&self.capability_store)
+    }
+
+    /// Clone the shared DM in-flight ACK registry.
+    #[must_use]
+    pub fn dm_inflight_acks(&self) -> std::sync::Arc<dm::InFlightAcks> {
+        std::sync::Arc::clone(&self.dm_inflight_acks)
+    }
+
+    /// Clone the shared recent-delivery dedupe cache.
+    #[must_use]
+    pub fn recent_delivery_cache(&self) -> std::sync::Arc<dm::RecentDeliveryCache> {
+        std::sync::Arc::clone(&self.recent_delivery_cache)
+    }
+
+    /// Spawn the DM inbox service backed by the given KEM keypair.
+    /// Idempotent — the prior service is aborted before spawning new.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no gossip runtime is configured.
+    pub async fn start_dm_inbox(
+        &self,
+        kem_keypair: std::sync::Arc<groups::kem_envelope::AgentKemKeypair>,
+        config: dm_inbox::DmInboxConfig,
+    ) -> error::Result<()> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "cannot start DM inbox: no gossip runtime configured",
+            ))
+        })?;
+        let signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(
+            self.identity.agent_keypair(),
+        ));
+        let service = dm_inbox::DmInboxService::spawn(
+            std::sync::Arc::clone(runtime.pubsub()),
+            signing,
+            self.identity.agent_id(),
+            self.identity.machine_id(),
+            std::sync::Arc::clone(&kem_keypair),
+            std::sync::Arc::clone(&self.direct_messaging),
+            std::sync::Arc::clone(&self.contact_store),
+            std::sync::Arc::clone(&self.dm_inflight_acks),
+            std::sync::Arc::clone(&self.recent_delivery_cache),
+            config,
+        )
+        .await
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "DM inbox spawn failed: {e}"
+            )))
+        })?;
+        let mut guard = self.dm_inbox_service.lock().await;
+        if let Some(prev) = guard.take() {
+            prev.abort();
+        }
+        *guard = Some(service);
+
+        // Upgrade our advertised capabilities so peers stop falling back
+        // to the raw-QUIC path. The capability advert service watches
+        // this channel and republishes immediately on change.
+        let upgraded =
+            dm::DmCapabilities::pending().with_kem_public_key(kem_keypair.public_bytes.clone());
+        if self.dm_capabilities_tx.send(upgraded).is_err() {
+            tracing::debug!("dm_capabilities watch has no receivers; skipping upgrade broadcast");
+        }
+        tracing::info!("DM inbox service started");
+        Ok(())
+    }
+
+    /// Stop the DM inbox service, if running. Idempotent.
+    pub async fn stop_dm_inbox(&self) {
+        let mut guard = self.dm_inbox_service.lock().await;
+        if let Some(service) = guard.take() {
+            service.abort();
+        }
     }
 
     /// Connect to cached peers in parallel, returning (succeeded, failed) peer lists.
@@ -4299,6 +4521,15 @@ impl AgentBuilder {
             direct_listener_started: std::sync::atomic::AtomicBool::new(false),
             presence,
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
+            dm_capabilities_tx: std::sync::Arc::new({
+                let (tx, _rx) = tokio::sync::watch::channel(dm::DmCapabilities::pending());
+                tx
+            }),
+            dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
+            recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
+            capability_advert_service: tokio::sync::Mutex::new(None),
+            dm_inbox_service: tokio::sync::Mutex::new(None),
         })
     }
 }
