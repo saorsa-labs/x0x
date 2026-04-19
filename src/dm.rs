@@ -1040,9 +1040,7 @@ mod tests {
         let rid = [1u8; 16];
         let rx = acks.register(rid);
         assert!(acks.resolve(&rid, DmAckOutcome::Accepted));
-        let received = tokio::runtime::Runtime::new()
-            .expect("rt")
-            .block_on(async move { rx.await });
+        let received = tokio::runtime::Runtime::new().expect("rt").block_on(rx);
         assert_eq!(received.expect("ok"), DmAckOutcome::Accepted);
         // Second resolve → no-op.
         assert!(!acks.resolve(&rid, DmAckOutcome::Accepted));
