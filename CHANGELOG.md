@@ -2,6 +2,65 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.18.0] - 2026-04-20
+
+### Added
+
+- **`GET /diagnostics/gossip`** — drop-detection endpoint exposing
+  `PubSubStats` counters for every stage of the pub/sub pipeline
+  (publish / incoming / decoded / delivered / subscriber-channel-closed)
+  plus derived `in_flight_decode` and `decode_to_delivery_drops`.
+- **`x0x diagnostics gossip`** — CLI subcommand parallel to
+  `diagnostics connectivity`.
+- **`X0X_LOG_DIR`** — per-pid file log sink for `x0xd`; appends
+  `<dir>/x0xd-<pid>.log` alongside stdout. Opt-in.
+- **ant-quic 0.27.1/0.27.2 surface pass-throughs** on `NetworkNode`:
+  `probe_peer` (#173 active liveness), `connection_health` (#170),
+  `send_with_receive_ack` (#172), `subscribe_all_peer_events` (#171).
+- `tests/ant_quic_0272_surface.rs` — 4 integration tests exercising
+  each new primitive against localhost `P2pEndpoint`s.
+- `docs/parity-matrix.md` — capability × surface matrix across CLI,
+  REST, embedded GUI, Python / Node bindings, the communitas-x0x-client
+  Rust crate, communitas-core / ui-service / ui-api / dioxus / kanban /
+  apple / bench.
+- `tests/e2e_stress_gossip.sh` — N-daemon / M-message stress harness
+  that fails on any `decode_to_delivery_drops > 0`.
+- `tests/e2e_gui_chrome.mjs` — Playwright driver for the embedded
+  HTML GUI; captures HAR + console stream + screenshot + JSON pass/fail
+  per capability. Loads GUI from the daemon's `/gui` handler so the
+  page is same-origin with the REST surface.
+- `tests/e2e_communitas_dioxus.sh` — JSON-IPC driver skeleton for the
+  Communitas Dioxus desktop app.
+- `communitas-apple/Tests/CommunitasUITests/` — XCUITest target with
+  5 golden-path UI tests.
+- `tests/e2e_proof_runner.sh` — top-level orchestrator rolling every
+  phase into `proofs/<timestamp>/proof-report.json`.
+
+### Changed
+
+- Bumped `ant-quic` `0.27.1 → 0.27.2`.
+- Bumped `saorsa-gossip-*` `0.5.17 → 0.5.18` (re-pins ant-quic 0.27.2
+  across all 11 crates).
+- Rust toolchain pinned to 1.95.0 — blake3 1.8.4 transitively requires
+  `constant_time_eq 0.4.3` which has a 1.95 MSRV.
+- `dm_inbox::InboxPipeline` rebroadcast-dedup map moved behind a
+  `RebroadcastDedupMap` type alias (clippy 1.95 tightened
+  `clippy::type_complexity`).
+- API endpoint registry and shipped manifest grew to 114 endpoints.
+
+### Validation
+
+- `cargo fmt --check`: clean
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean
+- `cargo nextest run --all-features --workspace`: **1006 / 1006 pass**
+
+### Proof runs (checked into `proofs/`)
+
+- Local 3-daemon gossip stress — 100 % delivery, 0 drops
+  (`proofs/stress-20260420-085503/`).
+- Chrome GUI capability walk — 9 / 9 pass including live pub/sub
+  round-trip (`proofs/chrome-20260420-v2/`).
+
 ## [v0.17.1] - 2026-04-16
 
 ### Fixed
