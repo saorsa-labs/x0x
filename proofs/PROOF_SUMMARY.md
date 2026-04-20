@@ -80,6 +80,48 @@ as ant-quic's own `b_*` tests) and drives one of the new primitives.
 | `x0x`: `diagnostics gossip` | CLI wrapper for the new endpoint |
 | `NetworkNode` pass-throughs | `probe_peer` / `connection_health` / `send_with_receive_ack` / `subscribe_all_peer_events` |
 
+## Chrome / Playwright GUI proof
+
+`proofs/chrome-20260420-v2/gui-parity-report.json` — **9 / 9 pass**:
+
+```
+[PASS] daemon-health
+[PASS] agent-card
+[PASS] presence-online
+[PASS] diagnostics-connectivity
+[PASS] diagnostics-gossip          ← new this release
+[PASS] groups-discover
+[PASS] stores-list
+[PASS] contacts-list
+[PASS] pubsub-roundtrip
+```
+
+Round-trip proof (`pubsub-roundtrip`) — publish from the page context,
+sleep, read `/diagnostics/gossip`, assert counters advanced and drops
+are zero:
+
+```json
+{
+  "publish_total": 13, "publish_failed": 0,
+  "incoming_total": 12, "incoming_decoded": 12, "incoming_decode_failed": 0,
+  "delivered_to_subscriber": 12, "subscriber_channel_closed": 0,
+  "decode_to_delivery_drops": 0, "in_flight_decode": 0
+}
+```
+
+Artefacts captured per run:
+
+- `chrome-gui.har` — network HAR (every fetch / WebSocket / SSE)
+- `chrome-gui.console.jsonl` — browser console stream
+- `chrome-gui.screenshot.png` — final full-page screenshot
+- `gui-parity-report.json` — per-capability pass/fail JSON
+
+Originally the harness loaded the GUI via `file://` and all page fetches
+hit CORS (browser blocked cross-origin to `http://127.0.0.1`). Fix:
+load the GUI from the daemon's embedded `/gui` handler so the page
+shares origin with the REST surface. The harness accepts `--gui <path>`
+to override back to `file://` when a daemon is unavailable.
+
 ## Red cells (gaps tracked, not blockers for v0.18.0)
 
 See `docs/parity-matrix.md` "Red-cell ticket list". Summary:

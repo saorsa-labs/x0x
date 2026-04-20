@@ -36,7 +36,11 @@ const flag = (name, def) => {
 };
 
 const API_BASE = process.env.X0X_API_BASE ?? "http://127.0.0.1:12700";
-const GUI_PATH = resolve(flag("--gui", "src/gui/x0x-gui.html"));
+// Default to serving the GUI from the daemon (same-origin), which lets the
+// page use real fetch() without CORS. Pass `--gui <path>` to force a local
+// file:// load (useful when a daemon isn't available).
+const GUI_URL = flag("--gui-url", `${API_BASE}/gui`);
+const GUI_PATH = flag("--gui", null);
 const PROOF_DIR = resolve(flag("--proof-dir", `proofs/chrome-${Date.now()}`));
 const HEADED = !!process.env.X0X_GUI_HEADED;
 
@@ -62,6 +66,7 @@ const TOKEN = resolveToken();
 
 const report = {
     run_started_at: new Date().toISOString(),
+    gui_url: GUI_URL,
     gui_path: GUI_PATH,
     api_base: API_BASE,
     capabilities: {},
@@ -138,7 +143,7 @@ async function main() {
         { base: API_BASE, token: TOKEN },
     );
 
-    const url = `file://${GUI_PATH}`;
+    const url = GUI_PATH ? `file://${resolve(GUI_PATH)}` : GUI_URL;
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
     // Give the GUI a moment to hydrate / fetch /agent etc.

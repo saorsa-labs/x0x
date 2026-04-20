@@ -1,0 +1,55 @@
+{
+  "run_started_at": "2026-04-20T07:57:47.128Z",
+  "gui_path": "/Users/davidirvine/Desktop/Devel/projects/x0x/src/gui/x0x-gui.html",
+  "api_base": "http://127.0.0.1:12710",
+  "capabilities": {
+    "daemon-health": {
+      "status": "pass",
+      "result": {
+        "ok": true,
+        "status": "healthy",
+        "version": "0.17.4",
+        "peers": 16,
+        "uptime_secs": 56
+      }
+    },
+    "agent-card": {
+      "status": "fail",
+      "reason": "page.evaluate: TypeError: Failed to fetch\n    at eval (eval at evaluate (:302:30), <anonymous>:2:37)\n    at UtilityScript.evaluate (<anonymous>:304:16)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)"
+    },
+    "presence-online": {
+      "status": "fail",
+      "reason": "page.evaluate: TypeError: Failed to fetch\n    at eval (eval at evaluate (:302:30), <anonymous>:2:37)\n    at UtilityScript.evaluate (<anonymous>:304:16)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)"
+    },
+    "diagnostics-connectivity": {
+      "status": "fail",
+      "reason": "page.evaluate: TypeError: Failed to fetch\n    at eval (eval at evaluate (:302:30), <anonymous>:2:37)\n    at UtilityScript.evaluate (<anonymous>:304:16)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)"
+    },
+    "diagnostics-gossip": {
+      "status": "fail",
+      "reason": "page.evaluate: TypeError: Failed to fetch\n    at eval (eval at evaluate (:302:30), <anonymous>:2:37)\n    at UtilityScript.evaluate (<anonymous>:304:16)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)"
+    },
+    "groups-discover": {
+      "status": "fail",
+      "reason": "page.evaluate: TypeError: Failed to fetch\n    at eval (eval at evaluate (:302:30), <anonymous>:2:37)\n    at UtilityScript.evaluate (<anonymous>:304:16)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)"
+    },
+    "stores-list": {
+      "status": "fail",
+      "reason": "page.evaluate: TypeError: Failed to fetch\n    at eval (eval at evaluate (:302:30), <anonymous>:2:37)\n    at UtilityScript.evaluate (<anonymous>:304:16)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)"
+    },
+    "contacts-list": {
+      "status": "fail",
+      "reason": "page.evaluate: TypeError: Failed to fetch\n    at eval (eval at evaluate (:302:30), <anonymous>:2:37)\n    at UtilityScript.evaluate (<anonymous>:304:16)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)"
+    },
+    "pubsub-roundtrip": {
+      "status": "fail",
+      "reason": "page.evaluate: TypeError: Failed to fetch\n    at eval (eval at evaluate (:302:30), <anonymous>:6:23)\n    at UtilityScript.evaluate (<anonymous>:304:16)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)"
+    }
+  },
+  "totals": {
+    "pass": 1,
+    "fail": 8,
+    "skip": 0
+  },
+  "run_completed_at": "2026-04-20T07:57:50.693Z"
+}

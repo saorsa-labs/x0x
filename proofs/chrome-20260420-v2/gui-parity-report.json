@@ -1,0 +1,59 @@
+{
+  "run_started_at": "2026-04-20T07:58:11.293Z",
+  "gui_url": "http://127.0.0.1:12710/gui",
+  "gui_path": null,
+  "api_base": "http://127.0.0.1:12710",
+  "capabilities": {
+    "daemon-health": {
+      "status": "pass",
+      "result": {
+        "ok": true,
+        "status": "healthy",
+        "version": "0.17.4",
+        "peers": 16,
+        "uptime_secs": 80
+      }
+    },
+    "agent-card": {
+      "status": "pass"
+    },
+    "presence-online": {
+      "status": "pass"
+    },
+    "diagnostics-connectivity": {
+      "status": "pass"
+    },
+    "diagnostics-gossip": {
+      "status": "pass"
+    },
+    "groups-discover": {
+      "status": "pass"
+    },
+    "stores-list": {
+      "status": "pass"
+    },
+    "contacts-list": {
+      "status": "pass"
+    },
+    "pubsub-roundtrip": {
+      "status": "pass",
+      "stats": {
+        "decode_to_delivery_drops": 0,
+        "delivered_to_subscriber": 12,
+        "in_flight_decode": 0,
+        "incoming_decode_failed": 0,
+        "incoming_decoded": 12,
+        "incoming_total": 12,
+        "publish_failed": 0,
+        "publish_total": 13,
+        "subscriber_channel_closed": 0
+      }
+    }
+  },
+  "totals": {
+    "pass": 9,
+    "fail": 0,
+    "skip": 0
+  },
+  "run_completed_at": "2026-04-20T07:58:15.178Z"
+}
