@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.18.4] - 2026-04-21
+
+### Fixed
+
+- **Dual-stack bind for named instances.** `x0xd --name <instance>`
+  previously forced the QUIC bind to `0.0.0.0:0` (IPv4-only), so
+  daemons on a dual-stack host could neither reach nor be reached
+  by IPv6-only peers, and their `external_addrs` was IPv4-only
+  even when a globally-routable IPv6 was configured on the host.
+  Bind is now `[::]:0` (IPv6 unspecified with dual-stack), so
+  both families are listened-on and observed.
+- **File transfer chunk size.** `files::DEFAULT_CHUNK_SIZE` was 64 KiB
+  (raw) which, after base64 + JSON wrapper, produced ~87 KB DM
+  envelope payloads — exceeding `dm::MAX_PAYLOAD_BYTES` (49 152) so
+  `Send chunk 0 failed: envelope construction failed: payload
+  exceeds MAX_PAYLOAD_BYTES (87481 > 49152)` aborted every transfer.
+  Dropped to 32 KiB raw, which base64-encodes to ~43 691 B and fits
+  every chunk inside a single DM envelope with headroom for the JSON
+  wrapper. First successful proof: 262 144 B file in 7.17 s.
+
+### Added
+
+- `tests/e2e_full_measurement.sh` — comprehensive proof run that
+  captures pub/sub, DM with `require_ack_ms`, file transfer (with
+  full completion tracking), probe-peer matrix, NAT/connectivity,
+  relay state, coordinator state, and IPv4/IPv6 address-family
+  breakdown across `external_addrs` AND announced `agent.card.addresses`.
+- `/agent/card` snapshot per phase so the harness can compare what
+  the daemon WOULD announce (passes `is_publicly_advertisable`)
+  against what peers have OBSERVED (populates `external_addrs`).
+
+### Proof: `proofs/full-20260421-194618/`
+
+- 5 daemons, 500 msgs, strict gate: publisher 586 / subscribers 742
+  each, 0 drops anywhere.
+- File transfer: **262 144 B completed in 7.17 s** (0.29 Mbps over
+  DM-fragment channel on localhost).
+- Probe matrix: 20 / 20 ok.
+- Announced addresses: every node surfaces **7 public IPv6
+  addresses**; IPv4 is correctly filtered out because the local
+  v4 is RFC1918 (`192.168.1.212`). On a dual-public-IP host
+  (VPS) both families will appear.
+
 ## [v0.18.3] - 2026-04-21
 
 ### Fixed

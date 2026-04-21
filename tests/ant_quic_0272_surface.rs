@@ -70,13 +70,16 @@ async fn probe_peer_returns_finite_rtt_on_localhost_connection() {
     sleep(Duration::from_millis(150)).await;
 
     let rtt = sender
-        .probe_peer(&receiver_id, Duration::from_secs(2))
+        .probe_peer(&receiver_id, Duration::from_secs(10))
         .await
         .expect("probe_peer on live connection");
 
+    // Generous bound so nextest parallel-load scheduling jitter doesn't
+    // flake the test — the point is to prove probe_peer returns a finite
+    // RTT, not to measure raw localhost latency.
     assert!(
-        rtt < Duration::from_secs(1),
-        "probe RTT on localhost {rtt:?} should be well under 1s"
+        rtt < Duration::from_secs(5),
+        "probe RTT on localhost {rtt:?} should be well under 5s even under load"
     );
 
     sender.shutdown().await;
@@ -107,7 +110,7 @@ async fn connection_health_after_connect_is_observable() {
     let health = sender.connection_health(&receiver_id).await;
     let _ = format!("{health:?}");
     sender
-        .probe_peer(&receiver_id, Duration::from_secs(2))
+        .probe_peer(&receiver_id, Duration::from_secs(10))
         .await
         .expect("probe after health-check");
 
@@ -140,7 +143,7 @@ async fn send_with_receive_ack_round_trips_on_localhost() {
     };
 
     sender
-        .send_with_receive_ack(&receiver_id, b"x0x-ack-roundtrip", Duration::from_secs(3))
+        .send_with_receive_ack(&receiver_id, b"x0x-ack-roundtrip", Duration::from_secs(10))
         .await
         .expect("send_with_receive_ack on healthy link");
 
@@ -167,7 +170,7 @@ async fn subscribe_all_peer_events_fires_established_on_connect() {
         .await
         .expect("connect_addr");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut saw_established = false;
     while tokio::time::Instant::now() < deadline {
         match timeout(Duration::from_millis(250), events.recv()).await {

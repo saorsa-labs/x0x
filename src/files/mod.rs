@@ -6,8 +6,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Default chunk size: 64 KB.
-pub const DEFAULT_CHUNK_SIZE: usize = 65536;
+/// Default chunk size: 32 KiB raw.
+///
+/// Sized to fit every chunk inside a single DM envelope. Each chunk's
+/// wire form is base64(payload) + JSON wrapper (`transfer_id` +
+/// `chunk_index` + `sha256` + a few fields) — 32768 bytes base64-encodes
+/// to ~43 691 bytes which, with the JSON wrapper and DM overhead, still
+/// fits under `crate::dm::MAX_PAYLOAD_BYTES` (49 152). Using 64 KiB
+/// previously caused `envelope construction failed: payload exceeds
+/// MAX_PAYLOAD_BYTES (87481 > 49152)` and aborted every file transfer
+/// on chunk 0 — see proofs/full-20260421-193705/ for the regression.
+pub const DEFAULT_CHUNK_SIZE: usize = 32768;
 
 /// Maximum file transfer size: 1 GB.
 pub const MAX_TRANSFER_SIZE: u64 = 1_073_741_824;

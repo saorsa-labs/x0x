@@ -1,0 +1,13 @@
+{
+  "proof_dir": "proofs/full-20260421-194618",
+  "nodes": 5,
+  "messages": 500,
+  "pub_elapsed": 19,
+  "dm_ok": "ok",
+  "dm_rtt": "0",
+  "file_size": 262144,
+  "ft_offer_us": 162621,
+  "ft_complete_us": 7174801,
+  "ft_recv_bytes": 262144,
+  "ft_mbps": 0.29
+}

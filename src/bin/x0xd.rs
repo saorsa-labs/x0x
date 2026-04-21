@@ -901,9 +901,13 @@ async fn main() -> Result<()> {
             config.api_address = SocketAddr::from(([127, 0, 0, 1], 0));
         }
         // Use ephemeral QUIC port for named instances to avoid conflicts
-        // when running multiple instances on the same machine.
+        // when running multiple instances on the same machine. Keep the
+        // family at `[::]` (IPv6 unspecified, dual-stack) so both IPv4
+        // and IPv6 inbound reach the daemon — otherwise IPv6-only peers
+        // on the same machine can't connect and `external_addrs` is
+        // IPv4-only on multi-family hosts.
         if config.bind_address == default_bind_address() {
-            config.bind_address = SocketAddr::from(([0, 0, 0, 0], 0));
+            config.bind_address = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0));
         }
         config.instance_name = Some(name.clone());
     }

@@ -187,20 +187,22 @@ fn file_complete_roundtrip() {
 
 #[test]
 fn transfer_state_sending_fields() {
-    let ts = make_sending_transfer(200_000, DEFAULT_CHUNK_SIZE);
+    // Chunk-size-agnostic: 3 full chunks + a remainder = 4 total.
+    let size = (DEFAULT_CHUNK_SIZE as u64) * 3 + 200;
+    let ts = make_sending_transfer(size, DEFAULT_CHUNK_SIZE);
     assert_eq!(ts.direction, TransferDirection::Sending);
     assert_eq!(ts.status, TransferStatus::Pending);
     assert_eq!(ts.bytes_transferred, 0);
     assert_eq!(ts.source_path, Some("/tmp/test.bin".to_string()));
     assert!(ts.output_path.is_none());
     assert_eq!(ts.chunk_size, DEFAULT_CHUNK_SIZE);
-    // 200_000 / 65_536 = 3.05 → 4 chunks
     assert_eq!(ts.total_chunks, 4);
 }
 
 #[test]
 fn transfer_state_receiving_fields() {
-    let ts = make_receiving_transfer(65_536, DEFAULT_CHUNK_SIZE);
+    // Exactly one chunk regardless of chunk size constant.
+    let ts = make_receiving_transfer(DEFAULT_CHUNK_SIZE as u64, DEFAULT_CHUNK_SIZE);
     assert_eq!(ts.direction, TransferDirection::Receiving);
     assert_eq!(ts.status, TransferStatus::InProgress);
     assert!(ts.source_path.is_none());
@@ -238,16 +240,21 @@ fn total_chunks_chunk_size_plus_one() {
 
 #[test]
 fn total_chunks_exact_multiple() {
-    // 2 * 65536 = 131072 → exactly 2 chunks
-    let ts = make_sending_transfer(131_072, DEFAULT_CHUNK_SIZE);
+    // Exactly 2 chunks at whatever DEFAULT_CHUNK_SIZE is today.
+    let ts = make_sending_transfer(
+        (DEFAULT_CHUNK_SIZE as u64) * 2,
+        DEFAULT_CHUNK_SIZE,
+    );
     assert_eq!(ts.total_chunks, 2);
 }
 
 #[test]
 fn total_chunks_large_file() {
-    // 1 MiB = 16 chunks of 64KiB
-    let ts = make_sending_transfer(1_048_576, DEFAULT_CHUNK_SIZE);
-    assert_eq!(ts.total_chunks, 16);
+    // 1 MiB / current chunk size, rounded up.
+    const ONE_MIB: u64 = 1 << 20;
+    let expected = ONE_MIB.div_ceil(DEFAULT_CHUNK_SIZE as u64);
+    let ts = make_sending_transfer(ONE_MIB, DEFAULT_CHUNK_SIZE);
+    assert_eq!(ts.total_chunks, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +280,10 @@ fn expected_sequence_starts_at_zero() {
 
 #[test]
 fn expected_sequence_advances_with_chunks() {
-    let mut ts = make_receiving_transfer(200_000, DEFAULT_CHUNK_SIZE);
+    // Size the transfer relative to the current DEFAULT_CHUNK_SIZE so the
+    // test stays correct when the constant changes (64 KiB → 32 KiB etc.).
+    let two_chunks_plus_tail = (DEFAULT_CHUNK_SIZE as u64) * 2 + 1_024;
+    let mut ts = make_receiving_transfer(two_chunks_plus_tail, DEFAULT_CHUNK_SIZE);
 
     // After one full chunk
     ts.bytes_transferred = DEFAULT_CHUNK_SIZE as u64;
@@ -285,10 +295,10 @@ fn expected_sequence_advances_with_chunks() {
     let expected = ts.bytes_transferred / ts.chunk_size as u64;
     assert_eq!(expected, 2);
 
-    // After partial third chunk (200_000 - 2*65536 = 68928)
-    ts.bytes_transferred = 200_000;
+    // After partial third chunk
+    ts.bytes_transferred = two_chunks_plus_tail;
     let expected = ts.bytes_transferred / ts.chunk_size as u64;
-    assert_eq!(expected, 3);
+    assert_eq!(expected, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -445,14 +455,18 @@ fn transfer_state_deserializes_without_optional_fields() {
 
 #[test]
 fn file_offer_total_chunks_consistent() {
+    // Use a size chosen relative to DEFAULT_CHUNK_SIZE so the assertion
+    // stays honest when the constant changes.
+    let size = (DEFAULT_CHUNK_SIZE as u64) * 3 + 200;
+    let computed = size.div_ceil(DEFAULT_CHUNK_SIZE as u64);
     let offer = FileOffer {
         transfer_id: "tc1".into(),
         filename: "f.bin".into(),
-        size: 200_000,
+        size,
         sha256: "h".into(),
         chunk_size: DEFAULT_CHUNK_SIZE,
-        total_chunks: 4, // 200_000 / 65_536 = 3.05 → 4
+        total_chunks: computed,
     };
-    let computed = offer.size.div_ceil(offer.chunk_size as u64);
     assert_eq!(offer.total_chunks, computed);
+    assert_eq!(computed, 4); // 3 full chunks + 1 remainder regardless of chunk size
 }

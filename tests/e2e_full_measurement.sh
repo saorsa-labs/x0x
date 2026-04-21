@@ -132,6 +132,7 @@ snapshot_phase() {
         local dir="$PROOF_DIR/logs/node-$i"
         api "$i" GET /health          > "$dir/health-$phase.json"           || true
         api "$i" GET /agent           > "$dir/agent-$phase.json"            || true
+        api "$i" GET /agent/card      > "$dir/agent-card-$phase.json"       || true
         api "$i" GET /network/status  > "$dir/network-$phase.json"          || true
         api "$i" GET /diagnostics/connectivity > "$dir/connectivity-$phase.json" || true
         api "$i" GET /diagnostics/gossip > "$dir/gossip-$phase.json"        || true
@@ -211,32 +212,93 @@ dd if=/dev/urandom of="$FILE" bs=1024 count=256 2>/dev/null
 FILE_SIZE=$(stat -f%z "$FILE" 2>/dev/null || stat -c%s "$FILE")
 log "File transfer: ${FILE_SIZE} bytes (node-1 → node-2)"
 
-# `x0x send-file` binds to daemon 1 via its api-token env.
 export X0X_API_TOKEN="${TOKENS[0]}"
 export X0X_API_URL="http://127.0.0.1:${PORTS[0]}"
 ft_start_us=$(python3 -c "import time; print(int(time.time()*1_000_000))")
 FT_RESP=$("$CLI" --name measure-1 send-file "$NODE2_AGENT" "$FILE" 2>&1 || true)
-ft_end_us=$(python3 -c "import time; print(int(time.time()*1_000_000))")
-ft_elapsed_us=$((ft_end_us - ft_start_us))
+ft_offer_us=$(($(python3 -c "import time; print(int(time.time()*1_000_000))") - ft_start_us))
 unset X0X_API_TOKEN X0X_API_URL
 echo "$FT_RESP" > "$PROOF_DIR/logs/node-1/send-file.txt"
-# x0x send-file completes async — post the offer, the bytes flow as
-# accept→chunks. We'll treat the offer-send latency as a lower bound.
-ft_kbps=$(awk -v b="$FILE_SIZE" -v us="$ft_elapsed_us" 'BEGIN { printf "%.1f", (b * 8 / 1000.0) / (us / 1_000_000.0) }')
-log "File transfer offer sent in ${ft_elapsed_us}us (${ft_kbps} kbps initial-RTT-bounded)"
+
+# Extract transfer_id from `x0x send-file` output so we can poll status
+# on both sides and wait for Completed.
+TRANSFER_ID=$(echo "$FT_RESP" | grep -oE '[0-9a-f]{32}|[0-9a-f-]{36}' | head -1)
+log "File transfer offer sent (id=${TRANSFER_ID:-unknown}) in ${ft_offer_us}us"
+
+# Auto-accept on the receiver (node-2).
+if [ -n "$TRANSFER_ID" ]; then
+    api 2 POST "/files/accept/$TRANSFER_ID" > "$PROOF_DIR/logs/node-2/accept.json" || true
+fi
+
+# Poll both sides for Completed. 60 s hard cap.
+ft_complete_us="-1"
+ft_recv_bytes=0
+for _ in $(seq 1 60); do
+    sleep 1
+    S1=$(api 1 GET "/files/transfers/$TRANSFER_ID" 2>/dev/null || echo '{}')
+    S2=$(api 2 GET "/files/transfers/$TRANSFER_ID" 2>/dev/null || echo '{}')
+    ST1=$(echo "$S1" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('status','?'))" 2>/dev/null || echo "?")
+    ST2=$(echo "$S2" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('status','?'))" 2>/dev/null || echo "?")
+    BY2=$(echo "$S2" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('bytes_transferred',0))" 2>/dev/null || echo 0)
+    if [ "$ST1" = "Complete" ] && [ "$ST2" = "Complete" ]; then
+        ft_complete_us=$(($(python3 -c "import time; print(int(time.time()*1_000_000))") - ft_start_us))
+        ft_recv_bytes=$BY2
+        log "File transfer completed: ${ft_recv_bytes} bytes in ${ft_complete_us}us"
+        break
+    fi
+    if [ "$ST1" = "Failed" ] || [ "$ST2" = "Failed" ]; then
+        log "File transfer FAILED: send=$ST1 recv=$ST2"
+        break
+    fi
+done
+
+if [ "$ft_complete_us" != "-1" ]; then
+    ft_mbps=$(awk -v b="$FILE_SIZE" -v us="$ft_complete_us" \
+        'BEGIN { printf "%.2f", (b * 8 / 1000000.0) / (us / 1000000.0) }')
+else
+    ft_mbps="0"
+    log "File transfer did not complete within 60s"
+fi
 
 # --- Phase 6: post-run snapshot + report --------------------------------
 
 sleep 5
 snapshot_phase "post"
 
-# Build the summary report.
-python3 - <<PY > "$REPORT"
-import json, os, pathlib
+# Build the summary report. Shell values are written to a JSON sidecar
+# first so the heredoc (quoted, so `$` is NOT expanded) can load them
+# cleanly.
+cat > "$PROOF_DIR/_args.json" <<JSON
+{
+  "proof_dir": "$PROOF_DIR",
+  "nodes": $NODES,
+  "messages": $MESSAGES,
+  "pub_elapsed": $pub_elapsed,
+  "dm_ok": "$DM_OK",
+  "dm_rtt": "$DM_RTT",
+  "file_size": $FILE_SIZE,
+  "ft_offer_us": $ft_offer_us,
+  "ft_complete_us": $ft_complete_us,
+  "ft_recv_bytes": $ft_recv_bytes,
+  "ft_mbps": $ft_mbps
+}
+JSON
 
-proof = pathlib.Path("$PROOF_DIR")
-nodes = int("$NODES")
-messages = int("$MESSAGES")
+python3 - "$PROOF_DIR/_args.json" <<'PY' > "$REPORT"
+import json, pathlib, sys
+
+args = json.load(open(sys.argv[1]))
+proof = pathlib.Path(args["proof_dir"])
+nodes = args["nodes"]
+messages = args["messages"]
+pub_elapsed = args["pub_elapsed"]
+dm_ok = args["dm_ok"]
+dm_rtt = args["dm_rtt"]
+file_size = args["file_size"]
+ft_offer_us = args["ft_offer_us"]
+ft_complete_us = args["ft_complete_us"]
+ft_recv_bytes = args["ft_recv_bytes"]
+ft_mbps = args["ft_mbps"]
 
 def load(p):
     try:
@@ -244,6 +306,23 @@ def load(p):
             return json.load(f)
     except Exception:
         return None
+
+def split_families(addrs):
+    """Split list of 'host:port' strings into (v4, v6) buckets.
+
+    IPv6 addresses are bracketed like [::1]:1234; IPv4 are dotted a.b.c.d:port.
+    """
+    v4, v6 = [], []
+    for a in addrs or []:
+        if isinstance(a, str) and a.startswith("["):
+            v6.append(a)
+        elif isinstance(a, str) and a.count(":") == 1 and "." in a:
+            v4.append(a)
+        elif isinstance(a, str) and a.count(":") > 1:
+            v6.append(a)
+        elif isinstance(a, str):
+            v4.append(a)
+    return v4, v6
 
 per_node = []
 for i in range(1, nodes + 1):
@@ -253,11 +332,17 @@ for i in range(1, nodes + 1):
     goss  = load(d / "gossip-post.json") or {}
     peers = load(d / "peers-post.json") or {}
     agent = load(d / "agent-post.json") or {}
+    card  = load(d / "agent-card-post.json") or {}
 
     stats = (goss or {}).get("stats", {})
     extern = conn.get("external_addrs", []) or []
-    v4 = [a for a in extern if "." in a and ":" in a]
-    v6 = [a for a in extern if a.count(":") > 2]
+    v4, v6 = split_families(extern)
+    # Announced addresses live at card.card.addresses. These are what the
+    # daemon broadcasts in identity announcements — `collect_local_interface_addrs`
+    # filtered by `is_publicly_advertisable`.
+    card_obj = (card or {}).get("card", {}) or {}
+    announced = card_obj.get("addresses", []) or []
+    av4, av6 = split_families(announced)
 
     per_node.append({
         "idx": i,
@@ -274,6 +359,11 @@ for i in range(1, nodes + 1):
             "v4": v4,
             "v6": v6,
             "total": len(extern),
+        },
+        "announced_addrs": {
+            "v4": av4,
+            "v6": av6,
+            "total": len(announced),
         },
         "connections": conn.get("connections", {}),
         "relay": conn.get("relay", {}),
@@ -311,20 +401,27 @@ for n in per_node[1:]:
 any_relay = any(n.get("relay", {}).get("is_relaying") for n in per_node)
 any_v4 = any(n["external_addrs"]["v4"] for n in per_node)
 any_v6 = any(n["external_addrs"]["v6"] for n in per_node)
+any_announced_v4 = any(n["announced_addrs"]["v4"] for n in per_node)
+any_announced_v6 = any(n["announced_addrs"]["v6"] for n in per_node)
 
 report = {
     "config": {"nodes": nodes, "messages": messages},
-    "publish_elapsed_seconds": int("$pub_elapsed"),
-    "dm_ok": "$DM_OK",
-    "dm_rtt_ms": "$DM_RTT",
+    "publish_elapsed_seconds": pub_elapsed,
+    "dm_ok": dm_ok,
+    "dm_rtt_ms": dm_rtt,
     "file_transfer": {
-        "bytes": int("$FILE_SIZE"),
-        "offer_roundtrip_us": int("$ft_elapsed_us"),
-        "initial_kbps": float("$ft_kbps"),
+        "bytes": file_size,
+        "offer_roundtrip_us": ft_offer_us,
+        "complete_roundtrip_us": ft_complete_us,
+        "bytes_received": ft_recv_bytes,
+        "throughput_mbps": ft_mbps,
+        "completed": ft_complete_us > 0,
     },
     "any_relay_active": any_relay,
     "any_ipv4_external": any_v4,
     "any_ipv6_external": any_v6,
+    "any_ipv4_announced": any_announced_v4,
+    "any_ipv6_announced": any_announced_v6,
     "per_node": per_node,
     "failures": failures,
     "passed": len(failures) == 0,
