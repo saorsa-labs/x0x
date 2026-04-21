@@ -1,0 +1,20 @@
+[15:31:43] Stress config: NODES=5 MESSAGES=500 TOPIC=gossip-stress-90438
+[15:31:43] Proof dir: proofs/stress-20260421-v0182-fail-demo
+[15:31:44] Launching daemon 1 on port 12701
+[15:31:44] Launching daemon 2 on port 12702
+[15:31:44] Launching daemon 3 on port 12703
+[15:31:44] Launching daemon 4 on port 12704
+[15:31:44] Launching daemon 5 on port 12705
+[15:31:44] Waiting 30s for daemons to bind + discover each other...
+[15:32:14] Subscriptions installed; snapshotting pre-publish gossip stats
+[15:32:14] Publishing 500 messages from node 1 to topic gossip-stress-90438 (delay 30ms)
+[15:32:59] Published 500 msgs in 45s (11 msgs/s)
+[15:32:59] Sleeping 5s for delivery to drain...
+[15:33:04] node-1: publish=544 delivered=703 drops=0
+[15:33:04] node-2: publish=42 delivered=701 drops=0
+[15:33:04] node-3: publish=42 delivered=701 drops=0
+[15:33:04] node-4: publish=42 delivered=701 drops=0
+[15:33:04] node-5: publish=42 delivered=701 drops=0
+[15:33:04] Stress report → proofs/stress-20260421-v0182-fail-demo/stress-report.json
+[15:33:04] Subscriber acceptance threshold: 500 (MIN_DELIVERY_RATIO=1.0)
+[15:33:04] Cleaning up daemons...

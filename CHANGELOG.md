@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.18.2] - 2026-04-21
+
+Reviewer-flagged blocker fixes on top of 0.18.1. 0.18.0 has been yanked
+from crates.io — 0.18.1 was superseded by this release in the same day
+because of the scope of the fixes.
+
+### Fixed
+
+- **`tests/e2e_stress_gossip.sh` now actually enforces the delivery
+  claim** it documents. Previously the acceptance logic only checked
+  publisher count and pipeline drops, so the 2026-04-20 artefact
+  (`proofs/stress-20260420-085405/stress-report.json`) recorded 106 /
+  200 per subscriber and still exited 0. Added a per-subscriber
+  threshold gate (`delivered_to_subscriber >= MESSAGES *
+  MIN_DELIVERY_RATIO`), default ratio 1.0. `--min-delivery-ratio
+  <float>` flag and `MIN_DELIVERY_RATIO=<float>` env for deliberate
+  under-saturation measurement.
+- **`X0X_LOG_DIR` now tees to stdout AND the file**, as documented.
+  Previous behaviour replaced the stdout sink when the env var was
+  set. Reworked `init_logging` to compose the subscriber from two
+  `tracing_subscriber::fmt::layer()`s so each event fans out to both
+  writers while the `EnvFilter` still applies.
+- **Rust 1.95.0 MSRV pinned through the full chain.** `rust-version`
+  in `Cargo.toml` was stale at `1.75.0` while CHANGELOG already claimed
+  1.95.0. CI's `dtolnay/rust-toolchain@stable` pinned to
+  `@master` with explicit `toolchain: 1.95.0` in every job (fmt,
+  clippy, test, doc, parity).
+
+### Validation
+
+- `cargo fmt --check`: clean
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean
+- `cargo nextest run --all-features --workspace`: **1006 / 1006** pass
+
+### Notes for consumers of earlier 0.18
+
+`0.18.0` has been **yanked** — it shipped with ant-quic 0.27.2 and
+missed the supersede-race fix in ant-quic 0.27.3 that directly affects
+`/peers/events` accuracy. `0.18.1` pairs with ant-quic 0.27.3 and
+saorsa-gossip 0.5.19. `0.18.2` is functionally identical to 0.18.1
+at runtime — the changes are to the test harness acceptance gate,
+the logging topology, and the toolchain metadata. Upgrade `0.18.0 →
+0.18.2` directly; `0.18.1 → 0.18.2` is safe but strictly cosmetic at
+runtime.
+
 ## [v0.18.1] - 2026-04-21
 
 ### Changed

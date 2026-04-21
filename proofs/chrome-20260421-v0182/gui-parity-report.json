@@ -1,0 +1,71 @@
+{
+  "run_started_at": "2026-04-21T15:33:56.593Z",
+  "gui_url": "http://127.0.0.1:12717/gui",
+  "gui_path": null,
+  "api_base": "http://127.0.0.1:12717",
+  "capabilities": {
+    "daemon-health": {
+      "status": "pass",
+      "result": {
+        "ok": true,
+        "status": "healthy",
+        "version": "0.18.2",
+        "peers": 6,
+        "uptime_secs": 14
+      }
+    },
+    "agent-card": {
+      "status": "pass"
+    },
+    "presence-online": {
+      "status": "pass"
+    },
+    "diagnostics-connectivity": {
+      "status": "pass"
+    },
+    "diagnostics-gossip": {
+      "status": "pass"
+    },
+    "groups-discover": {
+      "status": "pass"
+    },
+    "stores-list": {
+      "status": "pass"
+    },
+    "contacts-list": {
+      "status": "pass"
+    },
+    "peer-health-self": {
+      "status": 200
+    },
+    "peer-probe-400-on-bad-hex": {
+      "status": 400
+    },
+    "peer-probe-503-on-unknown": {
+      "status": 503
+    },
+    "peers-events-sse": {
+      "status": "pass"
+    },
+    "pubsub-roundtrip": {
+      "status": "pass",
+      "stats": {
+        "decode_to_delivery_drops": 0,
+        "delivered_to_subscriber": 9,
+        "in_flight_decode": 0,
+        "incoming_decode_failed": 0,
+        "incoming_decoded": 9,
+        "incoming_total": 9,
+        "publish_failed": 0,
+        "publish_total": 10,
+        "subscriber_channel_closed": 0
+      }
+    }
+  },
+  "totals": {
+    "pass": 13,
+    "fail": 0,
+    "skip": 0
+  },
+  "run_completed_at": "2026-04-21T15:34:00.836Z"
+}

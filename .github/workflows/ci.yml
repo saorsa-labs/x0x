@@ -17,9 +17,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.95.0
           components: rustfmt
 
       - name: Check formatting
@@ -31,9 +32,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.95.0
           components: clippy
 
       - name: Cache cargo registry
@@ -69,8 +71,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -115,8 +119,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -167,8 +173,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
 
       - name: Cache cargo registry
         uses: actions/cache@v5

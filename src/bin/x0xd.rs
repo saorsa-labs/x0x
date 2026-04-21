@@ -8715,7 +8715,7 @@ async fn import_group_card(
         if existing
             .genesis
             .as_ref()
-            .map_or(true, |genesis| genesis.group_id != group_id)
+            .is_none_or(|genesis| genesis.group_id != group_id)
         {
             existing.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
                 group_id.clone(),
@@ -11387,26 +11387,48 @@ fn init_logging(level: &str, format: &str) -> Result<()> {
 
     let file_path_for_log = file_writer.as_ref().map(|(p, _)| p.display().to_string());
 
-    if let Some((_, f)) = file_writer {
+    // Compose the subscriber so stdout ALWAYS receives events; the optional
+    // file sink is installed as a second fmt layer so it tees rather than
+    // replaces stdout. tracing-subscriber's layered Registry guarantees each
+    // layer gets every event that matches `filter`.
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let stdout_layer: Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static> =
         if format == "json" {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::sync::Mutex::new(f))
-                .json()
-                .init();
+            Box::new(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(std::io::stdout),
+            )
         } else {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::sync::Mutex::new(f))
-                .init();
-        }
-    } else if format == "json" {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .init();
+            Box::new(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        };
+
+    let file_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
+        match file_writer {
+            Some((_, f)) => {
+                let writer = std::sync::Mutex::new(f);
+                if format == "json" {
+                    Some(Box::new(
+                        tracing_subscriber::fmt::layer().json().with_writer(writer),
+                    ))
+                } else {
+                    Some(Box::new(
+                        tracing_subscriber::fmt::layer().with_writer(writer),
+                    ))
+                }
+            }
+            None => None,
+        };
+
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(stdout_layer);
+    if let Some(layer) = file_layer {
+        registry.with(layer).init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        registry.init();
     }
 
     if let Some(path) = file_path_for_log.as_deref() {

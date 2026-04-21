@@ -1,8 +1,8 @@
 [package]
 name = "x0x"
-version = "0.18.1"
+version = "0.18.2"
 edition = "2021"
-rust-version = "1.75.0"
+rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
 description = "Agent-to-agent gossip network for AI systems — no winners, no losers, just cooperation"
 repository = "https://github.com/saorsa-labs/x0x"

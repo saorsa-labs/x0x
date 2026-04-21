@@ -16,6 +16,10 @@ NODES=3
 MESSAGES=1000
 TOPIC="gossip-stress-$$"
 PROOF_DIR=""
+# Minimum per-subscriber delivery fraction (0.0 - 1.0). Default 1.0 = every
+# subscriber must deliver >= MESSAGES. Relax only when you are deliberately
+# measuring under-saturation (e.g. deliberate overload).
+MIN_DELIVERY_RATIO="${MIN_DELIVERY_RATIO:-1.0}"
 
 while (( "$#" )); do
     case "$1" in
@@ -23,6 +27,7 @@ while (( "$#" )); do
         --messages) MESSAGES="$2"; shift 2 ;;
         --topic) TOPIC="$2"; shift 2 ;;
         --proof-dir) PROOF_DIR="$2"; shift 2 ;;
+        --min-delivery-ratio) MIN_DELIVERY_RATIO="$2"; shift 2 ;;
         *) echo "unknown arg: $1"; exit 2 ;;
     esac
 done
@@ -175,14 +180,35 @@ done
 
 log "Stress report → $REPORT"
 
-# Acceptance: publisher node published ≥ MESSAGES, subscriber nodes each
-# delivered ≥ MESSAGES, zero decode→delivery drops anywhere.
+# Acceptance gates:
+#   1. Publisher `publish_total` >= MESSAGES.
+#   2. Every subscriber's `delivered_to_subscriber` >= MESSAGES * MIN_DELIVERY_RATIO.
+#   3. `decode_to_delivery_drops` == 0 on every node (pipeline integrity).
+#
+# MIN_DELIVERY_RATIO defaults to 1.0 so runs that fail end-to-end delivery
+# surface as failures, not silent under-delivery like earlier proof
+# artefacts (e.g. proofs/stress-20260420-085405/stress-report.json where
+# subscribers only delivered 106/200 yet the run exited 0).
 PUB1=${POST_PUB[0]}
 FAIL=0
 if (( PUB1 < MESSAGES )); then
     log "FAIL: publisher only recorded $PUB1 of $MESSAGES publishes"
     FAIL=1
 fi
+# Subscriber-side threshold: every NON-publisher node must deliver
+# MESSAGES * MIN_DELIVERY_RATIO (integer floor). The publisher's own
+# `delivered_to_subscriber` includes self-subscription echo + internal
+# traffic and is not held to this bar.
+THRESHOLD=$(awk -v m="$MESSAGES" -v r="$MIN_DELIVERY_RATIO" \
+    'BEGIN { printf "%d\n", int(m * r) }')
+log "Subscriber acceptance threshold: $THRESHOLD (MIN_DELIVERY_RATIO=$MIN_DELIVERY_RATIO)"
+for i in $(seq 2 "$NODES"); do
+    DEL="${POST_DELIV[$((i - 1))]}"
+    if (( DEL < THRESHOLD )); then
+        log "FAIL: node-$i delivered $DEL < $THRESHOLD (target $MESSAGES)"
+        FAIL=1
+    fi
+done
 for i in $(seq 1 "$NODES"); do
     if [ "${POST_DROPS[$((i - 1))]}" != "0" ]; then
         log "FAIL: node-$i reports ${POST_DROPS[$((i - 1))]} decode→delivery drops"
