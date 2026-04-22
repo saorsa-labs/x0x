@@ -1,0 +1,15 @@
+[21:49:15] Config: NODES=2 MESSAGES=20 FILE_SIZE_KIB=1024 USE_HARD_CODED_BOOTSTRAP=1 TOPIC=measure-25092 PROOF_DIR=proofs/full-20260421-v0185-live-bootstrap-local2
+[21:49:15] Launching daemon 1 on API port 12801
+[21:49:15] Launching daemon 2 on API port 12802
+[21:49:15] Waiting 30s for daemons to bind + discover each other...
+[21:49:45] Snapshot: pre
+[21:49:45] Installing subscriptions on every node...
+[21:49:45] Publishing 20 pub/sub messages from node 1 (no delay)
+[21:49:46] Published 20 msgs in 1s
+[21:49:51] Snapshot: mid
+[21:49:51] DM round-trip from node-1 → node-2 with require_ack_ms=2000
+[21:49:51] DM send: ok=fail rtt_ms=-1
+[21:49:51] Probing every pair's peer liveness (ant-quic probe_peer)...
+[21:49:53] Probe matrix → proofs/full-20260421-v0185-live-bootstrap-local2/probe-matrix.json
+[21:49:53] File transfer: 1048576 bytes (node-1 → node-2)
+[21:49:53] Cleaning up daemons...

@@ -23,6 +23,8 @@ set -euo pipefail
 
 NODES="${NODES:-5}"
 MESSAGES="${MESSAGES:-500}"
+FILE_SIZE_KIB="${FILE_SIZE_KIB:-256}"
+USE_HARD_CODED_BOOTSTRAP="${USE_HARD_CODED_BOOTSTRAP:-0}"
 TOPIC="measure-$$"
 PROOF_DIR=""
 # Bind prefer — "v4" = 127.0.0.1, "v6" = ::1, "dual" = ::. We rotate across
@@ -37,6 +39,8 @@ while (( "$#" )); do
         --messages) MESSAGES="$2"; shift 2 ;;
         --proof-dir) PROOF_DIR="$2"; shift 2 ;;
         --topic) TOPIC="$2"; shift 2 ;;
+        --file-size-kib) FILE_SIZE_KIB="$2"; shift 2 ;;
+        --use-hard-coded-bootstrap) USE_HARD_CODED_BOOTSTRAP=1; shift ;;
         --bind-prefer) BIND_PREFER="$2"; shift 2 ;;
         *) echo "unknown arg: $1"; exit 2 ;;
     esac
@@ -46,10 +50,12 @@ done
 mkdir -p "$PROOF_DIR/logs"
 LOG="$PROOF_DIR/measure.log"
 REPORT="$PROOF_DIR/measure-report.json"
+TEST_RUST_LOG="${TEST_RUST_LOG:-${RUST_LOG:-info,x0x::connect=debug,x0x::discovery=debug,ant_quic::nat_traversal_api=info,ant_quic::masque=info}}"
 
 log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
-log "Config: NODES=$NODES MESSAGES=$MESSAGES TOPIC=$TOPIC PROOF_DIR=$PROOF_DIR"
+log "Config: NODES=$NODES MESSAGES=$MESSAGES FILE_SIZE_KIB=$FILE_SIZE_KIB USE_HARD_CODED_BOOTSTRAP=$USE_HARD_CODED_BOOTSTRAP TOPIC=$TOPIC PROOF_DIR=$PROOF_DIR"
+log "Logging: TEST_RUST_LOG=$TEST_RUST_LOG"
 
 BIN="${X0XD_BIN:-target/debug/x0xd}"
 CLI="${X0X_BIN:-target/debug/x0x}"
@@ -76,8 +82,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Launch daemons with rotating bind preference. All use --no-hard-coded-bootstrap
-# so cross-traffic to the live global mesh doesn't pollute the counters.
+# Launch daemons. By default we disable the hard-coded bootstrap set so
+# cross-traffic to the live global mesh does not pollute local-only proofs.
+# For live NAT / relay runs, pass --use-hard-coded-bootstrap or
+# USE_HARD_CODED_BOOTSTRAP=1.
 for i in $(seq 1 "$NODES"); do
     INSTANCE="measure-$i"
     PORT=$((12800 + i))
@@ -86,18 +94,24 @@ for i in $(seq 1 "$NODES"); do
 
     export X0X_LOG_DIR="$LOG_DIR"
     export X0X_LOG_FORMAT="json"
+    export RUST_LOG="$TEST_RUST_LOG"
 
     log "Launching daemon $i on API port $PORT"
+    DAEMON_ARGS=(
+        --name "$INSTANCE"
+        --api-port "$PORT"
+    )
+    if [ "$USE_HARD_CODED_BOOTSTRAP" != "1" ]; then
+        DAEMON_ARGS+=(--no-hard-coded-bootstrap)
+    fi
     "$BIN" \
-        --name "$INSTANCE" \
-        --api-port "$PORT" \
-        --no-hard-coded-bootstrap \
+        "${DAEMON_ARGS[@]}" \
         > "$LOG_DIR/stdout.log" \
         2> "$LOG_DIR/stderr.log" &
     PIDS+=($!)
     PORTS+=("$PORT")
 done
-unset X0X_LOG_DIR X0X_LOG_FORMAT
+unset X0X_LOG_DIR X0X_LOG_FORMAT RUST_LOG
 
 SETTLE_SECS="${SETTLE_SECS:-20}"
 log "Waiting ${SETTLE_SECS}s for daemons to bind + discover each other..."
@@ -208,7 +222,7 @@ log "Probe matrix → $PROOF_DIR/probe-matrix.json"
 # --- Phase 5: data transfer (file send) ---------------------------------
 
 FILE="$PROOF_DIR/test-payload.bin"
-dd if=/dev/urandom of="$FILE" bs=1024 count=256 2>/dev/null
+dd if=/dev/urandom of="$FILE" bs=1024 count="$FILE_SIZE_KIB" 2>/dev/null
 FILE_SIZE=$(stat -f%z "$FILE" 2>/dev/null || stat -c%s "$FILE")
 log "File transfer: ${FILE_SIZE} bytes (node-1 → node-2)"
 
@@ -222,37 +236,44 @@ echo "$FT_RESP" > "$PROOF_DIR/logs/node-1/send-file.txt"
 
 # Extract transfer_id from `x0x send-file` output so we can poll status
 # on both sides and wait for Completed.
-TRANSFER_ID=$(echo "$FT_RESP" | grep -oE '[0-9a-f]{32}|[0-9a-f-]{36}' | head -1)
+TRANSFER_ID=$(echo "$FT_RESP" | grep -oE '[0-9a-f]{32}|[0-9a-f-]{36}' | head -1 || true)
 log "File transfer offer sent (id=${TRANSFER_ID:-unknown}) in ${ft_offer_us}us"
 
-# Auto-accept on the receiver (node-2).
-if [ -n "$TRANSFER_ID" ]; then
-    api 2 POST "/files/accept/$TRANSFER_ID" > "$PROOF_DIR/logs/node-2/accept.json" || true
-fi
-
-# Poll both sides for Completed. 60 s hard cap.
+# Auto-accept on the receiver (node-2) and poll both sides for completion.
 ft_complete_us="-1"
 ft_recv_bytes=0
-for _ in $(seq 1 60); do
-    sleep 1
-    S1=$(api 1 GET "/files/transfers/$TRANSFER_ID" 2>/dev/null || echo '{}')
-    S2=$(api 2 GET "/files/transfers/$TRANSFER_ID" 2>/dev/null || echo '{}')
-    ST1=$(echo "$S1" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('status','?'))" 2>/dev/null || echo "?")
-    ST2=$(echo "$S2" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('status','?'))" 2>/dev/null || echo "?")
-    BY2=$(echo "$S2" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('bytes_transferred',0))" 2>/dev/null || echo 0)
-    if [ "$ST1" = "Complete" ] && [ "$ST2" = "Complete" ]; then
-        ft_complete_us=$(($(python3 -c "import time; print(int(time.time()*1_000_000))") - ft_start_us))
-        ft_recv_bytes=$BY2
-        log "File transfer completed: ${ft_recv_bytes} bytes in ${ft_complete_us}us"
-        break
-    fi
-    if [ "$ST1" = "Failed" ] || [ "$ST2" = "Failed" ]; then
-        log "File transfer FAILED: send=$ST1 recv=$ST2"
-        break
-    fi
-done
+if [ -n "$TRANSFER_ID" ]; then
+    api 2 POST "/files/accept/$TRANSFER_ID" > "$PROOF_DIR/logs/node-2/accept.json" || true
 
-if [ "$ft_complete_us" != "-1" ]; then
+    for _ in $(seq 1 60); do
+        sleep 1
+        S1=$(api 1 GET "/files/transfers/$TRANSFER_ID" 2>/dev/null || echo '{}')
+        S2=$(api 2 GET "/files/transfers/$TRANSFER_ID" 2>/dev/null || echo '{}')
+        ST1=$(echo "$S1" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('status','?'))" 2>/dev/null || echo "?")
+        ST2=$(echo "$S2" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('status','?'))" 2>/dev/null || echo "?")
+        BY2=$(echo "$S2" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('bytes_transferred',0))" 2>/dev/null || echo 0)
+        if [ "$ST1" = "Complete" ] && [ "$ST2" = "Complete" ]; then
+            START_MS=$(echo "$S1" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('started_at_unix_ms', 0))" 2>/dev/null || echo 0)
+            DONE_MS=$(echo "$S1" | python3 -c "import sys,json; d=json.load(sys.stdin).get('transfer') or {}; print(d.get('completed_at_unix_ms', 0) or 0)" 2>/dev/null || echo 0)
+            if [ "$START_MS" -gt 0 ] && [ "$DONE_MS" -ge "$START_MS" ]; then
+                ft_complete_us=$(((DONE_MS - START_MS) * 1000))
+            else
+                ft_complete_us=$(($(python3 -c "import time; print(int(time.time()*1_000_000))") - ft_start_us))
+            fi
+            ft_recv_bytes=$BY2
+            log "File transfer completed: ${ft_recv_bytes} bytes in ${ft_complete_us}us"
+            break
+        fi
+        if [ "$ST1" = "Failed" ] || [ "$ST2" = "Failed" ]; then
+            log "File transfer FAILED: send=$ST1 recv=$ST2"
+            break
+        fi
+    done
+else
+    log "File transfer skipped: sender did not return a transfer_id"
+fi
+
+if [ "$ft_complete_us" -gt 0 ]; then
     ft_mbps=$(awk -v b="$FILE_SIZE" -v us="$ft_complete_us" \
         'BEGIN { printf "%.2f", (b * 8 / 1000000.0) / (us / 1000000.0) }')
 else
@@ -273,6 +294,8 @@ cat > "$PROOF_DIR/_args.json" <<JSON
   "proof_dir": "$PROOF_DIR",
   "nodes": $NODES,
   "messages": $MESSAGES,
+  "file_size_kib": $FILE_SIZE_KIB,
+  "use_hard_coded_bootstrap": $USE_HARD_CODED_BOOTSTRAP,
   "pub_elapsed": $pub_elapsed,
   "dm_ok": "$DM_OK",
   "dm_rtt": "$DM_RTT",
@@ -291,6 +314,8 @@ args = json.load(open(sys.argv[1]))
 proof = pathlib.Path(args["proof_dir"])
 nodes = args["nodes"]
 messages = args["messages"]
+file_size_kib = args["file_size_kib"]
+use_hard_coded_bootstrap = bool(args["use_hard_coded_bootstrap"])
 pub_elapsed = args["pub_elapsed"]
 dm_ok = args["dm_ok"]
 dm_rtt = args["dm_rtt"]
@@ -405,7 +430,12 @@ any_announced_v4 = any(n["announced_addrs"]["v4"] for n in per_node)
 any_announced_v6 = any(n["announced_addrs"]["v6"] for n in per_node)
 
 report = {
-    "config": {"nodes": nodes, "messages": messages},
+    "config": {
+        "nodes": nodes,
+        "messages": messages,
+        "file_size_kib": file_size_kib,
+        "use_hard_coded_bootstrap": use_hard_coded_bootstrap,
+    },
     "publish_elapsed_seconds": pub_elapsed,
     "dm_ok": dm_ok,
     "dm_rtt_ms": dm_rtt,

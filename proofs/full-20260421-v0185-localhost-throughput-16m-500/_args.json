@@ -1,0 +1,14 @@
+{
+  "proof_dir": "proofs/full-20260421-v0185-localhost-throughput-16m-500",
+  "nodes": 5,
+  "messages": 500,
+  "file_size_kib": 16384,
+  "pub_elapsed": 18,
+  "dm_ok": "ok",
+  "dm_rtt": "0",
+  "file_size": 16777216,
+  "ft_offer_us": 723046,
+  "ft_complete_us": 1214000,
+  "ft_recv_bytes": 16777216,
+  "ft_mbps": 110.56
+}

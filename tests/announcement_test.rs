@@ -6,7 +6,9 @@
 //! deserialised, and verified — including the NAT fields added in Phase 1.3.
 
 use tempfile::TempDir;
-use x0x::{network::NetworkConfig, Agent, DiscoveredAgent, IdentityAnnouncement};
+use x0x::{
+    network::NetworkConfig, Agent, DiscoveredAgent, IdentityAnnouncement, MachineAnnouncement,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -319,4 +321,80 @@ async fn self_announcement_populates_discovery_cache() {
         discovered.iter().any(|a| a.agent_id == agent.agent_id()),
         "own agent should appear in discovery cache after announcing"
     );
+}
+
+#[tokio::test]
+async fn machine_announcement_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let agent = build_agent(&dir).await;
+
+    let ann = agent.build_machine_announcement().unwrap();
+    let bytes = bincode::serialize(&ann).unwrap();
+    let decoded: MachineAnnouncement = bincode::deserialize(&bytes).unwrap();
+
+    assert_eq!(decoded.machine_id, agent.machine_id());
+    assert!(decoded.nat_type.is_none());
+    assert!(decoded.can_receive_direct.is_none());
+    assert!(decoded.is_relay.is_none());
+    assert!(decoded.is_coordinator.is_none());
+    decoded
+        .verify()
+        .expect("decoded machine announcement should verify");
+}
+
+#[tokio::test]
+async fn self_announcement_populates_machine_cache() {
+    let dir = TempDir::new().unwrap();
+    let agent = Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_network_config(NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            bootstrap_nodes: vec![],
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+
+    agent.announce_identity(false, false).await.unwrap();
+
+    let machines = agent.discovered_machines().await.unwrap();
+    let found = machines
+        .iter()
+        .find(|machine| machine.machine_id == agent.machine_id())
+        .expect("own machine should appear in machine cache");
+    assert!(found.agent_ids.contains(&agent.agent_id()));
+}
+
+#[tokio::test]
+async fn user_and_agent_link_to_discovered_machine() {
+    let dir = TempDir::new().unwrap();
+    let user_kp = x0x::identity::UserKeypair::generate().unwrap();
+    let user_id = user_kp.user_id();
+    let agent = Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_user_key(user_kp)
+        .with_network_config(NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            bootstrap_nodes: vec![],
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+
+    agent.announce_identity(true, true).await.unwrap();
+
+    let machine = agent
+        .discovered_machine(agent.machine_id())
+        .await
+        .unwrap()
+        .expect("own machine should be discoverable");
+    assert!(machine.agent_ids.contains(&agent.agent_id()));
+    assert!(machine.user_ids.contains(&user_id));
+
+    let by_user = agent.find_machines_by_user(user_id).await.unwrap();
+    assert!(by_user.iter().any(|m| m.machine_id == agent.machine_id()));
 }

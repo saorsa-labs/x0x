@@ -8,7 +8,7 @@
 //! 2. **Coordinated** — hole-punching via a common coordinator node.
 //! 3. **Unreachable** — no viable path found with current information.
 
-use crate::DiscoveredAgent;
+use crate::{DiscoveredAgent, DiscoveredMachine};
 
 /// Summarises the connectivity properties of a discovered agent.
 ///
@@ -27,10 +27,10 @@ pub struct ReachabilityInfo {
     /// Whether the agent can receive direct inbound connections.
     /// `None` when not reported.
     pub can_receive_direct: Option<bool>,
-    /// Whether the agent is acting as a relay for peers behind strict NATs.
+    /// Whether the agent advertises relay service capability.
     /// `None` when not reported.
     pub is_relay: Option<bool>,
-    /// Whether the agent is coordinating NAT traversal timing for peers.
+    /// Whether the agent advertises coordinator capability.
     /// `None` when not reported.
     pub is_coordinator: Option<bool>,
 }
@@ -45,6 +45,18 @@ impl ReachabilityInfo {
             can_receive_direct: agent.can_receive_direct,
             is_relay: agent.is_relay,
             is_coordinator: agent.is_coordinator,
+        }
+    }
+
+    /// Build from a [`DiscoveredMachine`].
+    #[must_use]
+    pub fn from_discovered_machine(machine: &DiscoveredMachine) -> Self {
+        Self {
+            addresses: machine.addresses.clone(),
+            nat_type: machine.nat_type.clone(),
+            can_receive_direct: machine.can_receive_direct,
+            is_relay: machine.is_relay,
+            is_coordinator: machine.is_coordinator,
         }
     }
 
@@ -72,13 +84,13 @@ impl ReachabilityInfo {
         !self.addresses.is_empty() && self.can_receive_direct != Some(true)
     }
 
-    /// Returns `true` if the agent is acting as a relay node.
+    /// Returns `true` if the agent advertises relay service capability.
     #[must_use]
     pub fn is_relay(&self) -> bool {
         self.is_relay.unwrap_or(false)
     }
 
-    /// Returns `true` if the agent can coordinate NAT traversal for others.
+    /// Returns `true` if the agent advertises coordinator capability.
     #[must_use]
     pub fn is_coordinator(&self) -> bool {
         self.is_coordinator.unwrap_or(false)

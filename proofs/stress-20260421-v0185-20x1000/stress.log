@@ -1,0 +1,58 @@
+[21:52:27] Stress config: NODES=20 MESSAGES=1000 TOPIC=gossip-stress-26980
+[21:52:27] Proof dir: proofs/stress-20260421-v0185-20x1000
+[21:52:27] Launching daemon 1 on port 12701
+[21:52:27] Launching daemon 2 on port 12702
+[21:52:27] Launching daemon 3 on port 12703
+[21:52:27] Launching daemon 4 on port 12704
+[21:52:27] Launching daemon 5 on port 12705
+[21:52:27] Launching daemon 6 on port 12706
+[21:52:27] Launching daemon 7 on port 12707
+[21:52:27] Launching daemon 8 on port 12708
+[21:52:27] Launching daemon 9 on port 12709
+[21:52:27] Launching daemon 10 on port 12710
+[21:52:27] Launching daemon 11 on port 12711
+[21:52:27] Launching daemon 12 on port 12712
+[21:52:27] Launching daemon 13 on port 12713
+[21:52:27] Launching daemon 14 on port 12714
+[21:52:27] Launching daemon 15 on port 12715
+[21:52:27] Launching daemon 16 on port 12716
+[21:52:27] Launching daemon 17 on port 12717
+[21:52:27] Launching daemon 18 on port 12718
+[21:52:27] Launching daemon 19 on port 12719
+[21:52:27] Launching daemon 20 on port 12720
+[21:52:27] Waiting 20s for daemons to bind + discover each other...
+[21:52:49] Subscriptions installed; snapshotting pre-publish gossip stats
+[21:52:50] Publishing 1000 messages from node 1 to topic gossip-stress-26980 (delay 0ms)
+[21:54:51] Published 1000 msgs in 121s (8 msgs/s)
+[21:54:51] Sleeping 5s for delivery to drain...
+[21:54:56] node-1: publish=1136 delivered=1961 drops=0
+[21:54:56] node-2: publish=135 delivered=991 drops=0
+[21:54:56] node-3: publish=136 delivered=1003 drops=0
+[21:54:56] node-4: publish=139 delivered=1020 drops=0
+[21:54:56] node-5: publish=146 delivered=1024 drops=0
+[21:54:56] node-6: publish=138 delivered=999 drops=0
+[21:54:56] node-7: publish=137 delivered=1002 drops=0
+[21:54:56] node-8: publish=139 delivered=1004 drops=0
+[21:54:56] node-9: publish=139 delivered=1047 drops=0
+[21:54:56] node-10: publish=139 delivered=1076 drops=0
+[21:54:56] node-11: publish=139 delivered=992 drops=0
+[21:54:56] node-12: publish=135 delivered=999 drops=0
+[21:54:56] node-13: publish=139 delivered=1003 drops=0
+[21:54:56] node-14: publish=135 delivered=990 drops=0
+[21:54:56] node-15: publish=138 delivered=1021 drops=0
+[21:54:56] node-16: publish=145 delivered=1153 drops=0
+[21:54:56] node-17: publish=137 delivered=1018 drops=0
+[21:54:56] node-18: publish=136 delivered=993 drops=0
+[21:54:56] node-19: publish=137 delivered=999 drops=0
+[21:54:56] node-20: publish=138 delivered=988 drops=0
+[21:54:56] Stress report → proofs/stress-20260421-v0185-20x1000/stress-report.json
+[21:54:56] Subscriber acceptance threshold: 1000 (MIN_DELIVERY_RATIO=1.0)
+[21:54:56] FAIL: node-2 delivered 991 < 1000 (target 1000)
+[21:54:56] FAIL: node-6 delivered 999 < 1000 (target 1000)
+[21:54:56] FAIL: node-11 delivered 992 < 1000 (target 1000)
+[21:54:56] FAIL: node-12 delivered 999 < 1000 (target 1000)
+[21:54:56] FAIL: node-14 delivered 990 < 1000 (target 1000)
+[21:54:56] FAIL: node-18 delivered 993 < 1000 (target 1000)
+[21:54:56] FAIL: node-19 delivered 999 < 1000 (target 1000)
+[21:54:56] FAIL: node-20 delivered 988 < 1000 (target 1000)
+[21:54:56] Cleaning up daemons...

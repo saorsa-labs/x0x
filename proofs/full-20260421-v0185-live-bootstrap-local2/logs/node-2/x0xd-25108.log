@@ -1,0 +1,296 @@
+[2m2026-04-21T21:49:15.682530Z[0m [32m INFO[0m [2mx0x::startup[0m[2m:[0m tracing subscriber initialised (file sink active) [3msource[0m[2m=[0mconfig log_level=info [3mlog_file[0m[2m=[0mproofs/full-20260421-v0185-live-bootstrap-local2/logs/node-2/x0xd-25108.log
+[2m2026-04-21T21:49:15.682653Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m x0xd started [3mversion[0m[2m=[0m0.18.4 [3mbinary[0m[2m=[0m"x0xd" [3mpid[0m[2m=[0m25108
+[2m2026-04-21T21:49:15.891191Z[0m [33m WARN[0m [2mx0xd[0m[2m:[0m Startup update check failed: failed to fetch manifest: GitHub API error: HTTP status client error (403 rate limit exceeded) for url (https://api.github.com/repos/saorsa-labs/x0x/releases/latest) [3merror[0m[2m=[0mfailed to fetch manifest: GitHub API error: HTTP status client error (403 rate limit exceeded) for url (https://api.github.com/repos/saorsa-labs/x0x/releases/latest)
+[2m2026-04-21T21:49:15.891278Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m Starting x0xd v0.18.4
+[2m2026-04-21T21:49:15.891324Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m Instance name: measure-2
+[2m2026-04-21T21:49:15.891379Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m API address: 127.0.0.1:12802
+[2m2026-04-21T21:49:15.891428Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m Bind address: [::]:0
+[2m2026-04-21T21:49:15.891594Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m Identity directory: /Users/davidirvine/.x0x-measure-2
+[2m2026-04-21T21:49:15.894345Z[0m [32m INFO[0m [2mant_quic::bootstrap_cache::cache[0m[2m:[0m Opened bootstrap cache with 0 peers
+[2m2026-04-21T21:49:15.894760Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Creating P2P endpoint with peer ID: PeerId([137, 165, 124, 32, 217, 194, 50, 44, 93, 113, 169, 63, 134, 237, 237, 97, 210, 156, 228, 97, 194, 238, 98, 181, 223, 89, 126, 90, 29, 220, 214, 195])
+[2m2026-04-21T21:49:15.895010Z[0m [32m INFO[0m [2mant_quic::bootstrap_cache::cache[0m[2m:[0m Opened bootstrap cache with 0 peers
+[2m2026-04-21T21:49:15.895401Z[0m [32m INFO[0m [2mant_quic::high_level::runtime::dual_stack[0m[2m:[0m Dual-stack sockets: IPv4=0.0.0.0:58941, IPv6=[::]:58941
+[2m2026-04-21T21:49:15.895549Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Bound dual-socket: IPv4=0.0.0.0:58941, IPv6=[::]:58941 (true dual-stack, separate sockets)
+[2m2026-04-21T21:49:15.896081Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Endpoint bound to actual address: [::]:58941
+[2m2026-04-21T21:49:15.896163Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Added dual-stack address 0.0.0.0:58941 to discovery candidates
+[2m2026-04-21T21:49:15.896203Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Updated discovery manager with bound address: [::]:58941 (+1 additional)
+[2m2026-04-21T21:49:15.896343Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Created MASQUE relay server on [::]:58941 (symmetric P2P node)
+[2m2026-04-21T21:49:15.896594Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Started accepting connections (symmetric P2P node)
+[2m2026-04-21T21:49:15.896660Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Started discovery/orchestration task
+[2m2026-04-21T21:49:15.896714Z[0m [32m INFO[0m [2mant_quic::candidate_discovery[0m[2m:[0m Starting candidate discovery for peer PeerId([40, 95, 110, 60, 219, 33, 110, 133, 182, 252, 54, 105, 250, 248, 76, 92, 29, 234, 180, 189, 16, 108, 199, 140, 141, 128, 178, 194, 115, 228, 142, 5])
+[2m2026-04-21T21:49:15.896779Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Started local candidate discovery for peer PeerId([40, 95, 110, 60, 219, 33, 110, 133, 182, 252, 54, 105, 250, 248, 76, 92, 29, 234, 180, 189, 16, 108, 199, 140, 141, 128, 178, 194, 115, 228, 142, 5])
+[2m2026-04-21T21:49:15.897166Z[0m [32m INFO[0m [2mant_quic::node[0m[2m:[0m Node created with peer ID: PeerId([137, 165, 124, 32, 217, 194, 50, 44, 93, 113, 169, 63, 134, 237, 237, 97, 210, 156, 228, 97, 194, 238, 98, 181, 223, 89, 126, 90, 29, 220, 214, 195])
+[2m2026-04-21T21:49:15.900991Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m126 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m128
+[2m2026-04-21T21:49:15.909897Z[0m [32m INFO[0m [2mant_quic::candidate_discovery::macos[0m[2m:[0m Network interface scan completed successfully
+[2m2026-04-21T21:49:15.926103Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m Agent ID: AgentId(0x6d7c3c7b48c8e138)
+[2m2026-04-21T21:49:15.926123Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m Machine ID: MachineId(0x89a57c20d9c2322c)
+[2m2026-04-21T21:49:15.926152Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m Contact store loaded from /Users/davidirvine/Library/Application Support/x0x-measure-2/contacts.json
+[2m2026-04-21T21:49:15.926255Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m No named groups file found, starting fresh
+[2m2026-04-21T21:49:15.926371Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m API token loaded from /Users/davidirvine/Library/Application Support/x0x-measure-2/api-token
+[2m2026-04-21T21:49:15.926703Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m agent KEM-768 public key loaded (1184 bytes)
+[2m2026-04-21T21:49:15.926814Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m P0-1: global group discovery listener subscribed [3mtopic[0m[2m=[0m"x0x.discovery.groups"
+[2m2026-04-21T21:49:15.926933Z[0m [32m INFO[0m [2mx0x[0m[2m:[0m Gossip runtime started
+[2m2026-04-21T21:49:15.927203Z[0m [32m INFO[0m [2mx0x[0m[2m:[0m Network event reconciliation listener started
+[2m2026-04-21T21:49:15.927224Z[0m [32m INFO[0m [2mx0x::direct[0m[2m:[0m direct message listener started [3mstage[0m[2m=[0m"listener"
+[2m2026-04-21T21:49:15.927440Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2401:c080:1000:4c32:5400:5ff:fed9:9737]:5483) (PeerId: None)
+[2m2026-04-21T21:49:15.927508Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(147.182.234.192:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:15.927495Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2a01:4f9:c012:684b::1]:5483) (PeerId: None)
+[2m2026-04-21T21:49:15.927514Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927552Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(65.21.157.229:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:15.927565Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2604:a880:4:1d0:0:1:6ba1:f000]:5483) (PeerId: None)
+[2m2026-04-21T21:49:15.927535Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2604:a880:400:d1:0:3:7db3:f001]:5483) (PeerId: None)
+[2m2026-04-21T21:49:15.927588Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(142.93.199.50:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:15.927597Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927576Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(116.203.101.172:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:15.927630Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927636Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927614Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2a01:4f8:1c1a:31e6::1]:5483) (PeerId: None)
+[2m2026-04-21T21:49:15.927657Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927689Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927701Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927707Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2001:19f0:4401:346:5400:5ff:fed9:9735]:5483) (PeerId: None)
+[2m2026-04-21T21:49:15.927679Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927724Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(45.77.176.184:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:15.927736Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927749Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(149.28.156.231:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:15.927767Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927781Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.927797Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:15.928343Z[0m [32m INFO[0m [2mx0xd[0m[2m:[0m API server listening on 127.0.0.1:12802 (port file: /Users/davidirvine/Library/Application Support/x0x-measure-2/api.port)
+[2m2026-04-21T21:49:16.695393Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(192.168.1.212:60149), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:16.695474Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:16.735386Z[0m [32m INFO[0m [2mant_quic::crypto::raw_public_keys[0m[2m:[0m Accepting any ML-DSA-65 public key (development mode)
+[2m2026-04-21T21:49:16.763115Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Both peers support NAT traversal, negotiating capabilities
+[2m2026-04-21T21:49:16.763134Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m NAT traversal capability negotiated successfully
+[2m2026-04-21T21:49:16.763145Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m NAT traversal capability successfully negotiated
+[2m2026-04-21T21:49:16.763168Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m negotiate_address_discovery: peer_params.address_discovery = Some(SendAndReceive)
+[2m2026-04-21T21:49:16.763177Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Peer supports address discovery: SendAndReceive
+[2m2026-04-21T21:49:16.763185Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Address discovery negotiated successfully: rate=10, all_paths=false
+[2m2026-04-21T21:49:16.763232Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m handle_observed_address_frame: RECEIVED OBSERVED_ADDRESS from peer [3maddress[0m[2m=[0m[::ffff:192.168.1.212]:58941 [3msequence[0m[2m=[0m0 [3mfrom_peer[0m[2m=[0munknown
+[2m2026-04-21T21:49:16.763283Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m queue_observed_address_frame: SENDING OBSERVED_ADDRESS to [::ffff:192.168.1.212]:60149 for path 0
+[2m2026-04-21T21:49:16.763353Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m populate_packet: ENCODING OBSERVED_ADDRESS into packet [3maddress[0m[2m=[0m[::ffff:192.168.1.212]:60149 [3msequence[0m[2m=[0m0
+[2m2026-04-21T21:49:16.763499Z[0m [32m INFO[0m [2mant_quic::happy_eyeballs[0m[2m:[0m Happy Eyeballs: connection succeeded [3maddr[0m[2m=[0m192.168.1.212:60149
+[2m2026-04-21T21:49:16.763538Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: Direct IPv4 connection to 192.168.1.212:60149 succeeded
+[2m2026-04-21T21:49:16.763571Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m add_connection: peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) at [::ffff:192.168.1.212]:60149 observed_address=Some(192.168.1.212:58941)
+[2m2026-04-21T21:49:16.763628Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint::lifecycle[0m[2m:[0m connection lifecycle transition [3mpeer_id[0m[2m=[0m6a1d4f03 [3mgeneration[0m[2m=[0m1 [3mfrom_state[0m[2m=[0m"Init" [3mto_state[0m[2m=[0m"Live" [3mreason[0m[2m=[0m"None" [3mconnection_id[0m[2m=[0mc671d2d4aa4b3b06 [3mstable_id[0m[2m=[0m49775224848
+[2m2026-04-21T21:49:16.763664Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m add_connection: now have 1 live connections
+[2m2026-04-21T21:49:16.763680Z[0m [32m INFO[0m [2mant_quic::high_level::endpoint[0m[2m:[0m Registered peer ID 6a1d4f03e7f0f338 for connection 192.168.1.212:60149 at low-level endpoint
+[2m2026-04-21T21:49:16.763695Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Added bootstrap node: 192.168.1.212:60149
+[2m2026-04-21T21:49:16.763733Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Received ConnectionEstablished event for peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) at [::ffff:192.168.1.212]:60149 (side: Client)
+[2m2026-04-21T21:49:16.763789Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m External address discovered: 192.168.1.212:58941
+[2m2026-04-21T21:49:16.763802Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Sent ADD_ADDRESS to peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]): addr=192.168.1.212:58941, seq=1
+[2m2026-04-21T21:49:16.763839Z[0m [33m WARN[0m [2mant_quic::silent_drop[0m[2m:[0m silent drop [3mkind[0m[2m=[0m"peer_event_tx_lifecycle" [3mpeer_id[0m[2m=[0mPeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) [3merror[0m[2m=[0mchannel closed
+[2m2026-04-21T21:49:16.763855Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m Accepted inbound connection from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) at Udp([::ffff:192.168.1.212]:60149)
+[2m2026-04-21T21:49:16.768189Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m handle_add_address: RECEIVED ADD_ADDRESS from peer addr=192.168.1.212:60149 (normalized=192.168.1.212:60149) seq=1 priority=1694498815
+[2m2026-04-21T21:49:16.768208Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Added remote candidate: 192.168.1.212:60149 (seq=1, priority=1694498815)
+[2m2026-04-21T21:49:16.768307Z[0m [32m INFO[0m [2mant_quic::endpoint[0m[2m:[0m Peer [::ffff:192.168.1.212]:60149 advertised new address 192.168.1.212:60149
+[2m2026-04-21T21:49:16.906628Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Both peers support NAT traversal, negotiating capabilities
+[2m2026-04-21T21:49:16.906642Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m NAT traversal capability negotiated successfully
+[2m2026-04-21T21:49:16.906650Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m NAT traversal capability successfully negotiated
+[2m2026-04-21T21:49:16.906665Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m negotiate_address_discovery: peer_params.address_discovery = Some(SendAndReceive)
+[2m2026-04-21T21:49:16.906672Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Peer supports address discovery: SendAndReceive
+[2m2026-04-21T21:49:16.906692Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Address discovery negotiated successfully: rate=10, all_paths=false
+[2m2026-04-21T21:49:16.906746Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m queue_observed_address_frame: SENDING OBSERVED_ADDRESS to [::ffff:192.168.1.212]:60149 for path 0
+[2m2026-04-21T21:49:16.907643Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m populate_packet: ENCODING OBSERVED_ADDRESS into packet [3maddress[0m[2m=[0m[::ffff:192.168.1.212]:60149 [3msequence[0m[2m=[0m0
+[2m2026-04-21T21:49:16.917604Z[0m [32m INFO[0m [2mant_quic::crypto::raw_public_keys[0m[2m:[0m Accepting any ML-DSA-65 client public key (P2P mode)
+[2m2026-04-21T21:49:16.921814Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m handle_observed_address_frame: RECEIVED OBSERVED_ADDRESS from peer [3maddress[0m[2m=[0m[::ffff:192.168.1.212]:58941 [3msequence[0m[2m=[0m0 [3mfrom_peer[0m[2m=[0munknown
+[2m2026-04-21T21:49:16.921954Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Accepted connection from [::ffff:192.168.1.212]:60149
+[2m2026-04-21T21:49:16.922000Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint::lifecycle[0m[2m:[0m connection lifecycle transition [3mpeer_id[0m[2m=[0m6a1d4f03 [3mgeneration[0m[2m=[0m2 [3mfrom_state[0m[2m=[0m"Init" [3mto_state[0m[2m=[0m"Superseded" [3mreason[0m[2m=[0mSuperseded [3mconnection_id[0m[2m=[0mbd23bd576f147b23 [3mstable_id[0m[2m=[0m49775235088
+[2m2026-04-21T21:49:16.922019Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint::lifecycle[0m[2m:[0m connection lifecycle transition [3mpeer_id[0m[2m=[0m6a1d4f03 [3mgeneration[0m[2m=[0m2 [3mfrom_state[0m[2m=[0m"Superseded" [3mto_state[0m[2m=[0m"Closing" [3mreason[0m[2m=[0mSuperseded [3mconnection_id[0m[2m=[0mbd23bd576f147b23 [3mstable_id[0m[2m=[0m49775235088
+[2m2026-04-21T21:49:16.922035Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint::lifecycle[0m[2m:[0m connection lifecycle transition [3mpeer_id[0m[2m=[0m6a1d4f03 [3mgeneration[0m[2m=[0m2 [3mfrom_state[0m[2m=[0m"Closing" [3mto_state[0m[2m=[0m"Closed" [3mreason[0m[2m=[0mSuperseded [3mconnection_id[0m[2m=[0mbd23bd576f147b23 [3mstable_id[0m[2m=[0m49775235088
+[2m2026-04-21T21:49:18.013493Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2401:c080:1000:4c32:5400:5ff:fed9:9737]:5483 via [2604:a880:4:1d0:0:1:6ba1:f000]:5483 (round 1)
+[2m2026-04-21T21:49:18.013597Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to [2604:a880:4:1d0:0:1:6ba1:f000]:5483
+[2m2026-04-21T21:49:18.030126Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 116.203.101.172:5483 via [2604:a880:400:d1:0:3:7db3:f001]:5483 (round 1)
+[2m2026-04-21T21:49:18.030144Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2604:a880:4:1d0:0:1:6ba1:f000]:5483 via 147.182.234.192:5483 (round 1)
+[2m2026-04-21T21:49:18.030163Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 65.21.157.229:5483 via [2001:19f0:4401:346:5400:5ff:fed9:9735]:5483 (round 1)
+[2m2026-04-21T21:49:18.030177Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2604:a880:400:d1:0:3:7db3:f001]:5483 via 65.21.157.229:5483 (round 1)
+[2m2026-04-21T21:49:18.030193Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to [2604:a880:400:d1:0:3:7db3:f001]:5483
+[2m2026-04-21T21:49:18.030209Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 147.182.234.192:5483
+[2m2026-04-21T21:49:18.030221Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to [2001:19f0:4401:346:5400:5ff:fed9:9735]:5483
+[2m2026-04-21T21:49:18.030228Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 65.21.157.229:5483
+[2m2026-04-21T21:49:18.043308Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 147.182.234.192:5483 via [2001:19f0:4401:346:5400:5ff:fed9:9735]:5483 (round 1)
+[2m2026-04-21T21:49:18.043401Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to [2001:19f0:4401:346:5400:5ff:fed9:9735]:5483
+[2m2026-04-21T21:49:18.046856Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 45.77.176.184:5483 via 149.28.156.231:5483 (round 1)
+[2m2026-04-21T21:49:18.046883Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 149.28.156.231:5483
+[2m2026-04-21T21:49:18.046897Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 149.28.156.231:5483 via 116.203.101.172:5483 (round 1)
+[2m2026-04-21T21:49:18.046945Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2001:19f0:4401:346:5400:5ff:fed9:9735]:5483 via [2604:a880:400:d1:0:3:7db3:f001]:5483 (round 1)
+[2m2026-04-21T21:49:18.046960Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 116.203.101.172:5483
+[2m2026-04-21T21:49:18.046970Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to [2604:a880:400:d1:0:3:7db3:f001]:5483
+[2m2026-04-21T21:49:18.046978Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 142.93.199.50:5483 via 65.21.157.229:5483 (round 1)
+[2m2026-04-21T21:49:18.046996Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 65.21.157.229:5483
+[2m2026-04-21T21:49:18.052952Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2a01:4f9:c012:684b::1]:5483 via 147.182.234.192:5483 (round 1)
+[2m2026-04-21T21:49:18.052976Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2a01:4f8:1c1a:31e6::1]:5483 via [2001:19f0:4401:346:5400:5ff:fed9:9735]:5483 (round 1)
+[2m2026-04-21T21:49:18.052982Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 147.182.234.192:5483
+[2m2026-04-21T21:49:18.053001Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to [2001:19f0:4401:346:5400:5ff:fed9:9735]:5483
+[2m2026-04-21T21:49:25.899471Z[0m [32m INFO[0m [2mant_quic::candidate_discovery[0m[2m:[0m Discovery completed for peer PeerId([40, 95, 110, 60, 219, 33, 110, 133, 182, 252, 54, 105, 250, 248, 76, 92, 29, 234, 180, 189, 16, 108, 199, 140, 141, 128, 178, 194, 115, 228, 142, 5]): 9 candidates found
+[2m2026-04-21T21:49:25.899537Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Discovery completed with 9 candidates in 10.002709958s (success rate: 100.00%)
+[2m2026-04-21T21:49:25.900728Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m124 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m126
+[2m2026-04-21T21:49:30.928670Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to 149.28.156.231:5483 timed out after 15s
+[2m2026-04-21T21:49:30.928727Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to [2401:c080:1000:4c32:5400:5ff:fed9:9737]:5483 timed out after 15s
+[2m2026-04-21T21:49:30.928775Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to 65.21.157.229:5483 timed out after 15s
+[2m2026-04-21T21:49:30.928842Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to 147.182.234.192:5483 timed out after 15s
+[2m2026-04-21T21:49:30.928925Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to [2604:a880:400:d1:0:3:7db3:f001]:5483 timed out after 15s
+[2m2026-04-21T21:49:30.928966Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to [2a01:4f9:c012:684b::1]:5483 timed out after 15s
+[2m2026-04-21T21:49:30.929019Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to 45.77.176.184:5483 timed out after 15s
+[2m2026-04-21T21:49:30.929093Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to [2001:19f0:4401:346:5400:5ff:fed9:9735]:5483 timed out after 15s
+[2m2026-04-21T21:49:30.929179Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to [2604:a880:4:1d0:0:1:6ba1:f000]:5483 timed out after 15s
+[2m2026-04-21T21:49:30.929216Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to 142.93.199.50:5483 timed out after 15s
+[2m2026-04-21T21:49:30.929411Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:30.929425Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to [2a01:4f8:1c1a:31e6::1]:5483 timed out after 15s
+[2m2026-04-21T21:49:30.929582Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Connection to 116.203.101.172:5483 timed out after 15s
+[2m2026-04-21T21:49:30.929634Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:30.929653Z[0m [32m INFO[0m [2mx0x[0m[2m:[0m Phase 2 round 1: 0/12 bootstrap peers connected
+[2m2026-04-21T21:49:30.929700Z[0m [32m INFO[0m [2mx0x[0m[2m:[0m Retrying 12 failed peers in 10s (round 2)
+[2m2026-04-21T21:49:30.929836Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:30.930910Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:31.901506Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:31.901845Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:31.901967Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:31.902288Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:32.899920Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:32.899968Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:32.900116Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:32.900720Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:33.901455Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:33.901656Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:33.901856Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:33.902340Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:34.900962Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:34.900979Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:34.901139Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:34.902032Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:35.901505Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m122 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m124
+[2m2026-04-21T21:49:35.901773Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:35.901802Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:35.901931Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:35.902678Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:36.901468Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:36.901691Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:36.901867Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:36.902449Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:37.901555Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:37.901710Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:37.901860Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:37.902452Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:38.901364Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:38.901694Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:38.901960Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:38.902507Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:39.901394Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:39.901660Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:39.901756Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:39.902107Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:40.899996Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:40.900470Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:40.900711Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:40.901317Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:40.934170Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(65.21.157.229:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:40.934192Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2604:a880:4:1d0:0:1:6ba1:f000]:5483) (PeerId: None)
+[2m2026-04-21T21:49:40.934219Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(142.93.199.50:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:40.934239Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934259Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934281Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934178Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2604:a880:400:d1:0:3:7db3:f001]:5483) (PeerId: None)
+[2m2026-04-21T21:49:40.934309Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2401:c080:1000:4c32:5400:5ff:fed9:9737]:5483) (PeerId: None)
+[2m2026-04-21T21:49:40.934330Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(116.203.101.172:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:40.934343Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934471Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934493Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(149.28.156.231:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:40.934410Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2a01:4f8:1c1a:31e6::1]:5483) (PeerId: None)
+[2m2026-04-21T21:49:40.934538Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2001:19f0:4401:346:5400:5ff:fed9:9735]:5483) (PeerId: None)
+[2m2026-04-21T21:49:40.934568Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934589Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934602Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934634Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=None, IPv6=Some([2a01:4f9:c012:684b::1]:5483) (PeerId: None)
+[2m2026-04-21T21:49:40.934663Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(147.182.234.192:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:40.934679Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934712Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934741Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:40.934805Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Starting fallback connection: IPv4=Some(45.77.176.184:5483), IPv6=None (PeerId: None)
+[2m2026-04-21T21:49:40.934846Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Happy Eyeballs: racing 1 direct addresses (timeout: 2.082s)
+[2m2026-04-21T21:49:41.900674Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:41.901531Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:41.901776Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:41.902508Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:42.900291Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:42.901160Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:42.901331Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:42.901940Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] recv: 2 bytes (Membership) from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106])
+[2m2026-04-21T21:49:43.019186Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 65.21.157.229:5483 via 142.93.199.50:5483 (round 1)
+[2m2026-04-21T21:49:43.019221Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2604:a880:4:1d0:0:1:6ba1:f000]:5483 via 65.21.157.229:5483 (round 1)
+[2m2026-04-21T21:49:43.019283Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 142.93.199.50:5483
+[2m2026-04-21T21:49:43.019307Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 65.21.157.229:5483
+[2m2026-04-21T21:49:43.029840Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 142.93.199.50:5483 via 45.77.176.184:5483 (round 1)
+[2m2026-04-21T21:49:43.029860Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2a01:4f9:c012:684b::1]:5483 via 65.21.157.229:5483 (round 1)
+[2m2026-04-21T21:49:43.029889Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2401:c080:1000:4c32:5400:5ff:fed9:9737]:5483 via [2a01:4f8:1c1a:31e6::1]:5483 (round 1)
+[2m2026-04-21T21:49:43.029912Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 65.21.157.229:5483
+[2m2026-04-21T21:49:43.029899Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 45.77.176.184:5483
+[2m2026-04-21T21:49:43.029941Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2a01:4f8:1c1a:31e6::1]:5483 via [2604:a880:4:1d0:0:1:6ba1:f000]:5483 (round 1)
+[2m2026-04-21T21:49:43.029951Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to [2a01:4f8:1c1a:31e6::1]:5483
+[2m2026-04-21T21:49:43.029969Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 116.203.101.172:5483 via 192.168.1.212:60149 (round 1)
+[2m2026-04-21T21:49:43.029990Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2001:19f0:4401:346:5400:5ff:fed9:9735]:5483 via [2604:a880:4:1d0:0:1:6ba1:f000]:5483 (round 1)
+[2m2026-04-21T21:49:43.030004Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to [2604:a880:4:1d0:0:1:6ba1:f000]:5483
+[2m2026-04-21T21:49:43.030023Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 192.168.1.212:60149
+[2m2026-04-21T21:49:43.030032Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to [2604:a880:4:1d0:0:1:6ba1:f000]:5483
+[2m2026-04-21T21:49:43.046580Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 149.28.156.231:5483 via 65.21.157.229:5483 (round 1)
+[2m2026-04-21T21:49:43.046598Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 147.182.234.192:5483 via 45.77.176.184:5483 (round 1)
+[2m2026-04-21T21:49:43.046611Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to 45.77.176.184:5483 via [2401:c080:1000:4c32:5400:5ff:fed9:9737]:5483 (round 1)
+[2m2026-04-21T21:49:43.046626Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 45.77.176.184:5483
+[2m2026-04-21T21:49:43.046617Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 65.21.157.229:5483
+[2m2026-04-21T21:49:43.046640Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to [2401:c080:1000:4c32:5400:5ff:fed9:9737]:5483
+[2m2026-04-21T21:49:43.052195Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying hole-punch to [2604:a880:400:d1:0:3:7db3:f001]:5483 via 116.203.101.172:5483 (round 1)
+[2m2026-04-21T21:49:43.052213Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Connecting directly to 116.203.101.172:5483
+[2m2026-04-21T21:49:43.063190Z[0m [32m INFO[0m [2mant_quic::crypto::raw_public_keys[0m[2m:[0m Accepting any ML-DSA-65 public key (development mode)
+[2m2026-04-21T21:49:43.072541Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Both peers support NAT traversal, negotiating capabilities
+[2m2026-04-21T21:49:43.072565Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m NAT traversal capability negotiated successfully
+[2m2026-04-21T21:49:43.072579Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m NAT traversal capability successfully negotiated
+[2m2026-04-21T21:49:43.072593Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m negotiate_address_discovery: peer_params.address_discovery = Some(SendAndReceive)
+[2m2026-04-21T21:49:43.072601Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Peer supports address discovery: SendAndReceive
+[2m2026-04-21T21:49:43.072609Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Address discovery negotiated successfully: rate=10, all_paths=false
+[2m2026-04-21T21:49:43.072634Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m handle_observed_address_frame: RECEIVED OBSERVED_ADDRESS from peer [3maddress[0m[2m=[0m[::ffff:192.168.1.212]:58941 [3msequence[0m[2m=[0m0 [3mfrom_peer[0m[2m=[0munknown
+[2m2026-04-21T21:49:43.072664Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m queue_observed_address_frame: SENDING OBSERVED_ADDRESS to [::ffff:192.168.1.212]:60149 for path 0
+[2m2026-04-21T21:49:43.072802Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m populate_packet: ENCODING OBSERVED_ADDRESS into packet [3maddress[0m[2m=[0m[::ffff:192.168.1.212]:60149 [3msequence[0m[2m=[0m0
+[2m2026-04-21T21:49:43.072876Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m add_connection: peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) at [::ffff:192.168.1.212]:60149 observed_address=Some(192.168.1.212:58941)
+[2m2026-04-21T21:49:43.073035Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint::lifecycle[0m[2m:[0m connection lifecycle transition [3mpeer_id[0m[2m=[0m6a1d4f03 [3mgeneration[0m[2m=[0m1 [3mfrom_state[0m[2m=[0m"Live" [3mto_state[0m[2m=[0m"Superseded" [3mreason[0m[2m=[0mSuperseded [3mconnection_id[0m[2m=[0mc671d2d4aa4b3b06 [3mstable_id[0m[2m=[0m49775224848
+[2m2026-04-21T21:49:43.073055Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint::lifecycle[0m[2m:[0m connection lifecycle transition [3mpeer_id[0m[2m=[0m6a1d4f03 [3mgeneration[0m[2m=[0m3 [3mfrom_state[0m[2m=[0m"Init" [3mto_state[0m[2m=[0m"Live" [3mreason[0m[2m=[0m"None" [3mconnection_id[0m[2m=[0mfca646273bfd4b7e [3mstable_id[0m[2m=[0m49776164880
+[2m2026-04-21T21:49:43.073089Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m add_connection: now have 1 live connections
+[2m2026-04-21T21:49:43.073107Z[0m [32m INFO[0m [2mant_quic::high_level::endpoint[0m[2m:[0m Registered peer ID 6a1d4f03e7f0f338 for connection 192.168.1.212:60149 at low-level endpoint
+[2m2026-04-21T21:49:43.073149Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Received ConnectionEstablished event for peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) at [::ffff:192.168.1.212]:60149 (side: Client)
+[2m2026-04-21T21:49:43.073168Z[0m [33m WARN[0m [2mant_quic::silent_drop[0m[2m:[0m silent drop [3mkind[0m[2m=[0m"peer_event_tx_lifecycle" [3mpeer_id[0m[2m=[0mPeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) [3merror[0m[2m=[0mchannel closed
+[2m2026-04-21T21:49:43.073183Z[0m [33m WARN[0m [2mant_quic::silent_drop[0m[2m:[0m silent drop [3mkind[0m[2m=[0m"peer_event_tx_lifecycle" [3mpeer_id[0m[2m=[0mPeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) [3merror[0m[2m=[0mchannel closed
+[2m2026-04-21T21:49:43.073202Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m Accepted inbound connection from peer PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) at Udp([::ffff:192.168.1.212]:60149)
+[2m2026-04-21T21:49:43.073242Z[0m [33m WARN[0m [2mant_quic::silent_drop[0m[2m:[0m silent drop [3mkind[0m[2m=[0m"peer_event_tx_lifecycle" [3mpeer_id[0m[2m=[0mPeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) [3merror[0m[2m=[0mchannel closed
+[2m2026-04-21T21:49:43.073247Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Starting NAT traversal to peer PeerId([166, 226, 252, 230, 34, 9, 205, 27, 107, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) via coordinator 192.168.1.212:60149
+[2m2026-04-21T21:49:43.073274Z[0m [32m INFO[0m [2mant_quic::candidate_discovery[0m[2m:[0m Starting candidate discovery for peer PeerId([166, 226, 252, 230, 34, 9, 205, 27, 107, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+[2m2026-04-21T21:49:43.073278Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint::lifecycle[0m[2m:[0m connection lifecycle transition [3mpeer_id[0m[2m=[0m6a1d4f03 [3mgeneration[0m[2m=[0m1 [3mfrom_state[0m[2m=[0m"Superseded" [3mto_state[0m[2m=[0m"Closing" [3mreason[0m[2m=[0mSuperseded [3mconnection_id[0m[2m=[0mc671d2d4aa4b3b06 [3mstable_id[0m[2m=[0m49775224848
+[2m2026-04-21T21:49:43.073297Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint::lifecycle[0m[2m:[0m connection lifecycle transition [3mpeer_id[0m[2m=[0m6a1d4f03 [3mgeneration[0m[2m=[0m1 [3mfrom_state[0m[2m=[0m"Closing" [3mto_state[0m[2m=[0m"Closed" [3mreason[0m[2m=[0mSuperseded [3mconnection_id[0m[2m=[0mc671d2d4aa4b3b06 [3mstable_id[0m[2m=[0m49775224848
+[2m2026-04-21T21:49:43.073335Z[0m [33m WARN[0m [2mant_quic::silent_drop[0m[2m:[0m silent drop [3mkind[0m[2m=[0m"peer_event_tx_lifecycle" [3mpeer_id[0m[2m=[0mPeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) [3merror[0m[2m=[0mchannel closed
+[2m2026-04-21T21:49:43.073357Z[0m [33m WARN[0m [2mant_quic::silent_drop[0m[2m:[0m silent drop [3mkind[0m[2m=[0m"peer_event_tx_lifecycle" [3mpeer_id[0m[2m=[0mPeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) [3merror[0m[2m=[0mchannel closed
+[2m2026-04-21T21:49:43.073499Z[0m [33m WARN[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Peer PeerId([166, 226, 252, 230, 34, 9, 205, 27, 107, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) is not synchronized
+[2m2026-04-21T21:49:43.077508Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m coordinator control rejected request_id=1 from_peer=PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) initiator=PeerId([137, 165, 124, 32, 217, 194, 50, 44, 93, 113, 169, 63, 134, 237, 237, 97, 210, 156, 228, 97, 194, 238, 98, 181, 223, 89, 126, 90, 29, 220, 214, 195]) target=PeerId([166, 226, 252, 230, 34, 9, 205, 27, 107, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) round=1 reason=UnknownTarget
+[2m2026-04-21T21:49:43.077556Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m coordinator control rejected handled request_id=1 from_peer=PeerId([106, 29, 79, 3, 231, 240, 243, 56, 28, 31, 191, 4, 248, 94, 157, 106, 151, 14, 56, 6, 55, 208, 38, 100, 244, 48, 19, 59, 111, 187, 108, 106]) initiator=PeerId([137, 165, 124, 32, 217, 194, 50, 44, 93, 113, 169, 63, 134, 237, 237, 97, 210, 156, 228, 97, 194, 238, 98, 181, 223, 89, 126, 90, 29, 220, 214, 195]) target=PeerId([166, 226, 252, 230, 34, 9, 205, 27, 107, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) round=1 reason=UnknownTarget
+[2m2026-04-21T21:49:43.077616Z[0m [33m WARN[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Peer PeerId([166, 226, 252, 230, 34, 9, 205, 27, 107, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) is not synchronized
+[2m2026-04-21T21:49:43.077652Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Trying relay connection to 116.203.101.172:5483 via 192.168.1.212:60149
+[2m2026-04-21T21:49:43.077678Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m Attempting MASQUE relay connection to 116.203.101.172:5483 via 192.168.1.212:60149
+[2m2026-04-21T21:49:43.077690Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Establishing relay session to 192.168.1.212:60149
+[2m2026-04-21T21:49:43.095985Z[0m [32m INFO[0m [2mant_quic::crypto::raw_public_keys[0m[2m:[0m Accepting any ML-DSA-65 public key (development mode)
+[2m2026-04-21T21:49:43.114890Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Both peers support NAT traversal, negotiating capabilities
+[2m2026-04-21T21:49:43.114908Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m NAT traversal capability negotiated successfully
+[2m2026-04-21T21:49:43.114919Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m NAT traversal capability successfully negotiated
+[2m2026-04-21T21:49:43.114936Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m negotiate_address_discovery: peer_params.address_discovery = Some(SendAndReceive)
+[2m2026-04-21T21:49:43.114947Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Peer supports address discovery: SendAndReceive
+[2m2026-04-21T21:49:43.114956Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m Address discovery negotiated successfully: rate=10, all_paths=false
+[2m2026-04-21T21:49:43.114995Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m handle_observed_address_frame: RECEIVED OBSERVED_ADDRESS from peer [3maddress[0m[2m=[0m[::ffff:192.168.1.212]:58941 [3msequence[0m[2m=[0m0 [3mfrom_peer[0m[2m=[0munknown
+[2m2026-04-21T21:49:43.115033Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m queue_observed_address_frame: SENDING OBSERVED_ADDRESS to [::ffff:192.168.1.212]:60149 for path 0
+[2m2026-04-21T21:49:43.115135Z[0m [32m INFO[0m [2mant_quic::connection[0m[2m:[0m populate_packet: ENCODING OBSERVED_ADDRESS into packet [3maddress[0m[2m=[0m[::ffff:192.168.1.212]:60149 [3msequence[0m[2m=[0m0
+[2m2026-04-21T21:49:43.115199Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Connected to relay server 192.168.1.212:60149
+[2m2026-04-21T21:49:43.119696Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Relay session established with public address: Some([::]:64923)
+[2m2026-04-21T21:49:43.119773Z[0m [32m INFO[0m [2mant_quic::p2p_endpoint[0m[2m:[0m MASQUE relay session established via 192.168.1.212:60149 (public addr: Some([::]:64923))
+[2m2026-04-21T21:49:43.900822Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:45.900749Z[0m [32m INFO[0m [2msaorsa_gossip_membership[0m[2m:[0m Adaptive degrees changed [3mactive_target[0m[2m=[0m8 [3mpassive_max[0m[2m=[0m120 [3mprev_active[0m[2m=[0m8 [3mprev_passive[0m[2m=[0m122
+[2m2026-04-21T21:49:45.930912Z[0m [32m INFO[0m [2mx0x::network[0m[2m:[0m [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a1d4f03e7f0f338)
+[2m2026-04-21T21:49:47.900936Z[0m [33m WARN[0m [2msaorsa_gossip_membership[0m[2m:[0m SWIM: Suspect timeout → marked dead [3mpeer_id[0m[2m=[0m6a1d4f03e7f0f338
+[2m2026-04-21T21:49:53.076236Z[0m [32m INFO[0m [2mant_quic::candidate_discovery[0m[2m:[0m Discovery completed for peer PeerId([166, 226, 252, 230, 34, 9, 205, 27, 107, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]): 9 candidates found
+[2m2026-04-21T21:49:53.076351Z[0m [32m INFO[0m [2mant_quic::nat_traversal_api[0m[2m:[0m Discovery completed with 9 candidates in 10.002747833s (success rate: 100.00%)
+[2m2026-04-21T21:49:53.080759Z[0m [32m INFO[0m [2mx0x::connect[0m[2m:[0m direct dial failed [3mstrategy[0m[2m=[0m"direct_addr" [3maddr[0m[2m=[0m116.203.101.172:5483 [3mfamily[0m[2m=[0m"v4" [3mdur_ms[0m[2m=[0m12147 [3moutcome[0m[2m=[0m"fail" [3merror[0m[2m=[0mEndpoint error: All connection strategies failed: DirectIPv4: Timeout; DirectIPv6: Happy Eyeballs timed out; HolePunch { round: 1 }: coordination rejected: unknown target; HolePunch { round: 1 }: coordination rejected: unknown target; Relay: Timeout
+[2m2026-04-21T21:49:53.080868Z[0m [33m WARN[0m [2mx0x[0m[2m:[0m Failed to connect to 116.203.101.172:5483: connection failed: Endpoint error: All connection strategies failed: DirectIPv4: Timeout; DirectIPv6: Happy Eyeballs timed out; HolePunch { round: 1 }: coordination rejected: unknown target; HolePunch { round: 1 }: coordination rejected: unknown target; Relay: Timeout

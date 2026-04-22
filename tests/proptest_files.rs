@@ -92,6 +92,8 @@ proptest! {
         let state: TransferState = serde_json::from_value(value).unwrap();
         prop_assert_eq!(state.chunk_size, DEFAULT_CHUNK_SIZE);
         prop_assert_eq!(state.total_chunks, 0);
+        prop_assert_eq!(state.started_at_unix_ms, 0);
+        prop_assert_eq!(state.completed_at_unix_ms, None);
         prop_assert_eq!(state.direction, TransferDirection::Sending);
         prop_assert_eq!(state.status, TransferStatus::Pending);
     }

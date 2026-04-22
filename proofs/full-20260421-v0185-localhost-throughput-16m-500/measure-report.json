@@ -1,0 +1,312 @@
+{
+  "config": {
+    "nodes": 5,
+    "messages": 500,
+    "file_size_kib": 16384
+  },
+  "publish_elapsed_seconds": 18,
+  "dm_ok": "ok",
+  "dm_rtt_ms": "0",
+  "file_transfer": {
+    "bytes": 16777216,
+    "offer_roundtrip_us": 723046,
+    "complete_roundtrip_us": 1214000,
+    "bytes_received": 16777216,
+    "throughput_mbps": 110.56,
+    "completed": true
+  },
+  "any_relay_active": false,
+  "any_ipv4_external": true,
+  "any_ipv6_external": false,
+  "any_ipv4_announced": false,
+  "any_ipv6_announced": true,
+  "per_node": [
+    {
+      "idx": 1,
+      "agent_id": "0d047d1dd29a6230447568087d9775b17726652e85784b97e8ded5b13b951a6e",
+      "machine_id": "6a1d4f03e7f0f3381c1fbf04f85e9d6a970e380637d02664f430133b6fbb6c6a",
+      "port_mapping": {
+        "active": false,
+        "external_addr": null
+      },
+      "nat_type": "FullCone",
+      "can_receive_direct": true,
+      "has_global_address": false,
+      "external_addrs": {
+        "v4": [
+          "192.168.1.212:54779"
+        ],
+        "v6": [],
+        "total": 1
+      },
+      "announced_addrs": {
+        "v4": [],
+        "v6": [
+          "[2a0d:3344:32d:2e10:1cea:552d:dbb:23f3]:54779",
+          "[2a0d:3344:32d:2e10:28a0:4fad:caea:57f7]:54779"
+        ],
+        "total": 2
+      },
+      "connections": {
+        "active": 4,
+        "connected_peers": 4,
+        "direct": 6,
+        "hole_punch_success_rate": 0.0,
+        "relayed": 0
+      },
+      "relay": {
+        "bytes_forwarded": 0,
+        "is_relaying": false,
+        "sessions": 0
+      },
+      "coordinator": {
+        "is_coordinating": false,
+        "sessions": 0
+      },
+      "avg_rtt_ms": 0,
+      "uptime_s": 50,
+      "gossip": {
+        "publish_total": 561,
+        "publish_failed": 0,
+        "incoming_total": 796,
+        "incoming_decoded": 796,
+        "incoming_decode_failed": 0,
+        "delivered_to_subscriber": 796,
+        "subscriber_channel_closed": 0,
+        "in_flight_decode": 0,
+        "decode_to_delivery_drops": 0
+      },
+      "peer_count": 4
+    },
+    {
+      "idx": 2,
+      "agent_id": "6d7c3c7b48c8e138c354737d3429608471c6a9319e66c09bb48dacfd367ac8c0",
+      "machine_id": "89a57c20d9c2322c5d71a93f86eded61d29ce461c2ee62b5df597e5a1ddcd6c3",
+      "port_mapping": {
+        "active": false,
+        "external_addr": null
+      },
+      "nat_type": "FullCone",
+      "can_receive_direct": true,
+      "has_global_address": false,
+      "external_addrs": {
+        "v4": [
+          "192.168.1.212:52611"
+        ],
+        "v6": [],
+        "total": 1
+      },
+      "announced_addrs": {
+        "v4": [],
+        "v6": [
+          "[2a0d:3344:32d:2e10:1cea:552d:dbb:23f3]:52611",
+          "[2a0d:3344:32d:2e10:28a0:4fad:caea:57f7]:52611"
+        ],
+        "total": 2
+      },
+      "connections": {
+        "active": 4,
+        "connected_peers": 4,
+        "direct": 4,
+        "hole_punch_success_rate": 0.0,
+        "relayed": 0
+      },
+      "relay": {
+        "bytes_forwarded": 0,
+        "is_relaying": false,
+        "sessions": 0
+      },
+      "coordinator": {
+        "is_coordinating": false,
+        "sessions": 0
+      },
+      "avg_rtt_ms": 0,
+      "uptime_s": 50,
+      "gossip": {
+        "publish_total": 61,
+        "publish_failed": 0,
+        "incoming_total": 796,
+        "incoming_decoded": 796,
+        "incoming_decode_failed": 0,
+        "delivered_to_subscriber": 796,
+        "subscriber_channel_closed": 0,
+        "in_flight_decode": 0,
+        "decode_to_delivery_drops": 0
+      },
+      "peer_count": 4
+    },
+    {
+      "idx": 3,
+      "agent_id": "4c842c78b6fcf68fcec9a7ec693dffac909c36e50b8759f281ac4e8cc85a7c03",
+      "machine_id": "06f8ea349eb9ae85242629709a824e6b3d64c2485dacfe269df46e16b2b038e1",
+      "port_mapping": {
+        "active": false,
+        "external_addr": null
+      },
+      "nat_type": "FullCone",
+      "can_receive_direct": true,
+      "has_global_address": false,
+      "external_addrs": {
+        "v4": [
+          "192.168.1.212:65098"
+        ],
+        "v6": [],
+        "total": 1
+      },
+      "announced_addrs": {
+        "v4": [],
+        "v6": [
+          "[2a0d:3344:32d:2e10:1cea:552d:dbb:23f3]:65098",
+          "[2a0d:3344:32d:2e10:28a0:4fad:caea:57f7]:65098"
+        ],
+        "total": 2
+      },
+      "connections": {
+        "active": 4,
+        "connected_peers": 4,
+        "direct": 6,
+        "hole_punch_success_rate": 0.0,
+        "relayed": 0
+      },
+      "relay": {
+        "bytes_forwarded": 0,
+        "is_relaying": false,
+        "sessions": 0
+      },
+      "coordinator": {
+        "is_coordinating": false,
+        "sessions": 0
+      },
+      "avg_rtt_ms": 1,
+      "uptime_s": 50,
+      "gossip": {
+        "publish_total": 61,
+        "publish_failed": 0,
+        "incoming_total": 796,
+        "incoming_decoded": 796,
+        "incoming_decode_failed": 0,
+        "delivered_to_subscriber": 796,
+        "subscriber_channel_closed": 0,
+        "in_flight_decode": 0,
+        "decode_to_delivery_drops": 0
+      },
+      "peer_count": 4
+    },
+    {
+      "idx": 4,
+      "agent_id": "8d9b2f6c1037427bd40887b55f7e61aa2c47f180ebc94ea4d8a7d0cfcbb9825a",
+      "machine_id": "601761b59e22e5e96d1bab8fd8cd8f3c2a63cd9af330af4919d8c6bc8b82a1a2",
+      "port_mapping": {
+        "active": false,
+        "external_addr": null
+      },
+      "nat_type": "FullCone",
+      "can_receive_direct": true,
+      "has_global_address": false,
+      "external_addrs": {
+        "v4": [
+          "192.168.1.212:62910"
+        ],
+        "v6": [],
+        "total": 1
+      },
+      "announced_addrs": {
+        "v4": [],
+        "v6": [
+          "[2a0d:3344:32d:2e10:1cea:552d:dbb:23f3]:62910",
+          "[2a0d:3344:32d:2e10:28a0:4fad:caea:57f7]:62910"
+        ],
+        "total": 2
+      },
+      "connections": {
+        "active": 4,
+        "connected_peers": 4,
+        "direct": 5,
+        "hole_punch_success_rate": 0.0,
+        "relayed": 0
+      },
+      "relay": {
+        "bytes_forwarded": 0,
+        "is_relaying": false,
+        "sessions": 0
+      },
+      "coordinator": {
+        "is_coordinating": false,
+        "sessions": 0
+      },
+      "avg_rtt_ms": 0,
+      "uptime_s": 50,
+      "gossip": {
+        "publish_total": 61,
+        "publish_failed": 0,
+        "incoming_total": 796,
+        "incoming_decoded": 796,
+        "incoming_decode_failed": 0,
+        "delivered_to_subscriber": 796,
+        "subscriber_channel_closed": 0,
+        "in_flight_decode": 0,
+        "decode_to_delivery_drops": 0
+      },
+      "peer_count": 4
+    },
+    {
+      "idx": 5,
+      "agent_id": "bd53170b512cc0e87bc064ad32e1df7220c907f2b15d96fb39d22c42564e1005",
+      "machine_id": "ec85d2fdc596e93e75abfc741add76c6742c4e5a259afed81996cd451dd6f442",
+      "port_mapping": {
+        "active": false,
+        "external_addr": null
+      },
+      "nat_type": "FullCone",
+      "can_receive_direct": true,
+      "has_global_address": false,
+      "external_addrs": {
+        "v4": [
+          "192.168.1.212:50368"
+        ],
+        "v6": [],
+        "total": 1
+      },
+      "announced_addrs": {
+        "v4": [],
+        "v6": [
+          "[2a0d:3344:32d:2e10:1cea:552d:dbb:23f3]:50368",
+          "[2a0d:3344:32d:2e10:28a0:4fad:caea:57f7]:50368"
+        ],
+        "total": 2
+      },
+      "connections": {
+        "active": 4,
+        "connected_peers": 4,
+        "direct": 5,
+        "hole_punch_success_rate": 0.0,
+        "relayed": 0
+      },
+      "relay": {
+        "bytes_forwarded": 0,
+        "is_relaying": false,
+        "sessions": 0
+      },
+      "coordinator": {
+        "is_coordinating": false,
+        "sessions": 0
+      },
+      "avg_rtt_ms": 0,
+      "uptime_s": 50,
+      "gossip": {
+        "publish_total": 61,
+        "publish_failed": 0,
+        "incoming_total": 796,
+        "incoming_decoded": 796,
+        "incoming_decode_failed": 0,
+        "delivered_to_subscriber": 796,
+        "subscriber_channel_closed": 0,
+        "in_flight_decode": 0,
+        "decode_to_delivery_drops": 0
+      },
+      "peer_count": 4
+    }
+  ],
+  "failures": [],
+  "passed": true
+}

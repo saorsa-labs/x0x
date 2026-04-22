@@ -16,7 +16,7 @@
 //! x0xd --list                           # list running instances
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -398,6 +398,8 @@ struct AppState {
     file_transfers: RwLock<HashMap<String, x0x::files::TransferState>>,
     /// Incremental SHA-256 hashers for receiving transfers.
     receive_hashers: RwLock<HashMap<String, Sha256>>,
+    /// Out-of-order decoded chunks buffered until their predecessors arrive.
+    pending_file_chunks: RwLock<HashMap<String, BTreeMap<u64, Vec<u8>>>>,
     /// Directory for received file data.
     transfers_dir: PathBuf,
     /// Channel to trigger graceful shutdown from the /shutdown endpoint.
@@ -676,6 +678,13 @@ struct ConnectAgentRequest {
     agent_id: String,
 }
 
+/// POST /machines/connect request body.
+#[derive(Debug, Deserialize)]
+struct ConnectMachineRequest {
+    /// Machine ID as 64-character hex string.
+    machine_id: String,
+}
+
 /// POST /direct/send request body.
 #[derive(Debug, Deserialize)]
 struct DirectSendRequest {
@@ -756,6 +765,21 @@ struct DiscoveredAgentEntry {
     addresses: Vec<String>,
     announced_at: u64,
     last_seen: u64,
+}
+
+/// Discovered machine endpoint entry from machine announcements.
+#[derive(Debug, Serialize)]
+struct DiscoveredMachineEntry {
+    machine_id: String,
+    addresses: Vec<String>,
+    announced_at: u64,
+    last_seen: u64,
+    nat_type: Option<String>,
+    can_receive_direct: Option<bool>,
+    is_relay: Option<bool>,
+    is_coordinator: Option<bool>,
+    agent_ids: Vec<String>,
+    user_ids: Vec<String>,
 }
 
 /// Peer entry.
@@ -1191,6 +1215,7 @@ async fn main() -> Result<()> {
         broadcast_tx,
         file_transfers: RwLock::new(HashMap::new()),
         receive_hashers: RwLock::new(HashMap::new()),
+        pending_file_chunks: RwLock::new(HashMap::new()),
         transfers_dir: config.data_dir.join("transfers"),
         shutdown_tx,
         shutdown_notify,
@@ -1434,7 +1459,12 @@ async fn main() -> Result<()> {
         .route("/presence/events", get(presence_events))
         .route("/agents/discovered", get(discovered_agents))
         .route("/agents/discovered/:agent_id", get(discovered_agent))
+        .route("/agents/:agent_id/machine", get(machine_for_agent_handler))
+        .route("/machines/discovered", get(discovered_machines))
+        .route("/machines/discovered/:machine_id", get(discovered_machine))
+        .route("/machines/connect", post(connect_machine))
         .route("/users/:user_id/agents", get(agents_by_user_handler))
+        .route("/users/:user_id/machines", get(machines_by_user_handler))
         .route("/agent/user-id", get(agent_user_id_handler))
         .route("/contacts", get(list_contacts))
         .route("/contacts", post(add_contact))
@@ -1855,6 +1885,46 @@ async fn shutdown_handler(State(state): State<Arc<AppState>>) -> impl IntoRespon
 // File transfer endpoints
 // ---------------------------------------------------------------------------
 
+fn file_transfer_now() -> (u64, u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (now.as_secs(), now.as_millis() as u64)
+}
+
+fn file_transfer_send_config() -> x0x::dm::DmSendConfig {
+    x0x::dm::DmSendConfig {
+        prefer_raw_quic_if_connected: true,
+        ..x0x::dm::DmSendConfig::default()
+    }
+}
+
+async fn send_file_message(
+    state: &Arc<AppState>,
+    agent_id: &AgentId,
+    msg: &x0x::files::FileMessage,
+) -> std::result::Result<x0x::dm::DmReceipt, String> {
+    let payload = serde_json::to_vec(msg).map_err(|e| format!("serialization failed: {e}"))?;
+    state
+        .agent
+        .send_direct(agent_id, payload)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn send_file_chunk_message(
+    state: &Arc<AppState>,
+    agent_id: &AgentId,
+    msg: &x0x::files::FileMessage,
+) -> std::result::Result<x0x::dm::DmReceipt, String> {
+    let payload = serde_json::to_vec(msg).map_err(|e| format!("serialization failed: {e}"))?;
+    state
+        .agent
+        .send_direct_with_config(agent_id, payload, file_transfer_send_config())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// POST /files/send — initiate a file transfer to an agent.
 async fn file_send_handler(
     State(state): State<Arc<AppState>>,
@@ -1887,10 +1957,7 @@ async fn file_send_handler(
     };
 
     let transfer_id = uuid::Uuid::new_v4().to_string();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let (now_secs, now_ms) = file_transfer_now();
 
     let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
     let total_chunks = if size == 0 {
@@ -1909,7 +1976,9 @@ async fn file_send_handler(
         status: x0x::files::TransferStatus::Pending,
         sha256: sha256.to_string(),
         error: None,
-        started_at: now,
+        started_at: now_secs,
+        started_at_unix_ms: now_ms,
+        completed_at_unix_ms: None,
         source_path: if source_path.is_empty() {
             None
         } else {
@@ -1936,35 +2005,25 @@ async fn file_send_handler(
         total_chunks,
     });
 
-    match serde_json::to_vec(&offer) {
-        Ok(payload) => match state.agent.send_direct(&agent_id, payload).await {
-            Ok(_receipt) => {
-                tracing::info!("File offer sent: {transfer_id} -> {agent_id_hex}");
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"ok": true, "transfer_id": transfer_id})),
-                )
-            }
-            Err(e) => {
-                tracing::error!("Failed to send file offer: {e}");
-                let mut transfers = state.file_transfers.write().await;
-                if let Some(t) = transfers.get_mut(&transfer_id) {
-                    t.status = x0x::files::TransferStatus::Failed;
-                    t.error = Some(format!("Failed to send offer: {e}"));
-                }
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        serde_json::json!({"ok": false, "error": format!("send offer failed: {e}")}),
-                    ),
-                )
-            }
-        },
+    match send_file_message(&state, &agent_id, &offer).await {
+        Ok(receipt) => {
+            tracing::info!(path = ?receipt.path, retries = receipt.retries_used, "File offer sent: {transfer_id} -> {agent_id_hex}");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "transfer_id": transfer_id})),
+            )
+        }
         Err(e) => {
-            tracing::error!("Failed to serialize file offer: {e}");
+            tracing::error!("Failed to send file offer: {e}");
+            let mut transfers = state.file_transfers.write().await;
+            if let Some(t) = transfers.get_mut(&transfer_id) {
+                t.status = x0x::files::TransferStatus::Failed;
+                t.error = Some(format!("Failed to send offer: {e}"));
+                t.completed_at_unix_ms = Some(file_transfer_now().1);
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok": false, "error": "serialization failed"})),
+                Json(serde_json::json!({"ok": false, "error": format!("send offer failed: {e}")})),
             )
         }
     }
@@ -2045,18 +2104,15 @@ async fn file_accept_handler(
     let accept_msg = x0x::files::FileMessage::Accept {
         transfer_id: id.clone(),
     };
-    let delivery_failed = match serde_json::to_vec(&accept_msg) {
-        Ok(payload) => match state.agent.send_direct(&agent_id, payload).await {
-            Ok(_receipt) => {
-                tracing::info!("File accept sent: {id} -> {remote_agent_hex}");
-                false
-            }
-            Err(e) => {
-                tracing::warn!("Failed to send accept to sender: {e}");
-                true
-            }
-        },
-        Err(_) => true,
+    let delivery_failed = match send_file_message(&state, &agent_id, &accept_msg).await {
+        Ok(receipt) => {
+            tracing::info!(path = ?receipt.path, retries = receipt.retries_used, "File accept sent: {id} -> {remote_agent_hex}");
+            false
+        }
+        Err(e) => {
+            tracing::warn!("Failed to send accept to sender: {e}");
+            true
+        }
     };
 
     if delivery_failed {
@@ -2096,6 +2152,7 @@ async fn file_reject_handler(
             Some(t) if t.status == x0x::files::TransferStatus::Pending => {
                 t.status = x0x::files::TransferStatus::Rejected;
                 t.error = Some(reason.clone());
+                t.completed_at_unix_ms = Some(file_transfer_now().1);
                 remote_agent_hex = t.remote_agent_id.clone();
             }
             Some(_) => {
@@ -2120,11 +2177,9 @@ async fn file_reject_handler(
             transfer_id: id.clone(),
             reason,
         };
-        if let Ok(payload) = serde_json::to_vec(&reject_msg) {
-            if let Err(e) = state.agent.send_direct(&agent_id, payload).await {
-                tracing::warn!("Failed to send reject to sender: {e}");
-                delivery_failed = true;
-            }
+        if let Err(e) = send_file_message(&state, &agent_id, &reject_msg).await {
+            tracing::warn!("Failed to send reject to sender: {e}");
+            delivery_failed = true;
         }
     }
 
@@ -3708,6 +3763,33 @@ fn discovered_agent_entry(agent: x0x::DiscoveredAgent) -> DiscoveredAgentEntry {
     }
 }
 
+fn discovered_machine_entry(machine: x0x::DiscoveredMachine) -> DiscoveredMachineEntry {
+    DiscoveredMachineEntry {
+        machine_id: hex::encode(machine.machine_id.as_bytes()),
+        addresses: machine
+            .addresses
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect(),
+        announced_at: machine.announced_at,
+        last_seen: machine.last_seen,
+        nat_type: machine.nat_type,
+        can_receive_direct: machine.can_receive_direct,
+        is_relay: machine.is_relay,
+        is_coordinator: machine.is_coordinator,
+        agent_ids: machine
+            .agent_ids
+            .into_iter()
+            .map(|id| hex::encode(id.as_bytes()))
+            .collect(),
+        user_ids: machine
+            .user_ids
+            .into_iter()
+            .map(|id| hex::encode(id.as_bytes()))
+            .collect(),
+    }
+}
+
 /// GET /agents/discovered
 /// Query parameters for `GET /agents/discovered`.
 #[derive(Deserialize, Default)]
@@ -3830,6 +3912,131 @@ async fn discovered_agent(
     }
 }
 
+/// GET /machines/discovered
+async fn discovered_machines(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DiscoveredAgentsQuery>,
+) -> impl IntoResponse {
+    let result = if query.unfiltered {
+        state.agent.discovered_machines_unfiltered().await
+    } else {
+        state.agent.discovered_machines().await
+    };
+    match result {
+        Ok(machines) => {
+            let entries: Vec<DiscoveredMachineEntry> =
+                machines.into_iter().map(discovered_machine_entry).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "machines": entries })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /machines/discovered/:machine_id
+async fn discovered_machine(
+    State(state): State<Arc<AppState>>,
+    Path(machine_id_hex): Path<String>,
+    Query(params): Query<DiscoveredAgentQuery>,
+) -> impl IntoResponse {
+    let machine_id = match parse_machine_id_hex(&machine_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    if params.wait {
+        match state.agent.find_machine(machine_id, 10).await {
+            Ok(Some(machine)) => {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "machine": discovered_machine_entry(machine),
+                    })),
+                );
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "machine not found within timeout"
+                    })),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+                );
+            }
+        }
+    }
+
+    match state.agent.discovered_machine(machine_id).await {
+        Ok(Some(machine)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "machine": discovered_machine_entry(machine),
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "machine not found" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /agents/:agent_id/machine
+async fn machine_for_agent_handler(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    match state.agent.machine_for_agent(agent_id).await {
+        Ok(Some(machine)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "agent_id": agent_id_hex,
+                "machine": discovered_machine_entry(machine),
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "agent machine not found" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
 /// GET /users/:user_id/agents
 async fn agents_by_user_handler(
     State(state): State<Arc<AppState>>,
@@ -3872,6 +4079,48 @@ async fn agents_by_user_handler(
     }
 }
 
+/// GET /users/:user_id/machines
+async fn machines_by_user_handler(
+    State(state): State<Arc<AppState>>,
+    Path(user_id_hex): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let user_id_bytes = match hex::decode(&user_id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "invalid user_id: expected 64 hex characters"
+                })),
+            );
+        }
+    };
+    let user_id = x0x::identity::UserId(user_id_bytes);
+    match state.agent.find_machines_by_user(user_id).await {
+        Ok(machines) => {
+            let entries: Vec<DiscoveredMachineEntry> =
+                machines.into_iter().map(discovered_machine_entry).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "user_id": user_id_hex,
+                    "machines": entries,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
 /// GET /agent/user-id
 async fn agent_user_id_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let user_id = state.agent.user_id().map(|uid| hex::encode(uid.0));
@@ -3897,6 +4146,20 @@ fn parse_agent_id_hex(hex_str: &str) -> Result<AgentId, String> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(AgentId(arr))
+}
+
+/// Parse a 64-character hex string into a MachineId.
+fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "expected 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        ));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(MachineId(arr))
 }
 
 /// GET /contacts — list all contacts with trust levels.
@@ -9702,6 +9965,71 @@ async fn connect_agent(
     }
 }
 
+/// POST /machines/connect — connect to a discovered machine.
+async fn connect_machine(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ConnectMachineRequest>,
+) -> impl IntoResponse {
+    let machine_id = match parse_machine_id_hex(&req.machine_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let connect_result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        state.agent.connect_to_machine(&machine_id),
+    )
+    .await;
+
+    match connect_result {
+        Ok(Ok(outcome)) => {
+            let (outcome_str, addr) = match outcome {
+                x0x::connectivity::ConnectOutcome::Direct(a) => ("Direct", Some(a.to_string())),
+                x0x::connectivity::ConnectOutcome::Coordinated(a) => {
+                    ("Coordinated", Some(a.to_string()))
+                }
+                x0x::connectivity::ConnectOutcome::AlreadyConnected => ("AlreadyConnected", None),
+                x0x::connectivity::ConnectOutcome::Unreachable => ("Unreachable", None),
+                x0x::connectivity::ConnectOutcome::NotFound => ("NotFound", None),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "outcome": outcome_str,
+                    "addr": addr
+                })),
+            )
+        }
+        Ok(Err(e)) => {
+            tracing::error!("connect_machine failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "connection failed" })),
+            )
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "connect_machine timed out after 60s for machine {}",
+                req.machine_id
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "outcome": "Unreachable",
+                    "addr": null
+                })),
+            )
+        }
+    }
+}
+
 /// POST /direct/send — send a direct message to a connected agent.
 async fn direct_send(
     State(state): State<Arc<AppState>>,
@@ -11517,10 +11845,7 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
         sender_hex
     );
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let (now_secs, now_ms) = file_transfer_now();
 
     let transfer = x0x::files::TransferState {
         transfer_id: offer.transfer_id.clone(),
@@ -11532,7 +11857,9 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
         status: x0x::files::TransferStatus::Pending,
         sha256: offer.sha256,
         error: None,
-        started_at: now,
+        started_at: now_secs,
+        started_at_unix_ms: now_ms,
+        completed_at_unix_ms: None,
         source_path: None,
         output_path: None,
         chunk_size: offer.chunk_size,
@@ -11597,6 +11924,7 @@ async fn handle_file_accept(state: &Arc<AppState>, sender: &AgentId, transfer_id
         if let Some(t) = transfers.get_mut(transfer_id) {
             t.status = x0x::files::TransferStatus::Failed;
             t.error = Some("No source path available".to_string());
+            t.completed_at_unix_ms = Some(file_transfer_now().1);
         }
         return;
     };
@@ -11632,6 +11960,7 @@ async fn stream_file_chunks(
             if let Some(t) = transfers.get_mut(transfer_id) {
                 t.status = x0x::files::TransferStatus::Failed;
                 t.error = Some(format!("Cannot open file: {e}"));
+                t.completed_at_unix_ms = Some(file_transfer_now().1);
             }
             return;
         }
@@ -11650,6 +11979,7 @@ async fn stream_file_chunks(
                 if let Some(t) = transfers.get_mut(transfer_id) {
                     t.status = x0x::files::TransferStatus::Failed;
                     t.error = Some(format!("Read error: {e}"));
+                    t.completed_at_unix_ms = Some(file_transfer_now().1);
                 }
                 return;
             }
@@ -11662,25 +11992,13 @@ async fn stream_file_chunks(
             data: chunk_data,
         });
 
-        let payload = match serde_json::to_vec(&chunk_msg) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("Serialize chunk failed: {e}");
-                let mut transfers = state.file_transfers.write().await;
-                if let Some(t) = transfers.get_mut(transfer_id) {
-                    t.status = x0x::files::TransferStatus::Failed;
-                    t.error = Some(format!("Serialization error: {e}"));
-                }
-                return;
-            }
-        };
-
-        if let Err(e) = state.agent.send_direct(agent_id, payload).await {
+        if let Err(e) = send_file_chunk_message(state, agent_id, &chunk_msg).await {
             tracing::error!("Send chunk {sequence} failed: {e}");
             let mut transfers = state.file_transfers.write().await;
             if let Some(t) = transfers.get_mut(transfer_id) {
                 t.status = x0x::files::TransferStatus::Failed;
                 t.error = Some(format!("Send failed at chunk {sequence}: {e}"));
+                t.completed_at_unix_ms = Some(file_transfer_now().1);
             }
             return;
         }
@@ -11702,22 +12020,22 @@ async fn stream_file_chunks(
         sha256: sha256.to_string(),
     });
 
-    if let Ok(payload) = serde_json::to_vec(&complete_msg) {
-        if let Err(e) = state.agent.send_direct(agent_id, payload).await {
-            tracing::error!("Send complete message failed: {e}");
-            let mut transfers = state.file_transfers.write().await;
-            if let Some(t) = transfers.get_mut(transfer_id) {
-                t.status = x0x::files::TransferStatus::Failed;
-                t.error = Some(format!("Send complete failed: {e}"));
-            }
-            return;
+    if let Err(e) = send_file_message(state, agent_id, &complete_msg).await {
+        tracing::error!("Send complete message failed: {e}");
+        let mut transfers = state.file_transfers.write().await;
+        if let Some(t) = transfers.get_mut(transfer_id) {
+            t.status = x0x::files::TransferStatus::Failed;
+            t.error = Some(format!("Send complete failed: {e}"));
+            t.completed_at_unix_ms = Some(file_transfer_now().1);
         }
+        return;
     }
 
     // Mark as complete on sender side
     let mut transfers = state.file_transfers.write().await;
     if let Some(t) = transfers.get_mut(transfer_id) {
         t.status = x0x::files::TransferStatus::Complete;
+        t.completed_at_unix_ms = Some(file_transfer_now().1);
     }
     tracing::info!("File transfer complete (sender): {transfer_id}");
 }
@@ -11744,6 +12062,7 @@ async fn handle_file_reject(
             }
             t.status = x0x::files::TransferStatus::Rejected;
             t.error = Some(reason.to_string());
+            t.completed_at_unix_ms = Some(file_transfer_now().1);
         }
     }
 }
@@ -11755,13 +12074,12 @@ async fn cleanup_failed_transfer(state: &Arc<AppState>, transfer_id: &str) {
     let part_path = state.transfers_dir.join(format!("{transfer_id}.part"));
     let _ = tokio::fs::remove_file(&part_path).await;
 
-    // Remove hasher
+    // Remove hasher + any buffered out-of-order chunks
     state.receive_hashers.write().await.remove(transfer_id);
+    state.pending_file_chunks.write().await.remove(transfer_id);
 }
 
 async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::files::FileChunk) {
-    use tokio::io::AsyncWriteExt;
-
     let sender_hex = hex::encode(sender.as_bytes());
 
     // Validate: transfer must exist, be a receiving transfer, be InProgress,
@@ -11773,7 +12091,6 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
                 if t.direction == x0x::files::TransferDirection::Receiving
                     && t.status == x0x::files::TransferStatus::InProgress =>
             {
-                // Authenticate: chunk must come from the agent who made the offer
                 if t.remote_agent_id != sender_hex {
                     tracing::warn!(
                         "Chunk from wrong agent for {}: expected {} got {sender_hex}",
@@ -11782,7 +12099,6 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
                     );
                     return;
                 }
-                // Compute expected sequence from bytes received so far
                 if t.chunk_size > 0 {
                     t.bytes_transferred / t.chunk_size as u64
                 } else {
@@ -11805,80 +12121,15 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
         }
     };
 
-    // Validate chunk ordering
-    if chunk.sequence != expected_sequence {
-        tracing::error!(
-            "Out-of-order chunk for {}: expected seq {} got {}",
-            chunk.transfer_id,
-            expected_sequence,
-            chunk.sequence
-        );
-        let mut transfers = state.file_transfers.write().await;
-        if let Some(t) = transfers.get_mut(&chunk.transfer_id) {
-            t.status = x0x::files::TransferStatus::Failed;
-            t.error = Some(format!(
-                "Out-of-order chunk: expected {} got {}",
-                expected_sequence, chunk.sequence
-            ));
-        }
-        drop(transfers);
-        cleanup_failed_transfer(state, &chunk.transfer_id).await;
-        return;
-    }
-
-    // Decode base64 data
     let data = match base64::engine::general_purpose::STANDARD.decode(&chunk.data) {
         Ok(d) => d,
         Err(e) => {
             tracing::error!("Chunk decode error for {}: {e}", chunk.transfer_id);
-            return;
-        }
-    };
-
-    // Enforce cumulative size limit
-    {
-        let transfers = state.file_transfers.read().await;
-        if let Some(t) = transfers.get(&chunk.transfer_id) {
-            let new_total = t.bytes_transferred + data.len() as u64;
-            if new_total > t.total_size {
-                tracing::error!(
-                    "Transfer {} exceeds declared size: {} + {} > {}",
-                    chunk.transfer_id,
-                    t.bytes_transferred,
-                    data.len(),
-                    t.total_size
-                );
-                drop(transfers);
-                let mut transfers = state.file_transfers.write().await;
-                if let Some(t) = transfers.get_mut(&chunk.transfer_id) {
-                    t.status = x0x::files::TransferStatus::Failed;
-                    t.error = Some("Received data exceeds declared file size".to_string());
-                }
-                drop(transfers);
-                cleanup_failed_transfer(state, &chunk.transfer_id).await;
-                return;
-            }
-        }
-    }
-
-    let part_path = state
-        .transfers_dir
-        .join(format!("{}.part", chunk.transfer_id));
-
-    // Append to partial file
-    let mut file = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&part_path)
-        .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!("Cannot open part file {}: {e}", part_path.display());
             let mut transfers = state.file_transfers.write().await;
             if let Some(t) = transfers.get_mut(&chunk.transfer_id) {
                 t.status = x0x::files::TransferStatus::Failed;
-                t.error = Some(format!("Cannot write chunk: {e}"));
+                t.error = Some(format!("Chunk decode error: {e}"));
+                t.completed_at_unix_ms = Some(file_transfer_now().1);
             }
             drop(transfers);
             cleanup_failed_transfer(state, &chunk.transfer_id).await;
@@ -11886,34 +12137,255 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
         }
     };
 
-    if let Err(e) = file.write_all(&data).await {
-        tracing::error!("Write chunk failed for {}: {e}", chunk.transfer_id);
-        let mut transfers = state.file_transfers.write().await;
-        if let Some(t) = transfers.get_mut(&chunk.transfer_id) {
-            t.status = x0x::files::TransferStatus::Failed;
-            t.error = Some(format!("Write failed: {e}"));
-        }
-        drop(transfers);
-        cleanup_failed_transfer(state, &chunk.transfer_id).await;
+    if chunk.sequence < expected_sequence {
+        tracing::debug!(
+            transfer_id = %chunk.transfer_id,
+            sequence = chunk.sequence,
+            expected_sequence,
+            "ignoring duplicate/stale file chunk"
+        );
         return;
     }
 
-    // Update incremental SHA-256 hasher
-    {
-        let mut hashers = state.receive_hashers.write().await;
-        hashers
-            .entry(chunk.transfer_id.clone())
-            .or_insert_with(Sha256::new)
-            .update(&data);
+    if chunk.sequence > expected_sequence {
+        let mut pending = state.pending_file_chunks.write().await;
+        let entry = pending.entry(chunk.transfer_id.clone()).or_default();
+        if entry.insert(chunk.sequence, data).is_some() {
+            tracing::debug!(
+                transfer_id = %chunk.transfer_id,
+                sequence = chunk.sequence,
+                "replaced buffered out-of-order file chunk"
+            );
+        } else {
+            tracing::debug!(
+                transfer_id = %chunk.transfer_id,
+                sequence = chunk.sequence,
+                expected_sequence,
+                "buffered out-of-order file chunk"
+            );
+        }
+        return;
     }
 
-    // Update progress
-    {
+    if let Err(e) = apply_ready_file_chunks(state, &chunk.transfer_id, chunk.sequence, data).await {
+        tracing::error!("File chunk apply failed for {}: {e}", chunk.transfer_id);
         let mut transfers = state.file_transfers.write().await;
         if let Some(t) = transfers.get_mut(&chunk.transfer_id) {
-            t.bytes_transferred += data.len() as u64;
+            t.status = x0x::files::TransferStatus::Failed;
+            t.error = Some(e);
+            t.completed_at_unix_ms = Some(file_transfer_now().1);
+        }
+        drop(transfers);
+        cleanup_failed_transfer(state, &chunk.transfer_id).await;
+    }
+}
+
+async fn apply_ready_file_chunks(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    first_sequence: u64,
+    first_data: Vec<u8>,
+) -> std::result::Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+
+    let part_path = state.transfers_dir.join(format!("{transfer_id}.part"));
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&part_path)
+        .await
+        .map_err(|e| format!("Cannot write chunk: {e}"))?;
+
+    let mut sequence = first_sequence;
+    let mut data = first_data;
+
+    loop {
+        let (expected_sequence, new_total, total_size) = {
+            let transfers = state.file_transfers.read().await;
+            let t = transfers
+                .get(transfer_id)
+                .ok_or_else(|| "transfer disappeared during chunk apply".to_string())?;
+            let expected = if t.chunk_size > 0 {
+                t.bytes_transferred / t.chunk_size as u64
+            } else {
+                0
+            };
+            if sequence != expected {
+                return Err(format!(
+                    "Out-of-order chunk: expected {} got {}",
+                    expected, sequence
+                ));
+            }
+            let new_total = t.bytes_transferred + data.len() as u64;
+            if new_total > t.total_size {
+                return Err(format!(
+                    "Received data exceeds declared file size: {} + {} > {}",
+                    t.bytes_transferred,
+                    data.len(),
+                    t.total_size
+                ));
+            }
+            (expected, new_total, t.total_size)
+        };
+
+        file.write_all(&data)
+            .await
+            .map_err(|e| format!("Write failed: {e}"))?;
+
+        {
+            let mut hashers = state.receive_hashers.write().await;
+            hashers
+                .entry(transfer_id.to_string())
+                .or_insert_with(Sha256::new)
+                .update(&data);
+        }
+
+        let maybe_expected_sha256 = {
+            let mut transfers = state.file_transfers.write().await;
+            let t = transfers
+                .get_mut(transfer_id)
+                .ok_or_else(|| "transfer disappeared while updating progress".to_string())?;
+            t.bytes_transferred = new_total;
+            if t.bytes_transferred == t.total_size {
+                Some(t.sha256.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(expected_sha256) = maybe_expected_sha256 {
+            finalize_received_transfer(state, transfer_id, &expected_sha256).await;
+            return Ok(());
+        }
+
+        let next_sequence = expected_sequence + 1;
+        let maybe_buffered = {
+            let mut pending = state.pending_file_chunks.write().await;
+            let next = pending
+                .get_mut(transfer_id)
+                .and_then(|buffer| buffer.remove(&next_sequence));
+            let empty = pending
+                .get(transfer_id)
+                .is_some_and(std::collections::BTreeMap::is_empty);
+            if empty {
+                pending.remove(transfer_id);
+            }
+            next
+        };
+
+        match maybe_buffered {
+            Some(next) => {
+                sequence = next_sequence;
+                data = next;
+            }
+            None => {
+                if new_total < total_size {
+                    return Ok(());
+                }
+                return Ok(());
+            }
         }
     }
+}
+
+async fn finalize_received_transfer(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    expected_sha256: &str,
+) {
+    let part_path = state.transfers_dir.join(format!("{transfer_id}.part"));
+
+    let computed_hash = {
+        let mut hashers = state.receive_hashers.write().await;
+        match hashers.remove(transfer_id) {
+            Some(hasher) => hex::encode(hasher.finalize()),
+            None => {
+                tracing::error!("No hasher found for transfer {transfer_id}");
+                let mut transfers = state.file_transfers.write().await;
+                if let Some(t) = transfers.get_mut(transfer_id) {
+                    t.status = x0x::files::TransferStatus::Failed;
+                    t.error = Some("No hash state found".to_string());
+                    t.completed_at_unix_ms = Some(file_transfer_now().1);
+                }
+                return;
+            }
+        }
+    };
+
+    if computed_hash != expected_sha256 {
+        tracing::error!(
+            "SHA-256 mismatch for {transfer_id}: expected {} got {}",
+            expected_sha256,
+            computed_hash
+        );
+        let _ = tokio::fs::remove_file(&part_path).await;
+        let mut transfers = state.file_transfers.write().await;
+        if let Some(t) = transfers.get_mut(transfer_id) {
+            t.status = x0x::files::TransferStatus::Failed;
+            t.error = Some(format!(
+                "SHA-256 mismatch: expected {} got {}",
+                expected_sha256, computed_hash
+            ));
+            t.completed_at_unix_ms = Some(file_transfer_now().1);
+        }
+        return;
+    }
+
+    let raw_filename = {
+        let transfers = state.file_transfers.read().await;
+        transfers
+            .get(transfer_id)
+            .map(|t| t.filename.clone())
+            .unwrap_or_else(|| transfer_id.to_string())
+    };
+    let base_name = std::path::Path::new(&raw_filename)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| transfer_id.to_string());
+    let id_prefix = if transfer_id.len() >= 8 {
+        &transfer_id[..8]
+    } else {
+        transfer_id
+    };
+    let filename = format!("{id_prefix}_{base_name}");
+
+    let final_path = state.transfers_dir.join(&filename);
+    if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
+        tracing::error!("Failed to rename part file: {e}");
+        let mut transfers = state.file_transfers.write().await;
+        if let Some(t) = transfers.get_mut(transfer_id) {
+            t.status = x0x::files::TransferStatus::Failed;
+            t.error = Some(format!("Failed to finalize file: {e}"));
+            t.completed_at_unix_ms = Some(file_transfer_now().1);
+        }
+        return;
+    }
+
+    {
+        let mut transfers = state.file_transfers.write().await;
+        if let Some(t) = transfers.get_mut(transfer_id) {
+            t.status = x0x::files::TransferStatus::Complete;
+            t.output_path = Some(final_path.to_string_lossy().to_string());
+            t.completed_at_unix_ms = Some(file_transfer_now().1);
+        }
+    }
+    state.pending_file_chunks.write().await.remove(transfer_id);
+
+    let _ = state.broadcast_tx.send(SseEvent {
+        event_type: "file:complete".to_string(),
+        data: serde_json::json!({
+            "transfer_id": transfer_id,
+            "filename": filename,
+            "sha256": computed_hash,
+            "path": final_path.to_string_lossy(),
+        }),
+    });
+
+    tracing::info!(
+        "File transfer complete (receiver): {} -> {}",
+        transfer_id,
+        final_path.display()
+    );
 }
 
 /// Handle a file-complete message — verify SHA-256 and finalize.
@@ -11928,15 +12400,16 @@ async fn handle_file_complete(
 
     // Validate: transfer must exist, be receiving, be InProgress,
     // and the sender must match the original offer's remote_agent_id.
-    // Also retrieve the stored SHA-256 from the original offer.
-    let expected_sha256 = {
+    // If the sender's complete arrives before the last chunk is processed,
+    // defer finalization — the chunk handler will finalize as soon as the
+    // declared byte count has been received.
+    let (expected_sha256, bytes_transferred, total_size) = {
         let transfers = state.file_transfers.read().await;
         match transfers.get(&complete.transfer_id) {
             Some(t)
                 if t.direction == x0x::files::TransferDirection::Receiving
                     && t.status == x0x::files::TransferStatus::InProgress =>
             {
-                // Authenticate: complete must come from the agent who made the offer
                 if t.remote_agent_id != sender_hex {
                     tracing::warn!(
                         "Complete from wrong agent for {}: expected {} got {sender_hex}",
@@ -11945,7 +12418,7 @@ async fn handle_file_complete(
                     );
                     return;
                 }
-                t.sha256.clone()
+                (t.sha256.clone(), t.bytes_transferred, t.total_size)
             }
             Some(t) => {
                 tracing::warn!(
@@ -11966,104 +12439,15 @@ async fn handle_file_complete(
         }
     };
 
-    let part_path = state
-        .transfers_dir
-        .join(format!("{}.part", complete.transfer_id));
-
-    // Finalize SHA-256
-    let computed_hash = {
-        let mut hashers = state.receive_hashers.write().await;
-        match hashers.remove(&complete.transfer_id) {
-            Some(hasher) => hex::encode(hasher.finalize()),
-            None => {
-                tracing::error!("No hasher found for transfer {}", complete.transfer_id);
-                let mut transfers = state.file_transfers.write().await;
-                if let Some(t) = transfers.get_mut(&complete.transfer_id) {
-                    t.status = x0x::files::TransferStatus::Failed;
-                    t.error = Some("No hash state found".to_string());
-                }
-                return;
-            }
-        }
-    };
-
-    // Compare computed hash against the SHA-256 from the original offer,
-    // NOT the attacker-supplied complete.sha256 field.
-    if computed_hash != expected_sha256 {
-        tracing::error!(
-            "SHA-256 mismatch for {}: expected {} got {}",
-            complete.transfer_id,
-            expected_sha256,
-            computed_hash
+    if bytes_transferred < total_size {
+        tracing::info!(
+            transfer_id = %complete.transfer_id,
+            bytes_transferred,
+            total_size,
+            "file complete arrived before final chunk; deferring finalize until declared bytes are received"
         );
-        // Clean up partial file
-        let _ = tokio::fs::remove_file(&part_path).await;
-        let mut transfers = state.file_transfers.write().await;
-        if let Some(t) = transfers.get_mut(&complete.transfer_id) {
-            t.status = x0x::files::TransferStatus::Failed;
-            t.error = Some(format!(
-                "SHA-256 mismatch: expected {} got {}",
-                expected_sha256, computed_hash
-            ));
-        }
         return;
     }
 
-    // Move to final location — sanitize filename to prevent path traversal
-    let raw_filename = {
-        let transfers = state.file_transfers.read().await;
-        transfers
-            .get(&complete.transfer_id)
-            .map(|t| t.filename.clone())
-            .unwrap_or_else(|| complete.transfer_id.clone())
-    };
-    // Strip any path components — only keep the final filename segment
-    let base_name = std::path::Path::new(&raw_filename)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| complete.transfer_id.clone());
-    // Prefix with transfer_id to avoid filename collisions (safe slice)
-    let id_prefix = if complete.transfer_id.len() >= 8 {
-        &complete.transfer_id[..8]
-    } else {
-        &complete.transfer_id
-    };
-    let filename = format!("{id_prefix}_{base_name}");
-
-    let final_path = state.transfers_dir.join(&filename);
-    if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
-        tracing::error!("Failed to rename part file: {e}");
-        let mut transfers = state.file_transfers.write().await;
-        if let Some(t) = transfers.get_mut(&complete.transfer_id) {
-            t.status = x0x::files::TransferStatus::Failed;
-            t.error = Some(format!("Failed to finalize file: {e}"));
-        }
-        return;
-    }
-
-    // Mark complete
-    {
-        let mut transfers = state.file_transfers.write().await;
-        if let Some(t) = transfers.get_mut(&complete.transfer_id) {
-            t.status = x0x::files::TransferStatus::Complete;
-            t.output_path = Some(final_path.to_string_lossy().to_string());
-        }
-    }
-
-    // Emit SSE event
-    let _ = state.broadcast_tx.send(SseEvent {
-        event_type: "file:complete".to_string(),
-        data: serde_json::json!({
-            "transfer_id": complete.transfer_id,
-            "filename": filename,
-            "sha256": computed_hash,
-            "path": final_path.to_string_lossy(),
-        }),
-    });
-
-    tracing::info!(
-        "File transfer complete (receiver): {} -> {}",
-        complete.transfer_id,
-        final_path.display()
-    );
+    finalize_received_transfer(state, &complete.transfer_id, &expected_sha256).await;
 }

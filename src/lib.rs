@@ -199,6 +199,11 @@ pub struct Agent {
     identity_discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
+    /// Cache of discovered machine endpoints from machine announcements and
+    /// agent→machine identity links.
+    machine_discovery_cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
     /// Ensures identity discovery listener is spawned once.
     identity_listener_started: std::sync::atomic::AtomicBool,
     /// How often to re-announce identity (seconds).
@@ -268,6 +273,9 @@ pub struct Message {
 /// Reserved gossip topic for signed identity announcements.
 pub const IDENTITY_ANNOUNCE_TOPIC: &str = "x0x.identity.announce.v1";
 
+/// Reserved gossip topic for signed machine endpoint announcements.
+pub const MACHINE_ANNOUNCE_TOPIC: &str = "x0x.machine.announce.v1";
+
 /// Return the shard-specific gossip topic for the given `agent_id`.
 ///
 /// Each agent publishes identity announcements to a deterministic shard topic
@@ -281,6 +289,16 @@ pub const IDENTITY_ANNOUNCE_TOPIC: &str = "x0x.identity.announce.v1";
 pub fn shard_topic_for_agent(agent_id: &identity::AgentId) -> String {
     let shard = saorsa_gossip_rendezvous::calculate_shard(&agent_id.0);
     format!("x0x.identity.shard.{shard}")
+}
+
+/// Return the shard-specific gossip topic for the given `machine_id`.
+///
+/// Machine shards let callers actively wait for a transport endpoint by
+/// machine identity, then resolve agent/user identities onto that endpoint.
+#[must_use]
+pub fn shard_topic_for_machine(machine_id: &identity::MachineId) -> String {
+    let shard = saorsa_gossip_rendezvous::calculate_shard(&machine_id.0);
+    format!("x0x.machine.shard.{shard}")
 }
 
 /// Gossip topic prefix for rendezvous `ProviderSummary` advertisements.
@@ -437,9 +455,15 @@ struct IdentityAnnouncementUnsigned {
     nat_type: Option<String>,
     /// Whether the machine can receive direct inbound connections.
     can_receive_direct: Option<bool>,
-    /// Whether the machine is currently relaying traffic for others.
+    /// Whether the machine advertises relay service capability to peers.
+    ///
+    /// This is a stable capability hint, not proof that the machine is
+    /// actively relaying traffic right now.
     is_relay: Option<bool>,
-    /// Whether the machine is coordinating NAT traversal for peers.
+    /// Whether the machine advertises coordinator capability to peers.
+    ///
+    /// This is a stable capability hint, not proof that the machine is
+    /// actively coordinating a traversal right now.
     is_coordinator: Option<bool>,
 }
 
@@ -471,11 +495,17 @@ pub struct IdentityAnnouncement {
     /// Whether the machine can receive direct inbound connections.
     /// `None` when the network is not yet started.
     pub can_receive_direct: Option<bool>,
-    /// Whether the machine is currently relaying traffic for peers behind strict NATs.
+    /// Whether the machine advertises relay service capability to peers.
+    ///
+    /// This is a stable capability hint derived from transport configuration,
+    /// not proof that the machine is actively relaying traffic right now.
     /// `None` when the network is not yet started.
     pub is_relay: Option<bool>,
-    /// Whether the machine is coordinating NAT traversal hole-punch timing for peers.
-    /// `None` when the network is not yet started.
+    /// Whether the machine advertises coordinator capability to peers.
+    ///
+    /// This is a stable capability hint derived from transport configuration,
+    /// not proof that the machine is actively coordinating a traversal right
+    /// now. `None` when the network is not yet started.
     pub is_coordinator: Option<bool>,
 }
 
@@ -562,6 +592,109 @@ impl IdentityAnnouncement {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MachineAnnouncementUnsigned {
+    machine_id: identity::MachineId,
+    machine_public_key: Vec<u8>,
+    addresses: Vec<std::net::SocketAddr>,
+    announced_at: u64,
+    /// NAT type string (e.g. "FullCone", "Symmetric", "Unknown").
+    nat_type: Option<String>,
+    /// Whether the machine can receive direct inbound connections.
+    can_receive_direct: Option<bool>,
+    /// Whether the machine advertises relay service capability to peers.
+    is_relay: Option<bool>,
+    /// Whether the machine advertises coordinator capability to peers.
+    is_coordinator: Option<bool>,
+}
+
+/// Signed machine endpoint announcement.
+///
+/// This is the transport-level discovery record: it says "machine X is
+/// reachable at these IPv4/IPv6 endpoints, with these NAT/relay/coordinator
+/// hints". Agent and user identities link to this machine separately through
+/// signed identity announcements.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MachineAnnouncement {
+    /// Machine identity for the daemon process.
+    pub machine_id: identity::MachineId,
+    /// Machine ML-DSA-65 public key bytes.
+    pub machine_public_key: Vec<u8>,
+    /// Machine ML-DSA-65 signature over the unsigned announcement.
+    pub machine_signature: Vec<u8>,
+    /// Reachability hints.
+    pub addresses: Vec<std::net::SocketAddr>,
+    /// Unix timestamp (seconds) of announcement creation.
+    pub announced_at: u64,
+    /// NAT type as detected by the network layer (e.g. "FullCone", "Symmetric").
+    /// `None` when the network is not yet started or NAT type is undetermined.
+    pub nat_type: Option<String>,
+    /// Whether the machine can receive direct inbound connections.
+    /// `None` when the network is not yet started.
+    pub can_receive_direct: Option<bool>,
+    /// Whether the machine advertises relay service capability to peers.
+    pub is_relay: Option<bool>,
+    /// Whether the machine advertises coordinator capability to peers.
+    pub is_coordinator: Option<bool>,
+}
+
+impl MachineAnnouncement {
+    fn to_unsigned(&self) -> MachineAnnouncementUnsigned {
+        MachineAnnouncementUnsigned {
+            machine_id: self.machine_id,
+            machine_public_key: self.machine_public_key.clone(),
+            addresses: self.addresses.clone(),
+            announced_at: self.announced_at,
+            nat_type: self.nat_type.clone(),
+            can_receive_direct: self.can_receive_direct,
+            is_relay: self.is_relay,
+            is_coordinator: self.is_coordinator,
+        }
+    }
+
+    /// Verify the machine-key attestation for this endpoint announcement.
+    pub fn verify(&self) -> error::Result<()> {
+        let machine_pub =
+            ant_quic::MlDsaPublicKey::from_bytes(&self.machine_public_key).map_err(|_| {
+                error::IdentityError::CertificateVerification(
+                    "invalid machine public key in machine announcement".to_string(),
+                )
+            })?;
+        let derived_machine_id = identity::MachineId::from_public_key(&machine_pub);
+        if derived_machine_id != self.machine_id {
+            return Err(error::IdentityError::CertificateVerification(
+                "machine_id does not match machine public key".to_string(),
+            ));
+        }
+
+        let unsigned_bytes = bincode::serialize(&self.to_unsigned()).map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "failed to serialize machine announcement for verification: {e}"
+            ))
+        })?;
+        let signature = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
+            &self.machine_signature,
+        )
+        .map_err(|e| {
+            error::IdentityError::CertificateVerification(format!(
+                "invalid machine signature in machine announcement: {:?}",
+                e
+            ))
+        })?;
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            &machine_pub,
+            &unsigned_bytes,
+            &signature,
+        )
+        .map_err(|e| {
+            error::IdentityError::CertificateVerification(format!(
+                "machine announcement signature verification failed: {:?}",
+                e
+            ))
+        })
+    }
+}
+
 /// Cached discovery data derived from identity announcements.
 #[derive(Debug, Clone)]
 pub struct DiscoveredAgent {
@@ -589,12 +722,224 @@ pub struct DiscoveredAgent {
     /// Whether this agent's machine can receive direct inbound connections.
     /// `None` if not reported.
     pub can_receive_direct: Option<bool>,
-    /// Whether this agent's machine is acting as a relay for peers behind strict NATs.
+    /// Whether this agent's machine advertises relay service capability.
     /// `None` if not reported.
     pub is_relay: Option<bool>,
-    /// Whether this agent's machine is coordinating NAT traversal timing for peers.
+    /// Whether this agent's machine advertises coordinator capability.
     /// `None` if not reported.
     pub is_coordinator: Option<bool>,
+}
+
+/// Cached machine endpoint data derived from signed machine announcements.
+#[derive(Debug, Clone)]
+pub struct DiscoveredMachine {
+    /// Machine identity, identical to the ant-quic `PeerId`.
+    pub machine_id: identity::MachineId,
+    /// Reachability hints for this machine.
+    pub addresses: Vec<std::net::SocketAddr>,
+    /// Announcement timestamp from the sender.
+    pub announced_at: u64,
+    /// Local timestamp (seconds) when this record was last updated.
+    pub last_seen: u64,
+    /// Raw ML-DSA-65 machine public key bytes from the announcement.
+    pub machine_public_key: Vec<u8>,
+    /// NAT type reported by this machine.
+    pub nat_type: Option<String>,
+    /// Whether this machine can receive direct inbound connections.
+    pub can_receive_direct: Option<bool>,
+    /// Whether this machine advertises relay service capability.
+    pub is_relay: Option<bool>,
+    /// Whether this machine advertises coordinator capability.
+    pub is_coordinator: Option<bool>,
+    /// Agent identities currently linked to this machine.
+    pub agent_ids: Vec<identity::AgentId>,
+    /// Human identities currently linked to this machine by consented agent
+    /// announcements.
+    pub user_ids: Vec<identity::UserId>,
+}
+
+impl DiscoveredMachine {
+    fn from_machine_announcement(
+        announcement: &MachineAnnouncement,
+        addresses: Vec<std::net::SocketAddr>,
+        last_seen: u64,
+    ) -> Self {
+        Self {
+            machine_id: announcement.machine_id,
+            addresses,
+            announced_at: announcement.announced_at,
+            last_seen,
+            machine_public_key: announcement.machine_public_key.clone(),
+            nat_type: announcement.nat_type.clone(),
+            can_receive_direct: announcement.can_receive_direct,
+            is_relay: announcement.is_relay,
+            is_coordinator: announcement.is_coordinator,
+            agent_ids: Vec::new(),
+            user_ids: Vec::new(),
+        }
+    }
+
+    fn from_discovered_agent(agent: &DiscoveredAgent) -> Self {
+        Self {
+            machine_id: agent.machine_id,
+            addresses: agent.addresses.clone(),
+            announced_at: agent.announced_at,
+            last_seen: agent.last_seen,
+            machine_public_key: agent.machine_public_key.clone(),
+            nat_type: agent.nat_type.clone(),
+            can_receive_direct: agent.can_receive_direct,
+            is_relay: agent.is_relay,
+            is_coordinator: agent.is_coordinator,
+            agent_ids: vec![agent.agent_id],
+            user_ids: agent.user_id.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AnnouncementAssistSnapshot {
+    nat_type: Option<String>,
+    can_receive_direct: Option<bool>,
+    relay_capable: Option<bool>,
+    coordinator_capable: Option<bool>,
+    relay_active: Option<bool>,
+    coordinator_active: Option<bool>,
+}
+
+impl AnnouncementAssistSnapshot {
+    fn from_node_status(status: &ant_quic::NodeStatus) -> Self {
+        Self {
+            nat_type: Some(status.nat_type.to_string()),
+            can_receive_direct: Some(status.can_receive_direct),
+            relay_capable: Some(status.relay_service_enabled),
+            coordinator_capable: Some(status.coordinator_service_enabled),
+            relay_active: Some(status.is_relaying),
+            coordinator_active: Some(status.is_coordinating),
+        }
+    }
+}
+
+fn push_unique<T: Copy + PartialEq>(items: &mut Vec<T>, item: T) {
+    if !items.contains(&item) {
+        items.push(item);
+    }
+}
+
+fn sort_discovered_machine(machine: &mut DiscoveredMachine) {
+    machine.addresses.sort_by_key(|addr| addr.to_string());
+    machine.agent_ids.sort_by_key(|id| id.0);
+    machine.user_ids.sort_by_key(|id| id.0);
+}
+
+async fn upsert_discovered_machine(
+    cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
+    mut incoming: DiscoveredMachine,
+) {
+    if incoming.machine_id.0 == [0u8; 32] {
+        return;
+    }
+
+    sort_discovered_machine(&mut incoming);
+    let mut cache = cache.write().await;
+    match cache.get_mut(&incoming.machine_id) {
+        Some(existing) => {
+            for addr in incoming.addresses {
+                if !existing.addresses.contains(&addr) {
+                    existing.addresses.push(addr);
+                }
+            }
+            if incoming.announced_at >= existing.announced_at {
+                existing.announced_at = incoming.announced_at;
+                if !incoming.machine_public_key.is_empty() {
+                    existing.machine_public_key = incoming.machine_public_key;
+                }
+                if incoming.nat_type.is_some() {
+                    existing.nat_type = incoming.nat_type;
+                }
+                if incoming.can_receive_direct.is_some() {
+                    existing.can_receive_direct = incoming.can_receive_direct;
+                }
+                if incoming.is_relay.is_some() {
+                    existing.is_relay = incoming.is_relay;
+                }
+                if incoming.is_coordinator.is_some() {
+                    existing.is_coordinator = incoming.is_coordinator;
+                }
+            }
+            existing.last_seen = existing.last_seen.max(incoming.last_seen);
+            for agent_id in incoming.agent_ids {
+                push_unique(&mut existing.agent_ids, agent_id);
+            }
+            for user_id in incoming.user_ids {
+                push_unique(&mut existing.user_ids, user_id);
+            }
+            sort_discovered_machine(existing);
+        }
+        None => {
+            cache.insert(incoming.machine_id, incoming);
+        }
+    }
+}
+
+async fn upsert_discovered_machine_from_agent(
+    cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
+    agent: &DiscoveredAgent,
+) {
+    if agent.machine_id.0 != [0u8; 32] {
+        upsert_discovered_machine(cache, DiscoveredMachine::from_discovered_agent(agent)).await;
+    }
+}
+
+fn build_machine_announcement_for_identity(
+    identity: &identity::Identity,
+    addresses: Vec<std::net::SocketAddr>,
+    announced_at: u64,
+    assist_snapshot: Option<&AnnouncementAssistSnapshot>,
+) -> error::Result<MachineAnnouncement> {
+    let machine_public_key = identity.machine_keypair().public_key().as_bytes().to_vec();
+    let unsigned = MachineAnnouncementUnsigned {
+        machine_id: identity.machine_id(),
+        machine_public_key: machine_public_key.clone(),
+        addresses,
+        announced_at,
+        nat_type: assist_snapshot.and_then(|snapshot| snapshot.nat_type.clone()),
+        can_receive_direct: assist_snapshot.and_then(|snapshot| snapshot.can_receive_direct),
+        is_relay: assist_snapshot.and_then(|snapshot| snapshot.relay_capable),
+        is_coordinator: assist_snapshot.and_then(|snapshot| snapshot.coordinator_capable),
+    };
+    let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
+        error::IdentityError::Serialization(format!(
+            "failed to serialize unsigned machine announcement: {e}"
+        ))
+    })?;
+    let machine_signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        identity.machine_keypair().secret_key(),
+        &unsigned_bytes,
+    )
+    .map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!(
+            "failed to sign machine announcement with machine key: {:?}",
+            e
+        )))
+    })?
+    .as_bytes()
+    .to_vec();
+
+    Ok(MachineAnnouncement {
+        machine_id: unsigned.machine_id,
+        machine_public_key,
+        machine_signature,
+        addresses: unsigned.addresses,
+        announced_at: unsigned.announced_at,
+        nat_type: unsigned.nat_type,
+        can_receive_direct: unsigned.can_receive_direct,
+        is_relay: unsigned.is_relay,
+        is_coordinator: unsigned.is_coordinator,
+    })
 }
 
 /// Builder for configuring an [`Agent`] before connecting to the network.
@@ -671,6 +1016,9 @@ struct HeartbeatContext {
     cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
+    machine_cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
     /// Whether the user has consented to identity disclosure.  When true,
     /// heartbeats include `user_id` and `agent_certificate` so they don't
     /// erase a consented disclosure.
@@ -745,17 +1093,19 @@ impl HeartbeatContext {
         // tests/proof-reports/MDNS_VS_GOSSIP_ADDRESS_SCOPE_20260415.md).
         addresses.retain(|a| is_publicly_advertisable(*a));
 
-        // Query NAT and relay status from the network layer.
-        let (nat_type, can_receive_direct, is_relay, is_coordinator) =
-            match self.network.node_status().await {
-                Some(status) => (
-                    Some(status.nat_type.to_string()),
-                    Some(status.can_receive_direct),
-                    Some(status.is_relaying),
-                    Some(status.is_coordinating),
-                ),
-                None => (None, None, None, None),
-            };
+        // Query reachability plus stable relay/coordinator capability from
+        // the network layer. Runtime activity is logged separately so we do
+        // not conflate "can help" with "is currently busy helping".
+        let assist_snapshot = self
+            .network
+            .node_status()
+            .await
+            .map(|status| AnnouncementAssistSnapshot::from_node_status(&status))
+            .unwrap_or_default();
+        let nat_type = assist_snapshot.nat_type.clone();
+        let can_receive_direct = assist_snapshot.can_receive_direct;
+        let relay_capable = assist_snapshot.relay_capable;
+        let coordinator_capable = assist_snapshot.coordinator_capable;
 
         // Include user identity ONLY if the user has previously consented
         // via announce_identity(true, true). This preserves the consented
@@ -784,8 +1134,8 @@ impl HeartbeatContext {
             announced_at,
             nat_type: nat_type.clone(),
             can_receive_direct,
-            is_relay,
-            is_coordinator,
+            is_relay: relay_capable,
+            is_coordinator: coordinator_capable,
         };
         let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -816,9 +1166,68 @@ impl HeartbeatContext {
             announced_at,
             nat_type,
             can_receive_direct,
-            is_relay,
-            is_coordinator,
+            is_relay: relay_capable,
+            is_coordinator: coordinator_capable,
         };
+        tracing::debug!(
+            target: "x0x::discovery",
+            announcement_kind = "heartbeat",
+            machine_prefix = %network::hex_prefix(&announcement.machine_id.0, 4),
+            addr_total = announcement.addresses.len(),
+            nat_type = announcement.nat_type.as_deref().unwrap_or("unknown"),
+            can_receive_direct = ?announcement.can_receive_direct,
+            relay_capable = ?announcement.is_relay,
+            coordinator_capable = ?announcement.is_coordinator,
+            relay_active = ?assist_snapshot.relay_active,
+            coordinator_active = ?assist_snapshot.coordinator_active,
+            "publishing identity announcement"
+        );
+
+        let machine_announcement = build_machine_announcement_for_identity(
+            &self.identity,
+            announcement.addresses.clone(),
+            announced_at,
+            Some(&assist_snapshot),
+        )?;
+        tracing::debug!(
+            target: "x0x::discovery",
+            announcement_kind = "machine_heartbeat",
+            machine_prefix = %network::hex_prefix(&machine_announcement.machine_id.0, 4),
+            addr_total = machine_announcement.addresses.len(),
+            nat_type = machine_announcement.nat_type.as_deref().unwrap_or("unknown"),
+            can_receive_direct = ?machine_announcement.can_receive_direct,
+            relay_capable = ?machine_announcement.is_relay,
+            coordinator_capable = ?machine_announcement.is_coordinator,
+            "publishing machine announcement"
+        );
+        let machine_encoded = bincode::serialize(&machine_announcement).map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "heartbeat: failed to serialize machine announcement: {e}"
+            ))
+        })?;
+        let machine_payload = bytes::Bytes::from(machine_encoded);
+        self.runtime
+            .pubsub()
+            .publish(
+                shard_topic_for_machine(&machine_announcement.machine_id),
+                machine_payload.clone(),
+            )
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "heartbeat: machine shard publish failed: {e}"
+                )))
+            })?;
+        self.runtime
+            .pubsub()
+            .publish(MACHINE_ANNOUNCE_TOPIC.to_string(), machine_payload)
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "heartbeat: machine publish failed: {e}"
+                )))
+            })?;
+
         let encoded = bincode::serialize(&announcement).map_err(|e| {
             error::IdentityError::Serialization(format!(
                 "heartbeat: failed to serialize announcement: {e}"
@@ -837,22 +1246,33 @@ impl HeartbeatContext {
                 )))
             })?;
         let now = Agent::unix_timestamp_secs();
-        self.cache.write().await.insert(
-            announcement.agent_id,
-            DiscoveredAgent {
-                agent_id: announcement.agent_id,
-                machine_id: announcement.machine_id,
-                user_id: announcement.user_id,
-                addresses: announcement.addresses,
-                announced_at: announcement.announced_at,
-                last_seen: now,
-                machine_public_key: machine_public_key.clone(),
-                nat_type: announcement.nat_type.clone(),
-                can_receive_direct: announcement.can_receive_direct,
-                is_relay: announcement.is_relay,
-                is_coordinator: announcement.is_coordinator,
-            },
-        );
+        upsert_discovered_machine(
+            &self.machine_cache,
+            DiscoveredMachine::from_machine_announcement(
+                &machine_announcement,
+                machine_announcement.addresses.clone(),
+                now,
+            ),
+        )
+        .await;
+        let discovered_agent = DiscoveredAgent {
+            agent_id: announcement.agent_id,
+            machine_id: announcement.machine_id,
+            user_id: announcement.user_id,
+            addresses: announcement.addresses,
+            announced_at: announcement.announced_at,
+            last_seen: now,
+            machine_public_key: machine_public_key.clone(),
+            nat_type: announcement.nat_type.clone(),
+            can_receive_direct: announcement.can_receive_direct,
+            is_relay: announcement.is_relay,
+            is_coordinator: announcement.is_coordinator,
+        };
+        upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
+        self.cache
+            .write()
+            .await
+            .insert(discovered_agent.agent_id, discovered_agent);
         Ok(())
     }
 }
@@ -1020,38 +1440,38 @@ impl Agent {
         network: &network::NetworkNode,
         target: &DiscoveredAgent,
     ) -> error::Result<()> {
+        #[derive(Default)]
+        struct HelperHintEntry {
+            addrs: Vec<std::net::SocketAddr>,
+            caps: ant_quic::bootstrap_cache::PeerCapabilities,
+            sources: std::collections::BTreeSet<&'static str>,
+        }
+
         fn merge_helper_hint(
-            hints: &mut std::collections::HashMap<
-                ant_quic::PeerId,
-                (
-                    Vec<std::net::SocketAddr>,
-                    ant_quic::bootstrap_cache::PeerCapabilities,
-                ),
-            >,
+            hints: &mut std::collections::HashMap<ant_quic::PeerId, HelperHintEntry>,
             peer_id: ant_quic::PeerId,
+            source: &'static str,
             addrs: impl IntoIterator<Item = std::net::SocketAddr>,
             supports_coordination: bool,
             supports_relay: bool,
         ) {
-            let entry = hints.entry(peer_id).or_insert_with(|| {
-                (
-                    Vec::new(),
-                    ant_quic::bootstrap_cache::PeerCapabilities::default(),
-                )
-            });
+            let entry = hints.entry(peer_id).or_default();
+            entry.sources.insert(source);
             for addr in addrs {
-                if !entry.0.contains(&addr) {
-                    entry.0.push(addr);
+                if !entry.addrs.contains(&addr) {
+                    entry.addrs.push(addr);
                 }
             }
             if supports_coordination {
-                entry.1.supports_coordination = true;
+                entry.caps.supports_coordination = true;
             }
             if supports_relay {
-                entry.1.supports_relay = true;
+                entry.caps.supports_relay = true;
             }
         }
 
+        let target_agent_prefix = network::hex_prefix(&target.agent_id.0, 4);
+        let target_machine_prefix = network::hex_prefix(&target.machine_id.0, 4);
         let target_peer_id = ant_quic::PeerId(target.machine_id.0);
         if target.machine_id.0 != [0u8; 32] {
             network
@@ -1062,21 +1482,25 @@ impl Agent {
                         "failed to upsert target peer hints: {e}"
                     )))
                 })?;
+            tracing::debug!(
+                target: "x0x::connect",
+                stage = "seed_target_hints",
+                %target_agent_prefix,
+                %target_machine_prefix,
+                target_addr_count = target.addresses.len(),
+                "upserted direct target hints"
+            );
         }
 
-        let mut helper_hints: std::collections::HashMap<
-            ant_quic::PeerId,
-            (
-                Vec<std::net::SocketAddr>,
-                ant_quic::bootstrap_cache::PeerCapabilities,
-            ),
-        > = std::collections::HashMap::new();
+        let mut helper_hints: std::collections::HashMap<ant_quic::PeerId, HelperHintEntry> =
+            std::collections::HashMap::new();
 
         if let Some(ref cache) = self.bootstrap_cache {
             for peer in cache.select_coordinators(6).await {
                 merge_helper_hint(
                     &mut helper_hints,
                     peer.peer_id,
+                    "bootstrap_cache:coordinator",
                     peer.preferred_addresses(),
                     true,
                     false,
@@ -1086,6 +1510,7 @@ impl Agent {
                 merge_helper_hint(
                     &mut helper_hints,
                     peer.peer_id,
+                    "bootstrap_cache:relay",
                     peer.preferred_addresses(),
                     false,
                     true,
@@ -1104,6 +1529,7 @@ impl Agent {
                 merge_helper_hint(
                     &mut helper_hints,
                     advert_peer_id,
+                    "gossip_cache_advert",
                     advert
                         .addr_hints
                         .into_iter()
@@ -1115,31 +1541,77 @@ impl Agent {
             }
         }
 
-        let discovered: Vec<DiscoveredAgent> = {
-            let cache = self.identity_discovery_cache.read().await;
+        let discovered: Vec<DiscoveredMachine> = {
+            let cache = self.machine_discovery_cache.read().await;
             cache.values().cloned().collect()
         };
         for candidate in discovered {
-            if candidate.agent_id == target.agent_id
-                || candidate.machine_id == target.machine_id
-                || candidate.machine_id.0 == [0u8; 32]
-            {
+            if candidate.machine_id == target.machine_id || candidate.machine_id.0 == [0u8; 32] {
                 continue;
             }
             merge_helper_hint(
                 &mut helper_hints,
                 ant_quic::PeerId(candidate.machine_id.0),
+                "machine_discovery_cache",
                 candidate.addresses.iter().copied(),
                 candidate.is_coordinator == Some(true),
                 candidate.is_relay == Some(true),
             );
         }
 
-        for (peer_id, (mut addrs, caps)) in helper_hints {
+        let helper_candidate_count = helper_hints.len();
+        let helper_addr_total: usize = helper_hints.values().map(|entry| entry.addrs.len()).sum();
+        tracing::info!(
+            target: "x0x::connect",
+            stage = "seed_target_hints",
+            %target_agent_prefix,
+            %target_machine_prefix,
+            target_addr_count = target.addresses.len(),
+            helper_candidate_count,
+            helper_addr_total,
+            "prepared helper hints for peer-authenticated dial"
+        );
+
+        for (peer_id, entry) in &helper_hints {
+            tracing::debug!(
+                target: "x0x::connect",
+                stage = "seed_target_hints",
+                helper_peer_prefix = %network::hex_prefix(&peer_id.0, 4),
+                helper_addr_count = entry.addrs.len(),
+                supports_coordination = entry.caps.supports_coordination,
+                supports_relay = entry.caps.supports_relay,
+                sources = %entry.sources.iter().copied().collect::<Vec<_>>().join(","),
+                "helper candidate discovered"
+            );
+        }
+
+        for (peer_id, entry) in helper_hints {
+            let HelperHintEntry {
+                mut addrs,
+                caps,
+                sources,
+            } = entry;
             addrs.retain(|addr| !target.addresses.contains(addr));
             if addrs.is_empty() && !caps.supports_coordination && !caps.supports_relay {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    stage = "seed_target_hints",
+                    helper_peer_prefix = %network::hex_prefix(&peer_id.0, 4),
+                    sources = %sources.iter().copied().collect::<Vec<_>>().join(","),
+                    "skipping helper with no remaining addresses or assist capability"
+                );
                 continue;
             }
+            tracing::debug!(
+                target: "x0x::connect",
+                stage = "seed_target_hints",
+                helper_peer_prefix = %network::hex_prefix(&peer_id.0, 4),
+                helper_addr_count = addrs.len(),
+                supports_coordination = caps.supports_coordination,
+                supports_relay = caps.supports_relay,
+                sources = %sources.iter().copied().collect::<Vec<_>>().join(","),
+                "upserting helper peer hints"
+            );
             network
                 .upsert_peer_hints(peer_id, addrs, Some(caps))
                 .await
@@ -1544,6 +2016,233 @@ impl Agent {
         Ok(connectivity::ConnectOutcome::Unreachable)
     }
 
+    /// Attempt to connect to a machine by its transport identity.
+    ///
+    /// This is the machine-centric dial path: `machine_id` is resolved to
+    /// IPv4/IPv6 endpoint hints, then ant-quic performs a peer-authenticated
+    /// dial that can use direct connection, coordinated hole-punching, or relay
+    /// support according to the transport cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only for internal failures. Connectivity failures are
+    /// reported as [`connectivity::ConnectOutcome::Unreachable`].
+    pub async fn connect_to_machine(
+        &self,
+        machine_id: &identity::MachineId,
+    ) -> error::Result<connectivity::ConnectOutcome> {
+        let call_start = std::time::Instant::now();
+        let machine_prefix = network::hex_prefix(&machine_id.0, 4);
+        tracing::debug!(
+            target: "x0x::connect",
+            stage = "connect_to_machine",
+            %machine_prefix,
+            "begin"
+        );
+
+        let machine = {
+            let cache = self.machine_discovery_cache.read().await;
+            cache.get(machine_id).cloned()
+        };
+        let Some(machine) = machine else {
+            tracing::info!(
+                target: "x0x::connect",
+                stage = "connect_to_machine",
+                %machine_prefix,
+                outcome = "not_found",
+                dur_ms = call_start.elapsed().as_millis() as u64,
+                "machine not in discovery cache"
+            );
+            return Ok(connectivity::ConnectOutcome::NotFound);
+        };
+
+        let Some(ref network) = self.network else {
+            tracing::warn!(
+                target: "x0x::connect",
+                stage = "connect_to_machine",
+                %machine_prefix,
+                outcome = "unreachable_no_network",
+                "network layer not initialised"
+            );
+            return Ok(connectivity::ConnectOutcome::Unreachable);
+        };
+
+        let peer_id = ant_quic::PeerId(machine.machine_id.0);
+        if network.is_connected(&peer_id).await {
+            for agent_id in &machine.agent_ids {
+                self.direct_messaging
+                    .mark_connected(*agent_id, machine.machine_id)
+                    .await;
+            }
+            return if let Some(addr) = machine.addresses.first() {
+                Ok(connectivity::ConnectOutcome::Direct(*addr))
+            } else {
+                Ok(connectivity::ConnectOutcome::AlreadyConnected)
+            };
+        }
+
+        let info = connectivity::ReachabilityInfo::from_discovered_machine(&machine);
+        let v4_addrs = info.addresses.iter().filter(|a| a.is_ipv4()).count();
+        let v6_addrs = info.addresses.len() - v4_addrs;
+        tracing::info!(
+            target: "x0x::connect",
+            stage = "connect_to_machine",
+            %machine_prefix,
+            addr_total = info.addresses.len(),
+            v4_addrs,
+            v6_addrs,
+            can_receive_direct = ?info.can_receive_direct,
+            should_attempt_direct = info.should_attempt_direct(),
+            needs_coordination = info.needs_coordination(),
+            "machine reachability classified"
+        );
+
+        if info.addresses.is_empty() {
+            return Ok(connectivity::ConnectOutcome::Unreachable);
+        }
+
+        network
+            .upsert_peer_hints(peer_id, info.addresses.clone(), None)
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "failed to upsert machine peer hints: {e}"
+                )))
+            })?;
+
+        let dial_timeout = std::time::Duration::from_secs(8);
+        match tokio::time::timeout(
+            dial_timeout,
+            network.connect_peer_with_addrs(peer_id, info.addresses.clone()),
+        )
+        .await
+        {
+            Ok(Ok((addr, verified_peer_id))) if verified_peer_id == peer_id => {
+                if let Some(ref bc) = self.bootstrap_cache {
+                    bc.add_from_connection(verified_peer_id, vec![addr], None)
+                        .await;
+                    bc.record_success(&verified_peer_id, 0).await;
+                }
+                for agent_id in &machine.agent_ids {
+                    self.direct_messaging
+                        .mark_connected(*agent_id, machine.machine_id)
+                        .await;
+                }
+                tracing::info!(
+                    target: "x0x::connect",
+                    stage = "connect_to_machine",
+                    %machine_prefix,
+                    strategy = "hinted_peer",
+                    outcome = "coordinated",
+                    selected_addr = %addr,
+                    dur_ms = call_start.elapsed().as_millis() as u64,
+                    "machine peer-authenticated dial succeeded"
+                );
+                return Ok(connectivity::ConnectOutcome::Coordinated(addr));
+            }
+            Ok(Ok((addr, verified_peer_id))) => {
+                tracing::warn!(
+                    target: "x0x::connect",
+                    stage = "connect_to_machine",
+                    %machine_prefix,
+                    selected_addr = %addr,
+                    verified_machine_prefix = %network::hex_prefix(&verified_peer_id.0, 4),
+                    "machine dial reached unexpected peer"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    stage = "connect_to_machine",
+                    %machine_prefix,
+                    error = %e,
+                    "machine peer-authenticated dial failed"
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    stage = "connect_to_machine",
+                    %machine_prefix,
+                    timeout_s = dial_timeout.as_secs(),
+                    "machine peer-authenticated dial timed out"
+                );
+            }
+        }
+
+        if info.should_attempt_direct() {
+            for addr in &info.addresses {
+                match tokio::time::timeout(dial_timeout, network.connect_addr(*addr)).await {
+                    Ok(Ok(connected_peer_id)) if connected_peer_id == peer_id => {
+                        if let Some(ref bc) = self.bootstrap_cache {
+                            bc.add_from_connection(connected_peer_id, vec![*addr], None)
+                                .await;
+                        }
+                        for agent_id in &machine.agent_ids {
+                            self.direct_messaging
+                                .mark_connected(*agent_id, machine.machine_id)
+                                .await;
+                        }
+                        tracing::info!(
+                            target: "x0x::connect",
+                            stage = "connect_to_machine",
+                            %machine_prefix,
+                            strategy = "direct_per_addr",
+                            outcome = "direct",
+                            selected_addr = %addr,
+                            dur_ms = call_start.elapsed().as_millis() as u64,
+                            "machine direct dial succeeded"
+                        );
+                        return Ok(connectivity::ConnectOutcome::Direct(*addr));
+                    }
+                    Ok(Ok(connected_peer_id)) => {
+                        tracing::warn!(
+                            target: "x0x::connect",
+                            stage = "connect_to_machine",
+                            %machine_prefix,
+                            %addr,
+                            connected_machine_prefix = %network::hex_prefix(&connected_peer_id.0, 4),
+                            "machine direct dial reached unexpected peer"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            stage = "connect_to_machine",
+                            %machine_prefix,
+                            %addr,
+                            error = %e,
+                            "machine direct dial failed"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            stage = "connect_to_machine",
+                            %machine_prefix,
+                            %addr,
+                            timeout_s = dial_timeout.as_secs(),
+                            "machine direct dial timed out"
+                        );
+                    }
+                }
+            }
+        }
+
+        tracing::warn!(
+            target: "x0x::connect",
+            stage = "connect_to_machine",
+            %machine_prefix,
+            outcome = "unreachable",
+            reason = "all_strategies_exhausted",
+            dur_ms = call_start.elapsed().as_millis() as u64,
+            v4_addrs,
+            v6_addrs,
+            "all machine connection strategies exhausted"
+        );
+        Ok(connectivity::ConnectOutcome::Unreachable)
+    }
+
     /// Save the bootstrap cache and release resources.
     ///
     /// Call this before dropping the agent to ensure the peer cache is
@@ -1632,6 +2331,22 @@ impl Agent {
             .map(|c| c.gossip_inbox && !c.kem_public_key.is_empty())
             .unwrap_or(false);
 
+        let mut preferred_raw_err = None;
+        if config.prefer_raw_quic_if_connected && !config.require_gossip {
+            match self.send_direct_raw_quic(to, &payload).await {
+                Ok(()) => return Ok(dm_send::raw_quic_receipt()),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "x0x::direct",
+                        recipient = %hex::encode(to.as_bytes()),
+                        error = %e,
+                        "preferred raw-QUIC path unavailable; falling back to capability-aware send"
+                    );
+                    preferred_raw_err = Some(e);
+                }
+            }
+        }
+
         if gossip_ok {
             let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
                 dm::DmError::LocalGossipUnavailable(
@@ -1664,23 +2379,21 @@ impl Agent {
             )));
         }
 
-        self.send_direct_raw_quic(to, payload)
-            .await
-            .map(|_| dm_send::raw_quic_receipt())
-            .map_err(|e| match e {
-                error::NetworkError::AgentNotFound(_)
-                | error::NetworkError::AgentNotConnected(_) => {
-                    dm::DmError::RecipientKeyUnavailable(e.to_string())
-                }
-                other => dm::DmError::PublishFailed(other.to_string()),
-            })
+        match preferred_raw_err {
+            Some(e) => Err(Self::map_raw_quic_dm_error(e)),
+            None => self
+                .send_direct_raw_quic(to, &payload)
+                .await
+                .map(|_| dm_send::raw_quic_receipt())
+                .map_err(Self::map_raw_quic_dm_error),
+        }
     }
 
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
     async fn send_direct_raw_quic(
         &self,
         agent_id: &identity::AgentId,
-        payload: Vec<u8>,
+        payload: &[u8],
     ) -> error::NetworkResult<()> {
         let send_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
@@ -1775,7 +2488,7 @@ impl Agent {
 
         // Send via network layer
         match network
-            .send_direct(&ant_peer_id, &self.identity.agent_id().0, &payload)
+            .send_direct(&ant_peer_id, &self.identity.agent_id().0, payload)
             .await
         {
             Ok(()) => {
@@ -1809,6 +2522,15 @@ impl Agent {
                 );
                 Err(e)
             }
+        }
+    }
+
+    fn map_raw_quic_dm_error(err: error::NetworkError) -> dm::DmError {
+        match err {
+            error::NetworkError::AgentNotFound(_) | error::NetworkError::AgentNotConnected(_) => {
+                dm::DmError::RecipientKeyUnavailable(err.to_string())
+            }
+            other => dm::DmError::PublishFailed(other.to_string()),
         }
     }
 
@@ -2000,10 +2722,20 @@ impl Agent {
 
         self.start_identity_listener().await?;
 
+        let network_status = if let Some(network) = self.network.as_ref() {
+            network.node_status().await
+        } else {
+            None
+        };
+        let assist_snapshot = network_status
+            .as_ref()
+            .map(AnnouncementAssistSnapshot::from_node_status)
+            .unwrap_or_default();
+
         // Include ALL routable addresses (IPv4 and IPv6).
         let mut addresses = if let Some(network) = self.network.as_ref() {
-            match network.node_status().await {
-                Some(status) if !status.external_addrs.is_empty() => status.external_addrs,
+            match network_status.as_ref() {
+                Some(status) if !status.external_addrs.is_empty() => status.external_addrs.clone(),
                 _ => match network.routable_addr().await {
                     Some(addr) => vec![addr],
                     None => self.announcement_addresses(),
@@ -2062,7 +2794,66 @@ impl Agent {
             include_user_identity,
             human_consent,
             addresses,
+            Some(&assist_snapshot),
         )?;
+        tracing::debug!(
+            target: "x0x::discovery",
+            announcement_kind = "explicit",
+            machine_prefix = %network::hex_prefix(&announcement.machine_id.0, 4),
+            addr_total = announcement.addresses.len(),
+            nat_type = announcement.nat_type.as_deref().unwrap_or("unknown"),
+            can_receive_direct = ?announcement.can_receive_direct,
+            relay_capable = ?announcement.is_relay,
+            coordinator_capable = ?announcement.is_coordinator,
+            relay_active = ?assist_snapshot.relay_active,
+            coordinator_active = ?assist_snapshot.coordinator_active,
+            "publishing identity announcement"
+        );
+
+        let machine_announcement = build_machine_announcement_for_identity(
+            &self.identity,
+            announcement.addresses.clone(),
+            announcement.announced_at,
+            Some(&assist_snapshot),
+        )?;
+        tracing::debug!(
+            target: "x0x::discovery",
+            announcement_kind = "machine_explicit",
+            machine_prefix = %network::hex_prefix(&machine_announcement.machine_id.0, 4),
+            addr_total = machine_announcement.addresses.len(),
+            nat_type = machine_announcement.nat_type.as_deref().unwrap_or("unknown"),
+            can_receive_direct = ?machine_announcement.can_receive_direct,
+            relay_capable = ?machine_announcement.is_relay,
+            coordinator_capable = ?machine_announcement.is_coordinator,
+            "publishing machine announcement"
+        );
+        let machine_payload =
+            bytes::Bytes::from(bincode::serialize(&machine_announcement).map_err(|e| {
+                error::IdentityError::Serialization(format!(
+                    "failed to serialize machine announcement: {e}"
+                ))
+            })?);
+        runtime
+            .pubsub()
+            .publish(
+                shard_topic_for_machine(&machine_announcement.machine_id),
+                machine_payload.clone(),
+            )
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "failed to publish machine announcement to shard topic: {e}"
+                )))
+            })?;
+        runtime
+            .pubsub()
+            .publish(MACHINE_ANNOUNCE_TOPIC.to_string(), machine_payload)
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "failed to publish machine announcement: {e}"
+                )))
+            })?;
 
         let encoded = bincode::serialize(&announcement).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -2096,22 +2887,34 @@ impl Agent {
             })?;
 
         let now = Self::unix_timestamp_secs();
-        self.identity_discovery_cache.write().await.insert(
-            announcement.agent_id,
-            DiscoveredAgent {
-                agent_id: announcement.agent_id,
-                machine_id: announcement.machine_id,
-                user_id: announcement.user_id,
-                addresses: announcement.addresses.clone(),
-                announced_at: announcement.announced_at,
-                last_seen: now,
-                machine_public_key: announcement.machine_public_key.clone(),
-                nat_type: announcement.nat_type.clone(),
-                can_receive_direct: announcement.can_receive_direct,
-                is_relay: announcement.is_relay,
-                is_coordinator: announcement.is_coordinator,
-            },
-        );
+        upsert_discovered_machine(
+            &self.machine_discovery_cache,
+            DiscoveredMachine::from_machine_announcement(
+                &machine_announcement,
+                machine_announcement.addresses.clone(),
+                now,
+            ),
+        )
+        .await;
+        let discovered_agent = DiscoveredAgent {
+            agent_id: announcement.agent_id,
+            machine_id: announcement.machine_id,
+            user_id: announcement.user_id,
+            addresses: announcement.addresses.clone(),
+            announced_at: announcement.announced_at,
+            last_seen: now,
+            machine_public_key: announcement.machine_public_key.clone(),
+            nat_type: announcement.nat_type.clone(),
+            can_receive_direct: announcement.can_receive_direct,
+            is_relay: announcement.is_relay,
+            is_coordinator: announcement.is_coordinator,
+        };
+        upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &discovered_agent)
+            .await;
+        self.identity_discovery_cache
+            .write()
+            .await
+            .insert(discovered_agent.agent_id, discovered_agent);
 
         // Record consent AFTER successful publish so heartbeats don't start
         // including user identity if this announcement never actually propagated.
@@ -2182,6 +2985,115 @@ impl Agent {
             .cloned())
     }
 
+    /// Get all discovered machine endpoints from machine announcements.
+    ///
+    /// The returned records are keyed by `machine_id`, which is the actual
+    /// transport identity used for direct dials, hole-punching, and relay
+    /// selection. Agent and user identities are link indexes over these
+    /// machine records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn discovered_machines(&self) -> error::Result<Vec<DiscoveredMachine>> {
+        self.start_identity_listener().await?;
+        let cutoff = Self::unix_timestamp_secs().saturating_sub(self.identity_ttl_secs);
+        let mut machines: Vec<_> = self
+            .machine_discovery_cache
+            .read()
+            .await
+            .values()
+            .filter(|m| m.announced_at >= cutoff)
+            .cloned()
+            .collect();
+        machines.sort_by_key(|m| m.machine_id.0);
+        Ok(machines)
+    }
+
+    /// Return all discovered machines regardless of TTL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn discovered_machines_unfiltered(&self) -> error::Result<Vec<DiscoveredMachine>> {
+        self.start_identity_listener().await?;
+        let mut machines: Vec<_> = self
+            .machine_discovery_cache
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        machines.sort_by_key(|m| m.machine_id.0);
+        Ok(machines)
+    }
+
+    /// Get one discovered machine record by machine ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn discovered_machine(
+        &self,
+        machine_id: identity::MachineId,
+    ) -> error::Result<Option<DiscoveredMachine>> {
+        self.start_identity_listener().await?;
+        Ok(self
+            .machine_discovery_cache
+            .read()
+            .await
+            .get(&machine_id)
+            .cloned())
+    }
+
+    /// Resolve a known agent identity to its current machine endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn machine_for_agent(
+        &self,
+        agent_id: identity::AgentId,
+    ) -> error::Result<Option<DiscoveredMachine>> {
+        self.start_identity_listener().await?;
+        let machine_id = {
+            let agents = self.identity_discovery_cache.read().await;
+            agents.get(&agent_id).map(|agent| agent.machine_id)
+        };
+        let Some(machine_id) = machine_id else {
+            return Ok(None);
+        };
+        Ok(self
+            .machine_discovery_cache
+            .read()
+            .await
+            .get(&machine_id)
+            .cloned())
+    }
+
+    /// Find all machine endpoints linked to a consented user identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn find_machines_by_user(
+        &self,
+        user_id: identity::UserId,
+    ) -> error::Result<Vec<DiscoveredMachine>> {
+        self.start_identity_listener().await?;
+        let cutoff = Self::unix_timestamp_secs().saturating_sub(self.identity_ttl_secs);
+        let mut machines: Vec<_> = self
+            .machine_discovery_cache
+            .read()
+            .await
+            .values()
+            .filter(|m| m.announced_at >= cutoff && m.user_ids.contains(&user_id))
+            .cloned()
+            .collect();
+        machines.sort_by_key(|m| m.machine_id.0);
+        Ok(machines)
+    }
+
     async fn start_identity_listener(&self) -> error::Result<()> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
@@ -2202,15 +3114,28 @@ impl Agent {
             .await;
         let own_shard_topic = shard_topic_for_agent(&self.agent_id());
         let mut sub_shard = runtime.pubsub().subscribe(own_shard_topic).await;
+        let mut sub_machine_legacy = runtime
+            .pubsub()
+            .subscribe(MACHINE_ANNOUNCE_TOPIC.to_string())
+            .await;
+        let own_machine_shard_topic = shard_topic_for_machine(&self.machine_id());
+        let mut sub_machine_shard = runtime.pubsub().subscribe(own_machine_shard_topic).await;
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
         let bootstrap_cache = self.bootstrap_cache.clone();
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let direct_messaging = std::sync::Arc::clone(&self.direct_messaging);
         let network = self.network.as_ref().map(std::sync::Arc::clone);
         let own_agent_id = self.agent_id();
+        let own_machine_id = self.machine_id();
         let rebroadcast_pubsub = std::sync::Arc::clone(runtime.pubsub());
 
         tokio::spawn(async move {
+            enum DiscoveryMessage {
+                Identity(crate::gossip::PubSubMessage),
+                Machine(crate::gossip::PubSubMessage),
+            }
+
             // Track agents we've already initiated auto-connect to, preventing
             // duplicate connection attempts from concurrent announcements.
             let mut auto_connect_attempted = std::collections::HashSet::<identity::AgentId>::new();
@@ -2224,15 +3149,124 @@ impl Agent {
                 (identity::AgentId, u64),
                 std::time::Instant,
             > = std::collections::HashMap::new();
+            let mut machine_rebroadcast_state: std::collections::HashMap<
+                (identity::MachineId, u64),
+                std::time::Instant,
+            > = std::collections::HashMap::new();
             const REBROADCAST_MIN_INTERVAL: std::time::Duration =
                 std::time::Duration::from_secs(20);
 
             loop {
-                // Drain whichever subscription fires next; deduplicate by AgentId in cache.
+                // Drain whichever subscription fires next; deduplicate by ID in cache.
                 let msg = tokio::select! {
-                    Some(m) = sub_legacy.recv() => m,
-                    Some(m) = sub_shard.recv() => m,
+                    Some(m) = sub_legacy.recv() => DiscoveryMessage::Identity(m),
+                    Some(m) = sub_shard.recv() => DiscoveryMessage::Identity(m),
+                    Some(m) = sub_machine_legacy.recv() => DiscoveryMessage::Machine(m),
+                    Some(m) = sub_machine_shard.recv() => DiscoveryMessage::Machine(m),
                     else => break,
+                };
+                let msg = match msg {
+                    DiscoveryMessage::Machine(msg) => {
+                        let decoded = {
+                            use bincode::Options;
+                            bincode::options()
+                                .with_fixint_encoding()
+                                .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+                                .allow_trailing_bytes()
+                                .deserialize::<MachineAnnouncement>(&msg.payload)
+                        };
+                        let raw_payload = msg.payload.clone();
+                        let announcement = match decoded {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Ignoring invalid machine announcement payload: {}",
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = announcement.verify() {
+                            tracing::warn!("Ignoring unverifiable machine announcement: {}", e);
+                            continue;
+                        }
+
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+
+                        let public_addrs: Vec<std::net::SocketAddr> = announcement
+                            .addresses
+                            .iter()
+                            .copied()
+                            .filter(|a| is_globally_routable(a.ip()))
+                            .collect();
+                        if !public_addrs.is_empty() {
+                            if let Some(ref bc) = &bootstrap_cache {
+                                let peer_id = ant_quic::PeerId(announcement.machine_id.0);
+                                bc.add_from_connection(peer_id, public_addrs, None).await;
+                            }
+                        }
+
+                        let filtered_addresses: Vec<std::net::SocketAddr> = announcement
+                            .addresses
+                            .iter()
+                            .copied()
+                            .filter(|a| is_publicly_advertisable(*a))
+                            .collect();
+                        let filtered_addr_count = filtered_addresses.len();
+                        upsert_discovered_machine(
+                            &machine_cache,
+                            DiscoveredMachine::from_machine_announcement(
+                                &announcement,
+                                filtered_addresses,
+                                now,
+                            ),
+                        )
+                        .await;
+                        tracing::debug!(
+                            target: "x0x::discovery",
+                            announcement_kind = "machine_received",
+                            machine_prefix = %network::hex_prefix(&announcement.machine_id.0, 4),
+                            addr_total = announcement.addresses.len(),
+                            filtered_addr_count,
+                            nat_type = announcement.nat_type.as_deref().unwrap_or("unknown"),
+                            can_receive_direct = ?announcement.can_receive_direct,
+                            relay_capable = ?announcement.is_relay,
+                            coordinator_capable = ?announcement.is_coordinator,
+                            "cached verified machine announcement"
+                        );
+
+                        if announcement.machine_id != own_machine_id {
+                            let key = (announcement.machine_id, announcement.announced_at);
+                            let should_forward = match machine_rebroadcast_state.get(&key) {
+                                None => true,
+                                Some(last) => last.elapsed() >= REBROADCAST_MIN_INTERVAL,
+                            };
+                            if should_forward {
+                                machine_rebroadcast_state.insert(key, std::time::Instant::now());
+                                if machine_rebroadcast_state.len() > 1024 {
+                                    let cutoff = std::time::Instant::now()
+                                        - std::time::Duration::from_secs(3600);
+                                    machine_rebroadcast_state.retain(|_, t| *t >= cutoff);
+                                }
+                                let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
+                                tokio::spawn(async move {
+                                    if let Err(e) = pubsub
+                                        .publish(MACHINE_ANNOUNCE_TOPIC.to_string(), raw_payload)
+                                        .await
+                                    {
+                                        tracing::debug!(
+                                            "machine announcement re-broadcast failed: {e}"
+                                        );
+                                    }
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    DiscoveryMessage::Identity(msg) => msg,
                 };
                 let decoded = {
                     use bincode::Options;
@@ -2337,21 +3371,37 @@ impl Agent {
                     .copied()
                     .filter(|a| is_publicly_advertisable(*a))
                     .collect();
-                cache.write().await.insert(
-                    announcement.agent_id,
-                    DiscoveredAgent {
-                        agent_id: announcement.agent_id,
-                        machine_id: announcement.machine_id,
-                        user_id: announcement.user_id,
-                        addresses: filtered_addresses,
-                        announced_at: announcement.announced_at,
-                        last_seen: now,
-                        machine_public_key: announcement.machine_public_key.clone(),
-                        nat_type: announcement.nat_type.clone(),
-                        can_receive_direct: announcement.can_receive_direct,
-                        is_relay: announcement.is_relay,
-                        is_coordinator: announcement.is_coordinator,
-                    },
+                let filtered_addr_count = filtered_addresses.len();
+                let discovered_agent = DiscoveredAgent {
+                    agent_id: announcement.agent_id,
+                    machine_id: announcement.machine_id,
+                    user_id: announcement.user_id,
+                    addresses: filtered_addresses,
+                    announced_at: announcement.announced_at,
+                    last_seen: now,
+                    machine_public_key: announcement.machine_public_key.clone(),
+                    nat_type: announcement.nat_type.clone(),
+                    can_receive_direct: announcement.can_receive_direct,
+                    is_relay: announcement.is_relay,
+                    is_coordinator: announcement.is_coordinator,
+                };
+                upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
+                cache
+                    .write()
+                    .await
+                    .insert(discovered_agent.agent_id, discovered_agent);
+                tracing::debug!(
+                    target: "x0x::discovery",
+                    announcement_kind = "received",
+                    agent_prefix = %network::hex_prefix(&announcement.agent_id.0, 4),
+                    machine_prefix = %network::hex_prefix(&announcement.machine_id.0, 4),
+                    addr_total = announcement.addresses.len(),
+                    filtered_addr_count,
+                    nat_type = announcement.nat_type.as_deref().unwrap_or("unknown"),
+                    can_receive_direct = ?announcement.can_receive_direct,
+                    relay_capable = ?announcement.is_relay,
+                    coordinator_capable = ?announcement.is_coordinator,
+                    "cached verified identity announcement"
                 );
 
                 // Identity announcements are the strongest agent↔machine binding we have.
@@ -2473,6 +3523,7 @@ impl Agent {
             include_user_identity,
             human_consent,
             self.announcement_addresses(),
+            None,
         )
     }
 
@@ -2481,6 +3532,7 @@ impl Agent {
         include_user_identity: bool,
         human_consent: bool,
         addresses: Vec<std::net::SocketAddr>,
+        assist_snapshot: Option<&AnnouncementAssistSnapshot>,
     ) -> error::Result<IdentityAnnouncement> {
         if include_user_identity && !human_consent {
             return Err(error::IdentityError::Storage(std::io::Error::other(
@@ -2511,9 +3563,6 @@ impl Agent {
             .as_bytes()
             .to_vec();
 
-        // NAT status is populated by the heartbeat loop (which is async and has
-        // access to NodeStatus). Here we use None for the NAT fields as this
-        // sync builder doesn't have async access to the network layer.
         let unsigned = IdentityAnnouncementUnsigned {
             agent_id: self.agent_id(),
             machine_id: self.machine_id(),
@@ -2522,10 +3571,10 @@ impl Agent {
             machine_public_key: machine_public_key.clone(),
             addresses,
             announced_at: Self::unix_timestamp_secs(),
-            nat_type: None,
-            can_receive_direct: None,
-            is_relay: None,
-            is_coordinator: None,
+            nat_type: assist_snapshot.and_then(|snapshot| snapshot.nat_type.clone()),
+            can_receive_direct: assist_snapshot.and_then(|snapshot| snapshot.can_receive_direct),
+            is_relay: assist_snapshot.and_then(|snapshot| snapshot.relay_capable),
+            is_coordinator: assist_snapshot.and_then(|snapshot| snapshot.coordinator_capable),
         };
         let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -2788,6 +3837,7 @@ impl Agent {
                 network: std::sync::Arc::clone(network),
                 interval_secs: self.heartbeat_interval_secs,
                 cache: std::sync::Arc::clone(&self.identity_discovery_cache),
+                machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
                 user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
             };
             tokio::spawn(async move {
@@ -3290,6 +4340,7 @@ impl Agent {
         let shard_topic = shard_topic_for_agent(&agent_id);
         let mut sub = runtime.pubsub().subscribe(shard_topic).await;
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
         loop {
@@ -3316,22 +4367,25 @@ impl Agent {
                                 .filter(|a| is_publicly_advertisable(*a))
                                 .collect();
                             let addrs = filtered.clone();
-                            cache.write().await.insert(
-                                ann.agent_id,
-                                DiscoveredAgent {
-                                    agent_id: ann.agent_id,
-                                    machine_id: ann.machine_id,
-                                    user_id: ann.user_id,
-                                    addresses: filtered,
-                                    announced_at: ann.announced_at,
-                                    last_seen: now,
-                                    machine_public_key: ann.machine_public_key.clone(),
-                                    nat_type: ann.nat_type.clone(),
-                                    can_receive_direct: ann.can_receive_direct,
-                                    is_relay: ann.is_relay,
-                                    is_coordinator: ann.is_coordinator,
-                                },
-                            );
+                            let discovered_agent = DiscoveredAgent {
+                                agent_id: ann.agent_id,
+                                machine_id: ann.machine_id,
+                                user_id: ann.user_id,
+                                addresses: filtered,
+                                announced_at: ann.announced_at,
+                                last_seen: now,
+                                machine_public_key: ann.machine_public_key.clone(),
+                                nat_type: ann.nat_type.clone(),
+                                can_receive_direct: ann.can_receive_direct,
+                                is_relay: ann.is_relay,
+                                is_coordinator: ann.is_coordinator,
+                            };
+                            upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
+                                .await;
+                            cache
+                                .write()
+                                .await
+                                .insert(discovered_agent.agent_id, discovered_agent);
                             return Ok(Some(addrs));
                         }
                     }
@@ -3364,6 +4418,81 @@ impl Agent {
                     is_coordinator: None,
                 });
             return Ok(Some(addrs));
+        }
+
+        Ok(None)
+    }
+
+    /// Find a machine by ID and return its current endpoint record.
+    ///
+    /// Performs a cache lookup first, then subscribes to the machine's shard
+    /// topic and waits up to `timeout_secs` for a signed machine announcement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn find_machine(
+        &self,
+        machine_id: identity::MachineId,
+        timeout_secs: u64,
+    ) -> error::Result<Option<DiscoveredMachine>> {
+        self.start_identity_listener().await?;
+
+        if let Some(machine) = self
+            .machine_discovery_cache
+            .read()
+            .await
+            .get(&machine_id)
+            .cloned()
+        {
+            return Ok(Some(machine));
+        }
+
+        let runtime = match self.gossip_runtime.as_ref() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let shard_topic = shard_topic_for_machine(&machine_id);
+        let mut sub = runtime.pubsub().subscribe(shard_topic).await;
+        let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.clamp(1, 60));
+
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let timeout = tokio::time::sleep_until(deadline);
+            tokio::select! {
+                Some(msg) = sub.recv() => {
+                    if let Ok(ann) = {
+                        use bincode::Options;
+                        bincode::DefaultOptions::new()
+                            .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+                            .deserialize::<MachineAnnouncement>(&msg.payload)
+                    } {
+                        if ann.verify().is_ok() && ann.machine_id == machine_id {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_secs());
+                            let filtered: Vec<std::net::SocketAddr> = ann
+                                .addresses
+                                .iter()
+                                .copied()
+                                .filter(|a| is_publicly_advertisable(*a))
+                                .collect();
+                            let discovered = DiscoveredMachine::from_machine_announcement(
+                                &ann,
+                                filtered,
+                                now,
+                            );
+                            upsert_discovered_machine(&machine_cache, discovered).await;
+                            return Ok(machine_cache.read().await.get(&machine_id).cloned());
+                        }
+                    }
+                }
+                _ = timeout => break,
+            }
         }
 
         Ok(None)
@@ -3445,6 +4574,25 @@ impl Agent {
         consent: bool,
     ) -> error::Result<IdentityAnnouncement> {
         self.build_identity_announcement(include_user, consent)
+    }
+
+    /// Build a signed [`MachineAnnouncement`] for this daemon's transport
+    /// endpoint.
+    ///
+    /// This sync helper uses currently known local interface addresses and
+    /// leaves async NAT/reachability fields as `None`; live network announces
+    /// populate those fields from `NetworkNode::node_status()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key signing fails.
+    pub fn build_machine_announcement(&self) -> error::Result<MachineAnnouncement> {
+        build_machine_announcement_for_identity(
+            &self.identity,
+            self.announcement_addresses(),
+            Self::unix_timestamp_secs(),
+            None,
+        )
     }
 
     /// Start the background identity heartbeat task.
@@ -3661,6 +4809,7 @@ impl Agent {
             network,
             interval_secs: self.heartbeat_interval_secs,
             cache: std::sync::Arc::clone(&self.identity_discovery_cache),
+            machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
             user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
         };
         let handle = tokio::task::spawn(async move {
@@ -3858,6 +5007,7 @@ impl Agent {
     pub async fn insert_discovered_agent_for_testing(&self, agent: DiscoveredAgent) {
         let agent_id = agent.agent_id;
         let machine_id = agent.machine_id;
+        upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
         self.identity_discovery_cache
             .write()
             .await
@@ -4346,7 +5496,11 @@ impl AgentBuilder {
             });
 
             let cert = if cert_still_valid {
-                existing_cert.expect("cert_still_valid implies Some")
+                existing_cert.ok_or_else(|| {
+                    error::IdentityError::Storage(std::io::Error::other(
+                        "agent certificate validity check succeeded with no certificate loaded",
+                    ))
+                })?
             } else {
                 let new_cert = identity::AgentCertificate::issue(&user_kp, &agent_keypair)?;
                 if let Some(ref p) = cert_path {
@@ -4518,6 +5672,9 @@ impl AgentBuilder {
             bootstrap_cache,
             gossip_cache_adapter,
             identity_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             identity_listener_started: std::sync::atomic::AtomicBool::new(false),
@@ -5290,6 +6447,25 @@ mod tests {
             result.is_err(),
             "Old-format announcement should not decode as new struct (protocol upgrade required)"
         );
+    }
+
+    #[test]
+    fn announcement_assist_snapshot_uses_capabilities_not_activity() {
+        let mut status = ant_quic::NodeStatus::default();
+        status.nat_type = ant_quic::NatType::FullCone;
+        status.can_receive_direct = true;
+        status.relay_service_enabled = true;
+        status.coordinator_service_enabled = true;
+        status.is_relaying = false;
+        status.is_coordinating = false;
+
+        let snapshot = AnnouncementAssistSnapshot::from_node_status(&status);
+        assert_eq!(snapshot.nat_type.as_deref(), Some("Full Cone"));
+        assert_eq!(snapshot.can_receive_direct, Some(true));
+        assert_eq!(snapshot.relay_capable, Some(true));
+        assert_eq!(snapshot.coordinator_capable, Some(true));
+        assert_eq!(snapshot.relay_active, Some(false));
+        assert_eq!(snapshot.coordinator_active, Some(false));
     }
 
     /// A new announcement with all NAT fields set round-trips through bincode.

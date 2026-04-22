@@ -55,9 +55,13 @@ const COVERED: &[(Method, &str)] = &[
     // ── Discovery ───────────────────────────────────────────────────────
     (Method::Get, "/agents/discovered"),
     (Method::Get, "/agents/discovered/:agent_id"),
+    (Method::Get, "/agents/:agent_id/machine"),
+    (Method::Get, "/machines/discovered"),
+    (Method::Get, "/machines/discovered/:machine_id"),
     (Method::Get, "/agents/reachability/:agent_id"),
     (Method::Post, "/agents/find/:agent_id"),
     (Method::Get, "/users/:user_id/agents"),
+    (Method::Get, "/users/:user_id/machines"),
     // ── Contacts ────────────────────────────────────────────────────────
     (Method::Get, "/contacts"),
     (Method::Post, "/contacts"),
@@ -79,6 +83,7 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Post, "/trust/evaluate"),
     // ── Direct messaging ────────────────────────────────────────────────
     (Method::Post, "/agents/connect"),
+    (Method::Post, "/machines/connect"),
     (Method::Post, "/direct/send"),
     (Method::Get, "/direct/connections"),
     (Method::Get, "/direct/events"),

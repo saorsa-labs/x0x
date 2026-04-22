@@ -1,0 +1,23 @@
+[21:34:38] Config: NODES=5 MESSAGES=500 FILE_SIZE_KIB=16384 TOPIC=measure-13661 PROOF_DIR=proofs/full-20260421-v0185-localhost-throughput-16m-500
+[21:34:38] Launching daemon 1 on API port 12801
+[21:34:38] Launching daemon 2 on API port 12802
+[21:34:38] Launching daemon 3 on API port 12803
+[21:34:38] Launching daemon 4 on API port 12804
+[21:34:38] Launching daemon 5 on API port 12805
+[21:34:38] Waiting 20s for daemons to bind + discover each other...
+[21:34:58] Snapshot: pre
+[21:34:59] Installing subscriptions on every node...
+[21:34:59] Publishing 500 pub/sub messages from node 1 (no delay)
+[21:35:17] Published 500 msgs in 18s
+[21:35:22] Snapshot: mid
+[21:35:22] DM round-trip from node-1 → node-2 with require_ack_ms=2000
+[21:35:22] DM send: ok=ok rtt_ms=0
+[21:35:22] Probing every pair's peer liveness (ant-quic probe_peer)...
+[21:35:24] Probe matrix → proofs/full-20260421-v0185-localhost-throughput-16m-500/probe-matrix.json
+[21:35:24] File transfer: 16777216 bytes (node-1 → node-2)
+[21:35:24] File transfer offer sent (id=1b3d2ff2-10bc-4da6-957b-4b87f7e02b2d) in 723046us
+[21:35:26] File transfer completed: 16777216 bytes in 1214000us
+[21:35:31] Snapshot: post
+[21:35:31] Measurement report → proofs/full-20260421-v0185-localhost-throughput-16m-500/measure-report.json
+[21:35:31] PASSED=True  FAILURES=0
+[21:35:31] Cleaning up daemons...

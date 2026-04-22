@@ -364,16 +364,30 @@ impl PubSubManager {
                     msg_topic = %message.topic,
                     "[4/6 pubsub] decoded, forwarding to subscriber channel"
                 );
-                if tx.send(message).await.is_err() {
-                    stats
-                        .subscriber_channel_closed
-                        .fetch_add(1, Ordering::Relaxed);
-                    tracing::info!(topic = %sub_topic, "[4/6 pubsub] subscriber channel closed");
-                    break;
+                match tx.try_send(message) {
+                    Ok(()) => {
+                        stats
+                            .delivered_to_subscriber
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        stats
+                            .subscriber_channel_closed
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            topic = %sub_topic,
+                            "[4/6 pubsub] subscriber channel full — dropping slow subscriber"
+                        );
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        stats
+                            .subscriber_channel_closed
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(topic = %sub_topic, "[4/6 pubsub] subscriber channel closed");
+                        break;
+                    }
                 }
-                stats
-                    .delivered_to_subscriber
-                    .fetch_add(1, Ordering::Relaxed);
             }
         });
 
@@ -1253,6 +1267,72 @@ mod tests {
             msg2.payload,
             Bytes::from("hello"),
             "Local duplicate publishes should both be delivered"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "stress: publishes 100k messages to prove slow-subscriber isolation"]
+    async fn test_slow_subscriber_isolated_at_100k_messages() {
+        use tokio::time::{timeout, Duration};
+
+        const MESSAGES: usize = 100_000;
+        let node = test_node().await;
+        let manager = Arc::new(PubSubManager::new(node, None).expect("manager"));
+        let _slow = manager.subscribe("slow-consumer".to_string()).await;
+        let mut fast = manager.subscribe("slow-consumer".to_string()).await;
+
+        let fast_task = tokio::spawn(async move {
+            let mut received = 0usize;
+            while received < MESSAGES {
+                let Some(_msg) = fast.recv().await else {
+                    break;
+                };
+                received += 1;
+            }
+            received
+        });
+
+        for i in 0..MESSAGES {
+            manager
+                .publish("slow-consumer".to_string(), Bytes::from(format!("msg-{i}")))
+                .await
+                .expect("publish");
+            if i % 256 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let fast_received = timeout(Duration::from_secs(30), fast_task)
+            .await
+            .expect("fast subscriber timed out")
+            .expect("fast task join failed");
+        let stats = manager.stats();
+
+        if let Ok(path) = std::env::var("X0X_SLOW_CONSUMER_PROOF") {
+            let body = serde_json::json!({
+                "messages": MESSAGES,
+                "publish_total": stats.publish_total,
+                "delivered_to_subscriber": stats.delivered_to_subscriber,
+                "subscriber_channel_closed": stats.subscriber_channel_closed,
+                "decode_to_delivery_drops": stats.decode_to_delivery_drops,
+                "fast_received": fast_received,
+            });
+            std::fs::write(path, serde_json::to_vec_pretty(&body).expect("proof json"))
+                .expect("write proof json");
+        }
+
+        assert_eq!(
+            stats.publish_total, MESSAGES as u64,
+            "publisher must reach full publish_total without stalling"
+        );
+        assert!(
+            stats.subscriber_channel_closed >= 1,
+            "slow subscriber should be dropped once its 10k buffer fills"
+        );
+        assert_eq!(
+            fast_received, MESSAGES,
+            "fast subscriber must still receive all {} messages",
+            MESSAGES
         );
     }
 }

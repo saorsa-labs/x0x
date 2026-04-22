@@ -1,0 +1,12 @@
+[22:38:43] slow-consumer proof → proofs/slow-consumer-20260421-233843
+   Compiling x0x v0.18.5 (/Users/davidirvine/Desktop/Devel/projects/x0x)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.48s
+     Running unittests src/lib.rs (target/debug/deps/x0x-79b32471764de6c6)
+
+running 1 test
+test gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages has been running for over 60 seconds
+test gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 588 filtered out; finished in 1179.58s
+
+[22:58:53] wrote proofs/slow-consumer-20260421-233843/result.json and proofs/slow-consumer-20260421-233843/summary.md

@@ -1,0 +1,8 @@
+{
+  "decode_to_delivery_drops": 0,
+  "delivered_to_subscriber": 110000,
+  "fast_received": 100000,
+  "messages": 100000,
+  "publish_total": 100000,
+  "subscriber_channel_closed": 1
+}

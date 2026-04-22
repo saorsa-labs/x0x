@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 117,
+  "endpoint_count": 122,
   "endpoints": [
     {
       "category": "status",
@@ -206,6 +206,27 @@
     },
     {
       "category": "discovery",
+      "cli_name": "agents machine",
+      "description": "Resolve agent to current machine endpoint",
+      "method": "GET",
+      "path": "/agents/:agent_id/machine"
+    },
+    {
+      "category": "machines",
+      "cli_name": "machines discovered",
+      "description": "List discovered machine endpoints",
+      "method": "GET",
+      "path": "/machines/discovered"
+    },
+    {
+      "category": "machines",
+      "cli_name": "machines get",
+      "description": "Get discovered machine endpoint details",
+      "method": "GET",
+      "path": "/machines/discovered/:machine_id"
+    },
+    {
+      "category": "discovery",
       "cli_name": "agents find",
       "description": "Find agent on network",
       "method": "POST",
@@ -224,6 +245,13 @@
       "description": "Agents by user ID",
       "method": "GET",
       "path": "/users/:user_id/agents"
+    },
+    {
+      "category": "machines",
+      "cli_name": "machines by-user",
+      "description": "Machine endpoints by user ID",
+      "method": "GET",
+      "path": "/users/:user_id/machines"
     },
     {
       "category": "contacts",
@@ -322,6 +350,13 @@
       "description": "Connect to agent",
       "method": "POST",
       "path": "/agents/connect"
+    },
+    {
+      "category": "direct",
+      "cli_name": "machines connect",
+      "description": "Connect to machine",
+      "method": "POST",
+      "path": "/machines/connect"
     },
     {
       "category": "direct",

@@ -2,6 +2,61 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.18.5] - 2026-04-21
+
+### Added
+
+- **Machine-centric discovery.** Machines now publish signed
+  `x0x.machine.announce.v1` endpoint announcements keyed by `machine_id`
+  and backed by a first-class discovered-machine cache. Agent and user
+  identities link onto those machine records, and the daemon exposes
+  `/machines/discovered`, `/machines/discovered/:machine_id`,
+  `/machines/connect`, `/agents/:agent_id/machine`, and
+  `/users/:user_id/machines` so callers can resolve `agent_id` /
+  `user_id` to the transport machine used for IPv4/IPv6 direct dials,
+  hole-punching, or relay-assisted connection.
+
+### Fixed
+
+- **File-transfer throughput on localhost.** File chunks now prefer the
+  raw-QUIC direct-stream path when a live direct connection already
+  exists, instead of paying the gossip-DM ACK round-trip on every chunk.
+  Control-plane messages (offer / accept / reject / complete) still use
+  the existing capability-aware path, so file setup and teardown retain
+  their prior delivery semantics while the bulk body uses the fast lane.
+- **Out-of-order raw chunk handling.** The receiver no longer fails the
+  whole transfer if chunk `N+1` arrives before chunk `N`. Out-of-order
+  chunks are buffered per transfer and drained in sequence as soon as the
+  missing predecessor arrives. This was required once the raw-QUIC chunk
+  path removed the implicit serialization that the gossip-DM ACK loop had
+  been imposing.
+- **Throughput measurement accuracy.** `TransferState` now exposes
+  `started_at_unix_ms` / `completed_at_unix_ms`, and
+  `tests/e2e_full_measurement.sh` can size the test file via
+  `--file-size-kib` / `FILE_SIZE_KIB`. The harness now computes file
+  throughput from daemon-side transfer timestamps instead of the old
+  1-second status-poll cadence, which materially understated fast local
+  transfers.
+- **Slow-subscriber isolation.** Pub/sub delivery to each local
+  subscriber channel is now non-blocking: once a subscriber's 10k buffer
+  fills, x0x drops that subscriber instead of letting it back-pressure
+  the topic delivery worker forever. This preserves delivery to other
+  subscribers and lets `subscriber_channel_closed` surface the event in
+  `GET /diagnostics/gossip`.
+
+### Proofs
+
+- `proofs/full-20260421-v0185-throughput-5node-16m/` — 5 daemons,
+  16 MiB file, **102.69 Mbps** localhost transfer throughput in the
+  throughput-focused run.
+- `proofs/full-20260421-v0185-localhost-throughput-16m-500/` —
+  comprehensive 5-daemon run, 500 pub/sub messages + 16 MiB file in
+  **1.214 s = 110.56 Mbps** under the heavier combined workload.
+- `proofs/slow-consumer-20260421-v0185-100k/` — one subscriber never
+  drains, one subscriber drains normally, 100 000 publishes total:
+  `publish_total=100000`, `subscriber_channel_closed=1`,
+  `fast_received=100000`, `decode_to_delivery_drops=0`.
+
 ## [v0.18.4] - 2026-04-21
 
 ### Fixed

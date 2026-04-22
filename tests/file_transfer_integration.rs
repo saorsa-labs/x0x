@@ -31,6 +31,8 @@ fn make_sending_transfer(size: u64, chunk_size: usize) -> TransferState {
         sha256: "abc123".to_string(),
         error: None,
         started_at: 0,
+        started_at_unix_ms: 0,
+        completed_at_unix_ms: None,
         source_path: Some("/tmp/test.bin".to_string()),
         output_path: None,
         chunk_size,
@@ -55,6 +57,8 @@ fn make_receiving_transfer(size: u64, chunk_size: usize) -> TransferState {
         sha256: "def456".to_string(),
         error: None,
         started_at: 0,
+        started_at_unix_ms: 0,
+        completed_at_unix_ms: None,
         source_path: None,
         output_path: Some("/tmp/received.bin".to_string()),
         chunk_size,
@@ -241,10 +245,7 @@ fn total_chunks_chunk_size_plus_one() {
 #[test]
 fn total_chunks_exact_multiple() {
     // Exactly 2 chunks at whatever DEFAULT_CHUNK_SIZE is today.
-    let ts = make_sending_transfer(
-        (DEFAULT_CHUNK_SIZE as u64) * 2,
-        DEFAULT_CHUNK_SIZE,
-    );
+    let ts = make_sending_transfer((DEFAULT_CHUNK_SIZE as u64) * 2, DEFAULT_CHUNK_SIZE);
     assert_eq!(ts.total_chunks, 2);
 }
 
@@ -447,6 +448,8 @@ fn transfer_state_deserializes_without_optional_fields() {
     assert!(ts.output_path.is_none());
     assert_eq!(ts.chunk_size, DEFAULT_CHUNK_SIZE); // serde default
     assert_eq!(ts.total_chunks, 0); // serde default
+    assert_eq!(ts.started_at_unix_ms, 0); // serde default
+    assert!(ts.completed_at_unix_ms.is_none()); // serde default
 }
 
 // ---------------------------------------------------------------------------

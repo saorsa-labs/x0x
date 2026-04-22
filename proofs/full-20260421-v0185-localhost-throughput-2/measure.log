@@ -1,0 +1,24 @@
+[21:04:38] Config: NODES=5 MESSAGES=500 FILE_SIZE_KIB=4096 TOPIC=measure-97362 PROOF_DIR=proofs/full-20260421-v0185-localhost-throughput-2
+[21:04:38] Launching daemon 1 on API port 12801
+[21:04:38] Launching daemon 2 on API port 12802
+[21:04:38] Launching daemon 3 on API port 12803
+[21:04:38] Launching daemon 4 on API port 12804
+[21:04:38] Launching daemon 5 on API port 12805
+[21:04:38] Waiting 20s for daemons to bind + discover each other...
+[21:04:58] Snapshot: pre
+[21:04:58] Installing subscriptions on every node...
+[21:04:58] Publishing 500 pub/sub messages from node 1 (no delay)
+[21:05:17] Published 500 msgs in 19s
+[21:05:22] Snapshot: mid
+[21:05:23] DM round-trip from node-1 → node-2 with require_ack_ms=2000
+[21:05:23] DM send: ok=ok rtt_ms=0
+[21:05:23] Probing every pair's peer liveness (ant-quic probe_peer)...
+[21:05:24] Probe matrix → proofs/full-20260421-v0185-localhost-throughput-2/probe-matrix.json
+[21:05:24] File transfer: 4194304 bytes (node-1 → node-2)
+[21:05:25] File transfer offer sent (id=9477ae54-2e14-43fe-874d-ea9b4d3a672b) in 258938us
+[21:05:26] File transfer FAILED: send=Complete recv=Failed
+[21:05:26] File transfer did not complete within 60s
+[21:05:31] Snapshot: post
+[21:05:31] Measurement report → proofs/full-20260421-v0185-localhost-throughput-2/measure-report.json
+[21:05:31] PASSED=True  FAILURES=0
+[21:05:31] Cleaning up daemons...

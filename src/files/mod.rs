@@ -105,6 +105,12 @@ pub struct TransferState {
     pub error: Option<String>,
     /// Timestamp when transfer started (unix seconds).
     pub started_at: u64,
+    /// Timestamp when transfer started (unix milliseconds).
+    #[serde(default)]
+    pub started_at_unix_ms: u64,
+    /// Timestamp when transfer reached a terminal state (unix milliseconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<u64>,
     /// Local file path (sender side only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,

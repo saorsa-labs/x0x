@@ -119,13 +119,19 @@ Notes:
 |---|---|---|---|
 | GET | `/agents/discovered` | `x0x agents list` | List discovered agents |
 | GET | `/agents/discovered/:agent_id` | `x0x agents get <agent_id>` | Get one discovered agent |
+| GET | `/agents/:agent_id/machine` | `x0x agents machine <agent_id>` | Resolve an agent to its current machine endpoint |
+| GET | `/machines/discovered` | `x0x machines discovered` | List discovered machine endpoints |
+| GET | `/machines/discovered/:machine_id` | `x0x machines get <machine_id>` | Get one discovered machine endpoint |
 | POST | `/agents/find/:agent_id` | `x0x agents find <agent_id>` | Actively look up an agent |
 | GET | `/agents/reachability/:agent_id` | `x0x agents reachability <agent_id>` | Reachability heuristics |
 | GET | `/users/:user_id/agents` | `x0x agents by-user <user_id>` | List agents linked to a user |
+| GET | `/users/:user_id/machines` | `x0x machines by-user <user_id>` | List machine endpoints linked to a user |
 
 Query params:
 - `/agents/discovered?unfiltered=true`
 - `/agents/discovered/:agent_id?wait=<seconds>`
+- `/machines/discovered?unfiltered=true`
+- `/machines/discovered/:machine_id?wait=<seconds>`
 
 ## Contacts, machines, and trust
 
@@ -174,6 +180,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | POST | `/agents/connect` | `x0x direct connect <agent_id>` | Establish a direct connection |
+| POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
 | POST | `/direct/send` | `x0x direct send <agent_id> <message>` | Send a direct base64 payload |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages |

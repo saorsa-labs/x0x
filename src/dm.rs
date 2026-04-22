@@ -298,6 +298,11 @@ pub struct DmSendConfig {
     /// recipient's capability advert is missing. Used to enforce the
     /// gossip path in test harnesses.
     pub require_gossip: bool,
+    /// If true and `require_gossip` is false, first try the legacy/raw
+    /// QUIC direct-stream path when a live direct connection already exists.
+    /// If that fast path is unavailable, fall back to the normal
+    /// capability-aware send logic.
+    pub prefer_raw_quic_if_connected: bool,
 }
 
 impl Default for DmSendConfig {
@@ -310,6 +315,7 @@ impl Default for DmSendConfig {
             max_retries: 1,
             backoff: BackoffPolicy::Fixed(Duration::from_millis(500)),
             require_gossip: false,
+            prefer_raw_quic_if_connected: false,
         }
     }
 }

@@ -1,0 +1,41 @@
+Warning: Permanently added '45.77.176.184' (ED25519) to the list of known hosts.
+Apr 22 09:08:46 vultr x0xd[1450222]: 2026-04-22T09:08:46.689986Z  INFO x0x::network: [1/6 network] send: 16063 bytes (PubSub) to peer PeerId(0b7bb5a3b9951f8a)
+Apr 22 09:08:46 vultr x0xd[1450222]: 2026-04-22T09:08:46.694380Z  INFO x0x::network: [1/6 network] send: 16063 bytes (PubSub) to peer PeerId(0b7bb5a3b9951f8a)
+Apr 22 09:08:46 vultr x0xd[1450222]: 2026-04-22T09:08:46.697960Z  INFO x0x::network: [1/6 network] send: 16041 bytes (PubSub) to peer PeerId(0b7bb5a3b9951f8a)
+Apr 22 09:08:46 vultr x0xd[1450222]: 2026-04-22T09:08:46.700469Z  INFO x0x::network: [1/6 network] send: 16041 bytes (PubSub) to peer PeerId(0b7bb5a3b9951f8a)
+Apr 22 09:08:46 vultr x0xd[1450222]: 2026-04-22T09:08:46.706691Z  INFO x0x::network: [1/6 network] send: 16063 bytes (PubSub) to peer PeerId(0b7bb5a3b9951f8a)
+Apr 22 09:08:46 vultr x0xd[1450222]: 2026-04-22T09:08:46.707207Z  INFO x0x::network: [1/6 network] recv: 2 bytes (Membership) from peer PeerId([11, 123, 181, 163, 185, 149, 31, 138, 99, 1, 190, 188, 196, 153, 177, 172, 45, 189, 147, 209, 24, 91, 241, 155, 193, 9, 6, 97, 69, 56, 12, 92])
+Apr 22 09:08:46 vultr x0xd[1450222]: 2026-04-22T09:08:46.708355Z  INFO x0x::network: [1/6 network] send: 3 bytes (Membership) to peer PeerId(0b7bb5a3b9951f8a)
+Apr 22 09:08:47 vultr x0xd[1450222]: 2026-04-22T09:08:47.206876Z  INFO x0x::network: [1/6 network] send: 3 bytes (Membership) to peer PeerId(0b7bb5a3b9951f8a)
+Apr 22 09:08:48 vultr x0xd[1450222]: 2026-04-22T09:08:48.999339Z  INFO ant_quic::connection: Both peers support NAT traversal, negotiating capabilities
+Apr 22 09:08:48 vultr x0xd[1450222]: 2026-04-22T09:08:48.999383Z  INFO ant_quic::connection: NAT traversal capability negotiated successfully
+Apr 22 09:08:48 vultr x0xd[1450222]: 2026-04-22T09:08:48.999391Z  INFO ant_quic::connection: NAT traversal capability successfully negotiated
+Apr 22 09:08:48 vultr x0xd[1450222]: 2026-04-22T09:08:48.999402Z  INFO ant_quic::connection: negotiate_address_discovery: peer_params.address_discovery = Some(SendAndReceive)
+Apr 22 09:08:48 vultr x0xd[1450222]: 2026-04-22T09:08:48.999411Z  INFO ant_quic::connection: Peer supports address discovery: SendAndReceive
+Apr 22 09:08:48 vultr x0xd[1450222]: 2026-04-22T09:08:48.999419Z  INFO ant_quic::connection: Address discovery negotiated successfully: rate=10, all_paths=false
+Apr 22 09:08:48 vultr x0xd[1450222]: 2026-04-22T09:08:48.999483Z  INFO ant_quic::connection: queue_observed_address_frame: SENDING OBSERVED_ADDRESS to [2604:a880:400:d1:0:3:7db3:f001]:5483 for path 0
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.207888Z  INFO x0x::network: [1/6 network] send: 5434 bytes (PubSub) to peer PeerId(4721317e38abc8c4)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.213510Z  INFO x0x::network: [1/6 network] send: 5979 bytes (PubSub) to peer PeerId(6a24bdeddd828e1e)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.213993Z  INFO x0x::network: [1/6 network] send: 5499 bytes (PubSub) to peer PeerId(6a24bdeddd828e1e)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.216186Z  INFO x0x::network: [1/6 network] send: 5563 bytes (PubSub) to peer PeerId(0b7bb5a3b9951f8a)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.216821Z  INFO x0x::network: [1/6 network] send: 5402 bytes (PubSub) to peer PeerId(b2606ba6db0d98b3)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.218946Z  INFO x0x::network: [1/6 network] send: 6011 bytes (PubSub) to peer PeerId(b2606ba6db0d98b3)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.223453Z  INFO x0x::network: [1/6 network] send: 5787 bytes (PubSub) to peer PeerId(4721317e38abc8c4)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.225442Z  INFO x0x::network: [1/6 network] send: 5755 bytes (PubSub) to peer PeerId(6a24bdeddd828e1e)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.226207Z  INFO x0x::network: [1/6 network] send: 5370 bytes (PubSub) to peer PeerId(6a24bdeddd828e1e)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.229550Z  INFO x0x::network: [1/6 network] send: 5563 bytes (PubSub) to peer PeerId(b2606ba6db0d98b3)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.231321Z  INFO x0x::network: [1/6 network] send: 5370 bytes (PubSub) to peer PeerId(4721317e38abc8c4)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.231635Z  INFO x0x::network: [1/6 network] send: 101 bytes (Membership) to peer PeerId(4721317e38abc8c4)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.231725Z  INFO x0x::diag::connectivity: connectivity snapshot nat_type=FullCone can_receive_direct=true has_global_address=true external_addrs=1 port_mapping_active=false port_mapping_addr=None mdns_browsing=true mdns_advertising=true mdns_discovered=0 connected_peers=4 direct_connections=6 relayed_connections=0 hole_punch_success_rate=1.0 avg_rtt_ms=184 uptime_s=480
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.276467Z  INFO x0x::network: [1/6 network] send: 3 bytes (Membership) to peer PeerId(4721317e38abc8c4)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.276527Z  INFO x0x::network: [1/6 network] send: 3 bytes (Membership) to peer PeerId(b2606ba6db0d98b3)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.276542Z  INFO x0x::network: [1/6 network] send: 3 bytes (Membership) to peer PeerId(6a24bdeddd828e1e)
+Apr 22 09:08:50 vultr x0xd[1450222]: 2026-04-22T09:08:50.276556Z  INFO x0x::network: [1/6 network] send: 3 bytes (Membership) to peer PeerId(0b7bb5a3b9951f8a)
+Apr 22 09:08:51 vultr x0xd[1450222]: 2026-04-22T09:08:51.207665Z  WARN saorsa_gossip_membership: SWIM: Suspect timeout → marked dead peer_id=0b7bb5a3b9951f8a
+Apr 22 09:08:57 vultr x0xd[1450222]: 2026-04-22T09:08:57.208057Z  INFO ant_quic::connection: Both peers support NAT traversal, negotiating capabilities
+Apr 22 09:08:57 vultr x0xd[1450222]: 2026-04-22T09:08:57.208583Z  INFO ant_quic::connection: NAT traversal capability negotiated successfully
+Apr 22 09:08:57 vultr x0xd[1450222]: 2026-04-22T09:08:57.208593Z  INFO ant_quic::connection: NAT traversal capability successfully negotiated
+Apr 22 09:08:57 vultr x0xd[1450222]: 2026-04-22T09:08:57.208603Z  INFO ant_quic::connection: negotiate_address_discovery: peer_params.address_discovery = Some(SendAndReceive)
+Apr 22 09:08:57 vultr x0xd[1450222]: 2026-04-22T09:08:57.208612Z  INFO ant_quic::connection: Peer supports address discovery: SendAndReceive
+Apr 22 09:08:57 vultr x0xd[1450222]: 2026-04-22T09:08:57.208618Z  INFO ant_quic::connection: Address discovery negotiated successfully: rate=10, all_paths=false
+Apr 22 09:08:57 vultr x0xd[1450222]: 2026-04-22T09:08:57.208664Z  INFO ant_quic::connection: queue_observed_address_frame: SENDING OBSERVED_ADDRESS to [2604:a880:400:d1:0:3:7db3:f001]:5483 for path 0

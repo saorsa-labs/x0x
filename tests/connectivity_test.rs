@@ -220,6 +220,17 @@ async fn connect_to_unknown_agent_returns_not_found() {
     assert_eq!(outcome, ConnectOutcome::NotFound);
 }
 
+/// Connecting to a non-existent machine returns NotFound.
+#[tokio::test]
+async fn connect_to_unknown_machine_returns_not_found() {
+    let dir = TempDir::new().unwrap();
+    let agent = build_agent(&dir).await;
+
+    let unknown_id = x0x::identity::MachineId([201u8; 32]);
+    let outcome = agent.connect_to_machine(&unknown_id).await.unwrap();
+    assert_eq!(outcome, ConnectOutcome::NotFound);
+}
+
 /// An agent with no addresses returns Unreachable.
 #[tokio::test]
 async fn connect_to_agent_with_no_addresses_returns_unreachable() {
@@ -311,6 +322,34 @@ async fn reachability_returns_correct_info_from_cache() {
     assert!(!info.is_relay());
     assert!(info.is_coordinator());
     assert_eq!(info.addresses.len(), 1);
+}
+
+/// Inserting an agent discovery record also creates the machine endpoint link.
+#[tokio::test]
+async fn machine_for_agent_returns_linked_endpoint() {
+    let dir = TempDir::new().unwrap();
+    let agent = build_agent(&dir).await;
+
+    let da = fake_discovered(
+        103,
+        vec!["10.0.0.3:8080".parse().unwrap()],
+        Some("FullCone"),
+        Some(true),
+        Some(false),
+        Some(true),
+    );
+    let target_id = da.agent_id;
+    let target_machine = da.machine_id;
+    agent.insert_discovered_agent_for_testing(da).await;
+
+    let machine = agent
+        .machine_for_agent(target_id)
+        .await
+        .unwrap()
+        .expect("agent should resolve to a machine");
+    assert_eq!(machine.machine_id, target_machine);
+    assert!(machine.agent_ids.contains(&target_id));
+    assert_eq!(machine.addresses.len(), 1);
 }
 
 // ---------------------------------------------------------------------------

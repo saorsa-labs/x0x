@@ -257,6 +257,27 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "discovery",
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/agents/:agent_id/machine",
+        cli_name: "agents machine",
+        description: "Resolve agent to current machine endpoint",
+        category: "discovery",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/machines/discovered",
+        cli_name: "machines discovered",
+        description: "List discovered machine endpoints",
+        category: "machines",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/machines/discovered/:machine_id",
+        cli_name: "machines get",
+        description: "Get discovered machine endpoint details",
+        category: "machines",
+    },
+    EndpointDef {
         method: Method::Post,
         path: "/agents/find/:agent_id",
         cli_name: "agents find",
@@ -276,6 +297,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agents by-user",
         description: "Agents by user ID",
         category: "discovery",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/users/:user_id/machines",
+        cli_name: "machines by-user",
+        description: "Machine endpoints by user ID",
+        category: "machines",
     },
     // ── Contacts ────────────────────────────────────────────────────────
     EndpointDef {
@@ -377,6 +405,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         path: "/agents/connect",
         cli_name: "direct connect",
         description: "Connect to agent",
+        category: "direct",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/machines/connect",
+        cli_name: "machines connect",
+        description: "Connect to machine",
         category: "direct",
     },
     EndpointDef {
