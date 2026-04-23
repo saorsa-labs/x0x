@@ -343,6 +343,26 @@ async fn machine_announcement_round_trip() {
 }
 
 #[tokio::test]
+async fn machine_announcement_decode_rejects_trailing_bytes() {
+    let dir = TempDir::new().unwrap();
+    let agent = build_agent(&dir).await;
+
+    let ann = agent.build_machine_announcement().unwrap();
+    let mut bytes = bincode::serialize(&ann).unwrap();
+    bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+    let decoded = {
+        use bincode::Options;
+        bincode::DefaultOptions::new()
+            .with_limit(64 * 1024)
+            .reject_trailing_bytes()
+            .deserialize::<MachineAnnouncement>(&bytes)
+    };
+
+    assert!(decoded.is_err(), "trailing bytes must be rejected");
+}
+
+#[tokio::test]
 async fn self_announcement_populates_machine_cache() {
     let dir = TempDir::new().unwrap();
     let agent = Agent::builder()

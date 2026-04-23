@@ -428,10 +428,16 @@ impl ContactStore {
             .find(|m| m.machine_id == record.machine_id)
         {
             existing.last_seen = now_secs();
-            if record.label.is_some() {
-                existing.label = record.label;
+            let mut changed = false;
+            if let Some(label) = record.label {
+                if existing.label.as_ref() != Some(&label) {
+                    existing.label = Some(label);
+                    changed = true;
+                }
             }
-            let _ = self.save();
+            if changed {
+                let _ = self.save();
+            }
             false
         } else {
             contact.machines.push(record);

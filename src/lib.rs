@@ -894,6 +894,28 @@ async fn upsert_discovered_machine_from_agent(
     }
 }
 
+const MAX_MACHINE_ANNOUNCEMENT_DECODE_BYTES: u64 = 64 * 1024;
+
+fn deserialize_identity_announcement(
+    payload: &[u8],
+) -> std::result::Result<IdentityAnnouncement, Box<bincode::ErrorKind>> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+        .allow_trailing_bytes()
+        .deserialize(payload)
+}
+
+fn deserialize_machine_announcement(
+    payload: &[u8],
+) -> std::result::Result<MachineAnnouncement, Box<bincode::ErrorKind>> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_limit(MAX_MACHINE_ANNOUNCEMENT_DECODE_BYTES)
+        .reject_trailing_bytes()
+        .deserialize(payload)
+}
+
 fn build_machine_announcement_for_identity(
     identity: &identity::Identity,
     addresses: Vec<std::net::SocketAddr>,
@@ -2305,6 +2327,10 @@ impl Agent {
     /// # Errors
     ///
     /// See [`dm::DmError`].
+    ///
+    /// Uses the default capability-aware policy. Call
+    /// [`Self::send_direct_with_config`] to opt into the raw-QUIC fast path
+    /// explicitly.
     pub async fn send_direct(
         &self,
         to: &identity::AgentId,
@@ -3153,8 +3179,34 @@ impl Agent {
                 (identity::MachineId, u64),
                 std::time::Instant,
             > = std::collections::HashMap::new();
+            let mut seen_identity_payloads: std::collections::HashMap<
+                blake3::Hash,
+                std::time::Instant,
+            > = std::collections::HashMap::new();
+            let mut seen_machine_payloads: std::collections::HashMap<
+                blake3::Hash,
+                std::time::Instant,
+            > = std::collections::HashMap::new();
             const REBROADCAST_MIN_INTERVAL: std::time::Duration =
                 std::time::Duration::from_secs(20);
+            const VERIFIED_PAYLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+            let has_recent_verified_payload =
+                |seen: &std::collections::HashMap<blake3::Hash, std::time::Instant>,
+                 payload: &[u8]| {
+                    let key = blake3::hash(payload);
+                    matches!(seen.get(&key), Some(last) if last.elapsed() < VERIFIED_PAYLOAD_TTL)
+                };
+            let remember_verified_payload =
+                |seen: &mut std::collections::HashMap<blake3::Hash, std::time::Instant>,
+                 payload: &[u8]| {
+                    let now = std::time::Instant::now();
+                    seen.insert(blake3::hash(payload), now);
+                    if seen.len() > 4096 {
+                        let cutoff = now - VERIFIED_PAYLOAD_TTL;
+                        seen.retain(|_, t| *t >= cutoff);
+                    }
+                };
 
             loop {
                 // Drain whichever subscription fires next; deduplicate by ID in cache.
@@ -3167,16 +3219,10 @@ impl Agent {
                 };
                 let msg = match msg {
                     DiscoveryMessage::Machine(msg) => {
-                        let decoded = {
-                            use bincode::Options;
-                            bincode::options()
-                                .with_fixint_encoding()
-                                .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-                                .allow_trailing_bytes()
-                                .deserialize::<MachineAnnouncement>(&msg.payload)
-                        };
                         let raw_payload = msg.payload.clone();
-                        let announcement = match decoded {
+                        let already_verified =
+                            has_recent_verified_payload(&seen_machine_payloads, &raw_payload);
+                        let announcement = match deserialize_machine_announcement(&raw_payload) {
                             Ok(a) => a,
                             Err(e) => {
                                 tracing::debug!(
@@ -3187,9 +3233,12 @@ impl Agent {
                             }
                         };
 
-                        if let Err(e) = announcement.verify() {
-                            tracing::warn!("Ignoring unverifiable machine announcement: {}", e);
-                            continue;
+                        if !already_verified {
+                            if let Err(e) = announcement.verify() {
+                                tracing::warn!("Ignoring unverifiable machine announcement: {}", e);
+                                continue;
+                            }
+                            remember_verified_payload(&mut seen_machine_payloads, &raw_payload);
                         }
 
                         let now = std::time::SystemTime::now()
@@ -3268,16 +3317,10 @@ impl Agent {
                     }
                     DiscoveryMessage::Identity(msg) => msg,
                 };
-                let decoded = {
-                    use bincode::Options;
-                    bincode::options()
-                        .with_fixint_encoding()
-                        .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-                        .allow_trailing_bytes()
-                        .deserialize::<IdentityAnnouncement>(&msg.payload)
-                };
                 let raw_payload = msg.payload.clone();
-                let announcement = match decoded {
+                let already_verified =
+                    has_recent_verified_payload(&seen_identity_payloads, &raw_payload);
+                let announcement = match deserialize_identity_announcement(&raw_payload) {
                     Ok(a) => a,
                     Err(e) => {
                         tracing::debug!("Ignoring invalid identity announcement payload: {}", e);
@@ -3285,9 +3328,12 @@ impl Agent {
                     }
                 };
 
-                if let Err(e) = announcement.verify() {
-                    tracing::warn!("Ignoring unverifiable identity announcement: {}", e);
-                    continue;
+                if !already_verified {
+                    if let Err(e) = announcement.verify() {
+                        tracing::warn!("Ignoring unverifiable identity announcement: {}", e);
+                        continue;
+                    }
+                    remember_verified_payload(&mut seen_identity_payloads, &raw_payload);
                 }
 
                 // Evaluate trust for this (agent, machine) pair.
@@ -4350,12 +4396,7 @@ impl Agent {
             let timeout = tokio::time::sleep_until(deadline);
             tokio::select! {
                 Some(msg) = sub.recv() => {
-                    if let Ok(ann) = {
-                        use bincode::Options;
-                        bincode::DefaultOptions::new()
-                            .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-                            .deserialize::<IdentityAnnouncement>(&msg.payload)
-                    } {
+                    if let Ok(ann) = deserialize_identity_announcement(&msg.payload) {
                         if ann.verify().is_ok() && ann.agent_id == agent_id {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -4465,12 +4506,7 @@ impl Agent {
             let timeout = tokio::time::sleep_until(deadline);
             tokio::select! {
                 Some(msg) = sub.recv() => {
-                    if let Ok(ann) = {
-                        use bincode::Options;
-                        bincode::DefaultOptions::new()
-                            .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-                            .deserialize::<MachineAnnouncement>(&msg.payload)
-                    } {
+                    if let Ok(ann) = deserialize_machine_announcement(&msg.payload) {
                         if ann.verify().is_ok() && ann.machine_id == machine_id {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
