@@ -204,6 +204,11 @@ pub struct Agent {
     machine_discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
     >,
+    /// Cache of discovered users from user announcements (self-asserted
+    /// agent-ownership rosters).
+    user_discovery_cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::UserId, DiscoveredUser>>,
+    >,
     /// Ensures identity discovery listener is spawned once.
     identity_listener_started: std::sync::atomic::AtomicBool,
     /// How often to re-announce identity (seconds).
@@ -282,6 +287,14 @@ pub const IDENTITY_ANNOUNCE_TOPIC: &str = "x0x.identity.announce.v2";
 /// topic. v1 is retired.
 pub const MACHINE_ANNOUNCE_TOPIC: &str = "x0x.machine.announce.v2";
 
+/// Reserved gossip topic for signed user announcements.
+///
+/// A `UserAnnouncement` is a user-signed list of `AgentCertificate`s —
+/// it is the user saying "these are my agents", independent of whether
+/// any individual agent has consented to disclose its user binding.
+/// First introduced in v2 wire format.
+pub const USER_ANNOUNCE_TOPIC: &str = "x0x.user.announce.v2";
+
 /// Return the shard-specific gossip topic for the given `agent_id`.
 ///
 /// Each agent publishes identity announcements to a deterministic shard topic
@@ -305,6 +318,17 @@ pub fn shard_topic_for_agent(agent_id: &identity::AgentId) -> String {
 pub fn shard_topic_for_machine(machine_id: &identity::MachineId) -> String {
     let shard = saorsa_gossip_rendezvous::calculate_shard(&machine_id.0);
     format!("x0x.machine.shard.v2.{shard}")
+}
+
+/// Return the shard-specific gossip topic for the given `user_id`.
+///
+/// Users publish their agent-ownership roster to a deterministic shard so
+/// seekers can look up "which agents does UserId(X) claim?" without a full
+/// broadcast subscription.
+#[must_use]
+pub fn shard_topic_for_user(user_id: &identity::UserId) -> String {
+    let shard = saorsa_gossip_rendezvous::calculate_shard(&user_id.0);
+    format!("x0x.user.shard.v2.{shard}")
 }
 
 /// Gossip topic prefix for rendezvous `ProviderSummary` advertisements.
@@ -738,6 +762,205 @@ impl MachineAnnouncement {
                 e
             ))
         })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct UserAnnouncementUnsigned {
+    user_id: identity::UserId,
+    user_public_key: Vec<u8>,
+    /// Certificates the user issued binding `UserId` to each of their agents.
+    ///
+    /// Recipients verify each certificate's ML-DSA-65 signature and that
+    /// `certificate.user_id()` matches `user_id` in this announcement.
+    agent_certificates: Vec<identity::AgentCertificate>,
+    announced_at: u64,
+}
+
+/// Signed user announcement broadcast on [`USER_ANNOUNCE_TOPIC`].
+///
+/// Published by a human operator (via `Agent::announce_user_identity`) to
+/// assert first-class ownership of a set of agents, independent of whether
+/// any given agent has disclosed its user binding in its own heartbeat.
+/// Each [`identity::AgentCertificate`] is itself user-signed, so recipients
+/// can validate every agent-owner claim without trusting the enclosing
+/// announcement's producer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UserAnnouncement {
+    /// Human identity.
+    pub user_id: identity::UserId,
+    /// User's ML-DSA-65 public key bytes.
+    pub user_public_key: Vec<u8>,
+    /// User ML-DSA-65 signature over the unsigned announcement.
+    pub user_signature: Vec<u8>,
+    /// Agent certificates issued by this user.
+    pub agent_certificates: Vec<identity::AgentCertificate>,
+    /// Unix timestamp (seconds) of announcement creation.
+    pub announced_at: u64,
+}
+
+impl UserAnnouncement {
+    fn to_unsigned(&self) -> UserAnnouncementUnsigned {
+        UserAnnouncementUnsigned {
+            user_id: self.user_id,
+            user_public_key: self.user_public_key.clone(),
+            agent_certificates: self.agent_certificates.clone(),
+            announced_at: self.announced_at,
+        }
+    }
+
+    /// Sign an announcement binding the given user keypair to the provided
+    /// agent certificates. Each certificate must already have been issued by
+    /// this user — verification fails for any cert whose `user_id()` differs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the user public key cannot be extracted, signing
+    /// fails, or any certificate was issued by a different user.
+    pub fn sign(
+        user_kp: &identity::UserKeypair,
+        agent_certificates: Vec<identity::AgentCertificate>,
+        announced_at: u64,
+    ) -> error::Result<Self> {
+        let user_id = user_kp.user_id();
+        // Reject certificates from a different user up front — silent drop
+        // would hide a configuration bug.
+        for cert in &agent_certificates {
+            let cert_user = cert.user_id()?;
+            if cert_user != user_id {
+                return Err(error::IdentityError::CertificateVerification(
+                    "user announcement contains certificate issued by a different user".to_string(),
+                ));
+            }
+        }
+
+        let user_public_key = user_kp.public_key().as_bytes().to_vec();
+        let unsigned = UserAnnouncementUnsigned {
+            user_id,
+            user_public_key: user_public_key.clone(),
+            agent_certificates: agent_certificates.clone(),
+            announced_at,
+        };
+        let unsigned_bytes = bincode::serialize(&unsigned).map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "failed to serialize unsigned user announcement: {e}"
+            ))
+        })?;
+        let user_signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            user_kp.secret_key(),
+            &unsigned_bytes,
+        )
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "failed to sign user announcement with user key: {e:?}"
+            )))
+        })?
+        .as_bytes()
+        .to_vec();
+
+        Ok(Self {
+            user_id,
+            user_public_key,
+            user_signature,
+            agent_certificates,
+            announced_at,
+        })
+    }
+
+    /// Verify the user signature and every embedded `AgentCertificate`.
+    ///
+    /// Checks:
+    /// 1. `user_id` matches SHA-256 of `user_public_key`.
+    /// 2. Outer ML-DSA-65 signature over the canonical unsigned form.
+    /// 3. For each certificate: its signature verifies and its `user_id()`
+    ///    equals this announcement's `user_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing which check failed.
+    pub fn verify(&self) -> error::Result<()> {
+        let user_pub =
+            ant_quic::MlDsaPublicKey::from_bytes(&self.user_public_key).map_err(|_| {
+                error::IdentityError::CertificateVerification(
+                    "invalid user public key in user announcement".to_string(),
+                )
+            })?;
+        let derived_user_id = identity::UserId::from_public_key(&user_pub);
+        if derived_user_id != self.user_id {
+            return Err(error::IdentityError::CertificateVerification(
+                "user_id does not match user public key in user announcement".to_string(),
+            ));
+        }
+
+        let unsigned_bytes = bincode::serialize(&self.to_unsigned()).map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "failed to serialize user announcement for verification: {e}"
+            ))
+        })?;
+        let signature = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
+            &self.user_signature,
+        )
+        .map_err(|e| {
+            error::IdentityError::CertificateVerification(format!(
+                "invalid user signature in user announcement: {e:?}"
+            ))
+        })?;
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            &user_pub,
+            &unsigned_bytes,
+            &signature,
+        )
+        .map_err(|e| {
+            error::IdentityError::CertificateVerification(format!(
+                "user announcement signature verification failed: {e:?}"
+            ))
+        })?;
+
+        for cert in &self.agent_certificates {
+            cert.verify()?;
+            let cert_user = cert.user_id()?;
+            if cert_user != self.user_id {
+                return Err(error::IdentityError::CertificateVerification(
+                    "user announcement certificate user_id mismatch".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Cached discovery data derived from [`UserAnnouncement`]s.
+#[derive(Debug, Clone)]
+pub struct DiscoveredUser {
+    /// Human identity.
+    pub user_id: identity::UserId,
+    /// Raw ML-DSA-65 user public key bytes from the last verified announcement.
+    pub user_public_key: Vec<u8>,
+    /// Certificates the user has asserted ownership of.
+    pub agent_certificates: Vec<identity::AgentCertificate>,
+    /// Convenience list of agent IDs derived from the certificates.
+    pub agent_ids: Vec<identity::AgentId>,
+    /// Announcement timestamp from the sender.
+    pub announced_at: u64,
+    /// Local timestamp (seconds) when this record was last updated.
+    pub last_seen: u64,
+}
+
+impl DiscoveredUser {
+    fn from_announcement(announcement: &UserAnnouncement, last_seen: u64) -> Self {
+        let agent_ids: Vec<identity::AgentId> = announcement
+            .agent_certificates
+            .iter()
+            .filter_map(|c| c.agent_id().ok())
+            .collect();
+        Self {
+            user_id: announcement.user_id,
+            user_public_key: announcement.user_public_key.clone(),
+            agent_certificates: announcement.agent_certificates.clone(),
+            agent_ids,
+            announced_at: announcement.announced_at,
+            last_seen,
+        }
     }
 }
 
@@ -3328,6 +3551,119 @@ impl Agent {
         Ok(machines)
     }
 
+    /// Publish a signed [`UserAnnouncement`] for this agent's user identity.
+    ///
+    /// Builds the roster from the agent certificates the user has issued for
+    /// every agent visible through this `Agent` — at minimum, this agent's
+    /// own certificate. Requires explicit human consent to avoid an unwary
+    /// caller broadcasting user identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no user keypair is configured, `human_consent` is
+    /// false, no agent certificate is available, signing fails, or the
+    /// gossip runtime is not initialised.
+    pub async fn announce_user_identity(&self, human_consent: bool) -> error::Result<()> {
+        if !human_consent {
+            return Err(error::IdentityError::Storage(std::io::Error::other(
+                "user announcement requires explicit human consent — set human_consent: true",
+            )));
+        }
+        let user_kp = self.identity.user_keypair().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "user announcement requested but no user identity is configured",
+            ))
+        })?;
+        let own_cert = self.identity.agent_certificate().cloned().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "user announcement requested but agent certificate is missing",
+            ))
+        })?;
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        self.start_identity_listener().await?;
+
+        let announced_at = Self::unix_timestamp_secs();
+        let announcement = UserAnnouncement::sign(user_kp, vec![own_cert], announced_at)?;
+        let payload = bytes::Bytes::from(bincode::serialize(&announcement).map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "failed to serialize user announcement: {e}"
+            ))
+        })?);
+        runtime
+            .pubsub()
+            .publish(shard_topic_for_user(&announcement.user_id), payload.clone())
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "failed to publish user announcement to shard topic: {e}"
+                )))
+            })?;
+        runtime
+            .pubsub()
+            .publish(USER_ANNOUNCE_TOPIC.to_string(), payload)
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "failed to publish user announcement: {e}"
+                )))
+            })?;
+
+        let now = Self::unix_timestamp_secs();
+        let incoming = DiscoveredUser::from_announcement(&announcement, now);
+        self.user_discovery_cache
+            .write()
+            .await
+            .insert(incoming.user_id, incoming);
+        Ok(())
+    }
+
+    /// Get a discovered user by ID.
+    ///
+    /// Returns `Ok(None)` if the user has never announced or the cached
+    /// entry is older than `identity_ttl_secs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn discovered_user(
+        &self,
+        user_id: identity::UserId,
+    ) -> error::Result<Option<DiscoveredUser>> {
+        self.start_identity_listener().await?;
+        let cutoff = Self::unix_timestamp_secs().saturating_sub(self.identity_ttl_secs);
+        Ok(self
+            .user_discovery_cache
+            .read()
+            .await
+            .get(&user_id)
+            .filter(|u| u.announced_at >= cutoff)
+            .cloned())
+    }
+
+    /// List all currently-discovered users (those with a fresh announcement).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn discovered_users(&self) -> error::Result<Vec<DiscoveredUser>> {
+        self.start_identity_listener().await?;
+        let cutoff = Self::unix_timestamp_secs().saturating_sub(self.identity_ttl_secs);
+        let mut users: Vec<_> = self
+            .user_discovery_cache
+            .read()
+            .await
+            .values()
+            .filter(|u| u.announced_at >= cutoff)
+            .cloned()
+            .collect();
+        users.sort_by_key(|u| u.user_id.0);
+        Ok(users)
+    }
+
     async fn start_identity_listener(&self) -> error::Result<()> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
@@ -3354,20 +3690,33 @@ impl Agent {
             .await;
         let own_machine_shard_topic = shard_topic_for_machine(&self.machine_id());
         let mut sub_machine_shard = runtime.pubsub().subscribe(own_machine_shard_topic).await;
+        let mut sub_user_legacy = runtime
+            .pubsub()
+            .subscribe(USER_ANNOUNCE_TOPIC.to_string())
+            .await;
+        // Subscribe to our own user's shard (if we have a user identity) so
+        // we receive announcements addressed to us as well as broadcasts.
+        let mut sub_user_shard = match self.user_id() {
+            Some(uid) => Some(runtime.pubsub().subscribe(shard_topic_for_user(&uid)).await),
+            None => None,
+        };
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
+        let user_cache = std::sync::Arc::clone(&self.user_discovery_cache);
         let bootstrap_cache = self.bootstrap_cache.clone();
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let direct_messaging = std::sync::Arc::clone(&self.direct_messaging);
         let network = self.network.as_ref().map(std::sync::Arc::clone);
         let own_agent_id = self.agent_id();
         let own_machine_id = self.machine_id();
+        let own_user_id = self.user_id();
         let rebroadcast_pubsub = std::sync::Arc::clone(runtime.pubsub());
 
         tokio::spawn(async move {
             enum DiscoveryMessage {
                 Identity(crate::gossip::PubSubMessage),
                 Machine(crate::gossip::PubSubMessage),
+                User(crate::gossip::PubSubMessage),
             }
 
             // Track agents we've already initiated auto-connect to, preventing
@@ -3395,6 +3744,10 @@ impl Agent {
                 blake3::Hash,
                 std::time::Instant,
             > = std::collections::HashMap::new();
+            let mut user_rebroadcast_state: std::collections::HashMap<
+                (identity::UserId, u64),
+                std::time::Instant,
+            > = std::collections::HashMap::new();
             const REBROADCAST_MIN_INTERVAL: std::time::Duration =
                 std::time::Duration::from_secs(20);
             const VERIFIED_PAYLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -3418,11 +3771,21 @@ impl Agent {
 
             loop {
                 // Drain whichever subscription fires next; deduplicate by ID in cache.
+                // The user-shard subscription is conditional on having a local
+                // user identity; when absent, that arm yields a pending future
+                // so select! skips it cleanly.
                 let msg = tokio::select! {
                     Some(m) = sub_legacy.recv() => DiscoveryMessage::Identity(m),
                     Some(m) = sub_shard.recv() => DiscoveryMessage::Identity(m),
                     Some(m) = sub_machine_legacy.recv() => DiscoveryMessage::Machine(m),
                     Some(m) = sub_machine_shard.recv() => DiscoveryMessage::Machine(m),
+                    Some(m) = sub_user_legacy.recv() => DiscoveryMessage::User(m),
+                    Some(m) = async {
+                        match sub_user_shard.as_mut() {
+                            Some(s) => s.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => DiscoveryMessage::User(m),
                     else => break,
                 };
                 let msg = match msg {
@@ -3516,6 +3879,89 @@ impl Agent {
                                     {
                                         tracing::debug!(
                                             "machine announcement re-broadcast failed: {e}"
+                                        );
+                                    }
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    DiscoveryMessage::User(msg) => {
+                        let decoded = {
+                            use bincode::Options;
+                            bincode::options()
+                                .with_fixint_encoding()
+                                .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+                                .allow_trailing_bytes()
+                                .deserialize::<UserAnnouncement>(&msg.payload)
+                        };
+                        let raw_payload = msg.payload.clone();
+                        let announcement = match decoded {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Ignoring invalid user announcement payload: {}",
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+                        if let Err(e) = announcement.verify() {
+                            tracing::warn!("Ignoring unverifiable user announcement: {}", e);
+                            continue;
+                        }
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        let incoming = DiscoveredUser::from_announcement(&announcement, now);
+                        {
+                            let mut cache = user_cache.write().await;
+                            match cache.get_mut(&incoming.user_id) {
+                                Some(existing) if incoming.announced_at < existing.announced_at => {
+                                    // Ignore stale announcement.
+                                }
+                                Some(existing) => {
+                                    existing.user_public_key = incoming.user_public_key;
+                                    existing.agent_certificates = incoming.agent_certificates;
+                                    existing.agent_ids = incoming.agent_ids;
+                                    existing.announced_at = incoming.announced_at;
+                                    existing.last_seen = now;
+                                }
+                                None => {
+                                    cache.insert(incoming.user_id, incoming);
+                                }
+                            }
+                        }
+                        tracing::debug!(
+                            target: "x0x::discovery",
+                            announcement_kind = "user_received",
+                            user_prefix = %network::hex_prefix(&announcement.user_id.0, 4),
+                            agent_count = announcement.agent_certificates.len(),
+                            "cached verified user announcement"
+                        );
+                        // Rebroadcast for non-self announcements, dedup-windowed
+                        // like identity / machine announcements.
+                        if Some(announcement.user_id) != own_user_id {
+                            let key = (announcement.user_id, announcement.announced_at);
+                            let should_forward = match user_rebroadcast_state.get(&key) {
+                                None => true,
+                                Some(last) => last.elapsed() >= REBROADCAST_MIN_INTERVAL,
+                            };
+                            if should_forward {
+                                user_rebroadcast_state.insert(key, std::time::Instant::now());
+                                if user_rebroadcast_state.len() > 1024 {
+                                    let cutoff = std::time::Instant::now()
+                                        - std::time::Duration::from_secs(3600);
+                                    user_rebroadcast_state.retain(|_, t| *t >= cutoff);
+                                }
+                                let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
+                                tokio::spawn(async move {
+                                    if let Err(e) = pubsub
+                                        .publish(USER_ANNOUNCE_TOPIC.to_string(), raw_payload)
+                                        .await
+                                    {
+                                        tracing::debug!(
+                                            "user announcement re-broadcast failed: {e}"
                                         );
                                     }
                                 });
@@ -5939,6 +6385,9 @@ impl AgentBuilder {
             machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            user_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             identity_listener_started: std::sync::atomic::AtomicBool::new(false),
             heartbeat_interval_secs: self
                 .heartbeat_interval_secs
@@ -6833,5 +7282,72 @@ mod tests {
             bytes, re_encoded,
             "canonical bincode round-trip must be stable"
         );
+    }
+
+    #[test]
+    fn user_announcement_sign_and_verify() {
+        let user_kp = identity::UserKeypair::generate().unwrap();
+        let agent_kp_a = identity::AgentKeypair::generate().unwrap();
+        let agent_kp_b = identity::AgentKeypair::generate().unwrap();
+        let cert_a = identity::AgentCertificate::issue(&user_kp, &agent_kp_a).unwrap();
+        let cert_b = identity::AgentCertificate::issue(&user_kp, &agent_kp_b).unwrap();
+
+        let announcement = UserAnnouncement::sign(&user_kp, vec![cert_a, cert_b], 1234).unwrap();
+        announcement.verify().expect("freshly-signed must verify");
+        assert_eq!(announcement.user_id, user_kp.user_id());
+        assert_eq!(announcement.agent_certificates.len(), 2);
+    }
+
+    #[test]
+    fn user_announcement_rejects_foreign_certificate() {
+        let user_kp = identity::UserKeypair::generate().unwrap();
+        let other_user = identity::UserKeypair::generate().unwrap();
+        let agent_kp = identity::AgentKeypair::generate().unwrap();
+        // Certificate issued by `other_user` — we should refuse to include it
+        // in a roster signed by `user_kp`.
+        let foreign_cert = identity::AgentCertificate::issue(&other_user, &agent_kp).unwrap();
+        let err = UserAnnouncement::sign(&user_kp, vec![foreign_cert], 0).unwrap_err();
+        assert!(
+            err.to_string().contains("different user"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn user_announcement_tampered_agent_cert_list_fails() {
+        let user_kp = identity::UserKeypair::generate().unwrap();
+        let agent_kp = identity::AgentKeypair::generate().unwrap();
+        let cert = identity::AgentCertificate::issue(&user_kp, &agent_kp).unwrap();
+
+        let mut announcement = UserAnnouncement::sign(&user_kp, vec![cert], 10).unwrap();
+        // Forge an additional certificate from a different user into the list.
+        let other_user = identity::UserKeypair::generate().unwrap();
+        let other_agent = identity::AgentKeypair::generate().unwrap();
+        let foreign_cert = identity::AgentCertificate::issue(&other_user, &other_agent).unwrap();
+        announcement.agent_certificates.push(foreign_cert);
+        assert!(
+            announcement.verify().is_err(),
+            "announcement with appended foreign cert must fail verification"
+        );
+    }
+
+    #[test]
+    fn user_announcement_tampered_user_public_key_fails() {
+        let user_kp = identity::UserKeypair::generate().unwrap();
+        let agent_kp = identity::AgentKeypair::generate().unwrap();
+        let cert = identity::AgentCertificate::issue(&user_kp, &agent_kp).unwrap();
+        let mut announcement = UserAnnouncement::sign(&user_kp, vec![cert], 10).unwrap();
+        let other = identity::UserKeypair::generate().unwrap();
+        announcement.user_public_key = other.public_key().as_bytes().to_vec();
+        assert!(announcement.verify().is_err());
+    }
+
+    #[test]
+    fn user_shard_topic_is_deterministic() {
+        let user_id = identity::UserId([5u8; 32]);
+        let topic_a = shard_topic_for_user(&user_id);
+        let topic_b = shard_topic_for_user(&user_id);
+        assert_eq!(topic_a, topic_b);
+        assert!(topic_a.starts_with("x0x.user.shard.v2."));
     }
 }
