@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.19.1] - 2026-04-23
+
+### Fixed (dependency bumps)
+
+- **`ant-quic` → `0.27.4`.** Picks up the dual-stack CPU-spin fix:
+  `DualStackSocket::create_io_poller` now AND-combines v4/v6 writability
+  instead of OR-combining via `tokio::select!`. The prior OR-combination
+  let a stale `Ready` on the non-target socket satisfy the poller while
+  `try_send_to` had already cleared readiness on the target, so
+  `drive_transmit` spun its `WouldBlock` retry loop at 100 % CPU in pure
+  userspace. Reproduced on a live 6-continent bootstrap mesh (2-of-6
+  nodes rotating into 100 % within 4–7 min pre-fix); post-fix watch over
+  90 min showed all tokio workers in State S with <2 % mean CPU.
+- **`saorsa-gossip-*` → `0.5.20`.** Lockstep republish across all 11
+  workspace crates with `ant-quic = 0.27.4`; no gossip-side source
+  changes.
+- **`Cargo.toml` no longer carries the `[patch.crates-io] ant-quic = {
+  path = "../ant-quic" }` hack.** Deps now resolve cleanly from
+  crates.io.
+
+### Tests
+
+- Fixed a 1/256-flaky `test_agent_id_uniqueness` in
+  `tests/comprehensive_integration.rs`: `AgentId([rand::random::<u8>();
+  32])` (array-repeat: one byte × 32) → `AgentId(rand::random::<[u8;
+  32]>())` (32 independent bytes). Three sites updated.
+- `tests/e2e_deploy.sh` now sleeps 15 s between node restarts, matching
+  the rolling-start-requirement invariant.
+
+### Validation
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --all-features --all-targets -- -D warnings`: clean.
+- `cargo nextest run --all-features --workspace`: 1024/1025 (the one
+  failure is the pre-existing `parity_cli::every_endpoint_is_reachable_
+  from_cli`, same as 0.19.0).
+- Live 6-node bootstrap mesh on `v0.19.1`-equivalent build (consuming
+  published `ant-quic 0.27.4` + `saorsa-gossip 0.5.20` with no path
+  hacks): 11 min CPU watch, peak 40 % single sample, zero sustained
+  elevation — see
+  `proofs/v0.19.0-validation-20260423T131419Z/spin-forensics/final-revalidation/`.
+
 ## [v0.19.0] - 2026-04-23
 
 ### Breaking — wire format v2
