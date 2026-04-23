@@ -3031,7 +3031,21 @@ async fn introduction(
         })
         .collect();
 
-    let card = x0x::identity::IntroductionCard::from_identity(identity, None, visible_services);
+    let card =
+        match x0x::identity::IntroductionCard::from_identity(identity, None, visible_services) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("failed to build introduction card: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({
+                        "error": "failed to build introduction card",
+                        "detail": format!("{e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     // Build response — Unknown gets a minimal card, Known/Trusted get progressively more.
     let data = match peer_trust {

@@ -626,6 +626,23 @@ pub struct ServiceEntry {
     pub min_trust: String,
 }
 
+/// Unsigned view of an `IntroductionCard`, used as the canonical signing
+/// message. Field order must stay stable — any change is a wire break.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IntroductionCardUnsigned {
+    agent_id: AgentId,
+    machine_id: MachineId,
+    user_id: Option<UserId>,
+    certificate: Option<AgentCertificate>,
+    display_name: Option<String>,
+    identity_words: String,
+    services: Vec<ServiceEntry>,
+    /// Machine ML-DSA-65 public key bytes. Included in the signed payload so
+    /// verifiers can bind the signature to this specific machine key without
+    /// trusting an out-of-band lookup.
+    machine_public_key: Vec<u8>,
+}
+
 /// An introduction card presented to peers during connection setup.
 ///
 /// Contains the agent's identity, optional human-owner binding, advertised
@@ -648,23 +665,58 @@ pub struct IntroductionCard {
     pub identity_words: String,
     /// Trust-gated services offered by this agent.
     pub services: Vec<ServiceEntry>,
-    /// ML-DSA-65 signature over all fields above.
-    ///
-    /// TODO: Currently populated with the machine public key as a placeholder.
-    /// Once the signing message format is finalised, this will contain a real
-    /// ML-DSA-65 signature from the machine secret key over a canonical
-    /// serialisation of the card fields.
+    /// Machine ML-DSA-65 public key bytes. Needed by verifiers to check
+    /// [`IntroductionCard::signature`]; also independently bound to
+    /// [`IntroductionCard::machine_id`] (which is its SHA-256).
+    pub machine_public_key: Vec<u8>,
+    /// ML-DSA-65 signature by the machine secret key over the canonical
+    /// bincode serialisation of the card fields (excluding this signature).
     pub signature: Vec<u8>,
 }
 
 impl IntroductionCard {
+    /// Domain-separation prefix for canonical card bytes. Bumped on any
+    /// change to the signed field set.
+    const CARD_PREFIX: &'static [u8] = b"x0x-introduction-card-v1";
+
+    fn to_unsigned(&self) -> IntroductionCardUnsigned {
+        IntroductionCardUnsigned {
+            agent_id: self.agent_id,
+            machine_id: self.machine_id,
+            user_id: self.user_id,
+            certificate: self.certificate.clone(),
+            display_name: self.display_name.clone(),
+            identity_words: self.identity_words.clone(),
+            services: self.services.clone(),
+            machine_public_key: self.machine_public_key.clone(),
+        }
+    }
+
+    fn canonical_message(
+        unsigned: &IntroductionCardUnsigned,
+    ) -> Result<Vec<u8>, crate::error::IdentityError> {
+        let body = bincode::serialize(unsigned).map_err(|e| {
+            crate::error::IdentityError::Serialization(format!(
+                "failed to serialise introduction card for signing: {e}"
+            ))
+        })?;
+        let mut msg = Vec::with_capacity(Self::CARD_PREFIX.len() + body.len());
+        msg.extend_from_slice(Self::CARD_PREFIX);
+        msg.extend_from_slice(&body);
+        Ok(msg)
+    }
+
     /// Build an introduction card from an `Identity`, computing identity words
-    /// automatically.
+    /// automatically and signing the canonical payload with the machine key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if bincode serialisation or ML-DSA-65 signing fails.
     pub fn from_identity(
         identity: &Identity,
         display_name: Option<String>,
         services: Vec<ServiceEntry>,
-    ) -> Self {
+    ) -> Result<Self, crate::error::IdentityError> {
         let agent_id = identity.agent_id();
         let machine_id = identity.machine_id();
         let user_id = identity.user_id();
@@ -683,12 +735,31 @@ impl IntroductionCard {
                 .unwrap_or_default()
         };
 
-        // TODO: Replace with real ML-DSA-65 signature over canonical card bytes.
-        // For now, store the machine public key so verifiers can at least identify
-        // which machine produced the card.
-        let signature = identity.machine_keypair().public_key().as_bytes().to_vec();
+        let machine_public_key = identity.machine_keypair().public_key().as_bytes().to_vec();
+        let unsigned = IntroductionCardUnsigned {
+            agent_id,
+            machine_id,
+            user_id,
+            certificate: certificate.clone(),
+            display_name: display_name.clone(),
+            identity_words: identity_words.clone(),
+            services: services.clone(),
+            machine_public_key: machine_public_key.clone(),
+        };
+        let message = Self::canonical_message(&unsigned)?;
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            identity.machine_keypair().secret_key(),
+            &message,
+        )
+        .map_err(|e| {
+            crate::error::IdentityError::CertificateVerification(format!(
+                "failed to sign introduction card: {e:?}"
+            ))
+        })?
+        .as_bytes()
+        .to_vec();
 
-        Self {
+        Ok(Self {
             agent_id,
             machine_id,
             user_id,
@@ -696,7 +767,76 @@ impl IntroductionCard {
             display_name,
             identity_words,
             services,
+            machine_public_key,
             signature,
+        })
+    }
+
+    /// Verify the card's machine signature and embedded agent certificate.
+    ///
+    /// Checks:
+    /// 1. `machine_id` matches SHA-256 of `machine_public_key`.
+    /// 2. ML-DSA-65 signature over the canonical card bytes is valid.
+    /// 3. If `certificate` is present: its signature verifies, its
+    ///    `agent_id` matches this card's `agent_id`, and its `user_id`
+    ///    matches `user_id` (when disclosed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing which check failed.
+    pub fn verify(&self) -> Result<(), crate::error::IdentityError> {
+        let machine_pub = MlDsaPublicKey::from_bytes(&self.machine_public_key).map_err(|_| {
+            crate::error::IdentityError::CertificateVerification(
+                "invalid machine public key in introduction card".to_string(),
+            )
+        })?;
+        let derived_machine_id = MachineId::from_public_key(&machine_pub);
+        if derived_machine_id != self.machine_id {
+            return Err(crate::error::IdentityError::CertificateVerification(
+                "machine_id does not match machine public key in introduction card".to_string(),
+            ));
+        }
+
+        let message = Self::canonical_message(&self.to_unsigned())?;
+        let signature =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&self.signature)
+                .map_err(|e| {
+                    crate::error::IdentityError::CertificateVerification(format!(
+                        "invalid introduction card signature format: {e:?}"
+                    ))
+                })?;
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            &machine_pub,
+            &message,
+            &signature,
+        )
+        .map_err(|e| {
+            crate::error::IdentityError::CertificateVerification(format!(
+                "introduction card signature verification failed: {e:?}"
+            ))
+        })?;
+
+        match (self.user_id, self.certificate.as_ref()) {
+            (Some(user_id), Some(cert)) => {
+                cert.verify()?;
+                let cert_agent_id = cert.agent_id()?;
+                if cert_agent_id != self.agent_id {
+                    return Err(crate::error::IdentityError::CertificateVerification(
+                        "introduction card certificate agent_id mismatch".to_string(),
+                    ));
+                }
+                let cert_user_id = cert.user_id()?;
+                if cert_user_id != user_id {
+                    return Err(crate::error::IdentityError::CertificateVerification(
+                        "introduction card certificate user_id mismatch".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            _ => Err(crate::error::IdentityError::CertificateVerification(
+                "introduction card: user disclosure without matching certificate".to_string(),
+            )),
         }
     }
 }
@@ -832,5 +972,83 @@ mod tests {
         assert_eq!(identity.user_id(), Some(expected_user_id));
         assert!(identity.user_keypair().is_some());
         assert!(identity.agent_certificate().is_some());
+    }
+
+    #[test]
+    fn test_introduction_card_signature_round_trip() {
+        let identity = Identity::generate().unwrap();
+        let card = IntroductionCard::from_identity(&identity, None, Vec::new()).unwrap();
+        card.verify().expect("newly-minted card must verify");
+        assert_eq!(card.machine_id, identity.machine_id());
+        assert_eq!(
+            card.machine_public_key,
+            identity.machine_keypair().public_key().as_bytes()
+        );
+        // Signature must not be a raw public key anymore (placeholder bug).
+        assert_ne!(card.signature, card.machine_public_key);
+    }
+
+    #[test]
+    fn test_introduction_card_with_user_verifies() {
+        let machine_kp = MachineKeypair::generate().unwrap();
+        let agent_kp = AgentKeypair::generate().unwrap();
+        let user_kp = UserKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&user_kp, &agent_kp).unwrap();
+        let identity = Identity::new_with_user(machine_kp, agent_kp, user_kp, cert);
+
+        let card = IntroductionCard::from_identity(
+            &identity,
+            Some("alice".to_string()),
+            vec![ServiceEntry {
+                name: "presence".to_string(),
+                description: "online/offline".to_string(),
+                min_trust: "unknown".to_string(),
+            }],
+        )
+        .unwrap();
+        card.verify().expect("user-backed card must verify");
+    }
+
+    #[test]
+    fn test_introduction_card_tampered_display_name_fails() {
+        let identity = Identity::generate().unwrap();
+        let mut card = IntroductionCard::from_identity(&identity, None, Vec::new()).unwrap();
+        card.display_name = Some("imposter".to_string());
+        assert!(
+            card.verify().is_err(),
+            "mutation of signed field must invalidate signature"
+        );
+    }
+
+    #[test]
+    fn test_introduction_card_tampered_agent_id_fails() {
+        let identity = Identity::generate().unwrap();
+        let mut card = IntroductionCard::from_identity(&identity, None, Vec::new()).unwrap();
+        let other_agent = AgentKeypair::generate().unwrap();
+        card.agent_id = other_agent.agent_id();
+        assert!(card.verify().is_err());
+    }
+
+    #[test]
+    fn test_introduction_card_mismatched_machine_id_fails() {
+        let identity = Identity::generate().unwrap();
+        let mut card = IntroductionCard::from_identity(&identity, None, Vec::new()).unwrap();
+        // Corrupt machine_id while leaving the public key intact — verify must
+        // reject before even attempting the ML-DSA check.
+        card.machine_id = MachineId([0xAAu8; PEER_ID_LENGTH]);
+        assert!(card.verify().is_err());
+    }
+
+    #[test]
+    fn test_introduction_card_foreign_signature_fails() {
+        let identity_a = Identity::generate().unwrap();
+        let identity_b = Identity::generate().unwrap();
+
+        let mut card = IntroductionCard::from_identity(&identity_a, None, Vec::new()).unwrap();
+        // Splice a valid signature from a different identity; machine_id +
+        // machine_public_key still refer to identity_a, so verification must fail.
+        let forged_donor = IntroductionCard::from_identity(&identity_b, None, Vec::new()).unwrap();
+        card.signature = forged_donor.signature;
+        assert!(card.verify().is_err());
     }
 }
