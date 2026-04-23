@@ -2,7 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
-## [v0.19.1] - 2026-04-23
+## [v0.19.2] - 2026-04-23
+
+**Note.** The `v0.19.1` tag was cut earlier today but never reached
+crates.io — the release workflow's `Validate release metadata` step
+rejected it because `SKILL.md` was still stuck at `0.17.4` (a hard
+requirement of `SKILL.md version == Cargo.toml version == tag`). The
+same stale `SKILL.md` is why `v0.19.0` is not on crates.io either
+(`max_version` on crates.io is `0.18.4`). `v0.19.2` bundles the
+`v0.19.0` wire-v2 / UserAnnouncement / IntroductionCard work, the
+`v0.19.1` dependency bumps, **and** syncs `SKILL.md` so the release
+actually publishes.
 
 ### Fixed (dependency bumps)
 
