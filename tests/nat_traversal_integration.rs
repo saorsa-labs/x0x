@@ -15,8 +15,8 @@ const VPS_NODES: &[&str] = &[
     "147.182.234.192:5483", // saorsa-3 (SFO)
     "65.21.157.229:5483",   // saorsa-6 (Helsinki)
     "116.203.101.172:5483", // saorsa-7 (Nuremberg)
-    "152.42.210.67:5483",  // saorsa-8 (Singapore)
-    "170.64.176.102:5483",   // saorsa-9 (Sydney)
+    "152.42.210.67:5483",   // saorsa-8 (Singapore)
+    "170.64.176.102:5483",  // saorsa-9 (Sydney)
 ];
 
 /// Helper to create agent with VPS bootstrap nodes.
