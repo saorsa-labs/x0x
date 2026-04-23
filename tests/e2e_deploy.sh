@@ -92,6 +92,13 @@ for node in "${NODE_NAMES[@]}"; do
         FAILED_NODES+=("$node")
         continue
     fi
+
+    # Rolling restart: 15s between nodes to avoid simultaneous bootstrap storm
+    # (see rolling_start_requirement memory). Skip on the last node.
+    if [ "$node" != "${NODE_NAMES[-1]}" ]; then
+        echo "    Rolling delay 15s before next node..."
+        sleep 15
+    fi
 done
 
 if [ ${#FAILED_NODES[@]} -gt 0 ]; then
