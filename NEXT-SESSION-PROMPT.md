@@ -1,252 +1,167 @@
-# Next-session prompt — x0xd CPU spin, partial fix, more hunt needed
+# Next-session prompt — x0x v0.19.2 shipped, **memory growth on publishers** is the remaining issue
 
-**Read this before doing anything. State of the network: all 6 VPS bootstrap
-`x0xd` services are stopped + disabled. Do not restart them without a plan.**
+**Read this before doing anything.** State of the network: all 6 VPS bootstrap
+nodes are running `x0x v0.19.2` from crates.io — `316436de…` build of the
+stripped release binary. Mesh is stable at rest (~30-100 MB RSS per node, all
+6 peers connected). The CPU-spin bug from the prior session is **fixed** and
+shipped. **Don't restart the spin hunt.**
 
----
-
-## The one-sentence problem
-
-On the live 6-node public bootstrap mesh, `x0xd` workers latch into a
-sustained CPU spin (100–200 % per process, both tokio workers running,
-no kernel work, `journalctl` stops emitting) after a few minutes of
-normal gossip traffic. The spin rotates across nodes: at any probe,
-2–3 of 6 are pinned; `systemctl restart x0xd` clears the one you hit
-but another takes its place. Mesh converges only to a 3–4 peer subset
-before some node drops into spin again.
-
-If this isn't nailed, the public network is effectively unusable once
-any real traffic is on it. Treat it as a blocker.
+The new outstanding issue is a **memory-growth leak that fires only on nodes
+acting as sustained publishers**.
 
 ---
 
-## What's already been fixed (do not re-investigate)
+## What shipped (the closed work)
 
-Two real `getsockname(2)` hot paths found with `perf record -g --call-graph
-dwarf` on a spinning SFO daemon and fixed upstream in `ant-quic`
-(sibling path dep, repo `../ant-quic`, branch `master`):
+- `ant-quic 0.27.4` on crates.io — dual-stack `create_io_poller` switched
+  from OR-combine (`tokio::select!`) to AND-combine (`tokio::join!`) so a
+  stale `Ready` on the non-target socket can no longer satisfy the poller
+  while the target socket is back-pressured. Closes the 100 % CPU spin in
+  `drive_transmit`.
+- `saorsa-gossip-* 0.5.20` on crates.io — lockstep republish across all 11
+  workspace crates with `ant-quic = 0.27.4`; no gossip source changes.
+- `x0x 0.19.2` on crates.io — depends on the two above, strips the
+  `[patch.crates-io]` ant-quic path hack, syncs `SKILL.md` so the release
+  validator passes, bundles the v0.19.0 wire-v2 / UserAnnouncement /
+  IntroductionCard signing work that v0.19.0 + v0.19.1 tags failed to
+  publish.
 
-- **ant-quic `e6eb4b54`** — `perf(dual_stack): cache socket family instead
-  of per-packet getsockname`. `DualStackSocket::try_send` called
-  `socket.local_addr()?.is_ipv6()` on every outgoing UDP datagram.
-  `select_socket` now returns `(&socket, is_v6: bool)` and `convert_dest`
-  takes the boolean.
-- **ant-quic `43acc666`** — `perf(dual_stack): cache local_addr so
-  AsyncUdpSocket::local_addr is syscall-free`. quinn's
-  `ConnectionDriver::poll` calls `AsyncUdpSocket::local_addr` every
-  iteration; the impl used to delegate to `tokio::net::UdpSocket::local_addr()`
-  (another `getsockname`). It now serves `v4_addr`/`v6_addr` from fields
-  captured at `new()`.
-
-Effect (pre-fix vs post-fix symbolicated perf on a spinning VPS):
-
-| Stack location                                          | Pre  | Post-1 | Post-2 |
-|---------------------------------------------------------|------|--------|--------|
-| `getsockname` under `try_send → convert_dest`           | 71 % | gone   | gone   |
-| `getsockname` under `ConnectionDriver → local_addr`     | –    | 34 %   | gone   |
-| `parking_lot::Condvar::wait` (workers idle)             | no   | no     | yes (on freshly restarted nodes) |
-
-`gdb -batch -p $pid -ex "thread apply all bt"` after both fixes, on a
-freshly-restarted node, shows both `tokio-rt-worker` threads parked in
-`parking_lot::Condvar::wait` — healthy idle.
-
-Both fixes ship together as part of the release build
-`target/x86_64-unknown-linux-gnu/release/x0xd`
-(sha256 prefix `f9694c53aa42b542`).
-
-On the `x0x` side: commit `722f80e` (`perf: pick up ant-quic getsockname
-fixes + add release-profiling profile`). Adds a `[profile.release-profiling]`
-with `debug = "full"` + `strip = "none"` + `split-debuginfo = "off"`
-so gdb on VPS doesn't need `.dwo` files. Proof artefacts in
-`proofs/spin-fix-20260422-v0185/`.
+Validated end-to-end on the live 6-continent mesh from published crates only:
+288 CPU samples across 65 min, **0 samples > 50 %**, **0 nodes ever had 2
+consecutive samples > 50 %**, **0 gossip drops** in any of 72 diagnostic
+snapshots. Proof under `proofs/v0.19.0-validation-20260423T131419Z/`.
 
 ---
 
-## The residual bug (the real task)
+## The new bug — memory growth on publishers
 
-Even with both fixes deployed everywhere (verified by sha256 on each
-node before services were stopped), sustained 6-node mesh load still
-latches 2–3 nodes into spin:
+### Symptom
 
-- `top -bHn1 -p $(pidof x0xd)` on a pinned daemon shows **2 tokio
-  workers at ~100 % each**, main thread idle, `mDNS_daemon` idle.
-- `/proc/$pid/task/$tid/stack` is a few frames of interrupt-return /
-  timer interrupt — **threads are in user-space Rust**, *not* in any
-  syscall.
-- `gdb -batch -p $pid -ex "thread apply all bt"` on a pinned worker in
-  this post-fix state was not captured — every gdb attempt that caught
-  a spinning worker showed a stack in the OLD (pre-fix) profiling
-  binary, which was stale due to Cargo's profile-inheritance cache
-  (see "traps" below).
-- No new `journalctl` entries once a node is in the spin state.
-- `systemctl restart x0xd` clears one node for a few minutes before
-  another drops in.
-- The 5-minute sustained watch in
-  `proofs/spin-fix-20260422-v0185/mesh-watch.log` shows the rotating
-  2-of-6 / 3-of-6 pattern.
+Three of six VPS daemons OOM-killed during a 65-min sustained-load watch
+(`proofs/v0.19.0-validation-20260423T131419Z/12-60min-sustained-watch/`).
+Every one of those three was running the publisher loop. The other three
+(idle subscribers) stayed flat at 40-100 MB RSS the whole time.
 
-**This is the next bug to find.** Candidate hypotheses, roughly in
-priority order:
+```
+Apr 24 07:22:23 sfo       systemd: x0xd.service: oom-kill (anon-rss 1.2 GiB)
+Apr 24 07:27:53 nyc       kernel:  Killed process 90697 (x0xd) anon-rss 3 719 MB
+Apr 24 07:43:08 sfo       systemd: x0xd.service: oom-kill again
+Apr 24 07:52:20 helsinki  kernel:  Killed process 37081 (x0xd) anon-rss 3 571 MB
+```
 
-1. A busy-polling tokio task whose future is always `Poll::Ready`
-   (e.g. a `Notify` that's notified every time any packet arrives,
-   an `UnboundedReceiver::poll_recv` paired with an upstream that
-   always has something queued, or a broadcast channel lagging).
-   Profile showed `ant_quic::high_level::endpoint::RecvState::poll_socket
-   → mpsc::UnboundedSender::send → wake_by_val → eventfd_write` hitting
-   `tokio::yield_now` in earlier captures — this chain is suspicious
-   under steady mesh rate.
-2. ML-DSA-65 verification on every inbound announcement / gossip
-   message saturates 2 vCPUs on s-2vcpu-4gb droplets when the
-   6-node mesh has ~7 machines announcing. This would be *legitimate*
-   work, but if announcements aren't deduped aggressively enough it
-   becomes a cost-accumulation spiral.
-3. A CRDT OR-Set / PlumTree message amplification where each inbound
-   message generates N outbound messages without settling.
-4. The `observed_address_watch_task` spawned in
-   `ant-quic/src/nat_traversal_api.rs:5543` — it's `loop { iterate
-   all_observed_addresses; select! { observed_change, closed } }`.
-   If `observed_address_updated()` (a `Notify::notified()`) is notified
-   by every packet, the loop iterates at packet rate. Worth reading
-   closely.
-5. ant-quic connection-supersede race under IPv6 / IPv4 dual-stack
-   mapping (we are on dual-stack `[::]:5483`, all 6 bootstrap nodes
-   have global IPv6, and gossip runs across both families).
+Load was modest:
+- 50 msg/s × 4 KB target per publisher (curl-overhead capped to ~10-17 msg/s
+  actual; aggregate ~150 KB/s into mesh)
+- 133 579 messages published total over ~58 min by the 3 publishers
+- ~24 MB raw payload sent per publisher node
 
----
+Helsinki hit 3.5 GiB RSS after 53 min ≈ **150× the raw payload throughput
+retained in memory.** Clearly unbounded caching / accumulation somewhere.
 
-## Environment
+CPU stayed calm throughout (max 36.4 % single sample), so this is **not**
+the spin path firing in a different shape — it's a separate memory-side
+issue.
 
-### 6 bootstrap nodes (all STOPPED now)
+### Notable second-order effect
 
-| Name | IP | IPv6 | Provider | Size | Status | Binary (sha256 pfx) |
-|------|----|----|----|----|----|----|
-| NYC (saorsa-2)       | 142.93.199.50  | 2604:a880:400:d1:0:3:7db3:f001 | DigitalOcean NYC1   | s-2vcpu-4gb | stopped/disabled | `f9694c53…` (release) |
-| SFO (saorsa-3)       | 147.182.234.192 | 2604:a880:4:1d0:0:1:6ba1:f000  | DigitalOcean SFO3  | s-2vcpu-4gb | stopped/disabled | `f9694c53…` (release) |
-| HEL (saorsa-6)       | 65.21.157.229   | 2a01:4f9:c012:684b::1          | Hetzner Helsinki   | (original)  | stopped/disabled | `f9694c53…` (release) |
-| NUR (saorsa-7)       | 116.203.101.172 | 2a01:4f8:1c1a:31e6::1          | Hetzner Nuremberg  | (original)  | stopped/disabled | `f9694c53…` (release) |
-| SGP (saorsa-8, NEW)  | 152.42.210.67   | 2400:6180:0:d2:0:2:d30b:d000   | DigitalOcean SGP1  | s-2vcpu-4gb | stopped/disabled | `f9694c53…` (release) |
-| SYD (saorsa-9, NEW)  | 170.64.176.102  | 2400:6180:10:200::ba69:b000    | DigitalOcean SYD1  | s-2vcpu-4gb | stopped/disabled | `f9694c53…` (release) |
+Helsinki's publisher rate fell from ~18 msg/s (first 15 min) to < 8 msg/s
+(remaining 40 min). Wall-clock correlated with its RSS climb. Either the
+local `/publish` REST handler slows under memory pressure, or the
+`saorsa-gossip-pubsub` publish path takes longer to enqueue when its
+internal buffers are full.
 
-Vultr is **out** — Singapore was auto-null-routed by Vultr's DDoS
-heuristic under sustained gossip UDP, so saorsa-8 + saorsa-9 were
-moved to DO. That migration is the `585a8e8 infra(vps): retire Vultr
-nodes — migrate Singapore + Tokyo to DigitalOcean` commit. Tokens are
-in `tests/.vps-tokens.env`. SSH as `root@$IP`.
+### Hypotheses (priority order)
 
-The four DO droplets were resized `s-1vcpu-2gb → s-2vcpu-4gb` during
-this session because the old 1-vCPU was starving x0xd under mesh
-load. Hetzner HEL + NUR were *not* resized and need the same treatment
-if we retry at the old size (`hcloud` CLI isn't installed locally —
-use the Hetzner web console). They've held up better than the DO
-nodes did, but the sample is tainted by the spin.
+1. **PlumTree IHAVE / message-id cache** on the publisher side accumulating
+   `msg_id` entries without TTL eviction. At 4 KB × 100k messages =
+   400 MB raw, but msg_ids alone are 32 B × 100k = 3.2 MB so this would
+   need significant per-id metadata to hit GiB.
+2. **Per-peer outbound queue** retains buffered messages per `(peer, topic)`
+   under sustained back-pressure. A 5-peer fan-out × 100k msgs × 4 KB
+   payload + headers could legitimately reach the GiB range.
+3. **`delivered_to_subscriber` backlog** if no local subscriber is draining
+   the local copy of self-published messages. Worth checking whether the
+   publish path's own subscriber channel is bounded.
+4. **Heartbeat / SWIM piggyback growth** carrying ever-longer membership
+   digests.
+5. Something in the new (v0.19.x) wire-v2 / UserAnnouncement /
+   IntroductionCard cache paths — the v0.18.x→v0.19.0 deps were heavy on
+   cache additions.
 
-### Legacy Communitas — gone
+### First moves
 
-NYC / SFO / HEL / NUR were previously running 4–5 legacy
-`communitas-headless` / `communitas-bootstrap` / `communitas-mcp`
-daemons that competed for the 1-vCPU. Those were purged in this
-session because Communitas now bootstraps on x0x. Only x0xd is
-installed (and now stopped) on the bootstrap nodes.
+1. **Reproduce locally on a single daemon.** No mesh needed — start one
+   `x0xd`, `subscribe` to topic `T`, then publish to `T` at 100 msg/s ×
+   4 KB in a tight loop. Watch `/proc/PID/status | grep VmRSS` every 30 s
+   for 15 min. If RSS climbs predictably, we have a clean repro.
+2. **Bisect with `dhat-rs` or `heaptrack`.** Add `dhat::Profiler::new_heap()`
+   guard at `Agent::build()` exit, run the repro, post-mortem the dump.
+   Will name the largest live allocations directly.
+3. **Cross-check `/diagnostics/gossip` counters** under repro. If
+   `delivered_to_subscriber` is racing way ahead of consumer reads (i.e.
+   `recv_tx` queue is filling), the leak is in the subscriber pipeline.
+   Already saw `subscriber_channel_closed` bumping during VPS-e2e harness
+   churn — same code path could grow under publish load.
+4. **systemd guard rails** — even after the fix lands, set `MemoryMax=2G`
+   + `Restart=on-failure` + `RestartSec=30s` on the `x0xd.service` unit so
+   any future regression bounces gracefully rather than waiting for the
+   kernel OOM killer. Currently the kernel kill is silent and loses
+   in-flight state.
 
-### Local build state
+### Out of scope for the bug, in scope for the launch
 
-`rustc` 1.95.0, `cargo zigbuild 0.15.2`, target
-`x86_64-unknown-linux-gnu`.
-
-- `target/x86_64-unknown-linux-gnu/release/x0xd`
-  (29 MB, stripped, `f9694c53aa42b542`) — both fixes compiled in.
-- `target/x86_64-unknown-linux-gnu/release-profiling/x0xd`
-  (472 MB, debuginfo, `52ebff45aedb765e`) — same source, same fixes,
-  embedded debuginfo.
-
-`Cargo.toml` has the new `[profile.release-profiling]` for future
-perf/gdb work. Dep `ant-quic = { path = "../ant-quic" }` — both
-upstream fixes are on `../ant-quic` HEAD (`43acc666`).
+The bug is **not a v0.19.2 launch blocker** for typical client/agent use.
+End-user agents (laptops, phones, CLIs) don't sustain publisher-level rates
+for an hour. It only bites operators running an x0xd daemon as a high-rate
+publisher / gateway. Document the workaround (run on ≥ 8 GiB RAM, restart
+weekly) until the actual fix lands.
 
 ---
 
-## Traps already stepped in (don't repeat)
+## Don't repeat these
 
-1. **Cargo profile cache lied**. `[profile.release-profiling] inherits
-   = "release"` does NOT rebuild the `ant-quic` rlib when you change
-   the *profile* without also touching a source file. Earlier
-   symbolicated profiles were of the stale pre-fix binary even though
-   my local source was patched. Trusted signal:
-   `cargo clean --target x86_64-unknown-linux-gnu --profile release-profiling`
-   before every reprofile, or verify `Compiling ant-quic v0.27.3`
-   appears in the build log.
-2. **`split-debuginfo = "unpacked"`** is the default and ships `.dwo`
-   files next to the binary. You need the `.dwo` files on the VPS for
-   gdb / addr2line to resolve symbols, which is awful to manage. The
-   profile in this commit uses `split-debuginfo = "off"` so the
-   debuginfo is embedded — ~470 MB binary but gdb works.
-3. **`perf top -p $pid --stdio`** is *interactive* and only works on
-   a real terminal; use `perf record … -- sleep N && perf report
-   --stdio --no-children` for non-interactive captures.
-4. **Vultr auto-null-routes** sustained UDP traffic from non-DDoS-
-   protected IPs for 1–4 h. A dead-silent drop (ICMP + SYN both fail
-   while UDP nc reports "succeeded" — the latter is a false positive
-   since nc declares UDP success on no ICMP unreachable). Don't try
-   to put a new bootstrap on Vultr without DDoS Protection enabled.
-5. **Provider throttle vs our bug**: we verified the 4 providers
-   we deal with (DO, Hetzner, Vultr, Linode-as-backup). Hetzner had a
-   one-time Feb 2026 UDP over-scrub incident, resolved. DO only
-   blocks `udp/11211`. Linode moved off null-routing post-Akamai.
-   None of them are shaping our traffic — the spin is ours.
-
----
-
-## First moves for the next session
-
-1. **Don't restart the mesh yet.** Start one single node fresh
-   (e.g. `systemctl start x0xd` on `NUR`, one of the Hetzner nodes
-   that doesn't have a history of spinning in this session). With
-   nothing to gossip to, it should be quiet — confirms `x0xd` is OK
-   at rest.
-2. **Bring up two nodes** (NUR + NYC). If they spin with just a
-   2-node mesh, the bug's amplification factor is 2. If they stay
-   clean until we add more, the bug is load-dependent and the
-   threshold tells us something.
-3. **When a node spins, capture all four of these from the spinning
-   PID before you do anything else**:
-   - `top -bHn1 -p $pid` (per-thread CPU)
-   - `for tid in /proc/$pid/task/*/; do cat $tid/stack; done`
-     (kernel stacks — expect "running" if user-space only)
-   - `gdb -batch -p $pid -ex "set pagination off" -ex "thread apply
-     all bt 25"` with the **profiling binary** so Rust symbols resolve
-   - `perf record -F 999 -g -p $pid --call-graph dwarf -- sleep 10`,
-     then `perf report --stdio --no-children --percent-limit 0.5`
-4. **Look specifically** for the call chain through
-   `ant_quic::high_level::endpoint::RecvState::poll_socket` and for
-   `saorsa_gossip_pubsub::PubSubManager` / `PlumTree` entries — that's
-   where I'd put my money for the residual spin.
-5. **`tokio-console`** on a local reproducer. Attach the console
-   subscriber, join the local daemon to the public mesh (with VPS
-   stopped, bring up 1–2 VPS and the local + console), and watch
-   for tasks with `Polls: <rising fast>` and `Time busy: ~100%`.
-   That names the offender directly.
-6. Cross-check **`../ant-quic/src/nat_traversal_api.rs:5543
-   spawn_observed_address_watch_task_parts`** — the `loop { …;
-   tokio::select! { observed_change, closed } }` pattern relies on
-   `Notify::notified()` being edge-triggered. If the connection state
-   calls `notify_one()` on every packet (not just on observed-set
-   changes) then this task spins at packet rate.
+1. Cargo.toml's `[patch.crates-io] ant-quic = { path = "../ant-quic" }`
+   was load-bearing for v0.19.0 — without it, the crates.io tarball
+   shipped without the spin fix. **It's gone in v0.19.2.** Don't add it
+   back unless you also tag a fresh ant-quic and a fresh x0x.
+2. `SKILL.md`'s `version` field MUST match `Cargo.toml`'s `version`
+   field at release time. The release workflow fails fast on this; v0.19.0
+   and v0.19.1 tags both stillborned because nobody updated SKILL.md.
+   `v0.19.2` finally synced them.
+3. `tests/e2e_stress_gossip.sh` doesn't read its `NODES` / `MESSAGES` env
+   vars — they're hard-coded. If you want different params, edit the script
+   or pass them as positional args (need to add support).
+4. The release-profiling binary is **452 MB** with embedded debuginfo.
+   Don't deploy it to the live mesh — use it locally for gdb / perf only.
 
 ---
 
 ## Repo state
 
-Branch `main`, 3 local commits ahead of `origin/main`:
+- Branch `main`, latest commit `chore(release): v0.19.2`.
+- Three uncommitted commits ahead before the v0.19.2 release commit:
+  flake fix in `tests/comprehensive_integration.rs`, rolling-delay patch
+  in `tests/e2e_deploy.sh`, the release commit itself.
+- Tags on the repo: `v0.19.0`, `v0.19.1` (both stillborn, never on
+  crates.io), `v0.19.2` (live).
+- `proofs/v0.19.0-validation-20260423T131419Z/` is the curated proof from
+  this session and contains the full forensics chain. Read its `README.md`
+  for the go/no-go report and `12-60min-sustained-watch/README.md` for
+  the comprehensive memory-growth evidence.
 
-```
-722f80e perf: pick up ant-quic getsockname fixes + add release-profiling profile
-585a8e8 infra(vps): retire Vultr nodes — migrate Singapore + Tokyo to DigitalOcean
-c07af96 feat(discovery): machine-centric endpoint announcements + v0.18.5 proofs
-```
+---
 
-Not pushed. `../ant-quic` `master` has 2 local commits ahead of
-`origin/master` (`e6eb4b54`, `43acc666`). Also not pushed.
+## VPS state at session close
 
-Push only after the residual spin is understood — a half-fix release
-is worse than the current holding-pattern of stopped services.
+| Node | Provider | Service | RSS | Peers |
+|------|----------|---------|------|-------|
+| nyc / saorsa-2 | DO NYC1 | active | ~36 MB | 6 |
+| sfo / saorsa-3 | DO SFO3 | active | ~60 MB | 6 |
+| helsinki / saorsa-6 | Hetzner HEL | active | ~30 MB | 6 |
+| nuremberg / saorsa-7 | Hetzner NUR | active | ~50 MB | 4–6 |
+| singapore / saorsa-8 | DO SGP1 | active | ~50 MB | 5–6 |
+| sydney / saorsa-9 | DO SYD1 | active | ~50 MB | 6 |
+
+All on `316436de…` (x0x 0.19.2 stripped release built from published crates,
+no path patches). Tokens for SSH-based REST API access are in
+`tests/.vps-tokens.env` (gitignored).
