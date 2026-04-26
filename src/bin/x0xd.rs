@@ -554,6 +554,7 @@ struct UpdateTaskRequest {
 
 /// POST /contacts request body.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddContactRequest {
     /// Agent ID as 64-character hex string.
     agent_id: String,
@@ -571,6 +572,7 @@ fn default_trust_level() -> String {
 
 /// PATCH /contacts/:agent_id request body.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateContactRequest {
     /// New trust level: "blocked", "unknown", "known", or "trusted".
     trust_level: Option<String>,
@@ -580,6 +582,7 @@ struct UpdateContactRequest {
 
 /// POST /contacts/:agent_id/machines request body.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddMachineRequest {
     /// Machine ID as 64-character hex string.
     machine_id: String,
@@ -602,6 +605,7 @@ struct MachineEntry {
 
 /// POST /contacts/trust request body (quick trust shorthand).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QuickTrustRequest {
     /// Agent ID as 64-character hex string.
     agent_id: String,
@@ -3292,12 +3296,16 @@ async fn import_agent_card(
         }
     };
 
-    // Parse trust level
-    let trust = match req.trust_level.to_lowercase().as_str() {
-        "trusted" => x0x::contacts::TrustLevel::Trusted,
-        "known" => x0x::contacts::TrustLevel::Known,
-        "blocked" => x0x::contacts::TrustLevel::Blocked,
-        _ => x0x::contacts::TrustLevel::Known,
+    // Parse trust level — surface the FromStr error rather than silently
+    // coercing unknown values to Known. Matches the AddContactRequest path.
+    let trust: x0x::contacts::TrustLevel = match req.trust_level.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
     };
 
     // Parse agent ID

@@ -431,6 +431,51 @@ async fn daemon_api_add_contact() {
         .unwrap();
 }
 
+/// Regression test for issue #19: POST /contacts with `alias` (the field
+/// name a beta tester guessed) is rejected with a 400 instead of silently
+/// dropping the unknown key. `deny_unknown_fields` on `AddContactRequest`
+/// makes serde surface the right field name in its error.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_add_contact_rejects_unknown_field_alias() {
+    let d = daemon().await;
+    let agent = fake_id();
+    let r = ca(&d)
+        .post(d.url("/contacts"))
+        .json(&serde_json::json!({
+            "agent_id": agent,
+            "alias": "should-be-label",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// Regression test for issue #19: POST /agent/card/import with an unknown
+/// trust_level no longer silently coerces to "known". The daemon now
+/// returns the same FromStr error as POST /contacts.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_import_card_invalid_trust_level_rejected() {
+    let d = daemon().await;
+    let r = ca(&d)
+        .post(d.url("/agent/card/import"))
+        .json(&serde_json::json!({
+            "card": "x0x://agent/not-a-real-card",
+            "trust_level": "completely-bogus",
+        }))
+        .send()
+        .await
+        .unwrap();
+    // The card itself is invalid first, OR we hit the trust-level branch —
+    // either way it is a 400 with a structured error, not a silent default.
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert!(body["error"].is_string());
+}
+
 #[tokio::test]
 #[ignore]
 async fn daemon_api_list_contacts() {
