@@ -521,8 +521,49 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Resolve crate version
+        id: crate
+        run: |
+          version=$(grep -m1 '^version =' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "::error::could not parse [package].version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "x0x crate version: $version"
+
       - name: Publish x0x crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish -p x0x || echo "x0x already published or publish failed"
+          set +e
+          output=$(cargo publish -p x0x 2>&1)
+          status=$?
+          echo "$output"
+          if [ $status -eq 0 ]; then
+            echo "::notice::x0x ${{ steps.crate.outputs.version }} uploaded to crates.io"
+            exit 0
+          fi
+          if echo "$output" | grep -qiE "already (uploaded|exists)"; then
+            echo "::notice::x0x ${{ steps.crate.outputs.version }} already on crates.io — treating as success"
+            exit 0
+          fi
+          echo "::error::cargo publish failed (exit $status); see log above"
+          exit $status
+
+      - name: Verify version is indexed on crates.io
+        run: |
+          version="${{ steps.crate.outputs.version }}"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            indexed=$(curl -fsSL --retry 2 "https://crates.io/api/v1/crates/x0x" \
+              | python3 -c 'import sys,json; print(json.load(sys.stdin).get("crate",{}).get("max_version",""))' \
+              || echo "")
+            if [ "$indexed" = "$version" ]; then
+              echo "::notice::x0x $version is the indexed max_version on crates.io"
+              exit 0
+            fi
+            echo "attempt $attempt: indexed max_version='$indexed', want='$version'; retrying in 30s"
+            sleep 30
+          done
+          echo "::error::crates.io did not index x0x $version within ~5 min (last seen max_version='$indexed')"
+          exit 1

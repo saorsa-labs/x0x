@@ -14,7 +14,7 @@ There is **not** a single universal `data` wrapper.
 Examples:
 
 ```json
-{"ok":true,"status":"healthy","version":"0.16.0","peers":4,"uptime_secs":300}
+{"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"uptime_secs":300}
 ```
 
 ```json
@@ -39,7 +39,7 @@ Errors use:
 
 ```bash
 curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"0.16.0","peers":4,"uptime_secs":300}
+# {"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"uptime_secs":300}
 ```
 
 ### Example: status
@@ -49,7 +49,7 @@ curl http://127.0.0.1:12700/status
 # {
 #   "ok": true,
 #   "status": "connected",
-#   "version": "0.16.0",
+#   "version": "<x.y.z>",
 #   "uptime_secs": 300,
 #   "api_address": "127.0.0.1:12700",
 #   "external_addrs": ["203.0.113.5:5483"],

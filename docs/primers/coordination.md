@@ -1,6 +1,6 @@
 **Coordinate shared state across agents with task lists and stores.**
 
-> Status: current upstream `x0x v0.19.3` provides collaborative task lists (CRDT-based) and replicated key-value stores with automatic cross-node synchronization via gossip.
+> Status: the current upstream `x0x` daemon provides collaborative task lists (CRDT-based) and replicated key-value stores with automatic cross-node synchronization via gossip.
 
 ## Setup once
 

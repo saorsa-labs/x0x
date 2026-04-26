@@ -83,7 +83,9 @@ x0x is a bad fit when:
 
 ## Current state
 
-Version **0.16.0**.
+The shipped version is whatever `Cargo.toml`/the release tag says — see the
+[CHANGELOG](../CHANGELOG.md) for what landed in each one. This document
+describes the surface and is kept version-agnostic.
 
 Current, working surface area includes:
 

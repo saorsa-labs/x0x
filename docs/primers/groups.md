@@ -1,6 +1,6 @@
 **Use named groups for invite-based coordination, and MLS helpers for encryption.**
 
-> Status: current upstream `x0x v0.19.3` has two separate group surfaces: `x0x group ...` for named groups and invites, and `x0x groups ...` for low-level MLS helpers. They are related, but they are not yet one turnkey secure group-chat product.
+> Status: the current upstream `x0x` daemon has two separate group surfaces: `x0x group ...` for named groups and invites, and `x0x groups ...` for low-level MLS helpers. They are related, but they are not yet one turnkey secure group-chat product.
 
 ## Stable identity + evolving validity (Phase D.3)
 

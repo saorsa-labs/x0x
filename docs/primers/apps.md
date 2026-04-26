@@ -1,6 +1,6 @@
 **Build local apps on top of `x0xd`.**
 
-> Status: current upstream `x0x v0.19.3` is a good localhost app substrate. It is not yet a complete app packaging, discovery, or distribution platform.
+> Status: the current upstream `x0x` daemon is a good localhost app substrate. It is not yet a complete app packaging, discovery, or distribution platform.
 
 x0x is strong when your app runs on the same machine as the daemon and uses its local REST/WebSocket surface.
 
