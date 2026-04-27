@@ -553,11 +553,22 @@ jobs:
 
       - name: Verify version is indexed on crates.io
         run: |
+          # crates.io API rejects requests without a User-Agent (HTTP 403),
+          # per https://crates.io/policies#api. v0.19.4 and v0.19.5 both
+          # had this verify-step false-fail while the actual cargo publish
+          # had already succeeded.
           version="${{ steps.crate.outputs.version }}"
+          ua="x0x-release-ci/${version} (release@saorsalabs.com)"
           for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            indexed=$(curl -fsSL --retry 2 "https://crates.io/api/v1/crates/x0x" \
-              | python3 -c 'import sys,json; print(json.load(sys.stdin).get("crate",{}).get("max_version",""))' \
-              || echo "")
+            body=$(curl -fsSL --retry 2 -A "$ua" \
+              "https://crates.io/api/v1/crates/x0x" 2>/dev/null || echo "")
+            if [ -n "$body" ]; then
+              indexed=$(echo "$body" \
+                | python3 -c 'import sys,json; print(json.load(sys.stdin).get("crate",{}).get("max_version",""))' \
+                2>/dev/null || echo "")
+            else
+              indexed=""
+            fi
             if [ "$indexed" = "$version" ]; then
               echo "::notice::x0x $version is the indexed max_version on crates.io"
               exit 0
