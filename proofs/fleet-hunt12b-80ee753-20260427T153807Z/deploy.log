@@ -1,0 +1,39 @@
+Deploy commit: 80ee753f9f5f274c6dea84fa54b2cddd8dd473da
+Binary: target/x86_64-unknown-linux-gnu/release/x0xd (30250688 27 Apr 16:29)
+Targets: saorsa-2:142.93.199.50 saorsa-3:147.182.234.192 saorsa-6:65.21.157.229 saorsa-7:116.203.101.172
+Started: 2026-04-27T15:38:24Z
+===
+
+--- saorsa-2 (142.93.199.50) ---
+  Pre-deploy version: x0xd 0.19.3
+  Uploading binary... done
+  Installing + restarting x0xd... done
+  Post-deploy version: x0xd 0.19.3
+  Service active: active
+  Rolling delay 15s before next node...
+
+--- saorsa-3 (147.182.234.192) ---
+  Pre-deploy version: x0xd 0.19.3
+  Uploading binary... done
+  Installing + restarting x0xd... done
+  Post-deploy version: x0xd 0.19.3
+  Service active: active
+  Rolling delay 15s before next node...
+
+--- saorsa-6 (65.21.157.229) ---
+  Pre-deploy version: x0xd 0.19.3
+  Uploading binary... done
+  Installing + restarting x0xd... done
+  Post-deploy version: x0xd 0.19.3
+  Service active: active
+  Rolling delay 15s before next node...
+
+--- saorsa-7 (116.203.101.172) ---
+  Pre-deploy version: x0xd 0.19.3
+  Uploading binary... done
+  Installing + restarting x0xd... done
+  Post-deploy version: x0xd 0.19.3
+  Service active: active
+
+===
+Finished: 2026-04-27T15:42:46Z

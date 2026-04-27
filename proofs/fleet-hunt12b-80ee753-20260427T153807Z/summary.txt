@@ -1,0 +1,24 @@
+Hunt 12b 90-min fleet monitor
+=============================
+Commit: 80ee753f9f5f274c6dea84fa54b2cddd8dd473da
+Started: 2026-04-27T15:46:29Z
+Ended:   2026-04-27T17:16:03Z
+Nodes (N=4): saorsa-2:142.93.199.50 saorsa-3:147.182.234.192 saorsa-6:65.21.157.229 saorsa-7:116.203.101.172
+Success criteria:
+  - presence_online >= 3 on every node
+  - dispatcher.{pubsub,membership,bulk}.timed_out == 0
+  - dispatcher.recv_depth_max < 8000
+
+Ticks completed: 77
+Failures by criterion:
+  - min_online failures: 0
+  - timed_out failures:  106
+  - recv_depth failures: 0
+
+First-failure events:
+  - saorsa-7:timed_out: ps_timed_out=6 ms=0 bk=0 at tick 73 (2026-04-27T17:11:10Z)
+  - saorsa-2:timed_out: ps_timed_out=2 ms=6 bk=0 at tick 58 (2026-04-27T16:53:33Z)
+  - saorsa-3:timed_out: ps_timed_out=4 ms=0 bk=0 at tick 74 (2026-04-27T17:12:20Z)
+  - saorsa-6:timed_out: ps_timed_out=0 ms=1 bk=0 at tick 1 (2026-04-27T15:46:29Z)
+
+RESULT: FAIL
