@@ -133,6 +133,7 @@ pub fn presence_record_to_discovered_agent(
             if !addresses.is_empty() {
                 updated.addresses = addresses;
             }
+            updated.last_seen = updated.last_seen.max(record.since);
             return Some(updated);
         }
     }
@@ -468,8 +469,11 @@ impl PresenceWrapper {
             NetworkError::NodeCreation(format!("failed to create presence signing key: {e}"))
         })?;
 
+        let global_topic = global_presence_topic();
+        let mut initial_groups = HashMap::new();
+        initial_groups.insert(global_topic, GroupContext::new(global_topic));
         let groups: Arc<RwLock<HashMap<TopicId, GroupContext>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+            Arc::new(RwLock::new(initial_groups));
 
         let network_for_wrapper = Arc::clone(&network);
         let manager = PresenceManager::new_with_identity(
@@ -728,6 +732,31 @@ mod tests {
         assert_eq!(t1, t2, "global_presence_topic must be deterministic");
     }
 
+    #[tokio::test]
+    async fn test_presence_wrapper_joins_global_presence_topic() {
+        let config = crate::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            bootstrap_nodes: Vec::new(),
+            ..crate::network::NetworkConfig::default()
+        };
+        let network = crate::network::NetworkNode::new(config, None, None)
+            .await
+            .unwrap();
+        let wrapper = PresenceWrapper::new(
+            PeerId::new([9u8; 32]),
+            std::sync::Arc::new(network),
+            PresenceConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let groups = wrapper.manager().get_groups().await;
+        assert!(
+            groups.contains(&global_presence_topic()),
+            "global presence topic must be joined so beacon loop emits Bulk traffic"
+        );
+    }
+
     #[test]
     fn test_peer_to_agent_id_found() {
         let machine_bytes = [42u8; 32];
@@ -823,9 +852,10 @@ mod tests {
         assert_eq!(da.agent_id, agent_id, "Should use cached agent_id");
         // Addresses should be updated from the presence record.
         assert_eq!(da.addresses.len(), 1);
-        // machine_public_key should be preserved from cache (non-empty).
+        // machine_public_key should be preserved from cache (non-empty), while
+        // liveness should be refreshed from the beacon timestamp.
         assert!(!da.machine_public_key.is_empty());
-        let _ = now; // suppress unused warning
+        assert!(da.last_seen >= now);
     }
 
     #[test]

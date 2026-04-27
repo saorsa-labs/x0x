@@ -834,6 +834,18 @@ impl NetworkNode {
         }
     }
 
+    /// Return the current gossip receive queue depth and max capacity.
+    ///
+    /// This is sampled by the gossip runtime dispatcher before handling each
+    /// dequeued message so diagnostics can distinguish handler stalls from
+    /// network receiver back-pressure.
+    #[must_use]
+    pub fn gossip_recv_queue_depth(&self) -> (usize, usize) {
+        let max = self.recv_tx.max_capacity();
+        let available = self.recv_tx.capacity();
+        (max.saturating_sub(available), max)
+    }
+
     /// Gracefully shutdown the node.
     ///
     /// Drops the inner node, closing all connections.

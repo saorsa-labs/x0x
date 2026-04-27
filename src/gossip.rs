@@ -11,4 +11,7 @@ pub use config::GossipConfig;
 pub use pubsub::{
     PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot, SigningContext, Subscription,
 };
-pub use runtime::GossipRuntime;
+pub use runtime::{
+    DispatchStreamStats, DispatchStreamStatsSnapshot, GossipDispatchStats,
+    GossipDispatchStatsSnapshot, GossipRuntime,
+};

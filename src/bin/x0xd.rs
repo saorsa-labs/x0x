@@ -3607,7 +3607,7 @@ fn default_foaf_timeout_ms() -> u64 {
 /// List all agents currently online (network view: all non-blocked agents from
 /// the local discovery cache).
 async fn presence_online(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match state.agent.discovered_agents().await {
+    match state.agent.online_agents().await {
         Ok(agents) => {
             let contacts = state.agent.contacts().read().await;
             let filtered = x0x::presence::filter_by_trust(
@@ -11075,6 +11075,7 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
             Json(serde_json::json!({
                 "ok": true,
                 "stats": snap,
+                "dispatcher": state.agent.gossip_dispatch_stats(),
             })),
         ),
         None => (

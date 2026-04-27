@@ -1191,6 +1191,7 @@ fn deserialize_identity_announcement(
 ) -> std::result::Result<IdentityAnnouncement, Box<bincode::ErrorKind>> {
     use bincode::Options;
     bincode::DefaultOptions::new()
+        .with_fixint_encoding()
         .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
         .allow_trailing_bytes()
         .deserialize(payload)
@@ -1201,6 +1202,7 @@ fn deserialize_machine_announcement(
 ) -> std::result::Result<MachineAnnouncement, Box<bincode::ErrorKind>> {
     use bincode::Options;
     bincode::DefaultOptions::new()
+        .with_fixint_encoding()
         .with_limit(MAX_MACHINE_ANNOUNCEMENT_DECODE_BYTES)
         .reject_trailing_bytes()
         .deserialize(payload)
@@ -1794,6 +1796,16 @@ impl Agent {
     #[must_use]
     pub fn gossip_stats(&self) -> Option<gossip::PubSubStatsSnapshot> {
         self.gossip_runtime.as_ref().map(|rt| rt.pubsub().stats())
+    }
+
+    /// Snapshot of inbound gossip dispatcher counters.
+    ///
+    /// Returns `None` when the agent has no gossip runtime. Exposed through
+    /// `GET /diagnostics/gossip` alongside pub/sub drop-detection counters so
+    /// live soaks can identify slow or timed-out stream handlers.
+    #[must_use]
+    pub fn gossip_dispatch_stats(&self) -> Option<gossip::GossipDispatchStatsSnapshot> {
+        self.gossip_runtime.as_ref().map(|rt| rt.dispatch_stats())
     }
 
     /// Get the presence system wrapper, if configured.
@@ -3396,9 +3408,52 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|a| a.announced_at >= cutoff)
+            .filter(|a| a.last_seen >= cutoff)
             .cloned()
             .collect();
+        agents.sort_by_key(|a| a.agent_id.0);
+        Ok(agents)
+    }
+
+    /// Get all currently-online agents from live presence beacons.
+    ///
+    /// This is the backing view for `/presence/online`: signed identity
+    /// announcements provide the AgentId/MachineId binding, while presence
+    /// beacons provide short-TTL liveness. Fresh identity-cache entries are
+    /// included as a startup fallback before the first beacon poll converges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn online_agents(&self) -> error::Result<Vec<DiscoveredAgent>> {
+        self.start_identity_listener().await?;
+        let cutoff = Self::unix_timestamp_secs().saturating_sub(self.identity_ttl_secs);
+        let cache = self.identity_discovery_cache.read().await;
+        let mut seen = std::collections::HashSet::new();
+        let mut agents = Vec::new();
+
+        for agent in cache.values().filter(|agent| agent.last_seen >= cutoff) {
+            if seen.insert(agent.agent_id) {
+                agents.push(agent.clone());
+            }
+        }
+
+        if let Some(ref pw) = self.presence {
+            let records = pw
+                .manager()
+                .get_group_presence(crate::presence::global_presence_topic())
+                .await;
+            for (peer_id, record) in records {
+                if let Some(agent) =
+                    crate::presence::presence_record_to_discovered_agent(peer_id, &record, &cache)
+                {
+                    if seen.insert(agent.agent_id) {
+                        agents.push(agent);
+                    }
+                }
+            }
+        }
+
         agents.sort_by_key(|a| a.agent_id.0);
         Ok(agents)
     }
@@ -4476,16 +4531,80 @@ impl Agent {
 
         // Start presence beacons after membership overlay is established.
         if let Some(ref pw) = self.presence {
-            // Seed broadcast peers from connected peers so beacons propagate.
+            // Seed broadcast peers from both HyParView and ant-quic's live
+            // connection table so beacons propagate even when HyParView's
+            // active view lags behind the transport mesh.
             if let Some(ref runtime) = self.gossip_runtime {
                 let active = runtime.membership().active_view();
-                for peer in active {
-                    pw.manager().add_broadcast_peer(peer).await;
+                let active_view_count = active.len();
+                let mut broadcast_peers = active;
+
+                let mut connected_peer_count = 0usize;
+                if let Some(ref net) = self.network {
+                    let connected = net.connected_peers().await;
+                    connected_peer_count = connected.len();
+                    broadcast_peers.extend(
+                        connected
+                            .into_iter()
+                            .map(|peer| saorsa_gossip_types::PeerId::new(peer.0)),
+                    );
                 }
+
+                pw.manager().replace_broadcast_peers(broadcast_peers).await;
+                let broadcast_peer_count = pw.manager().broadcast_peer_count().await;
                 tracing::info!(
-                    "Presence seeded with {} broadcast peers",
-                    pw.manager().broadcast_peer_count().await
+                    active_view_count,
+                    connected_peer_count,
+                    broadcast_peer_count,
+                    "Presence seeded broadcast peers"
                 );
+
+                // Refresh broadcast_peers from HyParView and the live ant-quic
+                // connection table every 30 s. Without this, agents that finish
+                // join_network() before the mesh has formed can end up with an
+                // empty/stale broadcast set forever. The 2026-04-26 live mesh
+                // had full QUIC peer connectivity while HyParView active_view()
+                // stayed at <= 1 peer, so the transport table is the source of
+                // truth for presence fanout. Replace the fanout set each tick so
+                // stale/disconnected peers do not accumulate and later wedge
+                // presence delivery behind failed reconnect attempts.
+                let pw_clone = pw.clone();
+                let runtime_clone = runtime.clone();
+                let network_clone = self.network.as_ref().map(std::sync::Arc::clone);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                    interval.tick().await; // first tick fires immediately; startup already seeded
+                    loop {
+                        interval.tick().await;
+
+                        let active = runtime_clone.membership().active_view();
+                        let active_view_count = active.len();
+                        let mut broadcast_peers = active;
+
+                        let mut connected_peer_count = 0usize;
+                        if let Some(ref net) = network_clone {
+                            let connected = net.connected_peers().await;
+                            connected_peer_count = connected.len();
+                            broadcast_peers.extend(
+                                connected
+                                    .into_iter()
+                                    .map(|peer| saorsa_gossip_types::PeerId::new(peer.0)),
+                            );
+                        }
+
+                        pw_clone
+                            .manager()
+                            .replace_broadcast_peers(broadcast_peers)
+                            .await;
+                        let broadcast_peer_count = pw_clone.manager().broadcast_peer_count().await;
+                        tracing::info!(
+                            active_view_count,
+                            connected_peer_count,
+                            broadcast_peer_count,
+                            "Presence broadcast peer refresh"
+                        );
+                    }
+                });
             }
 
             // Populate address hints from network status for beacon metadata.
@@ -4863,7 +4982,7 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|a| a.announced_at >= cutoff)
+            .filter(|a| a.last_seen >= cutoff)
             .map(|a| a.agent_id)
             .collect();
         agents.sort_by_key(|a| a.0);
@@ -5690,6 +5809,7 @@ impl Agent {
                         .and_then(|b| {
                             use bincode::Options;
                             bincode::DefaultOptions::new()
+                                .with_fixint_encoding()
                                 .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
                                 .deserialize(b)
                                 .ok()
@@ -7210,6 +7330,31 @@ mod tests {
         assert_eq!(decoded.is_coordinator, Some(true));
         assert_eq!(decoded.reachable_via, vec![MachineId([5u8; 32])]);
         assert_eq!(decoded.relay_candidates, vec![MachineId([6u8; 32])]);
+    }
+
+    #[tokio::test]
+    async fn announcement_decode_helpers_match_bincode_serialize_wire_format() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent = Agent::builder()
+            .with_machine_key(temp.path().join("machine.key"))
+            .with_agent_key_path(temp.path().join("agent.key"))
+            .with_agent_cert_path(temp.path().join("agent.cert"))
+            .with_contact_store_path(temp.path().join("contacts.json"))
+            .build()
+            .await
+            .unwrap();
+
+        let identity = agent.build_identity_announcement(false, false).unwrap();
+        let identity_bytes = bincode::serialize(&identity).unwrap();
+        let decoded_identity = deserialize_identity_announcement(&identity_bytes).unwrap();
+        assert_eq!(decoded_identity.agent_id, identity.agent_id);
+        assert_eq!(decoded_identity.machine_id, identity.machine_id);
+
+        let machine = agent.build_machine_announcement().unwrap();
+        let machine_bytes = bincode::serialize(&machine).unwrap();
+        let decoded_machine = deserialize_machine_announcement(&machine_bytes).unwrap();
+        assert_eq!(decoded_machine.machine_id, machine.machine_id);
+        assert_eq!(decoded_machine.addresses, machine.addresses);
     }
 
     /// An announcement with None for all NAT fields (e.g. network not started)
