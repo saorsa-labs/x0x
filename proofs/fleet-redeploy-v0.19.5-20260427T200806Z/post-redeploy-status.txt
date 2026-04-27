@@ -1,0 +1,106 @@
+=== Post-redeploy fleet status (v0.19.5) ===
+saorsa-2     v=x0xd 0.19.5 svc=active health=healthy online=5  ?
+saorsa-3     v=x0xd 0.19.5 svc=active health=healthy online=5  ?
+saorsa-6     v=x0xd 0.19.5 svc=active health=healthy online=5  ?
+saorsa-7     v=x0xd 0.19.5 svc=active health=healthy online=3  ?
+=== /diagnostics/gossip per-stream snapshots after redeploy ===
+--- saorsa-2 ---
+    "dispatcher": {
+        "bulk": {
+            "max_elapsed_ms": 0,
+            "timed_out": 0
+        "membership": {
+            "max_elapsed_ms": 5,
+            "timed_out": 0
+        "pubsub": {
+            "max_elapsed_ms": 116,
+            "timed_out": 0
+        "recv_depth": {
+            "bulk": {
+                "capacity": 4000,
+                "latest": 0,
+                "max": 0
+            "membership": {
+                "capacity": 4000,
+                "latest": 0,
+                "max": 1
+            "pubsub": {
+                "capacity": 10000,
+                "latest": 0,
+                "max": 25
+
+--- saorsa-3 ---
+    "dispatcher": {
+        "bulk": {
+            "max_elapsed_ms": 1,
+            "timed_out": 0
+        "membership": {
+            "max_elapsed_ms": 83,
+            "timed_out": 0
+        "pubsub": {
+            "max_elapsed_ms": 62,
+            "timed_out": 0
+        "recv_depth": {
+            "bulk": {
+                "capacity": 4000,
+                "latest": 0,
+                "max": 0
+            "membership": {
+                "capacity": 4000,
+                "latest": 0,
+                "max": 0
+            "pubsub": {
+                "capacity": 10000,
+                "latest": 0,
+                "max": 17
+
+--- saorsa-6 ---
+    "dispatcher": {
+        "bulk": {
+            "max_elapsed_ms": 1,
+            "timed_out": 0
+        "membership": {
+            "max_elapsed_ms": 0,
+            "timed_out": 0
+        "pubsub": {
+            "max_elapsed_ms": 51,
+            "timed_out": 0
+        "recv_depth": {
+            "bulk": {
+                "capacity": 4000,
+                "latest": 0,
+                "max": 0
+            "membership": {
+                "capacity": 4000,
+                "latest": 0,
+                "max": 1
+            "pubsub": {
+                "capacity": 10000,
+                "latest": 0,
+                "max": 9
+
+--- saorsa-7 ---
+    "dispatcher": {
+        "bulk": {
+            "max_elapsed_ms": 1,
+            "timed_out": 0
+        "membership": {
+            "max_elapsed_ms": 0,
+            "timed_out": 0
+        "pubsub": {
+            "max_elapsed_ms": 0,
+            "timed_out": 0
+        "recv_depth": {
+            "bulk": {
+                "capacity": 4000,
+                "latest": 0,
+                "max": 0
+            "membership": {
+                "capacity": 0,
+                "latest": 0,
+                "max": 0
+            "pubsub": {
+                "capacity": 0,
+                "latest": 0,
+                "max": 0
+

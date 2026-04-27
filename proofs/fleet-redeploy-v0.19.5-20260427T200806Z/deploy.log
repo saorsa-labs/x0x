@@ -1,0 +1,40 @@
+Redeploy x0x v0.19.5 (Hunt 12c)
+Tag commit: 7d5415e290d034e3fecdfe48cc7b97b41d640ff3
+Binary: target/x86_64-unknown-linux-gnu/release/x0xd (30301440 27 Apr 21:07)
+Targets: saorsa-2:142.93.199.50 saorsa-3:147.182.234.192 saorsa-6:65.21.157.229 saorsa-7:116.203.101.172
+Started: 2026-04-27T20:08:06Z
+===
+
+--- saorsa-2 (142.93.199.50) ---
+  Uploading binary... done
+  Installing + restarting x0xd... done
+  Post-deploy version: x0xd 0.19.5
+  Service active: active
+  /diagnostics/gossip recv_depth shape: per-stream
+  Rolling delay 15s before next node...
+
+--- saorsa-3 (147.182.234.192) ---
+  Uploading binary... done
+  Installing + restarting x0xd... done
+  Post-deploy version: x0xd 0.19.5
+  Service active: active
+  /diagnostics/gossip recv_depth shape: per-stream
+  Rolling delay 15s before next node...
+
+--- saorsa-6 (65.21.157.229) ---
+  Uploading binary... done
+  Installing + restarting x0xd... done
+  Post-deploy version: x0xd 0.19.5
+  Service active: active
+  /diagnostics/gossip recv_depth shape: per-stream
+  Rolling delay 15s before next node...
+
+--- saorsa-7 (116.203.101.172) ---
+  Uploading binary... done
+  Installing + restarting x0xd... done
+  Post-deploy version: x0xd 0.19.5
+  Service active: active
+  /diagnostics/gossip recv_depth shape: per-stream
+
+===
+Finished: 2026-04-27T20:12:47Z
