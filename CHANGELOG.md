@@ -4,6 +4,89 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.4] - 2026-04-27
+
+Hunt 12b release. Fixes the live-fleet regression where `/presence/online`
+collapsed to self-only on most nodes 25–45 minutes after rolling restart.
+
+### Fixed
+
+- **`presence`: refresh broadcast peers from QUIC table.** The presence
+  broadcast set was seeded once from `HyParViewMembership::active_view()`
+  at `join_network()` and never refreshed. On the live mesh, HyParView's
+  active view stayed at ≤ 1 peer for many minutes after restart while
+  ant-quic was fully connected, so beacons fanned out to a tiny subset
+  and the rest of the fleet observed no inbound presence at all. A new
+  30 s background task now `replace_broadcast_peers()` with
+  `HyParView active view ∪ ant-quic connected_peers`, so the transport
+  mesh is the source of truth.
+- **`presence`: pre-join the global presence topic.**
+  `PresenceManager::handle_presence_message` silently dropped beacons
+  whose `topic_id` was not in the local `groups` map.
+  `PresenceWrapper::new` was building an empty groups map, so even when
+  beacons arrived, `/presence/online` stayed empty until the first
+  identity refresh seeded the entry. The wrapper now pre-joins
+  `global_presence_topic()` at construction; pinned by
+  `test_presence_wrapper_joins_global_presence_topic`.
+- **`presence`: `/presence/online` uses live beacon liveness.** The
+  endpoint filtered the discovery cache by `announced_at >= cutoff`
+  (the announcement timestamp from first discovery, never refreshed by
+  subsequent beacons). It now filters by `last_seen >= cutoff` in
+  `discovered_agents()` / `online_peer_count()`, refreshes `last_seen`
+  from beacon timestamps in `presence_record_to_discovered_agent()`,
+  and a new `Agent::online_agents()` merges the identity cache with
+  live `PresenceManager::get_group_presence()` records. Pinned by
+  `test_online_agents_uses_presence_beacon_liveness`.
+- **`gossip`: bincode wire-format fix on identity / machine
+  announcement decoders.** `deserialize_identity_announcement` /
+  `deserialize_machine_announcement` used
+  `bincode::DefaultOptions::new()` (varint encoding) while the writers
+  ship via `bincode::serialize` (fixint default). Decoders now call
+  `.with_fixint_encoding()` so they actually match the wire. New test
+  `announcement_decode_helpers_match_bincode_serialize_wire_format`
+  pins the round-trip.
+
+### Added
+
+- **`gossip`: dispatcher visibility instrumentation.** Wraps every
+  inbound dispatcher arm in a per-stream `tokio::time::timeout` (PubSub
+  10 s, Membership 5 s, Bulk 5 s) with WARN-on-timeout. New
+  `GossipDispatchStats` exposes per-stream counters
+  (`received` / `completed` / `timed_out` / `max_elapsed_ms`) plus
+  receive-queue depth (`recv_depth_latest` / `recv_depth_max` /
+  `recv_capacity_latest`). Surfaced via `Agent::gossip_dispatch_stats()`
+  and `GET /diagnostics/gossip` → new `dispatcher` field. Lets a fleet
+  soak distinguish handler stalls from network back-pressure without a
+  code change.
+
+### Dependencies
+
+- **`saorsa-gossip-*` → `0.5.23`.** Concurrent presence beacon fanout
+  (`saorsa-gossip-presence` `JoinSet` + 5 s → 15 s per-peer timeout) so
+  one slow peer cannot delay the rest of the mesh. Pubsub memory bound
+  under sustained publish + idle traffic.
+
+### Validation
+
+- `cargo nextest --lib --all-features`: 602 / 602 pass.
+- `tests/e2e_presence_propagation.sh`: 4-node localhost mesh,
+  `peers=3 online=4` on every node — `proofs/e2e-presence-propagation-20260427T151802Z/`.
+- 4-node fleet (saorsa-2 / 3 / 6 / 7), 90-minute monitor at 60 s
+  intervals: `presence_online >= 3` on every node every tick
+  (308 / 308 sample points). `recv_depth_max` peaks
+  4729 / 265 / 101 / 425 (well below the 8000 threshold). Proof:
+  `proofs/fleet-hunt12b-80ee753-20260427T153807Z/`.
+
+### Known follow-up
+
+- **Hunt 12c** — see `docs/design/hunt-12c-pubsub-handler-stall.md`.
+  The new dispatcher counters lit up an architectural bottleneck on
+  the most-loaded fleet node: a single peer's 16 056-byte PubSub
+  message every 10 s exhausted the 10 s handler timeout, accumulating
+  back-pressure on the shared `recv_tx`. The user-visible Hunt 12b
+  symptom remains fixed; the structural fix (per-stream channel split
+  in `src/network.rs`) is tracked for `v0.19.5` / `v0.20.0`.
+
 ### Removed (BREAKING)
 
 - **Dropped first-party Node.js (napi-rs) and Python (PyO3 / maturin) FFI
