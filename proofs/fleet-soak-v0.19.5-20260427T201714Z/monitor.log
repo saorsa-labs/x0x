@@ -1,0 +1,385 @@
+[tick 1 @ 2026-04-27T20:17:14Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=17 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=9 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 2 @ 2026-04-27T20:18:22Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=17 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=9 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 3 @ 2026-04-27T20:19:33Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=17 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 4 @ 2026-04-27T20:20:43Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=17 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 5 @ 2026-04-27T20:21:53Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=17 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 6 @ 2026-04-27T20:23:04Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=17 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 7 @ 2026-04-27T20:24:14Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 8 @ 2026-04-27T20:25:24Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 9 @ 2026-04-27T20:26:35Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 10 @ 2026-04-27T20:27:46Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 11 @ 2026-04-27T20:28:56Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 12 @ 2026-04-27T20:30:06Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 13 @ 2026-04-27T20:31:18Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 14 @ 2026-04-27T20:32:29Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 15 @ 2026-04-27T20:33:40Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 16 @ 2026-04-27T20:34:50Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=11 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 17 @ 2026-04-27T20:36:00Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 18 @ 2026-04-27T20:37:11Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 19 @ 2026-04-27T20:38:21Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 20 @ 2026-04-27T20:39:31Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 21 @ 2026-04-27T20:40:41Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=0 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 22 @ 2026-04-27T20:41:52Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 23 @ 2026-04-27T20:43:02Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 24 @ 2026-04-27T20:44:12Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 25 @ 2026-04-27T20:45:23Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 26 @ 2026-04-27T20:46:33Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 27 @ 2026-04-27T20:47:44Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=13 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 28 @ 2026-04-27T20:48:54Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=15 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 29 @ 2026-04-27T20:50:04Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=15 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 30 @ 2026-04-27T20:51:15Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=15 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 31 @ 2026-04-27T20:52:26Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=15 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 32 @ 2026-04-27T20:53:36Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=15 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 33 @ 2026-04-27T20:54:46Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=25 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=15 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 34 @ 2026-04-27T20:55:56Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=15 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 35 @ 2026-04-27T20:57:07Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 36 @ 2026-04-27T20:58:17Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 37 @ 2026-04-27T20:59:28Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 38 @ 2026-04-27T21:00:38Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 39 @ 2026-04-27T21:01:49Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 40 @ 2026-04-27T21:02:59Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 41 @ 2026-04-27T21:04:10Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 42 @ 2026-04-27T21:05:19Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 43 @ 2026-04-27T21:06:30Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 44 @ 2026-04-27T21:07:40Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 45 @ 2026-04-27T21:08:50Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 46 @ 2026-04-27T21:10:00Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 47 @ 2026-04-27T21:11:11Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 48 @ 2026-04-27T21:12:22Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 49 @ 2026-04-27T21:13:32Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 50 @ 2026-04-27T21:14:42Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 51 @ 2026-04-27T21:15:51Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 52 @ 2026-04-27T21:17:03Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 53 @ 2026-04-27T21:18:13Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 54 @ 2026-04-27T21:19:24Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 55 @ 2026-04-27T21:20:34Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 56 @ 2026-04-27T21:21:45Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 57 @ 2026-04-27T21:22:54Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 58 @ 2026-04-27T21:24:05Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 59 @ 2026-04-27T21:25:16Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 60 @ 2026-04-27T21:26:26Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 61 @ 2026-04-27T21:27:35Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 62 @ 2026-04-27T21:28:46Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 63 @ 2026-04-27T21:29:56Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 64 @ 2026-04-27T21:31:07Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 65 @ 2026-04-27T21:32:17Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 66 @ 2026-04-27T21:33:27Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 67 @ 2026-04-27T21:34:38Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 68 @ 2026-04-27T21:35:48Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 69 @ 2026-04-27T21:36:58Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 70 @ 2026-04-27T21:38:08Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 71 @ 2026-04-27T21:39:18Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 72 @ 2026-04-27T21:40:28Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 73 @ 2026-04-27T21:41:39Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 74 @ 2026-04-27T21:42:50Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=29 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 75 @ 2026-04-27T21:44:00Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=32 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 76 @ 2026-04-27T21:45:10Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=32 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0
+[tick 77 @ 2026-04-27T21:46:19Z] polling all nodes...
+  saorsa-2: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=32 rd_ms_max=1 rd_bk_max=0
+  saorsa-3: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=55 rd_ms_max=1 rd_bk_max=0
+  saorsa-6: online=5 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=18 rd_ms_max=1 rd_bk_max=0
+  saorsa-7: online=3 ps_to=0 ms_to=0 bk_to=0 rd_ps_max=0 rd_ms_max=0 rd_bk_max=0

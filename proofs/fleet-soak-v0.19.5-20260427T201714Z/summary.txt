@@ -1,0 +1,100 @@
+Hunt 12c live-fleet 90-min monitor (v0.19.5)
+============================================
+Commit:  0f6c7ce6c3a301f11dc49818d2844e2d6999314b
+Started: 2026-04-27T20:17:14Z
+Ended:   2026-04-27T21:46:29Z
+Nodes (N=4): saorsa-2 saorsa-3 saorsa-6 saorsa-7
+
+Ticks completed: 77 (the monitor body executed cleanly through the full
+                     90-minute window — see monitor.csv for all 308 sample
+                     points; the bash summary tail crashed on a buggy
+                     ${#FIRST_FAIL_TICK[@]:-0} substitution that did not
+                     affect the data collection).
+
+Pass criteria
+-------------
+  - presence_online >= 3 on every node every tick
+  - dispatcher.bulk.timed_out        == 0  (Step 2 isolation)
+  - dispatcher.membership.timed_out  == 0  (Step 2 isolation)
+  - dispatcher.pubsub.timed_out      (informational; expected to grow under
+                                      pathological PubSub load — did NOT in
+                                      this run)
+  - recv_depth.pubsub.max     <  8000  (80 % of 10 000 capacity)
+  - recv_depth.membership.max <  3500
+  - recv_depth.bulk.max       <  3500
+
+Failures by criterion
+---------------------
+  - min_online failures:                                          0
+  - bulk / membership timed_out failures (Step 2 isolation):      0
+  - recv_depth failures:                                          0
+
+Per-node results
+----------------
+saorsa-2 (NYC, DigitalOcean — the worst-affected node in v0.19.4):
+  online range:                                     5 every tick
+  pubsub.timed_out (final):                         0
+  pubsub.max_elapsed_ms (final):                    207
+  membership.timed_out (final):                     0
+  membership.max_elapsed_ms (final):                14
+  bulk.timed_out (final):                           0
+  bulk.max_elapsed_ms (final):                      3
+  recv_depth.pubsub.max:                            32  (0.3 % of capacity)
+  recv_depth.membership.max:                        1
+  recv_depth.bulk.max:                              0
+
+saorsa-3 (SFO, DigitalOcean):
+  online range:                                     5 every tick
+  pubsub.timed_out (final):                         0
+  pubsub.max_elapsed_ms (final):                    300
+  membership.timed_out (final):                     0
+  membership.max_elapsed_ms (final):                83
+  bulk.timed_out (final):                           0
+  bulk.max_elapsed_ms (final):                      7
+  recv_depth.pubsub.max:                            55
+  recv_depth.membership.max:                        1
+  recv_depth.bulk.max:                              0
+
+saorsa-6 (Helsinki, Hetzner):
+  online range:                                     5 every tick
+  pubsub.timed_out (final):                         0
+  pubsub.max_elapsed_ms (final):                    138
+  membership.timed_out (final):                     0
+  membership.max_elapsed_ms (final):                2
+  bulk.timed_out (final):                           0
+  bulk.max_elapsed_ms (final):                      4
+  recv_depth.pubsub.max:                            18
+  recv_depth.membership.max:                        1
+  recv_depth.bulk.max:                              0
+
+saorsa-7 (Nuremberg, Hetzner):
+  online range:                                     3 every tick
+  pubsub.timed_out (final):                         0
+  pubsub.max_elapsed_ms (final):                    0
+  membership.timed_out (final):                     0
+  membership.max_elapsed_ms (final):                0
+  bulk.timed_out (final):                           0
+  bulk.max_elapsed_ms (final):                      5
+  recv_depth.pubsub.max:                            (no PubSub traffic in window)
+  recv_depth.membership.max:                        (idle)
+  recv_depth.bulk.max:                              (idle)
+
+v0.19.4 vs v0.19.5 comparison (Hunt 12c improvement)
+----------------------------------------------------
+  Metric                                v0.19.4 (pre Step 2)    v0.19.5 (post Step 2)
+  saorsa-2 final pubsub.timed_out       129 (+6/min growth)     0
+  worst node membership.timed_out       20 (saorsa-2)           0
+  worst node bulk.timed_out             0                       0
+  saorsa-2 recv_depth.pubsub.max        4729 (47 % of cap)      32 (0.3 % of cap)
+  max pubsub.max_elapsed_ms             10 000 (TIMEOUT)        300
+  presence_online drift                 saorsa-2: 6 → 4         none
+
+Result
+------
+RESULT: PASS
+
+Hunt 12c (per-stream dispatcher isolation) is validated on the live fleet.
+The architectural bottleneck identified in v0.19.4 is resolved: a slow
+pubsub.handle_incoming no longer back-pressures the shared receive queue
+and Bulk presence beacons / Membership SWIM dispatch keep flowing
+independently.
