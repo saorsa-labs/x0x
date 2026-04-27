@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 /// Maximum time to spend handling one inbound presence Bulk message.
 ///
-/// The runtime dispatcher is the single consumer of the network receive queue.
-/// A wedged presence handler must not stop all future Bulk presence beacons from
-/// being processed while the lower network receiver keeps enqueueing packets.
+/// Bulk has its own dispatcher, but a wedged presence handler must still be
+/// bounded so future Bulk presence beacons continue to drain from the dedicated
+/// Bulk receive queue.
 const PRESENCE_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum time to spend handling one inbound PubSub message.
 const PUBSUB_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -68,15 +68,49 @@ impl DispatchStreamStats {
     }
 }
 
+/// Per-stream receive queue depth counters.
+#[derive(Debug, Default)]
+struct DispatchQueueStats {
+    latest: AtomicU64,
+    max: AtomicU64,
+    capacity: AtomicU64,
+}
+
+/// JSON-friendly snapshot of receive queue depth counters.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DispatchQueueStatsSnapshot {
+    pub latest: u64,
+    pub max: u64,
+    pub capacity: u64,
+}
+
+impl DispatchQueueStats {
+    fn record(&self, depth: usize, capacity: usize) {
+        let depth = usize_to_u64(depth);
+        let capacity = usize_to_u64(capacity);
+        self.latest.store(depth, Ordering::Relaxed);
+        self.max.fetch_max(depth, Ordering::Relaxed);
+        self.capacity.store(capacity, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> DispatchQueueStatsSnapshot {
+        DispatchQueueStatsSnapshot {
+            latest: self.latest.load(Ordering::Relaxed),
+            max: self.max.load(Ordering::Relaxed),
+            capacity: self.capacity.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Dispatcher counters for the inbound gossip receive pipeline.
 #[derive(Debug, Default)]
 pub struct GossipDispatchStats {
     pubsub: DispatchStreamStats,
     membership: DispatchStreamStats,
     bulk: DispatchStreamStats,
-    recv_depth_latest: AtomicU64,
-    recv_depth_max: AtomicU64,
-    recv_capacity_latest: AtomicU64,
+    pubsub_queue: DispatchQueueStats,
+    membership_queue: DispatchQueueStats,
+    bulk_queue: DispatchQueueStats,
 }
 
 /// JSON-friendly snapshot of [`GossipDispatchStats`].
@@ -85,18 +119,24 @@ pub struct GossipDispatchStatsSnapshot {
     pub pubsub: DispatchStreamStatsSnapshot,
     pub membership: DispatchStreamStatsSnapshot,
     pub bulk: DispatchStreamStatsSnapshot,
-    pub recv_depth_latest: u64,
-    pub recv_depth_max: u64,
-    pub recv_capacity_latest: u64,
+    pub recv_depth: DispatchQueueDepthSnapshot,
+}
+
+/// JSON-friendly snapshot of per-stream receive queue depths.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DispatchQueueDepthSnapshot {
+    pub pubsub: DispatchQueueStatsSnapshot,
+    pub membership: DispatchQueueStatsSnapshot,
+    pub bulk: DispatchQueueStatsSnapshot,
 }
 
 impl GossipDispatchStats {
-    fn record_dequeue(&self, depth: usize, capacity: usize) {
-        let depth = usize_to_u64(depth);
-        let capacity = usize_to_u64(capacity);
-        self.recv_depth_latest.store(depth, Ordering::Relaxed);
-        self.recv_depth_max.fetch_max(depth, Ordering::Relaxed);
-        self.recv_capacity_latest.store(capacity, Ordering::Relaxed);
+    fn record_dequeue(&self, stream_type: GossipStreamType, depth: usize, capacity: usize) {
+        match stream_type {
+            GossipStreamType::PubSub => self.pubsub_queue.record(depth, capacity),
+            GossipStreamType::Membership => self.membership_queue.record(depth, capacity),
+            GossipStreamType::Bulk => self.bulk_queue.record(depth, capacity),
+        }
     }
 
     /// Snapshot dispatcher counters.
@@ -106,9 +146,11 @@ impl GossipDispatchStats {
             pubsub: self.pubsub.snapshot(),
             membership: self.membership.snapshot(),
             bulk: self.bulk.snapshot(),
-            recv_depth_latest: self.recv_depth_latest.load(Ordering::Relaxed),
-            recv_depth_max: self.recv_depth_max.load(Ordering::Relaxed),
-            recv_capacity_latest: self.recv_capacity_latest.load(Ordering::Relaxed),
+            recv_depth: DispatchQueueDepthSnapshot {
+                pubsub: self.pubsub_queue.snapshot(),
+                membership: self.membership_queue.snapshot(),
+                bulk: self.bulk_queue.snapshot(),
+            },
         }
     }
 }
@@ -134,7 +176,7 @@ pub struct GossipRuntime {
     pubsub: Arc<PubSubManager>,
     peer_id: PeerId,
     presence: std::sync::Mutex<Option<Arc<PresenceWrapper>>>,
-    dispatcher_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    dispatcher_handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     peer_sync_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     keepalive_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     dispatch_stats: Arc<GossipDispatchStats>,
@@ -147,6 +189,242 @@ impl std::fmt::Debug for GossipRuntime {
             .field("peer_id", &self.peer_id)
             .finish_non_exhaustive()
     }
+}
+
+async fn run_pubsub_dispatcher(
+    network: Arc<NetworkNode>,
+    pubsub: Arc<PubSubManager>,
+    dispatch_stats: Arc<GossipDispatchStats>,
+) {
+    loop {
+        match network.receive_pubsub_message().await {
+            Ok((peer, data)) => {
+                let (recv_depth, recv_capacity) =
+                    network.gossip_recv_queue_depth(GossipStreamType::PubSub);
+                dispatch_stats.record_dequeue(GossipStreamType::PubSub, recv_depth, recv_capacity);
+                dispatch_stats.pubsub.record_received();
+                let bytes = data.len();
+                let started = Instant::now();
+                tracing::debug!(
+                    from = %peer,
+                    bytes,
+                    recv_depth,
+                    recv_capacity,
+                    stream_type = "PubSub",
+                    "[2/6 runtime] dispatching gossip message"
+                );
+                match tokio::time::timeout(
+                    PUBSUB_MESSAGE_HANDLE_TIMEOUT,
+                    pubsub.handle_incoming(peer, data),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let elapsed = started.elapsed();
+                        dispatch_stats.pubsub.record_completed(elapsed);
+                        tracing::debug!(
+                            from = %peer,
+                            bytes,
+                            elapsed_ms = duration_ms(elapsed),
+                            stream_type = "PubSub",
+                            "[2/6 runtime] completed gossip message dispatch"
+                        );
+                    }
+                    Err(_) => {
+                        let elapsed = started.elapsed();
+                        dispatch_stats.pubsub.record_timed_out(elapsed);
+                        tracing::warn!(
+                            from = %peer,
+                            bytes,
+                            elapsed_ms = duration_ms(elapsed),
+                            timeout_secs = PUBSUB_MESSAGE_HANDLE_TIMEOUT.as_secs(),
+                            stream_type = "PubSub",
+                            "Timed out handling gossip message"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("PubSub message receive failed: {}", e);
+                break;
+            }
+        }
+    }
+    tracing::info!("Gossip PubSub dispatcher shut down");
+}
+
+async fn run_membership_dispatcher(
+    network: Arc<NetworkNode>,
+    membership: Arc<HyParViewMembership<NetworkNode>>,
+    dispatch_stats: Arc<GossipDispatchStats>,
+) {
+    loop {
+        match network.receive_membership_message().await {
+            Ok((peer, data)) => {
+                let (recv_depth, recv_capacity) =
+                    network.gossip_recv_queue_depth(GossipStreamType::Membership);
+                dispatch_stats.record_dequeue(
+                    GossipStreamType::Membership,
+                    recv_depth,
+                    recv_capacity,
+                );
+                dispatch_stats.membership.record_received();
+                let bytes = data.len();
+                let started = Instant::now();
+                tracing::debug!(
+                    from = %peer,
+                    bytes,
+                    recv_depth,
+                    recv_capacity,
+                    stream_type = "Membership",
+                    "[2/6 runtime] dispatching gossip message"
+                );
+                match tokio::time::timeout(
+                    MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT,
+                    membership.dispatch_message(peer, &data),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        let elapsed = started.elapsed();
+                        dispatch_stats.membership.record_completed(elapsed);
+                        tracing::debug!(
+                            from = %peer,
+                            bytes,
+                            elapsed_ms = duration_ms(elapsed),
+                            stream_type = "Membership",
+                            "[2/6 runtime] completed gossip message dispatch"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        let elapsed = started.elapsed();
+                        dispatch_stats.membership.record_completed(elapsed);
+                        tracing::debug!(
+                            from = %peer,
+                            bytes,
+                            elapsed_ms = duration_ms(elapsed),
+                            stream_type = "Membership",
+                            "Failed to handle membership message: {e}"
+                        );
+                    }
+                    Err(_) => {
+                        let elapsed = started.elapsed();
+                        dispatch_stats.membership.record_timed_out(elapsed);
+                        tracing::warn!(
+                            from = %peer,
+                            bytes,
+                            elapsed_ms = duration_ms(elapsed),
+                            timeout_secs = MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT.as_secs(),
+                            stream_type = "Membership",
+                            "Timed out handling gossip message"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Membership message receive failed: {}", e);
+                break;
+            }
+        }
+    }
+    tracing::info!("Gossip Membership dispatcher shut down");
+}
+
+async fn run_bulk_dispatcher(
+    network: Arc<NetworkNode>,
+    presence: Option<Arc<PresenceWrapper>>,
+    dispatch_stats: Arc<GossipDispatchStats>,
+) {
+    loop {
+        match network.receive_bulk_message().await {
+            Ok((peer, data)) => {
+                let (recv_depth, recv_capacity) =
+                    network.gossip_recv_queue_depth(GossipStreamType::Bulk);
+                dispatch_stats.record_dequeue(GossipStreamType::Bulk, recv_depth, recv_capacity);
+                dispatch_stats.bulk.record_received();
+                let bytes = data.len();
+                let started = Instant::now();
+                tracing::debug!(
+                    from = %peer,
+                    bytes,
+                    recv_depth,
+                    recv_capacity,
+                    stream_type = "Bulk",
+                    "[2/6 runtime] dispatching gossip message"
+                );
+                if let Some(ref pm) = presence {
+                    match tokio::time::timeout(
+                        PRESENCE_MESSAGE_HANDLE_TIMEOUT,
+                        pm.manager().handle_presence_message(&data),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(source))) => {
+                            let elapsed = started.elapsed();
+                            dispatch_stats.bulk.record_completed(elapsed);
+                            tracing::debug!(
+                                from = %source,
+                                peer = %peer,
+                                bytes,
+                                elapsed_ms = duration_ms(elapsed),
+                                stream_type = "Bulk",
+                                "Handled presence beacon"
+                            );
+                        }
+                        Ok(Ok(None)) => {
+                            let elapsed = started.elapsed();
+                            dispatch_stats.bulk.record_completed(elapsed);
+                            tracing::debug!(
+                                from = %peer,
+                                bytes,
+                                elapsed_ms = duration_ms(elapsed),
+                                stream_type = "Bulk",
+                                "Presence message processed (no source)"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            let elapsed = started.elapsed();
+                            dispatch_stats.bulk.record_completed(elapsed);
+                            tracing::debug!(
+                                from = %peer,
+                                bytes,
+                                elapsed_ms = duration_ms(elapsed),
+                                stream_type = "Bulk",
+                                "Failed to handle presence message: {e}"
+                            );
+                        }
+                        Err(_) => {
+                            let elapsed = started.elapsed();
+                            dispatch_stats.bulk.record_timed_out(elapsed);
+                            tracing::warn!(
+                                from = %peer,
+                                bytes,
+                                elapsed_ms = duration_ms(elapsed),
+                                timeout_secs = PRESENCE_MESSAGE_HANDLE_TIMEOUT.as_secs(),
+                                stream_type = "Bulk",
+                                "Timed out handling gossip message"
+                            );
+                        }
+                    }
+                } else {
+                    let elapsed = started.elapsed();
+                    dispatch_stats.bulk.record_completed(elapsed);
+                    tracing::debug!(
+                        from = %peer,
+                        bytes,
+                        elapsed_ms = duration_ms(elapsed),
+                        stream_type = "Bulk",
+                        "Ignoring Bulk stream (presence not configured)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!("Bulk message receive failed: {}", e);
+                break;
+            }
+        }
+    }
+    tracing::info!("Gossip Bulk dispatcher shut down");
 }
 
 impl GossipRuntime {
@@ -192,7 +470,7 @@ impl GossipRuntime {
             pubsub,
             peer_id,
             presence: std::sync::Mutex::new(None),
-            dispatcher_handle: std::sync::Mutex::new(None),
+            dispatcher_handles: std::sync::Mutex::new(Vec::new()),
             peer_sync_handle: std::sync::Mutex::new(None),
             keepalive_handle: std::sync::Mutex::new(None),
             dispatch_stats: Arc::new(GossipDispatchStats::default()),
@@ -231,8 +509,8 @@ impl GossipRuntime {
 
     /// Set the presence wrapper for Bulk stream dispatch.
     ///
-    /// Must be called before `start()` so that the dispatcher loop can
-    /// route `GossipStreamType::Bulk` messages to the presence manager.
+    /// Must be called before `start()` so that the Bulk dispatcher can route
+    /// `GossipStreamType::Bulk` messages to the presence manager.
     pub fn set_presence(&self, presence: Arc<PresenceWrapper>) {
         if let Ok(mut guard) = self.presence.lock() {
             *guard = Some(presence);
@@ -265,201 +543,21 @@ impl GossipRuntime {
         let presence = self.presence();
         let dispatch_stats = Arc::clone(&self.dispatch_stats);
 
-        let handle = tokio::spawn(async move {
-            loop {
-                match saorsa_gossip_transport::GossipTransport::receive_message(network.as_ref())
-                    .await
-                {
-                    Ok((peer, stream_type, data)) => {
-                        let (recv_depth, recv_capacity) = network.gossip_recv_queue_depth();
-                        dispatch_stats.record_dequeue(recv_depth, recv_capacity);
-
-                        match stream_type {
-                            GossipStreamType::PubSub => {
-                                dispatch_stats.pubsub.record_received();
-                                let bytes = data.len();
-                                let started = Instant::now();
-                                tracing::debug!(
-                                    from = %peer,
-                                    bytes,
-                                    recv_depth,
-                                    recv_capacity,
-                                    stream_type = "PubSub",
-                                    "[2/6 runtime] dispatching gossip message"
-                                );
-                                match tokio::time::timeout(
-                                    PUBSUB_MESSAGE_HANDLE_TIMEOUT,
-                                    pubsub.handle_incoming(peer, data),
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        let elapsed = started.elapsed();
-                                        dispatch_stats.pubsub.record_completed(elapsed);
-                                        tracing::debug!(
-                                            from = %peer,
-                                            bytes,
-                                            elapsed_ms = duration_ms(elapsed),
-                                            stream_type = "PubSub",
-                                            "[2/6 runtime] completed gossip message dispatch"
-                                        );
-                                    }
-                                    Err(_) => {
-                                        let elapsed = started.elapsed();
-                                        dispatch_stats.pubsub.record_timed_out(elapsed);
-                                        tracing::warn!(
-                                            from = %peer,
-                                            bytes,
-                                            elapsed_ms = duration_ms(elapsed),
-                                            timeout_secs = PUBSUB_MESSAGE_HANDLE_TIMEOUT.as_secs(),
-                                            stream_type = "PubSub",
-                                            "Timed out handling gossip message"
-                                        );
-                                    }
-                                }
-                            }
-                            GossipStreamType::Membership => {
-                                dispatch_stats.membership.record_received();
-                                let bytes = data.len();
-                                let started = Instant::now();
-                                tracing::debug!(
-                                    from = %peer,
-                                    bytes,
-                                    recv_depth,
-                                    recv_capacity,
-                                    stream_type = "Membership",
-                                    "[2/6 runtime] dispatching gossip message"
-                                );
-                                match tokio::time::timeout(
-                                    MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT,
-                                    membership.dispatch_message(peer, &data),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(())) => {
-                                        let elapsed = started.elapsed();
-                                        dispatch_stats.membership.record_completed(elapsed);
-                                        tracing::debug!(
-                                            from = %peer,
-                                            bytes,
-                                            elapsed_ms = duration_ms(elapsed),
-                                            stream_type = "Membership",
-                                            "[2/6 runtime] completed gossip message dispatch"
-                                        );
-                                    }
-                                    Ok(Err(e)) => {
-                                        let elapsed = started.elapsed();
-                                        dispatch_stats.membership.record_completed(elapsed);
-                                        tracing::debug!(
-                                            from = %peer,
-                                            bytes,
-                                            elapsed_ms = duration_ms(elapsed),
-                                            stream_type = "Membership",
-                                            "Failed to handle membership message: {e}"
-                                        );
-                                    }
-                                    Err(_) => {
-                                        let elapsed = started.elapsed();
-                                        dispatch_stats.membership.record_timed_out(elapsed);
-                                        tracing::warn!(
-                                            from = %peer,
-                                            bytes,
-                                            elapsed_ms = duration_ms(elapsed),
-                                            timeout_secs = MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT.as_secs(),
-                                            stream_type = "Membership",
-                                            "Timed out handling gossip message"
-                                        );
-                                    }
-                                }
-                            }
-                            GossipStreamType::Bulk => {
-                                dispatch_stats.bulk.record_received();
-                                let bytes = data.len();
-                                let started = Instant::now();
-                                tracing::debug!(
-                                    from = %peer,
-                                    bytes,
-                                    recv_depth,
-                                    recv_capacity,
-                                    stream_type = "Bulk",
-                                    "[2/6 runtime] dispatching gossip message"
-                                );
-                                if let Some(ref pm) = presence {
-                                    match tokio::time::timeout(
-                                        PRESENCE_MESSAGE_HANDLE_TIMEOUT,
-                                        pm.manager().handle_presence_message(&data),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(Some(source))) => {
-                                            let elapsed = started.elapsed();
-                                            dispatch_stats.bulk.record_completed(elapsed);
-                                            tracing::debug!(
-                                                from = %source,
-                                                peer = %peer,
-                                                bytes,
-                                                elapsed_ms = duration_ms(elapsed),
-                                                stream_type = "Bulk",
-                                                "Handled presence beacon"
-                                            );
-                                        }
-                                        Ok(Ok(None)) => {
-                                            let elapsed = started.elapsed();
-                                            dispatch_stats.bulk.record_completed(elapsed);
-                                            tracing::debug!(
-                                                from = %peer,
-                                                bytes,
-                                                elapsed_ms = duration_ms(elapsed),
-                                                stream_type = "Bulk",
-                                                "Presence message processed (no source)"
-                                            );
-                                        }
-                                        Ok(Err(e)) => {
-                                            let elapsed = started.elapsed();
-                                            dispatch_stats.bulk.record_completed(elapsed);
-                                            tracing::debug!(
-                                                from = %peer,
-                                                bytes,
-                                                elapsed_ms = duration_ms(elapsed),
-                                                stream_type = "Bulk",
-                                                "Failed to handle presence message: {e}"
-                                            );
-                                        }
-                                        Err(_) => {
-                                            let elapsed = started.elapsed();
-                                            dispatch_stats.bulk.record_timed_out(elapsed);
-                                            tracing::warn!(
-                                                from = %peer,
-                                                bytes,
-                                                elapsed_ms = duration_ms(elapsed),
-                                                timeout_secs = PRESENCE_MESSAGE_HANDLE_TIMEOUT.as_secs(),
-                                                stream_type = "Bulk",
-                                                "Timed out handling gossip message"
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    let elapsed = started.elapsed();
-                                    dispatch_stats.bulk.record_completed(elapsed);
-                                    tracing::debug!(
-                                        from = %peer,
-                                        bytes,
-                                        elapsed_ms = duration_ms(elapsed),
-                                        stream_type = "Bulk",
-                                        "Ignoring Bulk stream (presence not configured)"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Message receive failed: {}", e);
-                        break;
-                    }
-                }
-            }
-            tracing::info!("Gossip message dispatcher shut down");
-        });
+        let pubsub_handle = tokio::spawn(run_pubsub_dispatcher(
+            Arc::clone(&network),
+            pubsub,
+            Arc::clone(&dispatch_stats),
+        ));
+        let membership_handle = tokio::spawn(run_membership_dispatcher(
+            Arc::clone(&network),
+            membership,
+            Arc::clone(&dispatch_stats),
+        ));
+        let bulk_handle = tokio::spawn(run_bulk_dispatcher(
+            Arc::clone(&network),
+            presence,
+            Arc::clone(&dispatch_stats),
+        ));
 
         // Periodically refresh PlumTree topic peers with current connections.
         // This ensures newly connected peers (discovered via HyParView or
@@ -506,11 +604,15 @@ impl GossipRuntime {
             *guard = Some(keepalive_handle);
         }
 
-        match self.dispatcher_handle.lock() {
-            Ok(mut guard) => *guard = Some(handle),
+        match self.dispatcher_handles.lock() {
+            Ok(mut guard) => {
+                guard.push(pubsub_handle);
+                guard.push(membership_handle);
+                guard.push(bulk_handle);
+            }
             Err(_) => {
                 return Err(crate::error::NetworkError::NodeCreation(
-                    "dispatcher handle lock poisoned".into(),
+                    "dispatcher handles lock poisoned".into(),
                 ));
             }
         }
@@ -535,8 +637,8 @@ impl GossipRuntime {
                 handle.abort();
             }
         }
-        if let Ok(mut guard) = self.dispatcher_handle.lock() {
-            if let Some(handle) = guard.take() {
+        if let Ok(mut guard) = self.dispatcher_handles.lock() {
+            for handle in guard.drain(..) {
                 handle.abort();
             }
         }
@@ -634,5 +736,26 @@ mod tests {
         let result = GossipRuntime::new(config, Arc::new(network), None).await;
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dispatch_stats_record_per_stream_queue_depth() {
+        let stats = GossipDispatchStats::default();
+
+        stats.record_dequeue(GossipStreamType::PubSub, 42, 10_000);
+        stats.record_dequeue(GossipStreamType::Membership, 7, 4_000);
+        stats.record_dequeue(GossipStreamType::Bulk, 3, 4_000);
+        stats.record_dequeue(GossipStreamType::PubSub, 4, 10_000);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.recv_depth.pubsub.latest, 4);
+        assert_eq!(snapshot.recv_depth.pubsub.max, 42);
+        assert_eq!(snapshot.recv_depth.pubsub.capacity, 10_000);
+        assert_eq!(snapshot.recv_depth.membership.latest, 7);
+        assert_eq!(snapshot.recv_depth.membership.max, 7);
+        assert_eq!(snapshot.recv_depth.membership.capacity, 4_000);
+        assert_eq!(snapshot.recv_depth.bulk.latest, 3);
+        assert_eq!(snapshot.recv_depth.bulk.max, 3);
+        assert_eq!(snapshot.recv_depth.bulk.capacity, 4_000);
     }
 }

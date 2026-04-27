@@ -38,6 +38,7 @@ use tracing::{debug, error, info, warn};
 type AntPeerId = ant_quic::PeerId;
 /// Saorsa gossip PeerId type alias
 type GossipPeerId = saorsa_gossip_types::PeerId;
+type GossipPayload = (AntPeerId, Bytes);
 
 /// Default port for x0x nodes (when specified).
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
@@ -54,6 +55,11 @@ pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default stats collection interval.
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Capacity for the PubSub inbound gossip channel.
+const GOSSIP_PUBSUB_RECV_CAPACITY: usize = 10_000;
+/// Capacity for low-volume control-style inbound gossip channels.
+const GOSSIP_CONTROL_RECV_CAPACITY: usize = 4_000;
 
 /// Maximum allowed size for bincode deserialization of untrusted network input.
 ///
@@ -214,6 +220,28 @@ pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
 ///
 /// This wraps ant-quic's Node with x0x-specific functionality
 /// including peer cache management and configuration.
+async fn forward_gossip_payload(
+    tx: &mpsc::Sender<GossipPayload>,
+    peer_id: AntPeerId,
+    stream_type: GossipStreamType,
+    payload: Bytes,
+    channel_name: &'static str,
+) -> Result<(), mpsc::error::SendError<GossipPayload>> {
+    let capacity = tx.capacity();
+    let max_capacity = tx.max_capacity();
+    if capacity.saturating_mul(5) < max_capacity {
+        warn!(
+            available = capacity,
+            max = max_capacity,
+            peer = ?peer_id,
+            stream = ?stream_type,
+            channel = channel_name,
+            "[1/6 network] gossip receive channel >80% full — stream-specific back-pressure active"
+        );
+    }
+    tx.send((peer_id, payload)).await
+}
+
 #[derive(Debug, Clone)]
 pub struct NetworkNode {
     /// ant-quic P2P node (wrapped in `Arc<RwLock>` for shared async access).
@@ -222,10 +250,15 @@ pub struct NetworkNode {
     config: NetworkConfig,
     /// Sender for broadcasting network events.
     event_sender: broadcast::Sender<NetworkEvent>,
-    /// Receiver channel for gossip messages (with stream type parsing).
-    /// Used by GossipTransport::receive_message().
-    recv_tx: mpsc::Sender<(AntPeerId, GossipStreamType, Bytes)>,
-    recv_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, GossipStreamType, Bytes)>>>,
+    /// Receiver channel for PubSub gossip messages.
+    recv_pubsub_tx: mpsc::Sender<GossipPayload>,
+    recv_pubsub_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
+    /// Receiver channel for membership gossip messages.
+    recv_membership_tx: mpsc::Sender<GossipPayload>,
+    recv_membership_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
+    /// Receiver channel for Bulk gossip messages (presence beacons).
+    recv_bulk_tx: mpsc::Sender<GossipPayload>,
+    recv_bulk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<(AntPeerId, Bytes)>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, Bytes)>>>,
@@ -281,29 +314,25 @@ impl NetworkNode {
 
         let peer_id = node.peer_id();
         let (event_sender, _event_receiver) = broadcast::channel(32);
-        // Gossip/PubSub inbound buffer. Every message arriving from every
-        // peer on any stream type funnels through this single mpsc to the
-        // saorsa-gossip-transport consumer. At 128 capacity, a momentary
-        // slowdown in the PlumTree layer (e.g. ML-DSA verification on a
-        // burst, a slow subscriber mpsc fill, briefly-held lock) backs up
-        // `spawn_receiver`'s `recv_tx.send().await` which stops draining
-        // ant-quic's recv queue — freezing ALL inbound traffic for this
-        // node, not just the slow topic. Observed in
-        // `proofs/stress-20260421-v0181/`: two subscribers stalled after
-        // ~1.2 s / ~100 messages while others kept flowing at 11 msg/s.
-        //
-        // 10 000 matches the per-subscription channel capacity in
-        // `PubSubManager::subscribe` so the network-layer buffer is no
-        // longer the smaller link in the chain.
-        let (recv_tx, recv_rx) = mpsc::channel(10_000);
+        // Inbound gossip buffers are split by stream type so PubSub back-pressure
+        // cannot block Bulk presence beacons or Membership/SWIM control traffic.
+        // PubSub keeps the historical 10k capacity to match subscription buffers;
+        // lower-volume control streams use smaller dedicated queues.
+        let (recv_pubsub_tx, recv_pubsub_rx) = mpsc::channel(GOSSIP_PUBSUB_RECV_CAPACITY);
+        let (recv_membership_tx, recv_membership_rx) = mpsc::channel(GOSSIP_CONTROL_RECV_CAPACITY);
+        let (recv_bulk_tx, recv_bulk_rx) = mpsc::channel(GOSSIP_CONTROL_RECV_CAPACITY);
         let (direct_tx, direct_rx) = mpsc::channel(10_000);
 
         let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
             config,
             event_sender,
-            recv_tx,
-            recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
+            recv_pubsub_tx,
+            recv_pubsub_rx: Arc::new(tokio::sync::Mutex::new(recv_pubsub_rx)),
+            recv_membership_tx,
+            recv_membership_rx: Arc::new(tokio::sync::Mutex::new(recv_membership_rx)),
+            recv_bulk_tx,
+            recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             peer_id,
@@ -840,9 +869,21 @@ impl NetworkNode {
     /// dequeued message so diagnostics can distinguish handler stalls from
     /// network receiver back-pressure.
     #[must_use]
-    pub fn gossip_recv_queue_depth(&self) -> (usize, usize) {
-        let max = self.recv_tx.max_capacity();
-        let available = self.recv_tx.capacity();
+    pub fn gossip_recv_queue_depth(&self, stream_type: GossipStreamType) -> (usize, usize) {
+        let (available, max) = match stream_type {
+            GossipStreamType::PubSub => (
+                self.recv_pubsub_tx.capacity(),
+                self.recv_pubsub_tx.max_capacity(),
+            ),
+            GossipStreamType::Membership => (
+                self.recv_membership_tx.capacity(),
+                self.recv_membership_tx.max_capacity(),
+            ),
+            GossipStreamType::Bulk => (
+                self.recv_bulk_tx.capacity(),
+                self.recv_bulk_tx.max_capacity(),
+            ),
+        };
         (max.saturating_sub(available), max)
     }
 
@@ -939,6 +980,33 @@ impl NetworkNode {
         rx.recv().await
     }
 
+    async fn receive_from_gossip_channel(
+        rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
+        stream_name: &'static str,
+    ) -> anyhow::Result<(GossipPeerId, Bytes)> {
+        let mut rx = rx.lock().await;
+        let (ant_peer, data) = rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("{stream_name} receive channel closed"))?;
+        Ok((ant_to_gossip_peer_id(&ant_peer), data))
+    }
+
+    /// Receive the next PubSub gossip message from the dedicated PubSub queue.
+    pub async fn receive_pubsub_message(&self) -> anyhow::Result<(GossipPeerId, Bytes)> {
+        Self::receive_from_gossip_channel(&self.recv_pubsub_rx, "PubSub").await
+    }
+
+    /// Receive the next Membership gossip message from the dedicated Membership queue.
+    pub async fn receive_membership_message(&self) -> anyhow::Result<(GossipPeerId, Bytes)> {
+        Self::receive_from_gossip_channel(&self.recv_membership_rx, "Membership").await
+    }
+
+    /// Receive the next Bulk gossip message from the dedicated Bulk queue.
+    pub async fn receive_bulk_message(&self) -> anyhow::Result<(GossipPeerId, Bytes)> {
+        Self::receive_from_gossip_channel(&self.recv_bulk_rx, "Bulk").await
+    }
+
     /// Spawn background receiver task that parses gossip stream types.
     ///
     /// This task continuously receives messages from ant-quic, parses the
@@ -947,7 +1015,9 @@ impl NetworkNode {
     /// - Gossip transport channel (for 0x00, 0x01, 0x02 gossip messages)
     fn spawn_receiver(&self) {
         let node = Arc::clone(&self.node);
-        let recv_tx = self.recv_tx.clone();
+        let recv_pubsub_tx = self.recv_pubsub_tx.clone();
+        let recv_membership_tx = self.recv_membership_tx.clone();
+        let recv_bulk_tx = self.recv_bulk_tx.clone();
         let direct_tx = self.direct_tx.clone();
 
         tokio::spawn(async move {
@@ -967,8 +1037,8 @@ impl NetworkNode {
                 let recv_result = node_ref.recv().await;
                 // Explicitly drop the read lock guard so we don't hold it
                 // across channel sends — otherwise a backpressured direct_tx
-                // or recv_tx can stall every other caller that wants the same
-                // read lock and masks as a delivery bug.
+                // or stream-specific gossip channel can stall every other caller
+                // that wants the same read lock and masks as a delivery bug.
                 drop(node_guard);
 
                 match recv_result {
@@ -1029,26 +1099,41 @@ impl NetworkNode {
                             peer_id
                         );
 
-                        // Back-pressure visibility: when the buffer is
-                        // >80% full, the downstream PlumTree/PubSub
-                        // pipeline is too slow for this node's inbound
-                        // rate. The send below still awaits (we prefer
-                        // back-pressure over drops), but logging makes
-                        // the condition surface immediately rather than
-                        // being invisible until a subscriber looks sad.
-                        let capacity = recv_tx.capacity();
-                        let max_capacity = recv_tx.max_capacity();
-                        if capacity.saturating_mul(5) < max_capacity {
-                            warn!(
-                                available = capacity,
-                                max = max_capacity,
-                                peer = ?peer_id,
-                                stream = ?stream_type,
-                                "[1/6 network] recv_tx >80% full — PubSub pipeline falling behind; back-pressure is about to stall network recv"
-                            );
-                        }
-                        if let Err(e) = recv_tx.send((peer_id, stream_type, payload)).await {
-                            error!("Failed to forward message: {}", e);
+                        let forward_result = match stream_type {
+                            GossipStreamType::PubSub => {
+                                forward_gossip_payload(
+                                    &recv_pubsub_tx,
+                                    peer_id,
+                                    stream_type,
+                                    payload,
+                                    "recv_pubsub_tx",
+                                )
+                                .await
+                            }
+                            GossipStreamType::Membership => {
+                                forward_gossip_payload(
+                                    &recv_membership_tx,
+                                    peer_id,
+                                    stream_type,
+                                    payload,
+                                    "recv_membership_tx",
+                                )
+                                .await
+                            }
+                            GossipStreamType::Bulk => {
+                                forward_gossip_payload(
+                                    &recv_bulk_tx,
+                                    peer_id,
+                                    stream_type,
+                                    payload,
+                                    "recv_bulk_tx",
+                                )
+                                .await
+                            }
+                        };
+
+                        if let Err(e) = forward_result {
+                            error!("Failed to forward gossip message: {}", e);
                             break;
                         }
                     }
@@ -1285,14 +1370,25 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         saorsa_gossip_transport::GossipStreamType,
         bytes::Bytes,
     )> {
-        let mut recv_rx = self.recv_rx.lock().await;
+        let mut bulk_rx = self.recv_bulk_rx.lock().await;
+        let mut membership_rx = self.recv_membership_rx.lock().await;
+        let mut pubsub_rx = self.recv_pubsub_rx.lock().await;
 
-        let (ant_peer, stream_type, data) = recv_rx
-            .recv()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Receive channel closed"))?;
-
-        Ok((ant_to_gossip_peer_id(&ant_peer), stream_type, data))
+        tokio::select! {
+            biased;
+            msg = bulk_rx.recv() => {
+                let (ant_peer, data) = msg.ok_or_else(|| anyhow::anyhow!("Bulk receive channel closed"))?;
+                Ok((ant_to_gossip_peer_id(&ant_peer), GossipStreamType::Bulk, data))
+            }
+            msg = membership_rx.recv() => {
+                let (ant_peer, data) = msg.ok_or_else(|| anyhow::anyhow!("Membership receive channel closed"))?;
+                Ok((ant_to_gossip_peer_id(&ant_peer), GossipStreamType::Membership, data))
+            }
+            msg = pubsub_rx.recv() => {
+                let (ant_peer, data) = msg.ok_or_else(|| anyhow::anyhow!("PubSub receive channel closed"))?;
+                Ok((ant_to_gossip_peer_id(&ant_peer), GossipStreamType::PubSub, data))
+            }
+        }
     }
 
     fn local_peer_id(&self) -> GossipPeerId {

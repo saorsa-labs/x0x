@@ -12,6 +12,6 @@ pub use pubsub::{
     PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot, SigningContext, Subscription,
 };
 pub use runtime::{
-    DispatchStreamStats, DispatchStreamStatsSnapshot, GossipDispatchStats,
-    GossipDispatchStatsSnapshot, GossipRuntime,
+    DispatchQueueDepthSnapshot, DispatchQueueStatsSnapshot, DispatchStreamStats,
+    DispatchStreamStatsSnapshot, GossipDispatchStats, GossipDispatchStatsSnapshot, GossipRuntime,
 };

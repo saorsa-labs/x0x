@@ -1,0 +1,4 @@
+node-1 peers=3 online=4 beacon_logs=16 handled_logs=52 positive_broadcasts=16
+node-2 peers=3 online=4 beacon_logs=16 handled_logs=54 positive_broadcasts=16
+node-3 peers=3 online=4 beacon_logs=16 handled_logs=54 positive_broadcasts=16
+node-4 peers=3 online=4 beacon_logs=16 handled_logs=38 positive_broadcasts=16

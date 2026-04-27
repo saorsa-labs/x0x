@@ -4,7 +4,80 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [v0.19.4] - 2026-04-27
+## [v0.19.5] - 2026-04-27
+
+Hunt 12c release. Resolves the architectural bottleneck identified in
+the v0.19.4 fleet soak: a slow `pubsub.handle_incoming` no longer
+back-pressures the shared receive queue and bleeds into Membership /
+Bulk dispatch.
+
+### Fixed
+
+- **`gossip`: per-stream isolation in the inbound receive pipeline.**
+  Replaced the single shared `recv_tx` mpsc with three stream-specific
+  channels in `src/network.rs`:
+  - `recv_pubsub_tx` (capacity 10 000, matches subscription buffer)
+  - `recv_membership_tx` (capacity 4 000)
+  - `recv_bulk_tx` (capacity 4 000)
+  The ant-quic receiver now routes each inbound message to the channel
+  for its `GossipStreamType`, with its own `>80% full` back-pressure
+  warning. New per-stream receive methods on `NetworkNode`:
+  `receive_pubsub_message()`, `receive_membership_message()`,
+  `receive_bulk_message()`.
+- **`gossip`: three independent dispatcher tasks.** Replaced the single
+  serial dispatcher loop with `run_pubsub_dispatcher`,
+  `run_membership_dispatcher`, and `run_bulk_dispatcher` in
+  `src/gossip/runtime.rs`. Each pulls only from its own channel and
+  runs the existing per-arm timeout (PubSub 10 s, Membership 5 s,
+  Bulk 5 s). A wedged PubSub handler can no longer block Bulk
+  presence beacons or Membership SWIM ping-acks.
+- **`gossip`: `GossipTransport::receive_message` compatibility kept**
+  via `tokio::select!` over the three channels with `biased; Bulk;
+  Membership; PubSub` ordering, so external trait consumers
+  (saorsa-gossip-runtime, tests in `tests/network_timeout.rs`)
+  continue to work unchanged.
+
+### Changed
+
+- **`/diagnostics/gossip` JSON shape** (BREAKING for monitor scripts).
+  The flat `recv_depth_latest` / `recv_depth_max` /
+  `recv_capacity_latest` fields are removed and replaced with a nested
+  `recv_depth` object keyed by stream type:
+  ```json
+  "recv_depth": {
+    "pubsub":     { "latest": 0, "max": 0, "capacity": 10000 },
+    "membership": { "latest": 0, "max": 0, "capacity": 4000  },
+    "bulk":       { "latest": 0, "max": 0, "capacity": 4000  }
+  }
+  ```
+  Per-stream depth makes the Hunt 12c symptom (PubSub queue saturating
+  while Bulk stays empty) directly visible.
+  Monitor scripts that read the old fields must update — see
+  `tests/e2e_hunt12c_pubsub_load_isolation.sh` for the new shape.
+
+### Added
+
+- **`tests/e2e_hunt12c_pubsub_load_isolation.sh`** — local reproducer
+  that hammers a 4-node mesh with sustained 12 KB PubSub messages at
+  15 msg/s and asserts that presence delivery stays healthy
+  (`online >= N-1`, `bulk.timed_out == 0`, `membership.timed_out == 0`).
+  Pre-Step-2 expectation: presence drift + bulk timeouts. Post-Step-2:
+  clean PASS. Proof: `proofs/hunt12c-pubsub-load-20260427T200041Z/`.
+- **Per-stream queue-depth unit test**
+  `test_dispatch_stats_record_per_stream_queue_depth` pins the new
+  per-stream snapshot shape.
+
+### Validation
+
+- `cargo nextest --workspace --all-features`: 1029 / 1029 pass.
+- `cargo clippy --all-features --all-targets -D warnings`: clean.
+- `tests/e2e_presence_propagation.sh`: 4 nodes, `peers=3 online=4`
+  on every node — `proofs/e2e-presence-propagation-20260427T195512Z/`.
+- `tests/e2e_hunt12c_pubsub_load_isolation.sh`: 4 nodes, 1356 PubSub
+  messages × 12 KB at 15 msg/s over 120 s — every node sustained
+  `online=4`, zero `bulk.timed_out`, zero `membership.timed_out`.
+
+
 
 Hunt 12b release. Fixes the live-fleet regression where `/presence/online`
 collapsed to self-only on most nodes 25–45 minutes after rolling restart.

@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.19.4
+version: 0.19.5
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
