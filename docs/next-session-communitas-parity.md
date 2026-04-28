@@ -1,5 +1,30 @@
 # Next session — Communitas + Apple parity coverage
 
+**Update 2026-04-28 (evening):** A three-stream comprehensive parity
+push kicked off. **Stream 1 (x0x GUI) is complete** — 6 GUI cells
+flipped to ✅ via Chrome harness assertions plus a new
+`POST /upgrade/apply` endpoint, with two cells deferred behind a
+documented design-doc requirement (key export, REST-driven user
+identity opt-in). 19/19 capabilities pass in
+`tests/e2e_gui_chrome.mjs`; proof bundle at
+`proofs/gui-parity-20260428T200557Z/`.
+
+**Streams 2 (Communitas Apple) and 3 (Communitas Dioxus) are out for
+external teams** — see the prompts in the chat handover. They write
+their evidence to their own repos' `PARITY_EVIDENCE.md`; this repo
+merges into `docs/parity-matrix.md` at the end.
+
+The earlier SwiftDaemonFixture work
+(`communitas-apple/Tests/X0xClientTests/Helpers/DaemonFixture.swift`
+plus the three live round-trip suites) closed Apple identity / trust /
+kv. Ticket #5 is closed. Stream 2's job is now the remaining 11 Apple
+🟡s — connect-agent UI, discover, four-word, WS feed, file transfer,
+group policy, group discover, FOAF, status, events SSE — and getting
+`CommunitasGoldenPathsUITests.swift` to actually pass instead of
+skipping (requires wiring accessibility ids into `Sources/Communitas/`).
+Stream 3's job is scaffolding a Dioxus WebDriver harness from scratch
+and closing the 17 Dioxus 🟡s.
+
 **State at hand-off (2026-04-28, end of v0.19.7 session)**
 
 - x0x **v0.19.7** is live on crates.io and GitHub Releases (multi-platform

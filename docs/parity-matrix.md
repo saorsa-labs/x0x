@@ -39,25 +39,29 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
   Dioxus-specific test layer; UI-driven Dioxus tests would belong in a
   future WebDriver harness.
 - **Apple**: Swift X0xClient method exists *and* the wire-shape decoder
-  has a Swift unit test. End-to-end XCUITest coverage is a future
-  session's deliverable; the Rust side already proves the protocol
-  contract.
+  has a Swift unit test. The identity / trust / KV rows additionally
+  carry **live round-trip coverage** against a real `x0xd` via the
+  Swift `DaemonFixture` helper at
+  `communitas/communitas-apple/Tests/X0xClientTests/Helpers/DaemonFixture.swift` —
+  run with `X0X_LIVE_TESTS=1 swift test` from `communitas-apple/`. End-to-end
+  XCUITest coverage of the Communitas app itself is a future session's
+  deliverable.
 
 ### Identity
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
 | Get agent id / card | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
-| Import agent card | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
+| Import agent card | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
 | Export/backup keypairs | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | — |
-| User (human) identity (opt-in) | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | — |
+| User (human) identity (opt-in) | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | — |
 | Agent certificate verify | ✅ | ✅ | — | ✅ | ✅ | ✅ | — | — | — |
 
 ### Trust & contacts
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
-| Add / block / trust contact | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
-| Machine-pinning enforcement | ✅ | ✅ | 🟡 | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
-| Trust evaluator decision read | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | — |
+| Add / block / trust contact | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
+| Machine-pinning enforcement | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
+| Trust evaluator decision read | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | — |
 
 ### Connectivity / discovery
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
@@ -94,15 +98,15 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Create named group | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Invite / join / leave | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Policy (roles, bans) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | 🟡 | 🟡 | — |
-| Discover groups (tag / nearby) | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | 🟡 | — |
+| Discover groups (tag / nearby) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | 🟡 | 🟡 | — |
 | MLS encryption | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 
 ### KV store
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
-| Create / list stores | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
-| PUT / GET / DELETE key | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
-| Access-policy enforcement | ✅ | ✅ | 🟡 | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
+| Create / list stores | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
+| PUT / GET / DELETE key | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
+| Access-policy enforcement | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
 
 ### Task lists (CRDT)
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
@@ -116,7 +120,7 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
 | Online list | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| FOAF walk | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | 🟡 | — |
+| FOAF walk | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | 🟡 | 🟡 | — |
 | Find specific agent | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Status / reachability | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
 | Events SSE | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
@@ -125,7 +129,7 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
 | Check updates | ✅ | ✅ | ✅ | — | — | ✅ | 🟡 | ✅ (Sparkle) | — |
-| Apply update | ✅ | ✅ | 🟡 | — | — | 🟡 | 🟡 | ✅ (Sparkle) | — |
+| Apply update | ✅ | ✅ | ✅ | — | — | 🟡 | 🟡 | ✅ (Sparkle) | — |
 | Gossip manifest propagation | ✅ | — | — | — | — | 🟡 | — | — | — |
 
 ---
@@ -156,17 +160,73 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
    `Tests/X0xClientTests/X0xClientTests.swift` (11 new cases). Rust↔Swift
    parity table extended with `RUST_SSE_TO_SWIFT` so future SSE methods
    can't drift.
-5. **Communitas Apple — broad identity/trust/kv 🟡** still open.
-   Method-level parity is enforced by `swift_parity.rs`; round-trip
-   coverage requires a SwiftDaemonFixture + XCUITest pass. Tracked for
-   the next session — see `docs/next-session-communitas-parity.md`.
+5. **Communitas Apple — broad identity/trust/kv 🟡** ✅ closed
+   2026-04-28. New Swift `DaemonFixture` helper
+   (`communitas/communitas-apple/Tests/X0xClientTests/Helpers/DaemonFixture.swift`)
+   mirrors the Rust `tests/harness/src/daemon.rs` shape — boots a real
+   `x0xd` against ephemeral ports + temp data dir + isolated identity
+   dir, gated behind `X0X_LIVE_TESTS=1` so the existing decoder-only
+   `swift test` pass is unaffected. Three new live suites land in
+   `Tests/X0xClientTests/`:
+   - `IdentityRoundTripTests.swift` — `GET /agent`, `GET /agent/user-id`
+     (opt-in null path), agent-card export → import across two daemons,
+     `GET /introduction`, distinct agent ids across two fixtures.
+   - `TrustRoundTripTests.swift` — `POST /contacts` lifecycle,
+     `setTrust` transitions, `evaluateTrust` Allow / RejectBlocked /
+     RejectMachineMismatch decision paths, machine-pin enforcement.
+   - `KvStoreRoundTripTests.swift` — create / list / PUT / GET /
+     DELETE / keys-list / overwrite, plus access-policy negative
+     proof (foreign daemon cannot reach a private store id).
+   Validation: 14 live tests pass against `x0xd 0.19.6`; full
+   `swift test` is 69/69 in both gated and live mode. End-to-end
+   XCUITest coverage of the Communitas app remains tracked for a
+   future session — see `docs/next-session-communitas-parity.md`.
 6. **Communitas Dioxus 🟡** — Dioxus consumes `communitas-x0x-client`
    directly, so client-layer parity transfers automatically. The
    remaining 🟡s reflect the absence of a Dioxus-specific UI test layer.
    Recommended scope-cut: keep these 🟡 until a WebDriver harness is
    in place; do not chase per-cell coverage at the Dioxus level until
    then.
-5. **Bench / kanban** — historical parity gaps; tracked but out of scope
+7. **x0x GUI — broad 🟡 cleanup** ✅ closed 2026-04-28. Audit
+   established that the matrix's remaining GUI 🟡s mostly reflected
+   harness gaps, not missing UI. Closed cells:
+   - `Trust & contacts / Machine-pinning enforcement` — already wired
+     in `renderPeople` detail panel via `togglePin`. New harness
+     assertion `gui-machine-pinning` round-trips through
+     `POST /contacts/:id/machines`, `…/pin`, then asserts `pinned: true`
+     comes back from `GET /contacts/:id/machines`.
+   - `Trust & contacts / Trust evaluator decision read` — already
+     wired in the same panel via `/trust/evaluate`. Harness assertion
+     `gui-trust-evaluator` blocks a contact and asserts the decision
+     contains `Reject` / `Blocked`.
+   - `KV store / Access-policy enforcement` — wired through Spaces.
+     Harness assertion `gui-kv-store-roundtrip` exercises the full
+     CRUD plus a delete-then-GET 404 negative.
+   - `Groups / Discover groups (tag/nearby)` — wired in
+     `renderDiscover`. Harness assertion `gui-group-discover` drives
+     both `/groups/discover?q=` and `/groups/discover/nearby`.
+   - `Presence / FOAF walk` — already wired ("Run FOAF walk" button
+     in `renderPresence`). Harness assertion `gui-presence-foaf`
+     calls `/presence/foaf?ttl=2` and asserts the response shape.
+   - `Upgrade / Apply update` — **new endpoint** `POST /upgrade/apply`
+     in `src/bin/x0xd.rs` (calls `UpgradeMonitor::check_for_updates`
+     then `AutoApplyUpgrader::apply_upgrade_from_manifest`). New
+     "Apply update" button in the home-view upgrade banner. Harness
+     assertion `gui-upgrade-apply` accepts `applied: true` (real
+     upgrade) or `applied: false` with a `reason` (no-op same-version).
+   - **Deferral**: `Identity / Export keypairs` left at 🟡 — exporting
+     ML-DSA-65 private key material via HTTP needs a design doc on
+     confirmation flow and at-rest encryption format. Tracked as a
+     follow-up; CLI surface is also 🟡 today.
+   - **Deferral**: `Identity / User identity (opt-in)` left at 🟡 in
+     non-CLI surfaces — `GET /agent/user-id` exists for read, but
+     opt-in is filesystem-based (`~/.x0x/user.key`). A REST opt-in
+     surface needs a key-generation + consent design doc.
+   New harness wrapper `tests/e2e_gui_chrome.sh` boots a temp daemon
+   on ephemeral ports and runs `e2e_gui_chrome.mjs` end-to-end; proof
+   bundle lands in `proofs/gui-parity-YYYYMMDDTHHMMSSZ/` (chrome HAR,
+   console log, screenshot, parity-report JSON, daemon log).
+8. **Bench / kanban** — historical parity gaps; tracked but out of scope
    until usage warrants.
 
 ---

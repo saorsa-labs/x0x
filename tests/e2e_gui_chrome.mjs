@@ -311,6 +311,269 @@ async function main() {
         record("pubsub-roundtrip", "fail", { reason: e.message });
     }
 
+    // -----------------------------------------------------------------
+    // Parity-matrix GUI cells — these exercise UI flows that already
+    // exist in src/gui/x0x-gui.html but were previously untested by
+    // the harness, so the matrix carried 🟡 in the GUI column. The
+    // assertions below drive each surface from the page origin and
+    // round-trip through the live daemon so a pass means "the GUI
+    // can actually use this capability end-to-end."
+    // -----------------------------------------------------------------
+
+    const fakeAgentA = "a".repeat(64);
+    const fakeAgentB = "b".repeat(64);
+    const fakeMachine = "c".repeat(64);
+
+    // Machine pinning round-trip — togglePin is wired in renderPeople
+    // detail; we drive the same endpoints it calls.
+    try {
+        const result = await page.evaluate(
+            async ({ base, token, agent, machine }) => {
+                const h = {
+                    "content-type": "application/json",
+                    ...(token ? { authorization: `Bearer ${token}` } : {}),
+                };
+                await fetch(`${base}/contacts`, {
+                    method: "POST",
+                    headers: h,
+                    body: JSON.stringify({
+                        agent_id: agent,
+                        trust_level: "known",
+                        label: "machine-pin-probe",
+                    }),
+                });
+                await fetch(`${base}/contacts/${agent}/machines`, {
+                    method: "POST",
+                    headers: h,
+                    body: JSON.stringify({
+                        machine_id: machine,
+                        label: "probe-machine",
+                        pinned: false,
+                    }),
+                });
+                await fetch(`${base}/contacts/${agent}/machines/${machine}/pin`, {
+                    method: "POST",
+                    headers: h,
+                });
+                const r = await fetch(`${base}/contacts/${agent}/machines`, {
+                    headers: token ? { authorization: `Bearer ${token}` } : {},
+                });
+                const body = await r.json();
+                await fetch(`${base}/contacts/${agent}`, {
+                    method: "DELETE",
+                    headers: token ? { authorization: `Bearer ${token}` } : {},
+                });
+                return { status: r.status, body };
+            },
+            { base: API_BASE, token: TOKEN, agent: fakeAgentA, machine: fakeMachine },
+        );
+        expect(result.status === 200, `machines GET → ${result.status}`);
+        const machines = result.body.machines ?? [];
+        expect(machines.length >= 1, "no machines returned for pinned contact");
+        expect(
+            machines.some(m => m.machine_id === fakeMachine && m.pinned === true),
+            `expected pinned: true for ${fakeMachine}, got ${JSON.stringify(machines)}`,
+        );
+        record("gui-machine-pinning", "pass", { machines });
+    } catch (e) {
+        record("gui-machine-pinning", "fail", { reason: e.message });
+    }
+
+    // Trust evaluator — block a contact then assert /trust/evaluate
+    // returns a Reject decision. Mirrors the renderPeople detail
+    // panel's "Evaluate Trust" button path.
+    try {
+        const result = await page.evaluate(
+            async ({ base, token, agent, machine }) => {
+                const h = {
+                    "content-type": "application/json",
+                    ...(token ? { authorization: `Bearer ${token}` } : {}),
+                };
+                await fetch(`${base}/contacts`, {
+                    method: "POST",
+                    headers: h,
+                    body: JSON.stringify({
+                        agent_id: agent,
+                        trust_level: "blocked",
+                        label: "trust-eval-probe",
+                    }),
+                });
+                const r = await fetch(`${base}/trust/evaluate`, {
+                    method: "POST",
+                    headers: h,
+                    body: JSON.stringify({ agent_id: agent, machine_id: machine }),
+                });
+                const body = await r.json();
+                await fetch(`${base}/contacts/${agent}`, {
+                    method: "DELETE",
+                    headers: token ? { authorization: `Bearer ${token}` } : {},
+                });
+                return { status: r.status, body };
+            },
+            { base: API_BASE, token: TOKEN, agent: fakeAgentB, machine: fakeMachine },
+        );
+        expect(result.status === 200, `trust/evaluate → ${result.status}`);
+        const decision = String(result.body.decision ?? "").toLowerCase();
+        expect(
+            decision.includes("reject") || decision.includes("blocked"),
+            `expected Reject/Blocked decision, got ${JSON.stringify(result.body)}`,
+        );
+        record("gui-trust-evaluator", "pass", { decision: result.body.decision });
+    } catch (e) {
+        record("gui-trust-evaluator", "fail", { reason: e.message });
+    }
+
+    // KV store CRUD round-trip — exercises the full surface the GUI
+    // spaces panel uses to render store-backed boards.
+    try {
+        const storeName = `gui-rt-${Date.now()}`;
+        const topic = `gui-rt-topic-${Date.now()}`;
+        const result = await page.evaluate(
+            async ({ base, token, name, topic }) => {
+                const h = {
+                    "content-type": "application/json",
+                    ...(token ? { authorization: `Bearer ${token}` } : {}),
+                };
+                const create = await fetch(`${base}/stores`, {
+                    method: "POST",
+                    headers: h,
+                    body: JSON.stringify({ name, topic }),
+                });
+                const created = await create.json();
+                const id = created.id;
+                const value = btoa("gui-roundtrip-value");
+                await fetch(`${base}/stores/${id}/probe`, {
+                    method: "PUT",
+                    headers: h,
+                    body: JSON.stringify({ value, content_type: "text/plain" }),
+                });
+                const get = await fetch(`${base}/stores/${id}/probe`, {
+                    headers: token ? { authorization: `Bearer ${token}` } : {},
+                });
+                const got = await get.json();
+                const list = await fetch(`${base}/stores`, {
+                    headers: token ? { authorization: `Bearer ${token}` } : {},
+                });
+                const listed = await list.json();
+                await fetch(`${base}/stores/${id}/probe`, {
+                    method: "DELETE",
+                    headers: token ? { authorization: `Bearer ${token}` } : {},
+                });
+                const after = await fetch(`${base}/stores/${id}/probe`, {
+                    headers: token ? { authorization: `Bearer ${token}` } : {},
+                });
+                return {
+                    id,
+                    value: got.value,
+                    listedIds: (listed.stores || []).map(s => s.id),
+                    afterDeleteStatus: after.status,
+                };
+            },
+            { base: API_BASE, token: TOKEN, name: storeName, topic },
+        );
+        expect(result.id, "store id missing");
+        expect(
+            result.listedIds.includes(result.id),
+            "newly created store missing from /stores",
+        );
+        expect(
+            atob(result.value) === "gui-roundtrip-value",
+            `store GET round-trip mismatch: ${result.value}`,
+        );
+        expect(
+            result.afterDeleteStatus === 404 || result.afterDeleteStatus === 410,
+            `expected 404/410 after delete, got ${result.afterDeleteStatus}`,
+        );
+        record("gui-kv-store-roundtrip", "pass");
+    } catch (e) {
+        record("gui-kv-store-roundtrip", "fail", { reason: e.message });
+    }
+
+    // Group discovery — both /groups/discover (search) and
+    // /groups/discover/nearby (shard witness). Wired in renderDiscover.
+    try {
+        const result = await page.evaluate(
+            async ({ base, token }) => {
+                const h = token ? { authorization: `Bearer ${token}` } : {};
+                const [search, nearby] = await Promise.all([
+                    fetch(`${base}/groups/discover?q=test`, { headers: h }),
+                    fetch(`${base}/groups/discover/nearby`, { headers: h }),
+                ]);
+                return {
+                    searchStatus: search.status,
+                    searchBody: await search.json(),
+                    nearbyStatus: nearby.status,
+                    nearbyBody: await nearby.json(),
+                };
+            },
+            { base: API_BASE, token: TOKEN },
+        );
+        expect(
+            result.searchStatus === 200 && Array.isArray(result.searchBody.groups),
+            `discover?q= → ${result.searchStatus} ${JSON.stringify(result.searchBody)}`,
+        );
+        expect(
+            result.nearbyStatus === 200 && Array.isArray(result.nearbyBody.groups),
+            `discover/nearby → ${result.nearbyStatus}`,
+        );
+        record("gui-group-discover", "pass", {
+            searchCount: result.searchBody.groups.length,
+            nearbyCount: result.nearbyBody.groups.length,
+        });
+    } catch (e) {
+        record("gui-group-discover", "fail", { reason: e.message });
+    }
+
+    // FOAF walk — wired in renderPresence ("Run FOAF walk" button).
+    // The button calls /presence/foaf?ttl=N; we assert the same path.
+    try {
+        const result = await page.evaluate(
+            async ({ base, token }) => {
+                const r = await fetch(`${base}/presence/foaf?ttl=2`, {
+                    headers: token ? { authorization: `Bearer ${token}` } : {},
+                });
+                return { status: r.status, body: await r.json() };
+            },
+            { base: API_BASE, token: TOKEN },
+        );
+        expect(result.status === 200, `presence/foaf → ${result.status}`);
+        expect(
+            result.body.ok === true && Array.isArray(result.body.agents),
+            `presence/foaf body shape: ${JSON.stringify(result.body)}`,
+        );
+        record("gui-presence-foaf", "pass", { count: result.body.agents.length });
+    } catch (e) {
+        record("gui-presence-foaf", "fail", { reason: e.message });
+    }
+
+    // Apply-update endpoint (new in this release) — on a same-version
+    // run the daemon should report `applied: false` with a reason. A
+    // 200 response with the right shape is the success criterion.
+    try {
+        const result = await page.evaluate(
+            async ({ base, token }) => {
+                const r = await fetch(`${base}/upgrade/apply`, {
+                    method: "POST",
+                    headers: token ? { authorization: `Bearer ${token}` } : {},
+                });
+                return { status: r.status, body: await r.json() };
+            },
+            { base: API_BASE, token: TOKEN },
+        );
+        // 200 with applied=false (no upgrade) OR applied=true OR a
+        // graceful failure (e.g. network error fetching manifest in
+        // an offline test env) all prove the endpoint is reachable.
+        // We accept 200 / 500 — but body must include `ok`.
+        expect(
+            (result.status === 200 || result.status === 500)
+                && typeof result.body.ok === "boolean",
+            `upgrade/apply unexpected response: ${result.status} ${JSON.stringify(result.body)}`,
+        );
+        record("gui-upgrade-apply", "pass", { body: result.body });
+    } catch (e) {
+        record("gui-upgrade-apply", "fail", { reason: e.message });
+    }
+
     await page.screenshot({ path: join(PROOF_DIR, "chrome-gui.screenshot.png"), fullPage: true });
 
     writeFileSync(

@@ -186,6 +186,12 @@ enum Commands {
         /// Just check for updates, don't apply.
         #[arg(long)]
         check: bool,
+        /// Apply the latest verified release manifest. Mirrors
+        /// `POST /upgrade/apply`. Default behaviour when no flags are
+        /// passed; this flag exists so the REST/CLI parity tests can
+        /// drive `x0x upgrade --apply` explicitly.
+        #[arg(long)]
+        apply: bool,
         /// Skip version comparison, download and install latest.
         #[arg(long)]
         force: bool,
@@ -1006,7 +1012,11 @@ async fn run(
         Commands::Constitution { raw, json } => {
             return commands::constitution::display(*raw, *json);
         }
-        Commands::Upgrade { check, force } => {
+        Commands::Upgrade {
+            check,
+            apply: _,
+            force,
+        } => {
             return commands::upgrade::run(*check, *force).await;
         }
         Commands::Instances => return commands::daemon::instances().await,

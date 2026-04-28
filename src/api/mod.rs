@@ -898,6 +898,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Check for updates",
         category: "upgrade",
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/upgrade/apply",
+        cli_name: "upgrade --apply",
+        description: "Apply the latest verified release manifest",
+        category: "upgrade",
+    },
     // ── WebSocket ───────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

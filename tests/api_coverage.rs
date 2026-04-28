@@ -162,6 +162,7 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Get, "/constitution/json"),
     // ── Upgrade ─────────────────────────────────────────────────────────
     (Method::Get, "/upgrade"),
+    (Method::Post, "/upgrade/apply"),
     // ── WebSocket ───────────────────────────────────────────────────────
     (Method::Get, "/ws"),
     (Method::Get, "/ws/direct"),

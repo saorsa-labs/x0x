@@ -1625,6 +1625,7 @@ async fn main() -> Result<()> {
         .route("/mls/groups/:id/welcome", post(create_mls_welcome))
         // Upgrade
         .route("/upgrade", get(check_upgrade))
+        .route("/upgrade/apply", post(apply_upgrade))
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
@@ -10956,6 +10957,101 @@ async fn check_upgrade(State(_state): State<Arc<AppState>>) -> impl IntoResponse
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "ok": false, "error": "upgrade check failed" })),
+            )
+        }
+    }
+}
+
+/// POST /upgrade/apply — fetch the latest signed manifest and apply it.
+///
+/// On a same-version run the monitor returns `None` and the handler
+/// reports `applied: false` with `reason: "no upgrade available"`.
+/// When a newer manifest is available the handler downloads the
+/// archive, verifies the SHA-256 + ML-DSA-65 signature, and performs
+/// the atomic binary swap via `apply_upgrade_from_manifest`. On a
+/// successful swap the daemon will be restarted by its supervisor on
+/// next start; the handler returns 200 with the new version.
+///
+/// This is the GUI-driven manual apply path. Background gossip-driven
+/// apply continues to run independently in the daemon's update loop.
+async fn apply_upgrade(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let monitor = match x0x::upgrade::monitor::UpgradeMonitor::new(
+        "saorsa-labs/x0x",
+        "x0xd",
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("upgrade monitor creation failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "upgrade monitor unavailable" })),
+            );
+        }
+    };
+
+    let release = match monitor.check_for_updates().await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "reason": "no upgrade available",
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            );
+        }
+        Err(e) => {
+            tracing::error!("upgrade check failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": "upgrade check failed" })),
+            );
+        }
+    };
+
+    let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd");
+    match upgrader
+        .apply_upgrade_from_manifest(&release.manifest)
+        .await
+    {
+        Ok(x0x::upgrade::UpgradeResult::Success { version }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "applied": true,
+                "version": version,
+                "previous_version": env!("CARGO_PKG_VERSION")
+            })),
+        ),
+        Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "applied": false,
+                "rolled_back": true,
+                "reason": reason
+            })),
+        ),
+        Ok(x0x::upgrade::UpgradeResult::NoUpgrade) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "applied": false,
+                "reason": "no upgrade required"
+            })),
+        ),
+        Err(e) => {
+            tracing::error!("apply upgrade failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "applied": false,
+                    "error": e.to_string()
+                })),
             )
         }
     }

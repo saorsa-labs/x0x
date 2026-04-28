@@ -1598,9 +1598,12 @@ async function pollDash(){
   const banner=document.getElementById('h-upgrade-banner');
   if(banner&&upg&&upg.update_available){
     banner.style.display='block';
-    banner.innerHTML=`<div class="card" style="border-color:var(--gn);background:var(--gn-dim);display:flex;align-items:center;justify-content:space-between">
-      <div><strong style="color:var(--gn)">Update available:</strong> v${esc(upg.latest_version||'?')} (you have v${esc(upg.current_version||'?')})</div>
-      <div style="font-size:12px;color:var(--tx2)">Run: <code style="color:var(--cy)">curl -sfL https://x0x.md | sh</code></div>
+    banner.innerHTML=`<div class="card" id="upg-banner" style="border-color:var(--gn);background:var(--gn-dim);display:flex;align-items:center;justify-content:space-between;gap:var(--sp2)">
+      <div><strong style="color:var(--gn)">Update available:</strong> v${esc(upg.version||upg.latest_version||'?')} (you have v${esc(upg.current_version||'?')})</div>
+      <div style="display:flex;gap:var(--sp2);align-items:center">
+        <button class="pri" id="upg-apply-btn" onclick="applyUpgrade()">Apply update</button>
+        <span style="font-size:11px;color:var(--tx2)">or <code style="color:var(--cy)">curl -sfL https://x0x.md | sh</code></span>
+      </div>
     </div>`;
   }else if(banner){banner.style.display='none'}
 
@@ -1615,6 +1618,23 @@ async function pollDash(){
       <td>${x.nat_type||'—'}</td>
       <td>${x.last_seen?fmtTime(x.last_seen):'—'}</td>
     </tr>`).join('')||'<tr><td colspan="5" style="color:var(--tx3)">No agents discovered</td></tr>';
+  }
+}
+
+async function applyUpgrade(){
+  const btn=document.getElementById('upg-apply-btn');
+  if(btn){btn.disabled=true;btn.textContent='Applying…'}
+  const r=await api('/upgrade/apply',{method:'POST'});
+  if(!r){toast('Apply failed: no response','error');if(btn){btn.disabled=false;btn.textContent='Apply update'}return}
+  if(r.ok&&r.applied){
+    toast('Upgrade applied: v'+(r.version||'?')+'. Daemon will restart.','success');
+    if(btn){btn.disabled=true;btn.textContent='Applied'}
+  }else if(r.ok){
+    toast(r.reason||'No upgrade required','info');
+    if(btn){btn.disabled=false;btn.textContent='Apply update'}
+  }else{
+    toast('Upgrade failed: '+(r.error||r.reason||'unknown'),'error');
+    if(btn){btn.disabled=false;btn.textContent='Apply update'}
   }
 }
 

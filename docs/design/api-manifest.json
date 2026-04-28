@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 122,
+  "endpoint_count": 123,
   "endpoints": [
     {
       "category": "status",
@@ -826,6 +826,13 @@
       "description": "Check for updates",
       "method": "GET",
       "path": "/upgrade"
+    },
+    {
+      "category": "upgrade",
+      "cli_name": "upgrade --apply",
+      "description": "Apply the latest verified release manifest",
+      "method": "POST",
+      "path": "/upgrade/apply"
     },
     {
       "category": "websocket",
