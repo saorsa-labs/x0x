@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.11] - 2026-04-29
+
+Async group-handler discovery fan-out — keeps `POST /groups` and
+`POST /groups/join` sub-second even under sustained pubsub back-pressure.
+
+### Changed
+
+- **`daemon`: spawn discovery-card and chat-announcement publishes off the
+  request hot path.** `create_named_group` did `publish_group_card_to_discovery`
+  (global topic + N tag/name/id shards) and `agent.publish(chat_topic, ...)`
+  inline; `join_group_via_invite` did the chat-announcement publish inline.
+  Each gossip publish goes through the runtime's pubsub stream, which can
+  block tens of seconds when the recv pipeline is saturated (release-manifest
+  floods are the easiest reproducer). Both call sites now `tokio::spawn` the
+  publishes — local state is already committed before they fire, the result
+  was already discarded with `let _ = ...`, and the post-fix latency for
+  `POST /groups` is sub-second on a saturated daemon. No protocol or
+  observable-state change for callers.
+
 ## [v0.19.10] - 2026-04-29
 
 Hotfix for the v0.19.9 group-handler hang under live-fleet back-pressure.

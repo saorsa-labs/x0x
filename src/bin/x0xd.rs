@@ -6589,6 +6589,14 @@ async fn create_named_group(
 
             // P0-1: If the group is discoverable, publish its card to the global
             // discovery topic so other daemons find it without manual import.
+            //
+            // The discovery-card fan-out is a best-effort gossip publish to
+            // the global topic plus N tag/name/id shards. Each publish goes
+            // through the gossip runtime, which can block tens of seconds
+            // under sustained pubsub back-pressure (e.g. release-manifest
+            // floods). Spawning the fan-out keeps `POST /groups` sub-second
+            // even on a saturated daemon — local state is already committed
+            // so the group is fully created from the caller's perspective.
             if info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden {
                 match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
                     Ok(Some(card)) => {
@@ -6597,7 +6605,15 @@ async fn create_named_group(
                         cache.insert(group_id_hex.clone(), card.clone());
                         cache.insert(stable_group_id, card);
                         drop(cache);
-                        publish_group_card_to_discovery(&state, &group_id_hex).await;
+                        let state_for_card = Arc::clone(&state);
+                        let group_id_for_card = group_id_hex.clone();
+                        tokio::spawn(async move {
+                            publish_group_card_to_discovery(
+                                state_for_card.as_ref(),
+                                &group_id_for_card,
+                            )
+                            .await;
+                        });
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -6606,7 +6622,11 @@ async fn create_named_group(
                 }
             }
 
-            // Announce creation on the chat topic
+            // Announce creation on the chat topic — fire-and-forget. The
+            // response did not depend on this completing pre-fix either
+            // (the result was already discarded with `let _ = ...`); moving
+            // it off the request task keeps the handler unblocked when the
+            // gossip publish path is slow.
             let agent_hex = hex::encode(agent_id.as_bytes());
             let display = info
                 .display_names
@@ -6624,10 +6644,18 @@ async fn create_named_group(
                     .unwrap_or_default()
                     .as_secs(),
             });
-            let _ = state
-                .agent
-                .publish(&chat_topic, announcement.to_string().into_bytes())
-                .await;
+            let state_for_chat = Arc::clone(&state);
+            let chat_topic_for_chat = chat_topic.clone();
+            let announcement_bytes = announcement.to_string().into_bytes();
+            tokio::spawn(async move {
+                if let Err(e) = state_for_chat
+                    .agent
+                    .publish(&chat_topic_for_chat, announcement_bytes)
+                    .await
+                {
+                    tracing::debug!(topic = %chat_topic_for_chat, "chat-create publish failed: {e}");
+                }
+            });
 
             (
                 StatusCode::CREATED,
@@ -7253,7 +7281,10 @@ async fn join_group_via_invite(
             save_named_groups(&state).await;
             ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
 
-            // Announce join on the chat topic so the creator sees us
+            // Announce join on the chat topic so the creator sees us —
+            // fire-and-forget. The result was already discarded pre-fix,
+            // and spawning keeps the handler responsive when the gossip
+            // publish path is slow under back-pressure.
             let agent_hex = joiner_hex;
             let display = info
                 .display_names
@@ -7272,10 +7303,18 @@ async fn join_group_via_invite(
                     .unwrap_or_default()
                     .as_secs(),
             });
-            let _ = state
-                .agent
-                .publish(&chat_topic, announcement.to_string().into_bytes())
-                .await;
+            let state_for_join = Arc::clone(&state);
+            let chat_topic_for_join = chat_topic.clone();
+            let announcement_bytes = announcement.to_string().into_bytes();
+            tokio::spawn(async move {
+                if let Err(e) = state_for_join
+                    .agent
+                    .publish(&chat_topic_for_join, announcement_bytes)
+                    .await
+                {
+                    tracing::debug!(topic = %chat_topic_for_join, "join announcement publish failed: {e}");
+                }
+            });
 
             (
                 StatusCode::OK,
