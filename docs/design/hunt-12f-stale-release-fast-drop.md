@@ -53,17 +53,37 @@ Recent NYC topic counts over 3 minutes after the failed v0.19.12 run:
  96 x0x.identity.announce.v2
 ```
 
-## Fix for v0.19.13
+## Fixes
 
-### 12f.1 — Fast-drop stale release manifests before signature verification
+### 12f.1 — Fast-drop stale release manifests before signature verification (v0.19.13)
 
 Parse the signed manifest JSON to read the version immediately after length-prefix decode. If `manifest.version <= x0x::VERSION`, return without ML-DSA verification, timestamp validation, rebroadcast, or upgrade apply. Signature verification remains mandatory before acting on any newer manifest.
 
 This preserves the security invariant: unverified stale manifests are ignored, never applied and never rebroadcast.
 
-### 12f.2 — Reduce default discoverable group-card republish cadence
+### 12f.2 — Reduce default discoverable group-card republish cadence (v0.19.13)
 
 Increase the default periodic group-card republish interval from 15 s to 300 s. Group creation/join still publishes immediately on the state-changing path; the periodic loop is only an anti-entropy safety net for late joiners. This reduces fleet PubSub background traffic when test groups accumulate.
+
+### 12f.3 — Delay best-effort group fan-out behind first user messages (v0.19.14)
+
+v0.19.13 improved the live-fleet result from **0 / 24** to **17 / 24**. The
+remaining misses were not permanent loss: manual polling minutes later showed
+the message cached on every failed joiner. The problem had shifted from
+"dropped" to "delayed beyond the 5 s cross-region grace window".
+
+The remaining delay aligned with group create/join background fan-out:
+
+- creator `POST /groups` spawned discovery-card fan-out to the global topic and
+  shard topics immediately;
+- creator `POST /groups` spawned a chat `created` announcement immediately;
+- joiner `POST /groups/join` spawned a chat `joined` announcement immediately;
+- then the harness published the first public message and polled 5 s later.
+
+Those discovery/chat publishes are best-effort anti-entropy. They do not need
+to precede the first user message. v0.19.14 delays them by 8 s while keeping
+local group state and both required listeners installed before the HTTP
+response returns.
 
 ## Validation plan
 
@@ -73,10 +93,10 @@ Increase the default periodic group-card republish interval from 15 s to 300 s. 
    - `cargo nextest run --all-features --workspace`
    - `bash tests/e2e_first_message_after_join.sh`
    - `bash tests/e2e_comprehensive.sh`
-2. Release and deploy v0.19.13.
+2. Release and deploy v0.19.14.
 3. Clean up accumulated `xreg-*` test groups on the fleet (test artefacts, not product state).
 4. Re-run `/tmp/x0x-cross-region-first-msg.sh`; target remains 24 / 24.
 
-## Follow-up if v0.19.13 is still insufficient
+## Follow-up if v0.19.14 is still insufficient
 
-If PubSub remains saturated after stale-release fast-drop and test-group cleanup, the next mitigation is a real PubSub admission control path for known low-priority topics (`x0x/release`, discovery anti-entropy, identity anti-entropy), preferably before subscriber-channel enqueue. That likely belongs in a separate Hunt because it touches topic prioritisation rather than release-manifest policy.
+If PubSub remains saturated or first-message latency remains above the 5 s grace window after stale-release fast-drop, group fan-out delay, and test-group cleanup, the next mitigation is a real PubSub admission control path for known low-priority topics (`x0x/release`, discovery anti-entropy, identity anti-entropy), preferably before subscriber-channel enqueue. That likely belongs in a separate Hunt because it touches topic prioritisation rather than release-manifest policy.

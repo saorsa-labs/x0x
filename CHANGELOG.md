@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.14] - 2026-04-29
+
+Hunt 12f final follow-up — keeps first public messages ahead of best-effort
+named-group discovery/chat fan-out during live-fleet cross-region joins.
+
+### Changed
+
+- **`daemon`: delay best-effort group discovery-card and chat-announcement
+  publishes by 8 s after group create/join.** The local group state and
+  required metadata/public-message listeners are still installed before the
+  HTTP response returns, but non-critical fan-out now yields to the first
+  user message. This prevents the cross-region acceptance harness from
+  enqueueing discovery/card/chat anti-entropy ahead of the very first public
+  message it is trying to validate.
+
 ## [v0.19.13] - 2026-04-29
 
 Hunt 12f follow-up — drains stale release manifests faster on already-wedged

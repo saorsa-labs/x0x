@@ -199,6 +199,8 @@ struct DaemonConfig {
 /// Every x0x node uses the same well-known port by default.
 pub const DEFAULT_QUIC_PORT: u16 = 5483;
 
+const GROUP_BACKGROUND_PUBLISH_DELAY: Duration = Duration::from_secs(8);
+
 fn default_bootstrap_peers() -> Vec<SocketAddr> {
     x0x::network::DEFAULT_BOOTSTRAP_PEERS
         .iter()
@@ -6738,6 +6740,7 @@ async fn create_named_group(
                         let state_for_card = Arc::clone(&state);
                         let group_id_for_card = group_id_hex.clone();
                         tokio::spawn(async move {
+                            tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
                             publish_group_card_to_discovery(
                                 state_for_card.as_ref(),
                                 &group_id_for_card,
@@ -6778,6 +6781,7 @@ async fn create_named_group(
             let chat_topic_for_chat = chat_topic.clone();
             let announcement_bytes = announcement.to_string().into_bytes();
             tokio::spawn(async move {
+                tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
                 if let Err(e) = state_for_chat
                     .agent
                     .publish(&chat_topic_for_chat, announcement_bytes)
@@ -7437,6 +7441,7 @@ async fn join_group_via_invite(
             let chat_topic_for_join = chat_topic.clone();
             let announcement_bytes = announcement.to_string().into_bytes();
             tokio::spawn(async move {
+                tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
                 if let Err(e) = state_for_join
                     .agent
                     .publish(&chat_topic_for_join, announcement_bytes)
