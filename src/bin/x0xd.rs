@@ -7000,6 +7000,16 @@ async fn cache_public_message(state: &AppState, msg: x0x::groups::GroupPublicMes
 
 /// Spawn a listener on `x0x.groups.public.{group_id}`. Idempotent — a
 /// duplicate call for the same group_id is a no-op.
+///
+/// The pubsub subscribe is performed *inside* the spawned task so the
+/// caller returns immediately, matching the pattern in
+/// `ensure_named_group_metadata_listener`. Awaiting `subscribe` inline
+/// would block the calling request handler under gossip back-pressure
+/// (the recv pipeline can saturate at high throughput), which produces
+/// the symptom of `POST /groups`/`/groups/join`/`/groups/cards/import`
+/// hanging until the client times out. Spawning shifts the subscribe
+/// off the request path while still ensuring the listener is registered
+/// promptly afterwards.
 async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     {
         let tasks = state.public_message_tasks.read().await;
@@ -7008,17 +7018,19 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
         }
     }
     let topic = x0x::groups::public_topic_for(&group_id);
-    let mut sub = match state.agent.subscribe(&topic).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(topic = %topic, "E: failed to subscribe to public chat: {e}");
-            return;
-        }
-    };
     let state_for_listener = Arc::clone(&state);
     let group_id_for_listener = group_id.clone();
+    let topic_for_log = topic.clone();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
     let handle = tokio::spawn(async move {
+        let mut sub = match state_for_listener.agent.subscribe(&topic_for_log).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(topic = %topic_for_log, "E: failed to subscribe to public chat: {e}");
+                return;
+            }
+        };
+        tracing::info!(topic = %topic_for_log, "E: public-message listener subscribed");
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
@@ -7076,7 +7088,6 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
         .write()
         .await
         .insert(group_id, handle);
-    tracing::info!(topic = %topic, "E: public-message listener subscribed");
 }
 
 /// POST /groups/:id/invite — generate an invite link (body optional).

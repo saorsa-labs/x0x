@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.10] - 2026-04-29
+
+Hotfix for the v0.19.9 group-handler hang under live-fleet back-pressure.
+
+### Fixed
+
+- **`daemon`: subscribe inside the spawned listener task, not the caller.**
+  v0.19.9 added `spawn_public_message_listener` to the request hot path of
+  `POST /groups`, `POST /groups/join`, and `POST /groups/cards/import`. The
+  function awaited `state.agent.subscribe(&topic).await` *inline* in the
+  caller's task; under VPS-fleet pubsub back-pressure (`recv_pubsub_tx` at
+  capacity, gossip handler timing out at 10 s), subscribe could take
+  10 s+, hanging the request handler past the client's curl timeout. The
+  spawn now wraps subscribe inside the same `tokio::spawn` that owns the
+  receive loop, mirroring the `ensure_named_group_metadata_listener`
+  pattern that has shipped without incident since the original group code
+  landed. Local regression suite still 20/20; live VPS POST latency back
+  to sub-second.
+
 ## [v0.19.9] - 2026-04-29
 
 Fixes communitas#11 — first-message-after-join silently dropped.
