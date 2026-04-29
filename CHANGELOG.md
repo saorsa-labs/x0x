@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.9] - 2026-04-29
+
+Fixes communitas#11 — first-message-after-join silently dropped.
+
+### Fixed
+
+- **`daemon`: subscribe to public-message topic at every group-insert site.**
+  `spawn_public_message_listener` (subscribes to
+  `x0x.groups.public.<stable_id>`) was only invoked from
+  `POST /groups/:id/send` (sender-side pre-subscribe) and
+  `GET /groups/:id/messages` (poll-triggered). `create_named_group`,
+  `join_group_via_invite`, `import_group_card`, and the daemon-startup
+  persisted-load path only spawned the metadata listener. While a member
+  was unsubscribed, Plumtree-routed first messages were silently dropped
+  at their pubsub layer; Plumtree cannot backfill messages on a topic
+  that had no subscriber at receive time, so the loss was permanent.
+  A new helper `ensure_named_group_listeners` now spawns both the
+  metadata listener and the public-message listener (gated on
+  `confidentiality != MlsEncrypted`) at every group-insertion site.
+  Pre-fix repro: 0/12 first-message deliveries; post-fix: 25/25 across
+  0/100/500/2000/5000 ms join→send delays. Permanent regression test:
+  `tests/e2e_first_message_after_join.sh` (20/20 pass).
+
 ## [v0.19.5] - 2026-04-27
 
 Hunt 12c release. Resolves the architectural bottleneck identified in
