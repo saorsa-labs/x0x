@@ -1290,7 +1290,7 @@ async fn main() -> Result<()> {
             .map(|(id, _)| id.clone())
             .collect()
     };
-    let republish_interval_secs = config.group_card_republish_interval_secs.unwrap_or(15);
+    let republish_interval_secs = config.group_card_republish_interval_secs.unwrap_or(300);
     if republish_interval_secs > 0 {
         let state_for_republish = Arc::clone(&state);
         tokio::spawn(async move {
@@ -2603,12 +2603,6 @@ async fn run_gossip_update_listener(
             }
         };
 
-        // Stage 1: verify manifest signature
-        if let Err(e) = verify_manifest_signature(manifest_json, sig) {
-            tracing::warn!(error = %e, "Release manifest signature verification failed");
-            continue;
-        }
-
         let manifest: ReleaseManifest = match serde_json::from_slice(manifest_json) {
             Ok(m) => m,
             Err(e) => {
@@ -2616,6 +2610,24 @@ async fn run_gossip_update_listener(
                 continue;
             }
         };
+
+        // Fast-drop stale release-train manifests before ML-DSA verification.
+        // For versions at or below our own, we will neither rebroadcast nor apply
+        // the manifest, so signature work only slows the release-topic drain.
+        if !is_newer(&manifest.version, x0x::VERSION) {
+            tracing::debug!(
+                version = %manifest.version,
+                "Already on v{} or newer, skipping verification and rebroadcast",
+                manifest.version
+            );
+            continue;
+        }
+
+        // Stage 1: verify manifest signature before trusting any newer release.
+        if let Err(e) = verify_manifest_signature(manifest_json, sig) {
+            tracing::warn!(error = %e, "Release manifest signature verification failed");
+            continue;
+        }
 
         // Stage 2: reject replayed manifests that have aged past the policy window.
         // This prevents an attacker from replaying a legitimately signed but

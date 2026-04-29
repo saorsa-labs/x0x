@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.13] - 2026-04-29
+
+Hunt 12f follow-up — drains stale release manifests faster on already-wedged
+fleets and reduces background group-discovery anti-entropy pressure.
+
+### Fixed
+
+- **`daemon`: fast-drop stale release manifests before ML-DSA verification.**
+  The v0.19.12 listener skipped rebroadcast for versions at or below the
+  local daemon version, but only after decoding, parsing, and verifying the
+  release signature. On the saturated fleet, thousands of queued old
+  manifests still kept the release subscriber from draining fast enough. The
+  listener now parses the manifest version immediately after length-prefix
+  decode and ignores stale versions before signature verification. Newer
+  manifests still require signature verification before any rebroadcast or
+  apply path.
+
+### Changed
+
+- **`daemon`: reduce the default discoverable group-card republish cadence
+  from 15 s to 300 s.** Group create/join/import paths still publish cards
+  immediately; the periodic loop is an anti-entropy safety net, not a hot
+  path. The longer default prevents accumulated public test groups from
+  amplifying PubSub load during fleet validation.
+
 ## [v0.19.12] - 2026-04-29
 
 Hunt 12e release-manifest flood mitigation — stops stale `x0x/release`
