@@ -52,7 +52,7 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 |---|---|---|---|---|---|---|---|---|---|
 | Get agent id / card | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Import agent card | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| Export/backup keypairs | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | — |
+| Export/backup keypairs | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | — |
 | User (human) identity (opt-in) | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | ✅ | — |
 | Agent certificate verify | ✅ | ✅ | — | ✅ | ✅ | ✅ | — | — | — |
 
@@ -66,14 +66,14 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 ### Connectivity / discovery
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
-| Connect to agent (direct / coordinated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
+| Connect to agent (direct / coordinated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Probe peer liveness (**0.27.2 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
 | Connection health snapshot (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
 | Peer lifecycle subscription (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
-| Discover agents (cache / FOAF) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
+| Discover agents (cache / FOAF) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | `GET /diagnostics/connectivity` | ✅ | ✅ | ✅ | — | — | ✅ | — | — | — |
 | `GET /diagnostics/gossip` (this release) | ✅ | ✅ | ✅ | — | — | ✅ | — | — | — |
-| Four-word network bootstrap | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
+| Four-word network bootstrap | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 
 ### Messaging — pub/sub
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
@@ -81,7 +81,7 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Publish | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Subscribe | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Unsubscribe | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| WebSocket live feed | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
+| WebSocket live feed | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 
 ### Messaging — direct (DM-over-gossip)
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
@@ -90,15 +90,15 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Receive direct (annotated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Epidemic rebroadcast on caps topic | ✅ | — | — | — | — | ✅ | — | — | — |
 | Send + receive-ACK (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
-| File transfer (offer/accept) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 | — |
+| File transfer (offer/accept) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ✅ | — |
 
 ### Groups
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
 | Create named group | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Invite / join / leave | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| Policy (roles, bans) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 | — |
-| Discover groups (tag / nearby) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 | — |
+| Policy (roles, bans) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ✅ | — |
+| Discover groups (tag / nearby) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ✅ | — |
 | MLS encryption | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 
 ### KV store
@@ -120,10 +120,10 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
 | Online list | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| FOAF walk | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 | — |
+| FOAF walk | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ✅ | — |
 | Find specific agent | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| Status / reachability | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
-| Events SSE | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
+| Status / reachability | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| Events SSE | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 
 ### Upgrade / self-update
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
@@ -266,8 +266,45 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
    apply paths and defers the binary-replacement restart so the HTTP
    response can flush; `src/upgrade/apply.rs` exposes
    `with_restart_on_success(false)` + `restart_current_binary()`.
-9. **Bench / kanban** — historical parity gaps; tracked but out of scope
-   until usage warrants.
+9. **Communitas Apple — broad 🟡 cleanup** ✅ closed 2026-04-29 by
+   the parallel Apple stream. All 11 remaining Apple-column 🟡s
+   flipped via accessibility-id-wired UI surfaces in
+   `Sources/Communitas/Views/` plus 6 new live round-trip suites in
+   `communitas-apple/Tests/X0xClientTests/` driven through the
+   existing `DaemonFixture` (boots a real `x0xd` on ephemeral
+   ports, gated behind `X0X_LIVE_TESTS=1`). XCUITest target promoted
+   from 5 SKIP-prone golden paths to 16 UI-surface smoke methods.
+   Closed Apple cells:
+   - Identity: Export keypairs (new `IdentityBackupExporter` in
+     `Sources/X0xClient/IdentityBackup.swift` reads `agent.key`,
+     `machine.key`, optional `user.key`/`agent.cert`/`agent_kem.key`
+     into a confirmation-gated NSSavePanel JSON bundle — local-only,
+     does not bridge through REST so the cross-surface deferral
+     stands)
+   - Connectivity: Connect to agent, Discover agents, Four-word
+     network bootstrap (the four-word resolver shells out to the
+     `x0x` CLI rather than reimplementing the encoder dictionary)
+   - Pub/sub: WebSocket live feed
+   - Direct: File transfer (wire-shape contract — byte-level
+     two-daemon transfer covered by `tests/e2e_live_network.sh`
+     since `DaemonFixture` boots with empty `bootstrap_peers`)
+   - Groups: Policy (roles, bans), Discover (tag/nearby)
+   - Presence: FOAF walk, Status/reachability, Events SSE
+   Plus a wire-shape fix: `NamedGroupMember.updatedAt` changed
+   from `UInt64` to `UInt64?` to match the daemon's public-roster
+   shape (admin-scope endpoint emits `updated_at`; public roster
+   omits it). The Apple-column ✅ for "Export keypairs" reflects
+   the local Swift backup helper; GUI / x0x-client / Dioxus stay
+   🟡 deferred behind ticket #7's REST design-doc requirement.
+   Validation: `XCUITEST_SKIP=1 swift test` → 87/87 (gated mode);
+   `XCUITEST_SKIP=1 X0X_LIVE_TESTS=1 X0XD_BIN=… X0X_BIN=… swift
+   test` → 87/87 (live, 3.5 s). Proof bundle:
+   `communitas-apple/proofs/apple-parity-20260428/{swift-test-gated,
+   swift-test-live,run}.{log,txt}`. XCUITest execution under an
+   `xcodebuild`-generated host-app project remains tracked in
+   `docs/next-session-communitas-parity.md`.
+10. **Bench / kanban** — historical parity gaps; tracked but out of scope
+    until usage warrants.
 
 ---
 

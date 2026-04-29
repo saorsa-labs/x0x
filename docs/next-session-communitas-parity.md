@@ -1,29 +1,49 @@
 # Next session — Communitas + Apple parity coverage
 
-**Update 2026-04-28 (evening):** A three-stream comprehensive parity
-push kicked off. **Stream 1 (x0x GUI) is complete** — 6 GUI cells
-flipped to ✅ via Chrome harness assertions plus a new
-`POST /upgrade/apply` endpoint, with two cells deferred behind a
-documented design-doc requirement (key export, REST-driven user
-identity opt-in). 19/19 capabilities pass in
-`tests/e2e_gui_chrome.mjs`; proof bundle at
-`proofs/gui-parity-20260428T200557Z/`.
+**Update 2026-04-29:** All three streams of the comprehensive parity
+push are complete. **For the three target GUI surfaces (x0x embedded
+HTML, Communitas Apple, Communitas Dioxus) the matrix now carries no
+🟡 cells beyond two documented design-doc deferrals.**
 
-**Streams 2 (Communitas Apple) and 3 (Communitas Dioxus) are out for
-external teams** — see the prompts in the chat handover. They write
-their evidence to their own repos' `PARITY_EVIDENCE.md`; this repo
-merges into `docs/parity-matrix.md` at the end.
+- **Stream 1 (x0x GUI)** — 6 cells closed via Chrome harness
+  assertions + new `POST /upgrade/apply` endpoint. 19/19 in
+  `tests/e2e_gui_chrome.mjs`. (Commit `41e10d9` + Stream 3's
+  follow-up correctness fixes in `3dcde61`.)
+- **Stream 2 (Communitas Apple)** — all 11 Apple 🟡s closed:
+  6 new live round-trip suites in `Tests/X0xClientTests/`,
+  XCUITest target promoted from 5 SKIP-prone golden paths to 16
+  UI-surface smoke methods, accessibility ids wired through
+  `Sources/Communitas/Views/`. Local-only `IdentityBackupExporter`
+  closes the Apple Export-keypairs cell without bridging through
+  REST. 87/87 swift test in both gated and live mode.
+- **Stream 3 (Communitas Dioxus)** — 15 cells closed via new
+  `tests/e2e/` scaffold using the `x0x-test-harness::DaemonFixture`
+  Rust crate as a dev-dep + a feature-gated Dioxus headless driver
+  (`COMMUNITAS_TEST_MODE=1`). 17/17 in `just e2e`. Stream 3 also
+  caught + fixed a real correctness bug in Stream 1's `apply_upgrade`
+  endpoint (it killed the daemon mid-response before HTTP flush) and
+  added Mutex serialization across the three apply paths.
 
-The earlier SwiftDaemonFixture work
-(`communitas-apple/Tests/X0xClientTests/Helpers/DaemonFixture.swift`
-plus the three live round-trip suites) closed Apple identity / trust /
-kv. Ticket #5 is closed. Stream 2's job is now the remaining 11 Apple
-🟡s — connect-agent UI, discover, four-word, WS feed, file transfer,
-group policy, group discover, FOAF, status, events SSE — and getting
-`CommunitasGoldenPathsUITests.swift` to actually pass instead of
-skipping (requires wiring accessibility ids into `Sources/Communitas/`).
-Stream 3's job is scaffolding a Dioxus WebDriver harness from scratch
-and closing the 17 Dioxus 🟡s.
+**Remaining work** is now narrow:
+1. **XCUITest under `xcodebuild`** — `Package.swift` alone does not
+   generate an Xcode project with a host app. Generating
+   `.xcodeproj` / signing the host app is a future session task
+   (the package-host smoke methods compile + skip cleanly today).
+2. **Two cross-surface deferrals** (per matrix tickets #7 and #9):
+   - Identity / Export keypairs — needs a private-key-handling
+     design doc before any of GUI / x0x-client / Dioxus exposes
+     it. Apple closed via local Swift helper (no REST bridge).
+   - Identity / User identity opt-in (non-CLI surfaces) — needs a
+     REST opt-in / consent design doc. Currently filesystem-only
+     (`~/.x0x/user.key`).
+3. **Py + Node bindings columns** — they are retired (daemon-only
+   outside Rust as of 2026-04-26) but the matrix still grades
+   them as 🟡 in places. A doc-only sweep should change those to
+   `—` everywhere.
+4. **`communitas-x0x-client` (Rust)** has a few residual 🟡s
+   (typed `apply_upgrade`, gossip manifest propagation, trust
+   evaluator round-trip) — these are not target GUI surfaces and
+   are tracked as smaller follow-ups in their respective tickets.
 
 **State at hand-off (2026-04-28, end of v0.19.7 session)**
 
