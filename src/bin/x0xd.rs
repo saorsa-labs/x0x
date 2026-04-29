@@ -1356,18 +1356,23 @@ async fn main() -> Result<()> {
         }
     });
 
+    let self_published_release_manifests =
+        Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+
     // Gossip-based release subscription (primary update mechanism)
     if config.update.enabled && config.update.gossip_updates {
         let update_config = config.update.clone();
         let agent_for_gossip = Arc::clone(&state.agent);
         let data_dir = config.data_dir.clone();
         let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
+        let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
         tokio::spawn(async move {
             run_gossip_update_listener(
                 agent_for_gossip,
                 update_config,
                 data_dir,
                 upgrade_apply_lock,
+                self_published_for_gossip,
             )
             .await;
         });
@@ -1380,12 +1385,14 @@ async fn main() -> Result<()> {
         let agent_for_broadcast = Arc::clone(&state.agent);
         let update_config = config.update.clone();
         let data_dir_for_broadcast = config.data_dir.clone();
+        let self_published_for_broadcast = Arc::clone(&self_published_release_manifests);
         tokio::spawn(async move {
             broadcast_current_manifest(
                 &agent_for_broadcast,
                 &update_config.repo,
                 update_config.include_prereleases,
                 &data_dir_for_broadcast,
+                self_published_for_broadcast,
             )
             .await;
         });
@@ -1397,12 +1404,14 @@ async fn main() -> Result<()> {
         let agent_for_poll = Arc::clone(&state.agent);
         let data_dir_for_poll = config.data_dir.clone();
         let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
+        let self_published_for_poll = Arc::clone(&self_published_release_manifests);
         tokio::spawn(async move {
             run_fallback_github_poll(
                 agent_for_poll,
                 update_config,
                 data_dir_for_poll,
                 upgrade_apply_lock,
+                self_published_for_poll,
             )
             .await;
         });
@@ -2381,6 +2390,79 @@ async fn run_doctor(config: &DaemonConfig) -> Result<()> {
 // Self-update (gossip-based + GitHub fallback)
 // ---------------------------------------------------------------------------
 
+const RELEASE_REBROADCAST_INTERVAL: Duration = Duration::from_secs(300);
+const SELF_PUBLISHED_RELEASE_TTL: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Default)]
+struct SelfPublishedReleaseManifests {
+    published_at: HashMap<[u8; 32], Instant>,
+}
+
+impl SelfPublishedReleaseManifests {
+    fn record_payload(&mut self, payload: &[u8], now: Instant) {
+        self.prune(now);
+        self.published_at
+            .insert(release_manifest_payload_digest(payload), now);
+    }
+
+    fn contains_recent_digest(&mut self, digest: &[u8; 32], now: Instant) -> bool {
+        self.prune(now);
+        self.published_at.contains_key(digest)
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.published_at.retain(|_, first_seen| {
+            now.saturating_duration_since(*first_seen) < SELF_PUBLISHED_RELEASE_TTL
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseRebroadcastDecision {
+    Rebroadcast,
+    SkipNotNewer,
+    SkipSelfPublished,
+    SkipRecentlyRebroadcasted,
+}
+
+fn release_manifest_payload_digest(payload: &[u8]) -> [u8; 32] {
+    Sha256::digest(payload).into()
+}
+
+fn decide_release_manifest_rebroadcast(
+    manifest_version: &str,
+    current_version: &str,
+    payload_digest: [u8; 32],
+    rebroadcasted_versions: &mut HashMap<String, Instant>,
+    self_published: &mut SelfPublishedReleaseManifests,
+    now: Instant,
+) -> ReleaseRebroadcastDecision {
+    if !is_newer(manifest_version, current_version) {
+        return ReleaseRebroadcastDecision::SkipNotNewer;
+    }
+
+    if self_published.contains_recent_digest(&payload_digest, now) {
+        return ReleaseRebroadcastDecision::SkipSelfPublished;
+    }
+
+    match rebroadcasted_versions.get(manifest_version) {
+        Some(last) if now.saturating_duration_since(*last) < RELEASE_REBROADCAST_INTERVAL => {
+            ReleaseRebroadcastDecision::SkipRecentlyRebroadcasted
+        }
+        _ => {
+            rebroadcasted_versions.insert(manifest_version.to_string(), now);
+            // Keep the active version window compact. publish() re-signs the
+            // PlumTree envelope, so unbounded historical versions would keep
+            // producing fresh gossip message IDs after their interval expires.
+            if rebroadcasted_versions.len() > 2 {
+                rebroadcasted_versions.clear();
+                rebroadcasted_versions.insert(manifest_version.to_string(), now);
+            }
+            ReleaseRebroadcastDecision::Rebroadcast
+        }
+    }
+}
+
 /// Startup GitHub check. Returns Some(version) if an update was applied.
 async fn run_startup_update_check(
     config: &DaemonConfig,
@@ -2447,6 +2529,7 @@ async fn broadcast_current_manifest(
     repo: &str,
     include_prereleases: bool,
     data_dir: &std::path::Path,
+    self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
 ) {
     let monitor = match UpgradeMonitor::new(repo, "x0xd", x0x::VERSION) {
         Ok(m) => m.with_include_prereleases(include_prereleases),
@@ -2466,7 +2549,12 @@ async fn broadcast_current_manifest(
                 "Broadcasting current release manifest v{} to gossip",
                 verified.manifest.version
             );
-            if let Err(e) = agent.publish(RELEASE_TOPIC, verified.gossip_payload).await {
+            let gossip_payload = verified.gossip_payload;
+            {
+                let mut self_published = self_published_release_manifests.lock().await;
+                self_published.record_payload(&gossip_payload, Instant::now());
+            }
+            if let Err(e) = agent.publish(RELEASE_TOPIC, gossip_payload).await {
                 tracing::debug!(error = %e, "Failed to broadcast current manifest: {e}");
             }
         }
@@ -2487,6 +2575,7 @@ async fn run_gossip_update_listener(
     config: DaemonUpdateConfig,
     data_dir: PathBuf,
     upgrade_apply_lock: Arc<Mutex<()>>,
+    self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
 ) {
     let mut release_sub = match agent.subscribe(RELEASE_TOPIC).await {
         Ok(sub) => sub,
@@ -2501,7 +2590,6 @@ async fn run_gossip_update_listener(
     // publish() re-signs the payload with the local agent key, producing a new PlumTree
     // message ID each time — so PlumTree's transport-layer dedup cannot suppress re-sends.
     let mut rebroadcasted_versions: HashMap<String, Instant> = HashMap::new();
-    const REBROADCAST_INTERVAL: Duration = Duration::from_secs(300);
 
     while let Some(msg) = release_sub.recv().await {
         tracing::info!("Received release manifest via gossip");
@@ -2541,34 +2629,58 @@ async fn run_gossip_update_listener(
 
         // Rebroadcast with time-windowed dedup: allow re-rebroadcast every 5 minutes
         // so late-connecting peers (e.g., after a peer restarts) still receive the manifest.
-        let should_rebroadcast = match rebroadcasted_versions.get(&manifest.version) {
-            None => true,
-            Some(last) => last.elapsed() >= REBROADCAST_INTERVAL,
+        // Suppress manifests at or below our own version first; stale release-train
+        // manifests were the source of the fleet PubSub flood in Hunt 12e.
+        let payload_digest = release_manifest_payload_digest(&msg.payload);
+        let rebroadcast_decision = {
+            let mut self_published = self_published_release_manifests.lock().await;
+            decide_release_manifest_rebroadcast(
+                &manifest.version,
+                x0x::VERSION,
+                payload_digest,
+                &mut rebroadcasted_versions,
+                &mut self_published,
+                Instant::now(),
+            )
         };
-        if should_rebroadcast {
-            rebroadcasted_versions.insert(manifest.version.clone(), Instant::now());
-            // Prune older versions — keep only the current to prevent
-            // re-broadcast of old versions after pruning
-            if rebroadcasted_versions.len() > 2 {
-                let current_version = manifest.version.clone();
-                let current_time = Instant::now();
-                rebroadcasted_versions.clear();
-                rebroadcasted_versions.insert(current_version, current_time);
+
+        match rebroadcast_decision {
+            ReleaseRebroadcastDecision::Rebroadcast => {
+                tracing::info!(
+                    version = %manifest.version,
+                    "Rebroadcasting verified release manifest v{}",
+                    manifest.version
+                );
+                {
+                    let mut self_published = self_published_release_manifests.lock().await;
+                    self_published.record_payload(&msg.payload, Instant::now());
+                }
+                if let Err(e) = agent.publish(RELEASE_TOPIC, msg.payload.to_vec()).await {
+                    tracing::debug!(error = %e, "Failed to rebroadcast release manifest: {e}");
+                }
             }
-            tracing::info!(
-                version = %manifest.version,
-                "Rebroadcasting verified release manifest v{}",
-                manifest.version
-            );
-            if let Err(e) = agent.publish(RELEASE_TOPIC, msg.payload.to_vec()).await {
-                tracing::debug!(error = %e, "Failed to rebroadcast release manifest: {e}");
+            ReleaseRebroadcastDecision::SkipNotNewer => {
+                tracing::debug!(
+                    version = %manifest.version,
+                    "Already on v{} or newer, skipping rebroadcast",
+                    manifest.version
+                );
+                continue;
             }
-        } else {
-            tracing::debug!(
-                version = %manifest.version,
-                "Already rebroadcasted v{} recently, skipping",
-                manifest.version
-            );
+            ReleaseRebroadcastDecision::SkipSelfPublished => {
+                tracing::debug!(
+                    version = %manifest.version,
+                    "Skipping rebroadcast of self-published release manifest v{}",
+                    manifest.version
+                );
+            }
+            ReleaseRebroadcastDecision::SkipRecentlyRebroadcasted => {
+                tracing::debug!(
+                    version = %manifest.version,
+                    "Already rebroadcasted v{} recently, skipping",
+                    manifest.version
+                );
+            }
         }
 
         // Ignore if we're already on this version or newer
@@ -2618,6 +2730,7 @@ async fn run_fallback_github_poll(
     config: DaemonUpdateConfig,
     data_dir: PathBuf,
     upgrade_apply_lock: Arc<Mutex<()>>,
+    self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
 ) {
     let interval = Duration::from_secs(config.fallback_check_interval_minutes * 60);
     let mut ticker = tokio::time::interval(interval);
@@ -2672,7 +2785,12 @@ async fn run_fallback_github_poll(
                 // Broadcast to gossip with timeout — don't let dead peers block upgrade
                 let publish_payload = verified.gossip_payload.clone();
                 let publish_agent = agent.clone();
+                let self_published_for_publish = Arc::clone(&self_published_release_manifests);
                 tokio::spawn(async move {
+                    {
+                        let mut self_published = self_published_for_publish.lock().await;
+                        self_published.record_payload(&publish_payload, Instant::now());
+                    }
                     match tokio::time::timeout(
                         Duration::from_secs(10),
                         publish_agent.publish(RELEASE_TOPIC, publish_payload),
@@ -12777,4 +12895,101 @@ async fn handle_file_complete(
     }
 
     finalize_received_transfer(state, &complete.transfer_id, &expected_sha256).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use x0x::upgrade::manifest::{PlatformAsset, SCHEMA_VERSION};
+
+    fn manifest_with_version(version: &str) -> ReleaseManifest {
+        ReleaseManifest {
+            schema_version: SCHEMA_VERSION,
+            version: version.to_string(),
+            timestamp: 4_102_444_800,
+            assets: vec![PlatformAsset {
+                target: "x86_64-unknown-linux-gnu".to_string(),
+                archive_url: "https://example.com/x0x-linux-x64-gnu.tar.gz".to_string(),
+                archive_sha256: [0xAA; 32],
+                signature_url: "https://example.com/x0x-linux-x64-gnu.tar.gz.sig".to_string(),
+            }],
+            skill_url: "https://example.com/SKILL.md".to_string(),
+            skill_sha256: [0xBB; 32],
+        }
+    }
+
+    fn encoded_payload_for_manifest(manifest: &ReleaseManifest) -> Vec<u8> {
+        let manifest_json = serde_json::to_vec(manifest).expect("serialize manifest fixture");
+        x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, b"test-signature")
+    }
+
+    fn version_newer_than_current() -> String {
+        let mut version = semver::Version::parse(x0x::VERSION).expect("current version is semver");
+        version.patch += 1;
+        version.to_string()
+    }
+
+    #[test]
+    fn release_manifest_rebroadcast_only_newer_versions() {
+        let older_manifest = manifest_with_version("0.0.1");
+        let equal_manifest = manifest_with_version(x0x::VERSION);
+        let newer_version = version_newer_than_current();
+        let newer_manifest = manifest_with_version(&newer_version);
+
+        let mut rebroadcasted_versions = HashMap::new();
+        let mut self_published = SelfPublishedReleaseManifests::default();
+        let now = Instant::now();
+        let mut republished_versions = Vec::new();
+
+        for manifest in [&older_manifest, &equal_manifest, &newer_manifest] {
+            let payload = encoded_payload_for_manifest(manifest);
+            let decision = decide_release_manifest_rebroadcast(
+                &manifest.version,
+                x0x::VERSION,
+                release_manifest_payload_digest(&payload),
+                &mut rebroadcasted_versions,
+                &mut self_published,
+                now,
+            );
+            if decision == ReleaseRebroadcastDecision::Rebroadcast {
+                republished_versions.push(manifest.version.clone());
+            }
+        }
+
+        assert_eq!(republished_versions, vec![newer_version]);
+    }
+
+    #[test]
+    fn self_published_release_manifest_skips_rebroadcast_until_ttl() {
+        let newer_version = version_newer_than_current();
+        let manifest = manifest_with_version(&newer_version);
+        let payload = encoded_payload_for_manifest(&manifest);
+        let digest = release_manifest_payload_digest(&payload);
+        let now = Instant::now();
+
+        let mut self_published = SelfPublishedReleaseManifests::default();
+        self_published.record_payload(&payload, now);
+        let mut rebroadcasted_versions = HashMap::new();
+
+        let decision = decide_release_manifest_rebroadcast(
+            &manifest.version,
+            x0x::VERSION,
+            digest,
+            &mut rebroadcasted_versions,
+            &mut self_published,
+            now,
+        );
+        assert_eq!(decision, ReleaseRebroadcastDecision::SkipSelfPublished);
+
+        let after_ttl = now + SELF_PUBLISHED_RELEASE_TTL + Duration::from_secs(1);
+        let decision_after_ttl = decide_release_manifest_rebroadcast(
+            &manifest.version,
+            x0x::VERSION,
+            digest,
+            &mut rebroadcasted_versions,
+            &mut self_published,
+            after_ttl,
+        );
+        assert_eq!(decision_after_ttl, ReleaseRebroadcastDecision::Rebroadcast);
+    }
 }

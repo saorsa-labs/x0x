@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.12] - 2026-04-29
+
+Hunt 12e release-manifest flood mitigation — stops stale `x0x/release`
+manifests from saturating the PubSub dispatcher and delaying newly joined
+public-message subscribers.
+
+### Fixed
+
+- **`daemon`: suppress release-manifest rebroadcast for versions at or below
+  the local daemon version.** The gossip update listener now rejects stale
+  release-train manifests before the rebroadcast path, while keeping the
+  existing newer-version gate before upgrade apply. Nodes already on the
+  current release no longer relay old manifests every five minutes.
+- **`daemon`: remember self-published release manifest payload digests for
+  30 minutes.** Current-manifest startup broadcasts, fallback GitHub
+  broadcasts, and listener rebroadcasts are recorded by SHA-256 digest so a
+  PlumTree loopback of our own payload is not published again.
+
+### Added
+
+- **`tests/e2e_hunt12e_release_manifest_storm.sh`** — 4-daemon loopback
+  release-topic storm harness. It injects release-manifest-shaped payloads on
+  `x0x/release` and asserts `dispatcher.pubsub.timed_out == 0` throughout the
+  run (default 5 minutes, with `DURATION_SECS` override for smoke tests).
+
 ## [v0.19.11] - 2026-04-29
 
 Async group-handler discovery fan-out — keeps `POST /groups` and
