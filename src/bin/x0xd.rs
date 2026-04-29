@@ -1265,7 +1265,7 @@ async fn main() -> Result<()> {
         groups.keys().cloned().collect()
     };
     for group_id in existing_group_ids {
-        ensure_named_group_metadata_listener(Arc::clone(&state), &group_id).await;
+        ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
     }
 
     // P0-1: subscribe to the global group discovery topic so remote public
@@ -6484,6 +6484,37 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
         .insert(group_id, handle);
 }
 
+/// Spawn every gossip listener a member needs for a named group.
+///
+/// Members must be subscribed to both the metadata topic *and* the
+/// public-message topic (`x0x.groups.public.<stable_id>`) before any peer
+/// can publish, otherwise the very first signed-public message is silently
+/// dropped at the receiver's pubsub layer (Plumtree cannot backfill messages
+/// on a topic that had no subscriber at receive time). This helper enforces
+/// that invariant in one place — every site that inserts a group into
+/// `state.named_groups` must call it.
+///
+/// Both inner spawners are idempotent, so calling this repeatedly for the
+/// same `group_id` is safe. The public-message listener is gated on
+/// `confidentiality != MlsEncrypted` to match the convention in
+/// `GET /groups/:id/messages`, which rejects MLS-encrypted groups outright.
+async fn ensure_named_group_listeners(state: Arc<AppState>, group_id: &str) {
+    ensure_named_group_metadata_listener(Arc::clone(&state), group_id).await;
+    let public_topic_key = {
+        let groups = state.named_groups.read().await;
+        groups.get(group_id).and_then(|info| {
+            if info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted {
+                None
+            } else {
+                Some(info.stable_group_id().to_string())
+            }
+        })
+    };
+    if let Some(stable_id) = public_topic_key {
+        spawn_public_message_listener(state, stable_id).await;
+    }
+}
+
 /// POST /groups — create a named group.
 async fn create_named_group(
     State(state): State<Arc<AppState>>,
@@ -6554,7 +6585,7 @@ async fn create_named_group(
                 .await
                 .insert(group_id_hex.clone(), info.clone());
             save_named_groups(&state).await;
-            ensure_named_group_metadata_listener(Arc::clone(&state), &group_id_hex).await;
+            ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
 
             // P0-1: If the group is discoverable, publish its card to the global
             // discovery topic so other daemons find it without manual import.
@@ -7209,7 +7240,7 @@ async fn join_group_via_invite(
                 .await
                 .insert(group_id_hex.clone(), info.clone());
             save_named_groups(&state).await;
-            ensure_named_group_metadata_listener(Arc::clone(&state), &group_id_hex).await;
+            ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
 
             // Announce join on the chat topic so the creator sees us
             let agent_hex = joiner_hex;
@@ -9081,7 +9112,7 @@ async fn import_group_card(
     }
     drop(groups);
     save_named_groups(&state).await;
-    ensure_named_group_metadata_listener(Arc::clone(&state), &group_id).await;
+    ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
 
     (
         StatusCode::OK,
