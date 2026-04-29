@@ -455,22 +455,44 @@ pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
 }
 
 /// Default interval between identity heartbeat re-announcements (seconds).
-/// Interval between identity-announcement heartbeats.
 ///
-/// Previously 300 s — too slow when VPS bootstrap-node PlumTree trees
-/// only partially overlap: a missed announcement meant the receiver
-/// waited 5 minutes for the next chance. Lowered to 60 s so the mesh
-/// converges within a couple of cycles even when individual publishes
-/// are lost. Paired with the receiver-side re-broadcast in
-/// `start_identity_listener`, this gives epidemic-flood semantics
-/// equivalent to the release-manifest propagation path.
-pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+/// Heartbeats are anti-entropy, not a hot-path delivery mechanism. Keep the
+/// default at five minutes so bootstrap meshes do not spend their PubSub budget
+/// on repeated signed identity/machine announcements. Each fresh announcement
+/// still receives a one-shot receiver-side re-broadcast in
+/// `start_identity_listener` for epidemic convergence.
+pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 300;
 
 /// Default TTL for discovered agent cache entries (seconds).
 ///
 /// Entries not refreshed within this window are filtered from
 /// [`Agent::presence`] and [`Agent::discovered_agents`].
 pub const IDENTITY_TTL_SECS: u64 = 900;
+
+const DISCOVERY_REBROADCAST_STATE_CAP: usize = 1024;
+const DISCOVERY_REBROADCAST_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+fn should_rebroadcast_discovery_once<K>(
+    state: &mut std::collections::HashMap<K, std::time::Instant>,
+    key: K,
+    now: std::time::Instant,
+) -> bool
+where
+    K: Eq + std::hash::Hash,
+{
+    match state.entry(key) {
+        std::collections::hash_map::Entry::Occupied(_) => false,
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(now);
+            if state.len() > DISCOVERY_REBROADCAST_STATE_CAP {
+                if let Some(cutoff) = now.checked_sub(DISCOVERY_REBROADCAST_STATE_TTL) {
+                    state.retain(|_, seen_at| *seen_at >= cutoff);
+                }
+            }
+            true
+        }
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct IdentityAnnouncementUnsigned {
@@ -3778,11 +3800,11 @@ impl Agent {
             // duplicate connection attempts from concurrent announcements.
             let mut auto_connect_attempted = std::collections::HashSet::<identity::AgentId>::new();
 
-            // Time-windowed dedup for re-broadcast: (agent_id, announced_at)
-            // → last-rebroadcast Instant. Bounds how often we re-emit any
-            // given announcement so a busy mesh doesn't amplify gossip
-            // indefinitely. Mirrors the pattern used by the release-manifest
-            // re-broadcast loop in x0xd.
+            // One-shot dedup for re-broadcast: (agent_id, announced_at)
+            // → first-rebroadcast Instant. Bounds each fresh announcement to at
+            // most one receiver-side re-publish per daemon. Repeating the same
+            // payload every few seconds forms a PubSub feedback loop on the
+            // bootstrap mesh and delays latency-sensitive user messages.
             let mut rebroadcast_state: std::collections::HashMap<
                 (identity::AgentId, u64),
                 std::time::Instant,
@@ -3803,8 +3825,6 @@ impl Agent {
                 (identity::UserId, u64),
                 std::time::Instant,
             > = std::collections::HashMap::new();
-            const REBROADCAST_MIN_INTERVAL: std::time::Duration =
-                std::time::Duration::from_secs(20);
             const VERIFIED_PAYLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
             let has_recent_verified_payload =
@@ -3915,17 +3935,11 @@ impl Agent {
 
                         if announcement.machine_id != own_machine_id {
                             let key = (announcement.machine_id, announcement.announced_at);
-                            let should_forward = match machine_rebroadcast_state.get(&key) {
-                                None => true,
-                                Some(last) => last.elapsed() >= REBROADCAST_MIN_INTERVAL,
-                            };
-                            if should_forward {
-                                machine_rebroadcast_state.insert(key, std::time::Instant::now());
-                                if machine_rebroadcast_state.len() > 1024 {
-                                    let cutoff = std::time::Instant::now()
-                                        - std::time::Duration::from_secs(3600);
-                                    machine_rebroadcast_state.retain(|_, t| *t >= cutoff);
-                                }
+                            if should_rebroadcast_discovery_once(
+                                &mut machine_rebroadcast_state,
+                                key,
+                                std::time::Instant::now(),
+                            ) {
                                 let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
                                 tokio::spawn(async move {
                                     if let Err(e) = pubsub
@@ -3994,21 +4008,15 @@ impl Agent {
                             agent_count = announcement.agent_certificates.len(),
                             "cached verified user announcement"
                         );
-                        // Rebroadcast for non-self announcements, dedup-windowed
-                        // like identity / machine announcements.
+                        // Rebroadcast non-self announcements once, matching
+                        // identity / machine announcements.
                         if Some(announcement.user_id) != own_user_id {
                             let key = (announcement.user_id, announcement.announced_at);
-                            let should_forward = match user_rebroadcast_state.get(&key) {
-                                None => true,
-                                Some(last) => last.elapsed() >= REBROADCAST_MIN_INTERVAL,
-                            };
-                            if should_forward {
-                                user_rebroadcast_state.insert(key, std::time::Instant::now());
-                                if user_rebroadcast_state.len() > 1024 {
-                                    let cutoff = std::time::Instant::now()
-                                        - std::time::Duration::from_secs(3600);
-                                    user_rebroadcast_state.retain(|_, t| *t >= cutoff);
-                                }
+                            if should_rebroadcast_discovery_once(
+                                &mut user_rebroadcast_state,
+                                key,
+                                std::time::Instant::now(),
+                            ) {
                                 let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
                                 tokio::spawn(async move {
                                     if let Err(e) = pubsub
@@ -4175,24 +4183,19 @@ impl Agent {
                 // PlumTree overlap for the identity-announce topic: the
                 // origin's tree only reaches 1–2 hops reliably. Making
                 // every verified recipient re-publish guarantees flood
-                // convergence across the mesh. Dedup-window on
+                // convergence across the mesh. One-shot dedup on
                 // (agent_id, announced_at) bounds amplification. Pub/Sub
                 // v2 re-signs each publish with a new message ID so
-                // PlumTree's own dedup cannot suppress our forward.
+                // PlumTree's own dedup cannot suppress repeated forwards;
+                // therefore each daemon forwards a given announcement at most
+                // once.
                 if announcement.agent_id != own_agent_id {
                     let key = (announcement.agent_id, announcement.announced_at);
-                    let should_forward = match rebroadcast_state.get(&key) {
-                        None => true,
-                        Some(last) => last.elapsed() >= REBROADCAST_MIN_INTERVAL,
-                    };
-                    if should_forward {
-                        rebroadcast_state.insert(key, std::time::Instant::now());
-                        // Prune stale entries to cap memory.
-                        if rebroadcast_state.len() > 1024 {
-                            let cutoff =
-                                std::time::Instant::now() - std::time::Duration::from_secs(3600);
-                            rebroadcast_state.retain(|_, t| *t >= cutoff);
-                        }
+                    if should_rebroadcast_discovery_once(
+                        &mut rebroadcast_state,
+                        key,
+                        std::time::Instant::now(),
+                    ) {
                         let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
                         let payload = raw_payload.clone();
                         tokio::spawn(async move {
@@ -7038,6 +7041,28 @@ mod tests {
 
     fn sa(s: &str) -> std::net::SocketAddr {
         s.parse().expect("valid SocketAddr literal in test")
+    }
+
+    #[test]
+    fn discovery_rebroadcast_is_one_shot_per_announcement_key() {
+        let now = std::time::Instant::now();
+        let mut state = std::collections::HashMap::new();
+
+        assert!(should_rebroadcast_discovery_once(
+            &mut state,
+            (7_u8, 42_u64),
+            now
+        ));
+        assert!(!should_rebroadcast_discovery_once(
+            &mut state,
+            (7_u8, 42_u64),
+            now + std::time::Duration::from_secs(20),
+        ));
+        assert!(should_rebroadcast_discovery_once(
+            &mut state,
+            (7_u8, 43_u64),
+            now + std::time::Duration::from_secs(20),
+        ));
     }
 
     #[test]

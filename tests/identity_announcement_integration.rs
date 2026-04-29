@@ -144,10 +144,9 @@ async fn test_ttl_expiry_removes_from_presence() {
 
 #[test]
 fn test_default_heartbeat_and_ttl_constants() {
-    // Heartbeat tuned down to 60 s so bootstrap meshes (with patchy
-    // PlumTree overlap) converge within 1–2 cycles even when individual
-    // announcement publishes are lost.
-    assert_eq!(x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS, 60);
+    // Heartbeats are anti-entropy and remain well inside the 900 s TTL, while
+    // avoiding sustained PubSub pressure from repeated signed announcements.
+    assert_eq!(x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS, 300);
     assert_eq!(x0x::IDENTITY_TTL_SECS, 900);
 }
 

@@ -85,6 +85,33 @@ to precede the first user message. v0.19.14 delays them by 8 s while keeping
 local group state and both required listeners installed before the HTTP
 response returns.
 
+### 12f.4 — Stop identity/machine announcement feedback loops (v0.19.15)
+
+After v0.19.14 was deployed and the accumulated `xreg-*` test groups were
+pruned, fleet diagnostics still saturated within minutes. Topic samples over
+two minutes showed the residual pressure had moved to identity anti-entropy,
+not release manifests or group cards:
+
+```text
+781 x0x.machine.announce.v2
+739 x0x.identity.announce.v2
+ 37 x0x/caps/v1
+ 11 x0x.discovery.groups
+  3 x0x/release
+```
+
+Root cause: `start_identity_listener` re-published verified identity, machine,
+and user announcements every 20 s for the same `(id, announced_at)` key. PubSub
+v2 re-signs each publish with a fresh message ID, so PlumTree's message-ID
+dedup cannot suppress the repeat forward. On a six-node bootstrap mesh this
+formed a feedback loop: every daemon repeatedly re-forwarded already-forwarded
+anti-entropy payloads and pinned `recv_depth.pubsub.latest` at 10 000.
+
+v0.19.15 changes discovery-announcement re-broadcast to **one-shot per
+`(id, announced_at)` key per daemon** and restores the default identity
+heartbeat interval to 300 s. Heartbeats remain safely inside the 900 s TTL, and
+each fresh heartbeat still gets one epidemic re-broadcast for convergence.
+
 ## Validation plan
 
 1. Local quality gates:
@@ -93,10 +120,11 @@ response returns.
    - `cargo nextest run --all-features --workspace`
    - `bash tests/e2e_first_message_after_join.sh`
    - `bash tests/e2e_comprehensive.sh`
-2. Release and deploy v0.19.14.
+2. Release and deploy v0.19.15.
 3. Clean up accumulated `xreg-*` test groups on the fleet (test artefacts, not product state).
-4. Re-run `/tmp/x0x-cross-region-first-msg.sh`; target remains 24 / 24.
+4. Confirm `x0x.identity.announce.v2` / `x0x.machine.announce.v2` topic counts drop to low-rate heartbeat traffic and `recv_depth.pubsub.latest` drains below saturation.
+5. Re-run `/tmp/x0x-cross-region-first-msg.sh`; target remains 24 / 24.
 
-## Follow-up if v0.19.14 is still insufficient
+## Follow-up if v0.19.15 is still insufficient
 
-If PubSub remains saturated or first-message latency remains above the 5 s grace window after stale-release fast-drop, group fan-out delay, and test-group cleanup, the next mitigation is a real PubSub admission control path for known low-priority topics (`x0x/release`, discovery anti-entropy, identity anti-entropy), preferably before subscriber-channel enqueue. That likely belongs in a separate Hunt because it touches topic prioritisation rather than release-manifest policy.
+If PubSub remains saturated or first-message latency remains above the 5 s grace window after stale-release fast-drop, group fan-out delay, discovery re-broadcast one-shot dedup, and test-group cleanup, the next mitigation is a real PubSub admission control path for known low-priority topics (`x0x/release`, discovery anti-entropy, identity anti-entropy), preferably before subscriber-channel enqueue. That likely belongs in a separate Hunt because it touches topic prioritisation rather than release-manifest policy.

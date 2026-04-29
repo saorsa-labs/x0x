@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.15] - 2026-04-29
+
+Hunt 12f residual PubSub drain mitigation — stops identity/machine
+announcement re-broadcast feedback loops observed after the v0.19.14 fleet
+rollout and restores the lower-volume heartbeat cadence.
+
+### Fixed
+
+- **`core`: make identity, machine, and user announcement re-broadcasts
+  one-shot per `(id, announced_at)` key.** The previous 20 s re-broadcast
+  window allowed already-forwarded signed announcements to circulate again with
+  fresh PubSub message IDs, pinning the PubSub receive queue and delaying
+  latency-sensitive group messages.
+
+### Changed
+
+- **`core`: restore the default identity heartbeat interval to 300 s.**
+  Heartbeats remain well within the 900 s discovery TTL and now act as
+  low-rate anti-entropy instead of sustained background PubSub pressure.
+
 ## [v0.19.14] - 2026-04-29
 
 Hunt 12f final follow-up — keeps first public messages ahead of best-effort

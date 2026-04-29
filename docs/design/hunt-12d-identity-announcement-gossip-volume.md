@@ -2,6 +2,7 @@
 
 ## Status
 - **Opened:** 2026-04-28
+- **Fixed:** 2026-04-29 in `x0x v0.19.15` (one-shot discovery re-broadcast + 300 s heartbeat default).
 - **Source:** Discovered while preparing the Hunt 12c v0.19.5 4-hour live-fleet soak (`proofs/fleet-soak-4h-20260428T081446Z/`).
 - **Severity:** Medium — degrades API responsiveness, doesn't break presence (Hunt 12c isolation holds).
 - **Predecessor:** Hunt 12c (per-stream dispatcher isolation) — shipped in `x0x v0.19.5`. Hunt 12c is closed; the underlying load it isolates *against* is what 12d addresses.
@@ -131,26 +132,25 @@ their fanout undermines that role.
 
 ## Recommendation
 
-**Land Lever A first** as a v0.19.6 / v0.20.0 ship — a single
-constant change in `src/lib.rs` plus one CHANGELOG entry. Validate on
-the live fleet for 2–4 hours; expect ~5 × drop in PubSub channel
-pressure. Likely sufficient on its own.
+**Implemented in v0.19.15.** Lever A alone was not enough while receiver-side
+announcement re-broadcast could repeat every 20 s for the same `(id,
+announced_at)` key. v0.19.15 combines the 300 s heartbeat default with one-shot
+re-broadcast per fresh identity/machine/user announcement, which preserves
+epidemic convergence without forming a PubSub feedback loop.
 
-If Lever A alone doesn't bring `recv_depth.pubsub.max` below 50 % of
-capacity at steady state, plan Lever B as a v0.20.0 wire-format
-breaking change, with a compatibility window.
+If v0.19.15 still leaves `recv_depth.pubsub.max` near saturation at steady
+state, plan Lever B as a v0.20.0 wire-format breaking change, with a
+compatibility window.
 
-Defer Lever C until both A and B are tried — the gossip overlay's
-invariants should not be the first lever turned.
+Defer Lever C until the heartbeat/re-broadcast fix and Lever B are tried — the
+gossip overlay's invariants should not be the first lever turned.
 
 ## Validation plan
 
-- Unit: existing tests in `src/lib.rs` and `tests/identity_*.rs`
-  cover the announcement codec; no new unit work needed for Lever A.
-- Local: extend `tests/e2e_hunt12c_pubsub_load_isolation.sh` (the
-  reproducer added in v0.19.5) with a "long heartbeat" mode that
-  asserts `recv_depth.pubsub.max < 5000` after the same 120-second
-  load window.
+- Unit: `src/lib.rs` verifies one-shot discovery re-broadcast decisions;
+  `tests/identity_*.rs` cover announcement codec/default constants.
+- Local: `tests/e2e_hunt12c_pubsub_load_isolation.sh` and the release-storm
+  harness should stay below PubSub timeout thresholds under background traffic.
 - Fleet: 2-hour soak after deploy. Pass criteria:
   - `recv_depth.pubsub.max < 5000` (50 % of cap) at steady state on
     every node.
