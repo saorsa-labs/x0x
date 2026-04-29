@@ -112,6 +112,23 @@ v0.19.15 changes discovery-announcement re-broadcast to **one-shot per
 heartbeat interval to 300 s. Heartbeats remain safely inside the 900 s TTL, and
 each fresh heartbeat still gets one epidemic re-broadcast for convergence.
 
+### 12f.5 — Stable global fallback for first SignedPublic messages (v0.19.16)
+
+v0.19.15 made the PubSub dispatcher healthy (`pubsub.timed_out = 0`,
+`recv_depth.pubsub.latest = 0`) but live acceptance still missed **4 / 24**,
+all in the Sydney → Helsinki direction. The misses were permanent: Sydney had
+cached each first message locally, while Helsinki's message cache stayed empty.
+Helsinki's per-group listener had subscribed several seconds before each send,
+so the residual failure was not listener startup or queue drain; it was
+asymmetric reachability of brand-new per-group PubSub topics.
+
+v0.19.16 keeps the normal per-group topic (`x0x.groups.public.<group_id>`) and
+adds a long-lived fleet-wide fallback topic, `x0x.groups.public.v1`. Every
+daemon subscribes to the fallback at startup. Senders publish each SignedPublic
+message to both topics; receivers validate/cache only messages whose group is
+known locally. This gives first-message delivery a stable PubSub tree while
+retaining per-group topics for steady-state fan-out.
+
 ## Validation plan
 
 1. Local quality gates:
@@ -120,11 +137,11 @@ each fresh heartbeat still gets one epidemic re-broadcast for convergence.
    - `cargo nextest run --all-features --workspace`
    - `bash tests/e2e_first_message_after_join.sh`
    - `bash tests/e2e_comprehensive.sh`
-2. Release and deploy v0.19.15.
+2. Release and deploy v0.19.16.
 3. Clean up accumulated `xreg-*` test groups on the fleet (test artefacts, not product state).
-4. Confirm `x0x.identity.announce.v2` / `x0x.machine.announce.v2` topic counts drop to low-rate heartbeat traffic and `recv_depth.pubsub.latest` drains below saturation.
+4. Confirm `x0x.identity.announce.v2` / `x0x.machine.announce.v2` topic counts stay low-rate, `x0x.groups.public.v1` is present but not saturating, and `recv_depth.pubsub.latest` drains below saturation.
 5. Re-run `/tmp/x0x-cross-region-first-msg.sh`; target remains 24 / 24.
 
-## Follow-up if v0.19.15 is still insufficient
+## Follow-up if v0.19.16 is still insufficient
 
-If PubSub remains saturated or first-message latency remains above the 5 s grace window after stale-release fast-drop, group fan-out delay, discovery re-broadcast one-shot dedup, and test-group cleanup, the next mitigation is a real PubSub admission control path for known low-priority topics (`x0x/release`, discovery anti-entropy, identity anti-entropy), preferably before subscriber-channel enqueue. That likely belongs in a separate Hunt because it touches topic prioritisation rather than release-manifest policy.
+If PubSub remains saturated or first-message latency remains above the 5 s grace window after stale-release fast-drop, group fan-out delay, discovery re-broadcast one-shot dedup, stable global SignedPublic fallback, and test-group cleanup, the next mitigation is a real PubSub admission control path for known low-priority topics (`x0x/release`, discovery anti-entropy, identity anti-entropy), preferably before subscriber-channel enqueue. That likely belongs in a separate Hunt because it touches topic prioritisation rather than release-manifest policy.

@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.16] - 2026-04-29
+
+Hunt 12f final delivery mitigation — adds a stable global fallback path for
+SignedPublic group messages so the first message after a cross-region join is
+not dependent on a brand-new per-group PubSub tree.
+
+### Fixed
+
+- **`daemon`: publish SignedPublic group messages to a stable global fallback
+  topic in addition to `x0x.groups.public.<group_id>`.** All daemons subscribe
+  to `x0x.groups.public.v1` at startup and cache only messages that validate
+  against a locally known group. This covers asymmetric fresh-topic PlumTree
+  reachability observed on the live Sydney → Helsinki path while preserving the
+  per-group topic for normal steady-state delivery.
+
 ## [v0.19.15] - 2026-04-29
 
 Hunt 12f residual PubSub drain mitigation — stops identity/machine

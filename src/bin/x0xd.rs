@@ -1279,6 +1279,9 @@ async fn main() -> Result<()> {
     // Phase C.2: subscribe inbound direct messages for the
     // ListedToContacts pairwise sync channel.
     spawn_listed_to_contacts_listener(Arc::clone(&state)).await;
+    // Phase E: subscribe to a stable global SignedPublic message fallback so
+    // first messages are not dependent on a brand-new per-group topic tree.
+    spawn_global_public_message_listener(Arc::clone(&state)).await;
 
     // Re-publish our own discoverable group cards after startup so late joiners
     // pick them up.
@@ -6893,6 +6896,15 @@ async fn get_named_group_members(
 /// are dropped on insert (ring-buffer style).
 const PUBLIC_MESSAGE_HISTORY_CAP: usize = 512;
 
+/// Stable fleet-wide anti-entropy topic for SignedPublic messages.
+///
+/// Fresh per-group topics can have asymmetric PlumTree reachability during the
+/// first seconds after a cross-region join. Publishing each public message to
+/// this long-lived topic as well gives already-subscribed daemons a stable
+/// fallback path while receivers still validate/cache only messages for groups
+/// they know locally.
+const GLOBAL_PUBLIC_MESSAGE_TOPIC: &str = "x0x.groups.public.v1";
+
 /// Request body for `POST /groups/:id/send`.
 #[derive(Debug, Deserialize)]
 struct SendGroupMessageRequest {
@@ -7047,7 +7059,7 @@ async fn send_group_public_message(
             );
         }
     };
-    if let Err(e) = state.agent.publish(&topic, bytes).await {
+    if let Err(e) = state.agent.publish(&topic, bytes.clone()).await {
         tracing::warn!(topic = %topic, "E: public-send publish failed: {e}");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -7055,6 +7067,17 @@ async fn send_group_public_message(
                 "ok": false,
                 "error": format!("publish failed: {e}")
             })),
+        );
+    }
+    if let Err(e) = state
+        .agent
+        .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes)
+        .await
+    {
+        tracing::warn!(
+            topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
+            group_id = %msg.group_id,
+            "E: global public-send fallback publish failed: {e}"
         );
     }
     // Publish succeeded, so cache locally. The listener was started before the
@@ -7067,6 +7090,7 @@ async fn send_group_public_message(
             "ok": true,
             "group_id": msg.group_id,
             "topic": topic,
+            "fallback_topic": GLOBAL_PUBLIC_MESSAGE_TOPIC,
             "timestamp": msg.timestamp,
         })),
     )
@@ -7160,6 +7184,89 @@ async fn cache_public_message(state: &AppState, msg: x0x::groups::GroupPublicMes
     }
 }
 
+async fn ingest_public_message(
+    state: &AppState,
+    msg: x0x::groups::GroupPublicMessage,
+    group_id_for_log: &str,
+) {
+    // Validate against current group view at apply-time.
+    let message_group_id = msg.group_id.clone();
+    let snapshot = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id_for_log)
+            .or_else(|| {
+                groups.get(&message_group_id).or_else(|| {
+                    groups
+                        .values()
+                        .find(|info| info.stable_group_id() == message_group_id.as_str())
+                })
+            })
+            .map(|info| {
+                (
+                    info.policy.clone(),
+                    info.members_v2.clone(),
+                    info.stable_group_id().to_string(),
+                )
+            })
+    };
+    let Some((policy, members, stable_id)) = snapshot else {
+        return;
+    };
+    let ctx = x0x::groups::PublicIngestContext {
+        group_id: &stable_id,
+        policy: &policy,
+        members_v2: &members,
+    };
+    if let Err(e) = x0x::groups::validate_public_message(&ctx, &msg) {
+        tracing::warn!(
+            group_id = %group_id_for_log,
+            author = %msg.author_agent_id,
+            "E: dropped public message: {e}"
+        );
+        return;
+    }
+    cache_public_message(state, msg).await;
+}
+
+async fn spawn_global_public_message_listener(state: Arc<AppState>) {
+    let mut shutdown_rx = state.shutdown_notify.subscribe();
+    tokio::spawn(async move {
+        let mut sub = match state.agent.subscribe(GLOBAL_PUBLIC_MESSAGE_TOPIC).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
+                    "E: failed to subscribe to global public-message fallback: {e}"
+                );
+                return;
+            }
+        };
+        tracing::info!(
+            topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
+            "E: global public-message fallback listener subscribed"
+        );
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                maybe = sub.recv() => {
+                    let Some(gossip_msg) = maybe else { break; };
+                    let msg: x0x::groups::GroupPublicMessage =
+                        match serde_json::from_slice(&gossip_msg.payload) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::debug!("E: dropped malformed global public msg: {e}");
+                                continue;
+                            }
+                        };
+                    let group_id_for_log = msg.group_id.clone();
+                    ingest_public_message(&state, msg, &group_id_for_log).await;
+                }
+            }
+        }
+    });
+}
+
 /// Spawn a listener on `x0x.groups.public.{group_id}`. Idempotent — a
 /// duplicate call for the same group_id is a no-op.
 ///
@@ -7206,41 +7313,11 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
                                 continue;
                             }
                         };
-                    // Validate against current group view at apply-time.
-                    let snapshot = {
-                        let groups = state_for_listener.named_groups.read().await;
-                        groups
-                            .get(&group_id_for_listener)
-                            .or_else(|| {
-                                groups.values().find(|info| {
-                                    info.stable_group_id() == group_id_for_listener.as_str()
-                                })
-                            })
-                            .map(|info| {
-                                (
-                                    info.policy.clone(),
-                                    info.members_v2.clone(),
-                                    info.stable_group_id().to_string(),
-                                )
-                            })
-                    };
-                    let Some((policy, members, stable_id)) = snapshot else {
-                        continue;
-                    };
-                    let ctx = x0x::groups::PublicIngestContext {
-                        group_id: &stable_id,
-                        policy: &policy,
-                        members_v2: &members,
-                    };
-                    if let Err(e) = x0x::groups::validate_public_message(&ctx, &msg) {
-                        tracing::warn!(
-                            group_id = %group_id_for_listener,
-                            author = %msg.author_agent_id,
-                            "E: dropped public message: {e}"
-                        );
-                        continue;
-                    }
-                    cache_public_message(&state_for_listener, msg).await;
+                    ingest_public_message(
+                        &state_for_listener,
+                        msg,
+                        &group_id_for_listener,
+                    ).await;
                 }
             }
         }
