@@ -36,6 +36,8 @@ const flag = (name, def) => {
 };
 
 const API_BASE = process.env.X0X_API_BASE ?? "http://127.0.0.1:12700";
+const SECONDARY_API_BASE = process.env.X0X_SECONDARY_API_BASE ?? "";
+const SECONDARY_API_TOKEN = process.env.X0X_SECONDARY_API_TOKEN ?? "";
 // Default to serving the GUI from the daemon (same-origin), which lets the
 // page use real fetch() without CORS. Pass `--gui <path>` to force a local
 // file:// load (useful when a daemon isn't available).
@@ -69,6 +71,7 @@ const report = {
     gui_url: GUI_URL,
     gui_path: GUI_PATH,
     api_base: API_BASE,
+    secondary_api_base: SECONDARY_API_BASE || null,
     capabilities: {},
     totals: { pass: 0, fail: 0, skip: 0 },
 };
@@ -323,12 +326,14 @@ async function main() {
     const fakeAgentA = "a".repeat(64);
     const fakeAgentB = "b".repeat(64);
     const fakeMachine = "c".repeat(64);
+    const wrongMachine = "d".repeat(64);
 
-    // Machine pinning round-trip — togglePin is wired in renderPeople
-    // detail; we drive the same endpoints it calls.
+    // Machine pinning enforcement — togglePin is wired in renderPeople
+    // detail; we drive the same endpoints it calls, then evaluate a
+    // wrong machine and require RejectMachineMismatch.
     try {
         const result = await page.evaluate(
-            async ({ base, token, agent, machine }) => {
+            async ({ base, token, agent, machine, wrongMachine }) => {
                 const h = {
                     "content-type": "application/json",
                     ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -359,13 +364,25 @@ async function main() {
                     headers: token ? { authorization: `Bearer ${token}` } : {},
                 });
                 const body = await r.json();
+                const evalResponse = await fetch(`${base}/trust/evaluate`, {
+                    method: "POST",
+                    headers: h,
+                    body: JSON.stringify({ agent_id: agent, machine_id: wrongMachine }),
+                });
+                const evalBody = await evalResponse.json();
                 await fetch(`${base}/contacts/${agent}`, {
                     method: "DELETE",
                     headers: token ? { authorization: `Bearer ${token}` } : {},
                 });
-                return { status: r.status, body };
+                return { status: r.status, body, evalStatus: evalResponse.status, evalBody };
             },
-            { base: API_BASE, token: TOKEN, agent: fakeAgentA, machine: fakeMachine },
+            {
+                base: API_BASE,
+                token: TOKEN,
+                agent: fakeAgentA,
+                machine: fakeMachine,
+                wrongMachine,
+            },
         );
         expect(result.status === 200, `machines GET → ${result.status}`);
         const machines = result.body.machines ?? [];
@@ -374,14 +391,23 @@ async function main() {
             machines.some(m => m.machine_id === fakeMachine && m.pinned === true),
             `expected pinned: true for ${fakeMachine}, got ${JSON.stringify(machines)}`,
         );
-        record("gui-machine-pinning", "pass", { machines });
+        expect(result.evalStatus === 200, `trust/evaluate wrong machine → ${result.evalStatus}`);
+        expect(
+            String(result.evalBody.decision ?? "").includes("RejectMachineMismatch"),
+            `expected RejectMachineMismatch for wrong machine, got ${JSON.stringify(result.evalBody)}`,
+        );
+        record("gui-machine-pinning", "pass", {
+            machines,
+            wrongMachineDecision: result.evalBody.decision,
+        });
     } catch (e) {
         record("gui-machine-pinning", "fail", { reason: e.message });
     }
 
     // Trust evaluator — block a contact then assert /trust/evaluate
-    // returns a Reject decision. Mirrors the renderPeople detail
-    // panel's "Evaluate Trust" button path.
+    // returns a Reject decision. The visible UI for this endpoint lives
+    // in the Admin → Trust Evaluation panel; this probe runs from the
+    // page origin so CSP/auth match the embedded GUI runtime.
     try {
         const result = await page.evaluate(
             async ({ base, token, agent, machine }) => {
@@ -423,13 +449,14 @@ async function main() {
         record("gui-trust-evaluator", "fail", { reason: e.message });
     }
 
-    // KV store CRUD round-trip — exercises the full surface the GUI
-    // spaces panel uses to render store-backed boards.
+    // KV store CRUD + private-store isolation — exercises the GUI spaces
+    // CRUD surface and, when the wrapper provides a second daemon, proves a
+    // foreign daemon cannot read/write the primary daemon's private store id.
     try {
         const storeName = `gui-rt-${Date.now()}`;
         const topic = `gui-rt-topic-${Date.now()}`;
         const result = await page.evaluate(
-            async ({ base, token, name, topic }) => {
+            async ({ base, token, secondaryBase, secondaryToken, name, topic }) => {
                 const h = {
                     "content-type": "application/json",
                     ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -455,6 +482,29 @@ async function main() {
                     headers: token ? { authorization: `Bearer ${token}` } : {},
                 });
                 const listed = await list.json();
+
+                let foreignGetStatus = null;
+                let foreignPutStatus = null;
+                if (secondaryBase) {
+                    const secondaryHeaders = secondaryToken
+                        ? { authorization: `Bearer ${secondaryToken}` }
+                        : {};
+                    const secondaryJsonHeaders = {
+                        "content-type": "application/json",
+                        ...secondaryHeaders,
+                    };
+                    const foreignGet = await fetch(`${secondaryBase}/stores/${id}/probe`, {
+                        headers: secondaryHeaders,
+                    });
+                    foreignGetStatus = foreignGet.status;
+                    const foreignPut = await fetch(`${secondaryBase}/stores/${id}/probe`, {
+                        method: "PUT",
+                        headers: secondaryJsonHeaders,
+                        body: JSON.stringify({ value, content_type: "text/plain" }),
+                    });
+                    foreignPutStatus = foreignPut.status;
+                }
+
                 await fetch(`${base}/stores/${id}/probe`, {
                     method: "DELETE",
                     headers: token ? { authorization: `Bearer ${token}` } : {},
@@ -467,9 +517,18 @@ async function main() {
                     value: got.value,
                     listedIds: (listed.stores || []).map(s => s.id),
                     afterDeleteStatus: after.status,
+                    foreignGetStatus,
+                    foreignPutStatus,
                 };
             },
-            { base: API_BASE, token: TOKEN, name: storeName, topic },
+            {
+                base: API_BASE,
+                token: TOKEN,
+                secondaryBase: SECONDARY_API_BASE,
+                secondaryToken: SECONDARY_API_TOKEN,
+                name: storeName,
+                topic,
+            },
         );
         expect(result.id, "store id missing");
         expect(
@@ -480,11 +539,24 @@ async function main() {
             atob(result.value) === "gui-roundtrip-value",
             `store GET round-trip mismatch: ${result.value}`,
         );
+        if (SECONDARY_API_BASE) {
+            expect(
+                result.foreignGetStatus === 404,
+                `foreign daemon GET should be denied/not found, got ${result.foreignGetStatus}`,
+            );
+            expect(
+                result.foreignPutStatus === 404,
+                `foreign daemon PUT should be denied/not found, got ${result.foreignPutStatus}`,
+            );
+        }
         expect(
             result.afterDeleteStatus === 404 || result.afterDeleteStatus === 410,
             `expected 404/410 after delete, got ${result.afterDeleteStatus}`,
         );
-        record("gui-kv-store-roundtrip", "pass");
+        record("gui-kv-store-roundtrip", "pass", {
+            foreignGetStatus: result.foreignGetStatus,
+            foreignPutStatus: result.foreignPutStatus,
+        });
     } catch (e) {
         record("gui-kv-store-roundtrip", "fail", { reason: e.message });
     }
@@ -546,9 +618,10 @@ async function main() {
         record("gui-presence-foaf", "fail", { reason: e.message });
     }
 
-    // Apply-update endpoint (new in this release) — on a same-version
-    // run the daemon should report `applied: false` with a reason. A
-    // 200 response with the right shape is the success criterion.
+    // Apply-update endpoint — the wrapper disables destructive updates, so
+    // this should be a safe 200/no-op with a reason. If run against an
+    // update-enabled daemon and an update exists, the accepted success shape is
+    // 200/applied=true with a deferred restart marker.
     try {
         const result = await page.evaluate(
             async ({ base, token }) => {
@@ -560,15 +633,21 @@ async function main() {
             },
             { base: API_BASE, token: TOKEN },
         );
-        // 200 with applied=false (no upgrade) OR applied=true OR a
-        // graceful failure (e.g. network error fetching manifest in
-        // an offline test env) all prove the endpoint is reachable.
-        // We accept 200 / 500 — but body must include `ok`.
         expect(
-            (result.status === 200 || result.status === 500)
-                && typeof result.body.ok === "boolean",
+            result.status === 200 && result.body && result.body.ok === true,
             `upgrade/apply unexpected response: ${result.status} ${JSON.stringify(result.body)}`,
         );
+        if (result.body.applied === true) {
+            expect(
+                typeof result.body.version === "string" && result.body.restart_scheduled === true,
+                `upgrade/apply applied shape invalid: ${JSON.stringify(result.body)}`,
+            );
+        } else {
+            expect(
+                result.body.applied === false && typeof result.body.reason === "string",
+                `upgrade/apply no-op shape invalid: ${JSON.stringify(result.body)}`,
+            );
+        }
         record("gui-upgrade-apply", "pass", { body: result.body });
     } catch (e) {
         record("gui-upgrade-apply", "fail", { reason: e.message });

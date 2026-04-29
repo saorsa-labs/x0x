@@ -18,6 +18,8 @@ pub struct AutoApplyUpgrader {
     binary_name: String,
     /// Exit cleanly for service manager restart instead of spawning new process.
     stop_on_upgrade: bool,
+    /// Whether a successful apply should immediately restart/exec.
+    restart_on_success: bool,
 }
 
 impl AutoApplyUpgrader {
@@ -25,12 +27,32 @@ impl AutoApplyUpgrader {
         Self {
             binary_name: binary_name.to_string(),
             stop_on_upgrade: false,
+            restart_on_success: true,
         }
     }
 
     pub fn with_stop_on_upgrade(mut self, stop: bool) -> Self {
         self.stop_on_upgrade = stop;
         self
+    }
+
+    /// Configure whether a successful apply should immediately restart/exec.
+    ///
+    /// HTTP handlers should set this to `false`, return their response, then
+    /// restart asynchronously so clients can observe the apply result.
+    pub fn with_restart_on_success(mut self, restart: bool) -> Self {
+        self.restart_on_success = restart;
+        self
+    }
+
+    /// Restart the current binary using the configured restart mode.
+    ///
+    /// On Unix this may replace the current process with `exec()` and will not
+    /// return if the exec succeeds.
+    pub fn restart_current_binary(&self) -> Result<(), UpgradeError> {
+        let target_path = current_binary_path()?;
+        self.trigger_restart(&target_path);
+        Ok(())
     }
 
     /// Apply an upgrade from a `ReleaseManifest`.
@@ -41,7 +63,7 @@ impl AutoApplyUpgrader {
     /// 4. Download and verify ML-DSA-65 signature on archive (authenticity)
     /// 5. Extract binary from archive
     /// 6. Replace current binary with backup/rollback
-    /// 7. Trigger restart
+    /// 7. Optionally trigger restart
     pub async fn apply_upgrade_from_manifest(
         &self,
         manifest: &ReleaseManifest,
@@ -136,7 +158,9 @@ impl AutoApplyUpgrader {
                 "Successfully upgraded to version {}",
                 target_version
             );
-            self.trigger_restart(&target_path);
+            if self.restart_on_success {
+                self.trigger_restart(&target_path);
+            }
         }
 
         Ok(result)

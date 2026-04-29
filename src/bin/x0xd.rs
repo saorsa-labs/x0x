@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tokio::signal;
-use tokio::sync::{broadcast, mpsc, watch, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 #[cfg(feature = "profile-heap")]
 #[global_allocator]
@@ -424,6 +424,10 @@ struct AppState {
     shutdown_tx: mpsc::Sender<()>,
     /// Broadcasts daemon shutdown so long-lived SSE/WS connections can close.
     shutdown_notify: watch::Sender<bool>,
+    /// Update configuration honored by manual API-triggered update checks.
+    update_config: DaemonUpdateConfig,
+    /// Serializes all destructive binary replacement attempts.
+    upgrade_apply_lock: Arc<Mutex<()>>,
     /// API bearer token for authenticating local clients.
     api_token: String,
 }
@@ -1251,6 +1255,8 @@ async fn main() -> Result<()> {
         transfers_dir: config.data_dir.join("transfers"),
         shutdown_tx,
         shutdown_notify,
+        update_config: config.update.clone(),
+        upgrade_apply_lock: Arc::new(Mutex::new(())),
         api_token,
     });
 
@@ -1355,8 +1361,15 @@ async fn main() -> Result<()> {
         let update_config = config.update.clone();
         let agent_for_gossip = Arc::clone(&state.agent);
         let data_dir = config.data_dir.clone();
+        let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         tokio::spawn(async move {
-            run_gossip_update_listener(agent_for_gossip, update_config, data_dir).await;
+            run_gossip_update_listener(
+                agent_for_gossip,
+                update_config,
+                data_dir,
+                upgrade_apply_lock,
+            )
+            .await;
         });
     }
 
@@ -1383,8 +1396,15 @@ async fn main() -> Result<()> {
         let update_config = config.update.clone();
         let agent_for_poll = Arc::clone(&state.agent);
         let data_dir_for_poll = config.data_dir.clone();
+        let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         tokio::spawn(async move {
-            run_fallback_github_poll(agent_for_poll, update_config, data_dir_for_poll).await;
+            run_fallback_github_poll(
+                agent_for_poll,
+                update_config,
+                data_dir_for_poll,
+                upgrade_apply_lock,
+            )
+            .await;
         });
     }
 
@@ -2466,6 +2486,7 @@ async fn run_gossip_update_listener(
     agent: Arc<Agent>,
     config: DaemonUpdateConfig,
     data_dir: PathBuf,
+    upgrade_apply_lock: Arc<Mutex<()>>,
 ) {
     let mut release_sub = match agent.subscribe(RELEASE_TOPIC).await {
         Ok(sub) => sub,
@@ -2568,6 +2589,7 @@ async fn run_gossip_update_listener(
             "Applying upgrade immediately"
         );
 
+        let _upgrade_guard = upgrade_apply_lock.lock().await;
         let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
             .with_stop_on_upgrade(config.stop_on_upgrade);
         match upgrader.apply_upgrade_from_manifest(&manifest).await {
@@ -2595,6 +2617,7 @@ async fn run_fallback_github_poll(
     agent: Arc<Agent>,
     config: DaemonUpdateConfig,
     data_dir: PathBuf,
+    upgrade_apply_lock: Arc<Mutex<()>>,
 ) {
     let interval = Duration::from_secs(config.fallback_check_interval_minutes * 60);
     let mut ticker = tokio::time::interval(interval);
@@ -2670,6 +2693,7 @@ async fn run_fallback_github_poll(
                     }
                 });
 
+                let _upgrade_guard = upgrade_apply_lock.lock().await;
                 let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
                     .with_stop_on_upgrade(config.stop_on_upgrade);
                 match upgrader
@@ -10918,21 +10942,30 @@ async fn get_constitution_json() -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 /// GET /upgrade — check for available updates.
-async fn check_upgrade(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    let monitor = match x0x::upgrade::monitor::UpgradeMonitor::new(
-        "saorsa-labs/x0x",
-        "x0xd",
-        env!("CARGO_PKG_VERSION"),
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!("upgrade monitor creation failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "upgrade check unavailable" })),
-            );
-        }
-    };
+async fn check_upgrade(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if !state.update_config.enabled {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "update_available": false,
+                "current_version": env!("CARGO_PKG_VERSION"),
+                "reason": "updates disabled"
+            })),
+        );
+    }
+
+    let monitor =
+        match UpgradeMonitor::new(&state.update_config.repo, "x0xd", env!("CARGO_PKG_VERSION")) {
+            Ok(m) => m.with_include_prereleases(state.update_config.include_prereleases),
+            Err(e) => {
+                tracing::error!("upgrade monitor creation failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "ok": false, "error": "upgrade check unavailable" })),
+                );
+            }
+        };
 
     match monitor.check_for_updates().await {
         Ok(Some(release)) => (
@@ -10964,31 +10997,49 @@ async fn check_upgrade(State(_state): State<Arc<AppState>>) -> impl IntoResponse
 
 /// POST /upgrade/apply — fetch the latest signed manifest and apply it.
 ///
-/// On a same-version run the monitor returns `None` and the handler
-/// reports `applied: false` with `reason: "no upgrade available"`.
-/// When a newer manifest is available the handler downloads the
-/// archive, verifies the SHA-256 + ML-DSA-65 signature, and performs
-/// the atomic binary swap via `apply_upgrade_from_manifest`. On a
-/// successful swap the daemon will be restarted by its supervisor on
-/// next start; the handler returns 200 with the new version.
-///
-/// This is the GUI-driven manual apply path. Background gossip-driven
-/// apply continues to run independently in the daemon's update loop.
-async fn apply_upgrade(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    let monitor = match x0x::upgrade::monitor::UpgradeMonitor::new(
-        "saorsa-labs/x0x",
-        "x0xd",
-        env!("CARGO_PKG_VERSION"),
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!("upgrade monitor creation failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "upgrade monitor unavailable" })),
-            );
-        }
+/// On a same-version run the monitor returns `None` and the handler reports
+/// `applied: false` with `reason: "no upgrade available"`. When a newer
+/// manifest is available, this handler serializes the destructive apply with
+/// the background update workers, performs the verified binary swap, returns a
+/// JSON result, then schedules restart/exec after the response has a chance to
+/// flush.
+async fn apply_upgrade(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if !state.update_config.enabled {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "applied": false,
+                "reason": "updates disabled",
+                "current_version": env!("CARGO_PKG_VERSION")
+            })),
+        );
+    }
+
+    let Ok(_upgrade_guard) = state.upgrade_apply_lock.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "applied": false,
+                "error": "upgrade already in progress"
+            })),
+        );
     };
+
+    let monitor =
+        match UpgradeMonitor::new(&state.update_config.repo, "x0xd", env!("CARGO_PKG_VERSION")) {
+            Ok(m) => m.with_include_prereleases(state.update_config.include_prereleases),
+            Err(e) => {
+                tracing::error!("upgrade monitor creation failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        serde_json::json!({ "ok": false, "error": "upgrade monitor unavailable" }),
+                    ),
+                );
+            }
+        };
 
     let release = match monitor.check_for_updates().await {
         Ok(Some(r)) => r,
@@ -11012,20 +11063,28 @@ async fn apply_upgrade(State(_state): State<Arc<AppState>>) -> impl IntoResponse
         }
     };
 
-    let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd");
+    let stop_on_upgrade = state.update_config.stop_on_upgrade;
+    let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
+        .with_stop_on_upgrade(stop_on_upgrade)
+        .with_restart_on_success(false);
+
     match upgrader
         .apply_upgrade_from_manifest(&release.manifest)
         .await
     {
-        Ok(x0x::upgrade::UpgradeResult::Success { version }) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "applied": true,
-                "version": version,
-                "previous_version": env!("CARGO_PKG_VERSION")
-            })),
-        ),
+        Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+            schedule_restart_after_response(stop_on_upgrade);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": true,
+                    "version": version,
+                    "previous_version": env!("CARGO_PKG_VERSION"),
+                    "restart_scheduled": true
+                })),
+            )
+        }
         Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -11055,6 +11114,17 @@ async fn apply_upgrade(State(_state): State<Arc<AppState>>) -> impl IntoResponse
             )
         }
     }
+}
+
+fn schedule_restart_after_response(stop_on_upgrade: bool) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
+            .with_stop_on_upgrade(stop_on_upgrade);
+        if let Err(e) = upgrader.restart_current_binary() {
+            tracing::error!(error = %e, "failed to restart after manual upgrade apply");
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

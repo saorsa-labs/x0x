@@ -50,18 +50,18 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 ### Identity
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
-| Get agent id / card | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
-| Import agent card | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
+| Get agent id / card | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| Import agent card | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Export/backup keypairs | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | — |
-| User (human) identity (opt-in) | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | — |
+| User (human) identity (opt-in) | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | ✅ | — |
 | Agent certificate verify | ✅ | ✅ | — | ✅ | ✅ | ✅ | — | — | — |
 
 ### Trust & contacts
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
-| Add / block / trust contact | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
-| Machine-pinning enforcement | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
-| Trust evaluator decision read | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | — |
+| Add / block / trust contact | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| Machine-pinning enforcement | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| Trust evaluator decision read | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | — |
 
 ### Connectivity / discovery
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
@@ -70,10 +70,10 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Probe peer liveness (**0.27.2 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
 | Connection health snapshot (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
 | Peer lifecycle subscription (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
-| Discover agents (cache / FOAF) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
+| Discover agents (cache / FOAF) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
 | `GET /diagnostics/connectivity` | ✅ | ✅ | ✅ | — | — | ✅ | — | — | — |
 | `GET /diagnostics/gossip` (this release) | ✅ | ✅ | ✅ | — | — | ✅ | — | — | — |
-| Four-word network bootstrap | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | 🟡 | — |
+| Four-word network bootstrap | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
 
 ### Messaging — pub/sub
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
@@ -97,16 +97,16 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 |---|---|---|---|---|---|---|---|---|---|
 | Create named group | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Invite / join / leave | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| Policy (roles, bans) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | 🟡 | 🟡 | — |
-| Discover groups (tag / nearby) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | 🟡 | 🟡 | — |
+| Policy (roles, bans) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 | — |
+| Discover groups (tag / nearby) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 | — |
 | MLS encryption | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 
 ### KV store
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
-| Create / list stores | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
-| PUT / GET / DELETE key | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
-| Access-policy enforcement | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | ✅ | — |
+| Create / list stores | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| PUT / GET / DELETE key | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| Access-policy enforcement | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 
 ### Task lists (CRDT)
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
@@ -120,7 +120,7 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
 | Online list | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| FOAF walk | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | 🟡 | 🟡 | — |
+| FOAF walk | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 | — |
 | Find specific agent | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Status / reachability | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
 | Events SSE | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
@@ -128,8 +128,8 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 ### Upgrade / self-update
 | Capability | REST | CLI | GUI | Py | Node | x0x-client | Dioxus | Apple | Kanban |
 |---|---|---|---|---|---|---|---|---|---|
-| Check updates | ✅ | ✅ | ✅ | — | — | ✅ | 🟡 | ✅ (Sparkle) | — |
-| Apply update | ✅ | ✅ | ✅ | — | — | 🟡 | 🟡 | ✅ (Sparkle) | — |
+| Check updates | ✅ | ✅ | ✅ | — | — | ✅ | ✅ | ✅ (Sparkle) | — |
+| Apply update | ✅ | ✅ | ✅ | — | — | 🟡 | ✅ | ✅ (Sparkle) | — |
 | Gossip manifest propagation | ✅ | — | — | — | — | 🟡 | — | — | — |
 
 ---
@@ -190,30 +190,35 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 7. **x0x GUI — broad 🟡 cleanup** ✅ closed 2026-04-28. Audit
    established that the matrix's remaining GUI 🟡s mostly reflected
    harness gaps, not missing UI. Closed cells:
-   - `Trust & contacts / Machine-pinning enforcement` — already wired
-     in `renderPeople` detail panel via `togglePin`. New harness
-     assertion `gui-machine-pinning` round-trips through
-     `POST /contacts/:id/machines`, `…/pin`, then asserts `pinned: true`
-     comes back from `GET /contacts/:id/machines`.
-   - `Trust & contacts / Trust evaluator decision read` — already
-     wired in the same panel via `/trust/evaluate`. Harness assertion
-     `gui-trust-evaluator` blocks a contact and asserts the decision
-     contains `Reject` / `Blocked`.
-   - `KV store / Access-policy enforcement` — wired through Spaces.
-     Harness assertion `gui-kv-store-roundtrip` exercises the full
-     CRUD plus a delete-then-GET 404 negative.
+   - `Trust & contacts / Machine-pinning enforcement` — wired in
+     `renderPeople` detail panel via `togglePin`. Harness assertion
+     `gui-machine-pinning` round-trips through
+     `POST /contacts/:id/machines`, `…/pin`, asserts `pinned: true`
+     from `GET /contacts/:id/machines`, then calls `/trust/evaluate`
+     with an unpinned machine and requires `RejectMachineMismatch`.
+   - `Trust & contacts / Trust evaluator decision read` — wired in the
+     Admin → Trust Evaluation panel via `/trust/evaluate`. Harness
+     assertion `gui-trust-evaluator` blocks a contact and asserts the
+     decision contains `Reject` / `Blocked` from the GUI page origin.
+   - `KV store / Access-policy enforcement` — wired through Spaces/Admin
+     KV surfaces. Harness assertion `gui-kv-store-roundtrip` exercises
+     CRUD, delete-then-GET 404, and a secondary-daemon negative proof:
+     a foreign daemon cannot GET/PUT the primary daemon's private store id.
    - `Groups / Discover groups (tag/nearby)` — wired in
      `renderDiscover`. Harness assertion `gui-group-discover` drives
      both `/groups/discover?q=` and `/groups/discover/nearby`.
    - `Presence / FOAF walk` — already wired ("Run FOAF walk" button
      in `renderPresence`). Harness assertion `gui-presence-foaf`
      calls `/presence/foaf?ttl=2` and asserts the response shape.
-   - `Upgrade / Apply update` — **new endpoint** `POST /upgrade/apply`
-     in `src/bin/x0xd.rs` (calls `UpgradeMonitor::check_for_updates`
-     then `AutoApplyUpgrader::apply_upgrade_from_manifest`). New
-     "Apply update" button in the home-view upgrade banner. Harness
-     assertion `gui-upgrade-apply` accepts `applied: true` (real
-     upgrade) or `applied: false` with a `reason` (no-op same-version).
+   - `Upgrade / Apply update` — endpoint `POST /upgrade/apply` in
+     `src/bin/x0xd.rs` honors daemon update config, serializes binary
+     replacement with the background update workers, applies without
+     immediate `exec()`, returns JSON, then schedules restart after the
+     response has a chance to flush. New "Apply update" button in the
+     home-view upgrade banner. Harness assertion `gui-upgrade-apply`
+     requires HTTP 200 with either `applied: true` + `restart_scheduled`
+     or `applied: false` with a `reason` (the wrapper disables updates
+     for a safe no-op proof).
    - **Deferral**: `Identity / Export keypairs` left at 🟡 — exporting
      ML-DSA-65 private key material via HTTP needs a design doc on
      confirmation flow and at-rest encryption format. Tracked as a
@@ -222,11 +227,46 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
      non-CLI surfaces — `GET /agent/user-id` exists for read, but
      opt-in is filesystem-based (`~/.x0x/user.key`). A REST opt-in
      surface needs a key-generation + consent design doc.
-   New harness wrapper `tests/e2e_gui_chrome.sh` boots a temp daemon
-   on ephemeral ports and runs `e2e_gui_chrome.mjs` end-to-end; proof
-   bundle lands in `proofs/gui-parity-YYYYMMDDTHHMMSSZ/` (chrome HAR,
-   console log, screenshot, parity-report JSON, daemon log).
-8. **Bench / kanban** — historical parity gaps; tracked but out of scope
+   New harness wrapper `tests/e2e_gui_chrome.sh` boots temp primary +
+   secondary daemons on ephemeral ports and runs `e2e_gui_chrome.mjs`
+   end-to-end; proof bundle lands in `proofs/gui-parity-YYYYMMDDTHHMMSSZ/`
+   (chrome HAR, console log, screenshot, parity-report JSON, daemon logs).
+   Latest fix proof: `proofs/gui-parity-fix-20260428T215315Z/`.
+8. **Communitas Dioxus — broad 🟡 cleanup** ✅ closed 2026-04-29 by
+   the parallel Dioxus stream. New `tests/e2e/` scaffold in
+   `../communitas/communitas-dioxus/` boots two `x0x-test-harness::
+   DaemonFixture` instances and launches the real Dioxus binary in
+   `e2e-test-mode` (feature-gated, `COMMUNITAS_TEST_MODE=1`); each
+   row test drives JSON commands through the binary, which calls the
+   typed `communitas-x0x-client` surface used by the UI. Closed Dioxus
+   cells (15):
+   - Identity: get agent id/card, import agent card, user identity
+     (opt-in, read path)
+   - Trust & contacts: add/block/trust contact, machine pinning,
+     trust evaluator decision read
+   - Connectivity: discover agents (cache/FOAF), four-word network
+     bootstrap
+   - Groups: policy (roles/bans), discover (tag/nearby)
+   - KV store: create/list, PUT/GET/DELETE, access-policy
+     enforcement (foreign-daemon negative proof)
+   - Presence: FOAF walk
+   - Upgrade: check updates, apply update (raw `POST /upgrade/apply`
+     bridge — typed `X0xClient::apply_upgrade` follow-up tracked in
+     `communitas-dioxus/PARITY_EVIDENCE.md`)
+   - **Deferral**: `Identity / Export keypairs` left at 🟡 — same
+     reason as ticket #7 (no `communitas-x0x-client` method; needs
+     consent + at-rest-encryption design doc).
+   Run with `just e2e` from `communitas-dioxus/`. Proof bundle:
+   `communitas-dioxus/proofs/dioxus-parity-YYYYMMDD/{stdout,stderr}.log`.
+   The parallel stream also strengthened this repo's GUI harness:
+   `tests/e2e_gui_chrome.sh` now boots a secondary daemon for real
+   foreign-daemon negative proofs (machine-pin RejectMachineMismatch,
+   KV access-policy denial); `src/bin/x0xd.rs` `apply_upgrade`
+   now serializes through a `Mutex` shared with the gossip + GitHub
+   apply paths and defers the binary-replacement restart so the HTTP
+   response can flush; `src/upgrade/apply.rs` exposes
+   `with_restart_on_success(false)` + `restart_current_binary()`.
+9. **Bench / kanban** — historical parity gaps; tracked but out of scope
    until usage warrants.
 
 ---
