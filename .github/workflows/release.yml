@@ -510,6 +510,240 @@ jobs:
             No winners, no losers - just cooperation.
 
   # ============================================================
+  # Publish SKILL.md to ClawHub/OpenClaw
+  # ============================================================
+  publish-clawhub:
+    name: Publish SKILL.md to ClawHub
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: create-release
+    runs-on: ubuntu-latest
+    env:
+      CLAWHUB_REGISTRY: https://clawhub.ai
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Require ClawHub token
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          if [ -z "$CLAWHUB_TOKEN" ]; then
+            echo "::error::CLAWHUB_TOKEN secret is required to publish x0x to ClawHub"
+            exit 1
+          fi
+
+      - name: Verify ClawHub token
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          node - <<'NODE'
+          (async () => {
+            const registry = process.env.CLAWHUB_REGISTRY;
+            const token = process.env.CLAWHUB_TOKEN;
+
+            const response = await fetch(`${registry}/api/v1/whoami`, {
+              headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+            });
+
+            const body = await response.text();
+            console.log(body);
+            if (!response.ok) {
+              throw new Error(`ClawHub token validation failed with status ${response.status}`);
+            }
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Resolve ClawHub publish mode
+        run: |
+          latest_tag="$(git tag --list | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          if [ -z "$latest_tag" ]; then
+            echo "::error::Could not resolve the newest semver tag for ClawHub publish gating"
+            exit 1
+          fi
+
+          # Only the newest semver tag is allowed to move ClawHub's `latest`
+          # pointer automatically. Older tag reruns stay verify-only so a
+          # delayed backfill or manual rerun cannot move the live listing
+          # backward by accident. Backfilling an older missing version remains
+          # an explicit manual publish instead of part of this automatic path.
+          if [ "${GITHUB_REF_NAME}" = "$latest_tag" ]; then
+            echo "CLAWHUB_PUBLISH_MODE=latest" >> "$GITHUB_ENV"
+            echo "CLAWHUB_SHOULD_PUBLISH=true" >> "$GITHUB_ENV"
+          else
+            echo "CLAWHUB_PUBLISH_MODE=selected" >> "$GITHUB_ENV"
+            echo "CLAWHUB_SHOULD_PUBLISH=false" >> "$GITHUB_ENV"
+            echo "::notice::Skipping live ClawHub publish for ${GITHUB_REF_NAME}; newest repo tag is $latest_tag. Verification will only check that this version exists and has completed security scanning."
+          fi
+
+      - name: Publish tagged SKILL.md via ClawHub API
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          if [ "${CLAWHUB_SHOULD_PUBLISH:-false}" != "true" ]; then
+            echo "ClawHub publish skipped for ${GITHUB_REF_NAME}; verify-only mode is active."
+            exit 0
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          export VERSION
+
+          node - <<'NODE'
+          (async () => {
+            const fs = require('node:fs');
+            const path = require('node:path');
+
+            const registry = process.env.CLAWHUB_REGISTRY;
+            const token = process.env.CLAWHUB_TOKEN;
+            const version = process.env.VERSION;
+            const skillPath = path.join(process.cwd(), 'SKILL.md');
+            const skillBytes = fs.readFileSync(skillPath);
+
+            const payload = {
+              slug: 'x0x',
+              displayName: 'x0x',
+              version,
+              changelog: `Update x0x to v${version}.`,
+              acceptLicenseTerms: true,
+              tags: ['latest'],
+            };
+
+            const form = new FormData();
+            form.set('payload', JSON.stringify(payload));
+            form.append('files', new Blob([skillBytes], { type: 'text/markdown' }), 'SKILL.md');
+
+            // The skill source of truth remains SKILL.md in the repo root.
+            // We upload that file directly via the ClawHub API instead of going
+            // through the CLI's folder-based publish contract, which avoids both
+            // temporary bundle staging and passing the token on the command line.
+            // Publish only after the GitHub release job has succeeded so the
+            // SKILL.md install metadata can point at already-uploaded release assets.
+            const response = await fetch(`${registry}/api/v1/skills`, {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              body: form,
+            });
+
+            const body = await response.text();
+            console.log(body);
+
+            if (response.ok) {
+              return;
+            }
+
+            if (response.status === 409 || /already exists/i.test(body)) {
+              console.log(`::notice::ClawHub already has x0x@${version}; continuing to verification`);
+              return;
+            }
+
+            throw new Error(`ClawHub publish failed with status ${response.status}`);
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Verify published version after security scan
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          export VERSION
+
+          node - <<'NODE'
+          (async () => {
+            const registry = process.env.CLAWHUB_REGISTRY;
+            const token = process.env.CLAWHUB_TOKEN;
+            const version = process.env.VERSION;
+            const mode = process.env.CLAWHUB_PUBLISH_MODE || 'latest';
+
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const expectedDescription =
+              mode === 'selected'
+                ? `version ${version} with completed security scan`
+                : `latest=${version} with completed security scan`;
+
+            for (let attempt = 1; attempt <= 20; attempt += 1) {
+              const versionResponse = await fetch(
+                `${registry}/api/v1/skills/x0x/versions/${encodeURIComponent(version)}`,
+                {
+                  headers: {
+                    Accept: 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                },
+              );
+
+              const versionBodyText = await versionResponse.text();
+              console.log(`attempt ${attempt}: version status=${versionResponse.status}`);
+              console.log(versionBodyText);
+
+              let versionJson = null;
+              let observedVersion = null;
+              let scanComplete = false;
+              if (versionResponse.ok) {
+                versionJson = JSON.parse(versionBodyText);
+                observedVersion = versionJson?.version?.version ?? null;
+                scanComplete = versionJson?.version?.security?.hasScanResult === true;
+              }
+
+              let latestMatches = mode !== 'latest';
+              if (mode === 'latest') {
+                const latestResponse = await fetch(`${registry}/api/v1/skills/x0x`, {
+                  headers: {
+                    Accept: 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                });
+
+                const latestBodyText = await latestResponse.text();
+                console.log(`attempt ${attempt}: latest status=${latestResponse.status}`);
+                console.log(latestBodyText);
+
+                if (latestResponse.ok) {
+                  const latestJson = JSON.parse(latestBodyText);
+                  latestMatches = latestJson?.latestVersion?.version === version;
+                }
+              }
+
+              if (observedVersion === version && latestMatches && scanComplete) {
+                if (mode === 'selected') {
+                  console.log(`::notice::ClawHub already contains x0x@${version}`);
+                } else {
+                  console.log(`::notice::ClawHub latest version is now ${version}`);
+                }
+                return;
+              }
+
+              if (attempt < 20) {
+                console.log(
+                  `attempt ${attempt}: ClawHub has not exposed ${expectedDescription} yet; retrying in 15s`,
+                );
+                await sleep(15_000);
+              }
+            }
+
+            throw new Error(`ClawHub did not report ${expectedDescription} within 5 minutes`);
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+  # ============================================================
   # Publish to crates.io
   # ============================================================
   publish-crates:
