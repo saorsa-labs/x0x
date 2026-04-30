@@ -518,9 +518,7 @@ jobs:
     needs: create-release
     runs-on: ubuntu-latest
     env:
-      CLAWHUB_SITE: https://clawhub.ai
       CLAWHUB_REGISTRY: https://clawhub.ai
-      CLAWHUB_CONFIG_PATH: ${{ runner.temp }}/clawhub-config.json
     steps:
       - uses: actions/checkout@v5
         with:
@@ -539,19 +537,36 @@ jobs:
             exit 1
           fi
 
-      - name: Install ClawHub CLI
-        run: npm install -g clawhub@0.12.0
-
-      - name: Authenticate ClawHub CLI
+      - name: Verify ClawHub token
         env:
           CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
         run: |
-          clawhub login --token "$CLAWHUB_TOKEN" --no-browser
-          clawhub whoami
+          node - <<'NODE'
+          (async () => {
+            const registry = process.env.CLAWHUB_REGISTRY;
+            const token = process.env.CLAWHUB_TOKEN;
+
+            const response = await fetch(`${registry}/api/v1/whoami`, {
+              headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+            });
+
+            const body = await response.text();
+            console.log(body);
+            if (!response.ok) {
+              throw new Error(`ClawHub token validation failed with status ${response.status}`);
+            }
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
 
       - name: Resolve ClawHub publish mode
         run: |
-          latest_tag="$(git tag --list 'v*' --sort=-version:refname | /usr/bin/head -n 1)"
+          latest_tag="$(git tag --list | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
           if [ -z "$latest_tag" ]; then
             echo "::error::Could not resolve the newest semver tag for ClawHub publish gating"
             exit 1
@@ -568,78 +583,165 @@ jobs:
           else
             echo "CLAWHUB_PUBLISH_MODE=selected" >> "$GITHUB_ENV"
             echo "CLAWHUB_SHOULD_PUBLISH=false" >> "$GITHUB_ENV"
-            echo "::notice::Skipping live ClawHub publish for ${GITHUB_REF_NAME}; newest repo tag is $latest_tag. Verification will only check that this version already exists."
+            echo "::notice::Skipping live ClawHub publish for ${GITHUB_REF_NAME}; newest repo tag is $latest_tag. Verification will only check that this version exists and has completed security scanning."
           fi
 
-      - name: Publish tagged SKILL.md bundle
+      - name: Publish tagged SKILL.md via ClawHub API
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
         run: |
-          if [ "${CLAWHUB_SHOULD_PUBLISH:-true}" != "true" ]; then
+          if [ "${CLAWHUB_SHOULD_PUBLISH:-false}" != "true" ]; then
             echo "ClawHub publish skipped for ${GITHUB_REF_NAME}; verify-only mode is active."
             exit 0
           fi
 
           VERSION="${GITHUB_REF_NAME#v}"
-          SKILL_BUNDLE="$(mktemp -d "$RUNNER_TEMP/clawhub-skill.XXXXXX")"
+          export VERSION
 
-          # ClawHub skill publish expects a text bundle folder, not the full repo.
-          # We only need the current SKILL.md because it already contains the
-          # release version, frontmatter metadata, and the install instructions
-          # that the ClawHub listing should mirror.
-          cp SKILL.md "$SKILL_BUNDLE/"
+          node - <<'NODE'
+          (async () => {
+            const fs = require('node:fs');
+            const path = require('node:path');
 
-          # Publish only after the GitHub release job has succeeded so the
-          # SKILL.md install metadata can point at already-uploaded release assets.
-          if output="$(clawhub --no-input publish "$SKILL_BUNDLE" \
-            --slug x0x \
-            --name "x0x" \
-            --version "$VERSION" \
-            --changelog "Update x0x to v$VERSION." \
-            --tags latest 2>&1)"; then
-            echo "$output"
-          else
-            status=$?
-            echo "$output"
-            if echo "$output" | grep -qi "already exists"; then
-              echo "::notice::ClawHub already has x0x@$VERSION; continuing to verification"
-            else
-              exit $status
-            fi
-          fi
+            const registry = process.env.CLAWHUB_REGISTRY;
+            const token = process.env.CLAWHUB_TOKEN;
+            const version = process.env.VERSION;
+            const skillPath = path.join(process.cwd(), 'SKILL.md');
+            const skillBytes = fs.readFileSync(skillPath);
+
+            const payload = {
+              slug: 'x0x',
+              displayName: 'x0x',
+              version,
+              changelog: `Update x0x to v${version}.`,
+              acceptLicenseTerms: true,
+              tags: ['latest'],
+            };
+
+            const form = new FormData();
+            form.set('payload', JSON.stringify(payload));
+            form.append('files', new Blob([skillBytes], { type: 'text/markdown' }), 'SKILL.md');
+
+            // The skill source of truth remains SKILL.md in the repo root.
+            // We upload that file directly via the ClawHub API instead of going
+            // through the CLI's folder-based publish contract, which avoids both
+            // temporary bundle staging and passing the token on the command line.
+            // Publish only after the GitHub release job has succeeded so the
+            // SKILL.md install metadata can point at already-uploaded release assets.
+            const response = await fetch(`${registry}/api/v1/skills`, {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              body: form,
+            });
+
+            const body = await response.text();
+            console.log(body);
+
+            if (response.ok) {
+              return;
+            }
+
+            if (response.status === 409 || /already exists/i.test(body)) {
+              console.log(`::notice::ClawHub already has x0x@${version}; continuing to verification`);
+              return;
+            }
+
+            throw new Error(`ClawHub publish failed with status ${response.status}`);
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
 
       - name: Verify published version after security scan
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-            if [ "${CLAWHUB_PUBLISH_MODE:-latest}" = "selected" ]; then
-              inspect_cmd=(clawhub inspect x0x --version "$VERSION")
-              expected_line="Selected: $VERSION"
-            else
-              inspect_cmd=(clawhub inspect x0x)
-              expected_line="Latest: $VERSION"
-            fi
+          export VERSION
 
-            if output="$("${inspect_cmd[@]}" 2>&1)"; then
-              status=0
-            else
-              status=$?
-            fi
-            echo "$output"
+          node - <<'NODE'
+          (async () => {
+            const registry = process.env.CLAWHUB_REGISTRY;
+            const token = process.env.CLAWHUB_TOKEN;
+            const version = process.env.VERSION;
+            const mode = process.env.CLAWHUB_PUBLISH_MODE || 'latest';
 
-            if [ $status -eq 0 ] && echo "$output" | grep -q "$expected_line"; then
-              if [ "${CLAWHUB_PUBLISH_MODE:-latest}" = "selected" ]; then
-                echo "::notice::ClawHub already contains x0x@$VERSION"
-              else
-                echo "::notice::ClawHub latest version is now $VERSION"
-              fi
-              exit 0
-            fi
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const expectedDescription =
+              mode === 'selected'
+                ? `version ${version} with completed security scan`
+                : `latest=${version} with completed security scan`;
 
-            echo "attempt $attempt: ClawHub has not exposed '$expected_line' yet; retrying in 15s"
-            sleep 15
-          done
+            for (let attempt = 1; attempt <= 20; attempt += 1) {
+              const versionResponse = await fetch(
+                `${registry}/api/v1/skills/x0x/versions/${encodeURIComponent(version)}`,
+                {
+                  headers: {
+                    Accept: 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                },
+              );
 
-          echo "::error::ClawHub did not report '$expected_line' within 5 minutes"
-          exit 1
+              const versionBodyText = await versionResponse.text();
+              console.log(`attempt ${attempt}: version status=${versionResponse.status}`);
+              console.log(versionBodyText);
+
+              let versionJson = null;
+              let observedVersion = null;
+              let scanComplete = false;
+              if (versionResponse.ok) {
+                versionJson = JSON.parse(versionBodyText);
+                observedVersion = versionJson?.version?.version ?? null;
+                scanComplete = versionJson?.version?.security?.hasScanResult === true;
+              }
+
+              let latestMatches = mode !== 'latest';
+              if (mode === 'latest') {
+                const latestResponse = await fetch(`${registry}/api/v1/skills/x0x`, {
+                  headers: {
+                    Accept: 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                });
+
+                const latestBodyText = await latestResponse.text();
+                console.log(`attempt ${attempt}: latest status=${latestResponse.status}`);
+                console.log(latestBodyText);
+
+                if (latestResponse.ok) {
+                  const latestJson = JSON.parse(latestBodyText);
+                  latestMatches = latestJson?.latestVersion?.version === version;
+                }
+              }
+
+              if (observedVersion === version && latestMatches && scanComplete) {
+                if (mode === 'selected') {
+                  console.log(`::notice::ClawHub already contains x0x@${version}`);
+                } else {
+                  console.log(`::notice::ClawHub latest version is now ${version}`);
+                }
+                return;
+              }
+
+              if (attempt < 20) {
+                console.log(
+                  `attempt ${attempt}: ClawHub has not exposed ${expectedDescription} yet; retrying in 15s`,
+                );
+                await sleep(15_000);
+              }
+            }
+
+            throw new Error(`ClawHub did not report ${expectedDescription} within 5 minutes`);
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
 
   # ============================================================
   # Publish to crates.io
