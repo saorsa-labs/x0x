@@ -1301,12 +1301,21 @@ NEW_COUNT=$(jf "$R" "count")
 
 # Dedicated live C.2 proof suite: shard-only nearby witness,
 # late-subscriber AE repair, LTC delivery/privacy, and restart persistence.
-C2_LIVE_OUT=$(cd "$ROOT" && cargo test --test named_group_c2_live -- --ignored --nocapture 2>&1 || true)
-if echo "$C2_LIVE_OUT" | grep -q 'test result: ok'; then
+#
+# We stream cargo's output to a temp file rather than capturing via $(...)
+# because cargo test's interleaved build progress + test output has
+# previously confused bash command substitution and hidden the
+# "test result: ok" line — see proofs/full-suite-20260429T214746Z/01-local
+# for the original flake (4/4 pass standalone, 1/98 fail under harness).
+C2_LIVE_LOG="$(mktemp -t x0x-c2-live-XXXXXX.log)"
+( cd "$ROOT" && cargo test --test named_group_c2_live -- --ignored --nocapture ) \
+  >"$C2_LIVE_LOG" 2>&1 || true
+if grep -q 'test result: ok' "$C2_LIVE_LOG"; then
   ok "C.2: live proof suite passes (nearby + AE repair + LTC + restart)"
 else
-  fail "C.2: live proof suite" "$C2_LIVE_OUT"
+  fail "C.2: live proof suite" "$(tail -40 "$C2_LIVE_LOG")"
 fi
+rm -f "$C2_LIVE_LOG"
 
 # ListedToContacts privacy guarantee: a ListedToContacts group must NOT
 # leak to public tag/name/id shards even when bob has the matching

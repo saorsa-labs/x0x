@@ -230,8 +230,17 @@ impl DirectMessaging {
     /// Create a new DirectMessaging instance.
     #[must_use]
     pub fn new() -> Self {
-        let (message_tx, _) = broadcast::channel(256);
-        let (internal_tx, internal_rx) = mpsc::channel(256);
+        // Buffer sized for sustained file-chunk traffic. Previous 256 was
+        // sufficient for chat-style DMs but tokio::sync::broadcast silently
+        // drops the oldest messages from any receiver that lags by more than
+        // the buffer — which is exactly what happened during the 100M
+        // file-transfer regression on 2026-04-30 (only 17 MB / ~543 chunks
+        // of a 100 MB / 3200-chunk transfer reached the receiver before the
+        // sender finished its burst). The fix proper is windowed application
+        // ACK (see `FileMessage::ChunkAck` in src/files/mod.rs); this larger
+        // buffer is defense in depth for any other bursty subscriber.
+        let (message_tx, _) = broadcast::channel(8192);
+        let (internal_tx, internal_rx) = mpsc::channel(8192);
 
         Self {
             machine_to_agent: Arc::new(RwLock::new(HashMap::new())),

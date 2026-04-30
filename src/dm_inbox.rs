@@ -21,10 +21,6 @@ use tokio::task::JoinHandle;
 
 const ACK_ENVELOPE_LIFETIME_MS: u64 = 60_000;
 
-/// Key = (sender agent_id, request_id) → last-seen instant.
-/// Used by `InboxPipeline` for per-(sender, request) epidemic-rebroadcast dedup.
-type RebroadcastDedupMap = std::collections::HashMap<([u8; 32], [u8; 16]), std::time::Instant>;
-
 #[derive(Debug, Clone, Default)]
 pub struct DmInboxConfig {
     /// If true, trust-policy rejections do NOT emit an ACK.
@@ -38,10 +34,14 @@ pub struct DmInboxService {
 
 /// Shared DM transport topic. Every gossip-DM-capable agent subscribes
 /// here. Recipients filter by `envelope.recipient_agent_id`; non-
-/// recipients re-broadcast (with time-windowed dedup) so the envelope
-/// floods the mesh even when individual nodes have sparse PlumTree
-/// trees. Payload stays confidential via ML-KEM-768 encryption —
-/// non-recipients can't decrypt even though they see the envelope.
+/// recipients observe only encrypted metadata/payload and do not process it.
+///
+/// The shared bus keeps topic membership simple, but application-level
+/// re-broadcast is intentionally avoided: `PubSubManager::publish()` signs
+/// each hop with the local agent id, while the DM envelope signature is bound
+/// to the origin agent id. Re-publishing an origin envelope from a relay would
+/// make the outer PubSub sender differ from `envelope.sender_agent_id`, so
+/// downstream receivers would reject it and the fleet would only gain load.
 pub const DM_BUS_TOPIC: &str = "x0x/dm/v1/bus";
 
 impl DmInboxService {
@@ -79,7 +79,6 @@ impl DmInboxService {
             inflight,
             cache,
             silent_reject: config.silent_reject,
-            rebroadcast_state: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         };
 
         let topic_for_task = topic.clone();
@@ -121,14 +120,10 @@ struct InboxPipeline {
     inflight: Arc<InFlightAcks>,
     cache: Arc<RecentDeliveryCache>,
     silent_reject: bool,
-    /// Per-(sender, request_id) dedup for epidemic re-broadcast on the
-    /// shared DM bus. See comment in `handle_incoming`.
-    rebroadcast_state: tokio::sync::Mutex<RebroadcastDedupMap>,
 }
 
 impl InboxPipeline {
     async fn handle_incoming(&self, msg: PubSubMessage) {
-        let raw_payload = msg.payload.clone();
         let (pubsub_sender, sender_pubkey) = match (msg.sender, msg.sender_public_key.as_deref()) {
             (Some(s), Some(pk)) if msg.verified => (s, pk.to_vec()),
             _ => return,
@@ -156,37 +151,6 @@ impl InboxPipeline {
         .is_err()
         {
             return;
-        }
-
-        // Epidemic re-broadcast to close the mesh-convergence gap.
-        // Every node on the shared `x0x/dm/v1/bus` topic re-publishes
-        // verified-sender envelopes with a 20 s per-(sender, request_id)
-        // dedup window. This floods envelopes across bootstrap meshes
-        // even when PlumTree trees are sparse. Non-recipients can't
-        // decrypt the payload (ML-KEM-768) so payload confidentiality
-        // is preserved; only envelope metadata is visible.
-        if envelope.sender_agent_id != *self.self_agent_id.as_bytes() {
-            let mut guard = self.rebroadcast_state.lock().await;
-            let key = (envelope.sender_agent_id, envelope.request_id);
-            let should_forward = match guard.get(&key) {
-                None => true,
-                Some(last) => last.elapsed() >= std::time::Duration::from_secs(20),
-            };
-            if should_forward {
-                guard.insert(key, std::time::Instant::now());
-                if guard.len() > 4096 {
-                    let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(3600);
-                    guard.retain(|_, t| *t >= cutoff);
-                }
-                drop(guard);
-                let pubsub = Arc::clone(&self.pubsub);
-                let topic = DmInboxService::inbox_topic_name(&self.self_agent_id);
-                tokio::spawn(async move {
-                    if let Err(e) = pubsub.publish(topic, raw_payload).await {
-                        tracing::debug!("DM envelope re-broadcast failed: {e}");
-                    }
-                });
-            }
         }
 
         if envelope.recipient_agent_id != *self.self_agent_id.as_bytes() {

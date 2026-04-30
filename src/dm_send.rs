@@ -77,12 +77,24 @@ pub async fn send_via_gossip(
 
     let start = Instant::now();
     for attempt in 0..=config.max_retries {
-        pubsub
-            .publish(topic.clone(), Bytes::from(wire.clone()))
-            .await
-            .map_err(|e| DmError::LocalGossipUnavailable(e.to_string()))?;
+        // The per-attempt budget covers both the local PlumTree publish and
+        // the remote ACK wait.  Under PubSub back-pressure, `publish()` can be
+        // the slow leg; bounding only the ACK wait let HTTP handlers exceed
+        // their curl/user-visible deadline without returning a structured
+        // `DmError::Timeout`.
+        let attempt_result = tokio::time::timeout(config.timeout_per_attempt, async {
+            pubsub
+                .publish(topic.clone(), Bytes::from(wire.clone()))
+                .await
+                .map_err(|e| DmError::LocalGossipUnavailable(e.to_string()))?;
 
-        match tokio::time::timeout(config.timeout_per_attempt, &mut rx).await {
+            (&mut rx).await.map_err(|_| {
+                DmError::PublishFailed("in-flight ACK registry replaced our waiter".to_string())
+            })
+        })
+        .await;
+
+        match attempt_result {
             Ok(Ok(outcome)) => {
                 guard.mark_resolved();
                 return match outcome {
@@ -97,11 +109,7 @@ pub async fn send_via_gossip(
                     }
                 };
             }
-            Ok(Err(_)) => {
-                return Err(DmError::PublishFailed(
-                    "in-flight ACK registry replaced our waiter".to_string(),
-                ));
-            }
+            Ok(Err(e)) => return Err(e),
             Err(_) => {
                 if attempt < config.max_retries {
                     let delay = config.backoff.delay(config.timeout_per_attempt, attempt);

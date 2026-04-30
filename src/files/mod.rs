@@ -157,4 +157,18 @@ pub enum FileMessage {
         /// Reason for rejection.
         reason: String,
     },
+    /// Acknowledge that a chunk was received and persisted to disk.
+    ///
+    /// Sent by the receiver after each successful chunk write. The sender
+    /// waits for this before sending the next chunk, which throttles the
+    /// sender to the receiver's actual disk + decode rate and prevents the
+    /// `subscribe_direct` broadcast channel from lagging and silently
+    /// dropping chunks.
+    #[serde(rename = "file-chunk-ack")]
+    ChunkAck {
+        /// Transfer ID this ack belongs to.
+        transfer_id: String,
+        /// Highest contiguous chunk sequence number successfully persisted.
+        sequence: u64,
+    },
 }

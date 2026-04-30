@@ -88,7 +88,7 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 |---|---|---|---|---|---|---|---|---|---|
 | Send direct | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Receive direct (annotated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| Epidemic rebroadcast on caps topic | ✅ | — | — | — | — | ✅ | — | — | — |
+| Capability advert subscription/cache (no app rebroadcast) | ✅ | — | — | — | — | ✅ | — | — | — |
 | Send + receive-ACK (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
 | File transfer (offer/accept) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ✅ | — |
 

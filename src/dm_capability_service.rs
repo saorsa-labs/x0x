@@ -41,24 +41,9 @@ impl CapabilityAdvertService {
         let mut subscription = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
         let store_sub = Arc::clone(&store);
         let self_agent_for_sub = self_agent_id;
-        let rebroadcast_pubsub = Arc::clone(&pubsub);
 
         let subscriber = tokio::spawn(async move {
-            // Time-windowed dedup for receiver-side re-broadcast.
-            // Bootstrap meshes have patchy PlumTree overlap for the
-            // capability topic: an origin's tree only reaches 1–2 hops
-            // reliably. Having every verified recipient re-publish
-            // gives epidemic-flood convergence (same pattern as the
-            // release-manifest and identity-announcement re-broadcasts).
-            let mut rebroadcast_state: std::collections::HashMap<
-                ([u8; 32], u64),
-                std::time::Instant,
-            > = std::collections::HashMap::new();
-            const REBROADCAST_MIN_INTERVAL: std::time::Duration =
-                std::time::Duration::from_secs(20);
-
             while let Some(message) = subscription.recv().await {
-                let raw_payload = message.payload.clone();
                 let (pubsub_sender, sender_pubkey) =
                     match (message.sender, message.sender_public_key.as_deref()) {
                         (Some(s), Some(pk)) if message.verified => (s, pk.to_vec()),
@@ -89,32 +74,6 @@ impl CapabilityAdvertService {
                     "cached capability advert from {}",
                     hex::encode(advert.agent_id)
                 );
-
-                // Epidemic re-broadcast to close the mesh-convergence gap.
-                // Dedup by (agent_id, created_at_unix_ms) with a 20 s
-                // window so the same advert isn't bounced indefinitely.
-                let key = (advert.agent_id, advert.created_at_unix_ms);
-                let should_forward = match rebroadcast_state.get(&key) {
-                    None => true,
-                    Some(last) => last.elapsed() >= REBROADCAST_MIN_INTERVAL,
-                };
-                if should_forward {
-                    rebroadcast_state.insert(key, std::time::Instant::now());
-                    if rebroadcast_state.len() > 1024 {
-                        let cutoff =
-                            std::time::Instant::now() - std::time::Duration::from_secs(3600);
-                        rebroadcast_state.retain(|_, t| *t >= cutoff);
-                    }
-                    let pubsub = Arc::clone(&rebroadcast_pubsub);
-                    tokio::spawn(async move {
-                        if let Err(e) = pubsub
-                            .publish(DM_CAPABILITY_TOPIC.to_string(), raw_payload)
-                            .await
-                        {
-                            tracing::debug!("capability advert re-broadcast failed: {e}");
-                        }
-                    });
-                }
             }
             tracing::debug!("capability advert subscriber exited");
         });

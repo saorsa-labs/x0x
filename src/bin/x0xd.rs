@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -420,6 +421,13 @@ struct AppState {
     receive_hashers: RwLock<HashMap<String, Sha256>>,
     /// Out-of-order decoded chunks buffered until their predecessors arrive.
     pending_file_chunks: RwLock<HashMap<String, BTreeMap<u64, Vec<u8>>>>,
+    /// Per-active-send-transfer chunk-ack slots used to apply windowed
+    /// back-pressure. Sender registers a slot at the start of
+    /// `stream_file_chunks`; receiver replies with `FileMessage::ChunkAck`
+    /// after each chunk is persisted; sender waits before exceeding the
+    /// in-flight window. Removed when the transfer terminates. See
+    /// `FILE_CHUNK_WINDOW` and `FileChunkAckSlot`.
+    file_chunk_acks: RwLock<HashMap<String, Arc<FileChunkAckSlot>>>,
     /// Directory for received file data.
     transfers_dir: PathBuf,
     /// Channel to trigger graceful shutdown from the /shutdown endpoint.
@@ -1254,6 +1262,7 @@ async fn main() -> Result<()> {
         file_transfers: RwLock::new(HashMap::new()),
         receive_hashers: RwLock::new(HashMap::new()),
         pending_file_chunks: RwLock::new(HashMap::new()),
+        file_chunk_acks: RwLock::new(HashMap::new()),
         transfers_dir: config.data_dir.join("transfers"),
         shutdown_tx,
         shutdown_notify,
@@ -1959,10 +1968,108 @@ fn file_transfer_now() -> (u64, u64) {
     (now.as_secs(), now.as_millis() as u64)
 }
 
-fn file_transfer_send_config() -> x0x::dm::DmSendConfig {
+fn direct_message_send_config() -> x0x::dm::DmSendConfig {
     x0x::dm::DmSendConfig {
         prefer_raw_quic_if_connected: true,
         ..x0x::dm::DmSendConfig::default()
+    }
+}
+
+fn file_transfer_send_config() -> x0x::dm::DmSendConfig {
+    direct_message_send_config()
+}
+
+/// Maximum number of file chunks a sender may have in flight (sent but
+/// not yet acked) at any time. Caps the broadcast/queue pressure that
+/// caused the 100M chunk-loss regression on 2026-04-30 — the previous
+/// fire-and-forget loop bursted 3200 chunks faster than the receiver's
+/// disk write rate, overflowing tokio's `broadcast::channel(256)` and
+/// silently shedding chunks. With a window of 8, the sender can never
+/// have more than 8 chunks ahead of the receiver's last ack.
+const FILE_CHUNK_WINDOW: u64 = 8;
+
+/// Maximum time the sender will wait for a single chunk ack before
+/// considering the transfer failed. Generous enough to cover one
+/// cross-continent disk-write round-trip; the receiver disk write +
+/// QUIC return path is the slow leg.
+const FILE_CHUNK_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per-transfer chunk-ack slot. The sender registers this when it begins
+/// streaming chunks; the file-message listener bumps `last_acked` and wakes
+/// any waiter every time a `FileMessage::ChunkAck` lands for this transfer;
+/// the sender's chunk loop blocks on `wait_for_chunk_window` when its in-flight
+/// budget would exceed `FILE_CHUNK_WINDOW`.
+pub(crate) struct FileChunkAckSlot {
+    /// Highest contiguous sequence number the receiver has acked.
+    /// `u64::MAX` is the sentinel for "no ack received yet".
+    last_acked: AtomicU64,
+    /// Notified every time `last_acked` changes.
+    notify: tokio::sync::Notify,
+}
+
+impl FileChunkAckSlot {
+    fn new() -> Self {
+        Self {
+            last_acked: AtomicU64::new(u64::MAX),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn record_ack(&self, sequence: u64) {
+        // last_acked = max(last_acked, sequence), treating u64::MAX as -infinity.
+        let mut current = self.last_acked.load(Ordering::SeqCst);
+        loop {
+            let new = if current == u64::MAX {
+                sequence
+            } else {
+                current.max(sequence)
+            };
+            match self.last_acked.compare_exchange_weak(
+                current,
+                new,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+/// Block until `last_acked >= n.saturating_sub(FILE_CHUNK_WINDOW)`, i.e.
+/// until the sender's in-flight count would drop back to (or below) the
+/// window. For the first `FILE_CHUNK_WINDOW` chunks this returns immediately
+/// because the window isn't yet saturated.
+async fn wait_for_chunk_window(slot: &FileChunkAckSlot, n: u64) -> std::result::Result<(), String> {
+    if n < FILE_CHUNK_WINDOW {
+        return Ok(());
+    }
+    let required = n - FILE_CHUNK_WINDOW;
+    let deadline = tokio::time::Instant::now() + FILE_CHUNK_ACK_TIMEOUT;
+    loop {
+        let acked = slot.last_acked.load(Ordering::SeqCst);
+        if acked != u64::MAX && acked >= required {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "timeout waiting for file chunk ack >= {required}; last_acked={}",
+                if acked == u64::MAX {
+                    "<none>".to_string()
+                } else {
+                    acked.to_string()
+                }
+            ));
+        }
+        let notified = slot.notify.notified();
+        tokio::pin!(notified);
+        tokio::select! {
+            _ = notified.as_mut() => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
     }
 }
 
@@ -1974,7 +2081,7 @@ async fn send_file_message(
     let payload = serde_json::to_vec(msg).map_err(|e| format!("serialization failed: {e}"))?;
     state
         .agent
-        .send_direct(agent_id, payload)
+        .send_direct_with_config(agent_id, payload, file_transfer_send_config())
         .await
         .map_err(|e| e.to_string())
 }
@@ -5650,7 +5757,11 @@ async fn publish_listed_to_contacts_card(state: &AppState, card: x0x::groups::Gr
         }
         match state
             .agent
-            .send_direct(&contact.agent_id, payload.clone())
+            .send_direct_with_config(
+                &contact.agent_id,
+                payload.clone(),
+                direct_message_send_config(),
+            )
             .await
         {
             Ok(receipt) => tracing::info!(
@@ -10433,7 +10544,11 @@ async fn direct_send(
         Err(resp) => return resp,
     };
 
-    match state.agent.send_direct(&agent_id, payload).await {
+    match state
+        .agent
+        .send_direct_with_config(&agent_id, payload, direct_message_send_config())
+        .await
+    {
         Ok(receipt) => {
             let path_str = match receipt.path {
                 x0x::dm::DmPath::GossipInbox => "gossip_inbox",
@@ -12113,7 +12228,11 @@ async fn handle_ws_command(
                 }
             };
 
-            if let Err(e) = state.agent.send_direct(&aid, bytes).await {
+            if let Err(e) = state
+                .agent
+                .send_direct_with_config(&aid, bytes, direct_message_send_config())
+                .await
+            {
                 tracing::error!("ws send_direct failed: {e}");
                 let _ = tx.send(WsOutbound::Error {
                     message: "send failed".to_string(),
@@ -12349,6 +12468,16 @@ async fn handle_file_message(
         x0x::files::FileMessage::Complete(complete) => {
             handle_file_complete(state, sender, complete).await;
         }
+        x0x::files::FileMessage::ChunkAck {
+            transfer_id,
+            sequence,
+        } => {
+            // Wake the sender's chunk loop. Acks for unknown transfers
+            // (already torn down, never started here) are silently dropped.
+            if let Some(slot) = state.file_chunk_acks.read().await.get(&transfer_id) {
+                slot.record_ack(sequence);
+            }
+        }
     }
 }
 
@@ -12482,6 +12611,14 @@ async fn handle_file_accept(state: &Arc<AppState>, sender: &AgentId, transfer_id
 }
 
 /// Stream file chunks to the receiver via direct messaging.
+///
+/// Sends chunks over the existing direct-QUIC path (`prefer_raw_quic_if_connected`)
+/// with a windowed application-level ACK protocol on top: the sender registers
+/// a `FileChunkAckSlot`, waits for `FileMessage::ChunkAck` from the receiver
+/// to advance the in-flight window, and only allows up to `FILE_CHUNK_WINDOW`
+/// chunks ahead of the last ack at any time. This caps queue pressure on the
+/// receiver's `subscribe_direct` broadcast bus and prevents the silent
+/// chunk-loss regression that bricked 100M transfers on 2026-04-30.
 async fn stream_file_chunks(
     state: &Arc<AppState>,
     transfer_id: &str,
@@ -12491,16 +12628,36 @@ async fn stream_file_chunks(
 ) {
     use tokio::io::AsyncReadExt;
 
+    // Register an ack slot before we start streaming so any acks that race
+    // ahead of our first chunk are not dropped.
+    let ack_slot = Arc::new(FileChunkAckSlot::new());
+    state
+        .file_chunk_acks
+        .write()
+        .await
+        .insert(transfer_id.to_string(), Arc::clone(&ack_slot));
+
+    // Helper that always cleans up the ack slot, regardless of how the
+    // streaming task exits.
+    let mark_failed = |state: &Arc<AppState>, transfer_id: &str, error: String| {
+        let state = Arc::clone(state);
+        let transfer_id = transfer_id.to_string();
+        async move {
+            let mut transfers = state.file_transfers.write().await;
+            if let Some(t) = transfers.get_mut(&transfer_id) {
+                t.status = x0x::files::TransferStatus::Failed;
+                t.error = Some(error);
+                t.completed_at_unix_ms = Some(file_transfer_now().1);
+            }
+        }
+    };
+
     let mut file = match tokio::fs::File::open(source_path).await {
         Ok(f) => f,
         Err(e) => {
             tracing::error!("Cannot open file {source_path}: {e}");
-            let mut transfers = state.file_transfers.write().await;
-            if let Some(t) = transfers.get_mut(transfer_id) {
-                t.status = x0x::files::TransferStatus::Failed;
-                t.error = Some(format!("Cannot open file: {e}"));
-                t.completed_at_unix_ms = Some(file_transfer_now().1);
-            }
+            mark_failed(state, transfer_id, format!("Cannot open file: {e}")).await;
+            state.file_chunk_acks.write().await.remove(transfer_id);
             return;
         }
     };
@@ -12514,15 +12671,20 @@ async fn stream_file_chunks(
             Ok(n) => n,
             Err(e) => {
                 tracing::error!("Read error on {source_path}: {e}");
-                let mut transfers = state.file_transfers.write().await;
-                if let Some(t) = transfers.get_mut(transfer_id) {
-                    t.status = x0x::files::TransferStatus::Failed;
-                    t.error = Some(format!("Read error: {e}"));
-                    t.completed_at_unix_ms = Some(file_transfer_now().1);
-                }
+                mark_failed(state, transfer_id, format!("Read error: {e}")).await;
+                state.file_chunk_acks.write().await.remove(transfer_id);
                 return;
             }
         };
+
+        // Apply windowed back-pressure before sending: never have more than
+        // FILE_CHUNK_WINDOW chunks ahead of the receiver's last ack.
+        if let Err(e) = wait_for_chunk_window(&ack_slot, sequence).await {
+            tracing::error!("Chunk window wait failed for {transfer_id}: {e}");
+            mark_failed(state, transfer_id, e).await;
+            state.file_chunk_acks.write().await.remove(transfer_id);
+            return;
+        }
 
         let chunk_data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
         let chunk_msg = x0x::files::FileMessage::Chunk(x0x::files::FileChunk {
@@ -12533,12 +12695,13 @@ async fn stream_file_chunks(
 
         if let Err(e) = send_file_chunk_message(state, agent_id, &chunk_msg).await {
             tracing::error!("Send chunk {sequence} failed: {e}");
-            let mut transfers = state.file_transfers.write().await;
-            if let Some(t) = transfers.get_mut(transfer_id) {
-                t.status = x0x::files::TransferStatus::Failed;
-                t.error = Some(format!("Send failed at chunk {sequence}: {e}"));
-                t.completed_at_unix_ms = Some(file_transfer_now().1);
-            }
+            mark_failed(
+                state,
+                transfer_id,
+                format!("Send failed at chunk {sequence}: {e}"),
+            )
+            .await;
+            state.file_chunk_acks.write().await.remove(transfer_id);
             return;
         }
 
@@ -12553,6 +12716,21 @@ async fn stream_file_chunks(
         sequence += 1;
     }
 
+    // Drain the in-flight window: wait until the receiver has acked every
+    // chunk we sent before declaring the transfer Complete. Without this,
+    // the Complete message can arrive before the receiver has processed the
+    // last few chunks, which is exactly what the receiver logged as
+    // "file complete arrived before final chunk; deferring finalize".
+    if sequence > 0 {
+        let last_seq = sequence - 1;
+        if let Err(e) = wait_for_final_acks(&ack_slot, last_seq).await {
+            tracing::error!("Final chunk ack wait failed for {transfer_id}: {e}");
+            mark_failed(state, transfer_id, e).await;
+            state.file_chunk_acks.write().await.remove(transfer_id);
+            return;
+        }
+    }
+
     // Send completion message
     let complete_msg = x0x::files::FileMessage::Complete(x0x::files::FileComplete {
         transfer_id: transfer_id.to_string(),
@@ -12561,22 +12739,54 @@ async fn stream_file_chunks(
 
     if let Err(e) = send_file_message(state, agent_id, &complete_msg).await {
         tracing::error!("Send complete message failed: {e}");
-        let mut transfers = state.file_transfers.write().await;
-        if let Some(t) = transfers.get_mut(transfer_id) {
-            t.status = x0x::files::TransferStatus::Failed;
-            t.error = Some(format!("Send complete failed: {e}"));
-            t.completed_at_unix_ms = Some(file_transfer_now().1);
-        }
+        mark_failed(state, transfer_id, format!("Send complete failed: {e}")).await;
+        state.file_chunk_acks.write().await.remove(transfer_id);
         return;
     }
 
     // Mark as complete on sender side
-    let mut transfers = state.file_transfers.write().await;
-    if let Some(t) = transfers.get_mut(transfer_id) {
-        t.status = x0x::files::TransferStatus::Complete;
-        t.completed_at_unix_ms = Some(file_transfer_now().1);
+    {
+        let mut transfers = state.file_transfers.write().await;
+        if let Some(t) = transfers.get_mut(transfer_id) {
+            t.status = x0x::files::TransferStatus::Complete;
+            t.completed_at_unix_ms = Some(file_transfer_now().1);
+        }
     }
+    state.file_chunk_acks.write().await.remove(transfer_id);
     tracing::info!("File transfer complete (sender): {transfer_id}");
+}
+
+/// Block until the receiver has acked every chunk up to and including
+/// `last_seq`. Used after the sender's final chunk so we don't send the
+/// Complete envelope before the receiver has seen the chunks.
+async fn wait_for_final_acks(
+    slot: &FileChunkAckSlot,
+    last_seq: u64,
+) -> std::result::Result<(), String> {
+    let deadline = tokio::time::Instant::now() + FILE_CHUNK_ACK_TIMEOUT;
+    loop {
+        let acked = slot.last_acked.load(Ordering::SeqCst);
+        if acked != u64::MAX && acked >= last_seq {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "timeout waiting for final chunk ack >= {last_seq}; last_acked={}",
+                if acked == u64::MAX {
+                    "<none>".to_string()
+                } else {
+                    acked.to_string()
+                }
+            ));
+        }
+        let notified = slot.notify.notified();
+        tokio::pin!(notified);
+        tokio::select! {
+            _ = notified.as_mut() => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
 }
 
 /// Handle an incoming reject — mark the sending transfer as rejected.
@@ -12703,9 +12913,12 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
                 "buffered out-of-order file chunk"
             );
         }
+        // Ack even for buffered chunks: it lets the sender's window advance.
+        send_chunk_ack(state, sender, &chunk.transfer_id, chunk.sequence).await;
         return;
     }
 
+    let chunk_seq = chunk.sequence;
     if let Err(e) = apply_ready_file_chunks(state, &chunk.transfer_id, chunk.sequence, data).await {
         tracing::error!("File chunk apply failed for {}: {e}", chunk.transfer_id);
         let mut transfers = state.file_transfers.write().await;
@@ -12716,6 +12929,26 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
         }
         drop(transfers);
         cleanup_failed_transfer(state, &chunk.transfer_id).await;
+        return;
+    }
+
+    // Successful apply — ack the chunk so the sender's in-flight window
+    // can advance. Ack carries this chunk's sequence; if `apply_ready_file_chunks`
+    // drained additional buffered chunks above this one, those were already
+    // acked when they arrived (out-of-order buffer path above).
+    send_chunk_ack(state, sender, &chunk.transfer_id, chunk_seq).await;
+}
+
+/// Send a `FileMessage::ChunkAck` back to the sender. Failures to send the
+/// ack are logged but not propagated — the sender's ack-wait timeout will
+/// surface a stuck transfer if too many acks go missing.
+async fn send_chunk_ack(state: &Arc<AppState>, sender: &AgentId, transfer_id: &str, sequence: u64) {
+    let ack = x0x::files::FileMessage::ChunkAck {
+        transfer_id: transfer_id.to_string(),
+        sequence,
+    };
+    if let Err(e) = send_file_message(state, sender, &ack).await {
+        tracing::warn!(transfer_id, sequence, "failed to send file chunk ack: {e}");
     }
 }
 
@@ -13085,5 +13318,67 @@ mod tests {
             after_ttl,
         );
         assert_eq!(decision_after_ttl, ReleaseRebroadcastDecision::Rebroadcast);
+    }
+
+    #[test]
+    fn file_chunk_ack_slot_records_max() {
+        let slot = FileChunkAckSlot::new();
+        assert_eq!(slot.last_acked.load(Ordering::SeqCst), u64::MAX);
+        slot.record_ack(5);
+        assert_eq!(slot.last_acked.load(Ordering::SeqCst), 5);
+        // Older sequence does not regress the high-watermark.
+        slot.record_ack(3);
+        assert_eq!(slot.last_acked.load(Ordering::SeqCst), 5);
+        // Higher sequence advances it.
+        slot.record_ack(9);
+        assert_eq!(slot.last_acked.load(Ordering::SeqCst), 9);
+    }
+
+    #[tokio::test]
+    async fn wait_for_chunk_window_does_not_block_inside_window() {
+        let slot = FileChunkAckSlot::new();
+        // For chunks 0..FILE_CHUNK_WINDOW the window isn't saturated yet.
+        for n in 0..FILE_CHUNK_WINDOW {
+            wait_for_chunk_window(&slot, n)
+                .await
+                .expect("must return Ok inside the window");
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_chunk_window_releases_when_ack_arrives() {
+        let slot = Arc::new(FileChunkAckSlot::new());
+        // Sending chunk N=FILE_CHUNK_WINDOW requires ack of chunk 0.
+        let n = FILE_CHUNK_WINDOW;
+        let waiter_slot = Arc::clone(&slot);
+        let waiter = tokio::spawn(async move { wait_for_chunk_window(&waiter_slot, n).await });
+
+        // Give the waiter a chance to park, then deliver the ack.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        slot.record_ack(0);
+
+        let res = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter must release before the test timeout")
+            .expect("waiter task did not panic");
+        res.expect("must succeed once ack >= n - WINDOW arrives");
+    }
+
+    #[tokio::test]
+    async fn wait_for_final_acks_returns_when_last_seq_acked() {
+        let slot = Arc::new(FileChunkAckSlot::new());
+        let waiter_slot = Arc::clone(&slot);
+        let waiter = tokio::spawn(async move { wait_for_final_acks(&waiter_slot, 100).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        slot.record_ack(99); // not enough
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        slot.record_ack(100); // exact match — must release
+
+        let res = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter must release before the test timeout")
+            .expect("waiter task did not panic");
+        res.expect("must succeed once ack >= last_seq arrives");
     }
 }

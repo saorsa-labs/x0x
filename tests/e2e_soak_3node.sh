@@ -71,20 +71,34 @@ declare -A IP=([nyc]="$NYC_IP" [sfo]="$SFO_IP" [helsinki]="$HELSINKI_IP")
 declare -A TK=([nyc]="$NYC_TK" [sfo]="$SFO_TK" [helsinki]="$HELSINKI_TK")
 PUBLISHERS=(nyc helsinki)
 ALL_NODES=(nyc sfo helsinki)
-SSH="ssh -o ConnectTimeout=10 -o BatchMode=yes -o ControlMaster=no -o ControlPath=none"
+# SSH options:
+#   ConnectTimeout=10        give up if TCP handshake doesn't complete in 10 s
+#   ServerAliveInterval=10   send a keepalive every 10 s …
+#   ServerAliveCountMax=2    … and disconnect after 2 missed replies (≈30 s)
+# Without ServerAlive, a network blip during a sample loop can wedge the SSH
+# session indefinitely; the soak harness on 2026-04-30 hung at uptime=7h24m
+# this way and stopped sampling for the final 36 min of the 8 h run.
+SSH="ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o BatchMode=yes -o ControlMaster=no -o ControlPath=none"
+
+# Outer wall-clock cap on every SSH command so a stuck session can never
+# block the sample loop. 30 s is generous for any single sample call.
+ssh_run() {
+    local target="$1"; shift
+    timeout 30 $SSH "$target" "$@"
+}
 
 # ─────────────────────────────────────────────────────────────────────────
 # Helpers (all API calls go via SSH-tunneled curl on the box itself)
 # ─────────────────────────────────────────────────────────────────────────
 api_get() {
     local node="$1" path="$2"
-    $SSH root@"${IP[$node]}" \
+    ssh_run root@"${IP[$node]}" \
         "curl -sS -m 10 -H 'authorization: Bearer ${TK[$node]}' http://127.0.0.1:12600${path}" 2>/dev/null
 }
 
 api_post() {
     local node="$1" path="$2" body="$3"
-    $SSH root@"${IP[$node]}" \
+    ssh_run root@"${IP[$node]}" \
         "curl -sS -m 10 -X POST -H 'authorization: Bearer ${TK[$node]}' -H 'content-type: application/json' -d '${body}' http://127.0.0.1:12600${path}" 2>/dev/null
 }
 
@@ -92,11 +106,11 @@ remote_rss_kb() {
     # pidof matches the binary basename only (avoids self-match the way
     # pgrep -f does over SSH because the command line itself contains the
     # pattern).
-    $SSH root@"${IP[$1]}" 'PID=$(pidof x0xd); awk "/VmRSS/{print \$2}" /proc/$PID/status' 2>/dev/null
+    ssh_run root@"${IP[$1]}" 'PID=$(pidof x0xd); awk "/VmRSS/{print \$2}" /proc/$PID/status' 2>/dev/null
 }
 
 remote_cpu_pct() {
-    $SSH root@"${IP[$1]}" 'ps -o %cpu= -p $(pidof x0xd)' 2>/dev/null | tr -d ' \n'
+    ssh_run root@"${IP[$1]}" 'ps -o %cpu= -p $(pidof x0xd)' 2>/dev/null | tr -d ' \n'
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -206,7 +220,7 @@ nohup bash -c 'count=0; while [ ! -f '"'"'${REMOTE_STOP_FILE}'"'"' ]; do curl -s
 echo \$!
 EOF
 )
-    REMOTE_PUB_PIDS[$pn]=$($SSH root@"${IP[$pn]}" "$REMOTE_INNER" 2>/dev/null | tail -1 | tr -d '\n ')
+    REMOTE_PUB_PIDS[$pn]=$(ssh_run root@"${IP[$pn]}" "$REMOTE_INNER" 2>/dev/null | tail -1 | tr -d '\n ')
     log "  $pn remote publisher PID: ${REMOTE_PUB_PIDS[$pn]}"
 done
 
@@ -214,9 +228,9 @@ cleanup() {
     log "Shutting down publishers + sampler"
     # Stop remote publishers (touch stop flag + kill).
     for pn in "${PUBLISHERS[@]}"; do
-        $SSH root@"${IP[$pn]}" "touch '${REMOTE_STOP_FILE}'; kill ${REMOTE_PUB_PIDS[$pn]} 2>/dev/null || true; sleep 1; pkill -f 'curl.*${TOPIC}' 2>/dev/null || true" >/dev/null 2>&1 || true
+        ssh_run root@"${IP[$pn]}" "touch '${REMOTE_STOP_FILE}'; kill ${REMOTE_PUB_PIDS[$pn]} 2>/dev/null || true; sleep 1; pkill -f 'curl.*${TOPIC}' 2>/dev/null || true" >/dev/null 2>&1 || true
         # Capture final publish count.
-        $SSH root@"${IP[$pn]}" "cat '${REMOTE_COUNT_FILE}' 2>/dev/null || true" > "$PROOF_DIR/$pn-publish-count.txt" 2>/dev/null || true
+        ssh_run root@"${IP[$pn]}" "cat '${REMOTE_COUNT_FILE}' 2>/dev/null || true" > "$PROOF_DIR/$pn-publish-count.txt" 2>/dev/null || true
     done
     kill "$SAMPLER_PID" 2>/dev/null || true
     wait "$SAMPLER_PID" 2>/dev/null || true

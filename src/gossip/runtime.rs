@@ -19,7 +19,17 @@ use std::time::{Duration, Instant};
 /// Bulk receive queue.
 const PRESENCE_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum time to spend handling one inbound PubSub message.
-const PUBSUB_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// This is a watchdog against a wedged handler, not a per-message latency
+/// budget. The soak on 2026-04-30 (8h, 100 msg/s) produced ~5% of messages
+/// hitting the previous 10 s cap exactly (max_elapsed_ms = 10004 ms). Those
+/// are not stuck handlers — they are slow under cumulative load (ML-DSA-65
+/// verification + subscriber fan-out under scheduler pressure with 8 peers).
+/// `decode_to_delivery_drops` stayed at 0 across the soak, confirming the
+/// timeouts did not lose messages, only marked them late. Raising the cap to
+/// 30 s converts those false-positive watchdog fires into successful
+/// completions; a real wedged handler still gets cancelled, just later.
+const PUBSUB_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum time to spend handling one inbound membership message.
 const MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
