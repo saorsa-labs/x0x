@@ -510,6 +510,138 @@ jobs:
             No winners, no losers - just cooperation.
 
   # ============================================================
+  # Publish SKILL.md to ClawHub/OpenClaw
+  # ============================================================
+  publish-clawhub:
+    name: Publish SKILL.md to ClawHub
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: create-release
+    runs-on: ubuntu-latest
+    env:
+      CLAWHUB_SITE: https://clawhub.ai
+      CLAWHUB_REGISTRY: https://clawhub.ai
+      CLAWHUB_CONFIG_PATH: ${{ runner.temp }}/clawhub-config.json
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Require ClawHub token
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          if [ -z "$CLAWHUB_TOKEN" ]; then
+            echo "::error::CLAWHUB_TOKEN secret is required to publish x0x to ClawHub"
+            exit 1
+          fi
+
+      - name: Install ClawHub CLI
+        run: npm install -g clawhub@0.12.0
+
+      - name: Authenticate ClawHub CLI
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          clawhub login --token "$CLAWHUB_TOKEN" --no-browser
+          clawhub whoami
+
+      - name: Resolve ClawHub publish mode
+        run: |
+          latest_tag="$(git tag --list 'v*' --sort=-version:refname | /usr/bin/head -n 1)"
+          if [ -z "$latest_tag" ]; then
+            echo "::error::Could not resolve the newest semver tag for ClawHub publish gating"
+            exit 1
+          fi
+
+          # Only the newest semver tag is allowed to move ClawHub's `latest`
+          # pointer automatically. Older tag reruns stay verify-only so a
+          # delayed backfill or manual rerun cannot move the live listing
+          # backward by accident. Backfilling an older missing version remains
+          # an explicit manual publish instead of part of this automatic path.
+          if [ "${GITHUB_REF_NAME}" = "$latest_tag" ]; then
+            echo "CLAWHUB_PUBLISH_MODE=latest" >> "$GITHUB_ENV"
+            echo "CLAWHUB_SHOULD_PUBLISH=true" >> "$GITHUB_ENV"
+          else
+            echo "CLAWHUB_PUBLISH_MODE=selected" >> "$GITHUB_ENV"
+            echo "CLAWHUB_SHOULD_PUBLISH=false" >> "$GITHUB_ENV"
+            echo "::notice::Skipping live ClawHub publish for ${GITHUB_REF_NAME}; newest repo tag is $latest_tag. Verification will only check that this version already exists."
+          fi
+
+      - name: Publish tagged SKILL.md bundle
+        run: |
+          if [ "${CLAWHUB_SHOULD_PUBLISH:-true}" != "true" ]; then
+            echo "ClawHub publish skipped for ${GITHUB_REF_NAME}; verify-only mode is active."
+            exit 0
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          SKILL_BUNDLE="$(mktemp -d "$RUNNER_TEMP/clawhub-skill.XXXXXX")"
+
+          # ClawHub skill publish expects a text bundle folder, not the full repo.
+          # We only need the current SKILL.md because it already contains the
+          # release version, frontmatter metadata, and the install instructions
+          # that the ClawHub listing should mirror.
+          cp SKILL.md "$SKILL_BUNDLE/"
+
+          # Publish only after the GitHub release job has succeeded so the
+          # SKILL.md install metadata can point at already-uploaded release assets.
+          if output="$(clawhub --no-input publish "$SKILL_BUNDLE" \
+            --slug x0x \
+            --name "x0x" \
+            --version "$VERSION" \
+            --changelog "Update x0x to v$VERSION." \
+            --tags latest 2>&1)"; then
+            echo "$output"
+          else
+            status=$?
+            echo "$output"
+            if echo "$output" | grep -qi "already exists"; then
+              echo "::notice::ClawHub already has x0x@$VERSION; continuing to verification"
+            else
+              exit $status
+            fi
+          fi
+
+      - name: Verify published version after security scan
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            if [ "${CLAWHUB_PUBLISH_MODE:-latest}" = "selected" ]; then
+              inspect_cmd=(clawhub inspect x0x --version "$VERSION")
+              expected_line="Selected: $VERSION"
+            else
+              inspect_cmd=(clawhub inspect x0x)
+              expected_line="Latest: $VERSION"
+            fi
+
+            if output="$("${inspect_cmd[@]}" 2>&1)"; then
+              status=0
+            else
+              status=$?
+            fi
+            echo "$output"
+
+            if [ $status -eq 0 ] && echo "$output" | grep -q "$expected_line"; then
+              if [ "${CLAWHUB_PUBLISH_MODE:-latest}" = "selected" ]; then
+                echo "::notice::ClawHub already contains x0x@$VERSION"
+              else
+                echo "::notice::ClawHub latest version is now $VERSION"
+              fi
+              exit 0
+            fi
+
+            echo "attempt $attempt: ClawHub has not exposed '$expected_line' yet; retrying in 15s"
+            sleep 15
+          done
+
+          echo "::error::ClawHub did not report '$expected_line' within 5 minutes"
+          exit 1
+
+  # ============================================================
   # Publish to crates.io
   # ============================================================
   publish-crates:
