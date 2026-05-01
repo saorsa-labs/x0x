@@ -291,10 +291,13 @@ Bash + Python test harnesses in `tests/` for end-to-end validation:
 |--------|-------|-----------|---------------|
 | `e2e_comprehensive.sh` | Local (alice+bob+charlie) | ~143 | ALL 75+ endpoints, 18 categories: contacts lifecycle, machine pinning, trust eval (5 paths), MLS full lifecycle (add/remove/re-add), named groups (invite validation, leave/rejoin), KV stores (multi-key, update), presence (all 6 endpoints), seedless bootstrap |
 | `e2e_live_network.sh` | Local → live VPS mesh | ~66 | Local node joins real bootstrap network, bidirectional: direct messaging, pub/sub, MLS groups with VPS members, named group invites across network, presence discovery |
-| `e2e_vps.sh` | 6 VPS bootstrap nodes (legacy SSH-per-call) | ~102 | All 6 nodes: cross-continent direct messaging (NYC→Sydney), multi-continent MLS, named groups, KV stores, contact blocking, presence FOAF, constitution on all nodes. **Dominated by SSH RTT to Singapore/Sydney — use `e2e_vps_mesh.py` for clean cross-region matrix results.** |
-| `e2e_vps_mesh.py` *(new)* | 6 VPS bootstrap nodes (mesh-relay) | 30 directed pairs | All-pairs DM matrix driven through x0x's own pubsub via 1 SSH tunnel to an anchor node. ~16 s wall-clock, zero harness flakes. Backed by `tests/runners/x0x_test_runner.py` running as a systemd service on each VPS. See [`TEST_SUITE_GUIDE.md`](TEST_SUITE_GUIDE.md) §7b. |
-| `e2e_local_mesh.sh` *(new)* | Local 3-node smoke for mesh harness | 6 directed pairs | Boots alice/bob/charlie + a runner each, runs `e2e_vps_mesh.py --no-tunnel` against alice. Proves the protocol without SSH. |
-| `e2e_deploy.sh` | Build + deploy to VPS | ~24 | Cross-compile, upload `x0xd` **and** the mesh test runner (`x0x-test-runner.service`) to 6 nodes, verify health/version/mesh, collect API tokens |
+| `e2e_vps.sh` | 6 VPS bootstrap nodes (legacy SSH-per-call) | ~102 | All 6 nodes: cross-continent direct messaging (NYC→Sydney), multi-continent MLS, named groups, KV stores, contact blocking, presence FOAF, constitution on all nodes. **Dominated by SSH RTT to Singapore/Sydney — use the dogfood-family harnesses for clean cross-region results.** |
+| `e2e_vps_mesh.py` | Phase A — 6 VPS DM matrix (mesh-relay) | 30 directed pairs | All-pairs DM matrix driven through x0x's own DMs via 1 SSH tunnel to an anchor. ~16 s wall-clock, zero harness flakes. See [`TEST_SUITE_GUIDE.md`](TEST_SUITE_GUIDE.md) §7b. |
+| `e2e_vps_groups.py` | Phase B — 6 VPS groups + contacts dogfood | up to 49 | Anchor creates a `public_open` group, DMs invites to all runners, each posts a group message, contacts add/Trust/Block/remove cycle per node. See §7c. |
+| `e2e_local_mesh.sh` | Local 3-node Phase A smoke | 6 directed pairs | Boots alice/bob/charlie + a runner each, runs `e2e_vps_mesh.py --no-tunnel` against alice. Proves the protocol without SSH. |
+| `e2e_dogfood_groups.sh` | Phase B — local 3-instance groups + contacts | 29 | Same dogfood as §7c but local. ~5 s wall-clock. |
+| `e2e_dogfood_local.sh` | Phase D — fast 2-instance pre-commit smoke | 19 | Identity + contacts + DM round-trip + group lifecycle, all via DMs. ~5 s wall-clock; targets every-commit cadence. See §7e. |
+| `e2e_deploy.sh` | Build + deploy to VPS (with optional mesh verification) | ~24 | Cross-compile, upload `x0xd` **and** the mesh test runner (`x0x-test-runner.service`) to 6 nodes, verify health/version/mesh, collect API tokens. **`--mesh-verify` flag** chains Phase A + Phase B verification onto the deploy via 1 SSH tunnel. See §7d. |
 
 ### Running E2E Tests
 
@@ -302,28 +305,37 @@ Bash + Python test harnesses in `tests/` for end-to-end validation:
 # 1. Build release binary
 cargo build --release
 
-# 2. Local comprehensive test (no VPS needed, ~2 min)
-bash tests/e2e_comprehensive.sh
+# 2. PRE-COMMIT SMOKE (Phase D, ~5 s, no VPS, no SSH)
+bash tests/e2e_dogfood_local.sh
 
-# 3. Local mesh-harness smoke (proves the mesh protocol, no VPS)
+# 3. Local 3-instance dogfood (Phase B, contacts + groups, ~5 s)
+bash tests/e2e_dogfood_groups.sh
+
+# 4. Local Phase-A DM matrix smoke (3 daemons, no VPS, no SSH)
 bash tests/e2e_local_mesh.sh
 
-# 4. Live network test (local node joins real bootstrap, ~3 min)
+# 5. Local comprehensive test (legacy curl-driven, ~2 min)
+bash tests/e2e_comprehensive.sh
+
+# 6. Live network test (local node joins real bootstrap, ~3 min)
 #    Requires: VPS nodes running, SSH access
 bash tests/e2e_live_network.sh
 
-# 5. Deploy to VPS (cross-compile + upload x0xd + mesh runner, ~5 min)
-#    Requires: cargo-zigbuild, SSH access to 6 VPS nodes
-bash tests/e2e_deploy.sh
+# 7. Deploy to VPS — cross-compile + push x0xd + push runner + verify (~5 min)
+#    Add --mesh-verify to chain Phase A + B verification via 1 SSH tunnel
+bash tests/e2e_deploy.sh                          # SSH-only verification
+bash tests/e2e_deploy.sh --mesh-verify            # + Phase A + B mesh checks
 
-# 6a. VPS DM matrix via the mesh harness (RECOMMENDED, ~16 s)
-#     Requires: tokens in tests/.vps-tokens.env, mesh runner active on all 6 nodes
+# 8a. VPS Phase-A DM matrix (RECOMMENDED for cross-region DM proof, ~16 s)
 python3 tests/e2e_vps_mesh.py --anchor nyc --discover-secs 30 --settle-secs 60
 
-# 6b. VPS-only legacy SSH-per-call test (~4 min, may flake on Singapore/Sydney)
+# 8b. VPS Phase-B groups + contacts dogfood (up to 49 assertions, ~60 s)
+python3 tests/e2e_vps_groups.py --anchor nyc --discover-secs 45
+
+# 8c. VPS legacy SSH-per-call test (still useful for surface coverage, ~4 min)
 bash tests/e2e_vps.sh
 
-# 7. Health check (quick VPS status)
+# 9. Health check (quick VPS status)
 bash .deployment/health-check.sh              # basic
 bash .deployment/health-check.sh --extended   # with peer counts
 ```
@@ -344,7 +356,7 @@ When running tests that SSH to multiple VPS nodes sequentially, use `-o ControlM
 
 ## API Completeness
 
-124 REST endpoints, all wired to x0xd and CLI:
+128 REST endpoints, all wired to x0xd and CLI:
 - Identity + AgentCard: `GET /agent`, `GET /agent/card`, `POST /agent/card/import`
 - Presence: `GET /presence/online`, `GET /presence/foaf`, `GET /presence/find/:id`, `GET /presence/status/:id`, `GET /presence/events` (SSE)
 - Named groups: `POST/GET /groups`, `POST /groups/:id/invite`, `POST /groups/join`, policy, roles, join requests, ban/unban

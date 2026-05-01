@@ -28,18 +28,29 @@ guide.
        ├── --chrome           tests/e2e_gui_chrome.mjs            (Playwright GUI)
        ├── --dioxus           tests/e2e_communitas_dioxus.sh      (Dioxus IPC)
        ├── --xcuitest         CommunitasGoldenPathsUITests.swift  (Apple UI)
-       ├── --vps              tests/e2e_vps.sh                    (6 region matrix, SSH-per-call)
+       ├── --vps              tests/e2e_vps.sh                    (6 region matrix, SSH-per-call, legacy)
        ├── --vps-mesh         tests/e2e_vps_mesh.py               (6 region matrix, mesh-relay)
+       ├── --vps-groups       tests/e2e_vps_groups.py             (6 region groups + contacts dogfood)
+       ├── --dogfood-local    tests/e2e_dogfood_local.sh          (2-instance ~5 s smoke)
+       ├── --dogfood-groups   tests/e2e_dogfood_groups.sh         (3-instance groups dogfood)
        └── --lan              tests/e2e_lan.sh                    (Mac Studios)
 ```
 
-> **Mesh harness, new in this release.** `tests/e2e_vps_mesh.py` is the
-> recommended way to run the all-pairs DM matrix on the live fleet: it uses
-> **one** SSH tunnel to an anchor node and drives every other node through
-> x0x's own gossip pubsub. The legacy `tests/e2e_vps.sh` issues 60+
-> SSH+curl pairs back-to-back and is dominated by SSH RTT to Singapore /
-> Sydney; the mesh harness completes the same matrix in ~15 s with **zero**
-> harness flakes. See §7b below.
+> **Dogfood harness family — Phases A/B/C/D.** A coordinated set of
+> harnesses that exercise x0x via x0x's own primitives (DMs, named
+> groups, group messages) instead of curl-from-outside. They share a
+> single Phase-A wire protocol (`x0xtest|cmd|`/`res|`/`hop|` payload
+> prefixes) implemented by `tests/runners/x0x_test_runner.py` deployed
+> as a systemd service on every VPS. The Mac harness opens **one** SSH
+> tunnel to an anchor node — every assertion thereafter is a real
+> protocol round-trip.
+>
+> | Phase | Harness | Use |
+> |---|---|---|
+> | A | `e2e_vps_mesh.py` | All-pairs DM matrix (§7b) |
+> | B | `e2e_vps_groups.py` / `e2e_dogfood_groups.sh` | Groups + contacts (§7c) |
+> | C | `e2e_deploy.sh --mesh-verify` | Deploy + integrated mesh verification (§7d) |
+> | D | `e2e_dogfood_local.sh` | Fast 2-instance pre-commit smoke, ~5 s (§7e) |
 
 Every phase writes proof artefacts under `proofs/<timestamp>/` so a release
 can be replayed and audited after the fact.
@@ -534,6 +545,155 @@ traffic. Tests that need to push large payloads should use
 
 ---
 
+## 7c. Group + Contacts Dogfood — `e2e_vps_groups.py` / `e2e_dogfood_groups.sh`
+
+**Path:** `tests/e2e_vps_groups.py` (live fleet) +
+`tests/e2e_dogfood_groups.sh` (3-instance local) +
+`tests/e2e_dogfood_groups.py` (orchestrator shared by both)
+
+Phase B of the dogfood family. Where Phase A (§7b) tests the DM matrix,
+Phase B tests **named groups + contacts** entirely through x0x's own
+primitives. Every assertion is the result of:
+
+- a direct DM round-trip (orchestrator → runner → orchestrator), or
+- a group-message round-trip (anchor posts in a group, members reply
+  in the same group, anchor reads `/groups/:id/messages`)
+
+### Scenarios
+
+| Scenario | Assertions per runner |
+|---|---|
+| Contacts lifecycle | add → list-contains → Trusted → Blocked → remove → list-no-longer-contains (4 assertions) |
+| Group create / invite | anchor creates `public_open` group, mints `x0x://invite/...` link (2 assertions) |
+| Group join | each runner joins via the invite (1/runner) |
+| Local roster | each member's own `/groups/:id/members` shows themselves (1/runner) |
+| Group send | anchor posts kickoff, each runner posts reply (1+N) |
+| Local message cache | each member sees their own posted body in their cache (1/member) |
+| Group leave | leaver's `/groups` no longer lists the group (1) |
+
+For 6 fleet runners: up to **49 blocking assertions per run**.
+
+### Cross-member convergence — non-blocking INFO
+
+A separate, non-blocking assertion polls the anchor's view to check
+whether members' replies appear in the anchor's `/groups/:id/messages`
+cache. Today this is recorded as INFO (typically `0/N seen` on the
+live fleet) because of an open daemon ticket: `/groups/join` does not
+subscribe the joiner to the group's chat topic, so cross-member
+gossip never reaches the anchor. See
+[`docs/design/groups-join-roster-propagation.md`](docs/design/groups-join-roster-propagation.md).
+
+### Running
+
+```bash
+# Local 3-instance smoke (alice + bob + charlie)
+bash tests/e2e_dogfood_groups.sh                   # ~5 s
+
+# Live 6-VPS fleet (after e2e_deploy.sh has installed the runner)
+python3 tests/e2e_vps_groups.py --anchor nyc --discover-secs 45
+```
+
+### Resilience
+
+A transient `peer_disconnected` to one runner soft-skips that runner's
+slice of the test rather than failing the whole suite. Per-runner
+failure counts go in the JSON report. Two consecutive runs:
+
+| Run | Anchor | Pass | Fail | Notes |
+|---|---|---|---|---|
+| 1 | NYC | 41 | 0 | helsinki + sydney transiently unreachable → SKIP |
+| 2 | NYC | **49** | **0** | full fleet participation |
+
+---
+
+## 7d. Deploy + Mesh Verification — `e2e_deploy.sh --mesh-verify`
+
+**Path:** `tests/e2e_deploy.sh` (extended with the `--mesh-verify` flag
+or `MESH_VERIFY=1` env)
+
+Phase C of the dogfood family. After cross-compiling, uploading the
+new `x0xd` binary, restarting the service, and running the existing
+24 SSH+curl post-deploy checks, the script optionally fans out into
+**both** mesh harnesses sharing a single SSH tunnel:
+
+1. `e2e_vps_mesh.py` — Phase-A 30-pair DM matrix
+2. `e2e_vps_groups.py` — Phase-B groups + contacts dogfood
+
+The mesh-verify exit code is added to the deploy fail count, so a
+deploy that succeeded at the SSH layer but produces matrix failures
+(real cross-region churn) flips the overall result to non-zero.
+
+```bash
+# Deploy + integrated mesh verification
+bash tests/e2e_deploy.sh --mesh-verify
+
+# Or with a different anchor
+MESH_ANCHOR=sydney bash tests/e2e_deploy.sh --mesh-verify
+
+# Skip mesh-verify (default; legacy SSH-only verification)
+bash tests/e2e_deploy.sh
+```
+
+### What this gives you
+
+- Reduces the deploy verification surface from `4 metrics × 6 nodes = 24
+  SSH+curl pairs` to **one** SSH tunnel + protocol DMs
+- Turns deploy verification into a real cross-protocol round-trip — DMs,
+  named-group create/invite/join/post, contacts CRUD — exercised on the
+  freshly-deployed binary
+- Surfaces real cross-region issues (e.g. a Helsinki↔Sydney supersede
+  burst at deploy time) as the mesh-verify failure rather than as silent
+  drift
+
+### What it doesn't yet cover
+
+The binary push itself still needs SSH (cold-start). True
+gossip-coordinated rolling deploy is documented in
+[`docs/design/x0x-self-update-deploy.md`](docs/design/x0x-self-update-deploy.md)
+as a deferred follow-up — it requires daemon-side work (test-mode
+trust-key support + an `x0x upgrade publish` CLI verb).
+
+---
+
+## 7e. Fast Pre-Commit Smoke — `e2e_dogfood_local.sh`
+
+**Path:** `tests/e2e_dogfood_local.sh` + `tests/e2e_dogfood_local.py`
+
+Phase D of the dogfood family. The single-fastest end-to-end protocol
+test x0x has: boots **two** local daemons (alice + bob), starts one
+runner on bob, drives every assertion as a DM via Phase-A protocol.
+Targets a ~5 s wall-clock budget so it can run on every commit
+without slowing the dev loop.
+
+### Coverage in 19 assertions
+
+- Identity: anchor `/agent` returns 64-hex agent_id
+- Contacts: add → list → Trusted → Blocked → remove → list (7 assertions)
+- DM round-trip: hop DM `x0xtest|hop|...` from anchor → bob's runner
+  echoes `received_dm` back via DM with `digest_marker` preserved
+  (2 assertions)
+- Named group: create + invite + join + each member posts + each
+  member sees own message in cache + leave + list-no-longer-lists
+  (10 assertions)
+
+### Running
+
+```bash
+# Build + run (pre-commit: cargo build --release && tests/e2e_dogfood_local.sh)
+cargo build --release --bin x0xd
+bash tests/e2e_dogfood_local.sh                    # ~5 s
+```
+
+### Why "Phase D" specifically
+
+The legacy local smoke (`e2e_comprehensive.sh`, §2) takes ~2 minutes
+because it walks **every** REST endpoint over curl. Phase D takes ~5 s
+because it walks the **protocol** end-to-end with structured DMs and
+group operations — the same coverage class real apps exercise. It's
+the canonical "did I break the protocol" first-line test.
+
+---
+
 ## 9. Live Network Test — `e2e_live_network.sh`
 
 **Path:** `tests/e2e_live_network.sh`
@@ -587,17 +747,24 @@ Phases:
 |------|-------|
 | `--rust-tests` | `cargo nextest` workspace |
 | `--comprehensive` | `e2e_comprehensive.sh` |
+| `--dogfood-local` | `e2e_dogfood_local.sh` (~5 s, §7e) — pre-commit smoke |
+| `--dogfood-groups` | `e2e_dogfood_groups.sh` (3-instance, §7c) |
 | `--stress` | `e2e_stress_gossip.sh` |
 | `--chrome` | `e2e_gui_chrome.mjs` |
 | `--dioxus` | `e2e_communitas_dioxus.sh` |
 | `--xcuitest` | `xcodebuild ... CommunitasUITests` (macOS only) |
 | `--vps` | `e2e_vps.sh` (legacy SSH-per-call) |
-| `--vps-mesh` | `e2e_vps_mesh.py` (mesh-relay, **recommended**) |
+| `--vps-mesh` | `e2e_vps_mesh.py` (mesh-relay, §7b — **recommended**) |
+| `--vps-groups` | `e2e_vps_groups.py` (mesh groups + contacts, §7c) |
 | `--lan` | `e2e_lan.sh` |
 | `--all` | everything above |
 
-> Until `--vps-mesh` lands in `e2e_proof_runner.sh`, run it explicitly
-> after the runner is verified active on every node (see §7b).
+> The dogfood phases (`--dogfood-local`, `--dogfood-groups`,
+> `--vps-mesh`, `--vps-groups`) are not yet wired into
+> `e2e_proof_runner.sh`. Until they are, run them explicitly after
+> `e2e_deploy.sh` (which installs the runner on every VPS), or use
+> `e2e_deploy.sh --mesh-verify` to chain Phase A + Phase B
+> verification onto the deploy itself (§7d).
 
 ---
 
