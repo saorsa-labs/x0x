@@ -347,6 +347,8 @@ enum DiagnosticsSub {
     Gossip,
     /// Print direct-message counters, fan-out health, and per-peer state.
     Dm,
+    /// Print per-group ingest counters and drop-reason buckets.
+    Groups,
     /// Print remote exec counters, warnings, and ACL summary.
     Exec,
 }
@@ -1148,6 +1150,7 @@ async fn run(
             }
             DiagnosticsSub::Gossip => commands::network::diagnostics_gossip(&client).await,
             DiagnosticsSub::Dm => commands::network::diagnostics_dm(&client).await,
+            DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
         },
         Commands::Find { words } => commands::find::find(&client, &words).await,

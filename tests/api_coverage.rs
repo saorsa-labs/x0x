@@ -45,6 +45,7 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Get, "/diagnostics/connectivity"),
     (Method::Get, "/diagnostics/gossip"),
     (Method::Get, "/diagnostics/dm"),
+    (Method::Get, "/diagnostics/groups"),
     (Method::Get, "/diagnostics/exec"),
     (Method::Post, "/peers/:peer_id/probe"),
     (Method::Get, "/peers/:peer_id/health"),

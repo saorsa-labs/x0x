@@ -10,6 +10,7 @@
 //! Groups are the primary collaboration primitive for agents and humans.
 
 pub mod card;
+pub mod diagnostics;
 pub mod directory;
 pub mod discovery;
 pub mod invite;
@@ -22,8 +23,11 @@ pub mod state_commit;
 
 use crate::identity::{AgentId, AgentKeypair};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+pub use self::diagnostics::{
+    GroupCounters, GroupDiagnostic, GroupsDiagnostics, GroupsDiagnosticsSnapshot,
+};
 pub use self::directory::GroupCard;
 pub use self::discovery::{
     may_publish_to_public_shards, name_words, normalize_tag, shard_of, shards_for_public,
@@ -155,6 +159,20 @@ pub struct GroupInfo {
     /// subsequent public cards must carry the withdrawal flag.
     #[serde(default)]
     pub withdrawn: bool,
+
+    /// Hex-encoded one-time invite secrets that the local node has issued
+    /// for this group. Populated by `POST /groups/:id/invite`. Used by the
+    /// inviter when applying a `MemberJoined` metadata event so it can
+    /// verify that the joiner's claimed `invite_secret` matches one we
+    /// actually minted. Third-party receivers that did not mint the secret
+    /// rely on the joiner's signature plus the inviter's current
+    /// membership, so this field is only authoritative on the inviter.
+    ///
+    /// TODO: enforce a FIFO eviction once the set grows above 1024 entries.
+    /// Today the set is unbounded; we accept that trade-off because the
+    /// daemon already retains persistent group metadata of comparable size.
+    #[serde(default)]
+    pub issued_invite_secrets: HashSet<String>,
 }
 
 impl GroupInfo {
@@ -263,6 +281,7 @@ impl GroupInfo {
             avatar_url: None,
             banner_url: None,
             withdrawn: false,
+            issued_invite_secrets: HashSet::new(),
         };
         info.recompute_state_hash();
         info

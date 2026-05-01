@@ -742,26 +742,36 @@ class FleetHarness:
                 f"bodies={list(bodies)[:3]}",
             )
 
-        # Soft-info: anchor cross-member convergence
-        time.sleep(5)
-        try:
-            anchor_msgs = self.call(
-                self.anchor_name, "group_messages", {"group_id": gid},
+        # Hard PASS (groups-join-roster-propagation): the
+        # anchor must accept each joiner's signed reply within the
+        # cross-region window once their MemberJoined metadata event
+        # converges.
+        deadline = time.time() + 30.0
+        anchor_bodies: set = set()
+        expected_replies = {f"phase-b: ack from {m}" for m in joined}
+        while time.time() < deadline:
+            try:
+                anchor_msgs = self.call(
+                    self.anchor_name, "group_messages", {"group_id": gid},
+                )
+                anchor_bodies = set(
+                    self._message_bodies(anchor_msgs.get("details"))
+                )
+            except Exception as exc:
+                self.log.warning(
+                    "anchor cross-member check exception: %s", exc,
+                )
+                anchor_bodies = set()
+            if expected_replies.issubset(anchor_bodies):
+                break
+            time.sleep(1.0)
+        for m in joined:
+            expected_body = f"phase-b: ack from {m}"
+            self.assert_pass(
+                f"{self.anchor_name} sees {m}'s reply in /messages cache",
+                expected_body in anchor_bodies,
+                f"bodies={list(anchor_bodies)[:5]}",
             )
-            anchor_bodies = set(
-                self._message_bodies(anchor_msgs.get("details"))
-            )
-            expected_replies = {
-                f"phase-b: ack from {m}" for m in joined
-            }
-            seen = expected_replies.intersection(anchor_bodies)
-            self.log.info(
-                "  INFO %s observed %d/%d member replies after 5s "
-                "(cross-member — non-blocking)",
-                self.anchor_name, len(seen), len(expected_replies),
-            )
-        except Exception as exc:
-            self.log.warning("anchor cross-member check failed: %s", exc)
 
     @staticmethod
     def _member_aids(payload: Any) -> List[str]:

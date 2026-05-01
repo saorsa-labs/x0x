@@ -127,6 +127,23 @@ pub async fn diagnostics_dm(client: &DaemonClient) -> Result<()> {
     Ok(())
 }
 
+/// `x0x diagnostics groups` — GET /diagnostics/groups
+///
+/// Prints per-group ingest counters: `members_v2_size`, metadata/public
+/// listener state, accepted message count, last-message-at, and per-reason
+/// drop buckets (`decode_failed`, `author_banned`,
+/// `write_policy_violation`, `signature_failed`, `other`). The
+/// `write_policy_violation` bucket is the canary for the
+/// join-roster-propagation regression — non-zero on the owner side means
+/// joiners' messages reached the listener but the owner's `members_v2`
+/// view is missing them.
+pub async fn diagnostics_groups(client: &DaemonClient) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get("/diagnostics/groups").await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x peers probe <peer_id>` — POST /peers/:peer_id/probe
 ///
 /// Active liveness probe (ant-quic 0.27.2 #173). Sends a lightweight probe

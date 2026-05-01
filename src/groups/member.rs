@@ -26,6 +26,22 @@ impl GroupRole {
         }
     }
 
+    /// Stable on-the-wire encoding of the role as a single byte.
+    ///
+    /// Used by canonical signing helpers (e.g. `MemberJoined` event) so the
+    /// signing payload is independent of `serde` enum representation choices.
+    /// Values must remain stable across releases.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Owner => 0,
+            Self::Admin => 1,
+            Self::Moderator => 2,
+            Self::Member => 3,
+            Self::Guest => 4,
+        }
+    }
+
     /// Returns true iff this role's privilege is at least `minimum`.
     #[must_use]
     pub fn at_least(self, minimum: Self) -> bool {

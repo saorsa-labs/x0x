@@ -614,6 +614,32 @@ class DogfoodHarness:
                 f"got {len(aids)} ids: {[a[:8] for a in aids[:5]]}",
             )
 
+        # 4b. Wait for the owner's local roster to pick up each joiner
+        # via gossip-propagated MemberJoined metadata events. This is the
+        # convergence the join-roster-propagation fix provides; without it
+        # the owner's validate_public_message rejects every signed reply
+        # under WritePolicyViolation { MembersOnly }. PlumTree mesh
+        # formation on a fresh topic dominates the latency, so we poll.
+        member_aids = {self.runners[m].agent_id for m in members}
+        deadline = time.time() + 30.0
+        owner_roster: set = set()
+        while time.time() < deadline:
+            resp = self.call(
+                owner, "group_members", {"group_id": group_id},
+            )
+            owner_roster = set(
+                self._group_member_aids(resp.get("details"))
+            )
+            if member_aids.issubset(owner_roster):
+                break
+            time.sleep(0.5)
+        self.assert_pass(
+            f"{owner} roster converges to include all joiners",
+            member_aids.issubset(owner_roster),
+            f"missing={list(member_aids - owner_roster)} "
+            f"observed={[a[:8] for a in owner_roster]}",
+        )
+
         # 5. Owner posts the kickoff group message
         owner_post = self.call(
             owner, "group_send_message",
@@ -665,23 +691,33 @@ class DogfoodHarness:
                 f"bodies={list(bodies)[:5]}",
             )
 
-        # Soft-info: cross-member convergence on the owner's cache (not
-        # a release-blocker today; logs the actual delta for the audit
-        # trail without flipping the suite to FAIL).
-        time.sleep(3)
-        owner_msgs = self.call(
-            owner, "group_messages", {"group_id": group_id},
-        )
-        owner_bodies = set(
-            self._group_message_bodies(owner_msgs.get("details"))
-        )
+        # Hard PASS (groups-join-roster-propagation): each joiner's
+        # MemberJoined metadata event must propagate to alice so her
+        # validate_public_message accepts the joiner's signed body.
+        # Re-poll with a short timeout to absorb mesh formation jitter.
+        deadline = time.time() + 10.0
+        owner_bodies: set = set()
         expected_replies = {f"phase-b: ack from {m}" for m in members}
-        cross_seen = expected_replies.intersection(owner_bodies)
-        self.log.info(
-            "  INFO %s observed %d/%d member replies after 3s "
-            "(cross-member convergence — non-blocking)",
-            owner, len(cross_seen), len(expected_replies),
-        )
+        cross_seen: set = set()
+        while time.time() < deadline:
+            owner_msgs = self.call(
+                owner, "group_messages", {"group_id": group_id},
+            )
+            owner_bodies = set(
+                self._group_message_bodies(owner_msgs.get("details"))
+            )
+            cross_seen = expected_replies.intersection(owner_bodies)
+            if cross_seen == expected_replies:
+                break
+            time.sleep(0.5)
+        for m in members:
+            expected_body = f"phase-b: ack from {m}"
+            self.assert_pass(
+                f"alice sees {m}'s reply in /messages cache",
+                expected_body in owner_bodies,
+                f"observed {len(cross_seen)}/{len(expected_replies)}; "
+                f"bodies={list(owner_bodies)[:5]}",
+            )
 
         # 8. Leaver's perspective: after group_leave, the leaver's own
         # /groups list no longer contains the group. This is local

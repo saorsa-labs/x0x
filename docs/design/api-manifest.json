@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 128,
+  "endpoint_count": 129,
   "endpoints": [
     {
       "category": "status",
@@ -147,6 +147,13 @@
       "description": "Direct-message send/receive counters and per-peer health",
       "method": "GET",
       "path": "/diagnostics/dm"
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics groups",
+      "description": "Per-group ingest counters, listener state, and drop buckets",
+      "method": "GET",
+      "path": "/diagnostics/groups"
     },
     {
       "category": "exec",

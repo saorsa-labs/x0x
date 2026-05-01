@@ -200,6 +200,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Get,
+        path: "/diagnostics/groups",
+        cli_name: "diagnostics groups",
+        description: "Per-group ingest counters, listener state, and drop buckets",
+        category: "network",
+    },
+    EndpointDef {
+        method: Method::Get,
         path: "/diagnostics/exec",
         cli_name: "diagnostics exec",
         description: "Remote exec counters, warnings, active sessions, and ACL summary",

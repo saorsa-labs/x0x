@@ -442,6 +442,8 @@ struct AppState {
     api_token: String,
     /// Tier-1 remote exec service.
     exec_service: Arc<x0x::exec::ExecService>,
+    /// Per-group ingest diagnostics surfaced via `/diagnostics/groups`.
+    groups_diagnostics: Arc<x0x::groups::GroupsDiagnostics>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,6 +1326,7 @@ async fn main() -> Result<()> {
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         api_token,
         exec_service: Arc::clone(&exec_service),
+        groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
     });
 
     let existing_group_ids: Vec<String> = {
@@ -1729,6 +1732,7 @@ async fn main() -> Result<()> {
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
         .route("/diagnostics/dm", get(dm_diagnostics))
+        .route("/diagnostics/groups", get(groups_diagnostics))
         .route("/diagnostics/exec", get(exec_diagnostics))
         .route("/exec/run", post(exec_run))
         .route("/exec/cancel", post(exec_cancel))
@@ -5079,6 +5083,46 @@ enum NamedGroupMetadataEvent {
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
+    /// Joiner-authored membership announcement on `info.metadata_topic`.
+    ///
+    /// Emitted by `join_group_via_invite` immediately after the joiner's
+    /// local `members_v2.insert`. The receiver's
+    /// `apply_named_group_metadata_event` verifies the joiner's ML-DSA-65
+    /// signature, confirms the inviter is currently a member with role
+    /// at least `Member`, and adds the joiner to local `members_v2`. This
+    /// is the gossip-layer fix for the `WritePolicyViolation
+    /// { policy: MembersOnly }` cascade documented in
+    /// `docs/design/groups-join-roster-propagation.md`.
+    MemberJoined {
+        group_id: String,
+        /// Stable D.3 group_id, if the joiner already knows it. Receivers
+        /// resolve the local group via `mls_group_id` first, then fall
+        /// back to this.
+        #[serde(default)]
+        stable_group_id: Option<String>,
+        /// Hex agent_id of the joiner (always equals `sender`).
+        member_agent_id: String,
+        /// Base64 ML-DSA-65 public key of the joiner. Receivers use this
+        /// to verify `signature_b64` and to recompute the AgentId.
+        member_public_key_b64: String,
+        /// Joiner's role on entry. Today always `Member`; future invites
+        /// may carry a higher role.
+        role: x0x::groups::GroupRole,
+        /// Optional display name carried in the join request body.
+        #[serde(default)]
+        display_name: Option<String>,
+        /// Hex agent_id of the inviter (matches `SignedInvite::inviter`).
+        inviter_agent_id: String,
+        /// Hex one-time invite secret carried by the join handshake. The
+        /// inviter checks this against `info.issued_invite_secrets`;
+        /// third-party receivers rely on the joiner's signature plus the
+        /// inviter's current membership.
+        invite_secret: String,
+        /// Unix-millis timestamp at the joiner.
+        ts_ms: u64,
+        /// Base64 ML-DSA-65 signature over `canonical_member_joined_bytes`.
+        signature_b64: String,
+    },
     /// Phase D.2 (fixed): Cross-daemon delivery of the group's shared secret,
     /// sealed with ML-KEM-768 to the recipient's published public key.
     ///
@@ -5939,6 +5983,60 @@ async fn spawn_listed_to_contacts_listener(state: Arc<AppState>) {
     });
 }
 
+/// Domain-separation tag for the `MemberJoined` metadata event signature.
+///
+/// Bumping this string is a protocol break — receivers verify against the
+/// exact byte sequence below.
+const MEMBER_JOINED_DOMAIN: &[u8] = b"x0x.named_group.member_joined.v1";
+
+/// Build the canonical bytes signed by the joiner for a `MemberJoined`
+/// metadata event.
+///
+/// Layout (all length-prefixed string fields use a u32 big-endian length
+/// followed by the raw bytes; primitives use big-endian):
+///
+/// ```text
+/// MEMBER_JOINED_DOMAIN
+/// u32 len + group_id
+/// u32 len + stable_group_id (empty string if None)
+/// u32 len + member_agent_id
+/// u32 len + member_public_key_b64
+/// u8 role.as_u8()
+/// u32 len + display_name (empty string if None)
+/// u32 len + inviter_agent_id
+/// u32 len + invite_secret
+/// u64 BE  ts_ms
+/// ```
+#[allow(clippy::too_many_arguments)]
+fn canonical_member_joined_bytes(
+    group_id: &str,
+    stable_group_id: Option<&str>,
+    member_agent_id: &str,
+    member_public_key_b64: &str,
+    role: x0x::groups::GroupRole,
+    display_name: Option<&str>,
+    inviter_agent_id: &str,
+    invite_secret: &str,
+    ts_ms: u64,
+) -> Vec<u8> {
+    fn push_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
+        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(bytes);
+    }
+    let mut buf = Vec::with_capacity(MEMBER_JOINED_DOMAIN.len() + 256);
+    buf.extend_from_slice(MEMBER_JOINED_DOMAIN);
+    push_lp(&mut buf, group_id.as_bytes());
+    push_lp(&mut buf, stable_group_id.unwrap_or("").as_bytes());
+    push_lp(&mut buf, member_agent_id.as_bytes());
+    push_lp(&mut buf, member_public_key_b64.as_bytes());
+    buf.push(role.as_u8());
+    push_lp(&mut buf, display_name.unwrap_or("").as_bytes());
+    push_lp(&mut buf, inviter_agent_id.as_bytes());
+    push_lp(&mut buf, invite_secret.as_bytes());
+    buf.extend_from_slice(&ts_ms.to_be_bytes());
+    buf
+}
+
 async fn publish_named_group_metadata_event(
     state: &AppState,
     metadata_topic: &str,
@@ -6053,6 +6151,7 @@ async fn apply_named_group_metadata_event(
         | NamedGroupMetadataEvent::JoinRequestCancelled { group_id, .. }
         | NamedGroupMetadataEvent::GroupCardPublished { group_id, .. }
         | NamedGroupMetadataEvent::GroupMetadataUpdated { group_id, .. }
+        | NamedGroupMetadataEvent::MemberJoined { group_id, .. }
         | NamedGroupMetadataEvent::SecureShareDelivered { group_id, .. } => group_id.clone(),
     };
 
@@ -6752,6 +6851,179 @@ async fn apply_named_group_metadata_event(
             );
             false
         }
+        NamedGroupMetadataEvent::MemberJoined {
+            stable_group_id,
+            member_agent_id,
+            member_public_key_b64,
+            role,
+            display_name,
+            inviter_agent_id,
+            invite_secret,
+            ts_ms,
+            signature_b64,
+            ..
+        } => {
+            // 1. The gossip layer's `verified` gate already enforced that
+            //    `sender` produced this payload; check sender == member.
+            if !sender_hex.eq_ignore_ascii_case(&member_agent_id) {
+                tracing::debug!(
+                    group_id = %resolved_group_key,
+                    sender = %sender_hex,
+                    member = %member_agent_id,
+                    "MemberJoined: rejecting — sender != member_agent_id"
+                );
+                return false;
+            }
+
+            // 2. Decode the joiner's published public key + signature.
+            use base64::Engine as _;
+            let pubkey_bytes =
+                match base64::engine::general_purpose::STANDARD.decode(&member_public_key_b64) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::debug!(
+                            group_id = %resolved_group_key,
+                            "MemberJoined: bad public key base64: {e}"
+                        );
+                        return false;
+                    }
+                };
+            let pubkey = match ant_quic::MlDsaPublicKey::from_bytes(&pubkey_bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(
+                        group_id = %resolved_group_key,
+                        "MemberJoined: bad public key bytes: {e:?}"
+                    );
+                    return false;
+                }
+            };
+            let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(&signature_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(
+                        group_id = %resolved_group_key,
+                        "MemberJoined: bad signature base64: {e}"
+                    );
+                    return false;
+                }
+            };
+            let sig = match ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
+                &sig_bytes,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(
+                        group_id = %resolved_group_key,
+                        "MemberJoined: bad signature bytes: {e:?}"
+                    );
+                    return false;
+                }
+            };
+
+            // 3. Recompute canonical bytes and verify the joiner's signature.
+            //    `stable_group_id` is part of the signing input on the
+            //    publisher side; we pass it through verbatim here. Bumping
+            //    or stripping the field would break verify on the receiver.
+            let canonical = canonical_member_joined_bytes(
+                &group_id,
+                stable_group_id.as_deref(),
+                &member_agent_id,
+                &member_public_key_b64,
+                role,
+                display_name.as_deref(),
+                &inviter_agent_id,
+                &invite_secret,
+                ts_ms,
+            );
+            if let Err(e) = ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+                &pubkey, &canonical, &sig,
+            ) {
+                tracing::debug!(
+                    group_id = %resolved_group_key,
+                    "MemberJoined: signature did not verify: {e:?}"
+                );
+                return false;
+            }
+
+            // 4. Derived AgentId must match the claimed member_agent_id.
+            let derived = hex::encode(ant_quic::derive_peer_id_from_public_key(&pubkey).0);
+            if !derived.eq_ignore_ascii_case(&member_agent_id) {
+                tracing::debug!(
+                    group_id = %resolved_group_key,
+                    "MemberJoined: derived agent_id {} != claimed {}",
+                    derived,
+                    member_agent_id
+                );
+                return false;
+            }
+
+            // 5. The inviter must currently be an active member with role
+            //    at least `Member`. This is the gossip-layer authorisation
+            //    check that mirrors the invite_secret chain of evidence.
+            let inviter_role = info.caller_role(&inviter_agent_id);
+            let inviter_authorised =
+                inviter_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Member));
+            if !inviter_authorised {
+                tracing::debug!(
+                    group_id = %resolved_group_key,
+                    inviter = %inviter_agent_id,
+                    "MemberJoined: inviter not currently a member"
+                );
+                return false;
+            }
+
+            // 6. Asymmetric invite_secret check: only the original inviter
+            //    can verify the secret was actually minted locally. Third-
+            //    party receivers trust the joiner's signature plus the
+            //    inviter's current membership.
+            let local_is_inviter = local_agent_hex.eq_ignore_ascii_case(&inviter_agent_id);
+            if local_is_inviter && !info.issued_invite_secrets.contains(&invite_secret) {
+                tracing::debug!(
+                    group_id = %resolved_group_key,
+                    inviter = %inviter_agent_id,
+                    issued_count = info.issued_invite_secrets.len(),
+                    "MemberJoined: invite_secret not present in local issued set; rejecting"
+                );
+                return false;
+            }
+
+            // 7. Idempotent — if the joiner is already an active member,
+            //    do not re-bump joined_at; the listener can replay events.
+            if info.has_active_member(&member_agent_id) {
+                return false;
+            }
+
+            // 8. Apply the join.
+            info.add_member_with_kem(
+                member_agent_id.clone(),
+                role,
+                Some(inviter_agent_id.clone()),
+                display_name.clone(),
+                None,
+            );
+            if let Some(ref dn) = display_name {
+                info.set_display_name(&member_agent_id, dn.clone());
+            }
+            // Joiner-driven adds bump the local roster_revision so later
+            // owner-authored commits supersede cleanly.
+            info.roster_revision = info.roster_revision.saturating_add(1);
+            info.recompute_state_hash();
+            let updated = info.clone();
+            drop(groups);
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &updated).await;
+            save_named_groups(state).await;
+            state
+                .groups_diagnostics
+                .record_member_joined(&resolved_group_key);
+            tracing::info!(
+                group_id = %resolved_group_key,
+                member = %member_agent_id,
+                inviter = %inviter_agent_id,
+                "MemberJoined: applied joiner-authored membership event"
+            );
+            false
+        }
     }
 }
 
@@ -7402,6 +7674,10 @@ async fn ingest_public_message(
             })
     };
     let Some((policy, members, stable_id)) = snapshot else {
+        // Unknown group — count under the stable id we were given as the
+        // logging key. Useful for spotting messages that arrived before the
+        // local daemon learned about the group.
+        state.groups_diagnostics.record_other_drop(group_id_for_log);
         return;
     };
     let ctx = x0x::groups::PublicIngestContext {
@@ -7409,15 +7685,35 @@ async fn ingest_public_message(
         policy: &policy,
         members_v2: &members,
     };
-    if let Err(e) = x0x::groups::validate_public_message(&ctx, &msg) {
-        tracing::warn!(
-            group_id = %group_id_for_log,
-            author = %msg.author_agent_id,
-            "E: dropped public message: {e}"
-        );
-        return;
+    match x0x::groups::validate_public_message(&ctx, &msg) {
+        Ok(()) => {
+            state
+                .groups_diagnostics
+                .record_message_received(&stable_id, now_millis_u64());
+            cache_public_message(state, msg).await;
+        }
+        Err(e) => {
+            // Map ingest errors to diagnostics buckets so /diagnostics/groups
+            // reflects the drop fingerprint for the operator.
+            match &e {
+                x0x::groups::PublicMessageIngestError::AuthorBanned => {
+                    state.groups_diagnostics.record_author_banned(&stable_id)
+                }
+                x0x::groups::PublicMessageIngestError::WritePolicyViolation { .. } => state
+                    .groups_diagnostics
+                    .record_write_policy_violation(&stable_id),
+                x0x::groups::PublicMessageIngestError::InvalidSignature(_) => {
+                    state.groups_diagnostics.record_signature_failed(&stable_id)
+                }
+                _ => state.groups_diagnostics.record_other_drop(&stable_id),
+            }
+            tracing::warn!(
+                group_id = %group_id_for_log,
+                author = %msg.author_agent_id,
+                "E: dropped public message: {e}"
+            );
+        }
     }
-    cache_public_message(state, msg).await;
 }
 
 async fn spawn_global_public_message_listener(state: Arc<AppState>) {
@@ -7447,6 +7743,14 @@ async fn spawn_global_public_message_listener(state: Arc<AppState>) {
                             Ok(m) => m,
                             Err(e) => {
                                 tracing::debug!("E: dropped malformed global public msg: {e}");
+                                // Without a parsed payload we don't know the
+                                // group id — bucket as a generic "other"
+                                // drop on a sentinel key so we never panic
+                                // here. The condition is rare and visible
+                                // via the daemon's own debug log too.
+                                state.groups_diagnostics.record_decode_failed(
+                                    "__global_public__",
+                                );
                                 continue;
                             }
                         };
@@ -7501,6 +7805,9 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
                             Ok(m) => m,
                             Err(e) => {
                                 tracing::debug!("E: dropped malformed public msg: {e}");
+                                state_for_listener
+                                    .groups_diagnostics
+                                    .record_decode_failed(&group_id_for_listener);
                                 continue;
                             }
                         };
@@ -7531,45 +7838,59 @@ async fn create_group_invite(
         Ok(r) => r,
         Err(resp) => return resp.into_response(),
     };
-    let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        )
-            .into_response();
+    let (link, mls_group_id, group_name, expires_at) = {
+        let mut groups = state.named_groups.write().await;
+        let Some(info) = groups.get_mut(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            )
+                .into_response();
+        };
+
+        let agent_id = state.agent.agent_id();
+        if agent_id != info.creator {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "ok": false, "error": "only the creator can generate invites" })),
+            )
+                .into_response();
+        }
+        let mut invite = x0x::groups::invite::SignedInvite::new(
+            info.mls_group_id.clone(),
+            info.name.clone(),
+            &agent_id,
+            req.expiry_secs,
+        );
+        invite.stable_group_id = Some(info.stable_group_id().to_string());
+        invite.group_created_at = Some(info.created_at);
+        invite.group_description = Some(info.description.clone());
+        invite.policy = Some(info.policy.clone());
+        invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
+
+        // Track this secret on the inviter so a future MemberJoined event
+        // carrying it can be authenticated locally. The set is unbounded
+        // today (TODO: FIFO eviction at >1024 entries; see
+        // GroupInfo::issued_invite_secrets docs).
+        info.issued_invite_secrets
+            .insert(invite.invite_secret.clone());
+
+        let link = invite.to_link();
+        let mls_group_id = info.mls_group_id.clone();
+        let group_name = info.name.clone();
+        let expires_at = invite.expires_at;
+        (link, mls_group_id, group_name, expires_at)
     };
-
-    let agent_id = state.agent.agent_id();
-    if agent_id != info.creator {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "only the creator can generate invites" })),
-        )
-            .into_response();
-    }
-    let mut invite = x0x::groups::invite::SignedInvite::new(
-        info.mls_group_id.clone(),
-        info.name.clone(),
-        &agent_id,
-        req.expiry_secs,
-    );
-    invite.stable_group_id = Some(info.stable_group_id().to_string());
-    invite.group_created_at = Some(info.created_at);
-    invite.group_description = Some(info.description.clone());
-    invite.policy = Some(info.policy.clone());
-    invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
-
-    let link = invite.to_link();
+    save_named_groups(&state).await;
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "invite_link": link,
-            "group_id": info.mls_group_id,
-            "group_name": info.name,
-            "expires_at": invite.expires_at,
+            "group_id": mls_group_id,
+            "group_name": group_name,
+            "expires_at": expires_at,
         })),
     )
         .into_response()
@@ -7669,8 +7990,8 @@ async fn join_group_via_invite(
                 req.display_name.clone(),
             );
             // Set joiner's display name if provided
-            if let Some(dn) = req.display_name {
-                info.set_display_name(&joiner_hex, dn);
+            if let Some(ref dn) = req.display_name {
+                info.set_display_name(&joiner_hex, dn.clone());
             }
 
             let chat_topic = info.general_chat_topic();
@@ -7682,6 +8003,91 @@ async fn join_group_via_invite(
                 .insert(group_id_hex.clone(), info.clone());
             save_named_groups(&state).await;
             ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
+
+            // Publish a signed MemberJoined event on the metadata topic so
+            // the inviter (and every other current member running the
+            // metadata listener) updates `members_v2` to include us. Without
+            // this, the owner's `validate_public_message` rejects every
+            // post we make under `WritePolicyViolation { MembersOnly }` —
+            // see docs/design/groups-join-roster-propagation.md.
+            //
+            // Failure here is logged but does not fail the join: the local
+            // join already succeeded, and the legacy chat-topic
+            // announcement below remains as a defence-in-depth signal.
+            let signing_kp = state.agent.identity().agent_keypair();
+            let now_ms = now_millis_u64();
+            let member_pubkey_b64 = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(signing_kp.public_key().as_bytes())
+            };
+            let stable_id_for_event = info.stable_group_id().to_string();
+            let display_name_for_event = req.display_name.clone();
+            let canonical = canonical_member_joined_bytes(
+                &info.mls_group_id,
+                Some(&stable_id_for_event),
+                &joiner_hex,
+                &member_pubkey_b64,
+                x0x::groups::GroupRole::Member,
+                display_name_for_event.as_deref(),
+                &invite.inviter,
+                &invite.invite_secret,
+                now_ms,
+            );
+            match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                signing_kp.secret_key(),
+                &canonical,
+            ) {
+                Ok(sig) => {
+                    use base64::Engine as _;
+                    let signature_b64 =
+                        base64::engine::general_purpose::STANDARD.encode(sig.as_bytes());
+                    let event = NamedGroupMetadataEvent::MemberJoined {
+                        group_id: info.mls_group_id.clone(),
+                        stable_group_id: Some(stable_id_for_event),
+                        member_agent_id: joiner_hex.clone(),
+                        member_public_key_b64: member_pubkey_b64,
+                        role: x0x::groups::GroupRole::Member,
+                        display_name: display_name_for_event,
+                        inviter_agent_id: invite.inviter.clone(),
+                        invite_secret: invite.invite_secret.clone(),
+                        ts_ms: now_ms,
+                        signature_b64,
+                    };
+                    tracing::info!(
+                        group_id = %group_id_hex,
+                        topic = %info.metadata_topic,
+                        member = %joiner_hex,
+                        inviter = %invite.inviter,
+                        "MemberJoined: publishing joiner-authored membership event to metadata topic"
+                    );
+                    // Publish twice: once immediately so the inviter gets it
+                    // as soon as the metadata mesh covers them, then again
+                    // after `GROUP_BACKGROUND_PUBLISH_DELAY` so members
+                    // whose Plumtree links formed late still pick it up.
+                    // The applier is idempotent (re-applying the same
+                    // event for an already-active member is a no-op), so
+                    // double-publish is safe.
+                    publish_named_group_metadata_event(&state, &info.metadata_topic, &event).await;
+                    let state_for_replay = Arc::clone(&state);
+                    let topic_for_replay = info.metadata_topic.clone();
+                    let event_for_replay = event;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
+                        publish_named_group_metadata_event(
+                            &state_for_replay,
+                            &topic_for_replay,
+                            &event_for_replay,
+                        )
+                        .await;
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        group_id = %group_id_hex,
+                        "MemberJoined: failed to sign join announcement: {e:?}"
+                    );
+                }
+            }
 
             // Announce join on the chat topic so the creator sees us —
             // fire-and-forget. The result was already discarded pre-fix,
@@ -11902,6 +12308,49 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
             Json(serde_json::json!({ "ok": false, "error": "gossip runtime not initialized" })),
         ),
     }
+}
+
+/// GET /diagnostics/groups — per-group ingest diagnostics.
+///
+/// Mirrors `/diagnostics/dm` and `/diagnostics/exec`. For each
+/// locally-known group (or any group with non-zero counters) returns
+/// `members_v2_size`, listener-state booleans, and the per-reason
+/// drop buckets used by the public-message ingest pipeline. The
+/// `messages_dropped_write_policy_violation` bucket is the canary for
+/// the join-roster-propagation regression: a non-zero value on the
+/// owner side means joiners' messages are reaching the listener but
+/// `members_v2` is stale.
+async fn groups_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let metadata_keys: std::collections::HashSet<String> = state
+        .group_metadata_tasks
+        .read()
+        .await
+        .keys()
+        .cloned()
+        .collect();
+    let public_keys: std::collections::HashSet<String> = state
+        .public_message_tasks
+        .read()
+        .await
+        .keys()
+        .cloned()
+        .collect();
+    // Snapshot the named_groups under a single read lock to avoid
+    // repeatedly contending with the metadata listener under load.
+    let groups_view: HashMap<String, x0x::groups::GroupInfo> = {
+        let groups = state.named_groups.read().await;
+        groups.clone()
+    };
+    let snap = state
+        .groups_diagnostics
+        .snapshot(&groups_view, &metadata_keys, &public_keys);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "groups": snap.groups,
+        })),
+    )
 }
 
 /// GET /diagnostics/dm — direct-message send/receive diagnostics.
