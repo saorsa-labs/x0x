@@ -5086,12 +5086,15 @@ enum NamedGroupMetadataEvent {
     /// Joiner-authored membership announcement on `info.metadata_topic`.
     ///
     /// Emitted by `join_group_via_invite` immediately after the joiner's
-    /// local `members_v2.insert`. The receiver's
+    /// local `members_v2.insert`. The original inviter's
     /// `apply_named_group_metadata_event` verifies the joiner's ML-DSA-65
-    /// signature, confirms the inviter is currently a member with role
-    /// at least `Member`, and adds the joiner to local `members_v2`. This
-    /// is the gossip-layer fix for the `WritePolicyViolation
-    /// { policy: MembersOnly }` cascade documented in
+    /// signature, consumes the locally-issued one-time invite record,
+    /// rejects any role other than `Member`, then publishes an
+    /// authority-signed `MemberAdded` commit. Third-party receivers ignore
+    /// this request and apply only the signed commit, keeping durable roster
+    /// and `state_hash` mutations inside the D.3 commit chain. This is the
+    /// gossip-layer fix for the `WritePolicyViolation { policy:
+    /// MembersOnly }` cascade documented in
     /// `docs/design/groups-join-roster-propagation.md`.
     MemberJoined {
         group_id: String,
@@ -5105,8 +5108,8 @@ enum NamedGroupMetadataEvent {
         /// Base64 ML-DSA-65 public key of the joiner. Receivers use this
         /// to verify `signature_b64` and to recompute the AgentId.
         member_public_key_b64: String,
-        /// Joiner's role on entry. Today always `Member`; future invites
-        /// may carry a higher role.
+        /// Joiner's requested role on entry. Invite-join v1 accepts only
+        /// `Member`; higher roles require a future authority-signed flow.
         role: x0x::groups::GroupRole,
         /// Optional display name carried in the join request body.
         #[serde(default)]
@@ -5114,9 +5117,9 @@ enum NamedGroupMetadataEvent {
         /// Hex agent_id of the inviter (matches `SignedInvite::inviter`).
         inviter_agent_id: String,
         /// Hex one-time invite secret carried by the join handshake. The
-        /// inviter checks this against `info.issued_invite_secrets`;
-        /// third-party receivers rely on the joiner's signature plus the
-        /// inviter's current membership.
+        /// original inviter checks this against `info.issued_invites` and
+        /// consumes it before publishing the authoritative `MemberAdded`
+        /// commit. Third-party receivers never apply this secret directly.
         invite_secret: String,
         /// Unix-millis timestamp at the joiner.
         ts_ms: u64,
@@ -6958,69 +6961,131 @@ async fn apply_named_group_metadata_event(
                 return false;
             }
 
-            // 5. The inviter must currently be an active member with role
-            //    at least `Member`. This is the gossip-layer authorisation
-            //    check that mirrors the invite_secret chain of evidence.
+            // 5. Invite-join v1 is strictly role-capped. The joiner signs
+            //    the role, but the invite itself grants only Member; accepting
+            //    an arbitrary wire role would let an invite holder self-promote.
+            if role != x0x::groups::GroupRole::Member {
+                tracing::debug!(
+                    group_id = %resolved_group_key,
+                    member = %member_agent_id,
+                    role = ?role,
+                    "MemberJoined: rejecting non-member role"
+                );
+                return false;
+            }
+
+            // 6. Only the original local inviter can validate and consume the
+            //    one-time invite secret. Third-party receivers deliberately do
+            //    NOT apply MemberJoined directly; they wait for the inviter's
+            //    authority-signed MemberAdded commit below. This keeps all
+            //    durable roster/state_hash mutations inside the signed D.3
+            //    state-commit chain.
+            let local_is_inviter = local_agent_hex.eq_ignore_ascii_case(&inviter_agent_id);
+            if !local_is_inviter {
+                tracing::debug!(
+                    group_id = %resolved_group_key,
+                    inviter = %inviter_agent_id,
+                    local = %local_agent_hex,
+                    "MemberJoined: ignoring on non-inviter receiver"
+                );
+                return false;
+            }
             let inviter_role = info.caller_role(&inviter_agent_id);
             let inviter_authorised =
-                inviter_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Member));
+                inviter_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !inviter_authorised {
                 tracing::debug!(
                     group_id = %resolved_group_key,
                     inviter = %inviter_agent_id,
-                    "MemberJoined: inviter not currently a member"
+                    "MemberJoined: local inviter is not an admin/owner"
                 );
                 return false;
             }
 
-            // 6. Asymmetric invite_secret check: only the original inviter
-            //    can verify the secret was actually minted locally. Third-
-            //    party receivers trust the joiner's signature plus the
-            //    inviter's current membership.
-            let local_is_inviter = local_agent_hex.eq_ignore_ascii_case(&inviter_agent_id);
-            if local_is_inviter && !info.issued_invite_secrets.contains(&invite_secret) {
-                tracing::debug!(
-                    group_id = %resolved_group_key,
-                    inviter = %inviter_agent_id,
-                    issued_count = info.issued_invite_secrets.len(),
-                    "MemberJoined: invite_secret not present in local issued set; rejecting"
-                );
-                return false;
-            }
-
-            // 7. Idempotent — if the joiner is already an active member,
-            //    do not re-bump joined_at; the listener can replay events.
+            // 7. Idempotent — if the joiner is already active, a replayed
+            //    MemberJoined after the owner committed the add is a no-op and
+            //    must not consume any fresh invite record.
             if info.has_active_member(&member_agent_id) {
                 return false;
             }
 
-            // 8. Apply the join.
-            info.add_member_with_kem(
+            // 8. Build the authoritative committed add on a clone first. If
+            //    validation/signing fails, the live group remains unchanged.
+            let signing_kp = state.agent.identity().agent_keypair();
+            let now_ms = now_millis_u64();
+            let mut next = info.clone();
+            if let Err(reason) =
+                next.consume_issued_invite(&invite_secret, &member_agent_id, role, ts_ms, now_ms)
+            {
+                tracing::debug!(
+                    group_id = %resolved_group_key,
+                    inviter = %inviter_agent_id,
+                    reason,
+                    "MemberJoined: invite validation failed"
+                );
+                return false;
+            }
+            next.roster_revision = next.roster_revision.saturating_add(1);
+            next.add_member_with_kem(
                 member_agent_id.clone(),
-                role,
+                x0x::groups::GroupRole::Member,
                 Some(inviter_agent_id.clone()),
                 display_name.clone(),
                 None,
             );
             if let Some(ref dn) = display_name {
-                info.set_display_name(&member_agent_id, dn.clone());
+                next.set_display_name(&member_agent_id, dn.clone());
             }
-            // Joiner-driven adds bump the local roster_revision so later
-            // owner-authored commits supersede cleanly.
-            info.roster_revision = info.roster_revision.saturating_add(1);
-            info.recompute_state_hash();
-            let updated = info.clone();
+            let revision = next.roster_revision;
+            let commit = match next.seal_commit(signing_kp, now_ms) {
+                Ok(commit) => commit,
+                Err(e) => {
+                    tracing::warn!(
+                        group_id = %resolved_group_key,
+                        member = %member_agent_id,
+                        "MemberJoined: failed to seal authoritative add: {e}"
+                    );
+                    return false;
+                }
+            };
+            let metadata_topic = next.metadata_topic.clone();
+            let event_group_id = next.stable_group_id().to_string();
+            *info = next;
             drop(groups);
-            refresh_group_card_cache_from_info(state, &resolved_group_key, &updated).await;
+
+            // Persist and expose the committed roster before any slower MLS or
+            // discovery-card side effects. Tests and operators poll
+            // /groups/:id/members and /diagnostics/groups as the acceptance
+            // signal for this path.
             save_named_groups(state).await;
             state
                 .groups_diagnostics
                 .record_member_joined(&resolved_group_key);
+
+            if let Ok(member_id) = parse_agent_id_hex(&member_agent_id) {
+                let mut mls_groups = state.mls_groups.write().await;
+                if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
+                    if !group.is_member(&member_id) {
+                        let _ = group.add_member(member_id).await;
+                    }
+                }
+            }
+            save_mls_groups(state).await;
+            let event = NamedGroupMetadataEvent::MemberAdded {
+                group_id: event_group_id,
+                revision,
+                actor: inviter_agent_id.clone(),
+                agent_id: member_agent_id.clone(),
+                display_name: display_name.clone(),
+                commit: Some(commit),
+            };
+            publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+            maybe_publish_group_card_after_state_change(state, &resolved_group_key).await;
             tracing::info!(
                 group_id = %resolved_group_key,
                 member = %member_agent_id,
                 inviter = %inviter_agent_id,
-                "MemberJoined: applied joiner-authored membership event"
+                "MemberJoined: accepted and published authoritative MemberAdded commit"
             );
             false
         }
@@ -7868,12 +7933,16 @@ async fn create_group_invite(
         invite.policy = Some(info.policy.clone());
         invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
 
-        // Track this secret on the inviter so a future MemberJoined event
-        // carrying it can be authenticated locally. The set is unbounded
-        // today (TODO: FIFO eviction at >1024 entries; see
-        // GroupInfo::issued_invite_secrets docs).
-        info.issued_invite_secrets
-            .insert(invite.invite_secret.clone());
+        // Track this one-time secret on the inviter so a future
+        // MemberJoined request carrying it can be authenticated, role-capped,
+        // expiry-checked, and consumed locally before the inviter publishes an
+        // authority-signed MemberAdded commit.
+        info.record_issued_invite(
+            invite.invite_secret.clone(),
+            invite.created_at,
+            invite.expires_at,
+            x0x::groups::GroupRole::Member,
+        );
 
         let link = invite.to_link();
         let mls_group_id = info.mls_group_id.clone();

@@ -120,7 +120,7 @@ async fn list_members(d: &AgentInstance, group_id: &str) -> Vec<String> {
 
 async fn post_public_message(d: &AgentInstance, group_id: &str, body: &str) -> Value {
     authed_client(d)
-        .post(d.url(&format!("/groups/{group_id}/messages")))
+        .post(d.url(&format!("/groups/{group_id}/send")))
         .json(&serde_json::json!({ "body": body }))
         .send()
         .await
@@ -159,11 +159,119 @@ async fn diagnostics_groups(d: &AgentInstance) -> Value {
     resp.json().await.expect("diagnostics json")
 }
 
+async fn group_details(d: &AgentInstance, group_id: &str) -> Value {
+    authed_client(d)
+        .get(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .expect("group details request")
+        .json()
+        .await
+        .expect("group details json")
+}
+
+async fn publish_raw(d: &AgentInstance, topic: &str, payload: &[u8]) -> Value {
+    use base64::Engine as _;
+    authed_client(d)
+        .post(d.url("/publish"))
+        .json(&serde_json::json!({
+            "topic": topic,
+            "payload": base64::engine::general_purpose::STANDARD.encode(payload),
+        }))
+        .send()
+        .await
+        .expect("publish request")
+        .json()
+        .await
+        .expect("publish json")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_member_joined_bytes_for_test(
+    group_id: &str,
+    stable_group_id: Option<&str>,
+    member_agent_id: &str,
+    member_public_key_b64: &str,
+    role: x0x::groups::GroupRole,
+    display_name: Option<&str>,
+    inviter_agent_id: &str,
+    invite_secret: &str,
+    ts_ms: u64,
+) -> Vec<u8> {
+    fn push_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
+        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(bytes);
+    }
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"x0x.named_group.member_joined.v1");
+    push_lp(&mut buf, group_id.as_bytes());
+    push_lp(&mut buf, stable_group_id.unwrap_or("").as_bytes());
+    push_lp(&mut buf, member_agent_id.as_bytes());
+    push_lp(&mut buf, member_public_key_b64.as_bytes());
+    buf.push(role.as_u8());
+    push_lp(&mut buf, display_name.unwrap_or("").as_bytes());
+    push_lp(&mut buf, inviter_agent_id.as_bytes());
+    push_lp(&mut buf, invite_secret.as_bytes());
+    buf.extend_from_slice(&ts_ms.to_be_bytes());
+    buf
+}
+
+async fn signed_member_joined_event(
+    member: &AgentInstance,
+    group_id: &str,
+    inviter_agent_id: &str,
+    invite_secret: &str,
+    role: x0x::groups::GroupRole,
+) -> Value {
+    use base64::Engine as _;
+    let key_path = dirs::home_dir()
+        .expect("home dir")
+        .join(format!(".x0x-{}", member.name))
+        .join("agent.key");
+    let keypair = x0x::storage::load_agent_keypair_from(key_path)
+        .await
+        .expect("load member agent keypair");
+    let member_agent_id = hex::encode(keypair.agent_id().as_bytes());
+    let member_public_key_b64 =
+        base64::engine::general_purpose::STANDARD.encode(keypair.public_key().as_bytes());
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as u64;
+    let canonical = canonical_member_joined_bytes_for_test(
+        group_id,
+        Some(group_id),
+        &member_agent_id,
+        &member_public_key_b64,
+        role,
+        None,
+        inviter_agent_id,
+        invite_secret,
+        ts_ms,
+    );
+    let sig =
+        ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(keypair.secret_key(), &canonical)
+            .expect("sign forged member_joined");
+    serde_json::json!({
+        "event": "member_joined",
+        "group_id": group_id,
+        "stable_group_id": group_id,
+        "member_agent_id": member_agent_id,
+        "member_public_key_b64": member_public_key_b64,
+        "role": role,
+        "display_name": null,
+        "inviter_agent_id": inviter_agent_id,
+        "invite_secret": invite_secret,
+        "ts_ms": ts_ms,
+        "signature_b64": base64::engine::general_purpose::STANDARD.encode(sig.as_bytes()),
+    })
+}
+
 /// Acceptance criterion 1 happy path: bob joins alice's `public_open`
-/// group via invite, alice's `members_v2` reflects bob within 5 s, and
-/// bob's signed public message is accepted by alice within 5 s.
+/// group via invite, alice's `members_v2` reflects bob within the local
+/// mesh budget, and bob's signed public message is accepted by alice within
+/// the same budget.
 #[tokio::test]
-#[ignore]
 async fn member_joined_event_propagates_to_inviter() {
     let pair = pair().await;
     let alice = &pair.alice;
@@ -234,7 +342,6 @@ async fn member_joined_event_propagates_to_inviter() {
 /// MemberJoined event under a duplicate publish) does not double-count
 /// bob in alice's `members_v2`.
 #[tokio::test]
-#[ignore]
 async fn member_joined_event_is_idempotent() {
     let pair = pair().await;
     let alice = &pair.alice;
@@ -289,17 +396,91 @@ fn group_role_as_u8_is_stable_across_releases() {
     assert_eq!(GroupRole::Guest.as_u8(), 4);
 }
 
-/// Negative path: an invite secret that the inviter never minted is
-/// accepted on the wire today (third-party receivers trust the chain via
-/// signature + inviter membership), but the inviter's own applier must
-/// reject it. We can't directly synthesise a forged event without
-/// privileged access to the binary's internals, so this test instead
-/// asserts the public surface invariant that drives the asymmetric
-/// check: alice's `issued_invite_secrets` is updated when she generates
-/// an invite, and bob's join carries that secret forward to alice's
-/// MemberJoined apply path.
+/// Security regression: a joiner who holds a valid invite must not be able
+/// to self-promote by publishing a `MemberJoined { role: admin }` payload,
+/// and a joiner without a minted secret must not be admitted. Forged events
+/// must leave the one-time invite usable for the legitimate Member join that
+/// follows.
 #[tokio::test]
-#[ignore]
+async fn forged_member_joined_admin_role_or_secret_is_rejected() {
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let group_id = create_public_open_group(alice, "Reject Role Escalation").await;
+    let details = group_details(alice, &group_id).await;
+    let metadata_topic = details["metadata_topic"]
+        .as_str()
+        .expect("metadata_topic")
+        .to_string();
+    let invite = create_invite(alice, &group_id).await;
+    let parsed = x0x::groups::invite::SignedInvite::from_link(&invite).expect("parse invite");
+    let forged = signed_member_joined_event(
+        bob,
+        &group_id,
+        &parsed.inviter,
+        &parsed.invite_secret,
+        x0x::groups::GroupRole::Admin,
+    )
+    .await;
+    let payload = serde_json::to_vec(&forged).expect("forge json");
+    let published = publish_raw(bob, &metadata_topic, &payload).await;
+    assert_eq!(published["ok"], true, "publish forged event: {published:?}");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let bob_aid = bob.agent_id().await;
+    assert!(
+        !list_members(alice, &group_id).await.contains(&bob_aid),
+        "forged admin MemberJoined unexpectedly admitted bob",
+    );
+
+    let forged_secret = signed_member_joined_event(
+        bob,
+        &group_id,
+        &parsed.inviter,
+        &"00".repeat(32),
+        x0x::groups::GroupRole::Member,
+    )
+    .await;
+    let payload = serde_json::to_vec(&forged_secret).expect("forge secret json");
+    let published = publish_raw(bob, &metadata_topic, &payload).await;
+    assert_eq!(
+        published["ok"], true,
+        "publish forged secret event: {published:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !list_members(alice, &group_id).await.contains(&bob_aid),
+        "forged unknown-secret MemberJoined unexpectedly admitted bob",
+    );
+
+    let join_resp = join_via_invite(bob, &invite, "bob-member").await;
+    assert_eq!(join_resp["ok"], true, "legitimate join: {join_resp:?}");
+    let converged = wait_until(Duration::from_secs(15), || async {
+        list_members(alice, &group_id).await.contains(&bob_aid)
+    })
+    .await;
+    assert!(
+        converged,
+        "valid member join did not converge after forged admin event"
+    );
+
+    let details = group_details(alice, &group_id).await;
+    let members = details["members"].as_array().expect("members array");
+    let bob_row = members
+        .iter()
+        .find(|m| m["agent_id"].as_str() == Some(bob_aid.as_str()))
+        .expect("bob member row");
+    assert_eq!(
+        bob_row["role"], "member",
+        "bob must be admitted only as member"
+    );
+}
+
+/// Invite-secret path: alice records a structured one-time invite when she
+/// generates the link, then consumes it when bob's `MemberJoined` request is
+/// accepted and converted into an authority-signed `MemberAdded` commit.
+#[tokio::test]
 async fn issued_invite_secret_is_recorded_on_inviter() {
     let pair = pair().await;
     let alice = &pair.alice;
@@ -309,10 +490,8 @@ async fn issued_invite_secret_is_recorded_on_inviter() {
     let invite = create_invite(alice, &group_id).await;
 
     // The link round-trips through SignedInvite::from_link; we verify
-    // alice can authenticate bob's MemberJoined by observing convergence.
-    // (Negative-path forging is exercised by the
-    // `group_role_as_u8_is_stable_across_releases` unit test plus the
-    // applier's signature-verify return paths covered in clippy.)
+    // alice authenticates and consumes bob's MemberJoined by observing the
+    // committed membership converge.
     let bob_aid = bob.agent_id().await;
     let _ = join_via_invite(bob, &invite, "bob-secret").await;
     let converged = wait_until(Duration::from_secs(15), || async {

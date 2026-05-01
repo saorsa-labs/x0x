@@ -28,16 +28,14 @@ The orchestrator validates the following dogfood paths:
     remove      → list no longer contains
   Named-group lifecycle (alice owns; bob+charlie join):
     create public_open group
-    generate invite
-    bob joins via invite
-    charlie joins via invite
-    list members (≥3)
-    bob posts a "hello" group message
-    charlie posts a reply
+    generate one one-time invite per joiner
+    bob and charlie join via their own invites
+    every local roster contains self
+    alice's roster converges to include every joiner
+    alice posts a kickoff group message
+    bob and charlie post replies
     alice retrieves /groups/:id/messages and asserts both bodies present
-    alice sets bob's role / display name (if API permits)
-    bob leaves
-    members list shrinks to 2
+    the final joiner leaves and its local /groups list no longer contains the group
 
 Exit code 0 only if every assertion passes; otherwise 1.
 """
@@ -559,29 +557,31 @@ class DogfoodHarness:
             self.failures.append(f"{owner} group_id extraction")
             return
 
-        # 2. Invite
-        invite_resp = self.call(
-            owner, "group_invite", {"group_id": group_id},
-        )
-        self.assert_pass(
-            f"{owner} generates invite",
-            invite_resp.get("outcome") == "ok",
-            _short(invite_resp),
-        )
-        invite_details = invite_resp.get("details") or {}
-        invite_url = (
-            invite_details.get("invite_link")
-            or invite_details.get("invite")
-        )
-        if not invite_url or not invite_url.startswith("x0x://invite/"):
-            self.failures.append(
-                f"{owner} invite missing or wrong format: {invite_url!r}"
-            )
-            return
-
-        # 3. Each member joins
+        # 2/3. Generate one one-time invite per member, then join.
         member_groups: Dict[str, str] = {}
         for member in members:
+            invite_resp = self.call(
+                owner, "group_invite", {"group_id": group_id},
+            )
+            invite_ok = self.assert_pass(
+                f"{owner} generates invite for {member}",
+                invite_resp.get("outcome") == "ok",
+                _short(invite_resp),
+            )
+            invite_details = invite_resp.get("details") or {}
+            invite_url = (
+                invite_details.get("invite_link")
+                or invite_details.get("invite")
+            )
+            if (
+                not invite_ok
+                or not invite_url
+                or not invite_url.startswith("x0x://invite/")
+            ):
+                self.failures.append(
+                    f"{owner} invite for {member} missing or wrong format: {invite_url!r}"
+                )
+                continue
             join_resp = self.call(
                 member, "group_join", {"invite": invite_url},
             )
@@ -591,15 +591,20 @@ class DogfoodHarness:
                 ok,
                 _short(join_resp),
             )
-            joined_gid = (join_resp.get("details") or {}).get("group_id")
-            member_groups[member] = joined_gid or group_id
+            if ok:
+                joined_gid = (join_resp.get("details") or {}).get("group_id")
+                member_groups[member] = joined_gid or group_id
+
+        if len(member_groups) != len(members):
+            self.failures.append(
+                f"not all members joined: expected={members} joined={list(member_groups)}"
+            )
+            return
 
         # 4. Each member queries their own daemon and confirms it sees
-        # at least the member themselves in the roster. This is the
-        # local-view assertion — gossip-driven cross-member convergence
-        # is a separate concern (and currently slow on a no-bootstrap
-        # ad-hoc 3-daemon mesh; see daemon-side TODO on `/groups/join`
-        # subscribing to the chat topic).
+        # at least the member themselves in the roster. Owner-side
+        # cross-member convergence is asserted separately below before
+        # replies are sent.
         for m in [owner, *members]:
             gid = (
                 group_id if m == owner
@@ -614,12 +619,12 @@ class DogfoodHarness:
                 f"got {len(aids)} ids: {[a[:8] for a in aids[:5]]}",
             )
 
-        # 4b. Wait for the owner's local roster to pick up each joiner
-        # via gossip-propagated MemberJoined metadata events. This is the
-        # convergence the join-roster-propagation fix provides; without it
-        # the owner's validate_public_message rejects every signed reply
-        # under WritePolicyViolation { MembersOnly }. PlumTree mesh
-        # formation on a fresh topic dominates the latency, so we poll.
+        # 4b. Wait for the owner's local roster to pick up each joiner via
+        # the joiner-authored MemberJoined request followed by the inviter's
+        # authority-signed MemberAdded commit. Without this, the owner's
+        # validate_public_message rejects every signed reply under
+        # WritePolicyViolation { MembersOnly }. PlumTree mesh formation on a
+        # fresh topic dominates the latency, so we poll.
         member_aids = {self.runners[m].agent_id for m in members}
         deadline = time.time() + 30.0
         owner_roster: set = set()

@@ -11,14 +11,16 @@ scenarios against the fleet:
     - Anchor posts the kickoff group message; each runner posts a reply
       from its OWN daemon.
     - Anchor verifies (a) every member sees themselves in roster from
-      their local view, (b) every member's own posted message appears
-      in their own /groups/:id/messages cache.
-    - Anchor records cross-member convergence (member counts seen by
-      each runner of the other 5) as INFO only — currently slow on the
-      live fleet because /groups/join doesn't subscribe the joiner to
-      the chat-topic, see daemon TODO.
+      their local view, (b) anchor roster converges to include every
+      joined runner before replies are sent, and (c) every member's own
+      and anchor-observed /groups/:id/messages caches contain the expected
+      bodies.
     - Anchor exercises the contacts lifecycle: every remote runner
       add → trust=Trusted → trust=Blocked → remove a synthetic peer.
+
+Default mode is strict: every expected runner must be discovered and join.
+Use --allow-skips only for resilience drills where validating a reachable
+subset is acceptable.
 
 Use:
 
@@ -450,6 +452,7 @@ class FleetHarness:
         runners: Dict[str, Runner],
         log: logging.Logger,
         cmd_timeout_secs: int = 30,
+        allow_skips: bool = False,
     ) -> None:
         self.client = client
         self.router = router
@@ -458,6 +461,7 @@ class FleetHarness:
         self.runners = runners
         self.log = log
         self.cmd_timeout_secs = cmd_timeout_secs
+        self.allow_skips = allow_skips
         self.passes: List[str] = []
         self.failures: List[str] = []
 
@@ -609,13 +613,15 @@ class FleetHarness:
                     rem.get("outcome") == "ok",
                 )
             except Exception as exc:
-                # Transient cross-region churn: skip rather than fail
-                # the whole suite so the other runners' lifecycles are
-                # still exercised.
-                self.log.warning(
-                    "  SKIP %s contacts lifecycle (unreachable): %s",
-                    name, exc,
-                )
+                if self.allow_skips:
+                    self.log.warning(
+                        "  SKIP %s contacts lifecycle (unreachable): %s",
+                        name, exc,
+                    )
+                else:
+                    self.failures.append(
+                        f"{name} contacts lifecycle unreachable: {exc}"
+                    )
 
     def run_group_lifecycle(self) -> None:
         members = [n for n in self.runners if n != self.anchor_name]
@@ -643,33 +649,37 @@ class FleetHarness:
             self.failures.append("anchor failed to extract group_id")
             return
 
-        # 2. Anchor generates an invite
-        inv = self.call(
-            self.anchor_name, "group_invite", {"group_id": gid},
-        )
-        self.assert_pass(
-            f"{self.anchor_name} generates invite",
-            inv.get("outcome") == "ok",
-        )
-        invite = (inv.get("details") or {}).get("invite_link")
-        if not invite or not invite.startswith("x0x://invite/"):
-            self.failures.append("invite link missing or wrong format")
-            return
-
-        # 3. Each runner joins. A member that is currently unreachable
-        # (transient peer_disconnected) is recorded as SKIP rather than
-        # FAIL so the rest of the harness continues against the
-        # reachable subset.
+        # 2/3. Generate one one-time invite per runner, then join.
         joined: Dict[str, str] = {}
         for member in members:
+            inv = self.call(
+                self.anchor_name, "group_invite", {"group_id": gid},
+            )
+            invite_ok = self.assert_pass(
+                f"{self.anchor_name} generates invite for {member}",
+                inv.get("outcome") == "ok",
+            )
+            invite = (inv.get("details") or {}).get("invite_link")
+            if (
+                not invite_ok
+                or not invite
+                or not invite.startswith("x0x://invite/")
+            ):
+                self.failures.append(
+                    f"invite link for {member} missing or wrong format"
+                )
+                continue
             try:
                 resp = self.call(
                     member, "group_join", {"invite": invite},
                 )
             except Exception as exc:
-                self.log.warning(
-                    "  SKIP %s join unreachable: %s", member, exc,
-                )
+                if self.allow_skips:
+                    self.log.warning(
+                        "  SKIP %s join unreachable: %s", member, exc,
+                    )
+                    continue
+                self.failures.append(f"{member} join unreachable: {exc}")
                 continue
             ok = resp.get("outcome") == "ok"
             self.assert_pass(f"{member} joins via invite", ok)
@@ -679,7 +689,12 @@ class FleetHarness:
                 ) or gid
 
         if not joined:
-            self.failures.append("no reachable members joined the group")
+            self.failures.append("no members joined the group")
+            return
+        if not self.allow_skips and len(joined) != len(members):
+            self.failures.append(
+                f"not all members joined: expected={members} joined={list(joined)}"
+            )
             return
 
         # 4. Each member queries their own roster — must contain self
@@ -697,6 +712,36 @@ class FleetHarness:
                 aid in aids,
                 f"got {len(aids)}: {[a[:8] for a in aids[:5]]}",
             )
+
+        # 4b. Release-mode precondition: wait for the anchor's committed
+        # roster to include every joined runner before they post. Without
+        # owner-side backfill, replies sent before the authoritative
+        # MemberAdded commit arrives can be permanently dropped by
+        # MembersOnly write validation.
+        expected_member_aids = {
+            self.runners[m].agent_id for m in joined
+        }
+        deadline = time.time() + 30.0
+        anchor_roster: set = set()
+        while time.time() < deadline:
+            try:
+                r = self.call(
+                    self.anchor_name, "group_members", {"group_id": gid},
+                )
+                anchor_roster = set(self._member_aids(r.get("details")))
+            except Exception as exc:
+                self.log.warning(
+                    "anchor roster-convergence check exception: %s", exc,
+                )
+                anchor_roster = set()
+            if expected_member_aids.issubset(anchor_roster):
+                break
+            time.sleep(1.0)
+        self.assert_pass(
+            f"{self.anchor_name} roster converges to include all joined runners",
+            expected_member_aids.issubset(anchor_roster),
+            f"missing={list(expected_member_aids - anchor_roster)}",
+        )
 
         # 5. Each member posts a message
         anchor_post = self.call(
@@ -872,6 +917,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--tokens-file", default=None)
     parser.add_argument("--cmd-timeout", type=int, default=30)
     parser.add_argument("--report", default=None)
+    parser.add_argument(
+        "--allow-skips",
+        action="store_true",
+        help="permit unreachable runners and validate the reachable subset",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -939,6 +989,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             client, router, anchor_aid, args.anchor,
             args.nodes, args.discover_secs, log,
         )
+        missing = sorted(set(args.nodes) - set(runners))
+        if missing and not args.allow_skips:
+            log.error(
+                "missing expected runners in strict mode: %s (use --allow-skips for subset resilience)",
+                missing,
+            )
+            return 4
         if len(runners) < 2:
             log.error("need ≥2 runners, found %s", list(runners.keys()))
             return 4
@@ -948,6 +1005,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             anchor_aid=anchor_aid, anchor_name=args.anchor,
             runners=runners, log=log,
             cmd_timeout_secs=args.cmd_timeout,
+            allow_skips=args.allow_skips,
         )
 
         try:

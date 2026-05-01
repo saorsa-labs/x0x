@@ -564,24 +564,24 @@ primitives. Every assertion is the result of:
 | Scenario | Assertions per runner |
 |---|---|
 | Contacts lifecycle | add → list-contains → Trusted → Blocked → remove → list-no-longer-contains (4 assertions) |
-| Group create / invite | anchor creates `public_open` group, mints `x0x://invite/...` link (2 assertions) |
-| Group join | each runner joins via the invite (1/runner) |
+| Group create / invite | anchor creates `public_open` group, mints one one-time `x0x://invite/...` link per joiner |
+| Group join | each runner joins via its own invite (1/runner) |
 | Local roster | each member's own `/groups/:id/members` shows themselves (1/runner) |
+| Owner roster convergence | anchor's `/groups/:id/members` includes every joined runner before replies are sent |
 | Group send | anchor posts kickoff, each runner posts reply (1+N) |
-| Local message cache | each member sees their own posted body in their cache (1/member) |
+| Local/owner message cache | each member sees their own body; anchor sees every runner reply |
 | Group leave | leaver's `/groups` no longer lists the group (1) |
 
-For 6 fleet runners: up to **49 blocking assertions per run**.
+For 6 fleet runners: up to **50+ blocking assertions per run** depending on
+fleet size.
 
-### Cross-member convergence — non-blocking INFO
+### Cross-member convergence — hard gate
 
-A separate, non-blocking assertion polls the anchor's view to check
-whether members' replies appear in the anchor's `/groups/:id/messages`
-cache. Today this is recorded as INFO (typically `0/N seen` on the
-live fleet) because of an open daemon ticket: `/groups/join` does not
-subscribe the joiner to the group's chat topic, so cross-member
-gossip never reaches the anchor. See
-[`docs/design/groups-join-roster-propagation.md`](docs/design/groups-join-roster-propagation.md).
+The owner-side convergence check is now blocking. Joiners publish a signed
+`MemberJoined` request, the original inviter consumes the one-time invite and
+publishes an authority-signed `MemberAdded` commit, and the harness waits for
+the anchor roster to converge before replies are sent. The anchor must then see
+each member's reply in `/groups/:id/messages`.
 
 ### Running
 
@@ -595,14 +595,9 @@ python3 tests/e2e_vps_groups.py --anchor nyc --discover-secs 45
 
 ### Resilience
 
-A transient `peer_disconnected` to one runner soft-skips that runner's
-slice of the test rather than failing the whole suite. Per-runner
-failure counts go in the JSON report. Two consecutive runs:
-
-| Run | Anchor | Pass | Fail | Notes |
-|---|---|---|---|---|
-| 1 | NYC | 41 | 0 | helsinki + sydney transiently unreachable → SKIP |
-| 2 | NYC | **49** | **0** | full fleet participation |
+Release mode is strict: every expected runner must be discovered and join.
+For operational resilience drills, pass `--allow-skips` to validate the
+reachable subset while logging skipped nodes distinctly in the JSON report.
 
 ---
 
@@ -759,12 +754,10 @@ Phases:
 | `--lan` | `e2e_lan.sh` |
 | `--all` | everything above |
 
-> The dogfood phases (`--dogfood-local`, `--dogfood-groups`,
-> `--vps-mesh`, `--vps-groups`) are not yet wired into
-> `e2e_proof_runner.sh`. Until they are, run them explicitly after
-> `e2e_deploy.sh` (which installs the runner on every VPS), or use
-> `e2e_deploy.sh --mesh-verify` to chain Phase A + Phase B
-> verification onto the deploy itself (§7d).
+> VPS phases require deployed runners and `tests/.vps-tokens.env` (or
+> `X0X_TOKENS_FILE`). `e2e_vps_groups.py` is strict by default; pass
+> `--allow-skips` only for resilience drills where validating a reachable
+> subset is intentional.
 
 ---
 

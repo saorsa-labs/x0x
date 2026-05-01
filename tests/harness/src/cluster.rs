@@ -384,22 +384,32 @@ async fn assert_mesh_connected(
 }
 
 fn find_x0xd_binary() -> PathBuf {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_x0xd") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return path;
+        }
+    }
     // From tests/harness/, the project root is ../../
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let binary = PathBuf::from(manifest_dir).join("../../target/release/x0xd");
-    if binary.exists() {
-        return binary;
+    let debug = PathBuf::from(manifest_dir).join("target/debug/x0xd");
+    if debug.exists() {
+        return debug;
     }
-    // Try from project root directly
-    let alt = PathBuf::from(manifest_dir).join("target/release/x0xd");
-    if alt.exists() {
-        return alt;
+    let release = PathBuf::from(manifest_dir).join("target/release/x0xd");
+    if release.exists() {
+        return release;
+    }
+    let legacy = PathBuf::from(manifest_dir).join("../../target/release/x0xd");
+    if legacy.exists() {
+        return legacy;
     }
     panic!(
-        "x0xd binary not found. Build first: cargo build --release --bin x0xd\n\
-         Searched: {}, {}",
-        binary.display(),
-        alt.display()
+        "x0xd binary not found. Build first: cargo build --bin x0xd\n\
+         Searched: {}, {}, {}",
+        debug.display(),
+        release.display(),
+        legacy.display()
     );
 }
 

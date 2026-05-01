@@ -1,6 +1,6 @@
 # Joiner membership not published to metadata topic
 
-**Status:** open ticket — symptom verified, root cause located
+**Status:** implemented — joiner request + inviter-signed commit, E2E hard gate
 **Filed:** 2026-05-01
 **Filed by:** dogfood harness team
 **Related:** [TEST_SUITE_GUIDE.md §7c](../../TEST_SUITE_GUIDE.md), `tests/e2e_dogfood_groups.py`, `tests/e2e_vps_groups.py`, commit `0ca5133` (related-but-different first-message-after-join fix)
@@ -33,9 +33,9 @@ Bob and charlie can read alice's message — that's the
 `first-message-after-join` path that commit `0ca5133` fixed (joiner now
 subscribes to the public-message topic before the first ingest).
 
-But alice never picks up bob's or charlie's replies. The harness
-records this as a **non-blocking INFO** check today (see §7c) so it
-doesn't block CI.
+But alice never picks up bob's or charlie's replies. The dogfood harness now records this as a **blocking PASS/FAIL** check:
+the owner must first observe committed roster convergence and then cache each
+joiner's reply.
 
 ## Root cause
 
@@ -101,7 +101,7 @@ join, but no gossip event ever reaches alice's metadata listener.
 ### 1. Publish a `MemberJoined` metadata event on join
 
 Add to `join_group_via_invite` (right after the local `info.add_member`
-call), an analogue of the owner-side `publish_named_group_metadata_event`:
+call), a joiner-authored request on the metadata topic:
 
 ```rust
 let event = NamedGroupMetadataEvent::MemberJoined {
@@ -120,15 +120,17 @@ publish_named_group_metadata_event(&state, &info.metadata_topic, &event).await;
 The event must be **signed by the joiner**, and the receiver-side
 `apply_named_group_metadata_event` must:
 
-1. Verify the signature.
-2. Verify that the inviter named in the event is currently an admin or
-   member of the group (i.e. they were authorised to issue invites at
-   the time the join happened — the invite_secret already binds this
-   but the metadata-channel handler should re-check).
-3. Apply the join to the local `info.members_v2`.
+1. Verify the joiner's signature and derived AgentId.
+2. Reject any requested role other than `Member` for invite-join v1.
+3. Apply the request only on the original local inviter, where the structured
+   one-time invite record can be checked for role cap, expiry, and prior
+   consumption.
+4. Publish an inviter/authority-signed `MemberAdded` event carrying a
+   `GroupStateCommit`; third-party receivers ignore `MemberJoined` and apply
+   only the signed commit.
 
-Pure additive change — no existing behaviour breaks because today
-nobody publishes this event so there's no apply-side regression risk.
+This keeps durable roster and `state_hash` mutations inside the D.3 signed
+state-commit chain.
 
 ### 2. Backfill on owner-side ingest
 
@@ -166,12 +168,15 @@ DEBUG-level `tracing::warn!` line.
 The bug is fixed when **all** of these hold on a fresh local 3-daemon
 setup (no persisted state) and on the live VPS fleet:
 
-1. New unit test in `tests/named_group_join_metadata_event.rs`:
+1. New integration tests in `tests/named_group_join_metadata_event.rs`:
    - Daemon A creates a public_open group, generates an invite.
    - Daemon B joins via the invite.
-   - Within 2 s, A's `state.named_groups[gid].members_v2` contains B.
+   - Within the local mesh budget (15 s), A's `members_v2` contains B via an
+     authority-signed `MemberAdded` commit.
    - B publishes a signed message.
-   - A's `/groups/:id/messages` cache contains B's body within 2 s.
+   - A's `/groups/:id/messages` cache contains B's body within the same local
+     mesh budget.
+   - A forged `MemberJoined { role: admin }` does not admit or promote B.
 
 2. `tests/e2e_dogfood_groups.py` flips its current
    `INFO alice observed 0/N member replies` line to a hard PASS:
@@ -215,8 +220,7 @@ listener; this ticket ensures the listener accepts it.
 ## Why this is a separate ticket
 
 This was discovered while building Phase B of the dogfood-test family
-(2026-05-01). It's outside the harness's job to fix — Phase B
-intentionally treats cross-member convergence as INFO-only so the
-harness can ship without blocking on the daemon work. Once this
-ticket lands, the Phase-B harness toggles its soft-info assertions
-to hard PASSes and gains a real cross-member correctness gate.
+(2026-05-01). The first harness revision treated cross-member convergence as
+INFO-only so dogfood coverage could land while the daemon fix was pending.
+With this ticket implemented, Phase B treats owner roster convergence and
+owner-observed member replies as hard PASS/FAIL gates.

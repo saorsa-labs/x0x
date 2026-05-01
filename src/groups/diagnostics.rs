@@ -173,46 +173,79 @@ impl GroupsDiagnostics {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        // Union of locally-known groups and groups that have ever recorded
-        // a counter. The latter catches groups that have churned out of
-        // `state.named_groups` (e.g. owner deleted) but still have audit
-        // counters worth surfacing.
-        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for k in groups.keys() {
-            keys.insert(k.clone());
-        }
-        for k in counters_guard.keys() {
-            keys.insert(k.clone());
+        fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
+            dst.messages_received = dst.messages_received.saturating_add(src.messages_received);
+            dst.messages_dropped_decode_failed = dst
+                .messages_dropped_decode_failed
+                .saturating_add(src.messages_dropped_decode_failed);
+            dst.messages_dropped_author_banned = dst
+                .messages_dropped_author_banned
+                .saturating_add(src.messages_dropped_author_banned);
+            dst.messages_dropped_write_policy_violation = dst
+                .messages_dropped_write_policy_violation
+                .saturating_add(src.messages_dropped_write_policy_violation);
+            dst.messages_dropped_signature_failed = dst
+                .messages_dropped_signature_failed
+                .saturating_add(src.messages_dropped_signature_failed);
+            dst.messages_dropped_other = dst
+                .messages_dropped_other
+                .saturating_add(src.messages_dropped_other);
+            dst.member_joined_events_applied = dst
+                .member_joined_events_applied
+                .saturating_add(src.member_joined_events_applied);
+            dst.last_message_at_ms = match (dst.last_message_at_ms, src.last_message_at_ms) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (None, Some(b)) => Some(b),
+                (a, None) => a,
+            };
         }
 
-        let mut rows = Vec::with_capacity(keys.len());
-        for key in keys {
-            let info = groups.get(&key);
-            let stable_id = info
-                .map(|i| i.stable_group_id().to_string())
-                .unwrap_or_else(|| key.clone());
-            let members_v2_size = info
-                .map(|i| i.members_v2.values().filter(|m| m.is_active()).count())
-                .unwrap_or(0);
-            // Look up counters by either the local key or the stable id —
-            // the public-message ingest path keys on the stable id, while
-            // the metadata path keys on whichever the caller supplied.
-            let counters = counters_guard
-                .get(&key)
-                .or_else(|| counters_guard.get(&stable_id))
-                .cloned()
-                .unwrap_or_default();
-            rows.push(GroupDiagnostic {
-                group_id: key.clone(),
-                members_v2_size,
-                subscribed_metadata: metadata_subscribed.contains(&key),
-                // Public listener is keyed on stable id.
-                subscribed_public: public_subscribed.contains(&stable_id)
-                    || public_subscribed.contains(&key),
-                counters,
-            });
+        let stable_for_key = |key: &str| -> String {
+            groups
+                .get(key)
+                .map(|info| info.stable_group_id().to_string())
+                .or_else(|| {
+                    groups
+                        .values()
+                        .find(|info| info.stable_group_id() == key)
+                        .map(|info| info.stable_group_id().to_string())
+                })
+                .unwrap_or_else(|| key.to_string())
+        };
+
+        let mut rows: std::collections::BTreeMap<String, GroupDiagnostic> =
+            std::collections::BTreeMap::new();
+        for (key, info) in groups {
+            let stable_id = info.stable_group_id().to_string();
+            rows.entry(stable_id.clone())
+                .or_insert_with(|| GroupDiagnostic {
+                    group_id: stable_id.clone(),
+                    members_v2_size: info.members_v2.values().filter(|m| m.is_active()).count(),
+                    subscribed_metadata: metadata_subscribed.contains(key)
+                        || metadata_subscribed.contains(&stable_id),
+                    subscribed_public: public_subscribed.contains(&stable_id)
+                        || public_subscribed.contains(key),
+                    counters: GroupCounters::default(),
+                });
         }
-        GroupsDiagnosticsSnapshot { groups: rows }
+
+        for (key, counters) in counters_guard.iter() {
+            let stable_id = stable_for_key(key);
+            let row = rows
+                .entry(stable_id.clone())
+                .or_insert_with(|| GroupDiagnostic {
+                    group_id: stable_id,
+                    members_v2_size: 0,
+                    subscribed_metadata: metadata_subscribed.contains(key),
+                    subscribed_public: public_subscribed.contains(key),
+                    counters: GroupCounters::default(),
+                });
+            merge_counters(&mut row.counters, counters);
+        }
+
+        GroupsDiagnosticsSnapshot {
+            groups: rows.into_values().collect(),
+        }
     }
 }
 

@@ -11,7 +11,11 @@
 #   --chrome             tests/e2e_gui_chrome.mjs
 #   --dioxus             tests/e2e_communitas_dioxus.sh
 #   --xcuitest           xcodebuild UI tests (macOS only)
+#   --dogfood-local      tests/e2e_dogfood_local.sh
+#   --dogfood-groups     tests/e2e_dogfood_groups.sh
 #   --vps                tests/e2e_vps.sh (requires tokens)
+#   --vps-mesh           tests/e2e_vps_mesh.py (requires deployed runners)
+#   --vps-groups         tests/e2e_vps_groups.py (requires deployed runners)
 #   --lan                tests/e2e_lan.sh (requires Mac Studios)
 #   --all                everything above
 #
@@ -29,23 +33,28 @@ LOG="$PROOF_DIR/runner.log"
 log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
 RUN_RUST=0 RUN_COMP=0 RUN_STRESS=0 RUN_CHROME=0
-RUN_DIOXUS=0 RUN_XCUI=0 RUN_VPS=0 RUN_LAN=0
+RUN_DIOXUS=0 RUN_XCUI=0 RUN_DOGFOOD_LOCAL=0 RUN_DOGFOOD_GROUPS=0
+RUN_VPS=0 RUN_VPS_MESH=0 RUN_VPS_GROUPS=0 RUN_LAN=0
 
 if [ $# -eq 0 ]; then
-    echo "usage: $0 [--all] [--rust-tests] [--comprehensive] [--stress] [--chrome] [--dioxus] [--xcuitest] [--vps] [--lan]"
+    echo "usage: $0 [--all] [--rust-tests] [--comprehensive] [--dogfood-local] [--dogfood-groups] [--stress] [--chrome] [--dioxus] [--xcuitest] [--vps] [--vps-mesh] [--vps-groups] [--lan]"
     exit 2
 fi
 
 while (( "$#" )); do
     case "$1" in
-        --all) RUN_RUST=1; RUN_COMP=1; RUN_STRESS=1; RUN_CHROME=1; RUN_DIOXUS=1; RUN_XCUI=1; RUN_VPS=1; RUN_LAN=1 ;;
+        --all) RUN_RUST=1; RUN_COMP=1; RUN_DOGFOOD_LOCAL=1; RUN_DOGFOOD_GROUPS=1; RUN_STRESS=1; RUN_CHROME=1; RUN_DIOXUS=1; RUN_XCUI=1; RUN_VPS=1; RUN_VPS_MESH=1; RUN_VPS_GROUPS=1; RUN_LAN=1 ;;
         --rust-tests) RUN_RUST=1 ;;
         --comprehensive) RUN_COMP=1 ;;
+        --dogfood-local) RUN_DOGFOOD_LOCAL=1 ;;
+        --dogfood-groups) RUN_DOGFOOD_GROUPS=1 ;;
         --stress) RUN_STRESS=1 ;;
         --chrome) RUN_CHROME=1 ;;
         --dioxus) RUN_DIOXUS=1 ;;
         --xcuitest) RUN_XCUI=1 ;;
         --vps) RUN_VPS=1 ;;
+        --vps-mesh) RUN_VPS_MESH=1 ;;
+        --vps-groups) RUN_VPS_GROUPS=1 ;;
         --lan) RUN_LAN=1 ;;
         *) echo "unknown arg: $1"; exit 2 ;;
     esac
@@ -77,6 +86,12 @@ run_phase() {
 [ "$RUN_COMP" = 1 ] && [ -x tests/e2e_comprehensive.sh ] && run_phase comprehensive \
     bash tests/e2e_comprehensive.sh
 
+[ "$RUN_DOGFOOD_LOCAL" = 1 ] && [ -x tests/e2e_dogfood_local.sh ] && run_phase dogfood-local \
+    bash tests/e2e_dogfood_local.sh
+
+[ "$RUN_DOGFOOD_GROUPS" = 1 ] && [ -x tests/e2e_dogfood_groups.sh ] && run_phase dogfood-groups \
+    bash tests/e2e_dogfood_groups.sh
+
 [ "$RUN_STRESS" = 1 ] && run_phase stress \
     bash tests/e2e_stress_gossip.sh --nodes 3 --messages 500 \
         --proof-dir "$PROOF_DIR/stress"
@@ -94,6 +109,12 @@ run_phase() {
 
 [ "$RUN_VPS" = 1 ] && [ -x tests/e2e_vps.sh ] && run_phase vps \
     bash tests/e2e_vps.sh
+
+[ "$RUN_VPS_MESH" = 1 ] && [ -x tests/e2e_vps_mesh.py ] && run_phase vps-mesh \
+    python3 tests/e2e_vps_mesh.py
+
+[ "$RUN_VPS_GROUPS" = 1 ] && [ -x tests/e2e_vps_groups.py ] && run_phase vps-groups \
+    python3 tests/e2e_vps_groups.py
 
 [ "$RUN_LAN" = 1 ] && [ -x tests/e2e_lan.sh ] && run_phase lan \
     bash tests/e2e_lan.sh

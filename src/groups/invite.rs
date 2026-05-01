@@ -1,9 +1,11 @@
 //! Signed invite tokens for group membership.
 //!
-//! Invite tokens are shareable links that allow agents to join a group.
+//! Invite tokens are one-time links that allow one agent to join a group.
 //! Today admission is authenticated by the invite secret + join handshake;
-//! the `signature` field is retained as future-facing/vestigial metadata and
-//! is not currently enforced on the wire.
+//! the inviter records the secret locally, enforces expiry/role caps, consumes
+//! it on first successful use, then publishes an authority-signed membership
+//! commit. The `signature` field is retained as future-facing/vestigial
+//! metadata and is not currently enforced on the wire.
 
 use crate::groups::policy::GroupPolicy;
 use crate::identity::AgentId;
@@ -16,6 +18,7 @@ pub const DEFAULT_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
 /// A signed invite token for joining a group.
 ///
 /// Tokens are serialized to base64url for sharing via email, chat, QR codes, etc.
+/// Each token is accepted at most once by the inviter that minted it.
 /// The format is: `x0x://invite/<base64url(json(SignedInvite))>`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedInvite {
@@ -42,7 +45,8 @@ pub struct SignedInvite {
     /// Agent ID of the inviter (hex-encoded).
     pub inviter: String,
     /// One-time invite secret (32 bytes, hex-encoded).
-    /// Used to authenticate the join handshake.
+    /// Used to authenticate the join handshake and consumed by the inviter
+    /// when it publishes the authoritative membership commit.
     pub invite_secret: String,
     /// Unix seconds when this invite was created.
     pub created_at: u64,

@@ -60,6 +60,32 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// Locally-issued invite record used to authenticate joiner-authored
+/// `MemberJoined` requests at the original inviter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuedInviteRecord {
+    /// Unix seconds when the invite was minted.
+    #[serde(default)]
+    pub created_at_secs: u64,
+    /// Unix seconds after which the invite is no longer accepted. `0` means
+    /// no expiry, matching [`invite::SignedInvite`].
+    #[serde(default)]
+    pub expires_at_secs: u64,
+    /// Maximum role this invite may grant. Invite-join v1 uses `Member`.
+    #[serde(default = "default_invite_max_role")]
+    pub max_role: GroupRole,
+    /// Agent that consumed this one-time invite, if any.
+    #[serde(default)]
+    pub consumed_by: Option<String>,
+    /// Unix milliseconds when the invite was consumed locally.
+    #[serde(default)]
+    pub consumed_at_ms: Option<u64>,
+}
+
+fn default_invite_max_role() -> GroupRole {
+    GroupRole::Member
+}
+
 /// Metadata for a group.
 ///
 /// Persisted as JSON. The legacy v1 layout used a flat `members: BTreeSet`
@@ -160,19 +186,19 @@ pub struct GroupInfo {
     #[serde(default)]
     pub withdrawn: bool,
 
-    /// Hex-encoded one-time invite secrets that the local node has issued
-    /// for this group. Populated by `POST /groups/:id/invite`. Used by the
-    /// inviter when applying a `MemberJoined` metadata event so it can
-    /// verify that the joiner's claimed `invite_secret` matches one we
-    /// actually minted. Third-party receivers that did not mint the secret
-    /// rely on the joiner's signature plus the inviter's current
-    /// membership, so this field is only authoritative on the inviter.
-    ///
-    /// TODO: enforce a FIFO eviction once the set grows above 1024 entries.
-    /// Today the set is unbounded; we accept that trade-off because the
-    /// daemon already retains persistent group metadata of comparable size.
+    /// Legacy pre-v1.1 invite-secret set. Retained for JSON compatibility
+    /// with already-persisted group blobs, but new admission checks use
+    /// `issued_invites` so expiry, role cap, and one-time consumption can be
+    /// enforced.
     #[serde(default)]
     pub issued_invite_secrets: HashSet<String>,
+    /// Structured one-time invite records issued by this local node for this
+    /// group. Populated by `POST /groups/:id/invite` and consumed by the
+    /// original inviter when accepting a joiner-authored `MemberJoined`
+    /// request. Third-party receivers do not apply `MemberJoined` directly;
+    /// they wait for the inviter's authority-signed `MemberAdded` commit.
+    #[serde(default)]
+    pub issued_invites: HashMap<String, IssuedInviteRecord>,
 }
 
 impl GroupInfo {
@@ -282,6 +308,7 @@ impl GroupInfo {
             banner_url: None,
             withdrawn: false,
             issued_invite_secrets: HashSet::new(),
+            issued_invites: HashMap::new(),
         };
         info.recompute_state_hash();
         info
@@ -558,6 +585,67 @@ impl GroupInfo {
         if self.state_hash.is_empty() {
             self.recompute_state_hash();
         }
+    }
+
+    /// Record an invite minted by this local authority. Invite-join v1 is
+    /// deliberately one-time and role-capped to prevent replay and privilege
+    /// escalation from joiner-authored metadata events.
+    pub fn record_issued_invite(
+        &mut self,
+        secret: String,
+        created_at_secs: u64,
+        expires_at_secs: u64,
+        max_role: GroupRole,
+    ) {
+        self.issued_invite_secrets.insert(secret.clone());
+        self.issued_invites.insert(
+            secret,
+            IssuedInviteRecord {
+                created_at_secs,
+                expires_at_secs,
+                max_role,
+                consumed_by: None,
+                consumed_at_ms: None,
+            },
+        );
+    }
+
+    /// Consume a previously-recorded one-time invite for `member_agent_id`.
+    ///
+    /// Returns `Ok(())` only if the secret exists, has not already been
+    /// consumed, has not expired, and the requested role is within the
+    /// invite's role cap.
+    pub fn consume_issued_invite(
+        &mut self,
+        secret: &str,
+        member_agent_id: &str,
+        requested_role: GroupRole,
+        event_ts_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), &'static str> {
+        let Some(record) = self.issued_invites.get_mut(secret) else {
+            return Err("invite_secret_unknown");
+        };
+        if record.consumed_by.is_some() {
+            return Err("invite_secret_consumed");
+        }
+        if !record.max_role.at_least(requested_role) {
+            return Err("invite_role_exceeds_cap");
+        }
+        let event_secs = event_ts_ms / 1_000;
+        if event_secs.saturating_add(300) < record.created_at_secs {
+            return Err("invite_event_before_creation");
+        }
+        if record.expires_at_secs != 0 {
+            let now_secs = now_ms / 1_000;
+            if event_secs > record.expires_at_secs || now_secs > record.expires_at_secs {
+                return Err("invite_expired");
+            }
+        }
+        record.consumed_by = Some(member_agent_id.to_string());
+        record.consumed_at_ms = Some(now_ms);
+        self.issued_invite_secrets.remove(secret);
+        Ok(())
     }
 
     /// Add or update a member. If the member already exists, updates state to Active.
