@@ -159,7 +159,13 @@ Keypairs are serialized with **bincode** (compact binary), not JSON. Manual seri
 
 `src/bin/x0x.rs` — unified CLI that controls a running `x0xd` daemon. Every REST endpoint is mapped to a CLI subcommand. Shared endpoint registry in `src/api/mod.rs` ensures routes and CLI commands stay in sync. CLI modules in `src/cli/`.
 
-Key commands: `x0x start`, `x0x health`, `x0x agent`, `x0x contacts`, `x0x publish`, `x0x direct send`, `x0x groups`, `x0x tasks`, `x0x presence online|foaf|find|status`, `x0x routes` (prints all 75+ endpoints).
+Key commands: `x0x start`, `x0x health`, `x0x agent`, `x0x contacts`, `x0x publish`, `x0x direct send`, `x0x exec <agent> -- <argv...>`, `x0x groups`, `x0x tasks`, `x0x presence online|foaf|find|status`, `x0x routes` (prints all endpoints).
+
+### Tier-1 Remote Exec
+
+`x0x exec` runs non-interactive, strictly allowlisted commands on a remote daemon over signed/encrypted gossip-DM frames. It is disabled unless an exec ACL is present and has `[exec].enabled = true`. Default ACL path is `/etc/x0x/exec-acl.toml` on Linux and `/usr/local/etc/x0x/exec-acl.toml` on macOS; tests can override with `x0xd --exec-acl <PATH>`. See `docs/exec.md` and `docs/design/x0x-exec.md`.
+
+REST endpoints: `POST /exec/run`, `POST /exec/cancel`, `GET /exec/sessions`, `GET /diagnostics/exec`.
 
 ### x0xd Daemon Flags
 
@@ -169,6 +175,7 @@ x0xd [OPTIONS]
   --name <NAME>         Instance name for multi-instance support
   --api-port <PORT>               Override API server port (otherwise ephemeral for named instances)
   --no-hard-coded-bootstrap       Skip configured bootstrap peers
+  --exec-acl <PATH>               Override default exec ACL path (/etc/x0x/exec-acl.toml on Linux)
   --check                         Check configuration and exit
   --check-updates       Check for updates and exit
   --skip-update-check   Skip update check on startup
@@ -278,14 +285,16 @@ Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile
 
 ## E2E Test Scripts
 
-Four bash test scripts in `tests/` for end-to-end validation:
+Bash + Python test harnesses in `tests/` for end-to-end validation:
 
 | Script | Scope | Assertions | What it tests |
 |--------|-------|-----------|---------------|
 | `e2e_comprehensive.sh` | Local (alice+bob+charlie) | ~143 | ALL 75+ endpoints, 18 categories: contacts lifecycle, machine pinning, trust eval (5 paths), MLS full lifecycle (add/remove/re-add), named groups (invite validation, leave/rejoin), KV stores (multi-key, update), presence (all 6 endpoints), seedless bootstrap |
 | `e2e_live_network.sh` | Local → live VPS mesh | ~66 | Local node joins real bootstrap network, bidirectional: direct messaging, pub/sub, MLS groups with VPS members, named group invites across network, presence discovery |
-| `e2e_vps.sh` | 6 VPS bootstrap nodes | ~102 | All 6 nodes: cross-continent direct messaging (NYC→Sydney), multi-continent MLS, named groups, KV stores, contact blocking, presence FOAF, constitution on all nodes |
-| `e2e_deploy.sh` | Build + deploy to VPS | ~24 | Cross-compile, upload to 6 nodes, verify health/version/mesh, collect API tokens |
+| `e2e_vps.sh` | 6 VPS bootstrap nodes (legacy SSH-per-call) | ~102 | All 6 nodes: cross-continent direct messaging (NYC→Sydney), multi-continent MLS, named groups, KV stores, contact blocking, presence FOAF, constitution on all nodes. **Dominated by SSH RTT to Singapore/Sydney — use `e2e_vps_mesh.py` for clean cross-region matrix results.** |
+| `e2e_vps_mesh.py` *(new)* | 6 VPS bootstrap nodes (mesh-relay) | 30 directed pairs | All-pairs DM matrix driven through x0x's own pubsub via 1 SSH tunnel to an anchor node. ~16 s wall-clock, zero harness flakes. Backed by `tests/runners/x0x_test_runner.py` running as a systemd service on each VPS. See [`TEST_SUITE_GUIDE.md`](TEST_SUITE_GUIDE.md) §7b. |
+| `e2e_local_mesh.sh` *(new)* | Local 3-node smoke for mesh harness | 6 directed pairs | Boots alice/bob/charlie + a runner each, runs `e2e_vps_mesh.py --no-tunnel` against alice. Proves the protocol without SSH. |
+| `e2e_deploy.sh` | Build + deploy to VPS | ~24 | Cross-compile, upload `x0xd` **and** the mesh test runner (`x0x-test-runner.service`) to 6 nodes, verify health/version/mesh, collect API tokens |
 
 ### Running E2E Tests
 
@@ -296,19 +305,25 @@ cargo build --release
 # 2. Local comprehensive test (no VPS needed, ~2 min)
 bash tests/e2e_comprehensive.sh
 
-# 3. Live network test (local node joins real bootstrap, ~3 min)
+# 3. Local mesh-harness smoke (proves the mesh protocol, no VPS)
+bash tests/e2e_local_mesh.sh
+
+# 4. Live network test (local node joins real bootstrap, ~3 min)
 #    Requires: VPS nodes running, SSH access
 bash tests/e2e_live_network.sh
 
-# 4. Deploy to VPS (cross-compile + upload, ~5 min)
+# 5. Deploy to VPS (cross-compile + upload x0xd + mesh runner, ~5 min)
 #    Requires: cargo-zigbuild, SSH access to 6 VPS nodes
 bash tests/e2e_deploy.sh
 
-# 5. VPS-only test (test across 6 bootstrap nodes, ~4 min)
-#    Requires: tokens in tests/.vps-tokens.env (written by e2e_deploy.sh)
+# 6a. VPS DM matrix via the mesh harness (RECOMMENDED, ~16 s)
+#     Requires: tokens in tests/.vps-tokens.env, mesh runner active on all 6 nodes
+python3 tests/e2e_vps_mesh.py --anchor nyc --discover-secs 30 --settle-secs 60
+
+# 6b. VPS-only legacy SSH-per-call test (~4 min, may flake on Singapore/Sydney)
 bash tests/e2e_vps.sh
 
-# 6. Health check (quick VPS status)
+# 7. Health check (quick VPS status)
 bash .deployment/health-check.sh              # basic
 bash .deployment/health-check.sh --extended   # with peer counts
 ```
@@ -329,7 +344,7 @@ When running tests that SSH to multiple VPS nodes sequentially, use `-o ControlM
 
 ## API Completeness
 
-75+ REST endpoints, all wired to x0xd and CLI:
+124 REST endpoints, all wired to x0xd and CLI:
 - Identity + AgentCard: `GET /agent`, `GET /agent/card`, `POST /agent/card/import`
 - Presence: `GET /presence/online`, `GET /presence/foaf`, `GET /presence/find/:id`, `GET /presence/status/:id`, `GET /presence/events` (SSE)
 - Named groups: `POST/GET /groups`, `POST /groups/:id/invite`, `POST /groups/join`, policy, roles, join requests, ban/unban
@@ -339,6 +354,8 @@ When running tests that SSH to multiple VPS nodes sequentially, use `-o ControlM
 - MLS groups: `MlsGroup::new()`, `add_member()`, `remove_member()`, `MlsCipher::encrypt/decrypt()`
 - Task lists (CRDTs): `create_task_list()`, `join_task_list()` via `TaskListHandle`
 - File transfer: `POST /files/send`, `POST /files/accept/:id`
+- Diagnostics: `GET /diagnostics/connectivity`, `GET /diagnostics/gossip`, `GET /diagnostics/dm`, `GET /diagnostics/exec` (DM and exec counters + per-peer/session state; CLI: `x0x diagnostics dm`, `x0x diagnostics exec`)
+- Peer lifecycle: `GET /peers/events` SSE (Established / Replaced / Closing / Closed / ReaderExited)
 - GUI: `GET /gui` (embedded HTML), `x0x gui` opens browser
 - Identity, trust, contacts, gossip pub/sub, WebSocket: all complete
 

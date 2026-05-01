@@ -44,6 +44,8 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Get, "/network/bootstrap-cache"),
     (Method::Get, "/diagnostics/connectivity"),
     (Method::Get, "/diagnostics/gossip"),
+    (Method::Get, "/diagnostics/dm"),
+    (Method::Get, "/diagnostics/exec"),
     (Method::Post, "/peers/:peer_id/probe"),
     (Method::Get, "/peers/:peer_id/health"),
     (Method::Get, "/peers/events"),
@@ -87,6 +89,10 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Post, "/direct/send"),
     (Method::Get, "/direct/connections"),
     (Method::Get, "/direct/events"),
+    // ── Exec ───────────────────────────────────────────────────────────
+    (Method::Post, "/exec/run"),
+    (Method::Post, "/exec/cancel"),
+    (Method::Get, "/exec/sessions"),
     // ── MLS groups ──────────────────────────────────────────────────────
     (Method::Post, "/mls/groups"),
     (Method::Get, "/mls/groups"),
@@ -341,6 +347,7 @@ fn categories_are_valid() {
         "tasks",
         "stores",
         "files",
+        "exec",
         "upgrade",
         "websocket",
     ];

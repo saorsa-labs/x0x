@@ -236,6 +236,25 @@ pub enum DmError {
     #[error("timed out after {retries} retries over {elapsed:?}")]
     Timeout { retries: u8, elapsed: Duration },
 
+    /// Presence/identity data says the peer is probably offline before we
+    /// start a transport attempt.
+    #[error("peer likely offline: phi={phi}, last_seen_ms_ago={last_seen_ms_ago:?}")]
+    PeerLikelyOffline {
+        /// Phi-accrual suspicion score.
+        phi: f64,
+        /// Time since the last positive signal, when known.
+        last_seen_ms_ago: Option<u64>,
+    },
+
+    /// The transport lifecycle bus says the peer's active connection is
+    /// closing/closed/superseded, so waiting for the full timeout would be a
+    /// false hang.
+    #[error("peer disconnected: {reason}")]
+    PeerDisconnected {
+        /// Lifecycle or health reason.
+        reason: String,
+    },
+
     /// Recipient's agent accepted the envelope but their trust policy
     /// rejected the sender.
     #[error("recipient rejected: {reason}")]
@@ -251,6 +270,19 @@ pub enum DmError {
     /// encapsulation, or AEAD encryption).
     #[error("envelope construction failed: {0}")]
     EnvelopeConstruction(String),
+
+    /// User payload exceeds the direct-message transport's limit.
+    #[error("payload too large: {len} bytes exceeds max {max}")]
+    PayloadTooLarge {
+        /// Actual supplied payload length.
+        len: usize,
+        /// Maximum supported payload length.
+        max: usize,
+    },
+
+    /// The local network stack is not running or has no usable connectivity.
+    #[error("no usable connectivity: {0}")]
+    NoConnectivity(String),
 
     /// Catch-all for gossip transport errors not classified above.
     #[error("gossip transport error: {0}")]
@@ -283,6 +315,36 @@ pub enum DmPath {
     /// Legacy raw-QUIC direct-stream path. Still functional during the
     /// 0.18 overlap release.
     RawQuic,
+    /// Raw-QUIC path with ant-quic receive-pipeline ACK confirmation.
+    RawQuicAcked,
+}
+
+/// Fallback RTT used when no per-peer RTT sample has reached the local cache.
+pub const DM_TIMEOUT_FALLBACK_RTT_MS: u32 = 250;
+
+/// Minimum per-attempt DM timeout.
+pub const DM_TIMEOUT_MIN_MS: u64 = 500;
+
+/// Maximum per-attempt DM timeout.
+pub const DM_TIMEOUT_MAX_MS: u64 = 30_000;
+
+/// RTT multiplier used for adaptive per-attempt DM timeouts.
+pub const DM_TIMEOUT_RTT_MULTIPLIER: u64 = 16;
+
+/// Compute an adaptive per-attempt DM timeout from a smoothed peer RTT.
+///
+/// Unknown or zero RTT falls back to a conservative network-wide P95 estimate.
+/// The result is clamped so fast peers fail quickly while slow or unhealthy
+/// peers cannot pin an API request forever.
+#[must_use]
+pub fn dm_attempt_timeout(peer_rtt_ms: Option<u32>) -> Duration {
+    let base_ms = peer_rtt_ms
+        .filter(|rtt| *rtt > 0)
+        .unwrap_or(DM_TIMEOUT_FALLBACK_RTT_MS) as u64;
+    let timeout_ms = base_ms
+        .saturating_mul(DM_TIMEOUT_RTT_MULTIPLIER)
+        .clamp(DM_TIMEOUT_MIN_MS, DM_TIMEOUT_MAX_MS);
+    Duration::from_millis(timeout_ms)
 }
 
 /// Per-call configuration for `send_direct_with_config`.
@@ -303,19 +365,24 @@ pub struct DmSendConfig {
     /// If that fast path is unavailable, fall back to the normal
     /// capability-aware send logic.
     pub prefer_raw_quic_if_connected: bool,
+    /// When set, raw-QUIC sends use ant-quic's receive-pipeline ACK surface
+    /// and only return success after the remote reader task has drained the
+    /// bytes. `None` keeps the old fire-and-forget raw path.
+    pub raw_quic_receive_ack_timeout: Option<Duration>,
 }
 
 impl Default for DmSendConfig {
     fn default() -> Self {
-        // Tuned for REST-handler response times: worst-case 10.5 s
-        // (5 s + 0.5 s backoff + 5 s retry) so callers and downstream
-        // curl-based test harnesses don't hit their own timeouts.
+        // Adaptive default: unknown peers fall back to 250 ms × 16 = 4 s.
+        // `Agent::send_direct_with_config` replaces this fallback with the
+        // peer-specific bootstrap-cache EWMA RTT when available.
         Self {
-            timeout_per_attempt: Duration::from_secs(5),
+            timeout_per_attempt: dm_attempt_timeout(None),
             max_retries: 1,
-            backoff: BackoffPolicy::Fixed(Duration::from_millis(500)),
+            backoff: BackoffPolicy::ExponentialFromTimeout { factor: 2 },
             require_gossip: false,
             prefer_raw_quic_if_connected: false,
+            raw_quic_receive_ack_timeout: Some(dm_attempt_timeout(None)),
         }
     }
 }
@@ -1038,6 +1105,29 @@ mod tests {
         assert_eq!(b.delay(base, 0), Duration::from_secs(10));
         assert_eq!(b.delay(base, 1), Duration::from_secs(20));
         assert_eq!(b.delay(base, 2), Duration::from_secs(40));
+    }
+
+    #[test]
+    fn adaptive_dm_attempt_timeout_uses_rtt_with_floor_and_ceiling() {
+        assert_eq!(dm_attempt_timeout(Some(10)), Duration::from_millis(500));
+        assert_eq!(dm_attempt_timeout(Some(50)), Duration::from_millis(800));
+        assert_eq!(dm_attempt_timeout(None), Duration::from_secs(4));
+        assert_eq!(dm_attempt_timeout(Some(0)), Duration::from_secs(4));
+        assert_eq!(dm_attempt_timeout(Some(10_000)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn default_dm_send_config_is_adaptive() {
+        let cfg = DmSendConfig::default();
+        assert_eq!(cfg.timeout_per_attempt, dm_attempt_timeout(None));
+        assert!(matches!(
+            cfg.backoff,
+            BackoffPolicy::ExponentialFromTimeout { factor: 2 }
+        ));
+        assert_eq!(
+            cfg.raw_quic_receive_ack_timeout,
+            Some(dm_attempt_timeout(None))
+        );
     }
 
     #[test]

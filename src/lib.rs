@@ -142,6 +142,9 @@ pub mod upgrade;
 /// File transfer protocol types and state management.
 pub mod files;
 
+/// Secure Tier-1 remote exec protocol and runtime.
+pub mod exec;
+
 /// The x0x Constitution — The Four Laws of Intelligent Coexistence — embedded at compile time.
 pub mod constitution;
 
@@ -2781,6 +2784,42 @@ impl Agent {
             .await
     }
 
+    async fn dm_peer_rtt_ms(&self, agent_id: &identity::AgentId) -> Option<u32> {
+        let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
+        let cached_machine_id = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache
+                .get(agent_id)
+                .map(|entry| entry.machine_id)
+                .filter(|machine_id| machine_id.0 != [0_u8; 32])
+        };
+        let machine_id = registry_machine_id.or(cached_machine_id)?;
+        let peer = self
+            .bootstrap_cache
+            .as_ref()?
+            .get(&ant_quic::PeerId(machine_id.0))
+            .await?;
+        (peer.stats.avg_rtt_ms > 0).then_some(peer.stats.avg_rtt_ms)
+    }
+
+    async fn dm_peer_likely_offline(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> Option<(f64, Option<u64>)> {
+        if self.is_agent_connected(agent_id).await {
+            return None;
+        }
+        let last_seen = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache.get(agent_id).map(|entry| entry.last_seen)
+        }?;
+        let now_secs = Self::unix_timestamp_secs();
+        let age_secs = now_secs.saturating_sub(last_seen);
+        let heartbeat = self.heartbeat_interval_secs.max(1);
+        let phi = age_secs as f64 / heartbeat as f64;
+        (phi > 8.0).then_some((phi, Some(age_secs.saturating_mul(1000))))
+    }
+
     /// Like [`Self::send_direct`] with caller-provided [`dm::DmSendConfig`].
     ///
     /// # Errors
@@ -2792,6 +2831,21 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        let rtt_hint_ms = self.dm_peer_rtt_ms(to).await;
+        let mut config = config;
+        if config.timeout_per_attempt == dm::dm_attempt_timeout(None) {
+            config.timeout_per_attempt = dm::dm_attempt_timeout(rtt_hint_ms);
+        }
+        self.direct_messaging
+            .record_outgoing_started(*to, rtt_hint_ms);
+        if let Some((phi, last_seen_ms_ago)) = self.dm_peer_likely_offline(to).await {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::PeerLikelyOffline {
+                phi,
+                last_seen_ms_ago,
+            });
+        }
+
         let cap = self.capability_store.lookup(to);
         let gossip_ok = cap
             .as_ref()
@@ -2799,9 +2853,13 @@ impl Agent {
             .unwrap_or(false);
 
         let mut preferred_raw_err = None;
-        if config.prefer_raw_quic_if_connected && !config.require_gossip {
-            match self.send_direct_raw_quic(to, &payload).await {
-                Ok(()) => return Ok(dm_send::raw_quic_receipt()),
+        let preferred_raw_receipt = if config.prefer_raw_quic_if_connected && !config.require_gossip
+        {
+            match self
+                .send_direct_raw_quic(to, &payload, config.raw_quic_receive_ack_timeout)
+                .await
+            {
+                Ok(path) => Some(dm_send::raw_quic_receipt_for_path(path)),
                 Err(e) => {
                     tracing::debug!(
                         target: "x0x::direct",
@@ -2810,50 +2868,74 @@ impl Agent {
                         "preferred raw-QUIC path unavailable; falling back to capability-aware send"
                     );
                     preferred_raw_err = Some(e);
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
 
-        if gossip_ok {
-            let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
-                dm::DmError::LocalGossipUnavailable(
+        let result = if let Some(receipt) = preferred_raw_receipt {
+            Ok(receipt)
+        } else if preferred_raw_err
+            .as_ref()
+            .is_some_and(Self::raw_quic_error_should_stop_fallback)
+        {
+            match preferred_raw_err.take() {
+                Some(e) => Err(Self::map_raw_quic_dm_error(e)),
+                None => Err(dm::DmError::NoConnectivity(
+                    "raw-QUIC send failed before gossip fallback".to_string(),
+                )),
+            }
+        } else if gossip_ok {
+            match self.gossip_runtime.as_ref() {
+                Some(runtime) => {
+                    let signing =
+                        gossip::SigningContext::from_keypair(self.identity.agent_keypair());
+                    let kem_pub = cap
+                        .as_ref()
+                        .map(|c| c.kem_public_key.clone())
+                        .unwrap_or_default();
+                    dm_send::send_via_gossip(
+                        std::sync::Arc::clone(runtime.pubsub()),
+                        &signing,
+                        self.identity.agent_id(),
+                        self.identity.machine_id(),
+                        *to,
+                        &kem_pub,
+                        payload,
+                        &config,
+                        std::sync::Arc::clone(&self.dm_inflight_acks),
+                    )
+                    .await
+                }
+                None => Err(dm::DmError::LocalGossipUnavailable(
                     "send_direct: no gossip runtime configured".to_string(),
-                )
-            })?;
-            let signing = gossip::SigningContext::from_keypair(self.identity.agent_keypair());
-            let kem_pub = cap
-                .as_ref()
-                .map(|c| c.kem_public_key.clone())
-                .unwrap_or_default();
-            return dm_send::send_via_gossip(
-                std::sync::Arc::clone(runtime.pubsub()),
-                &signing,
-                self.identity.agent_id(),
-                self.identity.machine_id(),
-                *to,
-                &kem_pub,
-                payload,
-                &config,
-                std::sync::Arc::clone(&self.dm_inflight_acks),
-            )
-            .await;
-        }
-
-        if config.require_gossip {
-            return Err(dm::DmError::RecipientKeyUnavailable(format!(
+                )),
+            }
+        } else if config.require_gossip {
+            Err(dm::DmError::RecipientKeyUnavailable(format!(
                 "recipient {} has no gossip DM capability advert",
                 hex::encode(to.as_bytes())
-            )));
-        }
+            )))
+        } else {
+            match preferred_raw_err {
+                Some(e) => Err(Self::map_raw_quic_dm_error(e)),
+                None => self
+                    .send_direct_raw_quic(to, &payload, config.raw_quic_receive_ack_timeout)
+                    .await
+                    .map(dm_send::raw_quic_receipt_for_path)
+                    .map_err(Self::map_raw_quic_dm_error),
+            }
+        };
 
-        match preferred_raw_err {
-            Some(e) => Err(Self::map_raw_quic_dm_error(e)),
-            None => self
-                .send_direct_raw_quic(to, &payload)
-                .await
-                .map(|_| dm_send::raw_quic_receipt())
-                .map_err(Self::map_raw_quic_dm_error),
+        match &result {
+            Ok(receipt) => self
+                .direct_messaging
+                .record_outgoing_succeeded(*to, receipt.path),
+            Err(_) => self.direct_messaging.record_outgoing_failed(*to),
         }
+        result
     }
 
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
@@ -2861,11 +2943,18 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
         payload: &[u8],
-    ) -> error::NetworkResult<()> {
+        receive_ack_timeout: Option<std::time::Duration>,
+    ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
         let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
         let bytes = payload.len();
+        let digest = direct::dm_payload_digest_hex(payload);
+        let target_path_label = if receive_ack_timeout.is_some() {
+            "raw_quic_acked"
+        } else {
+            "raw_quic"
+        };
 
         let network = self.network.as_ref().ok_or_else(|| {
             tracing::warn!(
@@ -2938,6 +3027,22 @@ impl Agent {
         // Check if connected
         let ant_peer_id = ant_quic::PeerId(machine_id.0);
         let machine_prefix = network::hex_prefix(&machine_id.0, 4);
+        if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
+            tracing::warn!(
+                target: "x0x::direct",
+                stage = "send",
+                %agent_prefix,
+                %machine_prefix,
+                resolution,
+                outcome = "err_peer_disconnected",
+                reason = %reason,
+                dur_ms = send_start.elapsed().as_millis() as u64,
+                "lifecycle watcher says peer is disconnected"
+            );
+            return Err(error::NetworkError::ConnectionFailed(format!(
+                "peer disconnected: {reason}"
+            )));
+        }
         if !network.is_connected(&ant_peer_id).await {
             tracing::warn!(
                 target: "x0x::direct",
@@ -2953,12 +3058,78 @@ impl Agent {
             return Err(error::NetworkError::AgentNotConnected(agent_id.0));
         }
 
-        // Send via network layer
-        match network
-            .send_direct(&ant_peer_id, &self.identity.agent_id().0, payload)
-            .await
-        {
-            Ok(()) => {
+        tracing::info!(
+            target: "dm.trace",
+            stage = "path_chosen",
+            sender = %hex::encode(self.identity.agent_id().as_bytes()),
+            recipient = %hex::encode(agent_id.as_bytes()),
+            machine_id = %hex::encode(machine_id.as_bytes()),
+            path = target_path_label,
+            bytes,
+            digest = %digest,
+        );
+
+        // Send via network layer. Prefer receive-pipeline ACK when configured:
+        // success then means the remote ant-quic reader drained the direct
+        // message bytes, not merely that the local socket accepted them.
+        let send_result = if let Some(timeout) = receive_ack_timeout {
+            let wire = direct::DirectMessaging::encode_message(&self.identity.agent_id(), payload)?;
+            tracing::info!(
+                target: "dm.trace",
+                stage = "wire_encoded",
+                sender = %hex::encode(self.identity.agent_id().as_bytes()),
+                recipient = %hex::encode(agent_id.as_bytes()),
+                path = "raw_quic_acked",
+                bytes = wire.len(),
+                payload_bytes = bytes,
+                digest = %digest,
+            );
+            match network
+                .send_with_receive_ack(ant_peer_id, &wire, timeout)
+                .await
+            {
+                Some(Ok(())) => Ok(dm::DmPath::RawQuicAcked),
+                Some(Err(e)) => Err(error::NetworkError::ConnectionFailed(format!(
+                    "send_with_receive_ack failed: {e}"
+                ))),
+                None => Err(error::NetworkError::NodeCreation(
+                    "network node not initialized".to_string(),
+                )),
+            }
+        } else {
+            tracing::info!(
+                target: "dm.trace",
+                stage = "wire_encoded",
+                sender = %hex::encode(self.identity.agent_id().as_bytes()),
+                recipient = %hex::encode(agent_id.as_bytes()),
+                path = "raw_quic",
+                bytes,
+                digest = %digest,
+            );
+            network
+                .send_direct(&ant_peer_id, &self.identity.agent_id().0, payload)
+                .await
+                .map(|()| dm::DmPath::RawQuic)
+        };
+
+        match send_result {
+            Ok(path) => {
+                let path_label = match path {
+                    dm::DmPath::RawQuic => "raw_quic",
+                    dm::DmPath::RawQuicAcked => "raw_quic_acked",
+                    dm::DmPath::GossipInbox => "gossip_inbox",
+                };
+                tracing::info!(
+                    target: "dm.trace",
+                    stage = "outbound_send_returned_ok",
+                    sender = %hex::encode(self.identity.agent_id().as_bytes()),
+                    recipient = %hex::encode(agent_id.as_bytes()),
+                    machine_id = %hex::encode(machine_id.as_bytes()),
+                    path = path_label,
+                    bytes,
+                    digest = %digest,
+                    dur_ms = send_start.elapsed().as_millis() as u64,
+                );
                 tracing::info!(
                     target: "x0x::direct",
                     stage = "send",
@@ -2969,9 +3140,10 @@ impl Agent {
                     bytes,
                     dur_ms = send_start.elapsed().as_millis() as u64,
                     outcome = "ok",
+                    path = ?path,
                     "direct message sent"
                 );
-                Ok(())
+                Ok(path)
             }
             Err(e) => {
                 tracing::warn!(
@@ -2992,11 +3164,40 @@ impl Agent {
         }
     }
 
+    fn raw_quic_error_should_stop_fallback(err: &error::NetworkError) -> bool {
+        match err {
+            error::NetworkError::ConnectionFailed(reason) => {
+                reason.starts_with("peer disconnected:")
+                    || reason.starts_with("send_with_receive_ack failed:")
+            }
+            error::NetworkError::ConnectionClosed(_)
+            | error::NetworkError::ConnectionReset(_)
+            | error::NetworkError::NotConnected(_) => true,
+            _ => false,
+        }
+    }
+
     fn map_raw_quic_dm_error(err: error::NetworkError) -> dm::DmError {
         match err {
-            error::NetworkError::AgentNotFound(_) | error::NetworkError::AgentNotConnected(_) => {
+            error::NetworkError::AgentNotFound(_) => {
                 dm::DmError::RecipientKeyUnavailable(err.to_string())
             }
+            error::NetworkError::AgentNotConnected(_)
+            | error::NetworkError::NotConnected(_)
+            | error::NetworkError::ConnectionClosed(_)
+            | error::NetworkError::ConnectionReset(_) => dm::DmError::PeerDisconnected {
+                reason: err.to_string(),
+            },
+            error::NetworkError::ConnectionFailed(reason)
+                if reason.starts_with("peer disconnected:")
+                    || reason.starts_with("send_with_receive_ack failed:") =>
+            {
+                dm::DmError::PeerDisconnected { reason }
+            }
+            error::NetworkError::PayloadTooLarge { size, max } => {
+                dm::DmError::PayloadTooLarge { len: size, max }
+            }
+            error::NetworkError::NodeCreation(reason) => dm::DmError::NoConnectivity(reason),
             other => dm::DmError::PublishFailed(other.to_string()),
         }
     }
@@ -5449,6 +5650,9 @@ impl Agent {
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let dm = std::sync::Arc::clone(&self.direct_messaging);
 
+        let lifecycle_network = std::sync::Arc::clone(&network);
+        let lifecycle_dm = std::sync::Arc::clone(&dm);
+
         tokio::spawn(async move {
             let mut rx = network.subscribe();
             tracing::info!("Network event reconciliation listener started");
@@ -5502,13 +5706,63 @@ impl Agent {
                 }
             }
         });
+
+        tokio::spawn(async move {
+            let Some(mut rx) = lifecycle_network.subscribe_all_peer_events().await else {
+                tracing::debug!(
+                    "Peer lifecycle listener unavailable: network node not initialised"
+                );
+                return;
+            };
+            tracing::info!("Peer lifecycle watcher started for direct messaging");
+            loop {
+                let (peer_id, event) = match rx.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!("Peer lifecycle watcher lagged by {skipped} events");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let machine_id = identity::MachineId(peer_id.0);
+                match event {
+                    ant_quic::PeerLifecycleEvent::Established { generation } => {
+                        lifecycle_dm.record_lifecycle_established(machine_id, Some(generation));
+                    }
+                    ant_quic::PeerLifecycleEvent::Replaced { new_generation, .. } => {
+                        lifecycle_dm.record_lifecycle_replaced(machine_id, new_generation);
+                    }
+                    ant_quic::PeerLifecycleEvent::Closing { generation, reason } => {
+                        lifecycle_dm.record_lifecycle_blocked(
+                            machine_id,
+                            Some(generation),
+                            format!("closing: {reason}"),
+                        );
+                    }
+                    ant_quic::PeerLifecycleEvent::Closed { generation, reason } => {
+                        lifecycle_dm.record_lifecycle_blocked(
+                            machine_id,
+                            Some(generation),
+                            format!("closed: {reason}"),
+                        );
+                    }
+                    ant_quic::PeerLifecycleEvent::ReaderExited { generation } => {
+                        lifecycle_dm.record_lifecycle_blocked(
+                            machine_id,
+                            Some(generation),
+                            "reader exited",
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Start the direct message listener background task.
     ///
     /// This task reads raw direct messages from the network layer and
     /// dispatches them to `DirectMessaging::handle_incoming()`, which
-    /// broadcasts to all `subscribe_direct()` receivers.
+    /// fans out to all `subscribe_direct()` receiver queues.
     ///
     /// Called automatically by [`Agent::join_network`].
     fn start_direct_listener(&self) {
@@ -5559,6 +5813,18 @@ impl Agent {
                 let machine_id = identity::MachineId(ant_peer_id.0);
                 let data = payload[32..].to_vec();
                 let payload_bytes = data.len();
+                let digest = direct::dm_payload_digest_hex(&data);
+
+                tracing::info!(
+                    target: "dm.trace",
+                    stage = "inbound_envelope_received",
+                    sender = %hex::encode(sender.as_bytes()),
+                    machine_id = %hex::encode(machine_id.as_bytes()),
+                    path = "raw_quic",
+                    bytes = payload_bytes,
+                    raw_bytes,
+                    digest = %digest,
+                );
 
                 // Verify AgentId→MachineId binding against identity discovery cache.
                 let verified = {
@@ -5581,6 +5847,17 @@ impl Agent {
                 };
 
                 tracing::info!(
+                    target: "dm.trace",
+                    stage = "inbound_trust_evaluated",
+                    sender = %hex::encode(sender.as_bytes()),
+                    machine_id = %hex::encode(machine_id.as_bytes()),
+                    path = "raw_quic",
+                    verified,
+                    decision = ?trust_decision,
+                    digest = %digest,
+                );
+
+                tracing::info!(
                     target: "x0x::direct",
                     stage = "recv",
                     sender_prefix = %network::hex_prefix(&sender.0, 4),
@@ -5595,9 +5872,21 @@ impl Agent {
                 // Register and mark the sender as connected for future reverse direct sends.
                 dm.mark_connected(sender, machine_id).await;
 
-                // Broadcast to all subscribe_direct() receivers with verification info.
-                dm.handle_incoming(machine_id, sender, data, verified, trust_decision)
+                // Fan out to all subscribe_direct() receivers with verification info.
+                let delivered = dm
+                    .handle_incoming(machine_id, sender, data, verified, trust_decision)
                     .await;
+
+                tracing::info!(
+                    target: "dm.trace",
+                    stage = "inbound_broadcast_published",
+                    sender = %hex::encode(sender.as_bytes()),
+                    machine_id = %hex::encode(machine_id.as_bytes()),
+                    path = "raw_quic",
+                    delivered,
+                    subscribers = dm.subscriber_count(),
+                    digest = %digest,
+                );
 
                 tracing::debug!(
                     target: "x0x::direct",

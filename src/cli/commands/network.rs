@@ -116,6 +116,17 @@ pub async fn diagnostics_gossip(client: &DaemonClient) -> Result<()> {
     Ok(())
 }
 
+/// `x0x diagnostics dm` — GET /diagnostics/dm
+///
+/// Prints direct-message send/receive counters, subscriber fan-out health, and
+/// per-peer timing/path state.
+pub async fn diagnostics_dm(client: &DaemonClient) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get("/diagnostics/dm").await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x peers probe <peer_id>` — POST /peers/:peer_id/probe
 ///
 /// Active liveness probe (ant-quic 0.27.2 #173). Sends a lightweight probe

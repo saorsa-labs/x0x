@@ -31,8 +31,12 @@ struct Cli {
     name: Option<String>,
 
     /// Daemon API address override (default: auto-detect). [dev]
-    #[arg(long, global = true, hide = true)]
+    #[arg(long, global = true, hide = true, alias = "api-url")]
     api: Option<String>,
+
+    /// Backward-compatible output format selector (`json` or `text`). [dev]
+    #[arg(long, global = true, hide = true)]
+    format: Option<String>,
 
     /// Output as JSON.
     #[arg(long, global = true)]
@@ -156,6 +160,23 @@ enum Commands {
     },
     /// Stream all gossip events to stdout.
     Events,
+    /// Remote non-interactive exec over the x0x mesh.
+    Exec {
+        /// Target agent ID, or the literal `sessions` to list sessions.
+        agent_id: Option<String>,
+        /// Remote timeout in seconds (remote ACL caps apply).
+        #[arg(long)]
+        timeout: Option<u32>,
+        /// Send stdin from this file.
+        #[arg(long)]
+        stdin_file: Option<PathBuf>,
+        /// Cancel an in-flight request id.
+        #[arg(long)]
+        cancel: Option<String>,
+        /// Command argv. Use `--` before argv to preserve flags.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
     /// Direct messaging.
     Direct {
         #[command(subcommand)]
@@ -324,6 +345,10 @@ enum DiagnosticsSub {
     Connectivity,
     /// Print PubSub drop-detection counters (publish/deliver deltas).
     Gossip,
+    /// Print direct-message counters, fan-out health, and per-peer state.
+    Dm,
+    /// Print remote exec counters, warnings, and ACL summary.
+    Exec,
 }
 
 /// Presence subcommands.
@@ -974,7 +999,7 @@ enum WsSub {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let format = if cli.json {
+    let format = if cli.json || cli.format.as_deref() == Some("json") {
         OutputFormat::Json
     } else {
         OutputFormat::Text
@@ -1122,6 +1147,8 @@ async fn run(
                 commands::network::diagnostics_connectivity(&client).await
             }
             DiagnosticsSub::Gossip => commands::network::diagnostics_gossip(&client).await,
+            DiagnosticsSub::Dm => commands::network::diagnostics_dm(&client).await,
+            DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
         },
         Commands::Find { words } => commands::find::find(&client, &words).await,
         Commands::Connect { words } => commands::connect::connect(&client, &words).await,
@@ -1222,6 +1249,29 @@ async fn run(
         Commands::Subscribe { topic } => commands::messaging::subscribe(&client, &topic).await,
         Commands::Unsubscribe { id } => commands::messaging::unsubscribe(&client, &id).await,
         Commands::Events => commands::messaging::events(&client).await,
+        Commands::Exec {
+            agent_id,
+            timeout,
+            stdin_file,
+            cancel,
+            argv,
+        } => {
+            if agent_id.as_deref() == Some("sessions") && cancel.is_none() && argv.is_empty() {
+                commands::exec::sessions(&client).await
+            } else if agent_id.as_deref() == Some("cancel") && cancel.is_none() {
+                let Some(request_id) = argv.first() else {
+                    anyhow::bail!("usage: x0x exec cancel <request_id>");
+                };
+                commands::exec::cancel(&client, request_id, None).await
+            } else if let Some(request_id) = cancel {
+                commands::exec::cancel(&client, &request_id, agent_id.as_deref()).await
+            } else {
+                let Some(agent_id) = agent_id else {
+                    anyhow::bail!("usage: x0x exec <agent_id> [--timeout <secs>] [--stdin-file <path>] -- <argv...>");
+                };
+                commands::exec::run(&client, &agent_id, &argv, timeout, stdin_file.as_deref()).await
+            }
+        }
         Commands::Direct { sub } => match sub {
             DirectSub::Connect { agent_id } => commands::direct::connect(&client, &agent_id).await,
             DirectSub::Send {

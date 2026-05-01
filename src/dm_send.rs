@@ -72,6 +72,22 @@ pub async fn send_via_gossip(
     let wire = envelope.to_wire_bytes().map_err(map_identity_err)?;
     let topic = DmInboxService::inbox_topic_name(&recipient_agent_id);
 
+    tracing::info!(
+        target: "dm.trace",
+        stage = "path_chosen",
+        request_id = %hex::encode(request_id),
+        recipient = %hex::encode(recipient_agent_id.as_bytes()),
+        path = "gossip_inbox",
+        timeout_ms = config.timeout_per_attempt.as_millis() as u64,
+    );
+    tracing::info!(
+        target: "dm.trace",
+        stage = "wire_encoded",
+        request_id = %hex::encode(request_id),
+        recipient = %hex::encode(recipient_agent_id.as_bytes()),
+        bytes = wire.len(),
+    );
+
     let mut rx = inflight.register(request_id);
     let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
 
@@ -96,6 +112,13 @@ pub async fn send_via_gossip(
 
         match attempt_result {
             Ok(Ok(outcome)) => {
+                tracing::info!(
+                    target: "dm.trace",
+                    stage = "outbound_send_returned_ok",
+                    request_id = %hex::encode(request_id),
+                    recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                    attempt,
+                );
                 guard.mark_resolved();
                 return match outcome {
                     DmAckOutcome::Accepted => Ok(DmReceipt {
@@ -168,10 +191,15 @@ fn map_identity_err(e: IdentityError) -> DmError {
 
 #[must_use]
 pub fn raw_quic_receipt() -> DmReceipt {
+    raw_quic_receipt_for_path(DmPath::RawQuic)
+}
+
+#[must_use]
+pub fn raw_quic_receipt_for_path(path: DmPath) -> DmReceipt {
     DmReceipt {
         request_id: fresh_request_id(),
         accepted_at: Instant::now(),
         retries_used: 0,
-        path: DmPath::RawQuic,
+        path,
     }
 }

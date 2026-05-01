@@ -1,0 +1,16 @@
+[Unit]
+Description=x0x mesh-relay test runner
+After=x0xd.service
+Wants=x0xd.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/x0x-test-runner.env
+ExecStart=/usr/local/bin/x0x-test-runner.py
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

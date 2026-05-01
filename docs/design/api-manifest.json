@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 123,
+  "endpoint_count": 128,
   "endpoints": [
     {
       "category": "status",
@@ -140,6 +140,20 @@
       "description": "PubSub drop-detection counters (publish/deliver deltas)",
       "method": "GET",
       "path": "/diagnostics/gossip"
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics dm",
+      "description": "Direct-message send/receive counters and per-peer health",
+      "method": "GET",
+      "path": "/diagnostics/dm"
+    },
+    {
+      "category": "exec",
+      "cli_name": "diagnostics exec",
+      "description": "Remote exec counters, warnings, active sessions, and ACL summary",
+      "method": "GET",
+      "path": "/diagnostics/exec"
     },
     {
       "category": "network",
@@ -378,6 +392,27 @@
       "description": "Stream direct messages",
       "method": "GET",
       "path": "/direct/events"
+    },
+    {
+      "category": "exec",
+      "cli_name": "exec",
+      "description": "Run a strictly allowlisted non-interactive command on a remote daemon",
+      "method": "POST",
+      "path": "/exec/run"
+    },
+    {
+      "category": "exec",
+      "cli_name": "exec cancel",
+      "description": "Cancel an in-flight remote exec request",
+      "method": "POST",
+      "path": "/exec/cancel"
+    },
+    {
+      "category": "exec",
+      "cli_name": "exec sessions",
+      "description": "List local pending and remote active exec sessions",
+      "method": "GET",
+      "path": "/exec/sessions"
     },
     {
       "category": "groups",

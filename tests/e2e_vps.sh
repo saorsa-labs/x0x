@@ -499,7 +499,7 @@ HEL_AID="${NODE_AIDS[helsinki]:-}"
 if [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsinki]:-}" ]; then
     GUI_HTML=$(vps_ssh "$NYC_IP" "curl -sf -m 15 'http://127.0.0.1:12600/gui'" 2>/dev/null || echo "")
     TOTAL=$((TOTAL+1))
-    if echo "$GUI_HTML" | grep -q "X0X_TOKEN" && echo "$GUI_HTML" | grep -q "sendDm"; then
+    if grep -q "X0X_TOKEN" <<<"$GUI_HTML" && grep -q "sendDm" <<<"$GUI_HTML"; then
         PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} GET /gui serves injected chat UI"
     else
         FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} GET /gui missing expected injected chat markers"

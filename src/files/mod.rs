@@ -161,9 +161,8 @@ pub enum FileMessage {
     ///
     /// Sent by the receiver after each successful chunk write. The sender
     /// waits for this before sending the next chunk, which throttles the
-    /// sender to the receiver's actual disk + decode rate and prevents the
-    /// `subscribe_direct` broadcast channel from lagging and silently
-    /// dropping chunks.
+    /// sender to the receiver's actual disk + decode rate and prevents a
+    /// `subscribe_direct` subscriber queue from filling and being dropped.
     #[serde(rename = "file-chunk-ack")]
     ChunkAck {
         /// Transfer ID this ack belongs to.

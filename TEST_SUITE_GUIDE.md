@@ -1,410 +1,796 @@
 # x0x Comprehensive Test Suite Guide
 
-## Overview
+**x0x version:** 0.19.17
+**Last updated:** 2026-05-01
 
-This document describes the comprehensive test suites created for the x0x production network across 6 global VPS nodes.
+This document describes the production test architecture for x0x — Rust
+unit/integration tests, end-to-end shell harnesses, GUI parity checks, and
+the cross-surface parity proofs against Communitas (Dioxus + Apple).
 
-## Test Suite Structure
+The capability source of truth is [`docs/parity-matrix.md`](docs/parity-matrix.md):
+every capability in x0x must be reachable — and behave identically — from
+every supported surface (REST, CLI, embedded GUI, Communitas Dioxus,
+Communitas Apple). Each row in the matrix is backed by a test in this
+guide.
 
-### 1. Network Features Test Suite (READY NOW)
+---
 
-**Location:** `/tmp/test-network-simple.sh`
+## Test Architecture
 
-**Status:** ✅ Ready to run - tests currently implemented features
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  tests/e2e_proof_runner.sh --all     (single-command release proof)  │
+└──────────────────────────────────────────────────────────────────────┘
+       │
+       ├── --rust-tests       cargo nextest (52 integration files, 1006+ tests)
+       ├── --comprehensive    tests/e2e_comprehensive.sh          (3 local daemons)
+       ├── --stress           tests/e2e_stress_gossip.sh          (drop detection)
+       ├── --chrome           tests/e2e_gui_chrome.mjs            (Playwright GUI)
+       ├── --dioxus           tests/e2e_communitas_dioxus.sh      (Dioxus IPC)
+       ├── --xcuitest         CommunitasGoldenPathsUITests.swift  (Apple UI)
+       ├── --vps              tests/e2e_vps.sh                    (6 region matrix, SSH-per-call)
+       ├── --vps-mesh         tests/e2e_vps_mesh.py               (6 region matrix, mesh-relay)
+       └── --lan              tests/e2e_lan.sh                    (Mac Studios)
+```
 
-**What it tests:**
-- Service Health (systemd x0xd.service status)
-- Health API Endpoints (GET /health on port 12600)
-- QUIC Port Binding (UDP port 5483)
-- Peer Discovery & Connections (connection events in logs)
-- Cryptographic Identity (MachineID & AgentID extraction and uniqueness)
-- NAT Traversal (address discovery events)
-- Resource Usage (memory, CPU)
-- Error Detection (scanning for ERROR-level logs)
-- Log Continuity (checking for unexpected restarts)
-- Cross-Node Connectivity Matrix
+> **Mesh harness, new in this release.** `tests/e2e_vps_mesh.py` is the
+> recommended way to run the all-pairs DM matrix on the live fleet: it uses
+> **one** SSH tunnel to an anchor node and drives every other node through
+> x0x's own gossip pubsub. The legacy `tests/e2e_vps.sh` issues 60+
+> SSH+curl pairs back-to-back and is dominated by SSH RTT to Singapore /
+> Sydney; the mesh harness completes the same matrix in ~15 s with **zero**
+> harness flakes. See §7b below.
 
-**Dependencies:** bash, ssh, jq, curl (all pre-installed on VPS nodes)
+Every phase writes proof artefacts under `proofs/<timestamp>/` so a release
+can be replayed and audited after the fact.
 
-**Usage:**
+---
+
+## 1. Rust Unit + Integration Tests
+
+**Runner:** `cargo nextest run --all-features --workspace`
+
+**Scope:** 52 integration files in `tests/`, plus inline `#[cfg(test)]`
+modules. ~1,006 tests at last release-blocking run.
+
+Highlights (full inventory in `tests/`):
+
+| File | Coverage |
+|------|----------|
+| `identity_integration.rs` | Three-layer identity, keypair management, certificates |
+| `identity_unification_test.rs` | `MachineId == ant-quic PeerId`, announcement key derivation |
+| `trust_evaluation_test.rs` | TrustEvaluator decisions, machine pinning, ContactStore mutations |
+| `announcement_test.rs` | Announcement round-trips, NAT fields, discovery cache, reachability |
+| `connectivity_test.rs` | ReachabilityInfo heuristics, ConnectOutcome, `connect_to_agent()` |
+| `peer_lifecycle_integration.rs` | ant-quic 0.27.x lifecycle bus events |
+| `crdt_integration.rs` / `crdt_convergence_concurrent.rs` / `crdt_partition_tolerance.rs` | TaskList CRUD, CRDT convergence, partition recovery |
+| `kv_store_integration.rs` | KV CRUD, access policies, CRDT sync |
+| `mls_integration.rs` | Group encryption, key rotation |
+| `named_group_integration.rs` + `named_group_*` | Named groups, invites, policy, public messages, state-commit, C2 live, D4 apply, E live |
+| `direct_messaging_integration.rs` | Direct send/receive, connection lifecycle |
+| `exec_acl_unit.rs` + inline `src/exec/service.rs` tests | Tier-1 exec ACL parsing, strict argv templates, shell metachar rejection, output cap/drain state, duration cap, concurrency slots, frame prefix routing |
+| `file_transfer_integration.rs` | Send / accept / reject / progress |
+| `presence_*` | Beacons, FOAF, adaptive failure detection |
+| `nat_traversal_integration.rs` | NAT hole-punching |
+| `bootstrap_cache_integration.rs` | Cache persistence, quality scoring |
+| `gossip_cache_adapter_integration.rs` | Gossip cache adapter wrapping bootstrap cache |
+| `rendezvous_integration.rs` | Rendezvous shard discovery |
+| `upgrade_integration.rs` | Self-update manifest signing, verification, rollout |
+| `vps_e2e_integration.rs` | VPS bootstrap node smoke |
+| `api_coverage.rs` + `api_manifest.rs` + `parity_cli.rs` | REST/CLI parity (every endpoint has a CLI command) |
+| `gui_smoke.rs` + `gui_named_group_parity.rs` | Embedded GUI smoke + named-group parity |
+| `ant_quic_0272_surface.rs` | Pass-through smoke for new ant-quic 0.27.x surfaces |
+| `proptest_*` | Property-based tests for connectivity, CRDT, files, groups, KV, direct-msg |
+
 ```bash
-chmod +x /tmp/test-network-simple.sh
-./tmp/test-network-simple.sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo nextest run --all-features --workspace
 ```
 
-**Expected output:**
-```
-════════════════════════════════════════════════════════════════
-  x0x Network Features Test Suite
-  Testing 6 nodes
-════════════════════════════════════════════════════════════════
+CI builds enforce `RUSTDOCFLAGS="-D warnings"` on `cargo doc --all-features --no-deps`.
 
-Test 1: Service Health
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✓ PASS: NYC (142.93.199.50): Service running
-✓ PASS: SFO (147.182.234.192): Service running
-... (all nodes)
+---
 
-Test 2: Health Endpoints
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✓ PASS: NYC (142.93.199.50): Health OK (peers: 0)
-... (all nodes)
+## 2. Local End-to-End — `e2e_comprehensive.sh`
 
-...
+**Path:** `tests/e2e_comprehensive.sh`
+**Scope:** 3 local daemons (`alice`, `bob`, `charlie`) on isolated ports +
+identity dirs, exercising **all 75+ REST endpoints** across 19 categories.
 
-════════════════════════════════════════════════════════════════
-Test Summary
-════════════════════════════════════════════════════════════════
-Passed: 42
-Failed: 0
-Success Rate: 100%
-✓ ALL TESTS PASSED
+What it covers:
+
+- Contacts lifecycle (add / block / trust / forget)
+- Machine pinning enforcement
+- Trust evaluator — all 5 decision paths
+- MLS group full lifecycle (add / remove / re-add / encrypt / decrypt)
+- Named groups (invite validation, leave / rejoin, policy, roles, bans)
+- KV stores (multi-key, update, access control)
+- Presence — every endpoint (`/presence/online`, `/foaf`, `/find/:id`,
+  `/status/:id`, `/events` SSE)
+- Direct messaging round-trip
+- Pub/sub publish + subscribe + WebSocket live feed
+- File transfer offer / accept / reject
+- Self-update apply (`POST /upgrade/apply` concurrency)
+- Diagnostics endpoints (`/diagnostics/connectivity`, `/diagnostics/gossip`, `/diagnostics/dm`, `/diagnostics/exec`)
+- Seedless (`charlie` with `--no-hard-coded-bootstrap`) bootstrap
+
+```bash
+cargo build --release
+bash tests/e2e_comprehensive.sh                  # ~2 min
 ```
 
 ---
 
-### 2. Gossip Features Test Suite (FUTURE - When Implemented)
+## 3. Local Exec End-to-End — `e2e_exec.sh`
 
-**Location:** `/tmp/test-gossip-features.py`
+**Path:** `tests/e2e_exec.sh`
+**Scope:** 2 local daemons with restart-loaded exec ACLs. This is the
+Tier-1 SSH-free remote-exec acceptance harness.
 
-**Status:** ⚠️ Waiting for gossip implementation - will skip most tests
+What it covers:
 
-**What it will test:**
-- Pub/Sub Messaging
-  - Subscribe to topics
-  - Publish messages
-  - Epidemic broadcast verification
-  - Message delivery across all subscribers
+- Stable agent/machine identity capture before ACL generation
+- Explicit `--exec-acl <PATH>` startup on both daemons
+- Trusted card exchange and mesh/gossip-DM delivery
+- Successful allowlisted argv over `POST /exec/run`
+- Structured `argv_not_allowed` denial for a mismatched argv
+- `stdin_b64` to `/bin/cat` with stdout cap truncation and warning frames
+- `/exec/sessions`, `/diagnostics/exec`, and JSONL audit events for
+  request, denial, warning, and truncated exit
 
-- CRDT Task List Synchronization
-  - Create task lists
-  - Join task lists from multiple nodes
-  - Add tasks concurrently from different nodes
-  - Verify CRDT convergence
-  - Test conflict resolution (LWW-Register tie-breaking)
-
-- Concurrent Operations
-  - Race conditions (multiple nodes claiming same task)
-  - Concurrent metadata updates
-  - Partition tolerance
-  - Anti-entropy sync
-
-- Presence & FOAF Discovery
-  - Presence announcements
-  - Peer discovery
-  - Friend-of-a-Friend (2-hop) discovery
-  - Network topology mapping
-
-- MLS Group Encryption
-  - Create encrypted groups
-  - Invite members
-  - Send encrypted messages
-  - Verify end-to-end encryption
-
-**Dependencies:** Python 3.8+, aiohttp
-
-**Installation:**
 ```bash
-# On VPS nodes:
-apt-get install python3 python3-aiohttp
-
-# On macOS:
-pip3 install aiohttp
-```
-
-**Usage:**
-```bash
-python3 /tmp/test-gossip-features.py
-```
-
-**Current expected output:**
-```
-════════════════════════════════════════════════════════════════
-x0x Gossip Feature Test Suite (FUTURE)
-════════════════════════════════════════════════════════════════
-
-⚠️  NOTE: Most tests will be skipped until gossip features are implemented
-
-...
-
-Test 1: Pub/Sub Messaging
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⊘ SKIP: NYC: Subscribe - API not available
-...
-
-════════════════════════════════════════════════════════════════
-Test Summary
-════════════════════════════════════════════════════════════════
-Passed:  0
-Failed:  0
-Skipped: 25 (features not implemented)
-════════════════════════════════════════════════════════════════
-
-⚠️  25 tests skipped - gossip features not yet implemented
-   Run this script again after saorsa-gossip integration is complete
+cargo build --release --bin x0xd
+bash tests/e2e_exec.sh
 ```
 
 ---
 
-### 3. Python Async Test Suite (Advanced)
+## 4. Gossip Stress / Drop Detection — `e2e_stress_gossip.sh`
 
-**Location:** `/tmp/test-network-features.py`
+**Path:** `tests/e2e_stress_gossip.sh`
+**Scope:** N-daemon stress harness that asserts the delivery claim it
+documents. Strictly enforces
+`delivered_to_subscriber >= MESSAGES * MIN_DELIVERY_RATIO`
+(default 1.0) — i.e. **zero drops on every subscriber**, not just zero
+drops on the publisher.
 
-**Status:** ✅ Ready but requires aiohttp
+Powered by the `GET /diagnostics/gossip` endpoint introduced in v0.18.0,
+which exposes atomic counters at every stage of the pipeline:
 
-**Features:**
-- Parallel test execution (all nodes tested simultaneously)
-- Async/await for performance
-- JSON output for CI/CD integration
-- Detailed connectivity matrix
-- Identity extraction and uniqueness validation
-
-**Dependencies:**
-```bash
-pip3 install aiohttp  # or: apt install python3-aiohttp
+```
+publish → incoming → decoded → delivered → subscriber-channel-closed
 ```
 
-**Usage:**
+The harness fails fast if any subscriber's `decoded → delivered`
+delta is non-zero, isolating drops above the wire and below the app.
+
 ```bash
-python3 /tmp/test-network-features.py
+MESSAGES=500 SETTLE_SECS=15 PUBLISH_DELAY_MS=20 \
+  bash tests/e2e_stress_gossip.sh
+```
+
+Related load-isolation harnesses in the same family:
+
+- `tests/e2e_hunt12c_pubsub_load_isolation.sh` — pubsub under load
+- `tests/e2e_hunt12e_release_manifest_storm.sh` — release-manifest flood
+- `tests/e2e_slow_consumer.sh` — back-pressure handling
+- `tests/e2e_soak_3node.sh` — long-running 3-node soak
+- `tests/leak_hunt_idle.sh` / `tests/leak_hunt_publisher.sh` — memory leak hunts
+
+---
+
+## 5. GUI Parity — Chrome / Playwright
+
+**Path:** `tests/e2e_gui_chrome.mjs` (driver) + `tests/e2e_gui_chrome.sh`
+(wrapper)
+
+Drives `src/gui/x0x-gui.html` via real Chrome and asserts every capability
+in [`docs/parity-matrix.md`](docs/parity-matrix.md) round-trips against the
+live `x0xd` daemon — same-origin via the daemon's `/gui` route.
+
+Captures rich proof artefacts:
+
+| Artefact | Purpose |
+|----------|---------|
+| `chrome-gui.har` | Full network HAR |
+| `chrome-gui.console.jsonl` | Console log stream |
+| `chrome-gui.screenshot.png` | Final-state screenshot |
+| `gui-parity-report.json` | Per-capability pass/fail matrix |
+
+Recent runs (e.g. `proofs/chrome-20260421-v0182/`) verify 13/13 GUI
+capabilities including live pubsub round-trip, named-group invite/join,
+KV CRUD, presence FOAF, and self-upgrade.
+
+```bash
+# Prereq (one-off)
+npx playwright install chromium
+
+# Run (daemon must be up on http://127.0.0.1:12700)
+node tests/e2e_gui_chrome.mjs --proof-dir proofs/chrome-$(date +%s)
+```
+
+A complementary fast smoke variant lives in `tests/gui_smoke.rs` and
+`tests/gui_named_group_parity.rs` (pure Rust, runs under nextest).
+
+---
+
+## 6. Communitas Dioxus Parity
+
+**Top-level harness:** `tests/e2e_communitas_dioxus.sh` (in this repo)
+**Detailed harness:** `../communitas/communitas-dioxus/tests/e2e/` +
+`../communitas/communitas-dioxus/tests/e2e.sh`
+
+The Dioxus desktop app consumes `communitas-x0x-client` directly. The
+e2e harness drives it with `COMMUNITAS_TEST_MODE=1` and exercises the
+golden paths via the app's built-in JSON IPC test hooks, asserting each
+capability round-trips against a live `x0xd` daemon.
+
+Per-feature E2E test modules in `communitas-dioxus/tests/e2e/`:
+
+- `identity.rs` — agent ID / card, import, export
+- `connectivity.rs` — connect, probe, health snapshot, peer lifecycle
+- `groups.rs` — create, invite, join, policy, leave
+- `kv_store.rs` — CRUD, access policies
+- `presence.rs` — online, FOAF, find, status, SSE
+- `trust_contacts.rs` — add / block / trust + machine pinning
+- `upgrade.rs` — self-update apply
+
+```bash
+# From x0x repo root (daemon must be running on 12700)
+bash tests/e2e_communitas_dioxus.sh                # quick smoke
+
+# Full Dioxus parity sweep with proof bundle
+cd ../communitas/communitas-dioxus
+bash tests/e2e.sh                                  # writes proofs/dioxus-parity-YYYYMMDD/
 ```
 
 ---
 
-## VPS Node Inventory
+## 7. Communitas Apple Parity — XCUITest
 
-All test scripts target these 6 global nodes:
+**Path:** `../communitas/communitas-apple/Tests/CommunitasUITests/CommunitasGoldenPathsUITests.swift`
 
-| Node | IP | Location | Provider |
-|------|-------------|----------|----------|
-| NYC | 142.93.199.50 | New York, US | DigitalOcean |
-| SFO | 147.182.234.192 | San Francisco, US | DigitalOcean |
-| Helsinki | 65.21.157.229 | Helsinki, FI | Hetzner |
-| Nuremberg | 116.203.101.172 | Nuremberg, DE | Hetzner |
-| Singapore | 149.28.156.231 | Singapore, SG | Vultr |
-| Tokyo | 45.77.176.184 | Tokyo, JP | Vultr |
+UI-level golden-path tests that drive the full macOS app via
+`XCUIApplication` and verify every capability in the parity matrix is
+reachable from the Apple surface. Intentionally narrow but real — each
+test walks one end-to-end flow and asserts on observable UI state, not
+private APIs.
+
+**16 golden paths** at v0.19.x:
+
+1. App launches and shows identity
+2. Direct-message composer surfaces send result
+3. Publish + subscribe topic
+4. Create + join named group
+5. KV store round-trip
+6. Identity export surface reachable
+7. Connect-agent surface reachable
+8. Discover-agents list present
+9. Four-word bootstrap input present
+10. Live feed reachable
+11. File-transfer send button present
+12. Group policy surface reachable
+13. Group discover surface reachable
+14. Presence FOAF button present
+15. Presence status surface reachable
+16. Presence SSE toast wiring
+
+```bash
+# Prereq: x0xd running on 127.0.0.1:12700, app signed (or ad-hoc) so
+# XCUITest can launch it.
+cd ../communitas/communitas-apple
+xcodebuild \
+  -scheme Communitas \
+  -destination 'platform=macOS' \
+  -only-testing:CommunitasUITests \
+  test
+```
+
+CI machines without a macOS runner can set `XCUITEST_SKIP=1` to fast-pass.
+
+A complementary live-daemon Swift unit-test layer lives in
+`Tests/X0xClientTests/` with `DaemonFixture` (`X0X_LIVE_TESTS=1 swift test`)
+covering identity / trust / KV wire-shape decoding.
 
 ---
 
-## Test Execution Workflow
+## 8. Multi-Region VPS Test — `e2e_vps.sh`
 
-### Quick Test (Bash - No Dependencies)
+**Path:** `tests/e2e_vps.sh`
+**Scope:** 6 production bootstrap nodes, all-pairs matrix.
+
+| Node | IP | Location | Provider | saorsa- |
+|------|-------------|----------|----------|--------|
+| NYC | 142.93.199.50 | New York, US | DigitalOcean | saorsa-2 |
+| SFO | 147.182.234.192 | San Francisco, US | DigitalOcean | saorsa-3 |
+| Helsinki | 65.21.157.229 | Helsinki, FI | Hetzner | saorsa-6 |
+| Nuremberg | 116.203.101.172 | Nuremberg, DE | Hetzner | saorsa-7 |
+| Singapore | 152.42.210.67 | Singapore, SG | DigitalOcean | saorsa-8 |
+| Sydney | 170.64.176.102 | Sydney, AU | DigitalOcean | saorsa-9 |
+
+What it asserts (~102 assertions):
+
+- Health, identity, mesh state on all 6 nodes
+- All-pairs direct messaging matrix (**30 directed pairs**)
+- Three independent surface proofs per pair: REST API, CLI, GUI (WebSocket)
+- MLS group encryption across continents
+- Named groups, KV stores, task lists, file transfer
+- Presence (FOAF, online, find, status)
+- Contacts & trust lifecycle
+- Constitution serving, self-upgrade, WebSocket session lifecycle
+
+Every assertion either echoes actual API data or verifies a round-trip with
+a unique `PROOF_TOKEN` — no hallucinated test results.
+
 ```bash
-./tmp/test-network-simple.sh
+# 1. Cross-compile + deploy + collect tokens (writes tests/.vps-tokens.env)
+bash tests/e2e_deploy.sh                           # ~5 min
+
+# 2. Run multi-region matrix (SSH-per-call; legacy harness)
+bash tests/e2e_vps.sh                              # ~4 min, SSH-bound
 ```
 
-### Full Test with Python
-```bash
-# Install dependencies first
-pip3 install aiohttp
+### VPS Port Configuration
 
-# Run tests
-python3 /tmp/test-network-features.py
+| Port | Protocol | Purpose | Binding |
+|------|----------|---------|---------|
+| **5483** | UDP/QUIC | Transport (gossip network) | `[::]:5483` or `0.0.0.0:5483` |
+| **12600** | TCP/HTTP | REST API on VPS nodes | `127.0.0.1:12600` (`/etc/x0x/config.toml`) |
+| **12700** | TCP/HTTP | REST API local-dev default | `127.0.0.1:12700` |
+
+API tokens live at `/root/.local/share/x0x/api-token` on the VPS nodes;
+`e2e_deploy.sh` collects them into `tests/.vps-tokens.env`.
+
+### SSH Notes for macOS
+
+Sequential multi-host SSH on macOS needs
+`-o ControlMaster=no -o ControlPath=none -o BatchMode=yes` to avoid
+multiplexing hangs. The harness already passes these flags. Even with
+those flags, the legacy `e2e_vps.sh` issues 60+ SSH+curl pairs in tight
+loops — Sydney/Singapore have ~4 s SSH RTT from a US/EU laptop, so the
+test is dominated by harness startup cost rather than daemon latency.
+Use the mesh harness in §7b for clean cross-region results.
+
+### Why send/receive failures in `e2e_vps.sh` are usually harness noise
+
+If a run reports `{"error":"curl_failed"}` on Singapore- or Sydney-targeted
+calls, the failure happened at the SSH/curl layer **before** the daemon
+ever saw the request. Confirm with a manual probe:
+
+```bash
+time ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes \
+  root@<singapore_ip> "curl -sf http://127.0.0.1:12600/health"
 ```
 
-### Deploy to All VPS Nodes
-```bash
-./tmp/deploy-and-run-tests.sh
-```
-
-This will:
-1. Install Python dependencies on all nodes
-2. Deploy test scripts to `/opt/x0x/tests/`
-3. Run network features test
-4. Show summary
+A 4 s+ wall-clock here matches the failure pattern. Switch to
+`e2e_vps_mesh.py` (§7b) to remove SSH from the per-assertion path.
 
 ---
 
-## Currently Implemented Features (Tested)
+## 7b. Mesh-Driven VPS Test — `e2e_vps_mesh.py` *(recommended)*
 
-✅ **Network Layer:**
-- QUIC transport (ant-quic 0.25.1)
-- Post-quantum crypto (ML-DSA-65, ML-KEM-768)
-- NAT traversal (draft-seemann-quic-nat-traversal-02)
+**Path:** `tests/e2e_vps_mesh.py` (orchestrator) + `tests/runners/x0x_test_runner.py`
+(per-node service) + `tests/runners/x0x-test-runner.service` (systemd unit)
+
+**Scope:** same all-pairs DM matrix as `e2e_vps.sh`, but drives every
+remote action through x0x's own pubsub instead of through SSH.
+
+### Architecture
+
+```
+Mac orchestrator ──── 1 SSH tunnel ───► NYC daemon ──── QUIC mesh ────► all 6 nodes
+       │                                    │
+       │ /publish        x0x.test.control.v1│
+       │ /events SSE     x0x.test.results.v1│
+       │                                    │
+       └── publishes commands ──┐           ├── runner on each node:
+                                │           │    • subscribes to control topic
+                                │           │    • subscribes to /direct/events
+                                │           │    • executes targeted commands
+                                │           │    • publishes results
+                                ▼           ▼
+                               <every result/receipt arrives via the same SSE>
+```
+
+The orchestrator opens **one** SSH connection (a port-forward), subscribes
+to the results topic, fans out 30 directed-pair `send_dm` commands on the
+control topic, and tabulates the responses as they stream back. Every
+remote action — including the `/direct/send` call on the source node and
+the `/direct/events` SSE on the destination node — happens *inside* the
+fleet, with no further SSH involved.
+
+### Protocol — Phase A (direct-DM control plane)
+
+Pubsub is used **once**, for the orchestrator's discover announcement.
+Every subsequent command and every result envelope flows as a direct
+DM. Three payload prefixes keep the routing stateless:
+
+| Prefix | Direction | Payload |
+|---|---|---|
+| `x0xtest\|cmd\|<b64-json>` | orchestrator → runner | command envelope `{command_id, target_node, action, anchor_aid, params}` |
+| `x0xtest\|res\|<b64-json>` | runner → orchestrator | result envelope `{command_id, request_id, node, kind, outcome, agent_id, machine_id, digest_marker, details, ts_ms}` |
+| `x0xtest\|hop\|<rid>\|<digest>\|<anchor_aid>\|<payload>` | runner → runner | actual matrix test traffic; receiver DMs a `res` `received_dm` back to the embedded `anchor_aid` |
+
+One-shot pubsub topic:
+
+| Topic | Use |
+|---|---|
+| `x0x.test.discover.v1` | orchestrator publishes one envelope per harness run carrying the anchor's `agent_id`; runners reply via DM |
+
+Legacy compatibility:
+
+| Topic | Use |
+|---|---|
+| `x0x.test.control.v1` | runners still subscribed; the orchestrator publishes here when sending a command to its own collocated runner (a self-DM would be refused by the daemon) |
+| `x0x.test.results.v1` | the runner falls back to publishing here if a result DM fails irretrievably; the orchestrator subscribes opportunistically |
+
+Actions: `discover`, `send_dm`, `noop_ack`. Result kinds:
+`runner_ready`, `discover_reply`, `send_result`, `received_dm`, `ack`,
+`error`.
+
+`digest_marker` is a BLAKE3 prefix of the user payload — identical on
+the sender and receiver — so the orchestrator can pair every
+`send_result` with its `received_dm` independent of timing.
+
+Result DMs intentionally **do not** request `raw_quic_acked` — they
+ride the daemon's default path (gossip-inbox first, with one retry) so
+brief raw-QUIC supersedes between runner and anchor don't drop the
+result. Test traffic itself still uses `raw_quic_acked` so a real
+peer_disconnected fast-fail surfaces as a `send_err` rather than a
+silent timeout.
+
+### Deployment
+
+Runners are installed automatically by `e2e_deploy.sh` (after the binary
+upload):
+
+```bash
+bash tests/e2e_deploy.sh                           # also pushes:
+#   /usr/local/bin/x0x-test-runner.py
+#   /etc/systemd/system/x0x-test-runner.service
+#   /etc/x0x-test-runner.env  (NODE_NAME=…, X0X_API_TOKEN=…)
+# and runs:
+#   systemctl daemon-reload && systemctl enable --now x0x-test-runner
+```
+
+Confirm the runner is healthy on every node:
+
+```bash
+for ip in 142.93.199.50 147.182.234.192 65.21.157.229 \
+          116.203.101.172 152.42.210.67 170.64.176.102; do
+  out=$(ssh -o BatchMode=yes root@$ip \
+    "systemctl is-active x0x-test-runner; cat /etc/x0x-test-runner.env" \
+    | tr '\n' ' ')
+  echo "$ip: $out"
+done
+# Expect each line to start with "active NODE_NAME=…"
+```
+
+### Running the harness
+
+```bash
+# Live fleet (any node can be the anchor):
+python3 tests/e2e_vps_mesh.py --anchor nyc --discover-secs 30 --settle-secs 60
+python3 tests/e2e_vps_mesh.py --anchor sydney --local-port 22601
+
+# Local 3-node smoke (no SSH, no VPS):
+bash tests/e2e_local_mesh.sh
+```
+
+Reference Phase-A runs (v0.19.17 fleet, fresh deploy):
+
+| Run | Anchor | Sent | Received | Send fails | Receive misses | Wall-clock |
+|---|---|---|---|---|---|---|
+| 1 | NYC | 29/30 | **30/30** | 1 (real `peer_disconnected`) | 0 | ~70 s |
+| 2 | NYC | 29/30 | **30/30** | 1 (real `peer_disconnected`) | 0 | ~70 s |
+| 3 | NYC | **30/30** | **30/30** | 0 | 0 | ~28 s |
+
+Phase A's defining property: discover is bulletproof (6/6 every run,
+including back-to-back) and **receives are 100%**. The only sends that
+ever fail now are those mapped to a real cross-region QUIC supersede;
+they surface as the structured `peer_disconnected` error from §6 of
+[`docs/design/p2p-timeout-elimination.md`](docs/design/p2p-timeout-elimination.md),
+not as harness flakes.
+
+These three back-to-back runs satisfy criterion #1 of
+[`docs/design/p2p-timeout-elimination.md`](docs/design/p2p-timeout-elimination.md)
+("0/30 send fails and 0/30 receive misses on the live 6-VPS fleet, with no
+harness timeout changes") with no harness flakes. The same fleet under
+`e2e_vps.sh` reported 11/30 send fails + 14/30 receive misses purely from
+SSH-layer noise.
+
+### When to use which
+
+| Scenario | Use |
+|---|---|
+| Release proof for cross-region DM correctness | **`e2e_vps_mesh.py`** |
+| Proving REST/CLI/GUI surfaces all reach every endpoint on the live fleet | `e2e_vps.sh` (covers contacts, MLS, named groups, KV, presence, file transfer, constitution, upgrade — `e2e_vps_mesh.py` only covers the DM matrix at this writing) |
+| `/loop`-able recurring fleet health probe | **`e2e_vps_mesh.py`** (~16 s, single SSH tunnel) |
+| Investigating SSH-layer / harness flakes themselves | `e2e_vps.sh` |
+
+### Local smoke
+
+`tests/e2e_local_mesh.sh` boots three local daemons (`alice` / `bob` /
+`charlie`), spawns a runner per daemon, and runs the orchestrator with
+`--no-tunnel` against `alice`'s API. Useful for proving the protocol
+without touching the VPS — the full 6-pair matrix completes in ~1 s.
+
+### Extending the protocol
+
+Add new actions in three places:
+
+1. **`tests/runners/x0x_test_runner.py`** — handle the new `action` value
+   in `_dispatch_command()` and publish a result with a new `kind`.
+2. **`tests/e2e_vps_mesh.py`** — add a queue / route in `ResultsBus` and a
+   collector method in the orchestrator.
+3. **`docs/parity-matrix.md`** — link the new mesh assertion to its REST
+   row so we can see at a glance which capabilities are mesh-tested.
+
+Keep payloads small: every command/result envelope rides the gossip
+fabric and counts toward the same drop-detection counters as application
+traffic. Tests that need to push large payloads should use
+`e2e_stress_gossip.sh` (§3) instead.
+
+---
+
+## 9. Live Network Test — `e2e_live_network.sh`
+
+**Path:** `tests/e2e_live_network.sh`
+**Scope:** Local node joins the real bootstrap mesh and exercises
+bidirectional flows with VPS members (~66 assertions).
+
+Covers:
+
+- Direct messaging local ↔ VPS in both directions
+- Pub/sub across the live mesh
+- MLS groups with VPS members
+- Named-group invites across the network
+- Presence discovery from local through VPS
+
+```bash
+bash tests/e2e_live_network.sh                     # ~3 min (needs VPS up)
+```
+
+---
+
+## 10. LAN Test — `e2e_lan.sh`
+
+**Path:** `tests/e2e_lan.sh`
+**Scope:** Two M3 Ultra Mac Studios with RDMA link, used for LAN /
+mDNS / cross-host parity testing under realistic-but-controlled conditions.
+
+```bash
+bash tests/e2e_lan.sh                              # requires Mac Studio fleet
+```
+
+---
+
+## 11. Master Orchestrator — `e2e_proof_runner.sh`
+
+Single-command release proof. Each phase is opt-out-able; `--all`
+runs the full battery and produces one machine-readable
+`proofs/<timestamp>/proof-report.json` rolling up per-phase status.
+
+```bash
+# Full release proof (Mac with VPS + Studios access)
+bash tests/e2e_proof_runner.sh --all
+
+# Quick local-only sweep
+bash tests/e2e_proof_runner.sh \
+  --rust-tests --comprehensive --stress --chrome
+```
+
+Phases:
+
+| Flag | Phase |
+|------|-------|
+| `--rust-tests` | `cargo nextest` workspace |
+| `--comprehensive` | `e2e_comprehensive.sh` |
+| `--stress` | `e2e_stress_gossip.sh` |
+| `--chrome` | `e2e_gui_chrome.mjs` |
+| `--dioxus` | `e2e_communitas_dioxus.sh` |
+| `--xcuitest` | `xcodebuild ... CommunitasUITests` (macOS only) |
+| `--vps` | `e2e_vps.sh` (legacy SSH-per-call) |
+| `--vps-mesh` | `e2e_vps_mesh.py` (mesh-relay, **recommended**) |
+| `--lan` | `e2e_lan.sh` |
+| `--all` | everything above |
+
+> Until `--vps-mesh` lands in `e2e_proof_runner.sh`, run it explicitly
+> after the runner is verified active on every node (see §7b).
+
+---
+
+## Health Checks (Quick Status)
+
+```bash
+# Quick VPS health
+bash .deployment/health-check.sh                   # basic
+bash .deployment/health-check.sh --extended        # with peer counts
+```
+
+---
+
+## Currently Implemented Capabilities (Tested)
+
+All capabilities below have round-trip coverage in the matrix; see
+[`docs/parity-matrix.md`](docs/parity-matrix.md) for per-surface status.
+
+**Network layer**
+- QUIC transport (ant-quic 0.27.3 / 0.27.x, ML-DSA-65 / ML-KEM-768)
+- ant-quic native first-party LAN discovery + UPnP
+- NAT traversal via QUIC extension frames (`draft-seemann-quic-nat-traversal-02`),
+  PUNCH_ME_NOW peer-ID hole-punching through coordinator
 - MASQUE relay (RFC 9484)
 - Address discovery (QUIC extension frames)
+- Connection-supersede + lifecycle bus (`/peers/events`)
 
-✅ **Identity:**
-- MachineID (machine-bound, for QUIC auth)
-- AgentID (portable, for agent persistence)
-- Cryptographic uniqueness
-- 4-word speakable identities via `four-word-networking` crate (`IdentityEncoder`)
-- Introduction card (`GET /introduction`) with trust-gated service visibility
-- `x0x find <words>` — search discovered agents by identity words
-- `x0x connect <words>` — connect to agent by location words
-- Identity words injected into `x0x agent` and `x0x status` output
-- Location words injected into `x0x status` for external addresses
+**Identity**
+- MachineID (machine-bound; equals ant-quic PeerId)
+- AgentID (portable, importable)
+- UserID (optional, opt-in human identity)
+- AgentCertificate binding agent ↔ user
+- 4-word speakable identities (`four-word-networking`)
+- `GET /introduction` with trust-gated service visibility
 
-✅ **Bootstrap:**
-- Multi-peer connection
-- Exponential backoff retry
-- Peer caching
+**Trust & contacts**
+- ContactStore with `TrustLevel` and `IdentityType`
+- TrustEvaluator (5 decision paths including Pinned)
+- Machine pinning enforcement on every announcement
 
-✅ **Health API:**
-- GET /health endpoint
-- Status monitoring
-- 75+ REST endpoints (all wired to CLI and x0xd)
+**Bootstrap**
+- 6 hardcoded global nodes (port 5483)
+- 3-round retry with exponential backoff
+- Bootstrap cache enrichment from connections + presence beacons
+- Quality-scored cache persistence
 
-✅ **Gossip Layer:**
-- Pub/sub messaging (subscribe/publish via epidemic broadcast)
-- CRDT task lists (OR-Set checkboxes, LWW-Register metadata, RGA ordering)
-- CRDT key-value stores with access control
-- Presence beacons and FOAF discovery
+**Health & diagnostics**
+- `GET /health`, `GET /agent`, `GET /agent/card`
+- `GET /diagnostics/connectivity`
+- `GET /diagnostics/gossip` (drop-detection counters at every pipeline stage)
+- `GET /diagnostics/dm` (DM send/receive counters + per-peer RTT / path / lag state, this release)
+- `/peers/events` SSE — connection lifecycle bus (Established / Replaced / Closing / Closed / ReaderExited)
+- `dm.trace` correlation log (sender + receiver lines share a BLAKE3 `digest` field)
+- 60-second NodeStatus journal snapshots
+
+**Gossip**
+- Pub/sub via epidemic broadcast
+- CRDT task lists (OR-Set + LWW + RGA)
+- CRDT KV stores with access control
+- Presence beacons + FOAF discovery (Phi-Accrual lite, trust-scoped)
 - Anti-entropy sync
 
-✅ **MLS Encryption:**
-- Group creation and management
-- Member add/remove with welcome messages
-- ChaCha20-Poly1305 encrypt/decrypt
+**Encrypted groups**
+- MLS group create / add / remove / re-add
+- ChaCha20-Poly1305 encrypt / decrypt
+- Welcome messages for new members
 
-✅ **Direct Messaging:**
-- Agent-to-agent direct send/receive
-- Connection management
-- WebSocket real-time delivery
+**Named groups**
+- Create / invite / join / leave / rejoin
+- Display names
+- Policy (roles, bans)
+- DHT-free discovery (social, tag shards, presence-social browsing)
 
-✅ **Named Groups:**
-- Create/list/join groups with invite links
-- Display names, leave/rejoin
+**File transfer**
+- Send / accept / reject offers
+- Progress reporting
 
-✅ **File Transfer:**
-- Send/accept/reject file transfers
-
----
-
-## Not Yet Implemented (Future Tests)
-
-⚠️ **Advanced Features:**
-- Agent discovery by capability
-- Rendezvous coordination
+**Self-update**
+- ML-DSA-65-signed release manifests
+- Symmetric gossip propagation on `x0x/releases` topic
+- GitHub fallback poll
+- Atomic binary replacement with rollback
+- Staged deterministic rollout
 
 ---
 
-## Integration with CI/CD
+## Future Test Areas
 
-### GitHub Actions Integration
+These are **planned**, not yet wired into the proof runner:
 
-Add to `.github/workflows/network-test.yml`:
-
-```yaml
-name: Network Integration Test
-
-on:
-  push:
-    branches: [main]
-  schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Run Network Test
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
-        run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ./tests/test-network-simple.sh
-
-      - name: Upload Results
-        if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: test-results
-          path: /tmp/test-results.txt
-```
-
----
-
-## Test Output Files
-
-After running tests, the following files are generated:
-
-| File | Content |
-|------|---------|
-| `/tmp/test-results.txt` | Full test execution log |
-| `/tmp/x0x-node-identities.json` | Extracted node identities (MachineID, AgentID) |
-| `NETWORK_TEST_REPORT.txt` | Initial deployment test report |
+- **Performance benchmarks** — message throughput, cross-continent latency,
+  CRDT convergence time, memory under load
+- **Stress amplification** — 1000s of concurrent tasks, 100s of agents
+- **Chaos engineering** — random node failures, latency injection, packet
+  loss, clock skew
+- **Security testing** — explicit ML-DSA forgery / ML-KEM tamper /
+  replay / Sybil suites (currently relies on `cargo audit` + crypto unit
+  tests)
 
 ---
 
 ## Troubleshooting
 
-### Test Failures
-
-**Service not running:**
+### Service not running
 ```bash
 ssh root@<IP> 'systemctl status x0xd'
 ssh root@<IP> 'journalctl -u x0xd -n 50'
 ```
 
-**Health endpoint unreachable:**
+### Health endpoint unreachable
 ```bash
 ssh root@<IP> 'curl http://127.0.0.1:12600/health'
 ssh root@<IP> 'ss -tlpn | grep 12600'
 ```
 
-**QUIC port not bound:**
+### QUIC port not bound
 ```bash
 ssh root@<IP> 'ss -ulpn | grep 5483'
 ssh root@<IP> 'journalctl -u x0xd | grep "Bind address"'
 ```
 
-**No peer connections:**
+### No peer connections
 ```bash
 ssh root@<IP> 'journalctl -u x0xd --since "10 minutes ago" | grep -i connect'
 ```
 
-### Manual Test Execution
-
-Run individual tests on a specific node:
+### Drop detection
+If `e2e_stress_gossip.sh` reports drops, query the live counter directly:
 
 ```bash
-# Service health
-ssh root@142.93.199.50 'systemctl is-active x0xd'
-
-# Health API
-ssh root@142.93.199.50 'curl -s http://127.0.0.1:12600/health | jq .'
-
-# Connection logs
-ssh root@142.93.199.50 'journalctl -u x0xd --since "5 min ago" | grep -i connected'
-
-# Identity
-ssh root@142.93.199.50 'journalctl -u x0xd | grep -E "Machine ID:|Agent ID:"'
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:12700/diagnostics/gossip | jq .
 ```
+
+The `decode_to_delivery_drops` field localises drops to the
+network-recv → subscriber-channel hop. Per-pid logs are produced when
+`X0X_LOG_DIR` is set.
+
+For DM-specific issues (matrix-receive misses, unexplained timeouts) query
+`/diagnostics/dm` instead — it exposes per-peer counters
+(`outgoing_send_total`, `outgoing_send_failed`, `subscriber_channel_lagged`,
+`subscriber_channel_closed`) plus per-peer state (`avg_rtt_ms`,
+`last_send_ms_ago`, `preferred_path`):
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:12700/diagnostics/dm | jq .
+# Or via CLI:
+x0x diagnostics dm
+```
+
+### Mesh harness troubleshooting
+
+`e2e_vps_mesh.py` reports `discover missing: [...]` — the runner is not
+publishing on the results topic. Check, in order:
+
+```bash
+# 1. Is the runner alive?
+ssh root@<node_ip> 'systemctl is-active x0x-test-runner'
+
+# 2. Is its config pointing at a readable token?
+ssh root@<node_ip> 'cat /etc/x0x-test-runner.env'
+
+# 3. Has the runner subscribed to the control topic?
+ssh root@<node_ip> 'journalctl -u x0x-test-runner -n 30 --no-pager'
+# Expect: "subscribed to x0x.test.control.v1"
+
+# 4. Is gossip flowing?
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:12600/diagnostics/gossip | jq .stats
+```
+
+If discovery works but `send_dm` results don't return, look at
+`/diagnostics/dm` on the *sender* side and the receiver's `dm.trace`
+INFO log lines (search by `digest_marker` from the orchestrator output to
+correlate sender ↔ receiver).
 
 ---
 
-## Future Enhancements
+## CI Integration
 
-### Planned Test Additions
+`.github/workflows/`:
 
-1. **Performance Benchmarks:**
-   - Message throughput (messages/sec)
-   - Latency measurements (cross-continent)
-   - CRDT convergence time
-   - Memory usage under load
+- **ci.yml** — fmt, clippy, nextest, doc (symlinks `ant-quic` and
+  `saorsa-gossip` from `.deps/`)
+- **security.yml** — `cargo audit`
+- **release.yml** — multi-platform builds (7 targets), macOS code
+  signing, ML-DSA-65 manifest signing, `crates.io` publish
+- **build.yml** — PR validation
+- **sign-skill.yml** — GPG-signs `SKILL.md`
 
-2. **Stress Testing:**
-   - Rapid task creation (1000s of tasks)
-   - Concurrent operations (100s of agents)
-   - Network partition simulation
-   - Byzantine fault injection
-
-3. **Security Testing:**
-   - ML-DSA signature verification
-   - ML-KEM encryption validation
-   - Replay attack prevention
-   - Sybil attack resistance
-
-4. **Chaos Engineering:**
-   - Random node failures
-   - Network latency injection
-   - Packet loss simulation
-   - Clock skew testing
+The XCUITest target imports cleanly on Linux runners (`XCUITEST_SKIP=1`)
+and only actually executes on macOS.
 
 ---
 
@@ -412,23 +798,32 @@ ssh root@142.93.199.50 'journalctl -u x0xd | grep -E "Machine ID:|Agent ID:"'
 
 To add new tests:
 
-1. Add test function to appropriate suite
-2. Follow naming convention: `test_<feature_name>()`
-3. Use consistent pass/fail/skip reporting
-4. Document expected behavior
-5. Test locally before deploying to VPS
+1. Pick the right surface — REST/CLI parity goes in
+   `tests/api_coverage.rs` or `tests/parity_cli.rs`; GUI in
+   `tests/e2e_gui_chrome.mjs`; Dioxus in
+   `../communitas/communitas-dioxus/tests/e2e/`; Apple in
+   `CommunitasGoldenPathsUITests.swift`; cross-region matrix in
+   `tests/e2e_vps_mesh.py` (preferred) or `tests/e2e_vps.sh` (legacy).
+2. Update the corresponding row in [`docs/parity-matrix.md`](docs/parity-matrix.md)
+   from 🟡 / ❌ to ✅ once the test is green.
+3. Wire the test into `e2e_proof_runner.sh` if it should be part of the
+   release proof.
+4. Document expected behaviour in the test header.
+5. Run locally before pushing — every CI green light corresponds to a
+   `proofs/<timestamp>/` artefact bundle.
+
+Mesh-harness specific:
+
+6. New protocol commands go through the three-place edit in §7b
+   ("Extending the protocol"). Keep result envelopes small.
+7. Bumping the runner script means re-running `tests/e2e_deploy.sh`
+   (the deploy step pushes both the daemon binary *and* the runner).
 
 ---
 
 ## Support
 
-For issues or questions:
 - GitHub: https://github.com/saorsa-labs/x0x
 - Email: david@saorsalabs.com
-- Docs: https://x0x.dev (coming soon)
-
----
-
-**Last Updated:** 2026-04-03
-**x0x Version:** 0.14.9
-**Test Suite Version:** 2.0.0
+- Parity matrix: [`docs/parity-matrix.md`](docs/parity-matrix.md)
+- Architecture: [`CLAUDE.md`](CLAUDE.md)

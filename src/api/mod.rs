@@ -192,6 +192,20 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "network",
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/dm",
+        cli_name: "diagnostics dm",
+        description: "Direct-message send/receive counters and per-peer health",
+        category: "network",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/exec",
+        cli_name: "diagnostics exec",
+        description: "Remote exec counters, warnings, active sessions, and ACL summary",
+        category: "exec",
+    },
+    EndpointDef {
         method: Method::Post,
         path: "/peers/:peer_id/probe",
         cli_name: "peer probe",
@@ -434,6 +448,28 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "direct events",
         description: "Stream direct messages",
         category: "direct",
+    },
+    // ── Exec ───────────────────────────────────────────────────────────
+    EndpointDef {
+        method: Method::Post,
+        path: "/exec/run",
+        cli_name: "exec",
+        description: "Run a strictly allowlisted non-interactive command on a remote daemon",
+        category: "exec",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/exec/cancel",
+        cli_name: "exec cancel",
+        description: "Cancel an in-flight remote exec request",
+        category: "exec",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/exec/sessions",
+        cli_name: "exec sessions",
+        description: "List local pending and remote active exec sessions",
+        category: "exec",
     },
     // ── MLS groups ──────────────────────────────────────────────────────
     EndpointDef {

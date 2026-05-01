@@ -978,7 +978,7 @@ async fn daemon_api_complete_task() {
 }
 
 // ===========================================================================
-// Network (3)
+// Network (4)
 // ===========================================================================
 
 #[tokio::test]
@@ -1014,6 +1014,94 @@ async fn daemon_api_diagnostics_connectivity() {
     assert!(r["port_mapping"].is_object());
     assert!(r["mdns"].is_object());
     assert!(r["connections"].is_object());
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_diagnostics_dm() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/diagnostics/dm"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert!(r["stats"].is_object());
+    assert!(r["per_peer"].is_object());
+    assert!(r["subscriber_count"].is_number());
+    assert!(r["subscriber_capacity"].is_number());
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_diagnostics_exec() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/diagnostics/exec"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert!(r["enabled"].is_boolean());
+    assert!(r["totals"].is_object());
+    assert!(r["acl_summary"].is_object());
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_exec_sessions() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/exec/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert!(r["pending_clients"].is_array());
+    assert!(r["active_servers"].is_array());
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_exec_run_bad_agent_id() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .post(d.url("/exec/run"))
+        .json(&serde_json::json!({"agent_id":"bad", "argv":["echo", "1"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], false);
+    assert!(r["error"].is_string());
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_exec_cancel_bad_request_id() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .post(d.url("/exec/cancel"))
+        .json(&serde_json::json!({"request_id":"bad"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], false);
+    assert!(r["error"].is_string());
 }
 
 #[tokio::test]

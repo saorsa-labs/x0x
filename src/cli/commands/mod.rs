@@ -6,6 +6,7 @@ pub mod contacts;
 pub mod daemon;
 pub mod direct;
 pub mod discovery;
+pub mod exec;
 pub mod files;
 pub mod find;
 pub mod group;

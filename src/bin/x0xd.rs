@@ -440,6 +440,8 @@ struct AppState {
     upgrade_apply_lock: Arc<Mutex<()>>,
     /// API bearer token for authenticating local clients.
     api_token: String,
+    /// Tier-1 remote exec service.
+    exec_service: Arc<x0x::exec::ExecService>,
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +737,36 @@ struct DirectSendRequest {
     require_ack_ms: Option<u64>,
 }
 
+/// POST /exec/run request body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecRunRequest {
+    /// Target agent ID as 64-character hex string.
+    agent_id: String,
+    /// Exact argv vector. Never interpreted by a shell.
+    argv: Vec<String>,
+    /// Optional base64 stdin payload.
+    #[serde(default)]
+    stdin_b64: Option<String>,
+    /// Optional timeout in milliseconds. Remote ACL caps apply.
+    #[serde(default)]
+    timeout_ms: Option<u32>,
+    /// Requester-controlled CWD is rejected in v1 unless future ACL support is added.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// POST /exec/cancel request body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecCancelRequest {
+    /// Request ID as 32 hex chars.
+    request_id: String,
+    /// Optional target agent ID. If omitted, the local pending-session table is used.
+    #[serde(default)]
+    agent_id: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // MLS request / response types
 // ---------------------------------------------------------------------------
@@ -876,6 +908,7 @@ async fn main() -> Result<()> {
         println!("    --name <NAME>                   Instance name for multi-instance support");
         println!("    --api-port <PORT>               Override API server port");
         println!("    --no-hard-coded-bootstrap       Skip configured bootstrap peers");
+        println!("    --exec-acl <PATH>               Override default exec ACL path");
         println!("    --check                         Check configuration and exit");
         println!("    --check-updates       Check for updates and exit");
         println!("    --skip-update-check   Skip update check on startup");
@@ -893,6 +926,21 @@ async fn main() -> Result<()> {
         )
     } else {
         None
+    };
+
+    let exec_acl_override = if let Some(idx) = args.iter().position(|a| a == "--exec-acl") {
+        Some(PathBuf::from(
+            args.get(idx + 1)
+                .context("--exec-acl requires a path argument")?
+                .clone(),
+        ))
+    } else {
+        None
+    };
+    let exec_acl_load_mode = if exec_acl_override.is_some() {
+        x0x::exec::LoadMode::ExplicitPath
+    } else {
+        x0x::exec::LoadMode::DefaultPath
     };
 
     let check_only = args.contains(&"--check".to_string());
@@ -994,6 +1042,10 @@ async fn main() -> Result<()> {
 
     init_logging(&config.log_level, &config.log_format)?;
 
+    let exec_policy = x0x::exec::load_exec_policy(exec_acl_override.as_deref(), exec_acl_load_mode)
+        .await
+        .context("failed to load exec ACL")?;
+
     if doctor_mode {
         return run_doctor(&config).await;
     }
@@ -1001,6 +1053,7 @@ async fn main() -> Result<()> {
     if check_only {
         println!("Configuration is valid");
         println!("{:#?}", config);
+        println!("Exec ACL summary: {:#?}", exec_policy.summary());
         return Ok(());
     }
 
@@ -1115,9 +1168,11 @@ async fn main() -> Result<()> {
         max_peers_per_ip: 3,
     };
 
+    let contacts_path = config.data_dir.join("contacts.json");
     let mut builder = Agent::builder()
         .with_network_config(network_config)
         .with_peer_cache_dir(cache_dir)
+        .with_contact_store_path(&contacts_path)
         .with_heartbeat_interval(config.heartbeat_interval_secs)
         .with_identity_ttl(config.identity_ttl_secs);
 
@@ -1157,15 +1212,12 @@ async fn main() -> Result<()> {
         tracing::info!("User ID: {}", uid);
     }
 
-    // Create contact store and attach to gossip layer for trust filtering
-    let contacts = Arc::new(RwLock::new(ContactStore::new(
-        config.data_dir.join("contacts.json"),
-    )));
+    // Attach the agent-owned contact store to gossip and API state so the
+    // DM inbox trust evaluator observes the same mutations made by REST
+    // contact/card endpoints.
+    let contacts = Arc::clone(agent.contacts());
     agent.set_contacts(Arc::clone(&contacts));
-    tracing::info!(
-        "Contact store loaded from {}",
-        config.data_dir.join("contacts.json").display()
-    );
+    tracing::info!("Contact store loaded from {}", contacts_path.display());
 
     // MLS groups are session-scoped (saorsa-mls groups are not serializable)
     let mls_groups_path = config.data_dir.join("mls_groups.bin");
@@ -1229,6 +1281,8 @@ async fn main() -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (shutdown_notify, _) = watch::channel(false);
     let agent = Arc::new(agent);
+    let (exec_dm_tx, exec_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
+    let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
         subscriptions: RwLock::new(HashMap::new()),
@@ -1269,6 +1323,7 @@ async fn main() -> Result<()> {
         update_config: config.update.clone(),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         api_token,
+        exec_service: Arc::clone(&exec_service),
     });
 
     let existing_group_ids: Vec<String> = {
@@ -1341,6 +1396,7 @@ async fn main() -> Result<()> {
     // Join network in background — API is available immediately
     let join_agent = Arc::clone(&agent);
     let join_kem = Arc::clone(&agent_kem_keypair);
+    let join_exec_route_tx = exec_dm_tx.clone();
     let rendezvous_enabled = config.rendezvous_enabled;
     let rendezvous_validity_ms = config.rendezvous_validity_ms;
     tokio::spawn(async move {
@@ -1350,10 +1406,9 @@ async fn main() -> Result<()> {
                 // Start the DM inbox service now that the KEM keypair is
                 // loaded. This upgrades the capability advert so peers
                 // learn about gossip DM support within seconds.
-                if let Err(e) = join_agent
-                    .start_dm_inbox(join_kem, x0x::dm_inbox::DmInboxConfig::default())
-                    .await
-                {
+                let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
+                    .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, join_exec_route_tx);
+                if let Err(e) = join_agent.start_dm_inbox(join_kem, dm_inbox_config).await {
                     tracing::warn!("Failed to start DM inbox service: {e}");
                 }
                 if rendezvous_enabled {
@@ -1673,6 +1728,11 @@ async fn main() -> Result<()> {
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
+        .route("/diagnostics/dm", get(dm_diagnostics))
+        .route("/diagnostics/exec", get(exec_diagnostics))
+        .route("/exec/run", post(exec_run))
+        .route("/exec/cancel", post(exec_cancel))
+        .route("/exec/sessions", get(exec_sessions))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
@@ -1976,7 +2036,12 @@ fn direct_message_send_config() -> x0x::dm::DmSendConfig {
 }
 
 fn file_transfer_send_config() -> x0x::dm::DmSendConfig {
-    direct_message_send_config()
+    let mut config = direct_message_send_config();
+    // File transfer already has a stronger application-level ChunkAck after
+    // the receiver persists each chunk. Avoid layering the raw receive-ACK on
+    // every chunk, which adds an unnecessary second wait in the hot path.
+    config.raw_quic_receive_ack_timeout = None;
+    config
 }
 
 /// Maximum number of file chunks a sender may have in flight (sent but
@@ -3492,6 +3557,9 @@ async fn get_agent_card(
     let display_name = query.display_name.unwrap_or_default();
 
     let mut card = x0x::groups::card::AgentCard::new(display_name, &agent_id, &machine_id);
+    card.dm_capabilities = Some(x0x::dm::DmCapabilities::v1_gossip_ready(
+        state.agent_kem_keypair.public_bytes.clone(),
+    ));
 
     // Add user ID if available
     card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
@@ -3620,6 +3688,18 @@ async fn import_agent_card(
         .iter()
         .filter_map(|a| a.parse().ok())
         .collect();
+
+    if machine_id_bytes != [0u8; 32] {
+        if let Some(caps) = card.dm_capabilities.clone() {
+            if caps.gossip_inbox && !caps.kem_public_key.is_empty() {
+                state.agent.capability_store().insert(
+                    agent_id,
+                    x0x::identity::MachineId(machine_id_bytes),
+                    caps,
+                );
+            }
+        }
+    }
 
     if machine_id_bytes != [0u8; 32] || !addresses.is_empty() {
         state
@@ -10511,6 +10591,137 @@ async fn connect_machine(
     }
 }
 
+/// POST /exec/run — run a strictly allowlisted command on a remote daemon.
+async fn exec_run(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ExecRunRequest>,
+) -> axum::response::Response {
+    let agent_id = match parse_agent_id_hex(&req.agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            )
+                .into_response();
+        }
+    };
+    if req.argv.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "argv must not be empty" })),
+        )
+            .into_response();
+    }
+    let stdin = match req.stdin_b64.as_deref() {
+        Some(encoded) => match base64::engine::general_purpose::STANDARD.decode(encoded) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": format!("invalid stdin_b64: {e}") })),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+    let options = x0x::exec::ExecRunOptions {
+        argv: req.argv,
+        stdin,
+        timeout_ms: req.timeout_ms,
+        cwd: req.cwd,
+    };
+    match state.exec_service.run_remote(agent_id, options).await {
+        Ok(result) => {
+            let denial_reason = result.denial_reason.map(|r| r.as_str());
+            let warnings: Vec<&'static str> = result.warnings.iter().map(|w| w.as_str()).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "request_id": result.request_id.to_hex(),
+                    "code": result.code,
+                    "signal": result.signal,
+                    "duration_ms": result.duration_ms,
+                    "stdout_b64": base64::engine::general_purpose::STANDARD.encode(&result.stdout),
+                    "stderr_b64": base64::engine::general_purpose::STANDARD.encode(&result.stderr),
+                    "stdout_bytes_total": result.stdout_bytes_total,
+                    "stderr_bytes_total": result.stderr_bytes_total,
+                    "truncated": result.truncated,
+                    "denial_reason": denial_reason,
+                    "warnings": warnings,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let status = match e {
+                x0x::exec::service::ExecServiceError::Protocol(_) => StatusCode::BAD_REQUEST,
+                x0x::exec::service::ExecServiceError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+                x0x::exec::service::ExecServiceError::ResponseChannelClosed => {
+                    StatusCode::BAD_GATEWAY
+                }
+                x0x::exec::service::ExecServiceError::Transport(_)
+                | x0x::exec::service::ExecServiceError::Denied(_) => StatusCode::BAD_GATEWAY,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /exec/cancel — cancel an in-flight exec request originated by this daemon.
+async fn exec_cancel(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ExecCancelRequest>,
+) -> axum::response::Response {
+    let request_id = match x0x::exec::ExecRequestId::from_hex(&req.request_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let target = match req.agent_id.as_deref() {
+        Some(agent_hex) => match parse_agent_id_hex(agent_hex) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": e })),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+    match state.exec_service.cancel_remote(request_id, target).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /exec/sessions — list local pending client sessions and remote active sessions.
+async fn exec_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.exec_service.sessions_snapshot().await)
+}
+
+/// GET /diagnostics/exec — exec counters, active sessions, and safe ACL summary.
+async fn exec_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.exec_service.diagnostics_snapshot().await)
+}
+
 /// POST /direct/send — send a direct message to a connected agent.
 async fn direct_send(
     State(state): State<Arc<AppState>>,
@@ -10544,16 +10755,31 @@ async fn direct_send(
         Err(resp) => return resp,
     };
 
+    let mut send_config = direct_message_send_config();
+    if let Some(ack_ms) = req.require_ack_ms {
+        send_config.raw_quic_receive_ack_timeout =
+            Some(std::time::Duration::from_millis(ack_ms.clamp(100, 30_000)));
+    }
+
     match state
         .agent
-        .send_direct_with_config(&agent_id, payload, direct_message_send_config())
+        .send_direct_with_config(&agent_id, payload, send_config)
         .await
     {
         Ok(receipt) => {
             let path_str = match receipt.path {
                 x0x::dm::DmPath::GossipInbox => "gossip_inbox",
                 x0x::dm::DmPath::RawQuic => "raw_quic",
+                x0x::dm::DmPath::RawQuicAcked => "raw_quic_acked",
             };
+            tracing::info!(
+                target: "dm.trace",
+                stage = "accepted_at_api",
+                request_id = %hex::encode(receipt.request_id),
+                recipient = %hex::encode(agent_id.as_bytes()),
+                path = path_str,
+                retries_used = receipt.retries_used,
+            );
             // Optional post-send liveness confirmation via ant-quic's
             // `probe_peer` primitive. Proves the peer's receive pipeline is
             // alive; it does NOT prove this specific message was delivered
@@ -10617,11 +10843,23 @@ async fn direct_send(
                     (StatusCode::NOT_FOUND, "recipient_key_unavailable")
                 }
                 x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+                x0x::dm::DmError::PeerLikelyOffline { .. } => {
+                    (StatusCode::BAD_GATEWAY, "peer_likely_offline")
+                }
+                x0x::dm::DmError::PeerDisconnected { .. } => {
+                    (StatusCode::BAD_GATEWAY, "peer_disconnected")
+                }
                 x0x::dm::DmError::LocalGossipUnavailable(_) => {
                     (StatusCode::SERVICE_UNAVAILABLE, "local_gossip_unavailable")
                 }
                 x0x::dm::DmError::EnvelopeConstruction(_) => {
                     (StatusCode::BAD_REQUEST, "envelope_construction")
+                }
+                x0x::dm::DmError::PayloadTooLarge { .. } => {
+                    (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
+                }
+                x0x::dm::DmError::NoConnectivity(_) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "no_connectivity")
                 }
                 x0x::dm::DmError::PublishFailed(_) => {
                     (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed")
@@ -10682,6 +10920,13 @@ async fn direct_events_sse(
                     let Some(msg) = maybe_msg else {
                         break;
                     };
+                    tracing::info!(
+                        target: "dm.trace",
+                        stage = "inbound_sse_yielded",
+                        sender = %hex::encode(msg.sender.as_bytes()),
+                        machine_id = %hex::encode(msg.machine_id.as_bytes()),
+                        bytes = msg.payload.len(),
+                    );
                     let data = serde_json::json!({
                         "sender": hex::encode(msg.sender.as_bytes()),
                         "machine_id": hex::encode(msg.machine_id.as_bytes()),
@@ -11659,6 +11904,26 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
     }
 }
 
+/// GET /diagnostics/dm — direct-message send/receive diagnostics.
+async fn dm_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let x0x::direct::DmDiagnosticsSnapshot {
+        stats,
+        per_peer,
+        subscriber_count,
+        subscriber_capacity,
+    } = state.agent.direct_messaging().diagnostics_snapshot();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "stats": stats,
+            "per_peer": per_peer,
+            "subscriber_count": subscriber_count,
+            "subscriber_capacity": subscriber_capacity,
+        })),
+    )
+}
+
 /// Parse a hex `peer_id` path segment into an ant-quic `PeerId` (32 bytes).
 fn parse_peer_id(hex_str: &str) -> Result<ant_quic::PeerId, (StatusCode, Json<serde_json::Value>)> {
     let bytes = hex::decode(hex_str).map_err(|e| {
@@ -12617,7 +12882,7 @@ async fn handle_file_accept(state: &Arc<AppState>, sender: &AgentId, transfer_id
 /// a `FileChunkAckSlot`, waits for `FileMessage::ChunkAck` from the receiver
 /// to advance the in-flight window, and only allows up to `FILE_CHUNK_WINDOW`
 /// chunks ahead of the last ack at any time. This caps queue pressure on the
-/// receiver's `subscribe_direct` broadcast bus and prevents the silent
+/// receiver's `subscribe_direct` subscriber queue and prevents the silent
 /// chunk-loss regression that bricked 100M transfers on 2026-04-30.
 async fn stream_file_chunks(
     state: &Arc<AppState>,

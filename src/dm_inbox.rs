@@ -16,15 +16,61 @@ use crate::identity::{AgentId, MachineId};
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use bytes::Bytes;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 
 const ACK_ENVELOPE_LIFETIME_MS: u64 = 60_000;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct DmInboxConfig {
     /// If true, trust-policy rejections do NOT emit an ACK.
     pub silent_reject: bool,
+    /// Prefix-routed payloads that should bypass generic DirectMessaging fan-out.
+    pub typed_payload_routes: Vec<DmTypedPayloadRoute>,
+}
+
+impl std::fmt::Debug for DmInboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmInboxConfig")
+            .field("silent_reject", &self.silent_reject)
+            .field("typed_payload_routes", &self.typed_payload_routes.len())
+            .finish()
+    }
+}
+
+impl DmInboxConfig {
+    /// Add a typed-payload route. Matching payloads are delivered to `sender`
+    /// and are not emitted to generic `/direct/events` consumers.
+    #[must_use]
+    pub fn with_typed_payload_route(
+        mut self,
+        prefix: impl Into<Vec<u8>>,
+        sender: mpsc::Sender<DmTypedPayload>,
+    ) -> Self {
+        self.typed_payload_routes.push(DmTypedPayloadRoute {
+            prefix: prefix.into(),
+            sender,
+        });
+        self
+    }
+}
+
+/// Prefix route for decrypted DM payloads.
+#[derive(Clone)]
+pub struct DmTypedPayloadRoute {
+    pub prefix: Vec<u8>,
+    pub sender: mpsc::Sender<DmTypedPayload>,
+}
+
+/// A decrypted, verified DM payload routed before generic direct-message fan-out.
+#[derive(Debug, Clone)]
+pub struct DmTypedPayload {
+    pub sender: AgentId,
+    pub machine_id: MachineId,
+    pub payload: Vec<u8>,
+    pub verified: bool,
+    pub trust_decision: Option<TrustDecision>,
+    pub received_at_unix_ms: u64,
 }
 
 pub struct DmInboxService {
@@ -79,6 +125,7 @@ impl DmInboxService {
             inflight,
             cache,
             silent_reject: config.silent_reject,
+            typed_payload_routes: config.typed_payload_routes,
         };
 
         let topic_for_task = topic.clone();
@@ -120,6 +167,7 @@ struct InboxPipeline {
     inflight: Arc<InFlightAcks>,
     cache: Arc<RecentDeliveryCache>,
     silent_reject: bool,
+    typed_payload_routes: Vec<DmTypedPayloadRoute>,
 }
 
 impl InboxPipeline {
@@ -130,12 +178,16 @@ impl InboxPipeline {
         };
 
         if msg.payload.len() > MAX_ENVELOPE_BYTES {
+            self.dm.record_incoming_decode_failed();
             return;
         }
 
         let envelope = match DmEnvelope::from_wire_bytes(&msg.payload) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => {
+                self.dm.record_incoming_decode_failed();
+                return;
+            }
         };
 
         if envelope.protocol_version > DM_PROTOCOL_VERSION {
@@ -157,6 +209,14 @@ impl InboxPipeline {
             return;
         }
 
+        tracing::info!(
+            target: "dm.trace",
+            stage = "inbound_envelope_received",
+            request_id = %hex::encode(envelope.request_id),
+            sender = %hex::encode(envelope.sender_agent_id),
+            bytes = msg.payload.len(),
+        );
+
         let dedupe = envelope.dedupe_key();
         if let Some(cached) = self.cache.lookup(&dedupe) {
             if matches!(envelope.body, DmBody::Payload(_)) {
@@ -172,10 +232,25 @@ impl InboxPipeline {
         }
 
         if !verify_envelope_signature(&envelope, &sender_pubkey) {
+            self.dm.record_incoming_signature_failed();
+            tracing::info!(
+                target: "dm.trace",
+                stage = "inbound_signature_failed",
+                request_id = %hex::encode(envelope.request_id),
+                sender = %hex::encode(envelope.sender_agent_id),
+            );
             return;
         }
 
+        tracing::info!(
+            target: "dm.trace",
+            stage = "inbound_signature_verified",
+            request_id = %hex::encode(envelope.request_id),
+            sender = %hex::encode(envelope.sender_agent_id),
+        );
+
         if envelope.sender_agent_id != *pubsub_sender.as_bytes() {
+            self.dm.record_incoming_signature_failed();
             return;
         }
 
@@ -206,8 +281,17 @@ impl InboxPipeline {
             })
         };
 
+        tracing::info!(
+            target: "dm.trace",
+            stage = "inbound_trust_evaluated",
+            request_id = %hex::encode(envelope.request_id),
+            sender = %hex::encode(sender_agent_id.as_bytes()),
+            decision = %decision,
+        );
+
         match decision {
             TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch => {
+                self.dm.record_incoming_trust_rejected(sender_agent_id);
                 let outcome = DmAckOutcome::RejectedByPolicy {
                     reason: decision.to_string(),
                 };
@@ -225,21 +309,43 @@ impl InboxPipeline {
         let aad = envelope.aead_aad();
         let plaintext = match decrypt_payload(&self.kem_keypair, &payload, &aad) {
             Ok(p) => p,
-            Err(_) => return,
+            Err(_) => {
+                self.dm.record_incoming_decode_failed();
+                return;
+            }
         };
         if plaintext.request_id != envelope.request_id {
+            self.dm.record_incoming_decode_failed();
             return;
         }
 
-        self.dm
-            .handle_incoming(
-                sender_machine_id,
+        let is_typed_payload = self
+            .route_typed_payload(
                 sender_agent_id,
-                plaintext.payload,
-                true,
+                sender_machine_id,
+                plaintext.payload.clone(),
                 Some(decision),
             )
             .await;
+
+        if !is_typed_payload {
+            self.dm
+                .handle_incoming(
+                    sender_machine_id,
+                    sender_agent_id,
+                    plaintext.payload,
+                    true,
+                    Some(decision),
+                )
+                .await;
+
+            tracing::info!(
+                target: "dm.trace",
+                stage = "inbound_broadcast_published",
+                request_id = %hex::encode(envelope.request_id),
+                sender = %hex::encode(sender_agent_id.as_bytes()),
+            );
+        }
 
         self.cache
             .insert(envelope.dedupe_key(), DmAckOutcome::Accepted);
@@ -247,6 +353,37 @@ impl InboxPipeline {
         let _ = self
             .publish_ack(sender_agent_id, envelope.request_id, DmAckOutcome::Accepted)
             .await;
+    }
+
+    async fn route_typed_payload(
+        &self,
+        sender_agent_id: AgentId,
+        sender_machine_id: MachineId,
+        payload: Vec<u8>,
+        trust_decision: Option<TrustDecision>,
+    ) -> bool {
+        let Some(route) = self
+            .typed_payload_routes
+            .iter()
+            .find(|route| payload.starts_with(&route.prefix))
+        else {
+            return false;
+        };
+        let typed = DmTypedPayload {
+            sender: sender_agent_id,
+            machine_id: sender_machine_id,
+            payload,
+            verified: true,
+            trust_decision,
+            received_at_unix_ms: now_unix_ms(),
+        };
+        if route.sender.send(typed).await.is_err() {
+            tracing::warn!(
+                sender = %hex::encode(sender_agent_id.as_bytes()),
+                "typed DM payload route receiver is closed; dropping payload"
+            );
+        }
+        true
     }
 
     async fn publish_ack(
