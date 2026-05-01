@@ -575,10 +575,26 @@ impl ChannelPressureInfoLimiter {
 }
 
 static CHANNEL_PRESSURE_INFO_LIMITER: OnceLock<ChannelPressureInfoLimiter> = OnceLock::new();
+static CHANNEL_PRESSURE_WARN_LIMITER: OnceLock<ChannelPressureInfoLimiter> = OnceLock::new();
 static CHANNEL_DROP_WARN_LIMITER: OnceLock<ChannelPressureInfoLimiter> = OnceLock::new();
 
 fn channel_pressure_info_limiter() -> &'static ChannelPressureInfoLimiter {
     CHANNEL_PRESSURE_INFO_LIMITER.get_or_init(ChannelPressureInfoLimiter::default)
+}
+
+/// Rate limiter for the per-call ">80% full" pressure WARN.
+///
+/// Before ADR 0009 the producer was back-pressured by `mpsc::Sender::send().await`,
+/// which naturally bounded the WARN call rate to roughly the consumer drain rate.
+/// Under the new `try_send` policy on PubSub the producer is no longer throttled,
+/// so a sustained slow-consumer event would fire this WARN once per
+/// `forward_gossip_payload` call (i.e. at producer rate). The pressure WARN is
+/// kept as the operator cue but is now rate-limited per (channel, stream) so it
+/// surfaces a regime change rather than spamming the journal under steady
+/// pressure. The authoritative steady-state signals are
+/// `recv_pump.<stream>.{producer_per_sec, consumer_per_sec, max_depth, dropped_full}`.
+fn channel_pressure_warn_limiter() -> &'static ChannelPressureInfoLimiter {
+    CHANNEL_PRESSURE_WARN_LIMITER.get_or_init(ChannelPressureInfoLimiter::default)
 }
 
 /// Rate limiter for the per-frame "dropping PubSub frame" WARN.
@@ -653,7 +669,13 @@ fn warn_forward_channel_pressure<T>(
             "[1/6 network] receive forward channel >50% full — watch back-pressure trend before ant-quic recv drain"
         );
     }
-    if channel_pressure_exceeds_warn_threshold(available, max) {
+    if channel_pressure_exceeds_warn_threshold(available, max)
+        && channel_pressure_warn_limiter().should_emit(
+            channel_pressure_key(channel_name, stream_type),
+            Instant::now(),
+            CHANNEL_PRESSURE_INFO_INTERVAL,
+        )
+    {
         warn!(
             available,
             used,
@@ -662,7 +684,7 @@ fn warn_forward_channel_pressure<T>(
             peer = ?peer_id,
             stream = ?stream_type,
             channel = channel_name,
-            "[1/6 network] receive forward channel >80% full — back-pressure active before ant-quic recv drain"
+            "[1/6 network] receive forward channel >80% full — back-pressure active before ant-quic recv drain (rate-limited; see recv_pump.<stream>.{{producer_per_sec, consumer_per_sec, max_depth, dropped_full}} for steady-state)"
         );
     }
 }
@@ -2658,6 +2680,39 @@ mod pressure_tests {
         assert!(limiter.should_emit(
             key,
             start + CHANNEL_PRESSURE_INFO_INTERVAL + Duration::from_millis(1),
+            CHANNEL_PRESSURE_INFO_INTERVAL,
+        ));
+    }
+
+    #[tokio::test]
+    async fn warn_forward_channel_pressure_warn_limiter_is_independent_of_info_and_drop() {
+        // Three limiter instances must hold their own state so that a >50%
+        // INFO emission cannot suppress a subsequent >80% WARN, and the drop
+        // WARN limiter cannot suppress either pressure log. Each is a fresh
+        // ChannelPressureInfoLimiter — sharing the same underlying type is
+        // intentional, but the three statics in production must be distinct.
+        let info = ChannelPressureInfoLimiter::default();
+        let warn = ChannelPressureInfoLimiter::default();
+        let drop = ChannelPressureInfoLimiter::default();
+        let key = channel_pressure_key("recv_pubsub_tx", Some(GossipStreamType::PubSub));
+        let now = Instant::now();
+        assert!(info.should_emit(key, now, CHANNEL_PRESSURE_INFO_INTERVAL));
+        assert!(warn.should_emit(key, now, CHANNEL_PRESSURE_INFO_INTERVAL));
+        assert!(drop.should_emit(key, now, CHANNEL_PRESSURE_INFO_INTERVAL));
+        // Each limiter independently rate-limits its own next emission.
+        assert!(!info.should_emit(
+            key,
+            now + Duration::from_secs(1),
+            CHANNEL_PRESSURE_INFO_INTERVAL,
+        ));
+        assert!(!warn.should_emit(
+            key,
+            now + Duration::from_secs(1),
+            CHANNEL_PRESSURE_INFO_INTERVAL,
+        ));
+        assert!(!drop.should_emit(
+            key,
+            now + Duration::from_secs(1),
             CHANNEL_PRESSURE_INFO_INTERVAL,
         ));
     }
