@@ -444,12 +444,11 @@ Actions: `discover`, `send_dm`, `noop_ack`. Result kinds:
 the sender and receiver — so the orchestrator can pair every
 `send_result` with its `received_dm` independent of timing.
 
-Result DMs intentionally **do not** request `raw_quic_acked` — they
-ride the daemon's default path (gossip-inbox first, with one retry) so
-brief raw-QUIC supersedes between runner and anchor don't drop the
-result. Test traffic itself still uses `raw_quic_acked` so a real
-peer_disconnected fast-fail surfaces as a `send_err` rather than a
-silent timeout.
+Command, result, and test-hop DMs intentionally **do not** request
+`raw_quic_acked` by default — they ride the daemon's default path
+(gossip-inbox first, with one retry) so brief raw-QUIC supersedes do not
+drop harness control/result traffic. The harness's `send_result` and
+`received_dm` envelopes are the application-level delivery proof.
 
 ### Deployment
 

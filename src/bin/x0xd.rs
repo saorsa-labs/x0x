@@ -732,9 +732,9 @@ struct DirectSendRequest {
     agent_id: String,
     /// Base64-encoded payload.
     payload: String,
-    /// Optional opt-in: wait up to `require_ack_ms` ms for the remote
-    /// receive pipeline to ACK delivery (ant-quic 0.27.1 `send_with_receive_ack`).
-    /// Omit for fire-and-forget (default, unchanged behaviour).
+    /// Optional opt-in: after the DM path accepts the message, probe the
+    /// recipient's ant-quic receive pipeline for liveness with this timeout.
+    /// This does not force the message itself onto raw-QUIC receive-ACK.
     #[serde(default)]
     require_ack_ms: Option<u64>,
 }
@@ -2033,17 +2033,24 @@ fn file_transfer_now() -> (u64, u64) {
 }
 
 fn direct_message_send_config() -> x0x::dm::DmSendConfig {
-    x0x::dm::DmSendConfig {
-        prefer_raw_quic_if_connected: true,
-        ..x0x::dm::DmSendConfig::default()
-    }
+    // Generic daemon DMs are capability-aware and gossip-inbox first when the
+    // recipient advertises it. That path has an authenticated application-level
+    // ACK and is resilient to transient raw-QUIC supersede/reader churn.
+    x0x::dm::DmSendConfig::default()
 }
 
 fn file_transfer_send_config() -> x0x::dm::DmSendConfig {
-    let mut config = direct_message_send_config();
+    let mut config = x0x::dm::DmSendConfig {
+        prefer_raw_quic_if_connected: true,
+        stop_fallback_on_raw_error: true,
+        ..x0x::dm::DmSendConfig::default()
+    };
     // File transfer already has a stronger application-level ChunkAck after
     // the receiver persists each chunk. Avoid layering the raw receive-ACK on
     // every chunk, which adds an unnecessary second wait in the hot path.
+    // Also keep raw failures terminal: silently falling back to gossip would
+    // push 32 KiB chunks through signed/encrypted pubsub fanout and break the
+    // throughput/back-pressure assumptions of the file chunk window.
     config.raw_quic_receive_ack_timeout = None;
     config
 }
@@ -11230,15 +11237,9 @@ async fn direct_send(
         Err(resp) => return resp,
     };
 
-    let mut send_config = direct_message_send_config();
-    if let Some(ack_ms) = req.require_ack_ms {
-        send_config.raw_quic_receive_ack_timeout =
-            Some(std::time::Duration::from_millis(ack_ms.clamp(100, 30_000)));
-    }
-
     match state
         .agent
-        .send_direct_with_config(&agent_id, payload, send_config)
+        .send_direct_with_config(&agent_id, payload, direct_message_send_config())
         .await
     {
         Ok(receipt) => {

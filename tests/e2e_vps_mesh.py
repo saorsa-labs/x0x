@@ -62,10 +62,12 @@ LEGACY_RESULTS_TOPIC = "x0x.test.results.v1"
 #   x0xtest|res|<b64-json>   runner → orchestrator result
 PREFIX_CMD = b"x0xtest|cmd|"
 PREFIX_RES = b"x0xtest|res|"
-# Receive-pipeline ACK timeout for command DMs from the orchestrator. We
-# fail fast (and let the harness mark `send_no_result`) rather than wait
-# the full 30 s adaptive ceiling on a wedged peer.
-COMMAND_DM_ACK_MS = 8000
+# Command DMs use the daemon's default resilient DM path. The harness gets
+# stronger application-level proof from source `send_result` and destination
+# `received_dm` envelopes, so raw receive-ACK is disabled by default. Keep this
+# knob for a future explicit --raw-ack-stress mode; ordinary mesh correctness
+# should not depend on ant-quic receive-ACK timing.
+COMMAND_DM_ACK_MS: Optional[int] = None
 
 NODES_DEFAULT: List[str] = [
     "nyc",
@@ -637,7 +639,6 @@ def run_all_pairs_matrix(
                 "request_id": request_id,
                 "digest_marker": digest,
                 "anchor_aid": anchor_aid,
-                "require_ack_ms": 8000,
             },
         }
         resp = send_command_dm(
@@ -648,13 +649,13 @@ def run_all_pairs_matrix(
         expected_send_rids.add(request_id)
         expected_recv_pairs[(dst, request_id)] = True
         # Tiny inter-DM breather; the anchor's local /direct/send is fast,
-        # but a 50 ms pause keeps the receive-pipeline ACKs from queueing.
+        # but a 50 ms pause keeps the daemon receive/control queues smooth.
         time.sleep(0.05)
 
     if dm_dispatch_failures:
         log.warning(
             "%d command DMs failed to dispatch from anchor "
-            "(treated as send_no_result)",
+            "(reported as command_dispatch_fail)",
             len(dm_dispatch_failures),
         )
 
@@ -695,7 +696,10 @@ def run_all_pairs_matrix(
         out.sent += 1
         if sr is None:
             out.send_fail += 1
-            out.failures.append(f"send_no_result {request_id}")
+            if request_id in dm_dispatch_failures:
+                out.failures.append(f"command_dispatch_fail {request_id}")
+            else:
+                out.failures.append(f"send_no_result {request_id}")
             continue
         if sr.outcome == "ok":
             out.send_ok += 1

@@ -446,13 +446,13 @@ impl DirectMessaging {
 
     /// Mark an agent as disconnected.
     pub async fn mark_disconnected(&self, agent_id: &AgentId) {
-        let machine_id = {
-            let mut connected = self.connected_agents.write().await;
-            connected.remove(agent_id)
-        };
-        if let Some(machine_id) = machine_id {
-            self.record_lifecycle_blocked(machine_id, None, "network peer disconnected");
-        }
+        let mut connected = self.connected_agents.write().await;
+        connected.remove(agent_id);
+        // NetworkEvent::PeerDisconnected carries no ant-quic lifecycle
+        // generation. A delayed disconnect for a superseded old connection can
+        // therefore arrive after a newer Established/Replaced event. Do not
+        // write a lifecycle block here; generation-bearing Closed events are
+        // the authoritative source for the send fast-fail table.
         tracing::info!("Agent disconnected: {:?}", agent_id);
     }
 

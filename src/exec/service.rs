@@ -28,6 +28,11 @@ const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(2);
 // Keep below the 5s SLA; peer lifecycle events are the fast path, lease expiry is the backstop.
 const LEASE_TIMEOUT: Duration = Duration::from_secs(4);
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
+// Server-side idle guard: unlike the 4s client lease, this tracks child
+// stdout/stderr/exit progress so a renewing but stuck/silent session cannot
+// live forever if lifecycle disconnect events are missed.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SESSION_IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Options for a remote exec run originated by this daemon.
 #[derive(Debug, Clone)]
@@ -62,6 +67,10 @@ struct ActiveServerSession {
     machine_id: MachineId,
     cancel_tx: watch::Sender<CancelReason>,
     lease_deadline: Arc<Mutex<Instant>>,
+    /// Last observed server-side child activity (stdout/stderr/exit), not
+    /// client lease renewals. This makes the idle timeout an orthogonal
+    /// backstop instead of a slower duplicate of lease expiry.
+    last_activity: Arc<Mutex<Instant>>,
     argv_summary: String,
     started_at: Instant,
 }
@@ -78,6 +87,7 @@ enum CancelReason {
     LeaseExpired,
     PeerDisconnected,
     DurationCap,
+    IdleTimeout,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -121,6 +131,10 @@ impl ExecService {
         let lifecycle_service = Arc::clone(&service);
         tokio::spawn(async move {
             lifecycle_service.run_peer_lifecycle_loop().await;
+        });
+        let idle_service = Arc::clone(&service);
+        tokio::spawn(async move {
+            idle_service.run_session_idle_loop().await;
         });
         service
     }
@@ -333,13 +347,27 @@ impl ExecService {
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            let should_cancel = matches!(
-                event,
-                ant_quic::PeerLifecycleEvent::Closing { .. }
-                    | ant_quic::PeerLifecycleEvent::Closed { .. }
-                    | ant_quic::PeerLifecycleEvent::ReaderExited { .. }
-            );
-            if should_cancel {
+            let disconnect_reason = match event {
+                ant_quic::PeerLifecycleEvent::Closed { reason, .. }
+                    if reason != ant_quic::ConnectionCloseReason::Superseded =>
+                {
+                    Some(reason)
+                }
+                // ReaderExited is emitted before ant-quic classifies the exit,
+                // and Closing is pre-terminal. Do not cancel exec sessions until
+                // a non-superseded Closed event is observed and no replacement
+                // connection is live.
+                _ => None,
+            };
+            if let Some(reason) = disconnect_reason {
+                if network.is_connected(&peer_id).await {
+                    tracing::debug!(
+                        peer_id = %hex::encode(peer_id.0),
+                        ?reason,
+                        "ignoring exec lifecycle close because peer is still connected"
+                    );
+                    continue;
+                }
                 let machine_id = MachineId(peer_id.0);
                 let cancelled = self
                     .cancel_sessions_for_machine(machine_id, CancelReason::PeerDisconnected)
@@ -347,12 +375,47 @@ impl ExecService {
                 if cancelled > 0 {
                     tracing::info!(
                         machine_id = %hex::encode(machine_id.as_bytes()),
+                        ?reason,
                         cancelled,
                         "cancelled exec sessions for disconnected peer"
                     );
                 }
             }
         }
+    }
+
+    async fn run_session_idle_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(SESSION_IDLE_SCAN_INTERVAL).await;
+            let sessions: Vec<(ExecRequestId, ActiveServerSession)> = {
+                let active = self.active_servers.lock().await;
+                active
+                    .iter()
+                    .map(|(request_id, session)| (*request_id, session.clone()))
+                    .collect()
+            };
+            let now = Instant::now();
+            for (request_id, session) in sessions {
+                let last_activity = *session.last_activity.lock().await;
+                if now.duration_since(last_activity) < SESSION_IDLE_TIMEOUT {
+                    continue;
+                }
+                if session.cancel_tx.send(CancelReason::IdleTimeout).is_ok() {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        agent_id = %hex::encode(session.agent_id.as_bytes()),
+                        machine_id = %hex::encode(session.machine_id.as_bytes()),
+                        idle_ms = now.duration_since(last_activity).as_millis() as u64,
+                        "exec session idle timeout; cancelling remote child"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn record_session_activity(last_activity: &Arc<Mutex<Instant>>) {
+        let mut guard = last_activity.lock().await;
+        *guard = Instant::now();
     }
 
     async fn cancel_sessions_for_machine(
@@ -568,14 +631,17 @@ impl ExecService {
             .await;
 
         let (cancel_tx, cancel_rx) = watch::channel(CancelReason::DurationCap);
-        let lease_deadline = Arc::new(Mutex::new(Instant::now() + LEASE_TIMEOUT));
+        let now = Instant::now();
+        let lease_deadline = Arc::new(Mutex::new(now + LEASE_TIMEOUT));
+        let last_activity = Arc::new(Mutex::new(now));
         let active_session = ActiveServerSession {
             agent_id: inbound.sender,
             machine_id: inbound.machine_id,
             cancel_tx,
             lease_deadline: Arc::clone(&lease_deadline),
+            last_activity: Arc::clone(&last_activity),
             argv_summary: argv_summary(&argv),
-            started_at: Instant::now(),
+            started_at: now,
         };
         self.active_servers
             .lock()
@@ -590,6 +656,7 @@ impl ExecService {
             checked,
             cancel_rx,
             lease_deadline,
+            last_activity,
         )
         .await;
 
@@ -700,6 +767,7 @@ impl ExecService {
         checked: CheckedRequest,
         mut cancel_rx: watch::Receiver<CancelReason>,
         lease_deadline: Arc<Mutex<Instant>>,
+        last_activity: Arc<Mutex<Instant>>,
     ) {
         let started = Instant::now();
         let mut cmd = Command::new(&argv[0]);
@@ -768,6 +836,7 @@ impl ExecService {
             let total = Arc::clone(&stdout_total);
             let truncated = Arc::clone(&truncated);
             let seq = Arc::clone(&stdout_seq);
+            let activity = Arc::clone(&last_activity);
             let caps = checked.caps.clone();
             let argv_summary = argv_summary(&argv);
             tokio::spawn(async move {
@@ -781,6 +850,7 @@ impl ExecService {
                         total,
                         truncated,
                         seq,
+                        activity,
                         argv_summary,
                     )
                     .await;
@@ -791,6 +861,7 @@ impl ExecService {
             let total = Arc::clone(&stderr_total);
             let truncated = Arc::clone(&truncated);
             let seq = Arc::clone(&stderr_seq);
+            let activity = Arc::clone(&last_activity);
             let caps = checked.caps.clone();
             let argv_summary = argv_summary(&argv);
             tokio::spawn(async move {
@@ -804,6 +875,7 @@ impl ExecService {
                         total,
                         truncated,
                         seq,
+                        activity,
                         argv_summary,
                     )
                     .await;
@@ -868,6 +940,7 @@ impl ExecService {
                             CancelReason::LeaseExpired => WarningKind::LeaseExpired,
                             CancelReason::PeerDisconnected => WarningKind::PeerDisconnected,
                             CancelReason::DurationCap => WarningKind::DurationApproachingCap,
+                            CancelReason::IdleTimeout => WarningKind::LeaseExpired,
                         };
                         self.emit_warning(
                             to,
@@ -962,6 +1035,7 @@ impl ExecService {
                 truncated,
             )
             .await;
+        Self::record_session_activity(&last_activity).await;
         let frame = ExecFrame::Exit {
             request_id,
             code,
@@ -988,6 +1062,7 @@ impl ExecService {
         total: Arc<AtomicU64>,
         truncated: Arc<AtomicBool>,
         seq: Arc<AtomicU32>,
+        last_activity: Arc<Mutex<Instant>>,
         argv_summary: String,
     ) where
         R: AsyncRead + Unpin,
@@ -1021,6 +1096,7 @@ impl ExecService {
                     break;
                 }
             };
+            Self::record_session_activity(&last_activity).await;
             let n_u64 = n as u64;
             let new_total = total
                 .fetch_add(n_u64, Ordering::Relaxed)
@@ -1321,6 +1397,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lease_renew_extends_deadline_without_touching_idle_activity() {
+        let service = test_service().await;
+        let request_id = ExecRequestId([2; 16]);
+        let agent_id = AgentId([6; 32]);
+        let machine_id = MachineId([7; 32]);
+        let (cancel_tx, _cancel_rx) = watch::channel(CancelReason::DurationCap);
+        let lease_deadline = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
+        let activity_before_renew = Instant::now() - Duration::from_secs(60);
+        let last_activity = Arc::new(Mutex::new(activity_before_renew));
+
+        service.active_servers.lock().await.insert(
+            request_id,
+            ActiveServerSession {
+                agent_id,
+                machine_id,
+                cancel_tx,
+                lease_deadline: Arc::clone(&lease_deadline),
+                last_activity: Arc::clone(&last_activity),
+                argv_summary: "lease-test".to_string(),
+                started_at: Instant::now(),
+            },
+        );
+
+        service
+            .handle_lease_renew(agent_id, machine_id, request_id)
+            .await;
+
+        assert!(*lease_deadline.lock().await > Instant::now());
+        assert_eq!(*last_activity.lock().await, activity_before_renew);
+    }
+
+    #[tokio::test]
     async fn output_caps_warn_truncate_and_keep_draining() {
         let service = test_service().await;
         let request_id = ExecRequestId([3; 16]);
@@ -1333,6 +1441,8 @@ mod tests {
         let total = Arc::new(AtomicU64::new(0));
         let truncated = Arc::new(AtomicBool::new(false));
         let seq = Arc::new(AtomicU32::new(0));
+        let activity_before_output = Instant::now() - Duration::from_secs(10);
+        let last_activity = Arc::new(Mutex::new(activity_before_output));
         let data = vec![b'x'; 64];
 
         service
@@ -1345,12 +1455,14 @@ mod tests {
                 Arc::clone(&total),
                 Arc::clone(&truncated),
                 Arc::clone(&seq),
+                Arc::clone(&last_activity),
                 "cap-test".to_string(),
             )
             .await;
 
         assert_eq!(total.load(Ordering::Relaxed), data.len() as u64);
         assert!(truncated.load(Ordering::Relaxed));
+        assert!(*last_activity.lock().await > activity_before_output);
         let snapshot = service.diagnostics_snapshot().await;
         assert_eq!(snapshot.totals.cap_breaches.get("stdout"), Some(&1));
         assert_eq!(
@@ -1379,6 +1491,7 @@ mod tests {
         };
         let (_cancel_tx, cancel_rx) = watch::channel(CancelReason::DurationCap);
         let lease_deadline = Arc::new(Mutex::new(Instant::now() + Duration::from_secs(30)));
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
         let started = Instant::now();
 
         service
@@ -1390,6 +1503,7 @@ mod tests {
                 checked,
                 cancel_rx,
                 lease_deadline,
+                last_activity,
             )
             .await;
 

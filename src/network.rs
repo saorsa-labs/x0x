@@ -220,6 +220,47 @@ pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
 ///
 /// This wraps ant-quic's Node with x0x-specific functionality
 /// including peer cache management and configuration.
+fn warn_forward_channel_pressure<T>(
+    tx: &mpsc::Sender<T>,
+    peer_id: AntPeerId,
+    stream_type: Option<GossipStreamType>,
+    channel_name: &'static str,
+) {
+    let available = tx.capacity();
+    let max = tx.max_capacity();
+    let used = max.saturating_sub(available);
+    let used_pct = (used.saturating_mul(100)) / max.max(1);
+    if available.saturating_mul(5) < max {
+        warn!(
+            available,
+            used,
+            max,
+            used_pct,
+            peer = ?peer_id,
+            stream = ?stream_type,
+            channel = channel_name,
+            "[1/6 network] receive forward channel >80% full — back-pressure active before ant-quic recv drain"
+        );
+    } else if available.saturating_mul(2) < max {
+        // Trend signal before the late >80% warning. Sample at rough 10% bucket
+        // boundaries to avoid logging every hot-path send while the queue hovers
+        // above 50% full.
+        let bucket = (max / 10).max(1);
+        if used.is_multiple_of(bucket) {
+            info!(
+                available,
+                used,
+                max,
+                used_pct,
+                peer = ?peer_id,
+                stream = ?stream_type,
+                channel = channel_name,
+                "[1/6 network] receive forward channel >50% full — watch back-pressure trend before ant-quic recv drain"
+            );
+        }
+    }
+}
+
 async fn forward_gossip_payload(
     tx: &mpsc::Sender<GossipPayload>,
     peer_id: AntPeerId,
@@ -227,18 +268,7 @@ async fn forward_gossip_payload(
     payload: Bytes,
     channel_name: &'static str,
 ) -> Result<(), mpsc::error::SendError<GossipPayload>> {
-    let capacity = tx.capacity();
-    let max_capacity = tx.max_capacity();
-    if capacity.saturating_mul(5) < max_capacity {
-        warn!(
-            available = capacity,
-            max = max_capacity,
-            peer = ?peer_id,
-            stream = ?stream_type,
-            channel = channel_name,
-            "[1/6 network] gossip receive channel >80% full — stream-specific back-pressure active"
-        );
-    }
+    warn_forward_channel_pressure(tx, peer_id, Some(stream_type), channel_name);
     tx.send((peer_id, payload)).await
 }
 
@@ -292,7 +322,14 @@ impl NetworkNode {
         keypair: Option<(ant_quic::MlDsaPublicKey, ant_quic::MlDsaSecretKey)>,
     ) -> NetworkResult<Self> {
         let mut builder = NodeConfig::builder()
-            .data_channel_capacity(1024)
+            // Mitigation, not a correctness fix: give ant-quic's bounded
+            // app-facing recv queue enough headroom to match x0x's forwarding
+            // queues during explicit raw receive-ACK stress. This trades memory
+            // for fewer ACK-starvation false negatives; the forwarding channel
+            // pressure warnings below are the operator signal that the system is
+            // leaning on this buffer and needs load shedding or a structural
+            // recv-pump fix.
+            .data_channel_capacity(10_000)
             .max_concurrent_uni_streams(10_000);
 
         if let Some(bind_addr) = config.bind_addr {
@@ -1073,6 +1110,7 @@ impl NetworkNode {
                                 payload.len(),
                                 peer_id
                             );
+                            warn_forward_channel_pressure(&direct_tx, peer_id, None, "direct_tx");
                             if let Err(e) = direct_tx.send((peer_id, payload)).await {
                                 error!("Failed to forward direct message: {}", e);
                                 break;

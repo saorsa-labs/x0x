@@ -2877,10 +2877,10 @@ impl Agent {
 
         let result = if let Some(receipt) = preferred_raw_receipt {
             Ok(receipt)
-        } else if preferred_raw_err
-            .as_ref()
-            .is_some_and(Self::raw_quic_error_should_stop_fallback)
-        {
+        } else if preferred_raw_err.as_ref().is_some_and(|err| {
+            config.stop_fallback_on_raw_error
+                || Self::raw_quic_error_should_stop_fallback(err, gossip_ok)
+        }) {
             match preferred_raw_err.take() {
                 Some(e) => Err(Self::map_raw_quic_dm_error(e)),
                 None => Err(dm::DmError::NoConnectivity(
@@ -3024,26 +3024,46 @@ impl Agent {
             }
         };
 
-        // Check if connected
+        // Check if connected. ant-quic's live connection table is the source
+        // of truth; the x0x lifecycle table is a derived fast-fail cache and
+        // can briefly lag during connection replacement/supersede churn. Raw
+        // sends best-effort clear stale lifecycle blocks when ant-quic is live;
+        // capability-first gossip sends may leave cosmetic stale diagnostics
+        // until a raw probe/send path observes the live connection.
         let ant_peer_id = ant_quic::PeerId(machine_id.0);
         let machine_prefix = network::hex_prefix(&machine_id.0, 4);
-        if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
-            tracing::warn!(
-                target: "x0x::direct",
-                stage = "send",
-                %agent_prefix,
-                %machine_prefix,
-                resolution,
-                outcome = "err_peer_disconnected",
-                reason = %reason,
-                dur_ms = send_start.elapsed().as_millis() as u64,
-                "lifecycle watcher says peer is disconnected"
-            );
-            return Err(error::NetworkError::ConnectionFailed(format!(
-                "peer disconnected: {reason}"
-            )));
-        }
-        if !network.is_connected(&ant_peer_id).await {
+        let connected = network.is_connected(&ant_peer_id).await;
+        if connected {
+            if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    %agent_prefix,
+                    %machine_prefix,
+                    resolution,
+                    reason = %reason,
+                    "ignoring stale lifecycle block because ant-quic reports a live connection"
+                );
+                self.direct_messaging
+                    .record_lifecycle_established(machine_id, None);
+            }
+        } else {
+            if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    %agent_prefix,
+                    %machine_prefix,
+                    resolution,
+                    outcome = "err_peer_disconnected",
+                    reason = %reason,
+                    dur_ms = send_start.elapsed().as_millis() as u64,
+                    "lifecycle watcher says peer is disconnected"
+                );
+                return Err(error::NetworkError::ConnectionFailed(format!(
+                    "peer disconnected: {reason}"
+                )));
+            }
             tracing::warn!(
                 target: "x0x::direct",
                 stage = "send",
@@ -3164,15 +3184,25 @@ impl Agent {
         }
     }
 
-    fn raw_quic_error_should_stop_fallback(err: &error::NetworkError) -> bool {
+    fn raw_quic_error_should_stop_fallback(
+        err: &error::NetworkError,
+        gossip_available: bool,
+    ) -> bool {
         match err {
-            error::NetworkError::ConnectionFailed(reason) => {
-                reason.starts_with("peer disconnected:")
-                    || reason.starts_with("send_with_receive_ack failed:")
+            // These are semantic/local failures; trying the gossip path cannot
+            // make the payload smaller or create a missing local network node.
+            error::NetworkError::PayloadTooLarge { .. } | error::NetworkError::NodeCreation(_) => {
+                true
+            }
+            error::NetworkError::ConnectionFailed(reason)
+                if reason.starts_with("peer disconnected:")
+                    || reason.starts_with("send_with_receive_ack failed:") =>
+            {
+                !gossip_available
             }
             error::NetworkError::ConnectionClosed(_)
             | error::NetworkError::ConnectionReset(_)
-            | error::NetworkError::NotConnected(_) => true,
+            | error::NetworkError::NotConnected(_) => !gossip_available,
             _ => false,
         }
     }
@@ -5747,10 +5777,10 @@ impl Agent {
                         );
                     }
                     ant_quic::PeerLifecycleEvent::ReaderExited { generation } => {
-                        lifecycle_dm.record_lifecycle_blocked(
-                            machine_id,
-                            Some(generation),
-                            "reader exited",
+                        tracing::debug!(
+                            machine_prefix = %network::hex_prefix(machine_id.as_bytes(), 4),
+                            generation,
+                            "peer reader exited; waiting for Closed/Established before blocking direct DM"
                         );
                     }
                 }
@@ -7459,6 +7489,119 @@ mod tests {
         // No uppercase, no spaces, no special chars that conflict
         // with shell, YAML, Markdown, or URL encoding
         assert!(NAME.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn raw_quic_receive_ack_failure_falls_back_when_gossip_available() {
+        let err = error::NetworkError::ConnectionFailed(
+            "send_with_receive_ack failed: Connection closed: Superseded".to_string(),
+        );
+        assert!(
+            !Agent::raw_quic_error_should_stop_fallback(&err, true),
+            "transient raw ACK lifecycle churn should not suppress gossip fallback"
+        );
+        assert!(
+            Agent::raw_quic_error_should_stop_fallback(&err, false),
+            "without a gossip capability, the raw ACK failure remains terminal"
+        );
+    }
+
+    #[test]
+    fn raw_quic_payload_errors_still_stop_fallback() {
+        let err = error::NetworkError::PayloadTooLarge { size: 2, max: 1 };
+        assert!(Agent::raw_quic_error_should_stop_fallback(&err, true));
+    }
+
+    fn loopback_network_config() -> network::NetworkConfig {
+        network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
+            bootstrap_nodes: Vec::new(),
+            ..network::NetworkConfig::default()
+        }
+    }
+
+    fn normalize_loopback_addr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+        if addr.ip().is_unspecified() {
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                addr.port(),
+            )
+        } else {
+            addr
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connected_peer_clears_stale_lifecycle_block_before_raw_send() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let alice_network = alice.network().expect("alice network");
+        let connected_peer = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects to bob");
+        assert_eq!(connected_peer.0, bob.machine_id().0);
+
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let connected_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < connected_deadline {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(alice_network.is_connected(&bob_peer).await);
+
+        alice
+            .direct_messaging()
+            .mark_connected(bob.agent_id(), bob.machine_id())
+            .await;
+        alice.direct_messaging().record_lifecycle_blocked(
+            bob.machine_id(),
+            Some(1),
+            "closed: stale test block",
+        );
+        assert!(alice
+            .direct_messaging()
+            .lifecycle_block_reason(&bob.machine_id())
+            .is_some());
+
+        let receipt = alice
+            .send_direct_with_config(
+                &bob.agent_id(),
+                b"stale-block-clear".to_vec(),
+                dm::DmSendConfig {
+                    prefer_raw_quic_if_connected: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await
+            .expect("raw send should ignore and clear stale lifecycle block");
+        assert_eq!(receipt.path, dm::DmPath::RawQuic);
+        assert!(alice
+            .direct_messaging()
+            .lifecycle_block_reason(&bob.machine_id())
+            .is_none());
     }
 
     #[tokio::test]

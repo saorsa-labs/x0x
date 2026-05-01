@@ -89,7 +89,7 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
 | Send direct | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Receive direct (annotated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Capability advert subscription/cache (no app rebroadcast) | ✅ | — | — | — | — | ✅ | — | — | — |
-| Send + receive-ACK (**0.27.1 new**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
+| Send + liveness ACK/probe (**0.27.x**) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | — |
 | File transfer (offer/accept) | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ✅ | — |
 
 ### Groups
@@ -146,11 +146,12 @@ Legend: ✅ implemented & tested · 🟡 implemented, test gap · ❌ not yet wi
    `snapshot` object alongside the legacy `health` Debug string, so GUI
    and `communitas-x0x-client::PeerHealthSnapshot` can act on
    `connected`/`generation`/`idle_ms` programmatically.
-2. ~~**`send_with_receive_ack`**~~ — closed in v0.19.6. `POST /direct/send`
-   accepts opt-in `require_ack_ms`; CLI exposes `--require-ack-ms`;
-   `communitas-x0x-client::send_direct` accepts the option; GUI DM composer
-   has an "ACK" toggle that surfaces the round-trip RTT inline. Round-trip
-   tested via `direct_send_with_require_ack_round_trips_to_live_peer`.
+2. ~~**Receive-pipeline liveness confirmation**~~ — closed in v0.19.6.
+   `POST /direct/send` accepts opt-in `require_ack_ms`; CLI exposes
+   `--require-ack-ms`; `communitas-x0x-client::send_direct` accepts the
+   option; GUI DM composer has an "ACK" toggle that surfaces the post-send
+   `probe_peer` RTT inline. Round-trip tested via
+   `direct_send_with_require_ack_round_trips_to_live_peer`.
 3. ~~**`/diagnostics/gossip`**~~ — closed in v0.19.6. GUI panel renders the
    per-stream dispatcher stats; `communitas-x0x-client::gossip_stats` ships.
 4. **Communitas Apple — 0.27.x peer-lifecycle row** ✅ closed

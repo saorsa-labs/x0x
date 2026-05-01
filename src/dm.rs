@@ -369,20 +369,29 @@ pub struct DmSendConfig {
     /// and only return success after the remote reader task has drained the
     /// bytes. `None` keeps the old fire-and-forget raw path.
     pub raw_quic_receive_ack_timeout: Option<Duration>,
+    /// If true, a preferred raw-QUIC failure is terminal and the sender will
+    /// not silently fall back to gossip-inbox even when a capability advert is
+    /// present. Use this for higher-volume protocols (for example file
+    /// transfer) whose own back-pressure/ACK logic is tuned for raw QUIC.
+    pub stop_fallback_on_raw_error: bool,
 }
 
 impl Default for DmSendConfig {
     fn default() -> Self {
         // Adaptive default: unknown peers fall back to 250 ms × 16 = 4 s.
         // `Agent::send_direct_with_config` replaces this fallback with the
-        // peer-specific bootstrap-cache EWMA RTT when available.
+        // peer-specific bootstrap-cache EWMA RTT when available. The raw-QUIC
+        // receive-pipeline ACK is opt-in: leaving it disabled preserves the
+        // legacy fire-and-forget raw fallback and lets capability-aware sends
+        // prefer the gossip-inbox path's application-level ACK.
         Self {
             timeout_per_attempt: dm_attempt_timeout(None),
             max_retries: 1,
             backoff: BackoffPolicy::ExponentialFromTimeout { factor: 2 },
             require_gossip: false,
             prefer_raw_quic_if_connected: false,
-            raw_quic_receive_ack_timeout: Some(dm_attempt_timeout(None)),
+            raw_quic_receive_ack_timeout: None,
+            stop_fallback_on_raw_error: false,
         }
     }
 }
@@ -1124,10 +1133,8 @@ mod tests {
             cfg.backoff,
             BackoffPolicy::ExponentialFromTimeout { factor: 2 }
         ));
-        assert_eq!(
-            cfg.raw_quic_receive_ack_timeout,
-            Some(dm_attempt_timeout(None))
-        );
+        assert_eq!(cfg.raw_quic_receive_ack_timeout, None);
+        assert!(!cfg.stop_fallback_on_raw_error);
     }
 
     #[test]

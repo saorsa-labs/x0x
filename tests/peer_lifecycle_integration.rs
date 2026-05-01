@@ -4,7 +4,7 @@
 //! - `POST /peers/:peer_id/probe` — `probe_peer` (ant-quic 0.27.2 #173)
 //! - `GET /peers/:peer_id/health` — `connection_health` (ant-quic 0.27.1 #170)
 //! - `GET /peers/events` (SSE) — `subscribe_all_peer_events` (ant-quic 0.27.1 #171)
-//! - `POST /direct/send` with `require_ack_ms` — `send_with_receive_ack` (ant-quic 0.27.1 #172)
+//! - `POST /direct/send` with `require_ack_ms` — post-send `probe_peer` liveness confirmation
 //!
 //! Coverage rationale: `tests/api_coverage.rs` and `tests/parity_cli.rs`
 //! verify these endpoints + commands *exist*; `tests/ant_quic_0272_surface.rs`
