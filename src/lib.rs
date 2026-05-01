@@ -1833,6 +1833,16 @@ impl Agent {
         self.gossip_runtime.as_ref().map(|rt| rt.dispatch_stats())
     }
 
+    /// Snapshot of ant-quic → gossip receive-pump diagnostics.
+    ///
+    /// Returns `None` when this agent was built without a network node.
+    /// Exposed through `GET /diagnostics/gossip` so operators can compare
+    /// producer rate, consumer drain rate, queue dwell time, and overload drops.
+    #[must_use]
+    pub fn recv_pump_diagnostics(&self) -> Option<network::RecvPumpDiagnosticsSnapshot> {
+        self.network.as_ref().map(|net| net.recv_pump_diagnostics())
+    }
+
     /// Get the presence system wrapper, if configured.
     ///
     /// Returns `None` if this agent was built without a network config.
@@ -2831,6 +2841,39 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        if *to == self.identity.agent_id() {
+            self.direct_messaging.record_outgoing_started(*to, None);
+            if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
+                self.direct_messaging.record_outgoing_failed(*to);
+                return Err(dm::DmError::PayloadTooLarge {
+                    len: payload.len(),
+                    max: direct::MAX_DIRECT_PAYLOAD_SIZE,
+                });
+            }
+
+            let delivered = self
+                .direct_messaging
+                .handle_loopback(
+                    self.identity.machine_id(),
+                    self.identity.agent_id(),
+                    payload,
+                )
+                .await;
+            let receipt = dm_send::loopback_receipt();
+            self.direct_messaging
+                .record_outgoing_succeeded(*to, receipt.path);
+            tracing::info!(
+                target: "dm.trace",
+                stage = "outbound_send_returned_ok",
+                request_id = %hex::encode(receipt.request_id),
+                sender = %hex::encode(self.identity.agent_id().as_bytes()),
+                recipient = %hex::encode(to.as_bytes()),
+                path = "loopback",
+                delivered_subscribers = delivered,
+            );
+            return Ok(receipt);
+        }
+
         let rtt_hint_ms = self.dm_peer_rtt_ms(to).await;
         let mut config = config;
         if config.timeout_per_attempt == dm::dm_attempt_timeout(None) {
@@ -3135,6 +3178,7 @@ impl Agent {
         match send_result {
             Ok(path) => {
                 let path_label = match path {
+                    dm::DmPath::Loopback => "loopback",
                     dm::DmPath::RawQuic => "raw_quic",
                     dm::DmPath::RawQuicAcked => "raw_quic_acked",
                     dm::DmPath::GossipInbox => "gossip_inbox",
@@ -7510,6 +7554,46 @@ mod tests {
     fn raw_quic_payload_errors_still_stop_fallback() {
         let err = error::NetworkError::PayloadTooLarge { size: 2, max: 1 };
         assert!(Agent::raw_quic_error_should_stop_fallback(&err, true));
+    }
+
+    #[tokio::test]
+    async fn self_dm_uses_loopback_and_delivers_to_subscribers() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let mut rx = agent.subscribe_direct();
+        let payload = b"loopback-self-dm".to_vec();
+
+        let receipt = agent
+            .send_direct_with_config(
+                &agent.agent_id(),
+                payload.clone(),
+                dm::DmSendConfig::default(),
+            )
+            .await
+            .expect("self-DM should use loopback path");
+
+        assert_eq!(receipt.path, dm::DmPath::Loopback);
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("self-DM should be delivered promptly")
+            .expect("subscriber should remain open");
+        assert_eq!(msg.sender, agent.agent_id());
+        assert_eq!(msg.machine_id, agent.machine_id());
+        assert_eq!(msg.payload, payload);
+        assert!(msg.verified);
+        assert_eq!(msg.trust_decision, Some(trust::TrustDecision::Accept));
+
+        let diagnostics = agent.direct_messaging().diagnostics_snapshot();
+        assert_eq!(diagnostics.stats.outgoing_send_succeeded, 1);
+        assert_eq!(diagnostics.stats.outgoing_path_loopback, 1);
+        assert_eq!(diagnostics.stats.incoming_envelopes_total, 1);
+        assert_eq!(diagnostics.stats.incoming_delivered_to_subscribe, 1);
     }
 
     fn loopback_network_config() -> network::NetworkConfig {

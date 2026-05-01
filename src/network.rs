@@ -27,10 +27,11 @@ use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAdd
 use bytes::Bytes;
 use saorsa_gossip_transport::GossipStreamType;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -38,7 +39,17 @@ use tracing::{debug, error, info, warn};
 type AntPeerId = ant_quic::PeerId;
 /// Saorsa gossip PeerId type alias
 type GossipPeerId = saorsa_gossip_types::PeerId;
-type GossipPayload = (AntPeerId, Bytes);
+
+/// Module-private gossip frame queued between ant-quic receive and gossip dispatch.
+///
+/// `enqueued_at` is intentionally carried with each frame so diagnostics can
+/// report queue dwell time. The wrapper never crosses the public API boundary.
+#[derive(Debug)]
+struct GossipPayload {
+    peer_id: AntPeerId,
+    data: Bytes,
+    enqueued_at: Instant,
+}
 
 /// Default port for x0x nodes (when specified).
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
@@ -213,8 +224,402 @@ pub struct NetworkStats {
     pub peer_count: usize,
 }
 
+/// Snapshot of one stream in the ant-quic → gossip receive pump.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecvPumpStreamSnapshot {
+    /// Frames observed by the receive pump for this stream.
+    pub produced_total: u64,
+    /// Frames successfully queued for the gossip runtime dispatcher.
+    pub enqueued_total: u64,
+    /// Frames dequeued by the gossip runtime dispatcher.
+    pub dequeued_total: u64,
+    /// Frames dropped because the bounded receive queue was full.
+    pub dropped_full: u64,
+    /// Frames dropped because the receive queue was closed.
+    pub dropped_closed: u64,
+    /// Most recently sampled queue depth.
+    pub latest_depth: u64,
+    /// Maximum sampled queue depth.
+    pub max_depth: u64,
+    /// Queue capacity.
+    pub capacity: u64,
+    /// Maximum sampled dwell time between enqueue and dequeue.
+    pub max_dwell_ms: u64,
+    /// Average sampled dwell time between enqueue and dequeue.
+    pub avg_dwell_ms: u64,
+    /// Produced frames per second since this node started.
+    pub producer_per_sec: f64,
+    /// Dequeued frames per second since this node started.
+    pub consumer_per_sec: f64,
+}
+
+/// Per-peer producer/drop counters in the ant-quic → gossip receive pump.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RecvPumpPeerSnapshot {
+    pub pubsub_produced: u64,
+    pub membership_produced: u64,
+    pub bulk_produced: u64,
+    pub pubsub_dropped_full: u64,
+    pub membership_dropped_full: u64,
+    pub bulk_dropped_full: u64,
+}
+
+/// Snapshot of ant-quic → gossip receive-pump diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecvPumpDiagnosticsSnapshot {
+    /// Seconds since the diagnostics counters were created.
+    pub uptime_secs: u64,
+    pub pubsub: RecvPumpStreamSnapshot,
+    pub membership: RecvPumpStreamSnapshot,
+    pub bulk: RecvPumpStreamSnapshot,
+    pub per_peer: BTreeMap<String, RecvPumpPeerSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct RecvPumpStreamDiagnostics {
+    produced_total: std::sync::atomic::AtomicU64,
+    enqueued_total: std::sync::atomic::AtomicU64,
+    dequeued_total: std::sync::atomic::AtomicU64,
+    dropped_full: std::sync::atomic::AtomicU64,
+    dropped_closed: std::sync::atomic::AtomicU64,
+    latest_depth: std::sync::atomic::AtomicU64,
+    max_depth: std::sync::atomic::AtomicU64,
+    capacity: std::sync::atomic::AtomicU64,
+    max_dwell_ms: std::sync::atomic::AtomicU64,
+    total_dwell_ms: std::sync::atomic::AtomicU64,
+}
+
+impl RecvPumpStreamDiagnostics {
+    fn record_produced(&self, depth: usize, capacity: usize) {
+        self.produced_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.record_depth(depth, capacity);
+    }
+
+    fn record_enqueued(&self, depth: usize, capacity: usize) {
+        self.enqueued_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.record_depth(depth, capacity);
+    }
+
+    fn record_dropped_full(&self, depth: usize, capacity: usize) {
+        self.dropped_full
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.record_depth(depth, capacity);
+    }
+
+    fn record_dropped_closed(&self, depth: usize, capacity: usize) {
+        self.dropped_closed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.record_depth(depth, capacity);
+    }
+
+    fn record_dequeued(&self, dwell: Duration) {
+        self.dequeued_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dwell_ms = duration_to_u64_ms(dwell);
+        self.total_dwell_ms
+            .fetch_add(dwell_ms, std::sync::atomic::Ordering::Relaxed);
+        self.max_dwell_ms
+            .fetch_max(dwell_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_depth(&self, depth: usize, capacity: usize) {
+        let depth = usize_to_u64_saturating(depth);
+        let capacity = usize_to_u64_saturating(capacity);
+        self.latest_depth
+            .store(depth, std::sync::atomic::Ordering::Relaxed);
+        self.max_depth
+            .fetch_max(depth, std::sync::atomic::Ordering::Relaxed);
+        self.capacity
+            .store(capacity, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, uptime: Duration) -> RecvPumpStreamSnapshot {
+        let produced_total = self
+            .produced_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let enqueued_total = self
+            .enqueued_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let dequeued_total = self
+            .dequeued_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let total_dwell_ms = self
+            .total_dwell_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let elapsed = uptime.as_secs_f64();
+        let rate = |count: u64| {
+            if elapsed > 0.0 {
+                count as f64 / elapsed
+            } else {
+                0.0
+            }
+        };
+        RecvPumpStreamSnapshot {
+            produced_total,
+            enqueued_total,
+            dequeued_total,
+            dropped_full: self.dropped_full.load(std::sync::atomic::Ordering::Relaxed),
+            dropped_closed: self
+                .dropped_closed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            latest_depth: self.latest_depth.load(std::sync::atomic::Ordering::Relaxed),
+            max_depth: self.max_depth.load(std::sync::atomic::Ordering::Relaxed),
+            capacity: self.capacity.load(std::sync::atomic::Ordering::Relaxed),
+            max_dwell_ms: self.max_dwell_ms.load(std::sync::atomic::Ordering::Relaxed),
+            avg_dwell_ms: total_dwell_ms.checked_div(dequeued_total).unwrap_or(0),
+            producer_per_sec: rate(produced_total),
+            consumer_per_sec: rate(dequeued_total),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct RecvPumpPeerCounters {
+    pubsub_produced: u64,
+    membership_produced: u64,
+    bulk_produced: u64,
+    pubsub_dropped_full: u64,
+    membership_dropped_full: u64,
+    bulk_dropped_full: u64,
+}
+
+impl RecvPumpPeerCounters {
+    fn produced(&mut self, stream_type: GossipStreamType) {
+        match stream_type {
+            GossipStreamType::PubSub => {
+                self.pubsub_produced = self.pubsub_produced.saturating_add(1)
+            }
+            GossipStreamType::Membership => {
+                self.membership_produced = self.membership_produced.saturating_add(1);
+            }
+            GossipStreamType::Bulk => self.bulk_produced = self.bulk_produced.saturating_add(1),
+        }
+    }
+
+    fn dropped_full(&mut self, stream_type: GossipStreamType) {
+        match stream_type {
+            GossipStreamType::PubSub => {
+                self.pubsub_dropped_full = self.pubsub_dropped_full.saturating_add(1);
+            }
+            GossipStreamType::Membership => {
+                self.membership_dropped_full = self.membership_dropped_full.saturating_add(1);
+            }
+            GossipStreamType::Bulk => {
+                self.bulk_dropped_full = self.bulk_dropped_full.saturating_add(1);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> RecvPumpPeerSnapshot {
+        RecvPumpPeerSnapshot {
+            pubsub_produced: self.pubsub_produced,
+            membership_produced: self.membership_produced,
+            bulk_produced: self.bulk_produced,
+            pubsub_dropped_full: self.pubsub_dropped_full,
+            membership_dropped_full: self.membership_dropped_full,
+            bulk_dropped_full: self.bulk_dropped_full,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecvPumpDiagnostics {
+    started_at: Instant,
+    pubsub: RecvPumpStreamDiagnostics,
+    membership: RecvPumpStreamDiagnostics,
+    bulk: RecvPumpStreamDiagnostics,
+    per_peer: Mutex<HashMap<AntPeerId, RecvPumpPeerCounters>>,
+}
+
+impl RecvPumpDiagnostics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            pubsub: RecvPumpStreamDiagnostics::default(),
+            membership: RecvPumpStreamDiagnostics::default(),
+            bulk: RecvPumpStreamDiagnostics::default(),
+            per_peer: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn stream(&self, stream_type: GossipStreamType) -> &RecvPumpStreamDiagnostics {
+        match stream_type {
+            GossipStreamType::PubSub => &self.pubsub,
+            GossipStreamType::Membership => &self.membership,
+            GossipStreamType::Bulk => &self.bulk,
+        }
+    }
+
+    fn record_produced(
+        &self,
+        peer_id: AntPeerId,
+        stream_type: GossipStreamType,
+        depth: usize,
+        capacity: usize,
+    ) {
+        self.stream(stream_type).record_produced(depth, capacity);
+        self.with_peer(peer_id, |peer| peer.produced(stream_type));
+    }
+
+    fn record_enqueued(&self, stream_type: GossipStreamType, depth: usize, capacity: usize) {
+        self.stream(stream_type).record_enqueued(depth, capacity);
+    }
+
+    fn record_dropped_full(
+        &self,
+        peer_id: AntPeerId,
+        stream_type: GossipStreamType,
+        depth: usize,
+        capacity: usize,
+    ) {
+        self.stream(stream_type)
+            .record_dropped_full(depth, capacity);
+        self.with_peer(peer_id, |peer| peer.dropped_full(stream_type));
+    }
+
+    fn record_dropped_closed(&self, stream_type: GossipStreamType, depth: usize, capacity: usize) {
+        self.stream(stream_type)
+            .record_dropped_closed(depth, capacity);
+    }
+
+    fn record_dequeued(&self, stream_type: GossipStreamType, dwell: Duration) {
+        self.stream(stream_type).record_dequeued(dwell);
+    }
+
+    fn snapshot(&self) -> RecvPumpDiagnosticsSnapshot {
+        let uptime = self.started_at.elapsed();
+        let per_peer = match self.per_peer.lock() {
+            Ok(guard) => guard
+                .iter()
+                .map(|(peer_id, counters)| (hex::encode(peer_id.0), counters.snapshot()))
+                .collect(),
+            Err(e) => {
+                error!("receive pump peer diagnostics poisoned: {e}");
+                BTreeMap::new()
+            }
+        };
+        RecvPumpDiagnosticsSnapshot {
+            uptime_secs: uptime.as_secs(),
+            pubsub: self.pubsub.snapshot(uptime),
+            membership: self.membership.snapshot(uptime),
+            bulk: self.bulk.snapshot(uptime),
+            per_peer,
+        }
+    }
+
+    fn with_peer(&self, peer_id: AntPeerId, update: impl FnOnce(&mut RecvPumpPeerCounters)) {
+        match self.per_peer.try_lock() {
+            Ok(mut guard) => update(guard.entry(peer_id).or_default()),
+            Err(TryLockError::WouldBlock) => {
+                // Per-peer counters are diagnostics only; never let them become
+                // a new receive-pump choke point under the saturation they are
+                // meant to measure.
+            }
+            Err(TryLockError::Poisoned(e)) => error!("receive pump peer diagnostics poisoned: {e}"),
+        }
+    }
+}
+
+impl Default for RecvPumpDiagnostics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn duration_to_u64_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis())
+        .ok()
+        .map_or(u64::MAX, |v| v)
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).ok().map_or(u64::MAX, |v| v)
+}
+
 /// Stream type byte for direct messages (distinct from gossip: 0, 1, 2).
 pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
+
+const CHANNEL_PRESSURE_INFO_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ChannelPressureKey {
+    channel_name: &'static str,
+    stream_name: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct ChannelPressureInfoLimiter {
+    last_info_at: Mutex<HashMap<ChannelPressureKey, Instant>>,
+}
+
+impl ChannelPressureInfoLimiter {
+    fn should_emit(&self, key: ChannelPressureKey, now: Instant, interval: Duration) -> bool {
+        match self.last_info_at.lock() {
+            Ok(mut guard) => {
+                let should_emit = guard
+                    .get(&key)
+                    .is_none_or(|last| now.saturating_duration_since(*last) >= interval);
+                if should_emit {
+                    guard.insert(key, now);
+                }
+                should_emit
+            }
+            Err(e) => {
+                error!("receive forward pressure info limiter poisoned: {e}");
+                true
+            }
+        }
+    }
+}
+
+static CHANNEL_PRESSURE_INFO_LIMITER: OnceLock<ChannelPressureInfoLimiter> = OnceLock::new();
+static CHANNEL_DROP_WARN_LIMITER: OnceLock<ChannelPressureInfoLimiter> = OnceLock::new();
+
+fn channel_pressure_info_limiter() -> &'static ChannelPressureInfoLimiter {
+    CHANNEL_PRESSURE_INFO_LIMITER.get_or_init(ChannelPressureInfoLimiter::default)
+}
+
+/// Rate limiter for the per-frame "dropping PubSub frame" WARN.
+///
+/// Without rate-limiting, the drop WARN fires once per dropped frame at the
+/// producer rate. Under sustained PubSub saturation that produces tens of
+/// drops per second per peer, the WARN volume itself becomes an operational
+/// problem — journald takes the brunt and the authoritative `dropped_full`
+/// counter signal is buried in noise. The actual operator signal is the
+/// counter; the WARN is just a "look here" cue and should be sparse.
+fn channel_drop_warn_limiter() -> &'static ChannelPressureInfoLimiter {
+    CHANNEL_DROP_WARN_LIMITER.get_or_init(ChannelPressureInfoLimiter::default)
+}
+
+fn channel_pressure_key(
+    channel_name: &'static str,
+    stream_type: Option<GossipStreamType>,
+) -> ChannelPressureKey {
+    let stream_name = match stream_type {
+        Some(GossipStreamType::PubSub) => "pubsub",
+        Some(GossipStreamType::Membership) => "membership",
+        Some(GossipStreamType::Bulk) => "bulk",
+        None => "none",
+    };
+    ChannelPressureKey {
+        channel_name,
+        stream_name,
+    }
+}
+
+fn channel_pressure_exceeds_half(available: usize, max: usize) -> bool {
+    available.saturating_mul(2) < max
+}
+
+fn channel_pressure_exceeds_warn_threshold(available: usize, max: usize) -> bool {
+    available.saturating_mul(5) < max
+}
+
+fn channel_depth<T>(tx: &mpsc::Sender<T>) -> usize {
+    tx.max_capacity().saturating_sub(tx.capacity())
+}
 
 /// The x0x network node.
 ///
@@ -230,7 +635,25 @@ fn warn_forward_channel_pressure<T>(
     let max = tx.max_capacity();
     let used = max.saturating_sub(available);
     let used_pct = (used.saturating_mul(100)) / max.max(1);
-    if available.saturating_mul(5) < max {
+    if channel_pressure_exceeds_half(available, max)
+        && channel_pressure_info_limiter().should_emit(
+            channel_pressure_key(channel_name, stream_type),
+            Instant::now(),
+            CHANNEL_PRESSURE_INFO_INTERVAL,
+        )
+    {
+        info!(
+            available,
+            used,
+            max,
+            used_pct,
+            peer = ?peer_id,
+            stream = ?stream_type,
+            channel = channel_name,
+            "[1/6 network] receive forward channel >50% full — watch back-pressure trend before ant-quic recv drain"
+        );
+    }
+    if channel_pressure_exceeds_warn_threshold(available, max) {
         warn!(
             available,
             used,
@@ -241,24 +664,13 @@ fn warn_forward_channel_pressure<T>(
             channel = channel_name,
             "[1/6 network] receive forward channel >80% full — back-pressure active before ant-quic recv drain"
         );
-    } else if available.saturating_mul(2) < max {
-        // Trend signal before the late >80% warning. Sample at rough 10% bucket
-        // boundaries to avoid logging every hot-path send while the queue hovers
-        // above 50% full.
-        let bucket = (max / 10).max(1);
-        if used.is_multiple_of(bucket) {
-            info!(
-                available,
-                used,
-                max,
-                used_pct,
-                peer = ?peer_id,
-                stream = ?stream_type,
-                channel = channel_name,
-                "[1/6 network] receive forward channel >50% full — watch back-pressure trend before ant-quic recv drain"
-            );
-        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardGossipOutcome {
+    Enqueued,
+    DroppedFull,
 }
 
 async fn forward_gossip_payload(
@@ -267,9 +679,64 @@ async fn forward_gossip_payload(
     stream_type: GossipStreamType,
     payload: Bytes,
     channel_name: &'static str,
-) -> Result<(), mpsc::error::SendError<GossipPayload>> {
+    diagnostics: &RecvPumpDiagnostics,
+) -> Result<ForwardGossipOutcome, mpsc::error::SendError<GossipPayload>> {
     warn_forward_channel_pressure(tx, peer_id, Some(stream_type), channel_name);
-    tx.send((peer_id, payload)).await
+    let max = tx.max_capacity();
+    diagnostics.record_produced(peer_id, stream_type, channel_depth(tx), max);
+    let message = GossipPayload {
+        peer_id,
+        data: payload,
+        enqueued_at: Instant::now(),
+    };
+
+    if stream_type == GossipStreamType::PubSub {
+        return match tx.try_send(message) {
+            Ok(()) => {
+                diagnostics.record_enqueued(stream_type, channel_depth(tx), max);
+                Ok(ForwardGossipOutcome::Enqueued)
+            }
+            Err(mpsc::error::TrySendError::Full(_message)) => {
+                let depth = channel_depth(tx);
+                diagnostics.record_dropped_full(peer_id, stream_type, depth, max);
+                if channel_drop_warn_limiter().should_emit(
+                    channel_pressure_key(channel_name, Some(stream_type)),
+                    Instant::now(),
+                    CHANNEL_PRESSURE_INFO_INTERVAL,
+                ) {
+                    let dropped_full = diagnostics
+                        .pubsub
+                        .dropped_full
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    warn!(
+                        peer = ?peer_id,
+                        stream = ?stream_type,
+                        channel = channel_name,
+                        depth,
+                        max,
+                        dropped_full,
+                        "[1/6 network] dropping PubSub frame because receive forward channel is full (rate-limited; see recv_pump.pubsub.dropped_full for total)"
+                    );
+                }
+                Ok(ForwardGossipOutcome::DroppedFull)
+            }
+            Err(mpsc::error::TrySendError::Closed(message)) => {
+                diagnostics.record_dropped_closed(stream_type, channel_depth(tx), max);
+                Err(mpsc::error::SendError(message))
+            }
+        };
+    }
+
+    match tx.send(message).await {
+        Ok(()) => {
+            diagnostics.record_enqueued(stream_type, channel_depth(tx), max);
+            Ok(ForwardGossipOutcome::Enqueued)
+        }
+        Err(e) => {
+            diagnostics.record_dropped_closed(stream_type, channel_depth(tx), max);
+            Err(e)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +756,8 @@ pub struct NetworkNode {
     /// Receiver channel for Bulk gossip messages (presence beacons).
     recv_bulk_tx: mpsc::Sender<GossipPayload>,
     recv_bulk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
+    /// Diagnostics for the ant-quic → gossip receive pump.
+    recv_pump_diagnostics: Arc<RecvPumpDiagnostics>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<(AntPeerId, Bytes)>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, Bytes)>>>,
@@ -359,6 +828,7 @@ impl NetworkNode {
         let (recv_membership_tx, recv_membership_rx) = mpsc::channel(GOSSIP_CONTROL_RECV_CAPACITY);
         let (recv_bulk_tx, recv_bulk_rx) = mpsc::channel(GOSSIP_CONTROL_RECV_CAPACITY);
         let (direct_tx, direct_rx) = mpsc::channel(10_000);
+        let recv_pump_diagnostics = Arc::new(RecvPumpDiagnostics::new());
 
         let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
@@ -370,6 +840,7 @@ impl NetworkNode {
             recv_membership_rx: Arc::new(tokio::sync::Mutex::new(recv_membership_rx)),
             recv_bulk_tx,
             recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
+            recv_pump_diagnostics,
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             peer_id,
@@ -924,6 +1395,12 @@ impl NetworkNode {
         (max.saturating_sub(available), max)
     }
 
+    /// Snapshot ant-quic → gossip receive-pump diagnostics.
+    #[must_use]
+    pub fn recv_pump_diagnostics(&self) -> RecvPumpDiagnosticsSnapshot {
+        self.recv_pump_diagnostics.snapshot()
+    }
+
     /// Gracefully shutdown the node.
     ///
     /// Drops the inner node, closing all connections.
@@ -1019,29 +1496,50 @@ impl NetworkNode {
 
     async fn receive_from_gossip_channel(
         rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
+        diagnostics: &RecvPumpDiagnostics,
+        stream_type: GossipStreamType,
         stream_name: &'static str,
     ) -> anyhow::Result<(GossipPeerId, Bytes)> {
         let mut rx = rx.lock().await;
-        let (ant_peer, data) = rx
+        let payload = rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("{stream_name} receive channel closed"))?;
-        Ok((ant_to_gossip_peer_id(&ant_peer), data))
+        diagnostics.record_dequeued(stream_type, payload.enqueued_at.elapsed());
+        Ok((ant_to_gossip_peer_id(&payload.peer_id), payload.data))
     }
 
     /// Receive the next PubSub gossip message from the dedicated PubSub queue.
     pub async fn receive_pubsub_message(&self) -> anyhow::Result<(GossipPeerId, Bytes)> {
-        Self::receive_from_gossip_channel(&self.recv_pubsub_rx, "PubSub").await
+        Self::receive_from_gossip_channel(
+            &self.recv_pubsub_rx,
+            self.recv_pump_diagnostics.as_ref(),
+            GossipStreamType::PubSub,
+            "PubSub",
+        )
+        .await
     }
 
     /// Receive the next Membership gossip message from the dedicated Membership queue.
     pub async fn receive_membership_message(&self) -> anyhow::Result<(GossipPeerId, Bytes)> {
-        Self::receive_from_gossip_channel(&self.recv_membership_rx, "Membership").await
+        Self::receive_from_gossip_channel(
+            &self.recv_membership_rx,
+            self.recv_pump_diagnostics.as_ref(),
+            GossipStreamType::Membership,
+            "Membership",
+        )
+        .await
     }
 
     /// Receive the next Bulk gossip message from the dedicated Bulk queue.
     pub async fn receive_bulk_message(&self) -> anyhow::Result<(GossipPeerId, Bytes)> {
-        Self::receive_from_gossip_channel(&self.recv_bulk_rx, "Bulk").await
+        Self::receive_from_gossip_channel(
+            &self.recv_bulk_rx,
+            self.recv_pump_diagnostics.as_ref(),
+            GossipStreamType::Bulk,
+            "Bulk",
+        )
+        .await
     }
 
     /// Spawn background receiver task that parses gossip stream types.
@@ -1055,6 +1553,7 @@ impl NetworkNode {
         let recv_pubsub_tx = self.recv_pubsub_tx.clone();
         let recv_membership_tx = self.recv_membership_tx.clone();
         let recv_bulk_tx = self.recv_bulk_tx.clone();
+        let recv_pump_diagnostics = Arc::clone(&self.recv_pump_diagnostics);
         let direct_tx = self.direct_tx.clone();
 
         tokio::spawn(async move {
@@ -1145,6 +1644,7 @@ impl NetworkNode {
                                     stream_type,
                                     payload,
                                     "recv_pubsub_tx",
+                                    recv_pump_diagnostics.as_ref(),
                                 )
                                 .await
                             }
@@ -1155,6 +1655,7 @@ impl NetworkNode {
                                     stream_type,
                                     payload,
                                     "recv_membership_tx",
+                                    recv_pump_diagnostics.as_ref(),
                                 )
                                 .await
                             }
@@ -1165,14 +1666,19 @@ impl NetworkNode {
                                     stream_type,
                                     payload,
                                     "recv_bulk_tx",
+                                    recv_pump_diagnostics.as_ref(),
                                 )
                                 .await
                             }
                         };
 
-                        if let Err(e) = forward_result {
-                            error!("Failed to forward gossip message: {}", e);
-                            break;
+                        match forward_result {
+                            Ok(ForwardGossipOutcome::Enqueued) => {}
+                            Ok(ForwardGossipOutcome::DroppedFull) => continue,
+                            Err(e) => {
+                                error!("Failed to forward gossip message: {}", e);
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
@@ -1415,16 +1921,22 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         tokio::select! {
             biased;
             msg = bulk_rx.recv() => {
-                let (ant_peer, data) = msg.ok_or_else(|| anyhow::anyhow!("Bulk receive channel closed"))?;
-                Ok((ant_to_gossip_peer_id(&ant_peer), GossipStreamType::Bulk, data))
+                let payload = msg.ok_or_else(|| anyhow::anyhow!("Bulk receive channel closed"))?;
+                self.recv_pump_diagnostics
+                    .record_dequeued(GossipStreamType::Bulk, payload.enqueued_at.elapsed());
+                Ok((ant_to_gossip_peer_id(&payload.peer_id), GossipStreamType::Bulk, payload.data))
             }
             msg = membership_rx.recv() => {
-                let (ant_peer, data) = msg.ok_or_else(|| anyhow::anyhow!("Membership receive channel closed"))?;
-                Ok((ant_to_gossip_peer_id(&ant_peer), GossipStreamType::Membership, data))
+                let payload = msg.ok_or_else(|| anyhow::anyhow!("Membership receive channel closed"))?;
+                self.recv_pump_diagnostics
+                    .record_dequeued(GossipStreamType::Membership, payload.enqueued_at.elapsed());
+                Ok((ant_to_gossip_peer_id(&payload.peer_id), GossipStreamType::Membership, payload.data))
             }
             msg = pubsub_rx.recv() => {
-                let (ant_peer, data) = msg.ok_or_else(|| anyhow::anyhow!("PubSub receive channel closed"))?;
-                Ok((ant_to_gossip_peer_id(&ant_peer), GossipStreamType::PubSub, data))
+                let payload = msg.ok_or_else(|| anyhow::anyhow!("PubSub receive channel closed"))?;
+                self.recv_pump_diagnostics
+                    .record_dequeued(GossipStreamType::PubSub, payload.enqueued_at.elapsed());
+                Ok((ant_to_gossip_peer_id(&payload.peer_id), GossipStreamType::PubSub, payload.data))
             }
         }
     }
@@ -1953,6 +2465,235 @@ fn generate_message_id(sender: &[u8; 32], topic: &str, payload: &[u8], timestamp
     hasher.update(&timestamp.to_le_bytes());
     let hash = hasher.finalize();
     *hash.as_bytes()
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::*;
+
+    #[test]
+    fn warn_forward_channel_pressure_thresholds_match_existing_warn_behavior() {
+        assert!(!channel_pressure_exceeds_half(5_000, 10_000));
+        assert!(channel_pressure_exceeds_half(4_999, 10_000));
+        assert!(!channel_pressure_exceeds_warn_threshold(2_000, 10_000));
+        assert!(channel_pressure_exceeds_warn_threshold(1_999, 10_000));
+    }
+
+    #[test]
+    fn warn_forward_channel_pressure_info_limiter_emits_first_and_rate_limits() {
+        let limiter = ChannelPressureInfoLimiter::default();
+        let key = channel_pressure_key("recv_pubsub_tx", Some(GossipStreamType::PubSub));
+        let start = Instant::now();
+
+        assert!(limiter.should_emit(key, start, CHANNEL_PRESSURE_INFO_INTERVAL));
+        assert!(!limiter.should_emit(
+            key,
+            start + Duration::from_secs(1),
+            CHANNEL_PRESSURE_INFO_INTERVAL
+        ));
+        assert!(limiter.should_emit(
+            key,
+            start + CHANNEL_PRESSURE_INFO_INTERVAL + Duration::from_millis(1),
+            CHANNEL_PRESSURE_INFO_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn warn_forward_channel_pressure_info_limiter_is_per_channel_stream() {
+        let limiter = ChannelPressureInfoLimiter::default();
+        let pubsub = channel_pressure_key("recv_pubsub_tx", Some(GossipStreamType::PubSub));
+        let bulk = channel_pressure_key("recv_bulk_tx", Some(GossipStreamType::Bulk));
+        let start = Instant::now();
+
+        assert!(limiter.should_emit(pubsub, start, CHANNEL_PRESSURE_INFO_INTERVAL));
+        assert!(limiter.should_emit(bulk, start, CHANNEL_PRESSURE_INFO_INTERVAL));
+        assert!(!limiter.should_emit(
+            pubsub,
+            start + Duration::from_secs(1),
+            CHANNEL_PRESSURE_INFO_INTERVAL
+        ));
+    }
+
+    #[tokio::test]
+    async fn recv_pump_pubsub_full_drops_instead_of_blocking() {
+        let (tx, _rx) = mpsc::channel(1);
+        let diagnostics = RecvPumpDiagnostics::new();
+        let peer = ant_quic::PeerId([7; 32]);
+
+        let first = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            Bytes::from_static(b"one"),
+            "recv_pubsub_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+        let second = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            Bytes::from_static(b"two"),
+            "recv_pubsub_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first, ForwardGossipOutcome::Enqueued);
+        assert_eq!(second, ForwardGossipOutcome::DroppedFull);
+
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.pubsub.produced_total, 2);
+        assert_eq!(snapshot.pubsub.enqueued_total, 1);
+        assert_eq!(snapshot.pubsub.dropped_full, 1);
+        let peer_snapshot = snapshot.per_peer.get(&hex::encode(peer.0)).unwrap();
+        assert_eq!(peer_snapshot.pubsub_produced, 2);
+        assert_eq!(peer_snapshot.pubsub_dropped_full, 1);
+    }
+
+    #[tokio::test]
+    async fn recv_pump_membership_full_blocks_instead_of_dropping() {
+        // ADR 0009 §2: Membership and Bulk keep blocking sends. Lock that
+        // policy in: a full Membership channel must not return DroppedFull;
+        // it must await for capacity. We assert the await side by timing out
+        // a second send while the first occupies the only slot.
+        let (tx, mut rx) = mpsc::channel(1);
+        let diagnostics = RecvPumpDiagnostics::new();
+        let peer = ant_quic::PeerId([9; 32]);
+
+        let first = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::Membership,
+            Bytes::from_static(b"first"),
+            "recv_membership_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, ForwardGossipOutcome::Enqueued);
+
+        let pending = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::Membership,
+            Bytes::from_static(b"second"),
+            "recv_membership_tx",
+            &diagnostics,
+        );
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(100), pending).await;
+        assert!(
+            blocked.is_err(),
+            "Membership send must await capacity, not return DroppedFull"
+        );
+
+        // Drain to release the second send and confirm it then completes
+        // (i.e. the await was the right behaviour, not a deadlock).
+        rx.recv().await.expect("first message");
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.membership.produced_total, 2);
+        assert_eq!(snapshot.membership.enqueued_total, 1);
+        assert_eq!(
+            snapshot.membership.dropped_full, 0,
+            "Membership must never increment dropped_full per ADR 0009"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_pump_bulk_full_blocks_instead_of_dropping() {
+        // ADR 0009 §2: Bulk follows Membership policy.
+        let (tx, mut rx) = mpsc::channel(1);
+        let diagnostics = RecvPumpDiagnostics::new();
+        let peer = ant_quic::PeerId([10; 32]);
+
+        forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::Bulk,
+            Bytes::from_static(b"first"),
+            "recv_bulk_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+
+        let pending = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::Bulk,
+            Bytes::from_static(b"second"),
+            "recv_bulk_tx",
+            &diagnostics,
+        );
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(100), pending).await;
+        assert!(
+            blocked.is_err(),
+            "Bulk send must await capacity, not return DroppedFull"
+        );
+        rx.recv().await.expect("first message");
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.bulk.dropped_full, 0);
+    }
+
+    #[tokio::test]
+    async fn recv_pump_drop_warn_is_rate_limited() {
+        // Saturate PubSub channel and confirm the drop WARN limiter only
+        // releases on the configured interval boundary. The drop counter
+        // remains the authoritative signal; the WARN should fire sparsely.
+        let limiter = ChannelPressureInfoLimiter::default();
+        let key = channel_pressure_key("recv_pubsub_tx", Some(GossipStreamType::PubSub));
+        let start = Instant::now();
+        assert!(limiter.should_emit(key, start, CHANNEL_PRESSURE_INFO_INTERVAL));
+        // Subsequent drops within the interval do not re-emit.
+        for offset_ms in [10, 100, 1_000, 5_000, 29_999] {
+            assert!(!limiter.should_emit(
+                key,
+                start + Duration::from_millis(offset_ms),
+                CHANNEL_PRESSURE_INFO_INTERVAL,
+            ));
+        }
+        // After the interval, the next drop WARN releases.
+        assert!(limiter.should_emit(
+            key,
+            start + CHANNEL_PRESSURE_INFO_INTERVAL + Duration::from_millis(1),
+            CHANNEL_PRESSURE_INFO_INTERVAL,
+        ));
+    }
+
+    #[tokio::test]
+    async fn recv_pump_records_dequeue_dwell() {
+        let (tx, rx) = mpsc::channel(1);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let diagnostics = RecvPumpDiagnostics::new();
+        let peer = ant_quic::PeerId([8; 32]);
+
+        forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            Bytes::from_static(b"payload"),
+            "recv_pubsub_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+        let (got_peer, got_data) = NetworkNode::receive_from_gossip_channel(
+            &rx,
+            &diagnostics,
+            GossipStreamType::PubSub,
+            "PubSub",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(got_peer, ant_to_gossip_peer_id(&peer));
+        assert_eq!(got_data, Bytes::from_static(b"payload"));
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.pubsub.dequeued_total, 1);
+        assert_eq!(snapshot.pubsub.enqueued_total, 1);
+    }
 }
 
 #[cfg(test)]

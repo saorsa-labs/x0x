@@ -195,7 +195,16 @@ pub fn raw_quic_receipt() -> DmReceipt {
 }
 
 #[must_use]
+pub fn loopback_receipt() -> DmReceipt {
+    receipt_for_path(DmPath::Loopback)
+}
+
+#[must_use]
 pub fn raw_quic_receipt_for_path(path: DmPath) -> DmReceipt {
+    receipt_for_path(path)
+}
+
+fn receipt_for_path(path: DmPath) -> DmReceipt {
     DmReceipt {
         request_id: fresh_request_id(),
         accepted_at: Instant::now(),

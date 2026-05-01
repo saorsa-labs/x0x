@@ -310,6 +310,8 @@ pub struct DmReceipt {
 /// Which transport delivered the DM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmPath {
+    /// Local loopback path for messages addressed to this same agent.
+    Loopback,
     /// New gossip-inbox path (C).
     GossipInbox,
     /// Legacy raw-QUIC direct-stream path. Still functional during the

@@ -175,6 +175,7 @@ fn now_unix_ms_lossy() -> u64 {
 
 fn dm_path_label(path: DmPath) -> &'static str {
     match path {
+        DmPath::Loopback => "loopback",
         DmPath::GossipInbox => "gossip_inbox",
         DmPath::RawQuic => "raw_quic",
         DmPath::RawQuicAcked => "raw_quic_acked",
@@ -285,6 +286,7 @@ struct DirectDiagnosticsCounters {
     outgoing_send_total: AtomicU64,
     outgoing_send_succeeded: AtomicU64,
     outgoing_send_failed: AtomicU64,
+    outgoing_path_loopback: AtomicU64,
     outgoing_path_raw_quic: AtomicU64,
     outgoing_path_gossip_inbox: AtomicU64,
     incoming_envelopes_total: AtomicU64,
@@ -319,6 +321,7 @@ pub struct DmDiagnosticsStats {
     pub outgoing_send_total: u64,
     pub outgoing_send_succeeded: u64,
     pub outgoing_send_failed: u64,
+    pub outgoing_path_loopback: u64,
     pub outgoing_path_raw_quic: u64,
     pub outgoing_path_gossip_inbox: u64,
     pub incoming_envelopes_total: u64,
@@ -569,6 +572,11 @@ impl DirectMessaging {
             .outgoing_send_succeeded
             .fetch_add(1, Ordering::Relaxed);
         match path {
+            DmPath::Loopback => {
+                self.diagnostics
+                    .outgoing_path_loopback
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             DmPath::RawQuic | DmPath::RawQuicAcked => {
                 self.diagnostics
                     .outgoing_path_raw_quic
@@ -631,6 +639,10 @@ impl DirectMessaging {
             outgoing_send_failed: self
                 .diagnostics
                 .outgoing_send_failed
+                .load(Ordering::Relaxed),
+            outgoing_path_loopback: self
+                .diagnostics
+                .outgoing_path_loopback
                 .load(Ordering::Relaxed),
             outgoing_path_raw_quic: self
                 .diagnostics
@@ -705,6 +717,27 @@ impl DirectMessaging {
             subscriber_count: self.subscriber_count(),
             subscriber_capacity: self.subscriber_capacity,
         }
+    }
+
+    /// Enqueue a local loopback direct message through the normal delivery path.
+    ///
+    /// This is used when an agent sends a DM to its own [`AgentId`]. It avoids
+    /// creating an impossible QUIC self-connection while preserving the same
+    /// subscriber and pull-API fan-out semantics as a remote direct message.
+    pub(crate) async fn handle_loopback(
+        &self,
+        machine_id: MachineId,
+        agent_id: AgentId,
+        payload: Vec<u8>,
+    ) -> u64 {
+        self.handle_incoming(
+            machine_id,
+            agent_id,
+            payload,
+            true,
+            Some(TrustDecision::Accept),
+        )
+        .await
     }
 
     /// Process an incoming direct message from the network.

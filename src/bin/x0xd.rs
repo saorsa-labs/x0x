@@ -11244,6 +11244,7 @@ async fn direct_send(
     {
         Ok(receipt) => {
             let path_str = match receipt.path {
+                x0x::dm::DmPath::Loopback => "loopback",
                 x0x::dm::DmPath::GossipInbox => "gossip_inbox",
                 x0x::dm::DmPath::RawQuic => "raw_quic",
                 x0x::dm::DmPath::RawQuicAcked => "raw_quic_acked",
@@ -12371,6 +12372,7 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
                 "ok": true,
                 "stats": snap,
                 "dispatcher": state.agent.gossip_dispatch_stats(),
+                "recv_pump": state.agent.recv_pump_diagnostics(),
             })),
         ),
         None => (
