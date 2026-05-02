@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration for the gossip overlay network.
 ///
-/// These parameters control the HyParView membership protocol behavior.
+/// These parameters control the HyParView membership protocol behavior and
+/// x0x's receive-side dispatch pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipConfig {
     /// Size of active view (peers we actively gossip with).
@@ -22,6 +23,19 @@ pub struct GossipConfig {
     /// Passive Random Walk Length - hops for FORWARD_JOIN in passive view.
     /// Default: 3
     pub prwl: usize,
+
+    /// Number of concurrent PubSub decode/verify/fanout workers draining the
+    /// inbound PubSub queue. Default stays 1 for one release cycle so rollback
+    /// is a config-only change; operators can raise it to 2–8 for X0X-0005
+    /// soak validation.
+    #[serde(default = "default_dispatch_workers")]
+    pub dispatch_workers: usize,
+}
+
+const MAX_DISPATCH_WORKERS: usize = 8;
+
+const fn default_dispatch_workers() -> usize {
+    1
 }
 
 impl Default for GossipConfig {
@@ -31,6 +45,7 @@ impl Default for GossipConfig {
             passive_view_size: 30,
             arwl: 6,
             prwl: 3,
+            dispatch_workers: default_dispatch_workers(),
         }
     }
 }
@@ -50,6 +65,14 @@ impl GossipConfig {
         if self.prwl == 0 {
             return Err("prwl must be > 0".to_string());
         }
+        if self.dispatch_workers == 0 {
+            return Err("dispatch_workers must be > 0".to_string());
+        }
+        if self.dispatch_workers > MAX_DISPATCH_WORKERS {
+            return Err(format!(
+                "dispatch_workers must be <= {MAX_DISPATCH_WORKERS}"
+            ));
+        }
         Ok(())
     }
 }
@@ -65,6 +88,7 @@ mod tests {
         assert_eq!(config.passive_view_size, 30);
         assert_eq!(config.arwl, 6);
         assert_eq!(config.prwl, 3);
+        assert_eq!(config.dispatch_workers, 1);
     }
 
     #[test]
@@ -74,6 +98,18 @@ mod tests {
 
         let invalid = GossipConfig {
             active_view_size: 0,
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
+
+        let invalid = GossipConfig {
+            dispatch_workers: 0,
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
+
+        let invalid = GossipConfig {
+            dispatch_workers: MAX_DISPATCH_WORKERS + 1,
             ..Default::default()
         };
         assert!(invalid.validate().is_err());

@@ -1395,6 +1395,7 @@ pub struct AgentBuilder {
     user_key_path: Option<std::path::PathBuf>,
     #[allow(dead_code)]
     network_config: Option<network::NetworkConfig>,
+    gossip_config: Option<gossip::GossipConfig>,
     peer_cache_dir: Option<std::path::PathBuf>,
     /// When true, skip opening the bootstrap peer cache entirely.
     /// Useful for fully isolated embedders and test harnesses.
@@ -1728,6 +1729,7 @@ impl Agent {
             user_keypair: None,
             user_key_path: None,
             network_config: None,
+            gossip_config: None,
             peer_cache_dir: None,
             disable_peer_cache: false,
             heartbeat_interval_secs: None,
@@ -6442,6 +6444,18 @@ impl AgentBuilder {
         self
     }
 
+    /// Set gossip overlay configuration.
+    ///
+    /// This is primarily used by x0xd to expose operational knobs such as
+    /// `gossip.dispatch_workers`. If the agent is built without a network
+    /// configuration, the value is retained by the builder but has no runtime
+    /// effect.
+    #[must_use]
+    pub fn with_gossip_config(mut self, config: gossip::GossipConfig) -> Self {
+        self.gossip_config = Some(config);
+        self
+    }
+
     /// Set the directory for the bootstrap peer cache.
     ///
     /// The cache persists peer quality metrics across restarts, enabling
@@ -6789,7 +6803,7 @@ impl AgentBuilder {
         // Create gossip runtime if network exists
         let gossip_runtime = if let Some(ref net) = network {
             let runtime = gossip::GossipRuntime::new(
-                gossip::GossipConfig::default(),
+                self.gossip_config.unwrap_or_default(),
                 std::sync::Arc::clone(net),
                 Some(signing_ctx),
             )

@@ -121,6 +121,10 @@ name = "gui-coverage"
 path = "src/bin/gui_coverage.rs"
 test = false
 
+[[bench]]
+name = "gossip_dispatch_throughput"
+harness = false
+
 [workspace]
 members = [
     ".",

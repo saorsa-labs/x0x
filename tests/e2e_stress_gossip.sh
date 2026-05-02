@@ -8,7 +8,7 @@
 #
 # Usage:
 #   tests/e2e_stress_gossip.sh [--nodes 3] [--messages 1000] \
-#       [--topic gossip-stress] [--proof-dir proofs/stress-<ts>]
+#       [--topic gossip-stress] [--proof-dir proofs/stress-<ts>] [--slow-subscriber]
 
 set -euo pipefail
 
@@ -16,6 +16,7 @@ NODES=3
 MESSAGES=1000
 TOPIC="gossip-stress-$$"
 PROOF_DIR=""
+SLOW_SUBSCRIBER=0
 # Minimum per-subscriber delivery fraction (0.0 - 1.0). Default 1.0 = every
 # subscriber must deliver >= MESSAGES. Relax only when you are deliberately
 # measuring under-saturation (e.g. deliberate overload).
@@ -28,6 +29,7 @@ while (( "$#" )); do
         --topic) TOPIC="$2"; shift 2 ;;
         --proof-dir) PROOF_DIR="$2"; shift 2 ;;
         --min-delivery-ratio) MIN_DELIVERY_RATIO="$2"; shift 2 ;;
+        --slow-subscriber) SLOW_SUBSCRIBER=1; shift ;;
         *) echo "unknown arg: $1"; exit 2 ;;
     esac
 done
@@ -41,7 +43,7 @@ REPORT="$PROOF_DIR/stress-report.json"
 
 log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
-log "Stress config: NODES=$NODES MESSAGES=$MESSAGES TOPIC=$TOPIC"
+log "Stress config: NODES=$NODES MESSAGES=$MESSAGES TOPIC=$TOPIC SLOW_SUBSCRIBER=$SLOW_SUBSCRIBER"
 log "Proof dir: $PROOF_DIR"
 
 BIN="${X0XD_BIN:-target/debug/x0xd}"
@@ -53,14 +55,15 @@ if [ ! -x "$BIN" ] || [ ! -x "$CLI" ]; then
 fi
 
 PIDS=()
+SLOW_PIDS=()
 TOKENS=()
 PORTS=()
 cleanup() {
-    log "Cleaning up daemons..."
-    for pid in "${PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
+    log "Cleaning up slow subscribers + daemons..."
+    for pid in "${SLOW_PIDS[@]}" "${PIDS[@]}"; do
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
-    wait "${PIDS[@]}" 2>/dev/null || true
+    wait "${SLOW_PIDS[@]}" "${PIDS[@]}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -124,6 +127,37 @@ for i in $(seq 1 "$NODES"); do
     api "$i" POST /subscribe "{\"topic\":\"$TOPIC\"}" > "$PROOF_DIR/logs/node-$i/subscribe.json" || true
 done
 
+if (( SLOW_SUBSCRIBER == 1 )); then
+    slow_idx=2
+    if (( NODES < 2 )); then
+        slow_idx=1
+    fi
+    slow_port="${PORTS[$((slow_idx - 1))]}"
+    slow_token="${TOKENS[$((slow_idx - 1))]}"
+    log "Starting slow SSE subscriber on node-$slow_idx (intentionally reads one event/sec)"
+    python3 - "$slow_port" "$slow_token" > "$PROOF_DIR/logs/node-$slow_idx/slow-subscriber.log" 2>&1 <<'PY' &
+import sys
+import time
+import urllib.request
+
+port = sys.argv[1]
+token = sys.argv[2]
+req = urllib.request.Request(f"http://127.0.0.1:{port}/events")
+if token:
+    req.add_header("authorization", f"Bearer {token}")
+with urllib.request.urlopen(req, timeout=30) as resp:
+    while True:
+        line = resp.readline()
+        if not line:
+            break
+        # Deliberately lag the SSE response stream. x0xd should isolate this
+        # behind tokio::broadcast lag/drop semantics instead of pinning PubSub.
+        time.sleep(1.0)
+PY
+    SLOW_PIDS+=($!)
+    sleep 1
+fi
+
 log "Subscriptions installed; snapshotting pre-publish gossip stats"
 for i in $(seq 1 "$NODES"); do
     api "$i" GET /diagnostics/gossip > "$PROOF_DIR/logs/node-$i/gossip-pre.json" || true
@@ -155,25 +189,28 @@ sleep 5
 declare -a POST_PUB=()
 declare -a POST_DELIV=()
 declare -a POST_DROPS=()
+declare -a POST_SLOW=()
 for i in $(seq 1 "$NODES"); do
     api "$i" GET /diagnostics/gossip > "$PROOF_DIR/logs/node-$i/gossip-post.json" || true
     PUB=$(jq -r '.stats.publish_total // 0' "$PROOF_DIR/logs/node-$i/gossip-post.json" 2>/dev/null || echo 0)
     DEL=$(jq -r '.stats.delivered_to_subscriber // 0' "$PROOF_DIR/logs/node-$i/gossip-post.json" 2>/dev/null || echo 0)
     DROPS=$(jq -r '.stats.decode_to_delivery_drops // 0' "$PROOF_DIR/logs/node-$i/gossip-post.json" 2>/dev/null || echo 0)
+    SLOW=$(jq -r '.stats.slow_subscriber_dropped // 0' "$PROOF_DIR/logs/node-$i/gossip-post.json" 2>/dev/null || echo 0)
     POST_PUB+=("$PUB")
     POST_DELIV+=("$DEL")
     POST_DROPS+=("$DROPS")
-    log "node-$i: publish=$PUB delivered=$DEL drops=$DROPS"
+    POST_SLOW+=("$SLOW")
+    log "node-$i: publish=$PUB delivered=$DEL drops=$DROPS slow_subscriber_dropped=$SLOW"
 done
 
 # Report JSON.
 {
-    printf '{"nodes":%s,"messages":%s,"topic":"%s","elapsed_seconds":%s,"per_node":[' \
-        "$NODES" "$MESSAGES" "$TOPIC" "$elapsed"
+    printf '{"nodes":%s,"messages":%s,"topic":"%s","elapsed_seconds":%s,"slow_subscriber":%s,"per_node":[' \
+        "$NODES" "$MESSAGES" "$TOPIC" "$elapsed" "$SLOW_SUBSCRIBER"
     for i in $(seq 1 "$NODES"); do
         [ $i -gt 1 ] && printf ','
-        printf '{"idx":%s,"publish_total":%s,"delivered_to_subscriber":%s,"decode_to_delivery_drops":%s}' \
-            "$i" "${POST_PUB[$((i - 1))]}" "${POST_DELIV[$((i - 1))]}" "${POST_DROPS[$((i - 1))]}"
+        printf '{"idx":%s,"publish_total":%s,"delivered_to_subscriber":%s,"decode_to_delivery_drops":%s,"slow_subscriber_dropped":%s}' \
+            "$i" "${POST_PUB[$((i - 1))]}" "${POST_DELIV[$((i - 1))]}" "${POST_DROPS[$((i - 1))]}" "${POST_SLOW[$((i - 1))]}"
     done
     printf ']}\n'
 } > "$REPORT"

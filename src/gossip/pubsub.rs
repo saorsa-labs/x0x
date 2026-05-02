@@ -40,7 +40,12 @@ pub struct PubSubStats {
     pub incoming_decode_failed: AtomicU64,
     /// Messages successfully handed to a local subscriber channel.
     pub delivered_to_subscriber: AtomicU64,
-    /// Subscriber channel closed (dropped subscription) — message not delivered.
+    /// Subscriber channel was full and got dropped to isolate the dispatcher
+    /// from a slow local consumer (for example a stuck SSE client path).
+    pub slow_subscriber_dropped: AtomicU64,
+    /// Subscriber channel closed or was dropped after slow-consumer isolation —
+    /// message not delivered, but accounted for so decode→delivery deltas stay
+    /// meaningful.
     pub subscriber_channel_closed: AtomicU64,
 }
 
@@ -53,6 +58,7 @@ pub struct PubSubStatsSnapshot {
     pub incoming_decoded: u64,
     pub incoming_decode_failed: u64,
     pub delivered_to_subscriber: u64,
+    pub slow_subscriber_dropped: u64,
     pub subscriber_channel_closed: u64,
     /// `incoming_total - incoming_decoded - incoming_decode_failed` — messages
     /// that entered the pipeline but did not reach a decision yet (usually 0,
@@ -72,6 +78,7 @@ impl PubSubStats {
         let incoming_decoded = self.incoming_decoded.load(Ordering::Relaxed);
         let incoming_decode_failed = self.incoming_decode_failed.load(Ordering::Relaxed);
         let delivered_to_subscriber = self.delivered_to_subscriber.load(Ordering::Relaxed);
+        let slow_subscriber_dropped = self.slow_subscriber_dropped.load(Ordering::Relaxed);
         let subscriber_channel_closed = self.subscriber_channel_closed.load(Ordering::Relaxed);
         let in_flight_decode =
             incoming_total as i64 - incoming_decoded as i64 - incoming_decode_failed as i64;
@@ -85,6 +92,7 @@ impl PubSubStats {
             incoming_decoded,
             incoming_decode_failed,
             delivered_to_subscriber,
+            slow_subscriber_dropped,
             subscriber_channel_closed,
             in_flight_decode,
             decode_to_delivery_drops,
@@ -371,6 +379,9 @@ impl PubSubManager {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        stats
+                            .slow_subscriber_dropped
+                            .fetch_add(1, Ordering::Relaxed);
                         stats
                             .subscriber_channel_closed
                             .fetch_add(1, Ordering::Relaxed);
@@ -1313,6 +1324,7 @@ mod tests {
                 "messages": MESSAGES,
                 "publish_total": stats.publish_total,
                 "delivered_to_subscriber": stats.delivered_to_subscriber,
+                "slow_subscriber_dropped": stats.slow_subscriber_dropped,
                 "subscriber_channel_closed": stats.subscriber_channel_closed,
                 "decode_to_delivery_drops": stats.decode_to_delivery_drops,
                 "fast_received": fast_received,
@@ -1326,8 +1338,12 @@ mod tests {
             "publisher must reach full publish_total without stalling"
         );
         assert!(
-            stats.subscriber_channel_closed >= 1,
+            stats.slow_subscriber_dropped >= 1,
             "slow subscriber should be dropped once its 10k buffer fills"
+        );
+        assert!(
+            stats.subscriber_channel_closed >= 1,
+            "slow subscriber drop should be accounted as closed for delivery deltas"
         );
         assert_eq!(
             fast_received, MESSAGES,

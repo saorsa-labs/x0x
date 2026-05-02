@@ -121,6 +121,7 @@ pub struct GossipDispatchStats {
     pubsub_queue: DispatchQueueStats,
     membership_queue: DispatchQueueStats,
     bulk_queue: DispatchQueueStats,
+    pubsub_workers: AtomicU64,
 }
 
 /// JSON-friendly snapshot of [`GossipDispatchStats`].
@@ -130,6 +131,8 @@ pub struct GossipDispatchStatsSnapshot {
     pub membership: DispatchStreamStatsSnapshot,
     pub bulk: DispatchStreamStatsSnapshot,
     pub recv_depth: DispatchQueueDepthSnapshot,
+    /// Configured number of concurrent PubSub workers draining recv_pubsub_rx.
+    pub pubsub_workers: u64,
 }
 
 /// JSON-friendly snapshot of per-stream receive queue depths.
@@ -141,6 +144,13 @@ pub struct DispatchQueueDepthSnapshot {
 }
 
 impl GossipDispatchStats {
+    fn new(pubsub_workers: usize) -> Self {
+        Self {
+            pubsub_workers: AtomicU64::new(usize_to_u64(pubsub_workers)),
+            ..Default::default()
+        }
+    }
+
     fn record_dequeue(&self, stream_type: GossipStreamType, depth: usize, capacity: usize) {
         match stream_type {
             GossipStreamType::PubSub => self.pubsub_queue.record(depth, capacity),
@@ -161,6 +171,7 @@ impl GossipDispatchStats {
                 membership: self.membership_queue.snapshot(),
                 bulk: self.bulk_queue.snapshot(),
             },
+            pubsub_workers: self.pubsub_workers.load(Ordering::Relaxed),
         }
     }
 }
@@ -202,6 +213,8 @@ impl std::fmt::Debug for GossipRuntime {
 }
 
 async fn run_pubsub_dispatcher(
+    worker_id: usize,
+    worker_count: usize,
     network: Arc<NetworkNode>,
     pubsub: Arc<PubSubManager>,
     dispatch_stats: Arc<GossipDispatchStats>,
@@ -221,6 +234,8 @@ async fn run_pubsub_dispatcher(
                     recv_depth,
                     recv_capacity,
                     stream_type = "PubSub",
+                    worker_id,
+                    worker_count,
                     "[2/6 runtime] dispatching gossip message"
                 );
                 match tokio::time::timeout(
@@ -237,6 +252,8 @@ async fn run_pubsub_dispatcher(
                             bytes,
                             elapsed_ms = duration_ms(elapsed),
                             stream_type = "PubSub",
+                            worker_id,
+                            worker_count,
                             "[2/6 runtime] completed gossip message dispatch"
                         );
                     }
@@ -249,6 +266,8 @@ async fn run_pubsub_dispatcher(
                             elapsed_ms = duration_ms(elapsed),
                             timeout_secs = PUBSUB_MESSAGE_HANDLE_TIMEOUT.as_secs(),
                             stream_type = "PubSub",
+                            worker_id,
+                            worker_count,
                             "Timed out handling gossip message"
                         );
                     }
@@ -260,7 +279,11 @@ async fn run_pubsub_dispatcher(
             }
         }
     }
-    tracing::info!("Gossip PubSub dispatcher shut down");
+    tracing::info!(
+        worker_id,
+        worker_count,
+        "Gossip PubSub dispatcher shut down"
+    );
 }
 
 async fn run_membership_dispatcher(
@@ -472,6 +495,7 @@ impl GossipRuntime {
             Arc::clone(&network),
         ));
         let pubsub = Arc::new(PubSubManager::new(Arc::clone(&network), signing)?);
+        let dispatch_workers = config.dispatch_workers;
 
         Ok(Self {
             config,
@@ -483,7 +507,7 @@ impl GossipRuntime {
             dispatcher_handles: std::sync::Mutex::new(Vec::new()),
             peer_sync_handle: std::sync::Mutex::new(None),
             keepalive_handle: std::sync::Mutex::new(None),
-            dispatch_stats: Arc::new(GossipDispatchStats::default()),
+            dispatch_stats: Arc::new(GossipDispatchStats::new(dispatch_workers)),
         })
     }
 
@@ -553,11 +577,17 @@ impl GossipRuntime {
         let presence = self.presence();
         let dispatch_stats = Arc::clone(&self.dispatch_stats);
 
-        let pubsub_handle = tokio::spawn(run_pubsub_dispatcher(
-            Arc::clone(&network),
-            pubsub,
-            Arc::clone(&dispatch_stats),
-        ));
+        let pubsub_worker_count = self.config.dispatch_workers;
+        let mut pubsub_handles = Vec::with_capacity(pubsub_worker_count);
+        for worker_id in 0..pubsub_worker_count {
+            pubsub_handles.push(tokio::spawn(run_pubsub_dispatcher(
+                worker_id,
+                pubsub_worker_count,
+                Arc::clone(&network),
+                Arc::clone(&pubsub),
+                Arc::clone(&dispatch_stats),
+            )));
+        }
         let membership_handle = tokio::spawn(run_membership_dispatcher(
             Arc::clone(&network),
             membership,
@@ -616,7 +646,7 @@ impl GossipRuntime {
 
         match self.dispatcher_handles.lock() {
             Ok(mut guard) => {
-                guard.push(pubsub_handle);
+                guard.extend(pubsub_handles);
                 guard.push(membership_handle);
                 guard.push(bulk_handle);
             }
@@ -767,5 +797,21 @@ mod tests {
         assert_eq!(snapshot.recv_depth.bulk.latest, 3);
         assert_eq!(snapshot.recv_depth.bulk.max, 3);
         assert_eq!(snapshot.recv_depth.bulk.capacity, 4_000);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_records_configured_pubsub_workers() {
+        let config = GossipConfig {
+            dispatch_workers: 2,
+            ..Default::default()
+        };
+        let network = NetworkNode::new(NetworkConfig::default(), None, None)
+            .await
+            .expect("Failed to create network");
+        let runtime = GossipRuntime::new(config, Arc::new(network), None)
+            .await
+            .expect("Failed to create runtime");
+
+        assert_eq!(runtime.dispatch_stats().pubsub_workers, 2);
     }
 }

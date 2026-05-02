@@ -141,6 +141,10 @@ struct DaemonConfig {
     #[serde(default)]
     update: DaemonUpdateConfig,
 
+    /// Gossip overlay configuration (TOML: `[gossip]`).
+    #[serde(default)]
+    gossip: x0x::gossip::GossipConfig,
+
     /// How often to re-announce identity (seconds).
     #[serde(default = "default_heartbeat_interval")]
     heartbeat_interval_secs: u64,
@@ -338,6 +342,7 @@ impl Default for DaemonConfig {
                 .filter_map(|s| s.parse().ok())
                 .collect(),
             update: DaemonUpdateConfig::default(),
+            gossip: x0x::gossip::GossipConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             identity_ttl_secs: default_identity_ttl(),
             user_key_path: None,
@@ -1042,6 +1047,11 @@ async fn main() -> Result<()> {
         config.bootstrap_peers = Vec::new();
     }
 
+    config
+        .gossip
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid gossip config: {e}"))?;
+
     init_logging(&config.log_level, &config.log_format)?;
 
     let exec_policy = x0x::exec::load_exec_policy(exec_acl_override.as_deref(), exec_acl_load_mode)
@@ -1173,6 +1183,7 @@ async fn main() -> Result<()> {
     let contacts_path = config.data_dir.join("contacts.json");
     let mut builder = Agent::builder()
         .with_network_config(network_config)
+        .with_gossip_config(config.gossip.clone())
         .with_peer_cache_dir(cache_dir)
         .with_contact_store_path(&contacts_path)
         .with_heartbeat_interval(config.heartbeat_interval_secs)
