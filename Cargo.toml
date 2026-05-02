@@ -125,19 +125,6 @@ test = false
 name = "gossip_dispatch_throughput"
 harness = false
 
-[patch.crates-io]
-saorsa-gossip-coordinator = { path = "../saorsa-gossip/crates/coordinator" }
-saorsa-gossip-crdt-sync = { path = "../saorsa-gossip/crates/crdt-sync" }
-saorsa-gossip-groups = { path = "../saorsa-gossip/crates/groups" }
-saorsa-gossip-identity = { path = "../saorsa-gossip/crates/identity" }
-saorsa-gossip-membership = { path = "../saorsa-gossip/crates/membership" }
-saorsa-gossip-presence = { path = "../saorsa-gossip/crates/presence" }
-saorsa-gossip-pubsub = { path = "../saorsa-gossip/crates/pubsub" }
-saorsa-gossip-rendezvous = { path = "../saorsa-gossip/crates/rendezvous" }
-saorsa-gossip-runtime = { path = "../saorsa-gossip/crates/runtime" }
-saorsa-gossip-transport = { path = "../saorsa-gossip/crates/transport" }
-saorsa-gossip-types = { path = "../saorsa-gossip/crates/types" }
-
 [workspace]
 members = [
     ".",
