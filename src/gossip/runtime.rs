@@ -40,6 +40,10 @@ pub struct DispatchStreamStats {
     completed: AtomicU64,
     timed_out: AtomicU64,
     max_elapsed_ms: AtomicU64,
+    total_elapsed_ns: AtomicU64,
+    over_1s_count: AtomicU64,
+    over_5s_count: AtomicU64,
+    over_30s_count: AtomicU64,
 }
 
 /// JSON-friendly snapshot of per-stream dispatcher counters.
@@ -49,6 +53,14 @@ pub struct DispatchStreamStatsSnapshot {
     pub completed: u64,
     pub timed_out: u64,
     pub max_elapsed_ms: u64,
+    /// Cumulative handler wall-clock time, in nanoseconds.
+    pub total_elapsed_ns: u64,
+    /// Handler invocations that took at least 1 second.
+    pub over_1s_count: u64,
+    /// Handler invocations that took at least 5 seconds.
+    pub over_5s_count: u64,
+    /// Handler invocations that took at least 30 seconds.
+    pub over_30s_count: u64,
 }
 
 impl DispatchStreamStats {
@@ -58,14 +70,28 @@ impl DispatchStreamStats {
 
     fn record_completed(&self, elapsed: Duration) {
         self.completed.fetch_add(1, Ordering::Relaxed);
-        self.max_elapsed_ms
-            .fetch_max(duration_ms(elapsed), Ordering::Relaxed);
+        self.record_elapsed(elapsed);
     }
 
     fn record_timed_out(&self, elapsed: Duration) {
         self.timed_out.fetch_add(1, Ordering::Relaxed);
+        self.record_elapsed(elapsed);
+    }
+
+    fn record_elapsed(&self, elapsed: Duration) {
         self.max_elapsed_ms
             .fetch_max(duration_ms(elapsed), Ordering::Relaxed);
+        self.total_elapsed_ns
+            .fetch_add(duration_ns(elapsed), Ordering::Relaxed);
+        if elapsed >= Duration::from_secs(1) {
+            self.over_1s_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if elapsed >= Duration::from_secs(5) {
+            self.over_5s_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if elapsed >= Duration::from_secs(30) {
+            self.over_30s_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn snapshot(&self) -> DispatchStreamStatsSnapshot {
@@ -74,6 +100,10 @@ impl DispatchStreamStats {
             completed: self.completed.load(Ordering::Relaxed),
             timed_out: self.timed_out.load(Ordering::Relaxed),
             max_elapsed_ms: self.max_elapsed_ms.load(Ordering::Relaxed),
+            total_elapsed_ns: self.total_elapsed_ns.load(Ordering::Relaxed),
+            over_1s_count: self.over_1s_count.load(Ordering::Relaxed),
+            over_5s_count: self.over_5s_count.load(Ordering::Relaxed),
+            over_30s_count: self.over_30s_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -180,6 +210,12 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis())
         .ok()
         .map_or(u64::MAX, |ms| ms)
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos())
+        .ok()
+        .map_or(u64::MAX, |ns| ns)
 }
 
 fn usize_to_u64(value: usize) -> u64 {
@@ -797,6 +833,25 @@ mod tests {
         assert_eq!(snapshot.recv_depth.bulk.latest, 3);
         assert_eq!(snapshot.recv_depth.bulk.max, 3);
         assert_eq!(snapshot.recv_depth.bulk.capacity, 4_000);
+    }
+
+    #[test]
+    fn test_dispatch_stats_record_elapsed_buckets_for_all_streams() {
+        let stats = GossipDispatchStats::default();
+
+        stats.pubsub.record_completed(Duration::from_millis(25));
+        stats.membership.record_timed_out(Duration::from_secs(6));
+        stats.bulk.record_timed_out(Duration::from_secs(31));
+
+        let snapshot = stats.snapshot();
+        assert!(snapshot.pubsub.total_elapsed_ns >= 25_000_000);
+        assert_eq!(snapshot.pubsub.over_1s_count, 0);
+        assert_eq!(snapshot.membership.over_1s_count, 1);
+        assert_eq!(snapshot.membership.over_5s_count, 1);
+        assert_eq!(snapshot.membership.over_30s_count, 0);
+        assert_eq!(snapshot.bulk.over_1s_count, 1);
+        assert_eq!(snapshot.bulk.over_5s_count, 1);
+        assert_eq!(snapshot.bulk.over_30s_count, 1);
     }
 
     #[tokio::test]

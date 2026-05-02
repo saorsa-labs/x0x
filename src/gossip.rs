@@ -15,3 +15,4 @@ pub use runtime::{
     DispatchQueueDepthSnapshot, DispatchQueueStatsSnapshot, DispatchStreamStats,
     DispatchStreamStatsSnapshot, GossipDispatchStats, GossipDispatchStatsSnapshot, GossipRuntime,
 };
+pub use saorsa_gossip_pubsub::{PubSubStageStatsSnapshot, StageTimingStatsSnapshot};

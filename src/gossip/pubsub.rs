@@ -314,6 +314,14 @@ impl PubSubManager {
         self.stats.snapshot()
     }
 
+    /// Snapshot of low-level PlumTree PubSub stage timings.
+    ///
+    /// Surfaced at `GET /diagnostics/gossip` so soak runs can identify which
+    /// phase of inbound PubSub handling owns dispatcher wall-clock time.
+    pub fn stage_stats(&self) -> saorsa_gossip_pubsub::PubSubStageStatsSnapshot {
+        self.plumtree.stage_stats()
+    }
+
     /// Attach a contact store for trust-based message filtering.
     ///
     /// When set, incoming messages from `Blocked` senders are silently

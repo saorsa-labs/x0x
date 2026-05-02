@@ -12382,6 +12382,7 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
             Json(serde_json::json!({
                 "ok": true,
                 "stats": snap,
+                "pubsub_stages": state.agent.gossip_pubsub_stage_stats(),
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
             })),

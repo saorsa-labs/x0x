@@ -1835,6 +1835,18 @@ impl Agent {
         self.gossip_runtime.as_ref().map(|rt| rt.dispatch_stats())
     }
 
+    /// Snapshot of per-stage PubSub handling timings.
+    ///
+    /// Returns `None` when the agent has no gossip runtime. This is the
+    /// X0X-0006 diagnostic block used to identify which stage of
+    /// `PubSubManager::handle_incoming` dominates dispatcher wall-clock time.
+    #[must_use]
+    pub fn gossip_pubsub_stage_stats(&self) -> Option<gossip::PubSubStageStatsSnapshot> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| rt.pubsub().stage_stats())
+    }
+
     /// Snapshot of ant-quic → gossip receive-pump diagnostics.
     ///
     /// Returns `None` when this agent was built without a network node.
