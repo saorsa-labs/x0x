@@ -33,3 +33,10 @@ tests/proptest_presence.proptest-regressions
 proofs/
 dhat-heap-*.json
 test.txt
+
+# Session handoff prompts and ad-hoc test reports — local notes, not source.
+*NEXT-SESSION*.md
+*NEXT_SESSION*.md
+*next-session*.md
+NETWORK_TEST_REPORT.txt
+*_TEST_REPORT.txt
