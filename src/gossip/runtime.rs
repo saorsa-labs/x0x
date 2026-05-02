@@ -11,6 +11,7 @@ use saorsa_gossip_types::PeerId;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 /// X0X-0009 prototype: how often the adaptive worker supervisor samples
 /// recv_pump telemetry and decides whether to scale workers up or down.
@@ -31,6 +32,9 @@ const PUBSUB_WORKER_SCALE_DOWN_INTERVALS: u64 = 10;
 const PUBSUB_WORKER_MAX: usize = 16;
 /// X0X-0009 prototype: hard floor — at least one worker must always run.
 const PUBSUB_WORKER_MIN: usize = 1;
+/// X0X-0009 prototype: parked worker slots also poll the target at this
+/// interval so a lost Notify wake cannot strand a reusable worker slot.
+const PUBSUB_WORKER_PARK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// X0X-0009 prototype: average per-message dispatch time (over the window)
 /// above which the dispatcher is "slow" and we should scale up — even if the
 /// queue has not filled yet. Catches the long-RTT case where each republish
@@ -289,22 +293,29 @@ impl std::fmt::Debug for GossipRuntime {
 async fn run_pubsub_dispatcher(
     worker_id: usize,
     target_count: Arc<AtomicUsize>,
+    worker_notify: Arc<Notify>,
     network: Arc<NetworkNode>,
     pubsub: Arc<PubSubManager>,
     dispatch_stats: Arc<GossipDispatchStats>,
 ) {
     loop {
-        // X0X-0009 prototype: worker self-exits when the supervisor has
-        // shrunk the target below this worker's id. Checked at top of each
-        // iteration so an in-flight message dispatch always completes.
+        // X0X-0009: every worker slot is spawned once and tracked for
+        // shutdown. Slots above the current target park here, then wake when
+        // the supervisor changes the target. Keeping stable worker IDs avoids
+        // the scale-down/scale-up hole where a monotonic new id can be
+        // immediately outside the target again.
         let worker_count = target_count.load(Ordering::Relaxed);
         if worker_id >= worker_count {
-            tracing::info!(
+            tracing::debug!(
                 worker_id,
                 worker_count,
-                "X0X-0009 worker self-exit: supervisor shrank target below this id"
+                "X0X-0009 PubSub dispatcher worker parked above target"
             );
-            break;
+            tokio::select! {
+                _ = worker_notify.notified() => {}
+                _ = tokio::time::sleep(PUBSUB_WORKER_PARK_POLL_INTERVAL) => {}
+            }
+            continue;
         }
         match network.receive_pubsub_message().await {
             Ok((peer, data)) => {
@@ -380,9 +391,9 @@ async fn run_pubsub_dispatcher(
 /// by the supervisor task from one tick to the next).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SupervisorSample {
-    /// Lifetime producer rate (msg/s into the recv_pump).
+    /// Producer rate over the supervisor interval (msg/s into the recv_pump).
     pub producer_per_sec: f64,
-    /// Lifetime consumer rate (msg/s drained by the dispatcher).
+    /// Consumer rate over the supervisor interval (msg/s drained by the dispatcher).
     pub consumer_per_sec: f64,
     /// Most recent recv_pump queue depth.
     pub latest_depth: u64,
@@ -419,9 +430,8 @@ pub(crate) struct SupervisorSample {
 /// - sustained for `PUBSUB_WORKER_SCALE_DOWN_INTERVALS` (10) consecutive
 ///   supervisor intervals
 ///
-/// Caller is responsible for spawning new workers when `next_target >
-/// current_target` (worker self-exit handles the shrink case via the
-/// per-worker top-of-loop check).
+/// Caller is responsible for applying the target change and notifying parked
+/// worker slots. Worker tasks are stable and tracked for the runtime lifetime.
 fn supervisor_decide_target(
     sample: SupervisorSample,
     current_target: usize,
@@ -477,15 +487,22 @@ fn supervisor_decide_target(
 /// and `pubsub.stage_stats()` — no direct counter access needed here.
 #[derive(Debug, Clone, Copy, Default)]
 struct SupervisorPrevious {
+    produced: u64,
+    dequeued: u64,
     completed: u64,
     timed_out: u64,
     total_elapsed_ns: u64,
     per_peer_timeout: u64,
 }
 
+fn window_rate(current: u64, previous: u64, interval_secs: f64) -> f64 {
+    let interval_secs = interval_secs.max(1.0);
+    (current.saturating_sub(previous) as f64) / interval_secs
+}
+
 async fn run_pubsub_worker_supervisor(
     target_count: Arc<AtomicUsize>,
-    next_worker_id: Arc<AtomicUsize>,
+    worker_notify: Arc<Notify>,
     network: Arc<NetworkNode>,
     pubsub: Arc<PubSubManager>,
     dispatch_stats: Arc<GossipDispatchStats>,
@@ -502,6 +519,8 @@ async fn run_pubsub_worker_supervisor(
         let dispatcher = dispatch_stats.snapshot();
         let stages = pubsub.stage_stats();
 
+        let cur_produced = ps.produced_total;
+        let cur_dequeued = ps.dequeued_total;
         let cur_completed = dispatcher.pubsub.completed;
         let cur_timed_out = dispatcher.pubsub.timed_out;
         let cur_total_elapsed_ns = dispatcher.pubsub.total_elapsed_ns;
@@ -524,8 +543,8 @@ async fn run_pubsub_worker_supervisor(
         let recent_per_peer_timeout_rate = (delta_per_peer_timeout as f64) / interval_secs;
 
         let sample = SupervisorSample {
-            producer_per_sec: ps.producer_per_sec,
-            consumer_per_sec: ps.consumer_per_sec,
+            producer_per_sec: window_rate(cur_produced, previous.produced, interval_secs),
+            consumer_per_sec: window_rate(cur_dequeued, previous.dequeued, interval_secs),
             latest_depth: ps.latest_depth,
             capacity: ps.capacity,
             recent_avg_dispatch_ms,
@@ -534,6 +553,8 @@ async fn run_pubsub_worker_supervisor(
         };
 
         previous = SupervisorPrevious {
+            produced: cur_produced,
+            dequeued: cur_dequeued,
             completed: cur_completed,
             timed_out: cur_timed_out,
             total_elapsed_ns: cur_total_elapsed_ns,
@@ -548,6 +569,7 @@ async fn run_pubsub_worker_supervisor(
             continue;
         }
         target_count.store(next_target, Ordering::Relaxed);
+        worker_notify.notify_waiters();
         dispatch_stats
             .pubsub_workers
             .store(usize_to_u64(next_target), Ordering::Relaxed);
@@ -563,25 +585,6 @@ async fn run_pubsub_worker_supervisor(
             recent_per_peer_timeout_rate_per_sec = sample.recent_per_peer_timeout_rate_per_sec,
             "X0X-0009 supervisor adjusted PubSub dispatcher target"
         );
-        if next_target > current_target {
-            // Scale up — spawn new workers up to the new target. Each worker
-            // uses a fresh id allocated atomically so existing self-exit
-            // checks (worker_id >= target) keep working when the target later
-            // shrinks.
-            for _ in current_target..next_target {
-                let worker_id = next_worker_id.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(run_pubsub_dispatcher(
-                    worker_id,
-                    Arc::clone(&target_count),
-                    Arc::clone(&network),
-                    Arc::clone(&pubsub),
-                    Arc::clone(&dispatch_stats),
-                ));
-            }
-        }
-        // Scale-down case: target was lowered; the next mpsc::recv() top-of-
-        // loop check inside the highest-id worker will see worker_id >= target
-        // and exit. No explicit signaling needed.
     }
 }
 
@@ -876,18 +879,19 @@ impl GossipRuntime {
         let presence = self.presence();
         let dispatch_stats = Arc::clone(&self.dispatch_stats);
 
-        // X0X-0009 prototype: target_count starts at the configured value
-        // and is mutated at runtime by the supervisor below. next_worker_id
-        // is the rolling id allocator so spawn-on-scale-up never collides
-        // with a still-live worker's id.
+        // X0X-0009: spawn the full worker-slot ceiling once so every worker
+        // is tracked by `dispatcher_handles` and can be aborted on shutdown.
+        // `target_count` controls how many slots actively drain PubSub; the
+        // rest park until the supervisor raises the target.
         let pubsub_worker_count = self.config.dispatch_workers;
         let target_count = Arc::new(AtomicUsize::new(pubsub_worker_count));
-        let next_worker_id = Arc::new(AtomicUsize::new(pubsub_worker_count));
-        let mut pubsub_handles = Vec::with_capacity(pubsub_worker_count);
-        for worker_id in 0..pubsub_worker_count {
+        let worker_notify = Arc::new(Notify::new());
+        let mut pubsub_handles = Vec::with_capacity(PUBSUB_WORKER_MAX + 1);
+        for worker_id in 0..PUBSUB_WORKER_MAX {
             pubsub_handles.push(tokio::spawn(run_pubsub_dispatcher(
                 worker_id,
                 Arc::clone(&target_count),
+                Arc::clone(&worker_notify),
                 Arc::clone(&network),
                 Arc::clone(&pubsub),
                 Arc::clone(&dispatch_stats),
@@ -895,7 +899,7 @@ impl GossipRuntime {
         }
         let supervisor_handle = tokio::spawn(run_pubsub_worker_supervisor(
             Arc::clone(&target_count),
-            Arc::clone(&next_worker_id),
+            Arc::clone(&worker_notify),
             Arc::clone(&network),
             Arc::clone(&pubsub),
             Arc::clone(&dispatch_stats),
@@ -1152,7 +1156,8 @@ mod tests {
     // so we can prove the scale-up / scale-down / hysteresis logic without
     // spinning up a real network. The supervisor task itself only does
     // (a) sample telemetry, (b) compute deltas, (c) call this function,
-    // (d) spawn workers when target grew — all the policy is here.
+    // (d) update the active-worker target and notify parked worker slots —
+    // all the policy is here.
 
     /// Build a SupervisorSample with the given depth-related signals and
     /// "stage signals all zero" defaults. Used by older tests written before
@@ -1173,6 +1178,13 @@ mod tests {
             recent_timeout_rate_per_sec: 0.0,
             recent_per_peer_timeout_rate_per_sec: 0.0,
         }
+    }
+
+    #[test]
+    fn supervisor_window_rate_uses_counter_deltas_not_lifetime_rates() {
+        assert_eq!(window_rate(1_300, 1_000, 30.0), 10.0);
+        assert_eq!(window_rate(1_300, 1_300, 30.0), 0.0);
+        assert_eq!(window_rate(1_000, 1_300, 30.0), 0.0);
     }
 
     #[test]
@@ -1417,33 +1429,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_self_exits_when_target_drops_below_id() {
-        // Spawn a stub worker via the same loop shape the real dispatcher
-        // uses (target_count.load → break if id ≥ target). Drop the target
-        // below the worker's id and verify the worker terminates within a
-        // bounded poll budget. Proves the self-exit pattern works under
-        // tokio scheduling.
+    async fn parked_worker_slot_reactivates_after_downscale_then_upscale() {
+        // Regression for the monotonic-id bug: workers are stable slots now,
+        // not disposable tasks. A slot above target parks, then the same slot
+        // must become active again when the target rises back above its id.
         let target = Arc::new(AtomicUsize::new(2));
         let target_clone = Arc::clone(&target);
+        let notify = Arc::new(Notify::new());
+        let notify_clone = Arc::clone(&notify);
         let worker_id = 1usize;
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let active_count_clone = Arc::clone(&active_count);
+        let parked_count = Arc::new(AtomicUsize::new(0));
+        let parked_count_clone = Arc::clone(&parked_count);
         let handle = tokio::spawn(async move {
             loop {
                 let count = target_clone.load(Ordering::Relaxed);
                 if worker_id >= count {
+                    parked_count_clone.fetch_add(1, Ordering::Relaxed);
+                    notify_clone.notified().await;
+                    continue;
+                }
+                let active = active_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                if active >= 2 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                notify_clone.notified().await;
             }
         });
-        // Worker starts at id=1, target=2 → keeps running.
+
+        // Worker starts at id=1, target=2 and records one active pass.
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(!handle.is_finished(), "worker should still be running");
-        // Supervisor drops target to 1 → worker_id=1 ≥ target=1 → exit.
+        assert_eq!(active_count.load(Ordering::Relaxed), 1);
+
+        // Downscale to target=1 parks slot 1 instead of terminating it.
         target.store(1, Ordering::Relaxed);
+        notify.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(parked_count.load(Ordering::Relaxed), 1);
+        assert!(
+            !handle.is_finished(),
+            "parked worker slot should stay tracked"
+        );
+
+        // Upscale to target=2 wakes and reuses slot 1.
+        target.store(2, Ordering::Relaxed);
+        notify.notify_waiters();
         let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
         assert!(
             result.is_ok(),
-            "worker should self-exit within 200 ms after target drops below its id"
+            "parked worker slot should reactivate within 200 ms after target rises"
         );
+        assert_eq!(active_count.load(Ordering::Relaxed), 2);
     }
 }
