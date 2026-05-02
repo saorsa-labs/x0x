@@ -8,9 +8,47 @@ use crate::presence::PresenceWrapper;
 use saorsa_gossip_membership::{HyParViewMembership, MembershipConfig};
 use saorsa_gossip_transport::GossipStreamType;
 use saorsa_gossip_types::PeerId;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// X0X-0009 prototype: how often the adaptive worker supervisor samples
+/// recv_pump telemetry and decides whether to scale workers up or down.
+const PUBSUB_WORKER_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(30);
+/// X0X-0009 prototype: producer-rate-over-consumer-rate ratio above which
+/// the supervisor considers the dispatcher saturated and scales up.
+const PUBSUB_WORKER_SCALE_UP_RATIO: f64 = 1.10;
+/// X0X-0009 prototype: queue depth fraction above which scale-up fires
+/// regardless of producer/consumer ratio.
+const PUBSUB_WORKER_SCALE_UP_DEPTH_FRAC: f64 = 0.50;
+/// X0X-0009 prototype: queue depth fraction below which scale-down candidates
+/// accumulate. Workers scale back after this is sustained for several intervals.
+const PUBSUB_WORKER_SCALE_DOWN_DEPTH_FRAC: f64 = 0.05;
+/// X0X-0009 prototype: number of consecutive idle supervisor intervals required
+/// before a scale-down (hysteresis to prevent flapping).
+const PUBSUB_WORKER_SCALE_DOWN_INTERVALS: u64 = 10;
+/// X0X-0009 prototype: hard ceiling for adaptive scaling regardless of config.
+const PUBSUB_WORKER_MAX: usize = 16;
+/// X0X-0009 prototype: hard floor — at least one worker must always run.
+const PUBSUB_WORKER_MIN: usize = 1;
+/// X0X-0009 prototype: average per-message dispatch time (over the window)
+/// above which the dispatcher is "slow" and we should scale up — even if the
+/// queue has not filled yet. Catches the long-RTT case where each republish
+/// is bounded at 750 ms by the per-peer timeout but workers spend most of
+/// their time waiting on those timeouts.
+const PUBSUB_WORKER_SCALE_UP_AVG_DISPATCH_MS: f64 = 1_000.0;
+/// X0X-0009 prototype: dispatcher 30 s watchdog timeout rate above which we
+/// scale up immediately. Even one event per 10 s is operationally significant.
+const PUBSUB_WORKER_SCALE_UP_TIMEOUT_RATE: f64 = 0.10;
+/// X0X-0009 prototype: per-peer republish timeout rate above which an
+/// effective-worker calculation argues for more workers. Each timeout pins
+/// one worker for `PER_PEER_REPUBLISH_TIMEOUT` (750 ms). At 3/s on 4 workers
+/// that is ~56% of worker-time lost to timeouts.
+const PUBSUB_WORKER_PER_PEER_TIMEOUT_BUDGET: f64 = 0.30;
+/// X0X-0009 prototype: average per-message dispatch time below which the
+/// supervisor considers the dispatcher comfortable and accumulates idle
+/// intervals toward a scale-down.
+const PUBSUB_WORKER_SCALE_DOWN_AVG_DISPATCH_MS: f64 = 200.0;
 
 /// Maximum time to spend handling one inbound presence Bulk message.
 ///
@@ -250,12 +288,24 @@ impl std::fmt::Debug for GossipRuntime {
 
 async fn run_pubsub_dispatcher(
     worker_id: usize,
-    worker_count: usize,
+    target_count: Arc<AtomicUsize>,
     network: Arc<NetworkNode>,
     pubsub: Arc<PubSubManager>,
     dispatch_stats: Arc<GossipDispatchStats>,
 ) {
     loop {
+        // X0X-0009 prototype: worker self-exits when the supervisor has
+        // shrunk the target below this worker's id. Checked at top of each
+        // iteration so an in-flight message dispatch always completes.
+        let worker_count = target_count.load(Ordering::Relaxed);
+        if worker_id >= worker_count {
+            tracing::info!(
+                worker_id,
+                worker_count,
+                "X0X-0009 worker self-exit: supervisor shrank target below this id"
+            );
+            break;
+        }
         match network.receive_pubsub_message().await {
             Ok((peer, data)) => {
                 let (recv_depth, recv_capacity) =
@@ -317,9 +367,222 @@ async fn run_pubsub_dispatcher(
     }
     tracing::info!(
         worker_id,
-        worker_count,
+        target_count = target_count.load(Ordering::Relaxed),
         "Gossip PubSub dispatcher shut down"
     );
+}
+
+/// X0X-0009 prototype: a single sample of dispatcher health passed to the
+/// supervisor decision function. Combines the cumulative `recv_pump` /
+/// `dispatcher` / `pubsub_stages` snapshots into the windowed signals the
+/// policy actually needs: depth fraction, producer/consumer ratio, and the
+/// rates of slow-stage events over the supervisor interval (deltas computed
+/// by the supervisor task from one tick to the next).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SupervisorSample {
+    /// Lifetime producer rate (msg/s into the recv_pump).
+    pub producer_per_sec: f64,
+    /// Lifetime consumer rate (msg/s drained by the dispatcher).
+    pub consumer_per_sec: f64,
+    /// Most recent recv_pump queue depth.
+    pub latest_depth: u64,
+    /// recv_pump queue capacity.
+    pub capacity: u64,
+    /// Average per-message dispatch time over the supervisor interval (ms).
+    /// Computed as `delta(total_elapsed_ns) / max(delta(completed), 1)`.
+    pub recent_avg_dispatch_ms: f64,
+    /// Dispatcher 30 s watchdog timeouts per second over the interval.
+    pub recent_timeout_rate_per_sec: f64,
+    /// `pubsub_stages.republish_per_peer_timeout` events per second over the
+    /// interval. Each event represents one worker pinned for ~750 ms by a
+    /// slow remote peer. The supervisor treats this as effective-worker loss.
+    pub recent_per_peer_timeout_rate_per_sec: f64,
+}
+
+/// X0X-0009 prototype: pure decision function (no I/O, no time) that the
+/// supervisor calls every interval. Returns `(next_target, next_idle_intervals)`.
+///
+/// Scale-up signals (any one triggers +1, capped at `PUBSUB_WORKER_MAX`):
+/// 1. Queue depth ≥ 50% of capacity.
+/// 2. Producer / consumer rate ≥ `PUBSUB_WORKER_SCALE_UP_RATIO` (1.10).
+/// 3. Average dispatch time ≥ `PUBSUB_WORKER_SCALE_UP_AVG_DISPATCH_MS` (1 s).
+/// 4. Dispatcher watchdog timeout rate ≥ `PUBSUB_WORKER_SCALE_UP_TIMEOUT_RATE`
+///    (0.10/s; one event per 10 s).
+/// 5. Effective-worker fraction lost to per-peer timeouts ≥
+///    `PUBSUB_WORKER_PER_PEER_TIMEOUT_BUDGET` (30%).
+///
+/// Scale-down requires ALL of:
+/// - depth < 5% of capacity
+/// - producer ≤ consumer (or zero traffic)
+/// - average dispatch time < `PUBSUB_WORKER_SCALE_DOWN_AVG_DISPATCH_MS` (200 ms)
+/// - no recent dispatcher or per-peer timeouts
+/// - sustained for `PUBSUB_WORKER_SCALE_DOWN_INTERVALS` (10) consecutive
+///   supervisor intervals
+///
+/// Caller is responsible for spawning new workers when `next_target >
+/// current_target` (worker self-exit handles the shrink case via the
+/// per-worker top-of-loop check).
+fn supervisor_decide_target(
+    sample: SupervisorSample,
+    current_target: usize,
+    idle_intervals: u64,
+) -> (usize, u64) {
+    let depth_frac = if sample.capacity == 0 {
+        0.0
+    } else {
+        (sample.latest_depth as f64) / (sample.capacity as f64)
+    };
+    let producer_over_consumer = if sample.consumer_per_sec > 0.0 {
+        sample.producer_per_sec / sample.consumer_per_sec
+    } else {
+        0.0
+    };
+    // Effective-worker fraction lost to per-peer timeouts. Each per-peer
+    // timeout pins one worker for `PER_PEER_REPUBLISH_TIMEOUT` (750 ms);
+    // dividing by current_target gives the fraction of total worker-time
+    // the slow-peer path is consuming.
+    let per_peer_timeout_load = if current_target > 0 {
+        sample.recent_per_peer_timeout_rate_per_sec * 0.75 / (current_target as f64)
+    } else {
+        0.0
+    };
+
+    let saturated = depth_frac >= PUBSUB_WORKER_SCALE_UP_DEPTH_FRAC
+        || producer_over_consumer >= PUBSUB_WORKER_SCALE_UP_RATIO
+        || sample.recent_avg_dispatch_ms >= PUBSUB_WORKER_SCALE_UP_AVG_DISPATCH_MS
+        || sample.recent_timeout_rate_per_sec >= PUBSUB_WORKER_SCALE_UP_TIMEOUT_RATE
+        || per_peer_timeout_load >= PUBSUB_WORKER_PER_PEER_TIMEOUT_BUDGET;
+    if saturated {
+        let next = (current_target + 1).min(PUBSUB_WORKER_MAX);
+        return (next, 0);
+    }
+    let healthy = depth_frac < PUBSUB_WORKER_SCALE_DOWN_DEPTH_FRAC
+        && (sample.consumer_per_sec == 0.0 || producer_over_consumer <= 1.0)
+        && sample.recent_avg_dispatch_ms < PUBSUB_WORKER_SCALE_DOWN_AVG_DISPATCH_MS
+        && sample.recent_timeout_rate_per_sec == 0.0
+        && sample.recent_per_peer_timeout_rate_per_sec == 0.0;
+    if healthy && current_target > PUBSUB_WORKER_MIN {
+        let next_idle = idle_intervals + 1;
+        if next_idle >= PUBSUB_WORKER_SCALE_DOWN_INTERVALS {
+            return (current_target - 1, 0);
+        }
+        return (current_target, next_idle);
+    }
+    (current_target, idle_intervals)
+}
+
+/// X0X-0009 prototype: cumulative counters captured at the previous
+/// supervisor tick so the next tick can compute deltas. All values come
+/// from `network.recv_pump_diagnostics()`, `dispatch_stats.snapshot()`,
+/// and `pubsub.stage_stats()` — no direct counter access needed here.
+#[derive(Debug, Clone, Copy, Default)]
+struct SupervisorPrevious {
+    completed: u64,
+    timed_out: u64,
+    total_elapsed_ns: u64,
+    per_peer_timeout: u64,
+}
+
+async fn run_pubsub_worker_supervisor(
+    target_count: Arc<AtomicUsize>,
+    next_worker_id: Arc<AtomicUsize>,
+    network: Arc<NetworkNode>,
+    pubsub: Arc<PubSubManager>,
+    dispatch_stats: Arc<GossipDispatchStats>,
+) {
+    let mut idle_intervals: u64 = 0;
+    let mut previous = SupervisorPrevious::default();
+    let interval_secs = PUBSUB_WORKER_SUPERVISOR_INTERVAL.as_secs_f64().max(1.0);
+    let mut interval = tokio::time::interval(PUBSUB_WORKER_SUPERVISOR_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let recv_pump = network.recv_pump_diagnostics();
+        let ps = &recv_pump.pubsub;
+        let dispatcher = dispatch_stats.snapshot();
+        let stages = pubsub.stage_stats();
+
+        let cur_completed = dispatcher.pubsub.completed;
+        let cur_timed_out = dispatcher.pubsub.timed_out;
+        let cur_total_elapsed_ns = dispatcher.pubsub.total_elapsed_ns;
+        let cur_per_peer_timeout = stages.republish_per_peer_timeout;
+
+        let delta_completed = cur_completed.saturating_sub(previous.completed);
+        let delta_timed_out = cur_timed_out.saturating_sub(previous.timed_out);
+        let delta_total_elapsed_ns = cur_total_elapsed_ns.saturating_sub(previous.total_elapsed_ns);
+        let delta_per_peer_timeout = cur_per_peer_timeout.saturating_sub(previous.per_peer_timeout);
+
+        // Average dispatch time over the window: total elapsed ns divided by
+        // messages completed in the window. If nothing completed (idle), the
+        // metric is 0.0 — supervisor treats absence of work as healthy.
+        let recent_avg_dispatch_ms = if delta_completed > 0 {
+            (delta_total_elapsed_ns as f64 / delta_completed as f64) / 1_000_000.0
+        } else {
+            0.0
+        };
+        let recent_timeout_rate = (delta_timed_out as f64) / interval_secs;
+        let recent_per_peer_timeout_rate = (delta_per_peer_timeout as f64) / interval_secs;
+
+        let sample = SupervisorSample {
+            producer_per_sec: ps.producer_per_sec,
+            consumer_per_sec: ps.consumer_per_sec,
+            latest_depth: ps.latest_depth,
+            capacity: ps.capacity,
+            recent_avg_dispatch_ms,
+            recent_timeout_rate_per_sec: recent_timeout_rate,
+            recent_per_peer_timeout_rate_per_sec: recent_per_peer_timeout_rate,
+        };
+
+        previous = SupervisorPrevious {
+            completed: cur_completed,
+            timed_out: cur_timed_out,
+            total_elapsed_ns: cur_total_elapsed_ns,
+            per_peer_timeout: cur_per_peer_timeout,
+        };
+
+        let current_target = target_count.load(Ordering::Relaxed);
+        let (next_target, next_idle) =
+            supervisor_decide_target(sample, current_target, idle_intervals);
+        idle_intervals = next_idle;
+        if next_target == current_target {
+            continue;
+        }
+        target_count.store(next_target, Ordering::Relaxed);
+        dispatch_stats
+            .pubsub_workers
+            .store(usize_to_u64(next_target), Ordering::Relaxed);
+        tracing::info!(
+            previous_target = current_target,
+            next_target,
+            producer_per_sec = sample.producer_per_sec,
+            consumer_per_sec = sample.consumer_per_sec,
+            latest_depth = sample.latest_depth,
+            capacity = sample.capacity,
+            recent_avg_dispatch_ms = sample.recent_avg_dispatch_ms,
+            recent_timeout_rate_per_sec = sample.recent_timeout_rate_per_sec,
+            recent_per_peer_timeout_rate_per_sec = sample.recent_per_peer_timeout_rate_per_sec,
+            "X0X-0009 supervisor adjusted PubSub dispatcher target"
+        );
+        if next_target > current_target {
+            // Scale up — spawn new workers up to the new target. Each worker
+            // uses a fresh id allocated atomically so existing self-exit
+            // checks (worker_id >= target) keep working when the target later
+            // shrinks.
+            for _ in current_target..next_target {
+                let worker_id = next_worker_id.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(run_pubsub_dispatcher(
+                    worker_id,
+                    Arc::clone(&target_count),
+                    Arc::clone(&network),
+                    Arc::clone(&pubsub),
+                    Arc::clone(&dispatch_stats),
+                ));
+            }
+        }
+        // Scale-down case: target was lowered; the next mpsc::recv() top-of-
+        // loop check inside the highest-id worker will see worker_id >= target
+        // and exit. No explicit signaling needed.
+    }
 }
 
 async fn run_membership_dispatcher(
@@ -613,17 +876,31 @@ impl GossipRuntime {
         let presence = self.presence();
         let dispatch_stats = Arc::clone(&self.dispatch_stats);
 
+        // X0X-0009 prototype: target_count starts at the configured value
+        // and is mutated at runtime by the supervisor below. next_worker_id
+        // is the rolling id allocator so spawn-on-scale-up never collides
+        // with a still-live worker's id.
         let pubsub_worker_count = self.config.dispatch_workers;
+        let target_count = Arc::new(AtomicUsize::new(pubsub_worker_count));
+        let next_worker_id = Arc::new(AtomicUsize::new(pubsub_worker_count));
         let mut pubsub_handles = Vec::with_capacity(pubsub_worker_count);
         for worker_id in 0..pubsub_worker_count {
             pubsub_handles.push(tokio::spawn(run_pubsub_dispatcher(
                 worker_id,
-                pubsub_worker_count,
+                Arc::clone(&target_count),
                 Arc::clone(&network),
                 Arc::clone(&pubsub),
                 Arc::clone(&dispatch_stats),
             )));
         }
+        let supervisor_handle = tokio::spawn(run_pubsub_worker_supervisor(
+            Arc::clone(&target_count),
+            Arc::clone(&next_worker_id),
+            Arc::clone(&network),
+            Arc::clone(&pubsub),
+            Arc::clone(&dispatch_stats),
+        ));
+        pubsub_handles.push(supervisor_handle);
         let membership_handle = tokio::spawn(run_membership_dispatcher(
             Arc::clone(&network),
             membership,
@@ -868,5 +1145,305 @@ mod tests {
             .expect("Failed to create runtime");
 
         assert_eq!(runtime.dispatch_stats().pubsub_workers, 2);
+    }
+
+    // ── X0X-0009 supervisor decision tests ──────────────────────────────
+    // These exercise the pure decision function with synthetic telemetry
+    // so we can prove the scale-up / scale-down / hysteresis logic without
+    // spinning up a real network. The supervisor task itself only does
+    // (a) sample telemetry, (b) compute deltas, (c) call this function,
+    // (d) spawn workers when target grew — all the policy is here.
+
+    /// Build a SupervisorSample with the given depth-related signals and
+    /// "stage signals all zero" defaults. Used by older tests written before
+    /// the per-stage windowed signals were added; the dispatch_avg/timeout
+    /// values are 0.0 so those gates never fire.
+    fn sample_depth_only(
+        producer: f64,
+        consumer: f64,
+        depth: u64,
+        capacity: u64,
+    ) -> SupervisorSample {
+        SupervisorSample {
+            producer_per_sec: producer,
+            consumer_per_sec: consumer,
+            latest_depth: depth,
+            capacity,
+            recent_avg_dispatch_ms: 0.0,
+            recent_timeout_rate_per_sec: 0.0,
+            recent_per_peer_timeout_rate_per_sec: 0.0,
+        }
+    }
+
+    #[test]
+    fn supervisor_decide_target_scales_up_on_high_depth() {
+        let (next, idle) =
+            supervisor_decide_target(sample_depth_only(50.0, 50.0, 6_000, 10_000), 1, 0);
+        assert_eq!(next, 2);
+        assert_eq!(idle, 0);
+    }
+
+    #[test]
+    fn supervisor_decide_target_scales_up_on_producer_overshoot() {
+        let (next, idle) =
+            supervisor_decide_target(sample_depth_only(80.0, 50.0, 100, 10_000), 2, 5);
+        assert_eq!(next, 3);
+        assert_eq!(idle, 0);
+    }
+
+    #[test]
+    fn supervisor_decide_target_holds_when_balanced() {
+        let (next, idle) =
+            supervisor_decide_target(sample_depth_only(50.0, 50.0, 200, 10_000), 4, 3);
+        assert_eq!(next, 4);
+        assert_eq!(idle, 4);
+    }
+
+    #[test]
+    fn supervisor_decide_target_scales_down_after_sustained_idle() {
+        let (next, idle) =
+            supervisor_decide_target(sample_depth_only(50.0, 50.0, 200, 10_000), 4, 9);
+        assert_eq!(next, 3);
+        assert_eq!(idle, 0);
+    }
+
+    #[test]
+    fn supervisor_decide_target_never_drops_below_floor() {
+        let (next, idle) = supervisor_decide_target(sample_depth_only(0.0, 0.0, 0, 10_000), 1, 9);
+        assert_eq!(next, 1);
+        assert_eq!(idle, 9);
+    }
+
+    #[test]
+    fn supervisor_decide_target_caps_at_ceiling() {
+        let (next, idle) =
+            supervisor_decide_target(sample_depth_only(500.0, 50.0, 9_999, 10_000), 16, 0);
+        assert_eq!(next, 16);
+        assert_eq!(idle, 0);
+    }
+
+    #[test]
+    fn supervisor_decide_target_handles_cold_start_zero_consumer() {
+        let (next, _idle) =
+            supervisor_decide_target(sample_depth_only(50.0, 0.0, 6_000, 10_000), 1, 0);
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn supervisor_decide_target_hysteresis_resets_on_resaturation() {
+        let (next, idle) =
+            supervisor_decide_target(sample_depth_only(80.0, 50.0, 100, 10_000), 4, 8);
+        assert_eq!(next, 5);
+        assert_eq!(idle, 0);
+    }
+
+    // ── New per-stage windowed-signal tests (the X0X-0009 iteration b
+    //    additions: react to dispatcher slowness predictively, not just
+    //    after the queue fills) ────────────────────────────────────────
+
+    #[test]
+    fn supervisor_decide_target_scales_up_on_slow_average_dispatch() {
+        // Queue is empty, prod==cons — but each message is taking 1.2 s on
+        // average. That's a clear sign the dispatcher is sweating. Scale up.
+        let sample = SupervisorSample {
+            producer_per_sec: 50.0,
+            consumer_per_sec: 50.0,
+            latest_depth: 50,
+            capacity: 10_000,
+            recent_avg_dispatch_ms: 1_200.0,
+            recent_timeout_rate_per_sec: 0.0,
+            recent_per_peer_timeout_rate_per_sec: 0.0,
+        };
+        let (next, idle) = supervisor_decide_target(sample, 2, 4);
+        assert_eq!(next, 3);
+        assert_eq!(idle, 0);
+    }
+
+    #[test]
+    fn supervisor_decide_target_scales_up_on_dispatcher_timeout_rate() {
+        // Even one watchdog timeout per 10 s is operationally significant.
+        let sample = SupervisorSample {
+            producer_per_sec: 30.0,
+            consumer_per_sec: 30.0,
+            latest_depth: 100,
+            capacity: 10_000,
+            recent_avg_dispatch_ms: 50.0,
+            recent_timeout_rate_per_sec: 0.10,
+            recent_per_peer_timeout_rate_per_sec: 0.0,
+        };
+        let (next, idle) = supervisor_decide_target(sample, 1, 0);
+        assert_eq!(next, 2);
+        assert_eq!(idle, 0);
+    }
+
+    #[test]
+    fn supervisor_decide_target_scales_up_on_per_peer_timeout_load() {
+        // The long-RTT scenario: dispatcher looks fine on every other axis,
+        // but per-peer timeouts are draining ~30% of worker-time. The
+        // effective-worker calculation says we need more workers to keep
+        // up. With 4 workers and 1.6/s timeouts × 0.75 s = 1.2 s of
+        // worker-time per second = 30% load — exactly at the threshold.
+        let sample = SupervisorSample {
+            producer_per_sec: 50.0,
+            consumer_per_sec: 50.0,
+            latest_depth: 200,
+            capacity: 10_000,
+            recent_avg_dispatch_ms: 100.0,
+            recent_timeout_rate_per_sec: 0.0,
+            recent_per_peer_timeout_rate_per_sec: 1.6,
+        };
+        let (next, idle) = supervisor_decide_target(sample, 4, 5);
+        assert_eq!(next, 5);
+        assert_eq!(idle, 0);
+    }
+
+    #[test]
+    fn supervisor_decide_target_low_per_peer_timeout_load_does_not_scale() {
+        // Same shape as the per_peer_timeout_load test but only 0.2/s on 4
+        // workers = ~3.75% effective load. Below the 30% scale-up budget.
+        // No scale-up. The idle counter does NOT advance either, because
+        // ANY per-peer timeout breaks the "healthy" predicate — the
+        // supervisor refuses to shrink while peers are even occasionally
+        // slow. This is the conservative default; users can lower it
+        // explicitly if they want eager scale-down.
+        let sample = SupervisorSample {
+            producer_per_sec: 50.0,
+            consumer_per_sec: 50.0,
+            latest_depth: 200,
+            capacity: 10_000,
+            recent_avg_dispatch_ms: 100.0,
+            recent_timeout_rate_per_sec: 0.0,
+            recent_per_peer_timeout_rate_per_sec: 0.2,
+        };
+        let (next, idle) = supervisor_decide_target(sample, 4, 5);
+        assert_eq!(next, 4);
+        assert_eq!(
+            idle, 5,
+            "any per-peer timeout in the window blocks scale-down accumulation"
+        );
+    }
+
+    #[test]
+    fn supervisor_decide_target_scale_down_blocked_by_recent_per_peer_timeout() {
+        // Depth low, prod==cons, dispatch fast — but ANY per-peer timeout
+        // in the window is enough to block the scale-down. The supervisor
+        // refuses to lose a worker while peers are even occasionally slow.
+        let sample = SupervisorSample {
+            producer_per_sec: 50.0,
+            consumer_per_sec: 50.0,
+            latest_depth: 50,
+            capacity: 10_000,
+            recent_avg_dispatch_ms: 50.0,
+            recent_timeout_rate_per_sec: 0.0,
+            recent_per_peer_timeout_rate_per_sec: 0.05,
+        };
+        let (next, idle) = supervisor_decide_target(sample, 4, 9);
+        // No scale-down; idle counter does NOT advance because the
+        // per-peer-timeout rate broke the "healthy" predicate.
+        assert_eq!(next, 4);
+        assert_eq!(idle, 9);
+    }
+
+    #[test]
+    fn supervisor_decide_target_scale_down_blocked_by_slow_dispatch() {
+        // Depth low, no timeouts, but average dispatch time is 250 ms (above
+        // the 200 ms scale-down ceiling). Don't shrink — workers are working.
+        let sample = SupervisorSample {
+            producer_per_sec: 50.0,
+            consumer_per_sec: 50.0,
+            latest_depth: 50,
+            capacity: 10_000,
+            recent_avg_dispatch_ms: 250.0,
+            recent_timeout_rate_per_sec: 0.0,
+            recent_per_peer_timeout_rate_per_sec: 0.0,
+        };
+        let (next, idle) = supervisor_decide_target(sample, 4, 9);
+        assert_eq!(next, 4);
+        assert_eq!(idle, 9);
+    }
+
+    #[test]
+    fn supervisor_decide_target_scale_down_after_sustained_full_health() {
+        // All four "healthy" conditions hold for 10 consecutive intervals →
+        // scale down by one. This is the precise inverse of the new gates.
+        let sample = SupervisorSample {
+            producer_per_sec: 30.0,
+            consumer_per_sec: 30.0,
+            latest_depth: 50,
+            capacity: 10_000,
+            recent_avg_dispatch_ms: 50.0,
+            recent_timeout_rate_per_sec: 0.0,
+            recent_per_peer_timeout_rate_per_sec: 0.0,
+        };
+        let (next, idle) = supervisor_decide_target(sample, 4, 9);
+        assert_eq!(next, 3);
+        assert_eq!(idle, 0);
+    }
+
+    #[test]
+    fn supervisor_decide_target_long_rtt_simulation_converges() {
+        // Walk a 10-tick simulation that mimics the X0X-0008 sydney evidence:
+        // producer 80/s, dispatch ~150 ms, per-peer timeouts at 2/s (= 50%
+        // load on 4 workers, drops to 25% on 8). Start at 1, observe the
+        // supervisor scale up monotonically until per_peer_timeout_load
+        // falls below the 30% budget. Verifies the loop converges and does
+        // not over-shoot.
+        let mut target = 1usize;
+        let mut idle = 0u64;
+        for _ in 0..10 {
+            // Per-peer timeout load = 2.0 * 0.75 / target = 1.5 / target.
+            // At target=1: 1.50 > 0.30 → scale up
+            // At target=2: 0.75 > 0.30 → scale up
+            // At target=4: 0.375 > 0.30 → scale up
+            // At target=5: 0.30 == 0.30 → scale up (>= threshold)
+            // At target=6: 0.25 < 0.30 → no further scale
+            let sample = SupervisorSample {
+                producer_per_sec: 80.0,
+                consumer_per_sec: 80.0,
+                latest_depth: 100,
+                capacity: 10_000,
+                recent_avg_dispatch_ms: 150.0,
+                recent_timeout_rate_per_sec: 0.0,
+                recent_per_peer_timeout_rate_per_sec: 2.0,
+            };
+            let (next, next_idle) = supervisor_decide_target(sample, target, idle);
+            target = next;
+            idle = next_idle;
+        }
+        assert_eq!(
+            target, 6,
+            "supervisor should converge at target=6 where per-peer timeout load drops below 30%"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_self_exits_when_target_drops_below_id() {
+        // Spawn a stub worker via the same loop shape the real dispatcher
+        // uses (target_count.load → break if id ≥ target). Drop the target
+        // below the worker's id and verify the worker terminates within a
+        // bounded poll budget. Proves the self-exit pattern works under
+        // tokio scheduling.
+        let target = Arc::new(AtomicUsize::new(2));
+        let target_clone = Arc::clone(&target);
+        let worker_id = 1usize;
+        let handle = tokio::spawn(async move {
+            loop {
+                let count = target_clone.load(Ordering::Relaxed);
+                if worker_id >= count {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        // Worker starts at id=1, target=2 → keeps running.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!handle.is_finished(), "worker should still be running");
+        // Supervisor drops target to 1 → worker_id=1 ≥ target=1 → exit.
+        target.store(1, Ordering::Relaxed);
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        assert!(
+            result.is_ok(),
+            "worker should self-exit within 200 ms after target drops below its id"
+        );
     }
 }
