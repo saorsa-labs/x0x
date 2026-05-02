@@ -61,6 +61,8 @@ LEGACY_RESULTS_TOPIC = "x0x.test.results.v1"
 SSE_RECONNECT_BACKOFF_SECS = 2
 PUBLISH_RETRY_BACKOFF_SECS = 1
 PUBLISH_RETRY_MAX = 3
+TEST_DM_RETRY_BACKOFF_SECS = 1
+TEST_DM_RETRY_MAX = 3
 # Direct-DM result delivery does NOT request the raw-QUIC receive-ACK.
 # That path fast-fails with `peer_disconnected` when the QUIC connection
 # is momentarily superseded (a normal occurrence on a long-lived live
@@ -779,52 +781,85 @@ class TestRunner:
                 )
                 + payload
             )
-        try:
-            t0 = time.time()
-            resp = self.client.direct_send(
-                recipient,
-                payload,
-                require_ack_ms=require_ack_ms,
-            )
-            elapsed_ms = int((time.time() - t0) * 1000)
-            self._enqueue_result(
-                {
-                    "kind": "send_result",
-                    "command_id": cmd_id,
-                    "request_id": request_id,
-                    "outcome": "ok" if resp.get("ok") else {"error": resp},
-                    "digest_marker": digest,
-                    "details": {
-                        "path": resp.get("path"),
-                        "retries_used": resp.get("retries_used"),
-                        "remote_request_id": resp.get("request_id"),
-                        "wall_clock_ms": elapsed_ms,
-                        "recipient_aid": recipient,
-                    },
-                },
-                target_aid=anchor_aid,
-            )
-        except urllib.error.HTTPError as exc:
+        t0 = time.time()
+        last_error: Dict[str, Any] = {}
+        last_status: Optional[int] = None
+        for attempt in range(1, TEST_DM_RETRY_MAX + 1):
             try:
-                body = json.loads(exc.read())
-            except Exception:
-                body = {"status": exc.code, "reason": exc.reason}
-            elapsed_ms = int((time.time() - t0) * 1000)
-            self._enqueue_result(
-                {
-                    "kind": "send_result",
-                    "command_id": cmd_id,
-                    "request_id": request_id,
-                    "outcome": {"error": body},
-                    "digest_marker": digest,
-                    "details": {
-                        "wall_clock_ms": elapsed_ms,
-                        "recipient_aid": recipient,
-                        "http_status": exc.code,
+                resp = self.client.direct_send(
+                    recipient,
+                    payload,
+                    require_ack_ms=require_ack_ms,
+                )
+                elapsed_ms = int((time.time() - t0) * 1000)
+                self._enqueue_result(
+                    {
+                        "kind": "send_result",
+                        "command_id": cmd_id,
+                        "request_id": request_id,
+                        "outcome": "ok" if resp.get("ok") else {"error": resp},
+                        "digest_marker": digest,
+                        "details": {
+                            "path": resp.get("path"),
+                            "retries_used": resp.get("retries_used"),
+                            "remote_request_id": resp.get("request_id"),
+                            "wall_clock_ms": elapsed_ms,
+                            "recipient_aid": recipient,
+                            "runner_attempts": attempt,
+                        },
                     },
-                },
-                target_aid=anchor_aid,
-            )
+                    target_aid=anchor_aid,
+                )
+                return
+            except urllib.error.HTTPError as exc:
+                try:
+                    last_error = json.loads(exc.read())
+                except Exception:
+                    last_error = {"status": exc.code, "reason": exc.reason}
+                last_status = exc.code
+                self.log.debug(
+                    "test DM attempt %d/%d to %s… HTTP %d: %s",
+                    attempt,
+                    TEST_DM_RETRY_MAX,
+                    recipient[:16],
+                    exc.code,
+                    last_error,
+                )
+                if exc.code == 404:
+                    break
+            except Exception as exc:
+                last_error = {"error": str(exc)}
+                last_status = None
+                self.log.debug(
+                    "test DM attempt %d/%d to %s… failed: %s",
+                    attempt,
+                    TEST_DM_RETRY_MAX,
+                    recipient[:16],
+                    exc,
+                )
+
+            if attempt < TEST_DM_RETRY_MAX:
+                time.sleep(TEST_DM_RETRY_BACKOFF_SECS * attempt)
+
+        elapsed_ms = int((time.time() - t0) * 1000)
+        details: Dict[str, Any] = {
+            "wall_clock_ms": elapsed_ms,
+            "recipient_aid": recipient,
+            "runner_attempts": attempt,
+        }
+        if last_status is not None:
+            details["http_status"] = last_status
+        self._enqueue_result(
+            {
+                "kind": "send_result",
+                "command_id": cmd_id,
+                "request_id": request_id,
+                "outcome": {"error": last_error},
+                "digest_marker": digest,
+                "details": details,
+            },
+            target_aid=anchor_aid,
+        )
 
     # ─── Phase B: groups + contacts dispatch ───────────────────────────
     #

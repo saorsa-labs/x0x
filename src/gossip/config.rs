@@ -35,13 +35,13 @@ pub struct GossipConfig {
 
     /// Number of concurrent PubSub decode/verify/fanout workers draining the
     /// inbound PubSub queue. Default stays 1 for one release cycle so rollback
-    /// is a config-only change; operators can raise it to 2–8 for X0X-0005
-    /// soak validation.
+    /// is a config-only change; operators can raise it to 2-16 for X0X-0005
+    /// and X0X-0008 soak validation.
     #[serde(default = "default_dispatch_workers")]
     pub dispatch_workers: usize,
 }
 
-const MAX_DISPATCH_WORKERS: usize = 8;
+const MAX_DISPATCH_WORKERS: usize = 16;
 
 const fn default_active_view_size() -> usize {
     6

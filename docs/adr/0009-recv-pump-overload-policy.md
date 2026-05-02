@@ -58,7 +58,7 @@ The 2026-05-02 eight-hour VPS saturation event met the follow-up condition above
 
 Decision:
 
-- Add `gossip.dispatch_workers` (default `1`, valid range `1..=8`) as the rollback knob for parallel PubSub dispatch.
+- Add `gossip.dispatch_workers` (default `1`, valid range `1..=16`) as the rollback knob for parallel PubSub dispatch.
 - When `dispatch_workers > 1`, x0x spawns that many PubSub dispatcher tasks. They share the existing `recv_pubsub_rx` mpsc receiver as a work queue through the receiver mutex; each worker dequeues one frame, applies the existing per-message 30 s timeout, and calls `PubSubManager::handle_incoming` independently.
 - PlumTree state remains inside `saorsa-gossip-pubsub` and is protected by its per-topic `RwLock`. Deduplication/cache mutation stays under that lock; network fanout still happens after the lock is released.
 - Per-message timeout semantics become per-worker: one stuck EAGER fanout can pin one worker, but the remaining workers continue draining. If every worker is pinned, X0X-0004's `try_send`/`dropped_full` overload policy remains the safety net.

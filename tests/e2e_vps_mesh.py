@@ -4,14 +4,14 @@
 Drives the full 6-node fleet through *one* SSH tunnel to an anchor node.
 All test actions flow as direct DMs from the anchor's agent to each
 runner's agent; results return as direct DMs captured on the anchor's
-``/direct/events`` SSE stream. Pubsub is used exactly once, for the
-anchor announcement during discover.
+``/direct/events`` SSE stream. Pubsub is used only during discover, with
+bounded republish while runners are still missing.
 
 Architecture::
 
     Mac harness ──SSH tunnel──► anchor daemon ──QUIC mesh──► every node
         │                            │
-        │                            ├── publishes one discover envelope
+        │                            ├── republishes discover envelopes
         │                            │   on x0x.test.discover.v1
         │                            │   carrying anchor_aid
         │                            │
@@ -464,11 +464,12 @@ def _enqueue_result_envelope(
 def publish_discover(
     client: X0xClient, anchor_aid: str, request_id: str
 ) -> None:
-    """One-shot pubsub announcement carrying anchor_aid for runners.
+    """Pubsub announcement carrying anchor_aid for runners.
 
     Every subsequent command flows as a direct DM, but discovery is a
     chicken/egg case — runners don't yet know who the orchestrator is —
-    so we use exactly one pubsub round here to bootstrap.
+    so discover_runners republishes this envelope until every runner has
+    replied or the discovery window expires.
     """
     payload = json.dumps(
         {
