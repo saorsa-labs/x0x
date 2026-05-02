@@ -6,22 +6,31 @@ use serde::{Deserialize, Serialize};
 ///
 /// These parameters control the HyParView membership protocol behavior and
 /// x0x's receive-side dispatch pipeline.
+///
+/// All fields are individually `#[serde(default)]` so an operator can write a
+/// partial `[gossip]` section in TOML (for example only `dispatch_workers = 4`)
+/// without having to repeat every other tunable. Any unspecified field falls
+/// back to the value from `GossipConfig::default()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipConfig {
     /// Size of active view (peers we actively gossip with).
     /// Default: 6
+    #[serde(default = "default_active_view_size")]
     pub active_view_size: usize,
 
     /// Size of passive view (backup peers for failure recovery).
     /// Default: 30
+    #[serde(default = "default_passive_view_size")]
     pub passive_view_size: usize,
 
     /// Active Random Walk Length - hops for FORWARD_JOIN in active view.
     /// Default: 6
+    #[serde(default = "default_arwl")]
     pub arwl: usize,
 
     /// Passive Random Walk Length - hops for FORWARD_JOIN in passive view.
     /// Default: 3
+    #[serde(default = "default_prwl")]
     pub prwl: usize,
 
     /// Number of concurrent PubSub decode/verify/fanout workers draining the
@@ -33,6 +42,22 @@ pub struct GossipConfig {
 }
 
 const MAX_DISPATCH_WORKERS: usize = 8;
+
+const fn default_active_view_size() -> usize {
+    6
+}
+
+const fn default_passive_view_size() -> usize {
+    30
+}
+
+const fn default_arwl() -> usize {
+    6
+}
+
+const fn default_prwl() -> usize {
+    3
+}
 
 const fn default_dispatch_workers() -> usize {
     1
@@ -113,5 +138,32 @@ mod tests {
             ..Default::default()
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn partial_toml_section_falls_back_to_defaults() {
+        // Operators must be able to override a single field without repeating
+        // the rest of the struct. This guards against the regression that
+        // shipped briefly during the X0X-0005 soak rollout where missing
+        // `active_view_size` in a partial `[gossip]` section caused x0xd to
+        // restart-loop on every node.
+        let cfg: GossipConfig = toml::from_str("dispatch_workers = 4").expect("partial TOML");
+        let defaults = GossipConfig::default();
+        assert_eq!(cfg.dispatch_workers, 4);
+        assert_eq!(cfg.active_view_size, defaults.active_view_size);
+        assert_eq!(cfg.passive_view_size, defaults.passive_view_size);
+        assert_eq!(cfg.arwl, defaults.arwl);
+        assert_eq!(cfg.prwl, defaults.prwl);
+    }
+
+    #[test]
+    fn empty_toml_section_yields_full_defaults() {
+        let cfg: GossipConfig = toml::from_str("").expect("empty TOML");
+        let defaults = GossipConfig::default();
+        assert_eq!(cfg.active_view_size, defaults.active_view_size);
+        assert_eq!(cfg.passive_view_size, defaults.passive_view_size);
+        assert_eq!(cfg.arwl, defaults.arwl);
+        assert_eq!(cfg.prwl, defaults.prwl);
+        assert_eq!(cfg.dispatch_workers, defaults.dispatch_workers);
     }
 }
