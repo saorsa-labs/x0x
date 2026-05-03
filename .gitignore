@@ -13,7 +13,8 @@ __pycache__
 .claude/scheduled_tasks.lock
 .gstack/
 tests/.vps-tokens.env
-.config/
+.config/*
+!.config/nextest.toml
 test-results/
 fuzz/corpus/
 fuzz/artifacts/

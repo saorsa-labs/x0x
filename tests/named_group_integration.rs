@@ -14,7 +14,7 @@ mod cluster;
 #[path = "harness/src/daemon.rs"]
 mod daemon;
 
-use cluster::pair;
+use cluster::{pair, AgentInstance};
 use daemon::DaemonFixture;
 
 async fn daemon() -> DaemonFixture {
@@ -78,6 +78,15 @@ where
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn group_state_hash(d: &AgentInstance, group_id: &str) -> Option<String> {
+    let resp = d.get(&format!("/groups/{group_id}/state")).await;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: Value = resp.json().await.unwrap_or_default();
+    body["state_hash"].as_str().map(ToString::to_string)
 }
 
 // ===========================================================================
@@ -995,21 +1004,15 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
         .await
         .unwrap();
     assert_eq!(bob_join["ok"], true);
+    let bob_group_id = bob_join["group_id"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
 
     let bob_agent_id = bob.agent_id().await;
-    let add_resp: Value = alice
-        .post(
-            &format!("/groups/{group_id}/members"),
-            serde_json::json!({"agent_id": bob_agent_id, "display_name": "Bob Authoritative"}),
-        )
-        .await
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(add_resp["ok"], true, "add response: {add_resp:?}");
 
-    let added_seen = wait_until(Duration::from_secs(15), || async {
-        let info: Value = bob
+    let alice_sees_bob = wait_until(Duration::from_secs(15), || async {
+        let info: Value = alice
             .get(&format!("/groups/{group_id}/members"))
             .await
             .json()
@@ -1017,17 +1020,24 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
             .unwrap_or_default();
         info["members"]
             .as_array()
-            .map(|members| {
-                members
-                    .iter()
-                    .any(|m| m["display_name"] == "Bob Authoritative")
-            })
+            .map(|members| members.iter().any(|m| m["agent_id"] == bob_agent_id))
             .unwrap_or(false)
     })
     .await;
     assert!(
-        added_seen,
-        "bob never observed creator-authored membership update"
+        alice_sees_bob,
+        "alice never observed bob's invite join before removal"
+    );
+    let alice_hash = group_state_hash(alice, &group_id)
+        .await
+        .expect("alice state hash after bob join");
+    let bob_caught_up = wait_until(Duration::from_secs(15), || async {
+        group_state_hash(bob, &bob_group_id).await.as_deref() == Some(alice_hash.as_str())
+    })
+    .await;
+    assert!(
+        bob_caught_up,
+        "bob never applied alice's authoritative member add before removal"
     );
 
     let remove_resp: Value = alice
@@ -1039,7 +1049,7 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
     assert_eq!(remove_resp["ok"], true, "remove response: {remove_resp:?}");
 
     let removed_seen = wait_until(Duration::from_secs(15), || async {
-        let resp = bob.get(&format!("/groups/{group_id}")).await;
+        let resp = bob.get(&format!("/groups/{bob_group_id}")).await;
         resp.status() == StatusCode::NOT_FOUND
     })
     .await;
@@ -1236,21 +1246,15 @@ async fn named_group_creator_delete_propagates_to_peer() {
         .await
         .unwrap();
     assert_eq!(bob_join["ok"], true);
+    let bob_group_id = bob_join["group_id"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
 
     let bob_agent_id = bob.agent_id().await;
-    let add_resp: Value = alice
-        .post(
-            &format!("/groups/{group_id}/members"),
-            serde_json::json!({"agent_id": bob_agent_id, "display_name": "Bob Authoritative"}),
-        )
-        .await
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(add_resp["ok"], true, "add response: {add_resp:?}");
 
-    let added_seen = wait_until(Duration::from_secs(15), || async {
-        let info: Value = bob
+    let alice_sees_bob = wait_until(Duration::from_secs(15), || async {
+        let info: Value = alice
             .get(&format!("/groups/{group_id}/members"))
             .await
             .json()
@@ -1258,17 +1262,24 @@ async fn named_group_creator_delete_propagates_to_peer() {
             .unwrap_or_default();
         info["members"]
             .as_array()
-            .map(|members| {
-                members
-                    .iter()
-                    .any(|m| m["display_name"] == "Bob Authoritative")
-            })
+            .map(|members| members.iter().any(|m| m["agent_id"] == bob_agent_id))
             .unwrap_or(false)
     })
     .await;
     assert!(
-        added_seen,
-        "bob never observed creator-authored membership update before delete"
+        alice_sees_bob,
+        "alice never observed bob's invite join before delete"
+    );
+    let alice_hash = group_state_hash(alice, &group_id)
+        .await
+        .expect("alice state hash after bob join");
+    let bob_caught_up = wait_until(Duration::from_secs(15), || async {
+        group_state_hash(bob, &bob_group_id).await.as_deref() == Some(alice_hash.as_str())
+    })
+    .await;
+    assert!(
+        bob_caught_up,
+        "bob never applied alice's authoritative member add before delete"
     );
 
     let delete_resp: Value = alice
@@ -1280,7 +1291,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
     assert_eq!(delete_resp["ok"], true, "delete response: {delete_resp:?}");
 
     let deleted_seen = wait_until(Duration::from_secs(15), || async {
-        let resp = bob.get(&format!("/groups/{group_id}")).await;
+        let resp = bob.get(&format!("/groups/{bob_group_id}")).await;
         resp.status() == StatusCode::NOT_FOUND
     })
     .await;

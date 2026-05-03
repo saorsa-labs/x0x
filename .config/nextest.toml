@@ -1,0 +1,23 @@
+[profile.default]
+# Network integration tests need longer timeouts for QUIC handshakes
+# and gossip propagation on macOS
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# Tests that create multiple QUIC endpoints on localhost must not run
+# concurrently on macOS — ant-quic's dual-stack socket handling causes
+# intermittent connection failures and hangs when many endpoints share
+# the loopback interface. Serialise them via a shared test group.
+[test-groups.quic-localhost]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "test(mesh_connections) | test(/^test_local_/)"
+test-group = "quic-localhost"
+
+[[profile.default.overrides]]
+filter = "test(/^d4_/) | test(/^c2_/) | test(/^e_/)"
+test-group = "quic-localhost"
+
+[[profile.default.overrides]]
+filter = "binary(named_group_join_metadata_event) | binary(named_group_integration)"
+test-group = "quic-localhost"
