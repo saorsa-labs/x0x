@@ -7127,17 +7127,17 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
     let Some(metadata_topic) = metadata_topic else {
         return;
     };
+    let mut sub = match state.agent.subscribe(&metadata_topic).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            tracing::warn!(group_id = %group_id, topic = %metadata_topic, "failed to subscribe to named-group metadata topic: {e}");
+            return;
+        }
+    };
     let group_id = group_id.to_string();
     let task_group_id = group_id.clone();
     let state_for_task = Arc::clone(&state);
     let handle = tokio::spawn(async move {
-        let mut sub = match state_for_task.agent.subscribe(&metadata_topic).await {
-            Ok(sub) => sub,
-            Err(e) => {
-                tracing::warn!(group_id = %task_group_id, topic = %metadata_topic, "failed to subscribe to named-group metadata topic: {e}");
-                return;
-            }
-        };
         let mut shutdown_rx = state_for_task.shutdown_notify.subscribe();
         loop {
             tokio::select! {
@@ -7848,15 +7848,9 @@ async fn spawn_global_public_message_listener(state: Arc<AppState>) {
 /// Spawn a listener on `x0x.groups.public.{group_id}`. Idempotent — a
 /// duplicate call for the same group_id is a no-op.
 ///
-/// The pubsub subscribe is performed *inside* the spawned task so the
-/// caller returns immediately, matching the pattern in
-/// `ensure_named_group_metadata_listener`. Awaiting `subscribe` inline
-/// would block the calling request handler under gossip back-pressure
-/// (the recv pipeline can saturate at high throughput), which produces
-/// the symptom of `POST /groups`/`/groups/join`/`/groups/cards/import`
-/// hanging until the client times out. Spawning shifts the subscribe
-/// off the request path while still ensuring the listener is registered
-/// promptly afterwards.
+/// The pubsub subscribe is completed before returning so the first public
+/// message published after group creation/join cannot race ahead of the local
+/// listener. The spawned task owns only the receive loop.
 async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     {
         let tasks = state.public_message_tasks.read().await;
@@ -7865,18 +7859,18 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
         }
     }
     let topic = x0x::groups::public_topic_for(&group_id);
+    let mut sub = match state.agent.subscribe(&topic).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(topic = %topic, "E: failed to subscribe to public chat: {e}");
+            return;
+        }
+    };
     let state_for_listener = Arc::clone(&state);
     let group_id_for_listener = group_id.clone();
     let topic_for_log = topic.clone();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
     let handle = tokio::spawn(async move {
-        let mut sub = match state_for_listener.agent.subscribe(&topic_for_log).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(topic = %topic_for_log, "E: failed to subscribe to public chat: {e}");
-                return;
-            }
-        };
         tracing::info!(topic = %topic_for_log, "E: public-message listener subscribed");
         loop {
             tokio::select! {
