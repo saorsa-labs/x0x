@@ -84,6 +84,13 @@ const PRESENCE_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const PUBSUB_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum time to spend handling one inbound membership message.
 const MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Fixed worker count for the HyParView/SWIM membership control stream.
+///
+/// Membership traffic is lower-volume than PubSub, so it does not need the
+/// full adaptive supervisor. It still must not be single-consumer in production:
+/// slow WAN SWIM exchanges can otherwise pin the lone dispatcher for the full
+/// watchdog timeout and leave the control-plane queue near capacity.
+const MEMBERSHIP_DISPATCH_WORKERS: usize = 4;
 
 /// Per-stream dispatcher counters.
 #[derive(Debug, Default)]
@@ -204,6 +211,7 @@ pub struct GossipDispatchStats {
     membership_queue: DispatchQueueStats,
     bulk_queue: DispatchQueueStats,
     pubsub_workers: AtomicU64,
+    membership_workers: AtomicU64,
 }
 
 /// JSON-friendly snapshot of [`GossipDispatchStats`].
@@ -215,6 +223,8 @@ pub struct GossipDispatchStatsSnapshot {
     pub recv_depth: DispatchQueueDepthSnapshot,
     /// Configured number of concurrent PubSub workers draining recv_pubsub_rx.
     pub pubsub_workers: u64,
+    /// Fixed number of concurrent membership workers draining recv_membership_rx.
+    pub membership_workers: u64,
 }
 
 /// JSON-friendly snapshot of per-stream receive queue depths.
@@ -229,6 +239,7 @@ impl GossipDispatchStats {
     fn new(pubsub_workers: usize) -> Self {
         Self {
             pubsub_workers: AtomicU64::new(usize_to_u64(pubsub_workers)),
+            membership_workers: AtomicU64::new(usize_to_u64(MEMBERSHIP_DISPATCH_WORKERS)),
             ..Default::default()
         }
     }
@@ -254,6 +265,7 @@ impl GossipDispatchStats {
                 bulk: self.bulk_queue.snapshot(),
             },
             pubsub_workers: self.pubsub_workers.load(Ordering::Relaxed),
+            membership_workers: self.membership_workers.load(Ordering::Relaxed),
         }
     }
 }
@@ -639,6 +651,7 @@ async fn run_pubsub_worker_supervisor(
 }
 
 async fn run_membership_dispatcher(
+    worker_id: usize,
     network: Arc<NetworkNode>,
     membership: Arc<HyParViewMembership<NetworkNode>>,
     dispatch_stats: Arc<GossipDispatchStats>,
@@ -662,6 +675,7 @@ async fn run_membership_dispatcher(
                     recv_depth,
                     recv_capacity,
                     stream_type = "Membership",
+                    worker_id,
                     "[2/6 runtime] dispatching gossip message"
                 );
                 match tokio::time::timeout(
@@ -678,6 +692,7 @@ async fn run_membership_dispatcher(
                             bytes,
                             elapsed_ms = duration_ms(elapsed),
                             stream_type = "Membership",
+                            worker_id,
                             "[2/6 runtime] completed gossip message dispatch"
                         );
                     }
@@ -689,6 +704,7 @@ async fn run_membership_dispatcher(
                             bytes,
                             elapsed_ms = duration_ms(elapsed),
                             stream_type = "Membership",
+                            worker_id,
                             "Failed to handle membership message: {e}"
                         );
                     }
@@ -701,6 +717,7 @@ async fn run_membership_dispatcher(
                             elapsed_ms = duration_ms(elapsed),
                             timeout_secs = MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT.as_secs(),
                             stream_type = "Membership",
+                            worker_id,
                             "Timed out handling gossip message"
                         );
                     }
@@ -712,7 +729,7 @@ async fn run_membership_dispatcher(
             }
         }
     }
-    tracing::info!("Gossip Membership dispatcher shut down");
+    tracing::info!(worker_id, "Gossip Membership dispatcher shut down");
 }
 
 async fn run_bulk_dispatcher(
@@ -961,11 +978,15 @@ impl GossipRuntime {
             Arc::clone(&dispatch_stats),
         ));
         pubsub_handles.push(supervisor_handle);
-        let membership_handle = tokio::spawn(run_membership_dispatcher(
-            Arc::clone(&network),
-            membership,
-            Arc::clone(&dispatch_stats),
-        ));
+        let mut membership_handles = Vec::with_capacity(MEMBERSHIP_DISPATCH_WORKERS);
+        for worker_id in 0..MEMBERSHIP_DISPATCH_WORKERS {
+            membership_handles.push(tokio::spawn(run_membership_dispatcher(
+                worker_id,
+                Arc::clone(&network),
+                Arc::clone(&membership),
+                Arc::clone(&dispatch_stats),
+            )));
+        }
         let bulk_handle = tokio::spawn(run_bulk_dispatcher(
             Arc::clone(&network),
             presence,
@@ -1020,7 +1041,7 @@ impl GossipRuntime {
         match self.dispatcher_handles.lock() {
             Ok(mut guard) => {
                 guard.extend(pubsub_handles);
-                guard.push(membership_handle);
+                guard.extend(membership_handles);
                 guard.push(bulk_handle);
             }
             Err(_) => {
@@ -1205,6 +1226,10 @@ mod tests {
             .expect("Failed to create runtime");
 
         assert_eq!(runtime.dispatch_stats().pubsub_workers, 2);
+        assert_eq!(
+            runtime.dispatch_stats().membership_workers,
+            usize_to_u64(MEMBERSHIP_DISPATCH_WORKERS)
+        );
     }
 
     // ── X0X-0009 supervisor decision tests ──────────────────────────────
