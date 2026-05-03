@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.19] - 2026-05-03
+
+X0X-0015 launch-readiness harness and SLO gates — completes the
+X0X-0010..14 SOTA-gossip arc with a repeatable launch bar.
+
+### Added
+
+- **`tests/launch_readiness.py`**: orchestrator with scenario plugin pattern,
+  per-node `/diagnostics/gossip` pre/post snapshots, configurable scenarios
+  (`baseline`, `fanout_burst`, `restart_storm` — last is opt-in via
+  `--allow-restart-storm`), and a per-run go/no-go report under
+  `proofs/launch-readiness-<ts>/`.
+- **`docs/launch-gates/limited-production.md`** — early-adopter SLO bar
+  (≤ 5 dispatcher.timed_out delta per node, 0 recv_pump.dropped_full,
+  ≤ 200 per-peer-timeout delta, ≤ 200 suppressed_peers steady, 30/30 Phase A).
+- **`docs/launch-gates/broad-launch.md`** — fleet-launch SLO bar (strictly
+  stricter — 0 dispatcher.timed_out delta, ≤ 50 per-peer-timeout delta,
+  ≤ 100 suppressed_peers steady, ≤ 30 s restart recovery, 24 h soak +
+  partition-recovery dry-run + reviewer sign-off required).
+
+### Verified
+
+- Both gates GO against live 0.5.30 mesh (2026-05-03 17:40Z): baseline 30/30 +
+  100-msg fanout burst, dispatcher.timed_out=0 / dropped_full=0 cluster-wide.
+- 1097/1097 nextest, fmt + clippy `-D warnings` clean.
+
 ## [v0.19.16] - 2026-04-29
 
 Hunt 12f final delivery mitigation — adds a stable global fallback path for
