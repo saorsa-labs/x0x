@@ -145,6 +145,9 @@ class X0xClient:
     def subscribe(self, topic: str) -> Dict[str, Any]:
         return self._request("POST", "/subscribe", body={"topic": topic})
 
+    def unsubscribe(self, subscription_id: str) -> Dict[str, Any]:
+        return self._request("DELETE", f"/subscribe/{subscription_id}")
+
     def direct_send(
         self,
         agent_id: str,
@@ -263,6 +266,7 @@ class TestRunner:
         # daemon restart, even before the orchestrator publishes a
         # fresh discover.
         self._last_known_anchor_aid: Optional[str] = None
+        self._subscription_ids: Dict[str, str] = {}
 
     # ─── lifecycle ─────────────────────────────────────────────────────
     def run(self) -> int:
@@ -305,9 +309,26 @@ class TestRunner:
             self._agent_id[:16],
             (self._machine_id or "")[:16],
         )
+
+    def _subscribe_control_topics(self) -> None:
         for topic in (DISCOVER_TOPIC, LEGACY_CONTROL_TOPIC):
+            old_id = self._subscription_ids.pop(topic, None)
+            if old_id:
+                try:
+                    self.client.unsubscribe(old_id)
+                    self.log.info("unsubscribed stale %s (%s)", topic, old_id)
+                except Exception as exc:
+                    self.log.debug(
+                        "unsubscribe stale %s (%s) failed: %s",
+                        topic,
+                        old_id,
+                        exc,
+                    )
             try:
-                self.client.subscribe(topic)
+                resp = self.client.subscribe(topic)
+                sub_id = resp.get("subscription_id")
+                if isinstance(sub_id, str) and sub_id:
+                    self._subscription_ids[topic] = sub_id
                 self.log.info("subscribed to %s", topic)
             except Exception as exc:
                 self.log.warning(
@@ -427,6 +448,10 @@ class TestRunner:
     def _control_listener_loop(self) -> None:
         while not self._stop.is_set():
             try:
+                # Daemon restarts drop in-process subscriptions while this
+                # long-lived runner process stays up. Re-register before each
+                # SSE session so Phase-A discovery survives x0xd restarts.
+                self._subscribe_control_topics()
                 self._consume_sse(
                     "/events",
                     handler=self._handle_pubsub_event,

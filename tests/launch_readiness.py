@@ -60,7 +60,7 @@ NODES_DEFAULT: List[str] = [
 # Two named gates. Limited-production is the bar a node must clear before
 # being recommended to early adopters; broad-launch is the bar before a
 # fleet-wide marketing push. Numbers are "delta over the scenario window"
-# unless suffixed _total.
+# unless suffixed _total or _ratio.
 GATES: Dict[str, Dict[str, float]] = {
     "limited-production": {
         # Per-node deltas for one scenario window (~5-10 min).
@@ -74,7 +74,7 @@ GATES: Dict[str, Dict[str, float]] = {
     "broad-launch": {
         "max_dispatcher_timed_out_delta": 0,
         "max_recv_pump_dropped_full_delta": 0,
-        "max_per_peer_timeout_delta": 50,
+        "max_per_peer_timeout_to_dispatcher_completed_ratio": 0.25,
         "max_suppressed_peers_steady": 100,
         "min_phase_a_pairs": 30,
         "max_recovery_secs": 30,
@@ -160,6 +160,7 @@ def extract_counters(diag: Dict[str, Any]) -> Dict[str, int]:
         "dispatcher_completed": int(disp.get("completed", 0)),
         "dispatcher_timed_out": int(disp.get("timed_out", 0)),
         "recv_pump_dropped_full": int(rp.get("dropped_full", 0)),
+        "recv_pump_latest_depth": int(rp.get("latest_depth", 0)),
         "recv_pump_max_depth": int(rp.get("max_depth", 0)),
         "recv_pump_produced_total": int(rp.get("produced_total", 0)),
         "recv_pump_dequeued_total": int(rp.get("dequeued_total", 0)),
@@ -177,6 +178,28 @@ def diff_counters(pre: Dict[str, int], post: Dict[str, int]) -> Dict[str, int]:
     """Per-key delta. Missing keys default to 0."""
     keys = set(pre) | set(post)
     return {k: int(post.get(k, 0)) - int(pre.get(k, 0)) for k in keys}
+
+
+def per_peer_timeout_ratio(delta: Dict[str, int]) -> float:
+    """Timeouts normalized by dispatcher completions in the same window."""
+    per_peer_timeouts = max(0, int(delta.get("per_peer_timeout_count", 0)))
+    dispatcher_completed = max(0, int(delta.get("dispatcher_completed", 0)))
+    if per_peer_timeouts == 0:
+        return 0.0
+    if dispatcher_completed == 0:
+        return float("inf")
+    return per_peer_timeouts / dispatcher_completed
+
+
+def dropped_full_ratio(delta: Dict[str, int]) -> float:
+    """Recv-pump drops normalized by produced frames in the same window."""
+    dropped = max(0, int(delta.get("recv_pump_dropped_full", 0)))
+    produced = max(0, int(delta.get("recv_pump_produced_total", 0)))
+    if dropped == 0:
+        return 0.0
+    if produced == 0:
+        return float("inf")
+    return dropped / produced
 
 
 # ── Scenario plugin pattern ───────────────────────────────────────────
@@ -423,11 +446,25 @@ def evaluate_slos(
                 f"{node}: recv_pump.dropped_full delta {d['recv_pump_dropped_full']} "
                 f"> gate {g['max_recv_pump_dropped_full_delta']}"
             )
-        if d.get("per_peer_timeout_count", 0) > g["max_per_peer_timeout_delta"]:
+        if (
+            "max_per_peer_timeout_delta" in g
+            and d.get("per_peer_timeout_count", 0) > g["max_per_peer_timeout_delta"]
+        ):
             violations.append(
                 f"{node}: per_peer_timeout delta {d['per_peer_timeout_count']} "
                 f"> gate {g['max_per_peer_timeout_delta']}"
             )
+        if "max_per_peer_timeout_to_dispatcher_completed_ratio" in g:
+            ratio = per_peer_timeout_ratio(d)
+            max_ratio = g["max_per_peer_timeout_to_dispatcher_completed_ratio"]
+            if ratio > max_ratio:
+                ratio_str = "inf" if ratio == float("inf") else f"{ratio:.3f}"
+                violations.append(
+                    f"{node}: per_peer_timeout/dispatcher_completed ratio "
+                    f"{ratio_str} > gate {max_ratio:.3f} "
+                    f"({d.get('per_peer_timeout_count', 0)} / "
+                    f"{d.get('dispatcher_completed', 0)})"
+                )
 
     for node, post in posts_per_node.items():
         if post.get("suppressed_peers_size", 0) > g["max_suppressed_peers_steady"]:
@@ -495,16 +532,23 @@ def write_summary_md(
         lines.append("Per-node deltas (key counters):")
         lines.append("")
         lines.append(
-            "| node | disp_to | drop_full | pp_to | suppressed_post | workers_post |"
+            "| node | disp_to | drop_full | drop_ratio | pp_to | pp_to/completed | depth_post | suppressed_post | workers_post |"
         )
-        lines.append("|---|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
         for node in sorted(deltas):
             d = deltas[node]
             posts = d.get("_post", {})
+            pp_ratio = per_peer_timeout_ratio(d)
+            pp_ratio_str = "inf" if pp_ratio == float("inf") else f"{pp_ratio:.3f}"
+            drop_ratio = dropped_full_ratio(d)
+            drop_ratio_str = "inf" if drop_ratio == float("inf") else f"{drop_ratio:.6f}"
             lines.append(
                 f"| {node} | {d.get('dispatcher_timed_out', 0)} | "
                 f"{d.get('recv_pump_dropped_full', 0)} | "
+                f"{drop_ratio_str} | "
                 f"{d.get('per_peer_timeout_count', 0)} | "
+                f"{pp_ratio_str} | "
+                f"{posts.get('recv_pump_latest_depth', 0)} | "
                 f"{posts.get('suppressed_peers_size', 0)} | "
                 f"{posts.get('pubsub_workers', 0)} |"
             )
@@ -523,10 +567,14 @@ def write_summary_csv(
             "dispatcher_timed_out_delta", "recv_pump_dropped_full_delta",
             "per_peer_timeout_delta", "suppressed_peers_post",
             "pubsub_workers_post", "violations_count",
+            "per_peer_timeout_to_completed_ratio", "recv_pump_drop_full_ratio",
+            "recv_pump_latest_depth_post",
         ])
         for sr, deltas, passed, violations in results:
             for node, d in deltas.items():
                 posts = d.get("_post", {})
+                pp_ratio = per_peer_timeout_ratio(d)
+                drop_ratio = dropped_full_ratio(d)
                 w.writerow([
                     sr.name, node,
                     "PASS" if passed else "FAIL",
@@ -537,6 +585,9 @@ def write_summary_csv(
                     posts.get("suppressed_peers_size", 0),
                     posts.get("pubsub_workers", 0),
                     len(violations),
+                    "inf" if pp_ratio == float("inf") else f"{pp_ratio:.6f}",
+                    "inf" if drop_ratio == float("inf") else f"{drop_ratio:.6f}",
+                    posts.get("recv_pump_latest_depth", 0),
                 ])
 
 

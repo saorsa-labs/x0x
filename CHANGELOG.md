@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`tests/launch_readiness.py` broad-launch gate**: replace the absolute
+  `republish_per_peer_timeout <= 50` SLO with a normalized
+  `republish_per_peer_timeout / dispatcher_completed <= 0.25` SLO. Raw
+  per-peer timeout deltas remain in the report for investigation. The report
+  now also includes recv-pump drop ratio and queue depth, while the strict
+  launch blockers stay `dispatcher.timed_out=0` and `recv_pump.dropped_full=0`.
+- **`tests/runners/x0x_test_runner.py`**: re-register discovery/control
+  PubSub subscriptions whenever the runner reopens `/events`, so long-lived
+  runner processes survive `x0xd` restarts without losing Phase A discovery.
+
 ## [v0.19.19] - 2026-05-03
 
 X0X-0015 launch-readiness harness and SLO gates — completes the

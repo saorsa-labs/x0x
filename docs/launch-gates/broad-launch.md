@@ -2,8 +2,11 @@
 
 This is the bar a build of `x0xd` must clear before a fleet-wide launch
 push (marketing, public bootstrap recommendation, opening the network
-to a large external user base). It is strictly stricter than
-[`limited-production.md`](limited-production.md).
+to a large external user base). It is stricter than
+[`limited-production.md`](limited-production.md) on dispatcher timeouts,
+recv-pump drops, suppression size, Phase A delivery, and restart
+recovery. Per-peer timeout handling is intentionally scale-aware rather
+than a stricter absolute count.
 
 ## Run
 
@@ -24,10 +27,18 @@ mesh recovers before chaining further work.
 |---|---|---|
 | `dispatcher.pubsub.timed_out` delta per node | 0 | At broad-launch scale, a single dispatcher timeout per window is a regression to investigate. |
 | `recv_pump.pubsub.dropped_full` delta per node | 0 | Broad-launch must demonstrate the overload policy never engages on the bootstrap mesh. |
-| `republish_per_peer_timeout` delta per node | ≤ 50 | Cooling and outbound-budget should keep per-peer timeouts in single-digit-per-minute territory. |
+| `republish_per_peer_timeout / dispatcher.pubsub.completed` delta ratio per node | ≤ 0.25 | Per-peer timeouts are downstream isolated-send events. The broad-launch gate normalizes them by handled PubSub volume so a busier healthy mesh is not failed for natural RTT variance. |
 | `suppressed_peers` size at end of run | ≤ 100 | Bounded suppression set across all topics. |
 | Phase A directed-pair receives | = 30 | Always. |
 | Restart-storm recovery | ≤ 30s | Indicates the bootstrap cache and ant-quic re-handshake path are healthy. |
+
+The harness still reports raw `republish_per_peer_timeout` deltas in
+`summary.md` and `summary.csv`. Treat a raw value above roughly 200 per
+node per scenario window as an investigation signal, especially if it is
+concentrated on one peer or region, but do not fail broad launch on that
+absolute count alone while `dispatcher.pubsub.timed_out`,
+`recv_pump.pubsub.dropped_full`, and the normalized timeout ratio remain
+inside the gate.
 
 ## Required additional evidence (beyond harness)
 
