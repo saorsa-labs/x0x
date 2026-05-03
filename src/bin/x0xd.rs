@@ -2044,9 +2044,9 @@ fn file_transfer_now() -> (u64, u64) {
 }
 
 fn direct_message_send_config() -> x0x::dm::DmSendConfig {
-    // Generic daemon DMs are capability-aware and gossip-inbox first when the
+    // Generic daemon DMs use the capability-aware gossip-inbox path when the
     // recipient advertises it. That path has an authenticated application-level
-    // ACK and is resilient to transient raw-QUIC supersede/reader churn.
+    // ACK, which is the delivery semantic users and the mesh harness need.
     x0x::dm::DmSendConfig::default()
 }
 

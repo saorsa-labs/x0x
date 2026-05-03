@@ -304,6 +304,16 @@ class ResultsBus:
     received: queue.Queue = field(default_factory=queue.Queue)
 
 
+def drain_queue(q: queue.Queue) -> int:
+    drained = 0
+    while True:
+        try:
+            q.get_nowait()
+            drained += 1
+        except queue.Empty:
+            return drained
+
+
 def consume_sse(
     client: X0xClient,
     path: str,
@@ -620,6 +630,15 @@ def run_all_pairs_matrix(
         proof_token,
     )
 
+    stale_sends = drain_queue(bus.sends)
+    stale_received = drain_queue(bus.received)
+    if stale_sends or stale_received:
+        log.info(
+            "drained stale matrix results before fan-out: sends=%d received=%d",
+            stale_sends,
+            stale_received,
+        )
+
     expected_send_rids = set()
     expected_recv_pairs: Dict[Tuple[str, str], bool] = {}
     dm_dispatch_failures: List[str] = []
@@ -665,19 +684,29 @@ def run_all_pairs_matrix(
     out = MatrixOutcome()
     seen_sends: Dict[str, SendResult] = {}
     seen_recv: Dict[Tuple[str, str], ReceivedDm] = {}
+    expected_recv_keys = set(expected_recv_pairs.keys())
+    ignored_sends = 0
+    ignored_received = 0
 
     while time.time() < deadline:
         # Drain both queues opportunistically.
         progress = False
         try:
             sr = bus.sends.get_nowait()
-            seen_sends[sr.request_id] = sr
+            if sr.request_id in expected_send_rids:
+                seen_sends[sr.request_id] = sr
+            else:
+                ignored_sends += 1
             progress = True
         except queue.Empty:
             pass
         try:
             rd = bus.received.get_nowait()
-            seen_recv[(rd.node, rd.request_id)] = rd
+            key = (rd.node, rd.request_id)
+            if key in expected_recv_keys:
+                seen_recv[key] = rd
+            else:
+                ignored_received += 1
             progress = True
         except queue.Empty:
             pass
@@ -685,11 +714,18 @@ def run_all_pairs_matrix(
             time.sleep(0.1)
         # Fast-exit when everything observable has arrived.
         if (
-            len(seen_sends) >= len(expected_send_rids)
-            and len(seen_recv) >= len(expected_recv_pairs)
+            expected_send_rids.issubset(seen_sends.keys())
+            and expected_recv_keys.issubset(seen_recv.keys())
         ):
             log.info("all expected results observed before deadline")
             break
+
+    if ignored_sends or ignored_received:
+        log.info(
+            "ignored non-matrix/stale results while waiting: sends=%d received=%d",
+            ignored_sends,
+            ignored_received,
+        )
 
     # Tally.
     for request_id in expected_send_rids:
@@ -767,6 +803,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         type=int,
         default=45,
         help="seconds to wait for matrix results after publishing (default 45)",
+    )
+    parser.add_argument(
+        "--post-discover-settle-secs",
+        type=int,
+        default=10,
+        help=(
+            "seconds to wait after all runners are discovered before sending "
+            "the matrix; lets runner /direct/events streams attach after "
+            "daemon restarts (default 10)"
+        ),
     )
     parser.add_argument(
         "--nodes",
@@ -894,6 +940,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if len(runners) < 2:
             log.error("need at least 2 runners; found %s", list(runners.keys()))
             return 4
+        if args.post_discover_settle_secs > 0:
+            log.info(
+                "post-discover settle: waiting %ds for runner direct-event streams",
+                args.post_discover_settle_secs,
+            )
+            time.sleep(args.post_discover_settle_secs)
 
         out = run_all_pairs_matrix(
             client,

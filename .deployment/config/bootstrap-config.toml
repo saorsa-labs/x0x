@@ -26,12 +26,11 @@ rollout_window_minutes = 60
 # Gossip overlay tunables. See docs/adr/0009-recv-pump-overload-policy.md for
 # the recv-pump overload + parallel-dispatch policy.
 #
-# `dispatch_workers` is the *initial floor* for the X0X-0009 adaptive worker
-# supervisor. The supervisor watches recv_pump producer/consumer rates,
-# queue depth, average dispatch time, dispatcher-watchdog timeouts, and
-# per-peer-republish timeouts every 30 s, and scales workers up to a
-# ceiling of 16 (then back down with hysteresis) without operator
-# intervention. Setting this above 1 only makes sense as a soak override
-# or to skip the warm-up period. Default 1 is correct for every node type.
+# `dispatch_workers` is the rollback floor for the X0X-0009 adaptive worker
+# supervisor. The daemon starts at a moderate burst target during restarts,
+# then watches recv_pump producer/consumer rates, queue depth, average dispatch
+# time, dispatcher-watchdog timeouts, per-peer-republish timeouts, and PubSub
+# drops every 5 s. It scales active workers within 1..=32 and backs down only
+# after sustained health, without operator tuning.
 [gossip]
 dispatch_workers = 1

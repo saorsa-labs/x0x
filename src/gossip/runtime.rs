@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 
 /// X0X-0009 prototype: how often the adaptive worker supervisor samples
 /// recv_pump telemetry and decides whether to scale workers up or down.
-const PUBSUB_WORKER_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(30);
+const PUBSUB_WORKER_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(5);
 /// X0X-0009 prototype: producer-rate-over-consumer-rate ratio above which
 /// the supervisor considers the dispatcher saturated and scales up.
 const PUBSUB_WORKER_SCALE_UP_RATIO: f64 = 1.10;
@@ -26,12 +26,22 @@ const PUBSUB_WORKER_SCALE_UP_DEPTH_FRAC: f64 = 0.50;
 /// accumulate. Workers scale back after this is sustained for several intervals.
 const PUBSUB_WORKER_SCALE_DOWN_DEPTH_FRAC: f64 = 0.05;
 /// X0X-0009 prototype: number of consecutive idle supervisor intervals required
-/// before a scale-down (hysteresis to prevent flapping).
-const PUBSUB_WORKER_SCALE_DOWN_INTERVALS: u64 = 10;
+/// before a scale-down (hysteresis to prevent flapping). Kept at roughly
+/// five minutes even though the supervisor samples every five seconds.
+const PUBSUB_WORKER_SCALE_DOWN_INTERVALS: u64 = 60;
 /// X0X-0009 prototype: hard ceiling for adaptive scaling regardless of config.
-const PUBSUB_WORKER_MAX: usize = 16;
+const PUBSUB_WORKER_MAX: usize = 32;
 /// X0X-0009 prototype: hard floor — at least one worker must always run.
 const PUBSUB_WORKER_MIN: usize = 1;
+/// X0X-0009: start above the configured rollback floor after a daemon restart
+/// so the coordinated bootstrap reconnect burst has immediate drain capacity
+/// without activating the whole ceiling and amplifying the restart storm.
+const PUBSUB_WORKER_STARTUP_TARGET: usize = 8;
+/// X0X-0009: when producer rate exceeds consumer rate, ask for enough workers
+/// to close the measured gap plus headroom instead of adding one worker per
+/// tick. Coordinated restarts can otherwise fill the recv pump before the
+/// supervisor reaches a sustainable target.
+const PUBSUB_WORKER_SCALE_UP_HEADROOM: f64 = 1.25;
 /// X0X-0009 prototype: parked worker slots also poll the target at this
 /// interval so a lost Notify wake cannot strand a reusable worker slot.
 const PUBSUB_WORKER_PARK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -408,6 +418,8 @@ pub(crate) struct SupervisorSample {
     /// interval. Each event represents one worker pinned for ~750 ms by a
     /// slow remote peer. The supervisor treats this as effective-worker loss.
     pub recent_per_peer_timeout_rate_per_sec: f64,
+    /// PubSub recv-pump drops per second over the interval.
+    pub recent_drop_rate_per_sec: f64,
 }
 
 /// X0X-0009 prototype: pure decision function (no I/O, no time) that the
@@ -437,6 +449,7 @@ fn supervisor_decide_target(
     current_target: usize,
     idle_intervals: u64,
 ) -> (usize, u64) {
+    let current_target = current_target.clamp(PUBSUB_WORKER_MIN, PUBSUB_WORKER_MAX);
     let depth_frac = if sample.capacity == 0 {
         0.0
     } else {
@@ -457,20 +470,41 @@ fn supervisor_decide_target(
         0.0
     };
 
-    let saturated = depth_frac >= PUBSUB_WORKER_SCALE_UP_DEPTH_FRAC
-        || producer_over_consumer >= PUBSUB_WORKER_SCALE_UP_RATIO
-        || sample.recent_avg_dispatch_ms >= PUBSUB_WORKER_SCALE_UP_AVG_DISPATCH_MS
-        || sample.recent_timeout_rate_per_sec >= PUBSUB_WORKER_SCALE_UP_TIMEOUT_RATE
-        || per_peer_timeout_load >= PUBSUB_WORKER_PER_PEER_TIMEOUT_BUDGET;
-    if saturated {
-        let next = (current_target + 1).min(PUBSUB_WORKER_MAX);
+    if sample.recent_drop_rate_per_sec > 0.0 || depth_frac >= PUBSUB_WORKER_SCALE_UP_DEPTH_FRAC {
+        return (PUBSUB_WORKER_MAX, 0);
+    }
+
+    let mut next = current_target;
+    if producer_over_consumer >= PUBSUB_WORKER_SCALE_UP_RATIO {
+        let needed = ceil_worker_count(
+            (current_target as f64) * producer_over_consumer * PUBSUB_WORKER_SCALE_UP_HEADROOM,
+        );
+        next = next.max(needed).max(current_target.saturating_add(1));
+    }
+    if sample.recent_avg_dispatch_ms >= PUBSUB_WORKER_SCALE_UP_AVG_DISPATCH_MS {
+        next = next.max(current_target.saturating_add(1));
+    }
+    if sample.recent_timeout_rate_per_sec >= PUBSUB_WORKER_SCALE_UP_TIMEOUT_RATE {
+        next = next.max(current_target.saturating_add(1));
+    }
+    if per_peer_timeout_load >= PUBSUB_WORKER_PER_PEER_TIMEOUT_BUDGET {
+        let needed = ceil_worker_count(
+            sample.recent_per_peer_timeout_rate_per_sec * 0.75
+                / PUBSUB_WORKER_PER_PEER_TIMEOUT_BUDGET,
+        );
+        next = next.max(needed).max(current_target.saturating_add(1));
+    }
+
+    let next = next.min(PUBSUB_WORKER_MAX);
+    if next > current_target {
         return (next, 0);
     }
     let healthy = depth_frac < PUBSUB_WORKER_SCALE_DOWN_DEPTH_FRAC
         && (sample.consumer_per_sec == 0.0 || producer_over_consumer <= 1.0)
         && sample.recent_avg_dispatch_ms < PUBSUB_WORKER_SCALE_DOWN_AVG_DISPATCH_MS
         && sample.recent_timeout_rate_per_sec == 0.0
-        && sample.recent_per_peer_timeout_rate_per_sec == 0.0;
+        && sample.recent_per_peer_timeout_rate_per_sec == 0.0
+        && sample.recent_drop_rate_per_sec == 0.0;
     if healthy && current_target > PUBSUB_WORKER_MIN {
         let next_idle = idle_intervals + 1;
         if next_idle >= PUBSUB_WORKER_SCALE_DOWN_INTERVALS {
@@ -479,6 +513,16 @@ fn supervisor_decide_target(
         return (current_target, next_idle);
     }
     (current_target, idle_intervals)
+}
+
+fn ceil_worker_count(value: f64) -> usize {
+    if !value.is_finite() || value <= 0.0 {
+        return PUBSUB_WORKER_MIN;
+    }
+    if value >= PUBSUB_WORKER_MAX as f64 {
+        return PUBSUB_WORKER_MAX;
+    }
+    value.ceil() as usize
 }
 
 /// X0X-0009 prototype: cumulative counters captured at the previous
@@ -493,6 +537,7 @@ struct SupervisorPrevious {
     timed_out: u64,
     total_elapsed_ns: u64,
     per_peer_timeout: u64,
+    dropped_full: u64,
 }
 
 fn window_rate(current: u64, previous: u64, interval_secs: f64) -> f64 {
@@ -525,11 +570,13 @@ async fn run_pubsub_worker_supervisor(
         let cur_timed_out = dispatcher.pubsub.timed_out;
         let cur_total_elapsed_ns = dispatcher.pubsub.total_elapsed_ns;
         let cur_per_peer_timeout = stages.republish_per_peer_timeout;
+        let cur_dropped_full = ps.dropped_full;
 
         let delta_completed = cur_completed.saturating_sub(previous.completed);
         let delta_timed_out = cur_timed_out.saturating_sub(previous.timed_out);
         let delta_total_elapsed_ns = cur_total_elapsed_ns.saturating_sub(previous.total_elapsed_ns);
         let delta_per_peer_timeout = cur_per_peer_timeout.saturating_sub(previous.per_peer_timeout);
+        let delta_dropped_full = cur_dropped_full.saturating_sub(previous.dropped_full);
 
         // Average dispatch time over the window: total elapsed ns divided by
         // messages completed in the window. If nothing completed (idle), the
@@ -550,6 +597,7 @@ async fn run_pubsub_worker_supervisor(
             recent_avg_dispatch_ms,
             recent_timeout_rate_per_sec: recent_timeout_rate,
             recent_per_peer_timeout_rate_per_sec: recent_per_peer_timeout_rate,
+            recent_drop_rate_per_sec: (delta_dropped_full as f64) / interval_secs,
         };
 
         previous = SupervisorPrevious {
@@ -559,6 +607,7 @@ async fn run_pubsub_worker_supervisor(
             timed_out: cur_timed_out,
             total_elapsed_ns: cur_total_elapsed_ns,
             per_peer_timeout: cur_per_peer_timeout,
+            dropped_full: cur_dropped_full,
         };
 
         let current_target = target_count.load(Ordering::Relaxed);
@@ -583,6 +632,7 @@ async fn run_pubsub_worker_supervisor(
             recent_avg_dispatch_ms = sample.recent_avg_dispatch_ms,
             recent_timeout_rate_per_sec = sample.recent_timeout_rate_per_sec,
             recent_per_peer_timeout_rate_per_sec = sample.recent_per_peer_timeout_rate_per_sec,
+            recent_drop_rate_per_sec = sample.recent_drop_rate_per_sec,
             "X0X-0009 supervisor adjusted PubSub dispatcher target"
         );
     }
@@ -883,7 +933,13 @@ impl GossipRuntime {
         // is tracked by `dispatcher_handles` and can be aborted on shutdown.
         // `target_count` controls how many slots actively drain PubSub; the
         // rest park until the supervisor raises the target.
-        let pubsub_worker_count = self.config.dispatch_workers;
+        let pubsub_worker_count = self
+            .config
+            .dispatch_workers
+            .clamp(PUBSUB_WORKER_STARTUP_TARGET, PUBSUB_WORKER_MAX);
+        dispatch_stats
+            .pubsub_workers
+            .store(usize_to_u64(pubsub_worker_count), Ordering::Relaxed);
         let target_count = Arc::new(AtomicUsize::new(pubsub_worker_count));
         let worker_notify = Arc::new(Notify::new());
         let mut pubsub_handles = Vec::with_capacity(PUBSUB_WORKER_MAX + 1);
@@ -1177,6 +1233,7 @@ mod tests {
             recent_avg_dispatch_ms: 0.0,
             recent_timeout_rate_per_sec: 0.0,
             recent_per_peer_timeout_rate_per_sec: 0.0,
+            recent_drop_rate_per_sec: 0.0,
         }
     }
 
@@ -1191,7 +1248,7 @@ mod tests {
     fn supervisor_decide_target_scales_up_on_high_depth() {
         let (next, idle) =
             supervisor_decide_target(sample_depth_only(50.0, 50.0, 6_000, 10_000), 1, 0);
-        assert_eq!(next, 2);
+        assert_eq!(next, 32);
         assert_eq!(idle, 0);
     }
 
@@ -1199,7 +1256,7 @@ mod tests {
     fn supervisor_decide_target_scales_up_on_producer_overshoot() {
         let (next, idle) =
             supervisor_decide_target(sample_depth_only(80.0, 50.0, 100, 10_000), 2, 5);
-        assert_eq!(next, 3);
+        assert_eq!(next, 4);
         assert_eq!(idle, 0);
     }
 
@@ -1214,23 +1271,23 @@ mod tests {
     #[test]
     fn supervisor_decide_target_scales_down_after_sustained_idle() {
         let (next, idle) =
-            supervisor_decide_target(sample_depth_only(50.0, 50.0, 200, 10_000), 4, 9);
+            supervisor_decide_target(sample_depth_only(50.0, 50.0, 200, 10_000), 4, 59);
         assert_eq!(next, 3);
         assert_eq!(idle, 0);
     }
 
     #[test]
     fn supervisor_decide_target_never_drops_below_floor() {
-        let (next, idle) = supervisor_decide_target(sample_depth_only(0.0, 0.0, 0, 10_000), 1, 9);
+        let (next, idle) = supervisor_decide_target(sample_depth_only(0.0, 0.0, 0, 10_000), 1, 59);
         assert_eq!(next, 1);
-        assert_eq!(idle, 9);
+        assert_eq!(idle, 59);
     }
 
     #[test]
     fn supervisor_decide_target_caps_at_ceiling() {
         let (next, idle) =
-            supervisor_decide_target(sample_depth_only(500.0, 50.0, 9_999, 10_000), 16, 0);
-        assert_eq!(next, 16);
+            supervisor_decide_target(sample_depth_only(500.0, 50.0, 9_999, 10_000), 32, 0);
+        assert_eq!(next, 32);
         assert_eq!(idle, 0);
     }
 
@@ -1238,14 +1295,14 @@ mod tests {
     fn supervisor_decide_target_handles_cold_start_zero_consumer() {
         let (next, _idle) =
             supervisor_decide_target(sample_depth_only(50.0, 0.0, 6_000, 10_000), 1, 0);
-        assert_eq!(next, 2);
+        assert_eq!(next, 32);
     }
 
     #[test]
     fn supervisor_decide_target_hysteresis_resets_on_resaturation() {
         let (next, idle) =
             supervisor_decide_target(sample_depth_only(80.0, 50.0, 100, 10_000), 4, 8);
-        assert_eq!(next, 5);
+        assert_eq!(next, 8);
         assert_eq!(idle, 0);
     }
 
@@ -1265,6 +1322,7 @@ mod tests {
             recent_avg_dispatch_ms: 1_200.0,
             recent_timeout_rate_per_sec: 0.0,
             recent_per_peer_timeout_rate_per_sec: 0.0,
+            recent_drop_rate_per_sec: 0.0,
         };
         let (next, idle) = supervisor_decide_target(sample, 2, 4);
         assert_eq!(next, 3);
@@ -1282,6 +1340,7 @@ mod tests {
             recent_avg_dispatch_ms: 50.0,
             recent_timeout_rate_per_sec: 0.10,
             recent_per_peer_timeout_rate_per_sec: 0.0,
+            recent_drop_rate_per_sec: 0.0,
         };
         let (next, idle) = supervisor_decide_target(sample, 1, 0);
         assert_eq!(next, 2);
@@ -1303,6 +1362,7 @@ mod tests {
             recent_avg_dispatch_ms: 100.0,
             recent_timeout_rate_per_sec: 0.0,
             recent_per_peer_timeout_rate_per_sec: 1.6,
+            recent_drop_rate_per_sec: 0.0,
         };
         let (next, idle) = supervisor_decide_target(sample, 4, 5);
         assert_eq!(next, 5);
@@ -1326,6 +1386,7 @@ mod tests {
             recent_avg_dispatch_ms: 100.0,
             recent_timeout_rate_per_sec: 0.0,
             recent_per_peer_timeout_rate_per_sec: 0.2,
+            recent_drop_rate_per_sec: 0.0,
         };
         let (next, idle) = supervisor_decide_target(sample, 4, 5);
         assert_eq!(next, 4);
@@ -1348,6 +1409,7 @@ mod tests {
             recent_avg_dispatch_ms: 50.0,
             recent_timeout_rate_per_sec: 0.0,
             recent_per_peer_timeout_rate_per_sec: 0.05,
+            recent_drop_rate_per_sec: 0.0,
         };
         let (next, idle) = supervisor_decide_target(sample, 4, 9);
         // No scale-down; idle counter does NOT advance because the
@@ -1368,6 +1430,7 @@ mod tests {
             recent_avg_dispatch_ms: 250.0,
             recent_timeout_rate_per_sec: 0.0,
             recent_per_peer_timeout_rate_per_sec: 0.0,
+            recent_drop_rate_per_sec: 0.0,
         };
         let (next, idle) = supervisor_decide_target(sample, 4, 9);
         assert_eq!(next, 4);
@@ -1386,9 +1449,27 @@ mod tests {
             recent_avg_dispatch_ms: 50.0,
             recent_timeout_rate_per_sec: 0.0,
             recent_per_peer_timeout_rate_per_sec: 0.0,
+            recent_drop_rate_per_sec: 0.0,
         };
-        let (next, idle) = supervisor_decide_target(sample, 4, 9);
+        let (next, idle) = supervisor_decide_target(sample, 4, 59);
         assert_eq!(next, 3);
+        assert_eq!(idle, 0);
+    }
+
+    #[test]
+    fn supervisor_decide_target_jumps_to_ceiling_on_recv_pump_drops() {
+        let sample = SupervisorSample {
+            producer_per_sec: 30.0,
+            consumer_per_sec: 30.0,
+            latest_depth: 50,
+            capacity: 10_000,
+            recent_avg_dispatch_ms: 50.0,
+            recent_timeout_rate_per_sec: 0.0,
+            recent_per_peer_timeout_rate_per_sec: 0.0,
+            recent_drop_rate_per_sec: 0.1,
+        };
+        let (next, idle) = supervisor_decide_target(sample, 4, 12);
+        assert_eq!(next, 32);
         assert_eq!(idle, 0);
     }
 
@@ -1417,6 +1498,7 @@ mod tests {
                 recent_avg_dispatch_ms: 150.0,
                 recent_timeout_rate_per_sec: 0.0,
                 recent_per_peer_timeout_rate_per_sec: 2.0,
+                recent_drop_rate_per_sec: 0.0,
             };
             let (next, next_idle) = supervisor_decide_target(sample, target, idle);
             target = next;
