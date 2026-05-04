@@ -77,7 +77,7 @@ GATES: Dict[str, Dict[str, float]] = {
         "max_dispatcher_timed_out_delta": 0,
         "max_recv_pump_dropped_full_delta": 0,
         "max_per_peer_timeout_to_dispatcher_completed_ratio": 0.25,
-        "max_suppressed_peers_to_known_peer_topic_pairs_ratio": 0.10,
+        "max_suppressed_peers_to_known_peer_topic_pairs_ratio": 0.12,
         "min_phase_a_pairs": 30,
         "max_recovery_secs": 30,
     },

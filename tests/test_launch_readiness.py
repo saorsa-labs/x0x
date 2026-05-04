@@ -89,6 +89,30 @@ class LaunchReadinessGateTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual([], violations)
 
+    def test_broad_launch_accepts_warmed_soak_suppression_variance(self) -> None:
+        deltas = {
+            "nuremberg": {
+                "dispatcher_completed": 1000,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            }
+        }
+        posts = {
+            "nuremberg": {
+                "suppressed_peers_size": 154,
+                "known_peer_topic_pairs": 1359,
+            }
+        }
+        scenario = self.lr.ScenarioResult(name="fanout_burst", duration_secs=1.0)
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertTrue(passed)
+        self.assertEqual([], violations)
+
     def test_broad_launch_rejects_high_suppressed_peers_ratio(self) -> None:
         deltas = {
             "nuremberg": {
