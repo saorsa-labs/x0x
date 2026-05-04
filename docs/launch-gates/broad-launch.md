@@ -21,6 +21,24 @@ non-anchor nodes), so it requires the explicit
 `--allow-restart-storm` flag. Run during a quiet window and verify the
 mesh recovers before chaining further work.
 
+The fault-injection scenarios are also destructive and opt-in:
+
+```
+python3 tests/launch_readiness.py --gate broad-launch \
+    --scenarios high_rtt_peer \
+    --allow-netem --target-node sydney
+
+python3 tests/launch_readiness.py --gate broad-launch \
+    --scenarios partition_recovery \
+    --allow-iptables --partition-pair sfo,sydney
+```
+
+Do not run these during a baseline soak. `high_rtt_peer` installs a
+temporary `tc netem` delay on the target node and removes it on
+completion or interrupt. `partition_recovery` inserts temporary
+commented `iptables` DROP rules between the pair and removes them on
+completion or interrupt.
+
 ## Thresholds (per-scenario window, ~5-10 min)
 
 | Metric | Threshold | Rationale |
@@ -51,10 +69,17 @@ The harness gives you a snapshot. The broad-launch gate also needs:
   strict. A dispatcher-only transient is accepted at the soak level when
   cumulative `dispatcher.pubsub.timed_out` across all nodes is ≤ 5 per
   12h and every affected window is otherwise clean.
+- One **high-RTT slow-peer scenario** with `high_rtt_peer` against a
+  non-anchor node, writing
+  `scenarios/high_rtt_peer/peer-score-trajectory.json` and proving that
+  the target peer cools/demotes while the rest of the mesh keeps
+  dispatcher timeouts at 0.
 - One **partition-recovery scenario** executed against a non-production
   pair (e.g., two of the saorsa-N hosts that are not in active use):
   block `:5483` between the pair for 60s with `iptables`, then unblock,
-  and confirm anti-entropy reconciliation completes within 90s.
+  and confirm anti-entropy reconciliation completes within 90s. The
+  harness writes `scenarios/partition_recovery/recovery.json` and
+  verifies that the temporary rules are gone before it reports.
 - The most recent **codex-task-reviewer** sign-off on the upstream
   `saorsa-gossip` release notes.
 

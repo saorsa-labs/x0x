@@ -153,6 +153,72 @@ class LaunchReadinessGateTests(unittest.TestCase):
 
         self.assertEqual(0.05, ratio)
 
+    def test_netem_commands_apply_cleanup_and_verify_named_qdisc(self) -> None:
+        apply_cmd = self.lr.netem_apply_command("eth0", 1500, 200, "normal")
+        cleanup_cmd = self.lr.netem_cleanup_command("eth0")
+        verify_cmd = self.lr.netem_verify_clean_command("eth0")
+
+        self.assertIn("tc qdisc add dev eth0 root netem delay 1500ms 200ms", apply_cmd)
+        self.assertIn("distribution normal", apply_cmd)
+        self.assertEqual("tc qdisc del dev eth0 root 2>/dev/null || true", cleanup_cmd)
+        self.assertEqual("! tc qdisc show dev eth0 | grep -q netem", verify_cmd)
+
+    def test_partition_iptables_commands_use_comment_and_cleanup_loop(self) -> None:
+        apply_cmd = self.lr.iptables_apply_command("170.64.176.102", 5483)
+        cleanup_cmd = self.lr.iptables_cleanup_command("170.64.176.102", 5483)
+        verify_cmd = self.lr.iptables_verify_clean_command("170.64.176.102", 5483)
+
+        self.assertIn("iptables -I INPUT 1", apply_cmd)
+        self.assertIn("--sport 5483", apply_cmd)
+        self.assertIn("--comment x0x-partition-recovery", apply_cmd)
+        self.assertIn("while iptables -C INPUT", cleanup_cmd)
+        self.assertIn("iptables -D INPUT", cleanup_cmd)
+        self.assertTrue(verify_cmd.startswith("! iptables -C INPUT"))
+
+    def test_partition_pair_rejects_anchor_and_unknown_nodes(self) -> None:
+        nodes = {"nyc": ("1", "t"), "sfo": ("2", "t"), "sydney": ("3", "t")}
+
+        self.assertEqual(
+            ("sfo", "sydney"),
+            self.lr.parse_partition_pair("sfo,sydney", "nyc", nodes),
+        )
+        with self.assertRaises(ValueError):
+            self.lr.parse_partition_pair("nyc,sfo", "nyc", nodes)
+        with self.assertRaises(ValueError):
+            self.lr.parse_partition_pair("sfo,moon", "nyc", nodes)
+
+    def test_dispatcher_timeout_exempt_nodes_are_scenario_scoped(self) -> None:
+        deltas = {
+            "sfo": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 1,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            },
+            "nyc": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            },
+        }
+        posts = {
+            "sfo": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100},
+            "nyc": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100},
+        }
+        scenario = self.lr.ScenarioResult(
+            name="partition_recovery",
+            duration_secs=1.0,
+            extra_metrics={"dispatcher_timeout_exempt_nodes": "sfo"},
+        )
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertTrue(passed)
+        self.assertEqual([], violations)
+
     def test_report_outputs_append_new_csv_fields_and_markdown_ratios(self) -> None:
         scenario = self.lr.ScenarioResult(name="fanout_burst", duration_secs=1.0)
         deltas = {
