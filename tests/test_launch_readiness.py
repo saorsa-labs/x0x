@@ -65,6 +65,61 @@ class LaunchReadinessGateTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("per_peer_timeout/dispatcher_completed ratio", violations[0])
 
+    def test_broad_launch_suppressed_peers_gate_is_ratio_based(self) -> None:
+        deltas = {
+            "nuremberg": {
+                "dispatcher_completed": 1000,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            }
+        }
+        posts = {
+            "nuremberg": {
+                "suppressed_peers_size": 134,
+                "known_peer_topic_pairs": 1422,
+            }
+        }
+        scenario = self.lr.ScenarioResult(name="fanout_burst", duration_secs=1.0)
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertTrue(passed)
+        self.assertEqual([], violations)
+
+    def test_broad_launch_rejects_high_suppressed_peers_ratio(self) -> None:
+        deltas = {
+            "nuremberg": {
+                "dispatcher_completed": 1000,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            }
+        }
+        posts = {
+            "nuremberg": {
+                "suppressed_peers_size": 134,
+                "known_peer_topic_pairs": 1000,
+            }
+        }
+        scenario = self.lr.ScenarioResult(name="fanout_burst", duration_secs=1.0)
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertFalse(passed)
+        self.assertIn("suppressed_peers/known_peer_topic_pairs ratio", violations[0])
+
+    def test_nonzero_suppressed_with_zero_known_pairs_fails_ratio_gate(self) -> None:
+        ratio = self.lr.suppressed_peers_ratio(
+            {"suppressed_peers_size": 1, "known_peer_topic_pairs": 0}
+        )
+
+        self.assertEqual(float("inf"), ratio)
+
     def test_limited_production_still_uses_absolute_timeout_cap(self) -> None:
         deltas = {
             "helsinki": {
@@ -110,6 +165,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "_post": {
                     "recv_pump_latest_depth": 7,
                     "suppressed_peers_size": 3,
+                    "known_peer_topic_pairs": 60,
                     "pubsub_workers": 2,
                 },
             }
@@ -125,6 +181,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
             self.assertIn("drop_ratio", md)
             self.assertIn("pp_to/completed", md)
             self.assertIn("depth_post", md)
+            self.assertIn("suppressed/known", md)
 
             with (proof_dir / "summary.csv").open(newline="") as f:
                 rows = list(csv.reader(f))
@@ -148,12 +205,16 @@ class LaunchReadinessGateTests(unittest.TestCase):
                     "per_peer_timeout_to_completed_ratio",
                     "recv_pump_drop_full_ratio",
                     "recv_pump_latest_depth_post",
+                    "suppressed_peers_to_known_ratio",
+                    "known_peer_topic_pairs_post",
                 ],
                 rows[0][10:],
             )
             self.assertEqual("0.050000", rows[1][10])
             self.assertEqual("0.005000", rows[1][11])
             self.assertEqual("7", rows[1][12])
+            self.assertEqual("0.050000", rows[1][13])
+            self.assertEqual("60", rows[1][14])
 
 
 if __name__ == "__main__":

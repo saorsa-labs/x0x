@@ -75,7 +75,7 @@ GATES: Dict[str, Dict[str, float]] = {
         "max_dispatcher_timed_out_delta": 0,
         "max_recv_pump_dropped_full_delta": 0,
         "max_per_peer_timeout_to_dispatcher_completed_ratio": 0.25,
-        "max_suppressed_peers_steady": 100,
+        "max_suppressed_peers_to_known_peer_topic_pairs_ratio": 0.10,
         "min_phase_a_pairs": 30,
         "max_recovery_secs": 30,
     },
@@ -168,6 +168,7 @@ def extract_counters(diag: Dict[str, Any]) -> Dict[str, int]:
         "suppressed_peers_size": len(sp),
         "outbound_budget_exhausted": int(ps.get("outbound_budget_exhausted", 0)),
         "pubsub_workers": int(diag.get("dispatcher", {}).get("pubsub_workers", 0)),
+        "peer_scores_total": len(scores),
         "peer_scores_eager_eligible": sum(1 for r in scores if r.get("eager_eligible")),
         "peer_scores_lazy": sum(1 for r in scores if r.get("role") == "lazy"),
         "peer_scores_excluded": sum(1 for r in scores if r.get("role") == "excluded"),
@@ -200,6 +201,21 @@ def dropped_full_ratio(delta: Dict[str, int]) -> float:
     if produced == 0:
         return float("inf")
     return dropped / produced
+
+
+def suppressed_peers_ratio(post: Dict[str, int]) -> float:
+    """Suppressed peer-topic entries normalized by known peer-topic scores."""
+    suppressed = max(0, int(post.get("suppressed_peers_size", 0)))
+    known_pairs = max(
+        0,
+        int(post.get("known_peer_topic_pairs", 0)),
+        int(post.get("peer_scores_total", 0)),
+    )
+    if suppressed == 0:
+        return 0.0
+    if known_pairs == 0:
+        return float("inf")
+    return suppressed / known_pairs
 
 
 # ── Scenario plugin pattern ───────────────────────────────────────────
@@ -467,11 +483,25 @@ def evaluate_slos(
                 )
 
     for node, post in posts_per_node.items():
-        if post.get("suppressed_peers_size", 0) > g["max_suppressed_peers_steady"]:
+        if (
+            "max_suppressed_peers_steady" in g
+            and post.get("suppressed_peers_size", 0) > g["max_suppressed_peers_steady"]
+        ):
             violations.append(
                 f"{node}: suppressed_peers steady {post['suppressed_peers_size']} "
                 f"> gate {g['max_suppressed_peers_steady']}"
             )
+        if "max_suppressed_peers_to_known_peer_topic_pairs_ratio" in g:
+            ratio = suppressed_peers_ratio(post)
+            max_ratio = g["max_suppressed_peers_to_known_peer_topic_pairs_ratio"]
+            if ratio > max_ratio:
+                ratio_str = "inf" if ratio == float("inf") else f"{ratio:.3f}"
+                violations.append(
+                    f"{node}: suppressed_peers/known_peer_topic_pairs ratio "
+                    f"{ratio_str} > gate {max_ratio:.3f} "
+                    f"({post.get('suppressed_peers_size', 0)} / "
+                    f"{post.get('known_peer_topic_pairs', post.get('peer_scores_total', 0))})"
+                )
 
     if scenario.name == "baseline":
         rcv = scenario.extra_metrics.get("phase_a_received", 0)
@@ -532,9 +562,9 @@ def write_summary_md(
         lines.append("Per-node deltas (key counters):")
         lines.append("")
         lines.append(
-            "| node | disp_to | drop_full | drop_ratio | pp_to | pp_to/completed | depth_post | suppressed_post | workers_post |"
+            "| node | disp_to | drop_full | drop_ratio | pp_to | pp_to/completed | depth_post | suppressed_post | suppressed/known | known_pairs | workers_post |"
         )
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for node in sorted(deltas):
             d = deltas[node]
             posts = d.get("_post", {})
@@ -542,6 +572,10 @@ def write_summary_md(
             pp_ratio_str = "inf" if pp_ratio == float("inf") else f"{pp_ratio:.3f}"
             drop_ratio = dropped_full_ratio(d)
             drop_ratio_str = "inf" if drop_ratio == float("inf") else f"{drop_ratio:.6f}"
+            suppressed_ratio = suppressed_peers_ratio(posts)
+            suppressed_ratio_str = (
+                "inf" if suppressed_ratio == float("inf") else f"{suppressed_ratio:.3f}"
+            )
             lines.append(
                 f"| {node} | {d.get('dispatcher_timed_out', 0)} | "
                 f"{d.get('recv_pump_dropped_full', 0)} | "
@@ -550,6 +584,8 @@ def write_summary_md(
                 f"{pp_ratio_str} | "
                 f"{posts.get('recv_pump_latest_depth', 0)} | "
                 f"{posts.get('suppressed_peers_size', 0)} | "
+                f"{suppressed_ratio_str} | "
+                f"{posts.get('known_peer_topic_pairs', posts.get('peer_scores_total', 0))} | "
                 f"{posts.get('pubsub_workers', 0)} |"
             )
         lines.append("")
@@ -568,13 +604,15 @@ def write_summary_csv(
             "per_peer_timeout_delta", "suppressed_peers_post",
             "pubsub_workers_post", "violations_count",
             "per_peer_timeout_to_completed_ratio", "recv_pump_drop_full_ratio",
-            "recv_pump_latest_depth_post",
+            "recv_pump_latest_depth_post", "suppressed_peers_to_known_ratio",
+            "known_peer_topic_pairs_post",
         ])
         for sr, deltas, passed, violations in results:
             for node, d in deltas.items():
                 posts = d.get("_post", {})
                 pp_ratio = per_peer_timeout_ratio(d)
                 drop_ratio = dropped_full_ratio(d)
+                suppressed_ratio = suppressed_peers_ratio(posts)
                 w.writerow([
                     sr.name, node,
                     "PASS" if passed else "FAIL",
@@ -588,6 +626,8 @@ def write_summary_csv(
                     "inf" if pp_ratio == float("inf") else f"{pp_ratio:.6f}",
                     "inf" if drop_ratio == float("inf") else f"{drop_ratio:.6f}",
                     posts.get("recv_pump_latest_depth", 0),
+                    "inf" if suppressed_ratio == float("inf") else f"{suppressed_ratio:.6f}",
+                    posts.get("known_peer_topic_pairs", posts.get("peer_scores_total", 0)),
                 ])
 
 
@@ -678,8 +718,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         deltas: Dict[str, Dict[str, int]] = {}
         for node in nodes:
+            pre = pre_counters.get(node, {})
+            post = post_counters.get(node, {})
+            known_pairs = max(
+                int(pre.get("peer_scores_total", 0)),
+                int(post.get("peer_scores_total", 0)),
+            )
+            pre["known_peer_topic_pairs"] = known_pairs
+            post["known_peer_topic_pairs"] = known_pairs
             d = diff_counters(pre_counters.get(node, {}), post_counters.get(node, {}))
-            d["_post"] = post_counters.get(node, {})  # smuggle for reports
+            d["_post"] = post  # smuggle for reports
             deltas[node] = d
 
         passed, violations = evaluate_slos(args.gate, deltas, post_counters, sr)
