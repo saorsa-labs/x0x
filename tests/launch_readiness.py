@@ -393,6 +393,7 @@ def summarize_peer_view(diag: Dict[str, Any], target_peer_id: str) -> Dict[str, 
         "score_entries": len(scores),
         "suppressed_entries": len(suppressed),
         "suppressed_states": sorted({str(r.get("state", "unknown")) for r in suppressed}),
+        "suppressed_topics": sorted({str(r.get("topic")) for r in suppressed if r.get("topic")}),
         "roles": role_counts,
         "eager_eligible": sum(1 for r in scores if r.get("eager_eligible")),
         "score_min": min(score_values) if score_values else None,
@@ -455,6 +456,89 @@ def min_score(snapshot: Dict[str, Any], exclude_node: Optional[str] = None) -> O
         if isinstance(value, (int, float)):
             values.append(float(value))
     return min(values) if values else None
+
+
+def target_cooling_delta_summary(
+    start: Dict[str, Any],
+    mid: Dict[str, Any],
+    exclude_node: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Detect new target-peer cooling activity in a noisy baseline.
+
+    The live high_rtt_peer run can begin while unrelated suppressions are
+    draining. This helper looks only at the target peer as seen by each
+    observer and fires on positive per-observer deltas instead of aggregate
+    cluster counts.
+    """
+
+    observers: Dict[str, Any] = {}
+    cooling_event_observers: List[str] = []
+    timeout_observers: List[str] = []
+    new_suppression_observers: List[str] = []
+
+    start_observers = start.get("observers", {}) or {}
+    mid_observers = mid.get("observers", {}) or {}
+    for node in sorted(set(start_observers) | set(mid_observers)):
+        if node == exclude_node:
+            continue
+        start_view = start_observers.get(node, {}) or {}
+        mid_view = mid_observers.get(node, {}) or {}
+        if not isinstance(start_view, dict) or not isinstance(mid_view, dict):
+            continue
+        if "error" in start_view or "error" in mid_view:
+            observers[node] = {
+                "error": start_view.get("error") or mid_view.get("error")
+            }
+            continue
+
+        cooling_delta = max(
+            0.0,
+            float(mid_view.get("cooling_events", 0.0) or 0.0)
+            - float(start_view.get("cooling_events", 0.0) or 0.0),
+        )
+        timeout_delta = max(
+            0.0,
+            float(mid_view.get("outbound_send_timeouts", 0.0) or 0.0)
+            - float(start_view.get("outbound_send_timeouts", 0.0) or 0.0),
+        )
+        start_suppressed_topics = {
+            str(topic) for topic in (start_view.get("suppressed_topics", []) or [])
+        }
+        mid_suppressed_topics = {
+            str(topic) for topic in (mid_view.get("suppressed_topics", []) or [])
+        }
+        new_suppressed_topics = sorted(mid_suppressed_topics - start_suppressed_topics)
+        first_suppression = (
+            int(start_view.get("suppressed_entries", 0) or 0) == 0
+            and int(mid_view.get("suppressed_entries", 0) or 0) > 0
+        )
+        new_suppression = bool(new_suppressed_topics) or first_suppression
+
+        if cooling_delta > 0:
+            cooling_event_observers.append(node)
+        if timeout_delta > 0:
+            timeout_observers.append(node)
+        if new_suppression:
+            new_suppression_observers.append(node)
+
+        observers[node] = {
+            "cooling_events_delta": cooling_delta,
+            "outbound_send_timeouts_delta": timeout_delta,
+            "new_suppressed_topics": new_suppressed_topics,
+            "first_suppression": first_suppression,
+            "new_suppression": new_suppression,
+        }
+
+    cooling_observed = bool(
+        cooling_event_observers or timeout_observers or new_suppression_observers
+    )
+    return {
+        "cooling_observed": cooling_observed,
+        "cooling_event_observers": cooling_event_observers,
+        "outbound_send_timeout_observers": timeout_observers,
+        "new_suppression_observers": new_suppression_observers,
+        "observers": observers,
+    }
 
 
 def write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -809,11 +893,12 @@ def scenario_high_rtt_peer(ctx: ScenarioContext) -> ScenarioResult:
         and mid_min_score is not None
         and mid_min_score < start_min_score - 0.05
     )
-    cooling_observed = (
-        mid_suppressed > start_suppressed
-        or mid_demoted > start_demoted
-        or score_dropped
+    cooling_delta_summary = target_cooling_delta_summary(
+        start_sample,
+        mid_sample,
+        exclude_node=target,
     )
+    cooling_observed = bool(cooling_delta_summary["cooling_observed"])
     recovered = end_suppressed <= max(start_suppressed, 1)
     trajectory["summary"] = {
         "start_suppressed": start_suppressed,
@@ -823,6 +908,8 @@ def scenario_high_rtt_peer(ctx: ScenarioContext) -> ScenarioResult:
         "mid_lazy_or_excluded": mid_demoted,
         "start_min_score": start_min_score,
         "mid_min_score": mid_min_score,
+        "legacy_score_dropped": score_dropped,
+        "target_cooling_deltas": cooling_delta_summary,
         "cooling_observed": cooling_observed,
         "recovered": recovered,
     }
@@ -854,6 +941,7 @@ def scenario_high_rtt_peer(ctx: ScenarioContext) -> ScenarioResult:
             "suppression_recovered": recovered,
             "trajectory_path": str(trajectory_path),
             "dispatcher_timeout_exempt_nodes": target,
+            "suppression_ratio_exempt_nodes": target,
         },
         fail_reason=fail_reason,
     )
@@ -1082,6 +1170,11 @@ def evaluate_slos(
         for n in str(scenario.extra_metrics.get("dispatcher_timeout_exempt_nodes", "")).split(",")
         if n.strip()
     }
+    suppression_ratio_exempt_nodes = {
+        n.strip()
+        for n in str(scenario.extra_metrics.get("suppression_ratio_exempt_nodes", "")).split(",")
+        if n.strip()
+    }
 
     for node, d in deltas_per_node.items():
         if (
@@ -1126,7 +1219,10 @@ def evaluate_slos(
                 f"{node}: suppressed_peers steady {post['suppressed_peers_size']} "
                 f"> gate {g['max_suppressed_peers_steady']}"
             )
-        if "max_suppressed_peers_to_known_peer_topic_pairs_ratio" in g:
+        if (
+            "max_suppressed_peers_to_known_peer_topic_pairs_ratio" in g
+            and node not in suppression_ratio_exempt_nodes
+        ):
             ratio = suppressed_peers_ratio(post)
             max_ratio = g["max_suppressed_peers_to_known_peer_topic_pairs_ratio"]
             if ratio > max_ratio:

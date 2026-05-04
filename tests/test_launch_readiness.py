@@ -243,6 +243,99 @@ class LaunchReadinessGateTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual([], violations)
 
+    def test_suppression_ratio_exempt_nodes_are_scenario_scoped(self) -> None:
+        deltas = {
+            "sydney": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            },
+            "nyc": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            },
+        }
+        posts = {
+            "sydney": {"suppressed_peers_size": 50, "known_peer_topic_pairs": 100},
+            "nyc": {"suppressed_peers_size": 5, "known_peer_topic_pairs": 100},
+        }
+        scenario = self.lr.ScenarioResult(
+            name="high_rtt_peer",
+            duration_secs=1.0,
+            extra_metrics={"suppression_ratio_exempt_nodes": "sydney"},
+        )
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertTrue(passed)
+        self.assertEqual([], violations)
+
+    def test_target_cooling_observed_uses_per_observer_deltas(self) -> None:
+        start = {
+            "observers": {
+                "nyc": {
+                    "suppressed_entries": 10,
+                    "suppressed_topics": ["old"],
+                    "cooling_events": 5.0,
+                    "outbound_send_timeouts": 100.0,
+                },
+                "sfo": {
+                    "suppressed_entries": 0,
+                    "suppressed_topics": [],
+                    "cooling_events": 2.0,
+                    "outbound_send_timeouts": 20.0,
+                },
+                "sydney": {
+                    "suppressed_entries": 0,
+                    "suppressed_topics": [],
+                    "cooling_events": 0.0,
+                    "outbound_send_timeouts": 0.0,
+                },
+            }
+        }
+        mid = {
+            "observers": {
+                "nyc": {
+                    "suppressed_entries": 4,
+                    "suppressed_topics": ["old"],
+                    "cooling_events": 5.0,
+                    "outbound_send_timeouts": 140.0,
+                },
+                "sfo": {
+                    "suppressed_entries": 1,
+                    "suppressed_topics": ["new-topic"],
+                    "cooling_events": 3.0,
+                    "outbound_send_timeouts": 20.0,
+                },
+                "sydney": {
+                    "suppressed_entries": 0,
+                    "suppressed_topics": [],
+                    "cooling_events": 0.0,
+                    "outbound_send_timeouts": 0.0,
+                },
+            }
+        }
+
+        summary = self.lr.target_cooling_delta_summary(
+            start,
+            mid,
+            exclude_node="sydney",
+        )
+
+        self.assertTrue(summary["cooling_observed"])
+        self.assertEqual(["sfo"], summary["cooling_event_observers"])
+        self.assertEqual(["nyc"], summary["outbound_send_timeout_observers"])
+        self.assertEqual(["sfo"], summary["new_suppression_observers"])
+        self.assertEqual(
+            ["new-topic"],
+            summary["observers"]["sfo"]["new_suppressed_topics"],
+        )
+
     def test_report_outputs_append_new_csv_fields_and_markdown_ratios(self) -> None:
         scenario = self.lr.ScenarioResult(name="fanout_burst", duration_secs=1.0)
         deltas = {
