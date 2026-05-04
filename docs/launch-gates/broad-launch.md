@@ -39,6 +39,21 @@ completion or interrupt. `partition_recovery` inserts temporary
 commented `iptables` DROP rules between the pair and removes them on
 completion or interrupt.
 
+The large-topic overlay proof is non-destructive and runs locally:
+
+```
+python3 tests/topic_overlay_scale.py \
+    --peers 1000,5000,10000 \
+    --topic x0x.scale.hot \
+    --publish-rate 1 \
+    --duration-secs 300 \
+    --proof-dir proofs/topic-overlay-scale-<run-id>
+```
+
+This proof is about topic-overlay shape, not WAN reachability. It must
+show that a hot topic keeps per-node EAGER and LAZY views bounded while
+the global aggregate traffic grows with subscriber count.
+
 ## Thresholds (per-scenario window, ~5-10 min)
 
 | Metric | Threshold | Rationale |
@@ -103,6 +118,13 @@ The harness gives you a snapshot. The broad-launch gate also needs:
   and confirm anti-entropy reconciliation completes within 90s. The
   harness writes `scenarios/partition_recovery/recovery.json` and
   verifies that the temporary rules are gone before it reports.
+- One **large-topic overlay scale proof** from
+  `tests/topic_overlay_scale.py` at 1k, 5k, and 10k virtual subscribers.
+  The proof must write
+  `proofs/topic-overlay-scale-<run-id>/summary.md` and `metrics.csv`,
+  keep p99 EAGER degree inside the PlumTree target envelope, keep p99
+  LAZY/topic view below the documented cap, and detect the invalid
+  full-view behaviour where every subscriber is retained as a LAZY peer.
 - The most recent **codex-task-reviewer** sign-off on the upstream
   `saorsa-gossip` release notes.
 
