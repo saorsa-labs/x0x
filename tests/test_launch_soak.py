@@ -72,6 +72,7 @@ class LaunchSoakSummaryTests(unittest.TestCase):
                         "- phase_a_sent: `30`",
                         "- violations:",
                         "  - nyc: dispatcher_timed_out delta 1 > gate 0",
+                        "  - sfo: dispatcher_timed_out delta 2 > gate 0",
                     ]
                 ),
                 encoding="utf-8",
@@ -80,8 +81,8 @@ class LaunchSoakSummaryTests(unittest.TestCase):
                 "\n".join(
                     [
                         "scenario,node,dispatcher_timed_out_delta,recv_pump_dropped_full_delta,per_peer_timeout_delta,suppressed_peers_post,pubsub_workers_post,violations_count,suppressed_peers_to_known_ratio",
-                        "baseline,nyc,1,0,10,30,4,1,0.010000",
-                        "baseline,sfo,2,0,20,40,5,1,0.020000",
+                        "baseline,nyc,1,0,10,30,4,2,0.010000",
+                        "baseline,sfo,2,0,20,40,5,2,0.020000",
                     ]
                 ),
                 encoding="utf-8",
@@ -94,6 +95,7 @@ class LaunchSoakSummaryTests(unittest.TestCase):
         self.assertEqual("40", row["max_suppressed"])
         self.assertEqual("0.020000", row["max_suppressed_ratio"])
         self.assertIn("dispatcher_timed_out delta", row["violation_messages"])
+        self.assertEqual("2", row["violations"])
 
     def test_continuous_deltas_bridge_missing_pre_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -209,6 +211,74 @@ class LaunchSoakSummaryTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertIn("Overall verdict: **GO**", md)
         self.assertIn("tolerated dispatcher-only windows: **2**", md)
+
+    def test_write_summary_accepts_low_rate_dispatcher_noise_above_legacy_count(self) -> None:
+        rows = [
+            {
+                "verdict": "NO-GO",
+                "start_unix": "1",
+                "phase_a_received": "30",
+                "phase_a_sent": "30",
+                "max_disp_to_delta": "1",
+                "sum_disp_to_delta": "2",
+                "continuous_max_disp_to_delta": "3",
+                "continuous_sum_disp_to_delta": "10",
+                "continuous_sum_dispatcher_completed_delta": "1297023",
+                "max_drop_full_delta": "0",
+                "sum_drop_full_delta": "0",
+                "continuous_max_drop_full_delta": "0",
+                "continuous_sum_drop_full_delta": "0",
+                "max_pp_to_delta": "200",
+                "continuous_sum_pp_to_delta": "6507",
+                "max_suppressed": "118",
+                "max_suppressed_ratio": "0.069208",
+                "max_workers": "32",
+                "violations": "2",
+                "violation_messages": (
+                    "nyc: dispatcher_timed_out delta 1 > gate 0 || "
+                    "sfo: dispatcher_timed_out delta 1 > gate 0"
+                ),
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            passed = self.soak.write_summary(Path(tmp), "broad-launch", rows)
+            md = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+
+        self.assertTrue(passed)
+        self.assertIn("dispatcher-only adaptive policy: **adaptive-rate-ok**", md)
+        self.assertIn("dispatcher.timed_out / dispatcher.completed: **0.00000771**", md)
+
+    def test_write_summary_rejects_high_rate_dispatcher_noise(self) -> None:
+        rows = [
+            {
+                "verdict": "NO-GO",
+                "start_unix": "1",
+                "phase_a_received": "30",
+                "phase_a_sent": "30",
+                "max_disp_to_delta": "5",
+                "sum_disp_to_delta": "10",
+                "continuous_max_disp_to_delta": "10",
+                "continuous_sum_disp_to_delta": "10",
+                "continuous_sum_dispatcher_completed_delta": "1000",
+                "max_drop_full_delta": "0",
+                "sum_drop_full_delta": "0",
+                "continuous_max_drop_full_delta": "0",
+                "continuous_sum_drop_full_delta": "0",
+                "max_pp_to_delta": "0",
+                "continuous_sum_pp_to_delta": "0",
+                "max_suppressed": "20",
+                "max_suppressed_ratio": "0.010000",
+                "max_workers": "32",
+                "violations": "1",
+                "violation_messages": "nyc: dispatcher_timed_out delta 10 > gate 0",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            passed = self.soak.write_summary(Path(tmp), "broad-launch", rows)
+            md = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+
+        self.assertFalse(passed)
+        self.assertIn("dispatcher-only adaptive policy: **window-rate-high**", md)
 
     def test_write_summary_keeps_phase_a_gap_as_no_go(self) -> None:
         rows = [

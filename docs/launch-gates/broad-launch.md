@@ -114,8 +114,10 @@ The harness gives you a snapshot. The broad-launch gate also needs:
   not only the short scenario pre/post window. Phase A directed pairs
   and `recv_pump.pubsub.dropped_full` remain strict. The current
   dispatcher-only cap is a conservative bootstrap-mesh investigation
-  trigger: a raw count above it should not be "fixed" by retuning to the
-  VPS fleet without also checking normalized
+  trigger, not the final policy: a raw count above it is acceptable only
+  when the adaptive dispatcher-only policy also shows a low normalized
+  timeout rate and no sustained anomaly. Do not "fix" a raw count by
+  retuning to the VPS fleet without also checking normalized
   `dispatcher.timed_out / dispatcher.completed`, per-node-hour rates,
   telemetry gaps, queue/backlog growth, and whether delivery or drops
   degraded.

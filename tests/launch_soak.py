@@ -39,6 +39,11 @@ LOG = logging.getLogger("launch_soak")
 SOAK_MAX_DISPATCHER_TIMED_OUT_DELTA_PER_12H = 5
 SOAK_MAX_RECV_PUMP_DROPPED_FULL_DELTA = 0
 SOAK_MIN_PHASE_A_PAIRS = 30
+SOAK_MAX_DISPATCHER_TIMEOUT_RATIO = 0.0001
+SOAK_MAX_DISPATCHER_TIMEOUT_RATIO_PER_WINDOW = 0.0001
+SOAK_DISPATCHER_ANOMALY_BASELINE_FACTOR = 4.0
+SOAK_DISPATCHER_ANOMALY_RATE_FLOOR = 0.00005
+SOAK_MAX_CONSECUTIVE_DISPATCHER_ANOMALY_WINDOWS = 2
 
 
 def _int_field(row: Dict[str, str], key: str, default: int = 0) -> int:
@@ -190,6 +195,89 @@ def _counter_field(row: Dict[str, str], continuous_key: str, legacy_key: str) ->
     return _int_field(row, legacy_key)
 
 
+def _ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0 if numerator <= 0 else float("inf")
+    return numerator / denominator
+
+
+def _ratio_str(numerator: int, denominator: int) -> str:
+    ratio = _ratio(numerator, denominator)
+    if ratio == float("inf"):
+        return "inf"
+    return f"{ratio:.8f}"
+
+
+def dispatcher_noise_policy(rows: List[Dict[str, str]]) -> Dict[str, str]:
+    """Classify dispatcher-only soak noise using normalized/adaptive signals."""
+    total_disp = sum(
+        _counter_field(row, "continuous_sum_disp_to_delta", "sum_disp_to_delta")
+        for row in rows
+    )
+    total_completed = sum(
+        _int_field(row, "continuous_sum_dispatcher_completed_delta")
+        for row in rows
+    )
+    total_ratio = _ratio(total_disp, total_completed)
+    max_window_ratio = 0.0
+    baseline_rates: List[float] = []
+    consecutive_anomalies = 0
+    max_consecutive_anomalies = 0
+    anomaly_windows: List[str] = []
+
+    for idx, row in enumerate(rows, 1):
+        window_disp = _counter_field(row, "continuous_sum_disp_to_delta", "sum_disp_to_delta")
+        window_completed = _int_field(row, "continuous_sum_dispatcher_completed_delta")
+        if window_completed <= 0:
+            continue
+        window_ratio = _ratio(window_disp, window_completed)
+        max_window_ratio = max(max_window_ratio, window_ratio)
+        baseline = sorted(baseline_rates)[len(baseline_rates) // 2] if baseline_rates else 0.0
+        anomaly_threshold = max(
+            baseline * SOAK_DISPATCHER_ANOMALY_BASELINE_FACTOR,
+            SOAK_DISPATCHER_ANOMALY_RATE_FLOOR,
+        )
+        is_anomaly = (
+            window_completed > 0
+            and window_ratio > anomaly_threshold
+            and window_disp > 0
+        )
+        if is_anomaly:
+            consecutive_anomalies += 1
+            max_consecutive_anomalies = max(max_consecutive_anomalies, consecutive_anomalies)
+            anomaly_windows.append(str(idx))
+        else:
+            consecutive_anomalies = 0
+            if window_completed > 0:
+                baseline_rates.append(window_ratio)
+
+    if total_disp <= SOAK_MAX_DISPATCHER_TIMED_OUT_DELTA_PER_12H:
+        verdict = "legacy-count-ok"
+    elif total_ratio <= SOAK_MAX_DISPATCHER_TIMEOUT_RATIO:
+        verdict = "adaptive-rate-ok"
+    else:
+        verdict = "fleet-rate-high"
+
+    if max_window_ratio > SOAK_MAX_DISPATCHER_TIMEOUT_RATIO_PER_WINDOW:
+        verdict = "window-rate-high"
+    if max_consecutive_anomalies > SOAK_MAX_CONSECUTIVE_DISPATCHER_ANOMALY_WINDOWS:
+        verdict = "consecutive-anomalies"
+
+    passed = verdict in {"legacy-count-ok", "adaptive-rate-ok"}
+    return {
+        "passed": "true" if passed else "false",
+        "verdict": verdict,
+        "total_disp": str(total_disp),
+        "total_completed": str(total_completed),
+        "total_ratio": "inf" if total_ratio == float("inf") else f"{total_ratio:.8f}",
+        "max_window_ratio": (
+            "inf" if max_window_ratio == float("inf") else f"{max_window_ratio:.8f}"
+        ),
+        "max_consecutive_anomalies": str(max_consecutive_anomalies),
+        "anomaly_windows": ",".join(anomaly_windows) or "none",
+    }
+
+
 def discover_windows_summary(window_dir: Path) -> Dict[str, str]:
     """Pull the GO/NO-GO verdict + key counters out of a launch_readiness run.
 
@@ -282,7 +370,15 @@ def discover_windows_summary(window_dir: Path) -> Dict[str, str]:
                     else f"{max_suppressed_ratio:.6f}"
                 )
                 out["max_workers"] = str(_max("pubsub_workers_post"))
-                out["violations"] = str(sum(int(r.get("violations_count", "0")) for r in baseline_rows))
+                csv_violation_counts = []
+                for r in baseline_rows:
+                    try:
+                        csv_violation_counts.append(int(r.get("violations_count", "0") or "0"))
+                    except ValueError:
+                        pass
+                out["violations"] = str(
+                    len(violations) if violations else max(csv_violation_counts, default=0)
+                )
         except Exception as exc:
             LOG.warning("failed to parse %s: %s", csv_path, exc)
     return out
@@ -333,6 +429,7 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         _counter_field(r, "continuous_sum_pp_to_delta", "max_pp_to_delta")
         for r in rows
     )
+    dispatcher_policy = dispatcher_noise_policy(rows)
     unaccounted_gap_windows = [
         idx for idx, row in enumerate(rows, 1)
         if row.get("continuous_unaccounted_gaps")
@@ -352,11 +449,6 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
             return False
         messages = [m.strip() for m in raw.split(" || ") if m.strip()]
         return bool(messages) and all("dispatcher_timed_out delta" in m for m in messages)
-
-    def _ratio_str(numerator: int, denominator: int) -> str:
-        if denominator <= 0:
-            return "n/a"
-        return f"{numerator / denominator:.8f}"
 
     effective_failed: List[int] = []
     tolerated_dispatcher_windows: List[int] = []
@@ -378,7 +470,7 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         and missing_count == 0
         and not effective_failed
         and not unaccounted_gap_windows
-        and cumulative_disp_to <= dispatcher_limit
+        and dispatcher_policy["passed"] == "true"
         and cumulative_drop_full <= drop_limit
     )
 
@@ -394,12 +486,16 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         "- Counter source: **continuous post-to-post diagnostics deltas when available; "
         "legacy scenario deltas only when diagnostics are absent**",
         f"- dispatcher.timed_out delta across the continuous soak × all nodes: **{cumulative_disp_to}** "
-        f"(gate ≤ {dispatcher_limit}/12h)",
+        f"(legacy count trigger ≤ {dispatcher_limit}/12h)",
         f"- recv_pump.dropped_full delta across the continuous soak × all nodes: **{cumulative_drop_full}** "
         f"(gate ≤ {drop_limit})",
         f"- dispatcher.pubsub.completed delta across the continuous soak × all nodes: **{cumulative_completed}**",
         f"- dispatcher.timed_out / dispatcher.completed: **{_ratio_str(cumulative_disp_to, cumulative_completed)}**",
         f"- republish_per_peer_timeout / dispatcher.completed: **{_ratio_str(cumulative_pp_to, cumulative_completed)}**",
+        f"- dispatcher-only adaptive policy: **{dispatcher_policy['verdict']}** "
+        f"(max_window_ratio={dispatcher_policy['max_window_ratio']}, "
+        f"max_consecutive_anomalies={dispatcher_policy['max_consecutive_anomalies']}, "
+        f"anomaly_windows={dispatcher_policy['anomaly_windows']})",
         f"- tolerated dispatcher-only windows: **{','.join(str(i) for i in tolerated_dispatcher_windows) or 'none'}**",
         f"- effective failed windows: **{','.join(str(i) for i in effective_failed) or 'none'}**",
         f"- unaccounted telemetry-gap windows: **{','.join(str(i) for i in unaccounted_gap_windows) or 'none'}**",
