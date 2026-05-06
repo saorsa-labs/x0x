@@ -63,14 +63,8 @@ PUBLISH_RETRY_BACKOFF_SECS = 1
 PUBLISH_RETRY_MAX = 3
 TEST_DM_RETRY_BACKOFF_SECS = 1
 TEST_DM_RETRY_MAX = 3
-# Direct-DM result delivery does NOT request the raw-QUIC receive-ACK.
-# That path fast-fails with `peer_disconnected` when the QUIC connection
-# is momentarily superseded (a normal occurrence on a long-lived live
-# fleet), and result loss is far worse than result latency. Letting the
-# daemon use its default DM path (gossip-inbox first, with one retry)
-# trades ~100-500 ms of extra latency for resilience to mid-session
-# QUIC churn.
 RESULT_DM_ACK_MS: Optional[int] = None
+RESULT_RAW_QUIC_ACK_MS: Optional[int] = 3000
 RESULT_QUEUE_MAX = 1024
 RESULT_QUEUE_MAX_AGE_SECS = 300
 
@@ -155,6 +149,10 @@ class X0xClient:
         agent_id: str,
         payload: bytes,
         require_ack_ms: Optional[int] = None,
+        prefer_raw_quic_if_connected: bool = False,
+        raw_quic_receive_ack_ms: Optional[int] = None,
+        stop_fallback_on_raw_error: bool = False,
+        require_gossip: bool = False,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "agent_id": agent_id,
@@ -162,6 +160,14 @@ class X0xClient:
         }
         if require_ack_ms is not None:
             body["require_ack_ms"] = require_ack_ms
+        if prefer_raw_quic_if_connected:
+            body["prefer_raw_quic_if_connected"] = True
+        if raw_quic_receive_ack_ms is not None:
+            body["raw_quic_receive_ack_ms"] = raw_quic_receive_ack_ms
+        if stop_fallback_on_raw_error:
+            body["stop_fallback_on_raw_error"] = True
+        if require_gossip:
+            body["require_gossip"] = True
         return self._request("POST", "/direct/send", body=body)
 
     # ─── contacts ──────────────────────────────────────────────────────
@@ -381,15 +387,20 @@ class TestRunner:
         payload: bytes,
         envelope: Dict[str, Any],
     ) -> bool:
-        # Result DMs MUST go through the daemon's default DM path so the
-        # gossip-inbox fallback covers brief raw-QUIC outages. Setting
-        # require_ack_ms here would force raw_quic_acked and lose the
-        # message if the QUIC connection happens to be in supersede.
+        # Phase-A result DMs use the raw-QUIC message ACK path so the control
+        # plane stays independent of PlumTree. If raw delivery fails, the
+        # runner still falls back to the legacy results topic so the
+        # orchestrator can record the failure details.
         wire = b"x0xtest|res|" + base64.b64encode(payload)
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
             try:
                 self.client.direct_send(
-                    target_aid, wire, require_ack_ms=RESULT_DM_ACK_MS
+                    target_aid,
+                    wire,
+                    require_ack_ms=RESULT_DM_ACK_MS,
+                    prefer_raw_quic_if_connected=True,
+                    raw_quic_receive_ack_ms=RESULT_RAW_QUIC_ACK_MS,
+                    stop_fallback_on_raw_error=True,
                 )
                 return True
             except urllib.error.HTTPError as exc:
@@ -867,12 +878,22 @@ class TestRunner:
         t0 = time.time()
         last_error: Dict[str, Any] = {}
         last_status: Optional[int] = None
+        prefer_raw = bool(params.get("prefer_raw_quic_if_connected", False))
+        raw_ack_ms = params.get("raw_quic_receive_ack_ms")
+        if raw_ack_ms is not None:
+            raw_ack_ms = int(raw_ack_ms)
+        stop_fallback = bool(params.get("stop_fallback_on_raw_error", False))
+        require_gossip = bool(params.get("require_gossip", False))
         for attempt in range(1, TEST_DM_RETRY_MAX + 1):
             try:
                 resp = self.client.direct_send(
                     recipient,
                     payload,
                     require_ack_ms=require_ack_ms,
+                    prefer_raw_quic_if_connected=prefer_raw,
+                    raw_quic_receive_ack_ms=raw_ack_ms,
+                    stop_fallback_on_raw_error=stop_fallback,
+                    require_gossip=require_gossip,
                 )
                 elapsed_ms = int((time.time() - t0) * 1000)
                 self._enqueue_result(

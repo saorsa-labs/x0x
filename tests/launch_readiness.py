@@ -107,6 +107,14 @@ def load_tokens(path: Path) -> Dict[str, Tuple[str, str]]:
     return {n: (ip, toks[n]) for n, ip in ips.items() if n in toks}
 
 
+AUTH_BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+")
+
+
+def redact_auth_tokens(text: str) -> str:
+    """Redact bearer tokens before command strings reach proof logs."""
+    return AUTH_BEARER_RE.sub("Bearer [REDACTED]", text)
+
+
 # ── Diagnostics fetcher ────────────────────────────────────────────────
 def fetch_diagnostics(node: str, ip: str, token: str, timeout: int = 12) -> Dict[str, Any]:
     """Fetch /diagnostics/gossip via SSH (avoids opening per-node tunnels)."""
@@ -115,24 +123,30 @@ def fetch_diagnostics(node: str, ip: str, token: str, timeout: int = 12) -> Dict
         f"-H 'Authorization: Bearer {token}' "
         f"http://127.0.0.1:12600/diagnostics/gossip"
     )
-    proc = subprocess.run(
-        [
-            "ssh",
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=none",
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", f"ConnectTimeout={timeout}",
-            f"root@{ip}",
-            cmd,
-        ],
-        capture_output=True,
-        timeout=timeout + 10,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "ssh",
+                "-o", "ControlMaster=no",
+                "-o", "ControlPath=none",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", f"ConnectTimeout={timeout}",
+                f"root@{ip}",
+                cmd,
+            ],
+            capture_output=True,
+            timeout=timeout + 10,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise TimeoutError(
+            f"ssh+curl timed out for {node} after {timeout + 10}s"
+        ) from e
     if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(
             f"ssh+curl failed for {node}: rc={proc.returncode} "
-            f"stderr={proc.stderr.decode('utf-8', errors='replace').strip()}"
+            f"stderr={redact_auth_tokens(stderr)}"
         )
     body = proc.stdout.decode("utf-8", errors="replace").strip()
     if not body:
@@ -171,11 +185,16 @@ def ssh_run(ip: str, remote_cmd: str, timeout: int = 30) -> subprocess.Completed
 
 def ssh_checked(ip: str, remote_cmd: str, timeout: int = 30) -> str:
     """Run a remote command and raise with stderr context on failure."""
-    proc = ssh_run(ip, remote_cmd, timeout=timeout)
+    try:
+        proc = ssh_run(ip, remote_cmd, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise TimeoutError(
+            f"ssh command timed out after {timeout}s: {redact_auth_tokens(remote_cmd)}"
+        ) from e
     if proc.returncode != 0:
         raise RuntimeError(
-            f"ssh command failed rc={proc.returncode}: {remote_cmd}; "
-            f"stderr={proc.stderr.strip()}"
+            f"ssh command failed rc={proc.returncode}: {redact_auth_tokens(remote_cmd)}; "
+            f"stderr={redact_auth_tokens(proc.stderr.strip())}"
         )
     return proc.stdout.strip()
 
@@ -307,10 +326,23 @@ def extract_counters(diag: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+MONOTONIC_COUNTER_FIELDS = {
+    "dispatcher_completed",
+    "dispatcher_timed_out",
+    "recv_pump_dropped_full",
+    "recv_pump_produced_total",
+    "per_peer_timeout_count",
+}
+
+
 def diff_counters(pre: Dict[str, int], post: Dict[str, int]) -> Dict[str, int]:
-    """Per-key delta. Missing keys default to 0."""
+    """Per-key delta. Monotonic counters are clamped across resets/gaps."""
     keys = set(pre) | set(post)
-    return {k: int(post.get(k, 0)) - int(pre.get(k, 0)) for k in keys}
+    deltas = {k: int(post.get(k, 0)) - int(pre.get(k, 0)) for k in keys}
+    for key in MONOTONIC_COUNTER_FIELDS:
+        if key in deltas:
+            deltas[key] = max(0, deltas[key])
+    return deltas
 
 
 def per_peer_timeout_ratio(delta: Dict[str, int]) -> float:

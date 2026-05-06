@@ -337,7 +337,7 @@ def discover_windows_summary(window_dir: Path) -> Dict[str, str]:
                     vs = []
                     for r in baseline_rows:
                         try:
-                            vs.append(int(r.get(field, "0") or "0"))
+                            vs.append(max(0, int(r.get(field, "0") or "0")))
                         except ValueError:
                             pass
                     return max(vs) if vs else 0
@@ -345,7 +345,7 @@ def discover_windows_summary(window_dir: Path) -> Dict[str, str]:
                     total = 0
                     for r in baseline_rows:
                         try:
-                            total += int(r.get(field, "0") or "0")
+                            total += max(0, int(r.get(field, "0") or "0"))
                         except ValueError:
                             pass
                     return total

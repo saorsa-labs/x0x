@@ -81,9 +81,6 @@ const PRE_SEND_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Reconnect budget used after a failed pre-send probe.
 const PRE_SEND_RECONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Cadence for background app-level liveness maintenance.
-const LIVENESS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10);
-
 /// Capacity for the PubSub inbound gossip channel.
 const GOSSIP_PUBSUB_RECV_CAPACITY: usize = 10_000;
 /// Capacity for low-volume control-style inbound gossip channels.
@@ -804,6 +801,10 @@ pub struct NetworkNode {
     peer_id: AntPeerId,
     /// Bootstrap peer cache for recording connection outcomes.
     bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
+    /// Per-peer liveness repair locks. Prevents concurrent fanout and
+    /// maintenance tasks from repeatedly disconnecting/reconnecting the same
+    /// stale connection.
+    liveness_locks: Arc<Mutex<HashMap<AntPeerId, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl NetworkNode {
@@ -884,11 +885,11 @@ impl NetworkNode {
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             peer_id,
             bootstrap_cache,
+            liveness_locks: Arc::new(Mutex::new(HashMap::new())),
         };
 
         network_node.spawn_receiver();
         network_node.spawn_accept_loop();
-        network_node.spawn_liveness_maintenance();
 
         Ok(network_node)
     }
@@ -1079,51 +1080,6 @@ impl NetworkNode {
             })
     }
 
-    async fn idle_peers_needing_maintenance(&self) -> Vec<AntPeerId> {
-        let Ok(node) = self.require_node().await else {
-            return Vec::new();
-        };
-        let now = Instant::now();
-        node.connected_peers()
-            .await
-            .into_iter()
-            .filter(|conn| {
-                now.saturating_duration_since(conn.last_activity)
-                    >= PRE_SEND_LIVENESS_IDLE_THRESHOLD
-            })
-            .map(|conn| conn.peer_id)
-            .collect()
-    }
-
-    fn spawn_liveness_maintenance(&self) {
-        let network = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(LIVENESS_MAINTENANCE_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-            loop {
-                interval.tick().await;
-                if network.node.read().await.is_none() {
-                    break;
-                }
-
-                for peer_id in network.idle_peers_needing_maintenance().await {
-                    let network = network.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = network.ensure_peer_send_ready(&peer_id).await {
-                            tracing::debug!(
-                                target: "x0x::connect",
-                                peer_id_prefix = %hex_prefix(&peer_id.0, 4),
-                                error = %e,
-                                "idle peer liveness maintenance did not refresh peer"
-                            );
-                        }
-                    });
-                }
-            }
-        });
-    }
-
     fn peer_needs_pre_send_probe(health: &ant_quic::ConnectionHealth, idle_for: Duration) -> bool {
         !health.connected
             || health.reader_task_active != Some(true)
@@ -1214,7 +1170,47 @@ impl NetworkNode {
         }
     }
 
+    fn liveness_lock_for_peer(
+        &self,
+        peer_id: AntPeerId,
+    ) -> NetworkResult<Arc<tokio::sync::Mutex<()>>> {
+        let mut locks = self.liveness_locks.lock().map_err(|_| {
+            NetworkError::NodeCreation("peer liveness lock map poisoned".to_string())
+        })?;
+        Ok(locks
+            .entry(peer_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone())
+    }
+
+    async fn peer_needs_send_readiness_repair(&self, peer_id: &AntPeerId) -> NetworkResult<bool> {
+        let Some((_fallback_addr, idle_for)) = self.connected_peer_snapshot(peer_id).await else {
+            return Ok(true);
+        };
+
+        let health = self
+            .connection_health(*peer_id)
+            .await
+            .ok_or_else(|| NetworkError::NodeCreation("Node not initialized".to_string()))?;
+        Ok(Self::peer_needs_pre_send_probe(&health, idle_for))
+    }
+
     async fn ensure_peer_send_ready(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
+        if !self.peer_needs_send_readiness_repair(peer_id).await? {
+            return Ok(());
+        }
+
+        let lock = self.liveness_lock_for_peer(*peer_id)?;
+        let _guard = lock.lock().await;
+
+        if !self.peer_needs_send_readiness_repair(peer_id).await? {
+            return Ok(());
+        }
+
+        self.ensure_peer_send_ready_inner(peer_id).await
+    }
+
+    async fn ensure_peer_send_ready_inner(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
         let Some((fallback_addr, idle_for)) = self.connected_peer_snapshot(peer_id).await else {
             self.connect_cached_peer(*peer_id).await?;
             return Ok(());

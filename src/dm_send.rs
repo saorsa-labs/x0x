@@ -12,6 +12,7 @@ use crate::identity::{AgentId, MachineId};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::oneshot::error::TryRecvError;
 
 pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
 
@@ -93,6 +94,29 @@ pub async fn send_via_gossip(
 
     let start = Instant::now();
     for attempt in 0..=config.max_retries {
+        if attempt > 0 {
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    tracing::info!(
+                        target: "dm.trace",
+                        stage = "outbound_send_returned_ok",
+                        request_id = %hex::encode(request_id),
+                        recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                        attempt = attempt.saturating_sub(1),
+                        ack_observed = "before_retry",
+                    );
+                    guard.mark_resolved();
+                    return ack_outcome_to_receipt(outcome, request_id, attempt.saturating_sub(1));
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Closed) => {
+                    return Err(DmError::PublishFailed(
+                        "in-flight ACK registry replaced our waiter".to_string(),
+                    ));
+                }
+            }
+        }
+
         // The per-attempt budget covers both the local PlumTree publish and
         // the remote ACK wait.  Under PubSub back-pressure, `publish()` can be
         // the slow leg; bounding only the ACK wait let HTTP handlers exceed
@@ -120,17 +144,7 @@ pub async fn send_via_gossip(
                     attempt,
                 );
                 guard.mark_resolved();
-                return match outcome {
-                    DmAckOutcome::Accepted => Ok(DmReceipt {
-                        request_id,
-                        accepted_at: Instant::now(),
-                        retries_used: attempt,
-                        path: DmPath::GossipInbox,
-                    }),
-                    DmAckOutcome::RejectedByPolicy { reason } => {
-                        Err(DmError::RecipientRejected { reason })
-                    }
-                };
+                return ack_outcome_to_receipt(outcome, request_id, attempt);
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -142,6 +156,19 @@ pub async fn send_via_gossip(
                 }
             }
         }
+    }
+
+    if let Ok(outcome) = rx.try_recv() {
+        tracing::info!(
+            target: "dm.trace",
+            stage = "outbound_send_returned_ok",
+            request_id = %hex::encode(request_id),
+            recipient = %hex::encode(recipient_agent_id.as_bytes()),
+            attempt = config.max_retries,
+            ack_observed = "before_timeout",
+        );
+        guard.mark_resolved();
+        return ack_outcome_to_receipt(outcome, request_id, config.max_retries);
     }
 
     Err(DmError::Timeout {
@@ -167,6 +194,22 @@ impl InFlightGuard {
 
     fn mark_resolved(&mut self) {
         self.resolved = true;
+    }
+}
+
+fn ack_outcome_to_receipt(
+    outcome: DmAckOutcome,
+    request_id: [u8; 16],
+    retries_used: u8,
+) -> Result<DmReceipt, DmError> {
+    match outcome {
+        DmAckOutcome::Accepted => Ok(DmReceipt {
+            request_id,
+            accepted_at: Instant::now(),
+            retries_used,
+            path: DmPath::GossipInbox,
+        }),
+        DmAckOutcome::RejectedByPolicy { reason } => Err(DmError::RecipientRejected { reason }),
     }
 }
 

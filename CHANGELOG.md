@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.22] - 2026-05-06
+
+X0X-0030 mitigation rework. The 0.19.21 fix introduced an unbounded
+background liveness loop that caused per-peer probe storms, memory leaks
+(singapore OOM-killed at 10:15Z, fleet at 677-891 MB after ~3h vs 585 MB
+post-X0X-0028 baseline), and Phase A catastrophic regression (window 1
+14/12, window 7 3/4). Four root causes addressed:
+
+### Fixed
+
+- **`x0x` daemon (X0X-0030 rework)**: removed the background liveness
+  maintenance loop. Liveness repair is now lazy-only on the send path
+  via `ensure_peer_send_ready`. No more per-peer probe-every-10s.
+- **`x0x` `src/dm_send.rs`**: gossip DM retry could time out, sleep, then
+  republish without first checking whether the ACK arrived during the
+  backoff sleep. `send_via_gossip` now does `try_recv()` on the ACK
+  channel before each retry; a late ACK short-circuits the retry and
+  returns success. Prevents amplifying mesh load with redundant
+  republishes.
+- **Phase A harness independence**: `/direct/send` defaults to
+  `gossip_inbox` when peer capabilities exist, so the prior Phase A
+  tests had been silently exercising PubSub instead of raw QUIC. Added
+  `prefer_raw_quic_if_connected` and `raw_quic_receive_ack_ms` request
+  flags to `/direct/send`, with `COMMAND_RAW_QUIC_ACK_MS = 3000` in the
+  Phase A runner.
+- **Adaptive timeout signal**: was using direct-transport RTT to shrink
+  gossip-inbox ACK timeout — wrong signal for a PubSub-backed path.
+  Restored conservative default for gossip DMs.
+
+References: RFC 9002 (QUIC loss recovery), RFC 8085 (UDP usage
+guidelines), libp2p Gossipsub v1.1.
+
+### Verified
+
+- 660/660 nextest, 29/29 Python tests, clippy `-D warnings` clean.
+- `cargo test pre_send_probe --lib` passes (lazy probe path retained).
+
 ## [v0.19.21] - 2026-05-06
 
 X0X-0030 mitigation — QUIC connection idle-rot causing DM dispatch failures

@@ -2888,9 +2888,19 @@ impl Agent {
             return Ok(receipt);
         }
 
+        let cap = self.capability_store.lookup(to);
+        let gossip_ok = cap
+            .as_ref()
+            .map(|c| c.gossip_inbox && !c.kem_public_key.is_empty())
+            .unwrap_or(false);
+
         let rtt_hint_ms = self.dm_peer_rtt_ms(to).await;
         let mut config = config;
-        if config.timeout_per_attempt == dm::dm_attempt_timeout(None) {
+        // Direct transport RTT is a valid hint for raw-QUIC work, but it is
+        // not a reliable bound for the gossip-inbox ACK path. Keep the
+        // conservative default for PubSub-backed DMs unless the caller passed
+        // an explicit timeout.
+        if !gossip_ok && config.timeout_per_attempt == dm::dm_attempt_timeout(None) {
             config.timeout_per_attempt = dm::dm_attempt_timeout(rtt_hint_ms);
         }
         self.direct_messaging
@@ -2902,12 +2912,6 @@ impl Agent {
                 last_seen_ms_ago,
             });
         }
-
-        let cap = self.capability_store.lookup(to);
-        let gossip_ok = cap
-            .as_ref()
-            .map(|c| c.gossip_inbox && !c.kem_public_key.is_empty())
-            .unwrap_or(false);
 
         let mut preferred_raw_err = None;
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected && !config.require_gossip

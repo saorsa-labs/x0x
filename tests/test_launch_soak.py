@@ -97,6 +97,39 @@ class LaunchSoakSummaryTests(unittest.TestCase):
         self.assertIn("dispatcher_timed_out delta", row["violation_messages"])
         self.assertEqual("2", row["violations"])
 
+    def test_discover_summary_clamps_negative_counter_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            window_dir = Path(tmp)
+            (window_dir / "summary.md").write_text(
+                "\n".join(
+                    [
+                        "### Overall verdict: **NO-GO**",
+                        "- phase_a_received: `11`",
+                        "- phase_a_sent: `9`",
+                        "- violations:",
+                        "  - phase A received 11 < gate 30",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (window_dir / "summary.csv").write_text(
+                "\n".join(
+                    [
+                        "scenario,node,dispatcher_timed_out_delta,recv_pump_dropped_full_delta,per_peer_timeout_delta,suppressed_peers_post,pubsub_workers_post,violations_count,suppressed_peers_to_known_ratio",
+                        "baseline,nyc,-10,0,-4455,0,0,1,0.000000",
+                        "baseline,sfo,-34,0,-3595,0,0,1,0.000000",
+                        "baseline,sydney,2,0,689,332,24,1,0.138333",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            row = self.soak.discover_windows_summary(window_dir)
+
+        self.assertEqual("2", row["max_disp_to_delta"])
+        self.assertEqual("2", row["sum_disp_to_delta"])
+        self.assertEqual("689", row["max_pp_to_delta"])
+
     def test_continuous_deltas_bridge_missing_pre_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             soak_dir = Path(tmp)

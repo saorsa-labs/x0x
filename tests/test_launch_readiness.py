@@ -177,6 +177,30 @@ class LaunchReadinessGateTests(unittest.TestCase):
 
         self.assertEqual(0.05, ratio)
 
+    def test_diff_counters_clamps_monotonic_resets(self) -> None:
+        delta = self.lr.diff_counters(
+            {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 10,
+                "recv_pump_dropped_full": 2,
+                "per_peer_timeout_count": 50,
+            },
+            {},
+        )
+
+        self.assertEqual(0, delta["dispatcher_completed"])
+        self.assertEqual(0, delta["dispatcher_timed_out"])
+        self.assertEqual(0, delta["recv_pump_dropped_full"])
+        self.assertEqual(0, delta["per_peer_timeout_count"])
+
+    def test_redact_auth_tokens_masks_bearer_values(self) -> None:
+        text = "curl -H 'Authorization: Bearer abc123SECRET' http://127.0.0.1"
+
+        redacted = self.lr.redact_auth_tokens(text)
+
+        self.assertNotIn("abc123SECRET", redacted)
+        self.assertIn("Bearer [REDACTED]", redacted)
+
     def test_netem_commands_apply_cleanup_and_verify_named_qdisc(self) -> None:
         apply_cmd = self.lr.netem_apply_command("eth0", 1500, 200, "normal")
         cleanup_cmd = self.lr.netem_cleanup_command("eth0")

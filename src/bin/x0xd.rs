@@ -878,6 +878,20 @@ struct DirectSendRequest {
     agent_id: String,
     /// Base64-encoded payload.
     payload: String,
+    /// Prefer the raw-QUIC path when a live direct connection exists.
+    #[serde(default)]
+    prefer_raw_quic_if_connected: bool,
+    /// Optional raw-QUIC receive-pipeline ACK timeout for the message itself.
+    #[serde(default)]
+    raw_quic_receive_ack_ms: Option<u64>,
+    /// If true, do not fall back to gossip-inbox after a preferred raw-QUIC
+    /// failure.
+    #[serde(default)]
+    stop_fallback_on_raw_error: bool,
+    /// If true, require gossip-inbox delivery and reject recipients without a
+    /// gossip DM capability.
+    #[serde(default)]
+    require_gossip: bool,
     /// Optional opt-in: after the DM path accepts the message, probe the
     /// recipient's ant-quic receive pipeline for liveness with this timeout.
     /// This does not force the message itself onto raw-QUIC receive-ACK.
@@ -11423,9 +11437,19 @@ async fn direct_send(
         Err(resp) => return resp,
     };
 
+    let mut send_config = direct_message_send_config();
+    send_config.prefer_raw_quic_if_connected = req.prefer_raw_quic_if_connected;
+    send_config.stop_fallback_on_raw_error = req.stop_fallback_on_raw_error;
+    send_config.require_gossip = req.require_gossip;
+    if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
+        send_config.raw_quic_receive_ack_timeout = Some(std::time::Duration::from_millis(
+            raw_ack_ms.clamp(100, 30_000),
+        ));
+    }
+
     match state
         .agent
-        .send_direct_with_config(&agent_id, payload, direct_message_send_config())
+        .send_direct_with_config(&agent_id, payload, send_config)
         .await
     {
         Ok(receipt) => {

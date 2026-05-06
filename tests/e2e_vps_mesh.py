@@ -62,12 +62,12 @@ LEGACY_RESULTS_TOPIC = "x0x.test.results.v1"
 #   x0xtest|res|<b64-json>   runner → orchestrator result
 PREFIX_CMD = b"x0xtest|cmd|"
 PREFIX_RES = b"x0xtest|res|"
-# Command DMs use the daemon's default resilient DM path. The harness gets
-# stronger application-level proof from source `send_result` and destination
-# `received_dm` envelopes, so raw receive-ACK is disabled by default. Keep this
-# knob for a future explicit --raw-ack-stress mode; ordinary mesh correctness
-# should not depend on ant-quic receive-ACK timing.
+# Phase-A command and hop DMs explicitly use raw-QUIC receive ACKs so this
+# harness tests the point-to-point DM path without depending on PlumTree.
+# `COMMAND_DM_ACK_MS` remains the optional post-send liveness probe knob; it is
+# separate from `COMMAND_RAW_QUIC_ACK_MS`, which ACKs the message bytes.
 COMMAND_DM_ACK_MS: Optional[int] = None
+COMMAND_RAW_QUIC_ACK_MS: Optional[int] = 3000
 
 NODES_DEFAULT: List[str] = [
     "nyc",
@@ -167,6 +167,10 @@ class X0xClient:
         agent_id: str,
         payload: bytes,
         require_ack_ms: Optional[int] = COMMAND_DM_ACK_MS,
+        prefer_raw_quic_if_connected: bool = False,
+        raw_quic_receive_ack_ms: Optional[int] = None,
+        stop_fallback_on_raw_error: bool = False,
+        require_gossip: bool = False,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "agent_id": agent_id,
@@ -174,6 +178,14 @@ class X0xClient:
         }
         if require_ack_ms is not None:
             body["require_ack_ms"] = require_ack_ms
+        if prefer_raw_quic_if_connected:
+            body["prefer_raw_quic_if_connected"] = True
+        if raw_quic_receive_ack_ms is not None:
+            body["raw_quic_receive_ack_ms"] = raw_quic_receive_ack_ms
+        if stop_fallback_on_raw_error:
+            body["stop_fallback_on_raw_error"] = True
+        if require_gossip:
+            body["require_gossip"] = True
         return self._req("POST", "/direct/send", body=body)
 
     def open_sse(self, path: str, timeout: float = 3600 * 6):
@@ -524,7 +536,13 @@ def send_command_dm(
             return None
     wire = PREFIX_CMD + base64.b64encode(envelope)
     try:
-        return client.direct_send(target_aid, wire)
+        return client.direct_send(
+            target_aid,
+            wire,
+            prefer_raw_quic_if_connected=True,
+            raw_quic_receive_ack_ms=COMMAND_RAW_QUIC_ACK_MS,
+            stop_fallback_on_raw_error=True,
+        )
     except urllib.error.HTTPError as exc:
         try:
             body = json.loads(exc.read())
@@ -659,6 +677,9 @@ def run_all_pairs_matrix(
                 "request_id": request_id,
                 "digest_marker": digest,
                 "anchor_aid": anchor_aid,
+                "prefer_raw_quic_if_connected": True,
+                "raw_quic_receive_ack_ms": COMMAND_RAW_QUIC_ACK_MS,
+                "stop_fallback_on_raw_error": True,
             },
         }
         resp = send_command_dm(
