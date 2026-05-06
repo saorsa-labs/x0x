@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.21] - 2026-05-06
+
+X0X-0030 mitigation — QUIC connection idle-rot causing DM dispatch failures
+after long quiet periods. The 6h soak under 0.19.20 (X0X-0026..0029 fixes
+shipped) showed Phase A failures correlated with 28-min idle windows: the
+mesh _looked_ connected (peer count high) but `send_with_receive_ack` timed
+out at 12s on stale UDP paths after NAT/firewall pruning of idle flows.
+
+Per RFC 9000 + RFC 9308: QUIC idle timeout is separate from UDP/NAT
+middlebox timeout. RFC 9308 explicitly notes NAT state can expire after
+~30s of inactivity. The fix is x0x-side application liveness on top of
+ant-quic, not a transport-config change.
+
+### Fixed
+
+- **`x0x` daemon (X0X-0030)**: app-level liveness maintenance + pre-send
+  readiness repair in `src/network.rs`:
+  - Background liveness loop probes peers idle ≥ 20s every 10s
+    (`PRE_SEND_LIVENESS_IDLE_THRESHOLD = 20s`, below the RFC 9308 ~30s NAT
+    timeout reference).
+  - Pre-send call (`ensure_peer_send_ready`) wraps gossip transport, raw
+    direct sends, and `send_with_receive_ack`: detects stale connection
+    health (`ant_quic::ConnectionHealth.connected/reader_task_active`) or
+    excessive idle and triggers transparent reconnect.
+  - Reconnect path: `connect_cached_peer` first (uses bootstrap-cache
+    hints), falls back to current connected UDP address, with bounded 2s
+    probe + 3s reconnect budget so user-facing DM timeouts retain budget.
+  - All thresholds chosen relative to RFC 9308 reference, not to the
+    6-VPS bootstrap fleet — same pattern works for laptops, mobile,
+    IoT devices behind aggressive NAT.
+
+### Verified
+
+- 660/660 nextest pass, clippy `-D warnings` clean, fmt clean.
+- New unit test: `pre_send_probe` (tests/regression for the pre-send path).
+
 ## [v0.19.20] - 2026-05-05
 
 X0X-0026..0029 multi-day daemon stability fixes consumed end-to-end. Aligns

@@ -67,6 +67,23 @@ pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default stats collection interval.
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Idle application-data gap after which a peer is probed before reuse.
+///
+/// QUIC keep-alives are transport-level, but the launch soak showed peers can
+/// remain listed as connected after long quiet periods while the next
+/// application send stalls. Probe before the first post-idle send so stale UDP
+/// paths are repaired before the caller's delivery timeout is spent.
+const PRE_SEND_LIVENESS_IDLE_THRESHOLD: Duration = Duration::from_secs(20);
+
+/// Probe budget for the pre-send liveness check.
+const PRE_SEND_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Reconnect budget used after a failed pre-send probe.
+const PRE_SEND_RECONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Cadence for background app-level liveness maintenance.
+const LIVENESS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Capacity for the PubSub inbound gossip channel.
 const GOSSIP_PUBSUB_RECV_CAPACITY: usize = 10_000;
 /// Capacity for low-volume control-style inbound gossip channels.
@@ -871,6 +888,7 @@ impl NetworkNode {
 
         network_node.spawn_receiver();
         network_node.spawn_accept_loop();
+        network_node.spawn_liveness_maintenance();
 
         Ok(network_node)
     }
@@ -974,6 +992,9 @@ impl NetworkNode {
         data: &[u8],
         timeout: std::time::Duration,
     ) -> Option<Result<(), ant_quic::NodeError>> {
+        if let Err(e) = self.ensure_peer_send_ready(&peer_id).await {
+            return Some(Err(ant_quic::NodeError::Connection(e.to_string())));
+        }
         let node = self.node.read().await.as_ref().cloned()?;
         Some(node.send_with_receive_ack(&peer_id, data, timeout).await)
     }
@@ -1037,6 +1058,214 @@ impl NetworkNode {
     /// * `event` - The event to emit.
     pub fn emit_event(&self, event: NetworkEvent) {
         let _ = self.event_sender.send(event);
+    }
+
+    async fn connected_peer_snapshot(
+        &self,
+        peer_id: &AntPeerId,
+    ) -> Option<(Option<SocketAddr>, Duration)> {
+        let node = self.require_node().await.ok()?;
+        let now = Instant::now();
+        node.connected_peers()
+            .await
+            .into_iter()
+            .find(|conn| conn.peer_id == *peer_id)
+            .map(|conn| {
+                let addr = match conn.remote_addr {
+                    TransportAddr::Udp(addr) => Some(addr),
+                    _ => None,
+                };
+                (addr, now.saturating_duration_since(conn.last_activity))
+            })
+    }
+
+    async fn idle_peers_needing_maintenance(&self) -> Vec<AntPeerId> {
+        let Ok(node) = self.require_node().await else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        node.connected_peers()
+            .await
+            .into_iter()
+            .filter(|conn| {
+                now.saturating_duration_since(conn.last_activity)
+                    >= PRE_SEND_LIVENESS_IDLE_THRESHOLD
+            })
+            .map(|conn| conn.peer_id)
+            .collect()
+    }
+
+    fn spawn_liveness_maintenance(&self) {
+        let network = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(LIVENESS_MAINTENANCE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                interval.tick().await;
+                if network.node.read().await.is_none() {
+                    break;
+                }
+
+                for peer_id in network.idle_peers_needing_maintenance().await {
+                    let network = network.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = network.ensure_peer_send_ready(&peer_id).await {
+                            tracing::debug!(
+                                target: "x0x::connect",
+                                peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                                error = %e,
+                                "idle peer liveness maintenance did not refresh peer"
+                            );
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    fn peer_needs_pre_send_probe(health: &ant_quic::ConnectionHealth, idle_for: Duration) -> bool {
+        !health.connected
+            || health.reader_task_active != Some(true)
+            || idle_for >= PRE_SEND_LIVENESS_IDLE_THRESHOLD
+    }
+
+    async fn refresh_peer_connection(
+        &self,
+        peer_id: &AntPeerId,
+        fallback_addr: Option<SocketAddr>,
+        reason: String,
+    ) -> NetworkResult<()> {
+        tracing::warn!(
+            target: "x0x::connect",
+            peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+            ?fallback_addr,
+            reason,
+            "refreshing peer connection before send"
+        );
+
+        if self.is_connected(peer_id).await {
+            if let Err(e) = self.disconnect(peer_id).await {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                    error = %e,
+                    "disconnect before peer refresh failed; continuing with reconnect"
+                );
+            }
+        }
+
+        let cache_result = tokio::time::timeout(
+            PRE_SEND_RECONNECT_TIMEOUT,
+            self.connect_cached_peer(*peer_id),
+        )
+        .await;
+
+        match cache_result {
+            Ok(Ok(_)) => Ok(()),
+            Err(_) => {
+                let Some(addr) = fallback_addr else {
+                    return Err(NetworkError::ConnectionTimeout {
+                        peer_id: peer_id.0,
+                        timeout: PRE_SEND_RECONNECT_TIMEOUT,
+                    });
+                };
+
+                match tokio::time::timeout(PRE_SEND_RECONNECT_TIMEOUT, self.connect_addr(addr))
+                    .await
+                {
+                    Ok(Ok(connected_peer)) if connected_peer == *peer_id => Ok(()),
+                    Ok(Ok(connected_peer)) => Err(NetworkError::ConnectionFailed(format!(
+                        "peer refresh at {addr} connected to unexpected peer {:?}",
+                        connected_peer
+                    ))),
+                    Ok(Err(addr_err)) => Err(NetworkError::ConnectionFailed(format!(
+                        "peer refresh timed out via cache after {:?} and fallback {addr} failed ({addr_err})",
+                        PRE_SEND_RECONNECT_TIMEOUT
+                    ))),
+                    Err(_) => Err(NetworkError::ConnectionTimeout {
+                        peer_id: peer_id.0,
+                        timeout: PRE_SEND_RECONNECT_TIMEOUT,
+                    }),
+                }
+            }
+            Ok(Err(cache_err)) => {
+                let Some(addr) = fallback_addr else {
+                    return Err(cache_err);
+                };
+
+                match tokio::time::timeout(PRE_SEND_RECONNECT_TIMEOUT, self.connect_addr(addr))
+                    .await
+                {
+                    Ok(Ok(connected_peer)) if connected_peer == *peer_id => Ok(()),
+                    Ok(Ok(connected_peer)) => Err(NetworkError::ConnectionFailed(format!(
+                        "peer refresh at {addr} connected to unexpected peer {:?}",
+                        connected_peer
+                    ))),
+                    Ok(Err(addr_err)) => Err(NetworkError::ConnectionFailed(format!(
+                        "peer refresh failed via cache ({cache_err}) and fallback {addr} ({addr_err})"
+                    ))),
+                    Err(_) => Err(NetworkError::ConnectionTimeout {
+                        peer_id: peer_id.0,
+                        timeout: PRE_SEND_RECONNECT_TIMEOUT,
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn ensure_peer_send_ready(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
+        let Some((fallback_addr, idle_for)) = self.connected_peer_snapshot(peer_id).await else {
+            self.connect_cached_peer(*peer_id).await?;
+            return Ok(());
+        };
+
+        let health = self
+            .connection_health(*peer_id)
+            .await
+            .ok_or_else(|| NetworkError::NodeCreation("Node not initialized".to_string()))?;
+        if !Self::peer_needs_pre_send_probe(&health, idle_for) {
+            return Ok(());
+        }
+
+        if health.connected && health.reader_task_active == Some(true) {
+            match self
+                .probe_peer(*peer_id, PRE_SEND_LIVENESS_PROBE_TIMEOUT)
+                .await
+            {
+                Some(Ok(rtt)) => {
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                        idle_ms = idle_for.as_millis() as u64,
+                        rtt_ms = rtt.as_millis() as u64,
+                        "pre-send liveness probe succeeded"
+                    );
+                    return Ok(());
+                }
+                Some(Err(e)) => {
+                    return self
+                        .refresh_peer_connection(
+                            peer_id,
+                            fallback_addr,
+                            format!("probe failed: {e}"),
+                        )
+                        .await;
+                }
+                None => {
+                    return Err(NetworkError::NodeCreation(
+                        "Node not initialized".to_string(),
+                    ));
+                }
+            }
+        }
+
+        self.refresh_peer_connection(
+            peer_id,
+            fallback_addr,
+            "connection health not send-ready".to_string(),
+        )
+        .await
     }
 
     /// Connect to a cached peer using its expected peer ID.
@@ -1476,10 +1705,7 @@ impl NetworkNode {
         sender_agent_id: &[u8; 32],
         payload: &[u8],
     ) -> NetworkResult<()> {
-        // Check connection first
-        if !self.is_connected(peer_id).await {
-            return Err(NetworkError::NotConnected(peer_id.0));
-        }
+        self.ensure_peer_send_ready(peer_id).await?;
 
         // Build wire format: [0x10][sender_agent_id: 32 bytes][payload]
         let mut buf = Vec::with_capacity(1 + 32 + payload.len());
@@ -1891,17 +2117,14 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     ) -> anyhow::Result<()> {
         let ant_peer = gossip_to_ant_peer_id(&peer);
 
-        // If not connected, try to establish a connection before giving up.
-        // HyParView exchanges PeerIds via SHUFFLE without addresses, so peers
-        // in the passive/active view may not yet have a QUIC connection.
-        if !self.is_connected(&ant_peer).await {
-            if let Err(e) = self.connect_cached_peer(ant_peer).await {
-                return Err(anyhow::anyhow!(
-                    "Peer {:?} not connected and bootstrap cache dial failed: {}",
-                    peer,
-                    e,
-                ));
-            }
+        // If not connected, or if an existing quiet connection looks stale,
+        // establish a fresh path before spending the caller's send timeout.
+        if let Err(e) = self.ensure_peer_send_ready(&ant_peer).await {
+            return Err(anyhow::anyhow!(
+                "Peer {:?} not send-ready after liveness repair: {}",
+                peer,
+                e,
+            ));
         }
 
         // Prepare message: [stream_type_byte | data]
@@ -2070,6 +2293,48 @@ mod tests {
 
         assert_eq!(config.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(config.connection_timeout, DEFAULT_CONNECTION_TIMEOUT);
+    }
+
+    #[test]
+    fn pre_send_probe_not_needed_for_fresh_ready_connection() {
+        let health = ant_quic::ConnectionHealth {
+            connected: true,
+            reader_task_active: Some(true),
+            ..Default::default()
+        };
+
+        assert!(!NetworkNode::peer_needs_pre_send_probe(
+            &health,
+            Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn pre_send_probe_needed_for_idle_ready_connection() {
+        let health = ant_quic::ConnectionHealth {
+            connected: true,
+            reader_task_active: Some(true),
+            ..Default::default()
+        };
+
+        assert!(NetworkNode::peer_needs_pre_send_probe(
+            &health,
+            PRE_SEND_LIVENESS_IDLE_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn pre_send_probe_needed_for_inactive_reader() {
+        let health = ant_quic::ConnectionHealth {
+            connected: true,
+            reader_task_active: Some(false),
+            ..Default::default()
+        };
+
+        assert!(NetworkNode::peer_needs_pre_send_probe(
+            &health,
+            Duration::from_secs(1)
+        ));
     }
 
     #[test]
