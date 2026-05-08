@@ -80,6 +80,11 @@ GATES: Dict[str, Dict[str, float]] = {
         "max_suppressed_peers_to_known_peer_topic_pairs_ratio": 0.12,
         "min_phase_a_pairs": 30,
         "max_recovery_secs": 30,
+        # X0X-0039 acceptance: cluster-wide data_tx saturation must be zero.
+        # Any high-water event in the window indicates the shared mpsc
+        # data_tx channel was filled by a per-connection reader task,
+        # which is the back-pressure failure mode this gate gates against.
+        "max_data_tx_high_water_count_delta": 0,
     },
 }
 
@@ -125,10 +130,29 @@ def fetch_ack_diagnostics(node: str, ip: str, token: str, timeout: int = 12) -> 
     return fetch_remote_json(node, ip, token, "/diagnostics/ack", timeout)
 
 
+def fetch_connectivity_diagnostics(
+    node: str, ip: str, token: str, timeout: int = 12
+) -> Dict[str, Any]:
+    """Fetch /diagnostics/connectivity via SSH (X0X-0039 / X0X-0043 surfaces)."""
+    return fetch_remote_json(node, ip, token, "/diagnostics/connectivity", timeout)
+
+
 def fetch_diagnostics_local(base_url: str, token: str, timeout: int = 12) -> Dict[str, Any]:
     """Fetch /diagnostics/gossip from a local URL (no SSH)."""
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/diagnostics/gossip",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read() or b"{}")
+
+
+def fetch_connectivity_diagnostics_local(
+    base_url: str, token: str, timeout: int = 12
+) -> Dict[str, Any]:
+    """Fetch /diagnostics/connectivity from a local URL (no SSH)."""
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/diagnostics/connectivity",
         headers={"Authorization": f"Bearer {token}"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -303,7 +327,36 @@ MONOTONIC_COUNTER_FIELDS = {
     "recv_pump_dropped_full",
     "recv_pump_produced_total",
     "per_peer_timeout_count",
+    "data_tx_high_water_count",
+    "gso_bundle_send_total",
+    "gso_bundle_partial_send",
 }
+
+
+def extract_connectivity_scalars(diag: Dict[str, Any]) -> Dict[str, int]:
+    """Pull X0X-0039/X0X-0043 scalars out of /diagnostics/connectivity.
+
+    Fields use 0 as the sentinel for missing/null values so the existing
+    diff_counters / gate logic can handle them uniformly.
+    """
+    data_tx = diag.get("data_tx", {}) or {}
+    gso = diag.get("gso", {}) or {}
+
+    def _i(value: Any) -> int:
+        if value is None:
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "data_tx_depth": _i(data_tx.get("data_tx_depth")),
+        "data_tx_capacity": _i(data_tx.get("data_tx_capacity")),
+        "data_tx_high_water_count": _i(data_tx.get("data_tx_high_water_count")),
+        "gso_bundle_send_total": _i(gso.get("bundle_send_total")),
+        "gso_bundle_partial_send": _i(gso.get("bundle_partial_send")),
+    }
 
 
 def diff_counters(pre: Dict[str, int], post: Dict[str, int]) -> Dict[str, int]:
@@ -1212,6 +1265,17 @@ def evaluate_slos(
                     f"({d.get('per_peer_timeout_count', 0)} / "
                     f"{d.get('dispatcher_completed', 0)})"
                 )
+        # X0X-0039 acceptance: data_tx must not saturate cluster-wide.
+        if (
+            "max_data_tx_high_water_count_delta" in g
+            and d.get("data_tx_high_water_count", 0)
+            > g["max_data_tx_high_water_count_delta"]
+        ):
+            violations.append(
+                f"{node}: data_tx saturation delta "
+                f"{d.get('data_tx_high_water_count', 0)} > "
+                f"gate {g['max_data_tx_high_water_count_delta']}"
+            )
 
     for node, post in posts_per_node.items():
         if (
@@ -1323,6 +1387,31 @@ def write_summary_md(
                 f"{posts.get('pubsub_workers', 0)} |"
             )
         lines.append("")
+
+        # X0X-0039 / X0X-0043 — per-scenario connectivity diagnostics summary.
+        # data_tx_* gates broad-launch (hard fail). gso_* are recorded but
+        # do not fail the gate today (Quinn #2627 GSO-tail-drop hypothesis
+        # under test; bundles never form in current build).
+        lines.append("## Diagnostics (X0X-0039 data_tx, X0X-0043 GSO)")
+        lines.append("")
+        lines.append(
+            "| node | data_tx_depth_post | data_tx_capacity_post | "
+            "data_tx_high_water Δ | gso_bundle_send_total Δ | "
+            "gso_bundle_partial_send Δ |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|")
+        for node in sorted(deltas):
+            d = deltas[node]
+            posts = d.get("_post", {})
+            lines.append(
+                f"| {node} | "
+                f"{posts.get('data_tx_depth', 0)} | "
+                f"{posts.get('data_tx_capacity', 0)} | "
+                f"{d.get('data_tx_high_water_count', 0)} | "
+                f"{d.get('gso_bundle_send_total', 0)} | "
+                f"{d.get('gso_bundle_partial_send', 0)} |"
+            )
+        lines.append("")
     (proof_dir / "summary.md").write_text("\n".join(lines))
 
 
@@ -1340,6 +1429,10 @@ def write_summary_csv(
             "per_peer_timeout_to_completed_ratio", "recv_pump_drop_full_ratio",
             "recv_pump_latest_depth_post", "suppressed_peers_to_known_ratio",
             "known_peer_topic_pairs_post",
+            # X0X-0039 / X0X-0043 connectivity diagnostics scalars.
+            "data_tx_depth_post", "data_tx_capacity_post",
+            "data_tx_high_water_count_delta",
+            "gso_bundle_send_total_delta", "gso_bundle_partial_send_delta",
         ])
         for sr, deltas, passed, violations in results:
             for node, d in deltas.items():
@@ -1362,6 +1455,11 @@ def write_summary_csv(
                     posts.get("recv_pump_latest_depth", 0),
                     "inf" if suppressed_ratio == float("inf") else f"{suppressed_ratio:.6f}",
                     posts.get("known_peer_topic_pairs", posts.get("peer_scores_total", 0)),
+                    posts.get("data_tx_depth", 0),
+                    posts.get("data_tx_capacity", 0),
+                    d.get("data_tx_high_water_count", 0),
+                    d.get("gso_bundle_send_total", 0),
+                    d.get("gso_bundle_partial_send", 0),
                 ])
 
 
@@ -1456,6 +1554,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         scen_diag_dir.mkdir(exist_ok=True)
         scen_ack_diag_dir = proof_dir / "diagnostics_ack" / sname
         scen_ack_diag_dir.mkdir(parents=True, exist_ok=True)
+        scen_conn_diag_dir = proof_dir / "diagnostics_connectivity" / sname
+        scen_conn_diag_dir.mkdir(parents=True, exist_ok=True)
         # Pre-snapshot.
         pre_counters: Dict[str, Dict[str, int]] = {}
         for node, (ip, token) in nodes.items():
@@ -1473,6 +1573,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
             except Exception as e:
                 LOG.warning("pre ACK snapshot %s failed: %s", node, e)
+            try:
+                conn_diag = fetch_connectivity_diagnostics(node, ip, token)
+                (scen_conn_diag_dir / f"{node}-pre.json").write_text(
+                    json.dumps(conn_diag, indent=2)
+                )
+                pre_counters[node].update(extract_connectivity_scalars(conn_diag))
+            except Exception as e:
+                LOG.warning("pre connectivity snapshot %s failed: %s", node, e)
 
         sr = SCENARIOS[sname](ctx)
 
@@ -1493,6 +1601,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
             except Exception as e:
                 LOG.warning("post ACK snapshot %s failed: %s", node, e)
+            try:
+                conn_diag = fetch_connectivity_diagnostics(node, ip, token)
+                (scen_conn_diag_dir / f"{node}-post.json").write_text(
+                    json.dumps(conn_diag, indent=2)
+                )
+                post_counters[node].update(extract_connectivity_scalars(conn_diag))
+            except Exception as e:
+                LOG.warning("post connectivity snapshot %s failed: %s", node, e)
 
         deltas: Dict[str, Dict[str, int]] = {}
         for node in nodes:

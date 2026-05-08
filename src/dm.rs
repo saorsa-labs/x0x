@@ -384,6 +384,13 @@ pub struct DmSendConfig {
     /// present. Use this for higher-volume protocols (for example file
     /// transfer) whose own back-pressure/ACK logic is tuned for raw QUIC.
     pub stop_fallback_on_raw_error: bool,
+    /// X0X-0041: bounded grace window (ms) the DM path holds when ant-quic has
+    /// just observed a `Replaced` event but the new `Established` has not yet
+    /// fired. Mirrors iroh-gossip #43 "always prefer newest connection" — when
+    /// a supersede is in flight we wait briefly for the new generation rather
+    /// than declaring the peer disconnected. Default 250ms. Setting to 0
+    /// disables the grace and reverts to legacy behaviour.
+    pub prefer_newest_grace_ms: u64,
 }
 
 impl Default for DmSendConfig {
@@ -402,9 +409,14 @@ impl Default for DmSendConfig {
             prefer_raw_quic_if_connected: false,
             raw_quic_receive_ack_timeout: None,
             stop_fallback_on_raw_error: false,
+            // X0X-0041: 250ms is the soak-tested grace from iroh-gossip #43.
+            prefer_newest_grace_ms: DEFAULT_PREFER_NEWEST_GRACE_MS,
         }
     }
 }
+
+/// X0X-0041: default prefer-newest-connection grace window.
+pub const DEFAULT_PREFER_NEWEST_GRACE_MS: u64 = 250;
 
 /// Backoff schedule between send attempts.
 #[derive(Debug, Clone, Copy)]

@@ -12522,6 +12522,10 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
 
     match network.node_status().await {
         Some(ns) => {
+            // X0X-0039: real `data_tx` saturation snapshot from ant-quic 0.27.13.
+            let data_tx = network.data_channel_diagnostics().await;
+            // X0X-0043: real GSO bundle send snapshot from ant-quic 0.27.13.
+            let gso = network.gso_diagnostics().await;
             let snapshot = serde_json::json!({
                 "ok": true,
                 "peer_id": hex::encode(ns.peer_id.0),
@@ -12563,6 +12567,19 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                 },
                 "avg_rtt_ms": ns.avg_rtt.as_millis() as u64,
                 "uptime_s": ns.uptime.as_secs(),
+                // X0X-0039: `data_tx` channel saturation (ant-quic 0.27.13).
+                "data_tx": {
+                    "data_tx_depth": data_tx.as_ref().map(|d| d.data_tx_depth),
+                    "data_tx_capacity": data_tx.as_ref().map(|d| d.data_tx_capacity),
+                    "data_tx_high_water_count": data_tx.as_ref().map(|d| d.data_tx_high_water_count),
+                },
+                // X0X-0043: GSO bundle send counters (ant-quic 0.27.13). See
+                // `docs/debug/gso-bundle-tail-drop-x0x-0030.md` for the
+                // Quinn issue #2627 GSO-tail-drop hypothesis under test.
+                "gso": {
+                    "bundle_send_total": gso.as_ref().map(|g| g.bundle_send_total),
+                    "bundle_partial_send": gso.as_ref().map(|g| g.bundle_partial_send),
+                },
             });
             (StatusCode::OK, Json(snapshot))
         }

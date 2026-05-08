@@ -67,7 +67,12 @@ PREFIX_RES = b"x0xtest|res|"
 # `COMMAND_DM_ACK_MS` remains the optional post-send liveness probe knob; it is
 # separate from `COMMAND_RAW_QUIC_ACK_MS`, which ACKs the message bytes.
 COMMAND_DM_ACK_MS: Optional[int] = None
-COMMAND_RAW_QUIC_ACK_MS: Optional[int] = 3000
+# Bumped from 3000 → 6000 ms to accommodate ant-quic's X0X-0037 internal
+# duplicate-safe retry: first ACK attempt 3 s + retry budget 2 s + jitter
+# headroom = ~5.5 s. The original 3 s budget tripped before ant-quic's
+# retry could complete, throttling Phase A throughput on 0.19.31. See
+# X0X-0037 §followups.
+COMMAND_RAW_QUIC_ACK_MS: Optional[int] = 6000
 
 NODES_DEFAULT: List[str] = [
     "nyc",

@@ -12,7 +12,24 @@ use crate::identity::{AgentId, MachineId};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast::error::TryRecvError as BroadcastTryRecvError;
 use tokio::sync::oneshot::error::TryRecvError;
+
+/// X0X-0041: prefer-newest-connection hint for the gossip-DM retry loop.
+///
+/// When provided, the retry loop watches for `Replaced` lifecycle events that
+/// target the recipient's machine_id and short-circuits the current backoff —
+/// the supersede signal indicates the previous attempt's transport state is
+/// stale and we should reissue against the new generation immediately rather
+/// than waiting for the configured backoff window.
+pub struct DmLifecycleHint {
+    /// MachineId of the intended recipient (resolved by caller from the
+    /// discovery cache or direct-messaging registry).
+    pub recipient_machine_id: MachineId,
+    /// Receiver for `(machine_id, new_generation)` from
+    /// [`crate::direct::DirectMessaging::subscribe_lifecycle_replaced`].
+    pub replaced_rx: tokio::sync::broadcast::Receiver<(MachineId, u64)>,
+}
 
 pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
 
@@ -27,6 +44,7 @@ pub async fn send_via_gossip(
     payload: Vec<u8>,
     config: &DmSendConfig,
     inflight: Arc<InFlightAcks>,
+    lifecycle_hint: Option<DmLifecycleHint>,
 ) -> Result<DmReceipt, DmError> {
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(DmError::EnvelopeConstruction(format!(
@@ -92,6 +110,11 @@ pub async fn send_via_gossip(
     let mut rx = inflight.register(request_id);
     let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
 
+    // X0X-0041: split the lifecycle hint into the per-peer match key and the
+    // mutable receiver so we can both filter events and short-circuit the
+    // backoff on a `Replaced` for the target peer.
+    let mut lifecycle_hint = lifecycle_hint;
+
     let start = Instant::now();
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
@@ -150,17 +173,37 @@ pub async fn send_via_gossip(
             Err(_) => {
                 if attempt < config.max_retries {
                     let delay = config.backoff.delay(config.timeout_per_attempt, attempt);
-                    if let Some(outcome) = wait_for_ack_or_backoff(&mut rx, delay).await? {
-                        tracing::info!(
-                            target: "dm.trace",
-                            stage = "outbound_send_returned_ok",
-                            request_id = %hex::encode(request_id),
-                            recipient = %hex::encode(recipient_agent_id.as_bytes()),
-                            attempt,
-                            ack_observed = "during_backoff",
-                        );
-                        guard.mark_resolved();
-                        return ack_outcome_to_receipt(outcome, request_id, attempt);
+                    let wait_outcome = wait_for_ack_or_backoff_or_replaced(
+                        &mut rx,
+                        delay,
+                        lifecycle_hint.as_mut(),
+                    )
+                    .await?;
+                    match wait_outcome {
+                        BackoffWait::Ack(outcome) => {
+                            tracing::info!(
+                                target: "dm.trace",
+                                stage = "outbound_send_returned_ok",
+                                request_id = %hex::encode(request_id),
+                                recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                                attempt,
+                                ack_observed = "during_backoff",
+                            );
+                            guard.mark_resolved();
+                            return ack_outcome_to_receipt(outcome, request_id, attempt);
+                        }
+                        BackoffWait::ReplacedShortCircuit { new_generation } => {
+                            tracing::info!(
+                                target: "dm.trace",
+                                stage = "outbound_send_replaced_short_circuit",
+                                request_id = %hex::encode(request_id),
+                                recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                                attempt,
+                                new_generation,
+                                "X0X-0041: prefer-newest, abandon backoff and reissue against new generation",
+                            );
+                        }
+                        BackoffWait::Elapsed => {}
                     }
                 }
             }
@@ -219,6 +262,101 @@ async fn wait_for_ack_or_backoff(
             "in-flight ACK registry replaced our waiter".to_string(),
         )),
         Err(_) => Ok(None),
+    }
+}
+
+/// X0X-0041: outcome of the prefer-newest-aware backoff wait.
+#[derive(Debug)]
+enum BackoffWait {
+    /// The recipient ACKed during the backoff window.
+    Ack(DmAckOutcome),
+    /// A `Replaced` event for the target peer fired during the backoff —
+    /// short-circuit and reissue against the new generation.
+    ReplacedShortCircuit {
+        /// new generation reported by ant-quic
+        new_generation: u64,
+    },
+    /// Backoff window elapsed without ACK or supersede signal.
+    Elapsed,
+}
+
+/// X0X-0041: backoff wait that races ACK delivery, the configured backoff
+/// timer, and a supersede event for the target peer.
+async fn wait_for_ack_or_backoff_or_replaced(
+    rx: &mut tokio::sync::oneshot::Receiver<DmAckOutcome>,
+    delay: Duration,
+    lifecycle_hint: Option<&mut DmLifecycleHint>,
+) -> Result<BackoffWait, DmError> {
+    if delay.is_zero() {
+        return Ok(BackoffWait::Elapsed);
+    }
+    let Some(hint) = lifecycle_hint else {
+        // No hint → fall back to the legacy two-arm wait.
+        return match wait_for_ack_or_backoff(rx, delay).await? {
+            Some(outcome) => Ok(BackoffWait::Ack(outcome)),
+            None => Ok(BackoffWait::Elapsed),
+        };
+    };
+    let target_machine = hint.recipient_machine_id;
+    let replaced_rx = &mut hint.replaced_rx;
+
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(BackoffWait::Elapsed);
+        }
+        tokio::select! {
+            biased;
+            ack = &mut *rx => {
+                return match ack {
+                    Ok(outcome) => Ok(BackoffWait::Ack(outcome)),
+                    Err(_) => Err(DmError::PublishFailed(
+                        "in-flight ACK registry replaced our waiter".to_string(),
+                    )),
+                };
+            }
+            replaced = replaced_rx.recv() => {
+                match replaced {
+                    Ok((machine, gen)) if machine == target_machine => {
+                        return Ok(BackoffWait::ReplacedShortCircuit { new_generation: gen });
+                    }
+                    Ok(_) => {
+                        // Event for a different peer — keep waiting.
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Replaced channel lag on a noisy node — drain any
+                        // outstanding events for the target peer before
+                        // resuming the wait.
+                        loop {
+                            match replaced_rx.try_recv() {
+                                Ok((machine, gen)) if machine == target_machine => {
+                                    return Ok(BackoffWait::ReplacedShortCircuit { new_generation: gen });
+                                }
+                                Ok(_) => continue,
+                                Err(BroadcastTryRecvError::Empty)
+                                | Err(BroadcastTryRecvError::Closed)
+                                | Err(BroadcastTryRecvError::Lagged(_)) => break,
+                            }
+                        }
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Channel closed — fall back to the simple delay.
+                        match tokio::time::timeout_at(deadline, &mut *rx).await {
+                            Ok(Ok(outcome)) => return Ok(BackoffWait::Ack(outcome)),
+                            Ok(Err(_)) => return Err(DmError::PublishFailed(
+                                "in-flight ACK registry replaced our waiter".to_string(),
+                            )),
+                            Err(_) => return Ok(BackoffWait::Elapsed),
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Ok(BackoffWait::Elapsed);
+            }
+        }
     }
 }
 
@@ -309,5 +447,98 @@ mod tests {
             .expect("backoff timeout is not an error");
 
         assert_eq!(outcome, None);
+    }
+
+    /// X0X-0041: a `Replaced` event for the target peer fires during the
+    /// backoff window — the wait short-circuits with
+    /// `BackoffWait::ReplacedShortCircuit` rather than waiting for the full
+    /// backoff or returning `Elapsed`.
+    #[tokio::test]
+    async fn x0x_0041_backoff_short_circuits_on_replaced_for_target() {
+        let (_ack_tx, mut rx) = tokio::sync::oneshot::channel::<DmAckOutcome>();
+        let (replaced_tx, replaced_rx) = tokio::sync::broadcast::channel::<(MachineId, u64)>(8);
+        let target = MachineId([0x77; 32]);
+        let mut hint = DmLifecycleHint {
+            recipient_machine_id: target,
+            replaced_rx,
+        };
+
+        // Fire the supersede mid-wait.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = replaced_tx.send((target, 42));
+        });
+
+        let start = Instant::now();
+        let outcome =
+            wait_for_ack_or_backoff_or_replaced(&mut rx, Duration::from_secs(2), Some(&mut hint))
+                .await
+                .expect("wait should not error");
+
+        match outcome {
+            BackoffWait::ReplacedShortCircuit { new_generation } => {
+                assert_eq!(new_generation, 42);
+            }
+            other => panic!("expected short-circuit, got {other:?}"),
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "short-circuit must land in well under the 2s backoff (took {:?})",
+            start.elapsed()
+        );
+    }
+
+    /// X0X-0041: a `Replaced` event for an UNRELATED peer must NOT short-
+    /// circuit the backoff. Verifies the peer-id filter inside the wait helper.
+    #[tokio::test]
+    async fn x0x_0041_replaced_for_other_peer_does_not_short_circuit() {
+        let (_ack_tx, mut rx) = tokio::sync::oneshot::channel::<DmAckOutcome>();
+        let (replaced_tx, replaced_rx) = tokio::sync::broadcast::channel::<(MachineId, u64)>(8);
+        let target = MachineId([0x11; 32]);
+        let other = MachineId([0xEE; 32]);
+        let mut hint = DmLifecycleHint {
+            recipient_machine_id: target,
+            replaced_rx,
+        };
+        // Fire supersede for a different peer mid-wait.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = replaced_tx.send((other, 99));
+        });
+
+        let outcome = wait_for_ack_or_backoff_or_replaced(
+            &mut rx,
+            Duration::from_millis(80),
+            Some(&mut hint),
+        )
+        .await
+        .expect("wait should not error");
+
+        assert!(matches!(outcome, BackoffWait::Elapsed));
+    }
+
+    /// X0X-0041: a late ACK during the backoff still wins over a same-peer
+    /// supersede when the ACK fires first.
+    #[tokio::test]
+    async fn x0x_0041_late_ack_wins_when_first() {
+        let (ack_tx, mut rx) = tokio::sync::oneshot::channel();
+        let (_replaced_tx, replaced_rx) = tokio::sync::broadcast::channel::<(MachineId, u64)>(8);
+        let target = MachineId([0x33; 32]);
+        let mut hint = DmLifecycleHint {
+            recipient_machine_id: target,
+            replaced_rx,
+        };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = ack_tx.send(DmAckOutcome::Accepted);
+        });
+
+        let outcome =
+            wait_for_ack_or_backoff_or_replaced(&mut rx, Duration::from_secs(1), Some(&mut hint))
+                .await
+                .expect("wait should not error");
+
+        assert!(matches!(outcome, BackoffWait::Ack(DmAckOutcome::Accepted)));
     }
 }

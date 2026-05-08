@@ -65,7 +65,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 
 /// Stream type byte for direct messages (distinct from gossip: 0, 1, 2).
 pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
@@ -87,6 +87,14 @@ const DIRECT_DIAGNOSTICS_IDLE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// Minimum retained direct peer/lifecycle diagnostics entries before old idle
 /// records are evicted. The effective cap also scales with connected peers.
 const DIRECT_DIAGNOSTICS_MIN_RETAIN: usize = 1024;
+
+/// X0X-0041: capacity of the prefer-newest-connection broadcast channel.
+///
+/// Sized for bursty supersede churn (multiple peers replacing in tight
+/// succession). Slow subscribers may observe `RecvError::Lagged`; callers
+/// reconcile against the lifecycle table by calling
+/// [`DirectMessaging::current_generation`] after a lag.
+const LIFECYCLE_REPLACED_BROADCAST_CAPACITY: usize = 256;
 
 /// A direct message received from another agent.
 ///
@@ -496,6 +504,14 @@ pub struct DirectMessaging {
     /// Hot peer lifecycle table keyed by MachineId.
     lifecycle: Arc<Mutex<HashMap<MachineId, DirectLifecycleState>>>,
 
+    /// X0X-0041: prefer-newest-connection broadcast.
+    ///
+    /// Fires whenever ant-quic emits a `Replaced` lifecycle event so DM retry
+    /// loops can short-circuit the current attempt and target the new
+    /// generation immediately. The payload is `(machine_id, new_generation)`.
+    /// Late or absent subscribers do not block the producer.
+    lifecycle_replaced_tx: broadcast::Sender<(MachineId, u64)>,
+
     /// Internal sender for the receiver task.
     internal_tx: mpsc::Sender<DirectMessage>,
 
@@ -517,6 +533,10 @@ impl DirectMessaging {
         // lag/drop behaviour. If a subscriber fills its own queue, the oldest
         // buffered event in that subscriber queue is evicted and counted.
         let (internal_tx, internal_rx) = mpsc::channel(subscriber_capacity);
+        // X0X-0041: prefer-newest-connection broadcast. Capacity sized for
+        // bursty supersede churn during reconnect storms; lagging subscribers
+        // recover via lifecycle table reread.
+        let (lifecycle_replaced_tx, _) = broadcast::channel(LIFECYCLE_REPLACED_BROADCAST_CAPACITY);
 
         Self {
             machine_to_agent: Arc::new(RwLock::new(HashMap::new())),
@@ -527,6 +547,7 @@ impl DirectMessaging {
             diagnostics: Arc::new(DirectDiagnosticsCounters::default()),
             peer_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_replaced_tx,
             internal_tx,
             internal_rx: Arc::new(tokio::sync::Mutex::new(internal_rx)),
         }
@@ -585,11 +606,43 @@ impl DirectMessaging {
     }
 
     /// Record that a newer generation replaced the old one.
+    ///
+    /// X0X-0041: this also broadcasts on the prefer-newest channel so DM retry
+    /// loops mid-attempt can short-circuit and target the new generation.
     pub fn record_lifecycle_replaced(&self, machine_id: MachineId, new_generation: u64) {
         self.update_lifecycle(machine_id, |state| {
             state.generation = Some(new_generation);
             state.blocked_reason = None;
         });
+        // Best-effort broadcast — slow / absent subscribers do not block the
+        // producer. `send` returns Err only when there are zero receivers,
+        // which is normal during steady state.
+        let _ = self
+            .lifecycle_replaced_tx
+            .send((machine_id, new_generation));
+    }
+
+    /// X0X-0041: return the current active lifecycle generation for a peer,
+    /// if known. The lifecycle table is updated from ant-quic
+    /// `Established`/`Replaced` events; raw-DM uses this as a hint to detect
+    /// connection supersede mid-send.
+    #[must_use]
+    pub fn current_generation(&self, machine_id: &MachineId) -> Option<u64> {
+        match self.lifecycle.lock() {
+            Ok(guard) => guard.get(machine_id).and_then(|state| state.generation),
+            Err(e) => {
+                tracing::error!("direct lifecycle registry poisoned: {e}");
+                None
+            }
+        }
+    }
+
+    /// X0X-0041: subscribe to prefer-newest-connection events. The broadcast
+    /// payload is `(machine_id, new_generation)` and fires synchronously with
+    /// every [`Self::record_lifecycle_replaced`] call.
+    #[must_use]
+    pub fn subscribe_lifecycle_replaced(&self) -> broadcast::Receiver<(MachineId, u64)> {
+        self.lifecycle_replaced_tx.subscribe()
     }
 
     /// Record a closing/closed lifecycle state for a machine.
@@ -1297,6 +1350,44 @@ mod tests {
         assert_eq!(first.payload, 1_u64.to_be_bytes().to_vec());
         let second = lagging_rx.recv().await.unwrap();
         assert_eq!(second.payload, 2_u64.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn x0x_0041_current_generation_tracks_established_and_replaced() {
+        let dm = DirectMessaging::new();
+        let machine_id = MachineId([0xAB; 32]);
+        assert_eq!(dm.current_generation(&machine_id), None);
+        dm.record_lifecycle_established(machine_id, Some(7));
+        assert_eq!(dm.current_generation(&machine_id), Some(7));
+        dm.record_lifecycle_replaced(machine_id, 9);
+        assert_eq!(dm.current_generation(&machine_id), Some(9));
+    }
+
+    #[tokio::test]
+    async fn x0x_0041_subscribe_lifecycle_replaced_broadcasts_supersede() {
+        let dm = DirectMessaging::new();
+        let mut rx = dm.subscribe_lifecycle_replaced();
+        let machine_a = MachineId([0xA1; 32]);
+        let machine_b = MachineId([0xB2; 32]);
+
+        // Established events do NOT fire on the prefer-newest channel.
+        dm.record_lifecycle_established(machine_a, Some(1));
+        // Use try_recv to confirm no event has been queued.
+        match rx.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            other => panic!("expected Empty for Established, got {other:?}"),
+        }
+
+        dm.record_lifecycle_replaced(machine_a, 2);
+        let (m, gen) = rx.recv().await.expect("Replaced event");
+        assert_eq!(m, machine_a);
+        assert_eq!(gen, 2);
+
+        // Supersede on a different peer also lands on the broadcast.
+        dm.record_lifecycle_replaced(machine_b, 5);
+        let (m, gen) = rx.recv().await.expect("Replaced event");
+        assert_eq!(m, machine_b);
+        assert_eq!(gen, 5);
     }
 
     #[test]

@@ -120,6 +120,14 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 ///
 /// Agents can override these by calling `AgentBuilder::with_network_config`
 /// with a custom [`NetworkConfig`] containing different bootstrap nodes.
+///
+/// X0X-0038 (SOTA-Borrow Phase A): once the connection pipeline routes
+/// resolution through `ant_quic::LookupRegistry`, this list becomes the
+/// payload for an `ant_quic::HardcodedLookup` registered alongside the
+/// `BootstrapCacheLookup` and `MdnsLookup`. The trait + registry are already
+/// shipped in ant-quic; rewiring `Endpoint::connect` is intentionally out of
+/// scope for X0X-0038 (per the SOTA-Borrow plan: "Don't yet rip out direct
+/// mDNS / bootstrap-cache callers in p2p_endpoint.rs").
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     // IPv4
     "142.93.199.50:5483",   // NYC
@@ -980,6 +988,28 @@ impl NetworkNode {
     pub async fn ack_diagnostics(&self) -> Option<ant_quic::AckDiagnosticsSnapshot> {
         let node = self.node.read().await.as_ref().cloned()?;
         Some(node.ack_diagnostics())
+    }
+
+    /// Snapshot `data_tx` channel saturation diagnostics (X0X-0039).
+    ///
+    /// Surfaces depth, capacity, and cumulative high-water-count for the
+    /// shared `mpsc::Sender` fed by every per-connection reader task.
+    /// Returns `None` when the network node is not yet initialised.
+    pub async fn data_channel_diagnostics(
+        &self,
+    ) -> Option<ant_quic::DataChannelDiagnosticsSnapshot> {
+        let node = self.node.read().await.as_ref().cloned()?;
+        Some(node.data_channel_diagnostics())
+    }
+
+    /// Snapshot GSO bundle send diagnostics (X0X-0043).
+    ///
+    /// Returns cumulative counts of multi-segment GSO bundles submitted to
+    /// the kernel send path and of bundles reported as partial / failed.
+    /// Returns `None` when the network node is not yet initialised.
+    pub async fn gso_diagnostics(&self) -> Option<ant_quic::GsoDiagnosticsSnapshot> {
+        let node = self.node.read().await.as_ref().cloned()?;
+        Some(node.gso_diagnostics())
     }
 
     /// Active liveness probe for a peer (ant-quic 0.27.2 #173).
