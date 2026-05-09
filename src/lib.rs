@@ -2944,7 +2944,6 @@ impl Agent {
                     to,
                     &payload,
                     config.raw_quic_receive_ack_timeout,
-                    std::time::Duration::from_millis(config.prefer_newest_grace_ms),
                 )
                 .await
             {
@@ -3021,7 +3020,6 @@ impl Agent {
                         to,
                         &payload,
                         config.raw_quic_receive_ack_timeout,
-                        std::time::Duration::from_millis(config.prefer_newest_grace_ms),
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
@@ -3044,12 +3042,18 @@ impl Agent {
     /// ant-quic has just observed a `Replaced` lifecycle event but the new
     /// `Established` has not yet fired. Setting it to zero disables the grace
     /// and reverts to legacy behaviour.
+    // X0X-0051 / X0X-0053: the X0X-0041 prefer-newest-grace machinery on this
+    // path was removed in x0x 0.19.33 because it had a coverage gap on the
+    // ACKed raw send (it only ran when !connected pre-send, never racing
+    // `Replaced` against an in-flight `send_with_receive_ack`). Tracked for
+    // proper re-implementation in X0X-0053. The `record_lifecycle_replaced` /
+    // `current_generation` / `subscribe_lifecycle_replaced` API surface in
+    // src/direct.rs is intentionally retained for X0X-0053 to re-use.
     async fn send_direct_raw_quic(
         &self,
         agent_id: &identity::AgentId,
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
-        prefer_newest_grace: std::time::Duration,
     ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
@@ -3138,10 +3142,6 @@ impl Agent {
         // until a raw probe/send path observes the live connection.
         let ant_peer_id = ant_quic::PeerId(machine_id.0);
         let machine_prefix = network::hex_prefix(&machine_id.0, 4);
-        // X0X-0041: subscribe BEFORE the first connectivity probe so we never
-        // miss a `Replaced` event that fires between probe-and-grace-wait.
-        let mut lifecycle_replaced_rx = self.direct_messaging.subscribe_lifecycle_replaced();
-        let pre_send_generation = self.direct_messaging.current_generation(&machine_id);
         let mut connected = network.is_connected(&ant_peer_id).await;
 
         // X0X-0033: when machine_id is known (resolved from cache or registry)
@@ -3178,79 +3178,14 @@ impl Agent {
             connected = network.is_connected(&ant_peer_id).await;
         }
 
-        // X0X-0041: prefer-newest-connection grace window. ant-quic 0.27.3+
-        // emits `Replaced { new_generation, .. }` when a newer connection
-        // supersedes an older one. There is a brief race where the lifecycle
-        // table has the new generation recorded but `is_connected` has not yet
-        // flipped to true (the new `Established` event has not yet fired).
-        // Hold for a bounded grace rather than declaring the peer disconnected.
-        if !connected && !prefer_newest_grace.is_zero() {
-            // Quick check: did `Replaced` fire while we were probing/repairing?
-            // If yes, the broadcast queued the event and we should wait.
-            let mut saw_replaced = false;
-            while let Ok((replaced_machine, _gen)) = lifecycle_replaced_rx.try_recv() {
-                if replaced_machine == machine_id {
-                    saw_replaced = true;
-                }
-            }
-            // Also treat "current generation has advanced past the snapshot we
-            // captured before the connectivity probe" as evidence of supersede.
-            let post_probe_generation = self.direct_messaging.current_generation(&machine_id);
-            let generation_advanced = match (pre_send_generation, post_probe_generation) {
-                (Some(before), Some(after)) => after > before,
-                (None, Some(_)) => true,
-                _ => false,
-            };
-            if saw_replaced || generation_advanced {
-                tracing::debug!(
-                    target: "x0x::direct",
-                    stage = "send",
-                    %agent_prefix,
-                    %machine_prefix,
-                    resolution,
-                    grace_ms = prefer_newest_grace.as_millis() as u64,
-                    pre_send_generation,
-                    post_probe_generation,
-                    "prefer-newest grace: holding for new Established"
-                );
-                let grace_deadline = tokio::time::Instant::now() + prefer_newest_grace;
-                // Poll on a tight cadence — supersede transitions are sub-ms
-                // on the local actor, but transport-level `is_connected`
-                // reflection through the live-connection table is async.
-                let poll_step = std::time::Duration::from_millis(20);
-                loop {
-                    if tokio::time::Instant::now() >= grace_deadline {
-                        break;
-                    }
-                    let next_wake =
-                        std::cmp::min(tokio::time::Instant::now() + poll_step, grace_deadline);
-                    tokio::select! {
-                        biased;
-                        evt = lifecycle_replaced_rx.recv() => {
-                            // Drain any further Replaced events. Lag is
-                            // recoverable via current_generation. We do not
-                            // filter on peer here — any event wakes the loop
-                            // so we re-poll is_connected.
-                            let _ = evt;
-                        }
-                        _ = tokio::time::sleep_until(next_wake) => {}
-                    }
-                    if network.is_connected(&ant_peer_id).await {
-                        connected = true;
-                        tracing::debug!(
-                            target: "x0x::direct",
-                            stage = "send",
-                            %agent_prefix,
-                            %machine_prefix,
-                            resolution,
-                            elapsed_ms = send_start.elapsed().as_millis() as u64,
-                            "prefer-newest grace: new connection observed"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
+        // X0X-0051 / X0X-0053: the X0X-0041 prefer-newest-grace block was
+        // removed in x0x 0.19.33. It only fired when `is_connected` returned
+        // false before the send, never racing `Replaced` against the in-flight
+        // `send_with_receive_ack` below — so it had a coverage gap on the
+        // ACKed raw-DM path the Phase A harness exercises. The proper
+        // re-implementation (race in-flight send against same-peer Replaced)
+        // is tracked in X0X-0053. This path now falls straight through to the
+        // standard !connected error handling.
 
         if connected {
             if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
