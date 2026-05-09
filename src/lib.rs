@@ -2937,6 +2937,7 @@ impl Agent {
         }
 
         let mut preferred_raw_err = None;
+        let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected && !config.require_gossip
         {
             match self
@@ -2944,6 +2945,7 @@ impl Agent {
                     to,
                     &payload,
                     config.raw_quic_receive_ack_timeout,
+                    prefer_newest_grace,
                 )
                 .await
             {
@@ -3020,6 +3022,7 @@ impl Agent {
                         to,
                         &payload,
                         config.raw_quic_receive_ack_timeout,
+                        prefer_newest_grace,
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
@@ -3038,22 +3041,27 @@ impl Agent {
 
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
     ///
-    /// X0X-0041: `prefer_newest_grace` is the bounded window to wait when
-    /// ant-quic has just observed a `Replaced` lifecycle event but the new
-    /// `Established` has not yet fired. Setting it to zero disables the grace
-    /// and reverts to legacy behaviour.
-    // X0X-0051 / X0X-0053: the X0X-0041 prefer-newest-grace machinery on this
-    // path was removed in x0x 0.19.33 because it had a coverage gap on the
-    // ACKed raw send (it only ran when !connected pre-send, never racing
-    // `Replaced` against an in-flight `send_with_receive_ack`). Tracked for
-    // proper re-implementation in X0X-0053. The `record_lifecycle_replaced` /
-    // `current_generation` / `subscribe_lifecycle_replaced` API surface in
-    // src/direct.rs is intentionally retained for X0X-0053 to re-use.
+    /// X0X-0053: `prefer_newest_grace` is the bounded post-Replaced reissue
+    /// grace — the maximum time we wait for the new connection's
+    /// `is_connected` to flip true after a same-peer `Replaced` event fires
+    /// mid-send before we reissue. Setting it to zero disables the grace and
+    /// reissues immediately on Replaced (or fails if the new connection is
+    /// not yet live).
+    ///
+    /// On the ACKed raw path, the in-flight `send_with_receive_ack` future
+    /// is raced against `lifecycle_replaced_rx.recv()` filtered for the
+    /// target peer's machine_id. On Replaced for the target peer, the
+    /// in-flight send is abandoned and reissued once against the new
+    /// generation. If the reissue also fails, the standard error is
+    /// returned. This closes the X0X-0041 coverage gap surfaced by the
+    /// Phase A bisect (P1 finding in
+    /// `proofs/sota-borrow-phaseA-bisect-20260508T214634Z/ANALYSIS.md` §0.1).
     async fn send_direct_raw_quic(
         &self,
         agent_id: &identity::AgentId,
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
+        prefer_newest_grace: std::time::Duration,
     ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
@@ -3261,23 +3269,22 @@ impl Agent {
                 payload_bytes = bytes,
                 digest = %digest,
             );
-            match network
-                .send_with_receive_ack(ant_peer_id, &wire, timeout)
-                .await
-            {
-                Some(Ok(())) => Ok(dm::DmPath::RawQuicAcked),
-                Some(Err(e)) => {
-                    let reason = format!("send_with_receive_ack failed: {e}");
-                    if Self::raw_quic_ack_receive_backpressured(&reason) {
-                        Err(error::NetworkError::RemoteReceiveBackpressured(reason))
-                    } else {
-                        Err(error::NetworkError::ConnectionFailed(reason))
-                    }
-                }
-                None => Err(error::NetworkError::NodeCreation(
-                    "network node not initialized".to_string(),
-                )),
-            }
+            // X0X-0053: race the in-flight send_with_receive_ack against
+            // same-peer Replaced. On Replaced for this machine_id, abandon
+            // the in-flight future (Quinn streams are drop-safe — see
+            // ant-quic's send_with_receive_ack contract) and reissue once
+            // against the new generation. The reissue does not race again;
+            // a healthy peer should converge in a single supersede cycle.
+            self.send_ack_racing_replaced(
+                network.as_ref(),
+                ant_peer_id,
+                machine_id,
+                &wire,
+                timeout,
+                prefer_newest_grace,
+                agent_id,
+            )
+            .await
         } else {
             tracing::info!(
                 target: "dm.trace",
@@ -3344,6 +3351,205 @@ impl Agent {
                 );
                 Err(e)
             }
+        }
+    }
+
+    /// X0X-0053: race the in-flight `send_with_receive_ack` against same-peer
+    /// `Replaced`. On Replaced for the target peer, abandon the in-flight
+    /// future, briefly wait for the new connection's `is_connected` to flip
+    /// true (bounded by `prefer_newest_grace`), then reissue once against
+    /// the new generation. The reissue does not race again — a healthy peer
+    /// converges in a single supersede cycle. Lag handling on the broadcast
+    /// channel mirrors `dm_send::wait_for_ack_or_backoff_or_replaced` —
+    /// drain to current and re-subscribe.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_ack_racing_replaced(
+        &self,
+        network: &network::NetworkNode,
+        ant_peer_id: ant_quic::PeerId,
+        machine_id: identity::MachineId,
+        wire: &[u8],
+        timeout: std::time::Duration,
+        prefer_newest_grace: std::time::Duration,
+        agent_id: &identity::AgentId,
+    ) -> error::NetworkResult<dm::DmPath> {
+        use tokio::sync::broadcast::error::RecvError;
+        use tokio::sync::broadcast::error::TryRecvError as BroadcastTryRecvError;
+
+        // Subscribe BEFORE issuing the send so any Replaced that fires
+        // mid-send is delivered to this receiver and not dropped.
+        let mut replaced_rx = self.direct_messaging.subscribe_lifecycle_replaced();
+        let pre_send_generation = self.direct_messaging.current_generation(&machine_id);
+
+        let agent_prefix = network::hex_prefix(&agent_id.0, 4);
+        let machine_prefix = network::hex_prefix(&machine_id.0, 4);
+        let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
+
+        // First attempt: race send_with_receive_ack against same-peer Replaced.
+        let send_fut = network.send_with_receive_ack(ant_peer_id, wire, timeout);
+        tokio::pin!(send_fut);
+
+        let superseded_to: u64;
+
+        loop {
+            tokio::select! {
+                biased;
+                send_result = &mut send_fut => {
+                    // X0X-0053: even when send_fut completes (Ok or Err)
+                    // first, drain the broadcast for any queued Replaced
+                    // event for our peer. On Err with a queued supersede,
+                    // we treat the failure as a casualty of the supersede
+                    // race and reissue against the new generation —
+                    // exactly the production case where the in-flight ACK
+                    // exchange errors out fast on the dying connection
+                    // milliseconds before the new connection is registered.
+                    match send_result {
+                        Some(Ok(())) => return Ok(dm::DmPath::RawQuicAcked),
+                        Some(Err(e)) => {
+                            // Drain any queued Replaced for our peer.
+                            let mut queued_supersede: Option<u64> = None;
+                            loop {
+                                match replaced_rx.try_recv() {
+                                    Ok((m, gen)) if m == machine_id => {
+                                        queued_supersede = Some(gen);
+                                    }
+                                    Ok(_) => continue,
+                                    Err(BroadcastTryRecvError::Empty)
+                                    | Err(BroadcastTryRecvError::Closed)
+                                    | Err(BroadcastTryRecvError::Lagged(_)) => break,
+                                }
+                            }
+                            if let Some(gen) = queued_supersede {
+                                superseded_to = gen;
+                                break;
+                            }
+                            let reason = format!("send_with_receive_ack failed: {e}");
+                            return if Self::raw_quic_ack_receive_backpressured(&reason) {
+                                Err(error::NetworkError::RemoteReceiveBackpressured(reason))
+                            } else {
+                                Err(error::NetworkError::ConnectionFailed(reason))
+                            };
+                        }
+                        None => return Err(error::NetworkError::NodeCreation(
+                            "network node not initialized".to_string(),
+                        )),
+                    }
+                }
+                replaced = replaced_rx.recv() => {
+                    match replaced {
+                        Ok((m, gen)) if m == machine_id => {
+                            superseded_to = gen;
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(RecvError::Lagged(_)) => {
+                            // Drain the channel for any pending event for our
+                            // peer; if found, treat as supersede.
+                            let mut found: Option<u64> = None;
+                            loop {
+                                match replaced_rx.try_recv() {
+                                    Ok((m, gen)) if m == machine_id => {
+                                        found = Some(gen);
+                                        break;
+                                    }
+                                    Ok(_) => continue,
+                                    Err(BroadcastTryRecvError::Empty)
+                                    | Err(BroadcastTryRecvError::Closed)
+                                    | Err(BroadcastTryRecvError::Lagged(_)) => break,
+                                }
+                            }
+                            if let Some(gen) = found {
+                                superseded_to = gen;
+                                break;
+                            }
+                            // No event for our peer — re-subscribe to clear
+                            // lag state and keep waiting.
+                            replaced_rx = self
+                                .direct_messaging
+                                .subscribe_lifecycle_replaced();
+                            continue;
+                        }
+                        Err(RecvError::Closed) => {
+                            // Channel closed — no further supersede signals.
+                            // Fall through to await the in-flight send to its
+                            // natural completion.
+                            let result = (&mut send_fut).await;
+                            return match result {
+                                Some(Ok(())) => Ok(dm::DmPath::RawQuicAcked),
+                                Some(Err(e)) => {
+                                    let reason =
+                                        format!("send_with_receive_ack failed: {e}");
+                                    if Self::raw_quic_ack_receive_backpressured(&reason) {
+                                        Err(error::NetworkError::RemoteReceiveBackpressured(reason))
+                                    } else {
+                                        Err(error::NetworkError::ConnectionFailed(reason))
+                                    }
+                                }
+                                None => Err(error::NetworkError::NodeCreation(
+                                    "network node not initialized".to_string(),
+                                )),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reached here only via a confirmed same-peer Replaced. The pinned
+        // in-flight send future is no longer polled and will be dropped at
+        // scope exit (Quinn streams are drop-safe — abandoning the future
+        // simply releases the local stream handle; the underlying connection
+        // is the one ant-quic is replacing). Wait briefly for the new
+        // connection's `is_connected` to flip true before reissuing.
+        let new_generation = superseded_to;
+        tracing::info!(
+            target: "dm.trace",
+            stage = "raw_quic_ack_replaced_short_circuit",
+            from = %self_prefix,
+            to = %agent_prefix,
+            %machine_prefix,
+            pre_send_generation = ?pre_send_generation,
+            new_generation,
+            grace_ms = prefer_newest_grace.as_millis() as u64,
+            "X0X-0053: same-peer Replaced fired during in-flight send_with_receive_ack; abandoning and reissuing",
+        );
+
+        // Bounded grace: poll for the new connection to be live before
+        // reissuing. If it never flips inside the grace window, return the
+        // standard not-connected error and let the caller fall back.
+        if !prefer_newest_grace.is_zero() {
+            let grace_deadline = tokio::time::Instant::now() + prefer_newest_grace;
+            const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+            while tokio::time::Instant::now() < grace_deadline {
+                if network.is_connected(&ant_peer_id).await {
+                    break;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+
+        if !network.is_connected(&ant_peer_id).await {
+            return Err(error::NetworkError::AgentNotConnected(agent_id.0));
+        }
+
+        // Reissue once against the new generation. No further race — a
+        // healthy peer should converge in a single supersede cycle.
+        match network
+            .send_with_receive_ack(ant_peer_id, wire, timeout)
+            .await
+        {
+            Some(Ok(())) => Ok(dm::DmPath::RawQuicAcked),
+            Some(Err(e)) => {
+                let reason = format!("send_with_receive_ack failed: {e}");
+                if Self::raw_quic_ack_receive_backpressured(&reason) {
+                    Err(error::NetworkError::RemoteReceiveBackpressured(reason))
+                } else {
+                    Err(error::NetworkError::ConnectionFailed(reason))
+                }
+            }
+            None => Err(error::NetworkError::NodeCreation(
+                "network node not initialized".to_string(),
+            )),
         }
     }
 
