@@ -64,7 +64,25 @@ PUBLISH_RETRY_MAX = 3
 TEST_DM_RETRY_BACKOFF_SECS = 1
 TEST_DM_RETRY_MAX = 3
 RESULT_DM_ACK_MS: Optional[int] = None
-RESULT_RAW_QUIC_ACK_MS: Optional[int] = 3000
+
+
+def _optional_int_env(name: str, default: Optional[int]) -> Optional[int]:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    lowered = raw.strip().lower()
+    if lowered in {"none", "off", "false", "0"}:
+        return None
+    return int(raw)
+
+
+# X0X-0060: result DMs share the same receive-pipeline ACK path as matrix
+# command/hop DMs. The old 3s budget was below the cross-region tail observed
+# in the 4h soak; make the default WAN-class and keep it tunable for bisects.
+RESULT_RAW_QUIC_ACK_MS: Optional[int] = _optional_int_env(
+    "X0X_RESULT_RAW_QUIC_ACK_MS",
+    12_000,
+)
 RESULT_QUEUE_MAX = 1024
 RESULT_QUEUE_MAX_AGE_SECS = 300
 

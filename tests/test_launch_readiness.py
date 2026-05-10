@@ -414,6 +414,11 @@ class LaunchReadinessGateTests(unittest.TestCase):
                     "recv_pump_latest_depth_post",
                     "suppressed_peers_to_known_ratio",
                     "known_peer_topic_pairs_post",
+                    "data_tx_depth_post",
+                    "data_tx_capacity_post",
+                    "data_tx_high_water_count_delta",
+                    "gso_bundle_send_total_delta",
+                    "gso_bundle_partial_send_delta",
                 ],
                 rows[0][10:],
             )

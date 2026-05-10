@@ -67,12 +67,26 @@ PREFIX_RES = b"x0xtest|res|"
 # `COMMAND_DM_ACK_MS` remains the optional post-send liveness probe knob; it is
 # separate from `COMMAND_RAW_QUIC_ACK_MS`, which ACKs the message bytes.
 COMMAND_DM_ACK_MS: Optional[int] = None
-# Bumped from 3000 → 6000 ms to accommodate ant-quic's X0X-0037 internal
-# duplicate-safe retry: first ACK attempt 3 s + retry budget 2 s + jitter
-# headroom = ~5.5 s. The original 3 s budget tripped before ant-quic's
-# retry could complete, throttling Phase A throughput on 0.19.31. See
-# X0X-0037 §followups.
-COMMAND_RAW_QUIC_ACK_MS: Optional[int] = 6000
+def _optional_int_env(name: str, default: Optional[int]) -> Optional[int]:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    lowered = raw.strip().lower()
+    if lowered in {"none", "off", "false", "0"}:
+        return None
+    return int(raw)
+
+
+# X0X-0060: released-stack 4h soak showed 6s was still too tight for
+# receive-pipeline ACKs on the longest VPS paths under sustained load. The
+# failing peer admitted the payload, then its ACK-v2 response write failed
+# because the sender had already timed out and reset the response stream. Keep
+# the default WAN-class budget conservative and expose an env override for
+# bisects without editing the harness.
+COMMAND_RAW_QUIC_ACK_MS: Optional[int] = _optional_int_env(
+    "X0X_COMMAND_RAW_QUIC_ACK_MS",
+    12_000,
+)
 
 NODES_DEFAULT: List[str] = [
     "nyc",
