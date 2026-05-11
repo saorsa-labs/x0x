@@ -188,10 +188,26 @@ pub struct NetworkConfig {
     /// Max concurrent connections from a single IP. Default: 3.
     #[serde(default = "default_max_peers_per_ip")]
     pub max_peers_per_ip: u32,
+
+    /// X0X-0062 reviewer P2 #2: surface ant-quic's best-effort UPnP IGD
+    /// port-mapping toggle at the x0x config layer so daemon operators on
+    /// networks without IGD support (or with policy against it) can
+    /// disable it. ant-quic's default is `true`; x0x mirrors that. When
+    /// `false`, x0x calls `port_mapping_enabled(false)` on the ant-quic
+    /// builder, which skips the UPnP discovery task entirely.
+    ///
+    /// Settable via the daemon's TOML config (`port_mapping_enabled = false`)
+    /// and via the `--no-port-mapping` CLI flag.
+    #[serde(default = "default_port_mapping_enabled")]
+    pub port_mapping_enabled: bool,
 }
 
 fn default_max_connections() -> u32 {
     DEFAULT_MAX_CONNECTIONS
+}
+
+fn default_port_mapping_enabled() -> bool {
+    true
 }
 
 fn default_connection_timeout() -> Duration {
@@ -236,6 +252,7 @@ impl Default for NetworkConfig {
             pinned_bootstrap_peers: std::collections::HashSet::new(),
             inbound_allowlist: std::collections::HashSet::new(),
             max_peers_per_ip: 3,
+            port_mapping_enabled: true,
         }
     }
 }
@@ -886,6 +903,12 @@ impl NetworkNode {
         if let Some((pk, sk)) = keypair {
             builder = builder.keypair(pk, sk);
         }
+
+        // X0X-0062 reviewer P2 #2: surface ant-quic's best-effort UPnP
+        // port-mapping toggle so operators on networks without IGD support
+        // (or with policy against it) can disable it via `NetworkConfig`
+        // (and downstream via the daemon's config TOML / CLI flag).
+        builder = builder.port_mapping_enabled(config.port_mapping_enabled);
 
         let node = Node::with_config(builder.build()).await.map_err(|e| {
             NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e))
@@ -2625,6 +2648,7 @@ async fn test_mesh_connections_are_bidirectional() {
             pinned_bootstrap_peers: std::collections::HashSet::new(),
             inbound_allowlist: std::collections::HashSet::new(),
             max_peers_per_ip: 3,
+            port_mapping_enabled: true,
         };
 
         let node = NetworkNode::new(config, None, None).await.unwrap();

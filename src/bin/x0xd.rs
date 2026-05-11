@@ -137,6 +137,14 @@ struct DaemonConfig {
     #[serde(default = "default_bootstrap_peers")]
     bootstrap_peers: Vec<SocketAddr>,
 
+    /// X0X-0062 reviewer P2 #2: enable or disable ant-quic's best-effort
+    /// UPnP IGD port-mapping. Default `true` (matches ant-quic). Set to
+    /// `false` in the daemon TOML (`port_mapping_enabled = false`) or via
+    /// the `--no-port-mapping` CLI flag on networks without IGD support
+    /// or where unsolicited router port mappings are policy-forbidden.
+    #[serde(default = "default_port_mapping_enabled")]
+    port_mapping_enabled: bool,
+
     /// Update configuration.
     #[serde(default)]
     update: DaemonUpdateConfig,
@@ -211,6 +219,10 @@ fn default_bootstrap_peers() -> Vec<SocketAddr> {
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect()
+}
+
+fn default_port_mapping_enabled() -> bool {
+    true
 }
 
 fn default_bind_address() -> SocketAddr {
@@ -341,6 +353,7 @@ impl Default for DaemonConfig {
                 .iter()
                 .filter_map(|s| s.parse().ok())
                 .collect(),
+            port_mapping_enabled: default_port_mapping_enabled(),
             update: DaemonUpdateConfig::default(),
             gossip: x0x::gossip::GossipConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
@@ -1116,6 +1129,12 @@ async fn main() -> Result<()> {
     }
     let disable_configured_bootstrap = no_hard_coded_bootstrap || legacy_no_bootstrap;
 
+    // X0X-0062 reviewer P2 #2: `--no-port-mapping` lets operators disable
+    // ant-quic's best-effort UPnP IGD on networks without IGD support or
+    // where operator policy forbids unsolicited router port mappings. This
+    // overrides the daemon config's `port_mapping_enabled` field.
+    let cli_no_port_mapping = args.contains(&"--no-port-mapping".to_string());
+
     // Parse --api-port for overriding the API server port
     let api_port_override = if let Some(idx) = args.iter().position(|a| a == "--api-port") {
         let port_str = args
@@ -1333,6 +1352,9 @@ async fn main() -> Result<()> {
         pinned_bootstrap_peers: std::collections::HashSet::new(),
         inbound_allowlist: std::collections::HashSet::new(),
         max_peers_per_ip: 3,
+        // CLI flag wins over config TOML so operators can override on a
+        // single invocation without editing the config file.
+        port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
     };
 
     let contacts_path = config.data_dir.join("contacts.json");
