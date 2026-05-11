@@ -39,3 +39,13 @@ doc = false
 name = "fuzz_config_toml"
 path = "fuzz_targets/fuzz_config_toml.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_exec_frame"
+path = "fuzz_targets/fuzz_exec_frame.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_dm_envelope"
+path = "fuzz_targets/fuzz_dm_envelope.rs"
+doc = false

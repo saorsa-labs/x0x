@@ -16,6 +16,7 @@ use ant_quic::{
 };
 use hex;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// Length of a PeerId in bytes (SHA-256 hash output).
 pub const PEER_ID_LENGTH: usize = 32;
@@ -163,6 +164,12 @@ impl std::fmt::Debug for MachineKeypair {
     }
 }
 
+impl Drop for MachineKeypair {
+    fn drop(&mut self) {
+        self.secret_key.zeroize();
+    }
+}
+
 impl MachineKeypair {
     /// Generate a new random MachineKeypair.
     pub fn generate() -> Result<Self, crate::error::IdentityError> {
@@ -229,6 +236,12 @@ impl std::fmt::Debug for AgentKeypair {
             .field("public_key", &self.public_key)
             .field("secret_key", &"<REDACTED>")
             .finish()
+    }
+}
+
+impl Drop for AgentKeypair {
+    fn drop(&mut self) {
+        self.secret_key.zeroize();
     }
 }
 
@@ -302,6 +315,12 @@ impl std::fmt::Debug for UserKeypair {
             .field("public_key", &self.public_key)
             .field("secret_key", &"<REDACTED>")
             .finish()
+    }
+}
+
+impl Drop for UserKeypair {
+    fn drop(&mut self) {
+        self.secret_key.zeroize();
     }
 }
 

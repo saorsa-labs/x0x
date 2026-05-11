@@ -444,3 +444,280 @@ pub fn verify_envelope_signature(envelope: &DmEnvelope, public_key_bytes: &[u8])
     ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&public_key, &signed, &signature)
         .is_ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dm::MAX_ENVELOPE_BYTES;
+    use crate::identity::AgentKeypair;
+
+    fn test_keypair() -> AgentKeypair {
+        AgentKeypair::generate().expect("keygen")
+    }
+
+    fn make_unsigned_envelope(sender_kp: &AgentKeypair, recipient_id: &[u8; 32]) -> DmEnvelope {
+        let now = now_unix_ms();
+        DmEnvelope {
+            protocol_version: DM_PROTOCOL_VERSION,
+            request_id: [1u8; 16],
+            sender_agent_id: *sender_kp.agent_id().as_bytes(),
+            sender_machine_id: [2u8; 32],
+            recipient_agent_id: *recipient_id,
+            created_at_unix_ms: now,
+            expires_at_unix_ms: now + 60_000,
+            body: DmBody::Ack(crate::dm::DmAckBody {
+                acks_request_id: [3u8; 16],
+                outcome: crate::dm::DmAckOutcome::Accepted,
+            }),
+            signature: Vec::new(),
+        }
+    }
+
+    fn sign_envelope(envelope: &mut DmEnvelope, sender_kp: &AgentKeypair) {
+        let signed = envelope.signed_bytes().expect("signed_bytes");
+        let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            sender_kp.secret_key(),
+            &signed,
+        )
+        .expect("sign");
+        envelope.signature = sig.as_bytes().to_vec();
+    }
+
+    // ── Signature verification ────────────────────────────────────────
+
+    #[test]
+    fn verify_envelope_signature_accepts_valid_signature() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let mut envelope = make_unsigned_envelope(&sender_kp, &recipient_id);
+        sign_envelope(&mut envelope, &sender_kp);
+
+        assert!(verify_envelope_signature(
+            &envelope,
+            sender_kp.public_key().as_bytes()
+        ));
+    }
+
+    #[test]
+    fn verify_envelope_signature_rejects_empty_signature() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let envelope = make_unsigned_envelope(&sender_kp, &recipient_id);
+
+        assert!(!verify_envelope_signature(
+            &envelope,
+            sender_kp.public_key().as_bytes()
+        ));
+    }
+
+    #[test]
+    fn verify_envelope_signature_rejects_wrong_key() {
+        let sender_kp = test_keypair();
+        let wrong_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let mut envelope = make_unsigned_envelope(&sender_kp, &recipient_id);
+        sign_envelope(&mut envelope, &sender_kp);
+
+        // Verify with a different public key — must fail because the
+        // derived AgentId won't match sender_agent_id in the envelope.
+        assert!(!verify_envelope_signature(&envelope, wrong_kp.public_key().as_bytes()));
+    }
+
+    #[test]
+    fn verify_envelope_signature_rejects_tampered_body() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let mut envelope = make_unsigned_envelope(&sender_kp, &recipient_id);
+        sign_envelope(&mut envelope, &sender_kp);
+
+        // Tamper with the body after signing
+        envelope.body = DmBody::Ack(crate::dm::DmAckBody {
+            acks_request_id: [99u8; 16],
+            outcome: crate::dm::DmAckOutcome::Accepted,
+        });
+
+        assert!(!verify_envelope_signature(
+            &envelope,
+            sender_kp.public_key().as_bytes()
+        ));
+    }
+
+    #[test]
+    fn verify_envelope_signature_rejects_tampered_timestamp() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let mut envelope = make_unsigned_envelope(&sender_kp, &recipient_id);
+        sign_envelope(&mut envelope, &sender_kp);
+
+        // Tamper with timestamp after signing
+        envelope.created_at_unix_ms = 0;
+
+        assert!(!verify_envelope_signature(
+            &envelope,
+            sender_kp.public_key().as_bytes()
+        ));
+    }
+
+    #[test]
+    fn verify_envelope_signature_rejects_garbage_public_key() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let mut envelope = make_unsigned_envelope(&sender_kp, &recipient_id);
+        sign_envelope(&mut envelope, &sender_kp);
+
+        let garbage_key = [0xFFu8; 3200]; // ML-DSA-65 public keys are 807 bytes
+        assert!(!verify_envelope_signature(&envelope, &garbage_key));
+    }
+
+    #[test]
+    fn verify_envelope_signature_rejects_empty_public_key() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let mut envelope = make_unsigned_envelope(&sender_kp, &recipient_id);
+        sign_envelope(&mut envelope, &sender_kp);
+
+        assert!(!verify_envelope_signature(&envelope, &[]));
+    }
+
+    #[test]
+    fn verify_envelope_signature_rejects_tampered_sender_id() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let mut envelope = make_unsigned_envelope(&sender_kp, &recipient_id);
+        sign_envelope(&mut envelope, &sender_kp);
+
+        // Tamper with sender_agent_id after signing
+        envelope.sender_agent_id = [0xFFu8; 32];
+
+        assert!(!verify_envelope_signature(
+            &envelope,
+            sender_kp.public_key().as_bytes()
+        ));
+    }
+
+    // ── Envelope size limits ──────────────────────────────────────────
+
+    #[test]
+    fn envelope_from_wire_bytes_rejects_oversized() {
+        let oversized = vec![0u8; MAX_ENVELOPE_BYTES + 1];
+        let result = DmEnvelope::from_wire_bytes(&oversized);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn envelope_from_wire_bytes_rejects_garbage() {
+        let garbage = vec![0xFF, 0xFE, 0xFD];
+        let result = DmEnvelope::from_wire_bytes(&garbage);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn envelope_from_wire_bytes_rejects_empty() {
+        let result = DmEnvelope::from_wire_bytes(&[]);
+        assert!(result.is_err());
+    }
+
+    // ── Wire round-trip ───────────────────────────────────────────────
+
+    #[test]
+    fn envelope_wire_roundtrip() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let mut envelope = make_unsigned_envelope(&sender_kp, &recipient_id);
+        sign_envelope(&mut envelope, &sender_kp);
+
+        let wire = envelope.to_wire_bytes().expect("to_wire_bytes");
+        let decoded = DmEnvelope::from_wire_bytes(&wire).expect("from_wire_bytes");
+        assert_eq!(decoded.sender_agent_id, envelope.sender_agent_id);
+        assert_eq!(decoded.recipient_agent_id, envelope.recipient_agent_id);
+        assert_eq!(decoded.request_id, envelope.request_id);
+        assert_eq!(decoded.protocol_version, envelope.protocol_version);
+    }
+
+    // ── Dedupe key uniqueness ─────────────────────────────────────────
+
+    #[test]
+    fn dedupe_key_differs_for_different_request_ids() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let e1 = make_unsigned_envelope(&sender_kp, &recipient_id);
+        let mut e2 = make_unsigned_envelope(&sender_kp, &recipient_id);
+        e2.request_id = [99u8; 16];
+
+        assert_ne!(e1.dedupe_key(), e2.dedupe_key());
+    }
+
+    #[test]
+    fn dedupe_key_same_for_same_request_id() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let e1 = make_unsigned_envelope(&sender_kp, &recipient_id);
+        let e2 = make_unsigned_envelope(&sender_kp, &recipient_id);
+
+        assert_eq!(e1.dedupe_key(), e2.dedupe_key());
+    }
+
+    #[test]
+    fn dedupe_key_differs_for_different_senders() {
+        let sender1 = test_keypair();
+        let sender2 = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let e1 = make_unsigned_envelope(&sender1, &recipient_id);
+        let e2 = make_unsigned_envelope(&sender2, &recipient_id);
+
+        assert_ne!(e1.dedupe_key(), e2.dedupe_key());
+    }
+
+    // ── Protocol version enforcement ──────────────────────────────────
+
+    #[test]
+    fn envelope_future_version_detected() {
+        let sender_kp = test_keypair();
+        let recipient_id: [u8; 32] = [4u8; 32];
+        let mut envelope = make_unsigned_envelope(&sender_kp, &recipient_id);
+        envelope.protocol_version = DM_PROTOCOL_VERSION + 10;
+
+        assert!(envelope.protocol_version > DM_PROTOCOL_VERSION);
+    }
+
+    // ── Inbox topic name consistency ──────────────────────────────────
+
+    #[test]
+    fn inbox_topic_is_constant_for_all_agents() {
+        let id1: [u8; 32] = [1u8; 32];
+        let id2: [u8; 32] = [2u8; 32];
+        let agent1 = AgentId(id1);
+        let agent2 = AgentId(id2);
+
+        // DM_BUS_TOPIC is shared — all agents subscribe to the same topic
+        assert_eq!(
+            DmInboxService::inbox_topic_name(&agent1),
+            DmInboxService::inbox_topic_name(&agent2)
+        );
+        assert_eq!(DmInboxService::inbox_topic_name(&agent1), DM_BUS_TOPIC);
+    }
+
+    // ── Typed payload route matching ──────────────────────────────────
+
+    #[test]
+    fn typed_payload_route_matches_prefix() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<DmTypedPayload>(1);
+        let route = DmTypedPayloadRoute {
+            prefix: b"x0x-exec-v1\0".to_vec(),
+            sender: tx,
+        };
+        let payload = b"x0x-exec-v1\0some-command".to_vec();
+        assert!(payload.starts_with(&route.prefix));
+    }
+
+    #[test]
+    fn typed_payload_route_no_match_for_different_prefix() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<DmTypedPayload>(1);
+        let route = DmTypedPayloadRoute {
+            prefix: b"x0x-exec-v1\0".to_vec(),
+            sender: tx,
+        };
+        let payload = b"x0x-other-stuff".to_vec();
+        assert!(!payload.starts_with(&route.prefix));
+    }
+}

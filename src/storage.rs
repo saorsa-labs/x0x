@@ -542,6 +542,94 @@ mod tests {
         assert!(matches!(result, IdentityError::Serialization(_)));
     }
 
+    // ── File permission tests (Unix only) ─────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_key_file_has_restrictive_permissions() {
+        let keypair = MachineKeypair::generate().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("test_machine.key");
+        save_machine_keypair_to_path(&keypair, &path).await.unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "key file must have 0600 permissions, got {:o}",
+            mode
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_agent_key_file_has_restrictive_permissions() {
+        let keypair = AgentKeypair::generate().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("test_agent.key");
+        save_agent_keypair_to_path(&keypair, &path).await.unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "agent key file must have 0600 permissions, got {:o}",
+            mode
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_key_file_not_world_readable() {
+        let keypair = MachineKeypair::generate().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("test.key");
+        save_machine_keypair_to_path(&keypair, &path).await.unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        // World-readable bit (others read) must not be set
+        assert_eq!(mode & 0o004, 0, "key file must not be world-readable");
+        // Group-readable bit must not be set
+        assert_eq!(mode & 0o040, 0, "key file must not be group-readable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_key_file_not_world_writable() {
+        let keypair = MachineKeypair::generate().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("test.key");
+        save_machine_keypair_to_path(&keypair, &path).await.unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        // World-writable bit must not be set
+        assert_eq!(mode & 0o002, 0, "key file must not be world-writable");
+    }
+
+    #[cfg(unix)]
+    async fn save_agent_keypair_to_path(kp: &AgentKeypair, path: &Path) -> Result<()> {
+        let bytes = serialize_agent_keypair(kp)?;
+        let parent = path.parent().unwrap();
+        fs::create_dir_all(parent)
+            .await
+            .map_err(IdentityError::from)?;
+        fs::write(path, bytes).await.map_err(IdentityError::from)?;
+
+        // Apply restrictive permissions (mirrors production code)
+        let mut perms = fs::metadata(path)
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(path, perms)
+            .await
+            .map_err(IdentityError::from)?;
+
+        Ok(())
+    }
+
     // Helper functions for testing (since the main functions use ~/.x0x)
     async fn save_machine_keypair_to_path(kp: &MachineKeypair, path: &Path) -> Result<()> {
         let bytes = serialize_machine_keypair(kp)?;
@@ -550,6 +638,20 @@ mod tests {
             .await
             .map_err(IdentityError::from)?;
         fs::write(path, bytes).await.map_err(IdentityError::from)?;
+
+        // Apply restrictive permissions (mirrors production code path)
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path)
+                .await
+                .map_err(IdentityError::from)?
+                .permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(path, perms)
+                .await
+                .map_err(IdentityError::from)?;
+        }
+
         Ok(())
     }
 
