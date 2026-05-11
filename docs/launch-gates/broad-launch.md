@@ -116,15 +116,49 @@ make individual windows pass.
 
 | Metric | Threshold | Source |
 |---|---|---|
-| `effective_failed` windows | 0 (after `tolerated_dispatcher_windows` removed) | tests/launch_soak.py:453 |
-| `missing` windows | 0 | tests/launch_soak.py:413 |
-| `unaccounted_gap_windows` | 0 | tests/launch_soak.py:433 |
-| Cumulative `dropped_full` | ≤ `SOAK_MAX_RECV_PUMP_DROPPED_FULL_DELTA` (0) | tests/launch_soak.py:438 |
-| `dispatcher_noise_policy.passed` | `true` (verdict ∈ {legacy-count-ok, adaptive-rate-ok}) | tests/launch_soak.py:266 |
-| Aggregate `dispatcher_timed_out` total | ≤ `SOAK_MAX_DISPATCHER_TIMED_OUT_DELTA_PER_12H` (5) **or** rate ≤ `SOAK_MAX_DISPATCHER_TIMEOUT_RATIO` (0.0001) | tests/launch_soak.py:254 |
-| Max per-window dispatcher rate | ≤ `SOAK_MAX_DISPATCHER_TIMEOUT_RATIO_PER_WINDOW` (0.0001) | tests/launch_soak.py:261 |
-| Consecutive baseline×4 anomaly windows | ≤ `SOAK_MAX_CONSECUTIVE_DISPATCHER_ANOMALY_WINDOWS` (2) | tests/launch_soak.py:263 |
-| Tolerated dispatcher-only windows | reported, do not fail soak | tests/launch_soak.py:454 |
+| `effective_failed` windows | 0 (after `tolerated_dispatcher_windows` + `tolerated_phase_a_windows` removed) | tests/launch_soak.py |
+| `missing` windows | 0 | tests/launch_soak.py |
+| `unaccounted_gap_windows` | 0 | tests/launch_soak.py |
+| Cumulative `dropped_full` | ≤ `SOAK_MAX_RECV_PUMP_DROPPED_FULL_DELTA` (0) | tests/launch_soak.py |
+| `dispatcher_noise_policy.passed` | `true` (verdict ∈ {legacy-count-ok, adaptive-rate-ok}) | tests/launch_soak.py |
+| Aggregate `dispatcher_timed_out` total | ≤ `SOAK_MAX_DISPATCHER_TIMED_OUT_DELTA_PER_12H` (5) **or** rate ≤ `SOAK_MAX_DISPATCHER_TIMEOUT_RATIO` (0.0001) | tests/launch_soak.py |
+| Max per-window dispatcher rate | ≤ `SOAK_MAX_DISPATCHER_TIMEOUT_RATIO_PER_WINDOW` (0.0001) | tests/launch_soak.py |
+| Consecutive baseline×4 anomaly windows | ≤ `SOAK_MAX_CONSECUTIVE_DISPATCHER_ANOMALY_WINDOWS` (2) | tests/launch_soak.py |
+| Aggregate Phase A `sent / (30 × non-missing windows)` | ≥ `SOAK_MIN_AGGREGATE_PHASE_A_RATIO` (0.99) | tests/launch_soak.py |
+| Aggregate Phase A `received / (30 × non-missing windows)` | ≥ `SOAK_MIN_AGGREGATE_PHASE_A_RATIO` (0.99) | tests/launch_soak.py |
+| Tolerated dispatcher-only windows | reported, do not fail soak | tests/launch_soak.py |
+| Tolerated phase-A tail windows | reported, do not fail soak iff aggregate Phase A SLO holds | tests/launch_soak.py |
+
+### Aggregate Phase A SLO — X0X-0065 Pattern 1
+
+The per-window strict gate (`min_phase_a_pairs = 30`) treats any pair
+miss in a 15-min window as an investigation trigger. At cross-region
+RTTs (helsinki ↔ singapore/sydney is ~280 ms one-way) a single PTO +
+retransmit can exceed the ACK budget on a tail event, costing one of
+the 30 pairs in that window — without indicating a sustained
+regression.
+
+The aggregate Phase A SLO is the soak-level Pattern 1 application:
+
+- Numerator: `sum(phase_a_sent across windows)` and
+  `sum(phase_a_received across windows)`, computed separately.
+- Denominator: `SOAK_MIN_PHASE_A_PAIRS × len(non-missing windows)`.
+- Tolerance rule: a NO-GO window whose **only** violations are in
+  the `dispatcher_timed_out` or `phase_a` family (and where
+  `recv_pump.dropped_full == 0` for the window) joins
+  `tolerated_phase_a_windows` iff the aggregate ratios are at or
+  above `SOAK_MIN_AGGREGATE_PHASE_A_RATIO` once all windows are
+  classified.
+- Hard floor: `recv_pump.dropped_full`, `per_peer_timeout` ratio
+  above gate, and `suppressed_peers` ratio remain strict — none of
+  those classes is tolerated by the aggregate SLO. Any non-tail
+  violation in a window sends it straight to `effective_failed`.
+
+The 99% bar derives from the X0X-0065 acceptance criterion. At the
+6-node VPS bootstrap matrix it gives ~3 tolerated pair misses per 4h
+soak (480 pairs × 1%); deeper deployments scale the denominator
+naturally. Do not relax this without a documented decision and a
+re-soak.
 
 The harness still reports raw `republish_per_peer_timeout` deltas and
 raw `suppressed_peers` counts in `summary.md` and `summary.csv`. Treat a

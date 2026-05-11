@@ -44,6 +44,12 @@ SOAK_MAX_DISPATCHER_TIMEOUT_RATIO_PER_WINDOW = 0.0001
 SOAK_DISPATCHER_ANOMALY_BASELINE_FACTOR = 4.0
 SOAK_DISPATCHER_ANOMALY_RATE_FLOOR = 0.00005
 SOAK_MAX_CONSECUTIVE_DISPATCHER_ANOMALY_WINDOWS = 2
+# X0X-0065 Pattern 1 — explicit aggregate Phase A SLO. Per-window
+# Phase A misses (1-2 pairs out of 30 on cross-region tail-latency
+# paths) are tolerated only when the cumulative ratio across the
+# soak stays above this floor. Per-window strict threshold is
+# unchanged (still 30/30 in launch_readiness.py).
+SOAK_MIN_AGGREGATE_PHASE_A_RATIO = 0.99
 
 
 def _int_field(row: Dict[str, str], key: str, default: int = 0) -> int:
@@ -443,26 +449,81 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
             and _int_field(row, "phase_a_sent") >= SOAK_MIN_PHASE_A_PAIRS
         )
 
-    def _only_dispatcher_timeout_violations(row: Dict[str, str]) -> bool:
+    def _violation_messages(row: Dict[str, str]) -> List[str]:
         raw = row.get("violation_messages", "")
         if not raw:
-            return False
-        messages = [m.strip() for m in raw.split(" || ") if m.strip()]
-        return bool(messages) and all("dispatcher_timed_out delta" in m for m in messages)
+            return []
+        return [m.strip() for m in raw.split(" || ") if m.strip()]
+
+    def _is_dispatcher_violation(msg: str) -> bool:
+        return "dispatcher_timed_out delta" in msg
+
+    def _is_phase_a_violation(msg: str) -> bool:
+        return (
+            "phase A received" in msg
+            or "scenario errored: phase A exit code" in msg
+        )
+
+    def _only_dispatcher_timeout_violations(row: Dict[str, str]) -> bool:
+        messages = _violation_messages(row)
+        return bool(messages) and all(_is_dispatcher_violation(m) for m in messages)
+
+    def _only_tail_violations(row: Dict[str, str]) -> bool:
+        """All violations are either dispatcher_timed_out or phase_a tail.
+
+        These are the two failure classes covered by the aggregate
+        Pattern 1 SLOs. Anything else (e.g. recv_pump_dropped_full,
+        per_peer_timeout ratio above gate, suppressed_peers ratio) is
+        a real regression and counts as effective_failed.
+        """
+        messages = _violation_messages(row)
+        return bool(messages) and all(
+            _is_dispatcher_violation(m) or _is_phase_a_violation(m)
+            for m in messages
+        )
+
+    # Aggregate Phase A SLO — sum across all windows that produced
+    # data. Missing windows are excluded from the denominator so a
+    # telemetry gap does not arithmetic-trick the ratio upward; they
+    # are caught separately by the `missing_count == 0` requirement.
+    data_rows = [r for r in rows if r["verdict"] != "MISSING"]
+    agg_phase_a_sent = sum(_int_field(r, "phase_a_sent") for r in data_rows)
+    agg_phase_a_received = sum(_int_field(r, "phase_a_received") for r in data_rows)
+    agg_phase_a_target = SOAK_MIN_PHASE_A_PAIRS * len(data_rows)
+    agg_phase_a_sent_ratio = (
+        agg_phase_a_sent / agg_phase_a_target if agg_phase_a_target > 0 else 0.0
+    )
+    agg_phase_a_received_ratio = (
+        agg_phase_a_received / agg_phase_a_target if agg_phase_a_target > 0 else 0.0
+    )
+    aggregate_phase_a_ok = (
+        agg_phase_a_target > 0
+        and agg_phase_a_sent_ratio >= SOAK_MIN_AGGREGATE_PHASE_A_RATIO
+        and agg_phase_a_received_ratio >= SOAK_MIN_AGGREGATE_PHASE_A_RATIO
+    )
 
     effective_failed: List[int] = []
     tolerated_dispatcher_windows: List[int] = []
+    tolerated_phase_a_windows: List[int] = []
     for idx, row in enumerate(rows, 1):
         if row["verdict"] == "GO":
             continue
-        if (
-            row["verdict"] == "NO-GO"
-            and _phase_a_ok(row)
-            and _counter_field(row, "continuous_max_drop_full_delta", "max_drop_full_delta") == 0
-            and _only_dispatcher_timeout_violations(row)
-        ):
-            tolerated_dispatcher_windows.append(idx)
-            continue
+        drop_full_clean = (
+            _counter_field(row, "continuous_max_drop_full_delta", "max_drop_full_delta") == 0
+        )
+        if row["verdict"] == "NO-GO" and drop_full_clean and _only_tail_violations(row):
+            if _phase_a_ok(row) and _only_dispatcher_timeout_violations(row):
+                # Pure dispatcher-only tail — tolerated unconditionally
+                # (the dispatcher_noise_policy aggregate gate also
+                # evaluates rate / consecutive-anomaly upper bounds).
+                tolerated_dispatcher_windows.append(idx)
+                continue
+            if aggregate_phase_a_ok:
+                # Window has phase_a tail loss (with or without an
+                # accompanying dispatcher timeout); tolerated only
+                # while the aggregate Phase A ratio stays above SLO.
+                tolerated_phase_a_windows.append(idx)
+                continue
         effective_failed.append(idx)
 
     overall_pass = (
@@ -472,6 +533,7 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         and not unaccounted_gap_windows
         and dispatcher_policy["passed"] == "true"
         and cumulative_drop_full <= drop_limit
+        and aggregate_phase_a_ok
     )
 
     lines = [
@@ -497,6 +559,12 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         f"max_consecutive_anomalies={dispatcher_policy['max_consecutive_anomalies']}, "
         f"anomaly_windows={dispatcher_policy['anomaly_windows']})",
         f"- tolerated dispatcher-only windows: **{','.join(str(i) for i in tolerated_dispatcher_windows) or 'none'}**",
+        f"- tolerated phase-A tail windows: **{','.join(str(i) for i in tolerated_phase_a_windows) or 'none'}**",
+        f"- aggregate Phase A sent: **{agg_phase_a_sent}/{agg_phase_a_target}** "
+        f"({(agg_phase_a_sent_ratio * 100):.3f}%, gate ≥ {SOAK_MIN_AGGREGATE_PHASE_A_RATIO * 100:.0f}%)",
+        f"- aggregate Phase A received: **{agg_phase_a_received}/{agg_phase_a_target}** "
+        f"({(agg_phase_a_received_ratio * 100):.3f}%, gate ≥ {SOAK_MIN_AGGREGATE_PHASE_A_RATIO * 100:.0f}%)",
+        f"- aggregate Phase A SLO: **{'PASS' if aggregate_phase_a_ok else 'FAIL'}**",
         f"- effective failed windows: **{','.join(str(i) for i in effective_failed) or 'none'}**",
         f"- unaccounted telemetry-gap windows: **{','.join(str(i) for i in unaccounted_gap_windows) or 'none'}**",
         "",

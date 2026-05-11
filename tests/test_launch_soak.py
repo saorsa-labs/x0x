@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Dict
 
 
 def load_launch_soak():
@@ -312,6 +313,191 @@ class LaunchSoakSummaryTests(unittest.TestCase):
 
         self.assertFalse(passed)
         self.assertIn("dispatcher-only adaptive policy: **window-rate-high**", md)
+
+    def _make_row(
+        self,
+        *,
+        verdict: str = "GO",
+        phase_a_sent: int = 30,
+        phase_a_received: int = 30,
+        violation_messages: str = "",
+        disp_to: int = 0,
+        drop_full: int = 0,
+        start_unix: str = "1",
+    ) -> Dict[str, str]:
+        return {
+            "verdict": verdict,
+            "start_unix": start_unix,
+            "phase_a_received": str(phase_a_received),
+            "phase_a_sent": str(phase_a_sent),
+            "max_disp_to_delta": str(disp_to),
+            "sum_disp_to_delta": str(disp_to),
+            "continuous_max_disp_to_delta": str(disp_to),
+            "continuous_sum_disp_to_delta": str(disp_to),
+            "continuous_sum_dispatcher_completed_delta": "1000000",
+            "max_drop_full_delta": str(drop_full),
+            "sum_drop_full_delta": str(drop_full),
+            "continuous_max_drop_full_delta": str(drop_full),
+            "continuous_sum_drop_full_delta": str(drop_full),
+            "max_pp_to_delta": "0",
+            "continuous_sum_pp_to_delta": "0",
+            "max_suppressed": "0",
+            "max_suppressed_ratio": "0.000000",
+            "max_workers": "32",
+            "violations": str(len([m for m in violation_messages.split(" || ") if m])),
+            "violation_messages": violation_messages,
+        }
+
+    def test_aggregate_phase_a_tolerated_when_ratio_holds(self) -> None:
+        # 4 windows: 30, 30, 29, 30 sent → 119/120 = 99.17% ≥ 99% SLO.
+        # Window 3 has only the phase_a tail violation, so it joins
+        # tolerated_phase_a_windows and the soak passes.
+        rows = [
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="1"),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="2"),
+            self._make_row(
+                verdict="NO-GO",
+                phase_a_sent=29,
+                phase_a_received=29,
+                violation_messages=(
+                    "scenario errored: phase A exit code 1 || "
+                    "phase A received 29 < gate 30"
+                ),
+                start_unix="3",
+            ),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="4"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            passed = self.soak.write_summary(Path(tmp), "broad-launch", rows)
+            md = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+
+        self.assertTrue(passed, md)
+        self.assertIn("Overall verdict: **GO**", md)
+        self.assertIn("tolerated phase-A tail windows: **3**", md)
+        self.assertIn("aggregate Phase A sent: **119/120**", md)
+        self.assertIn("aggregate Phase A SLO: **PASS**", md)
+
+    def test_aggregate_phase_a_rejected_when_ratio_below_slo(self) -> None:
+        # 4 windows: 30, 30, 28, 28 sent → 116/120 = 96.67% < 99% SLO.
+        # Both NO-GO windows go to effective_failed because aggregate
+        # ratio falls below the floor.
+        rows = [
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="1"),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="2"),
+            self._make_row(
+                verdict="NO-GO",
+                phase_a_sent=28,
+                phase_a_received=28,
+                violation_messages=(
+                    "scenario errored: phase A exit code 1 || "
+                    "phase A received 28 < gate 30"
+                ),
+                start_unix="3",
+            ),
+            self._make_row(
+                verdict="NO-GO",
+                phase_a_sent=28,
+                phase_a_received=28,
+                violation_messages=(
+                    "scenario errored: phase A exit code 1 || "
+                    "phase A received 28 < gate 30"
+                ),
+                start_unix="4",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            passed = self.soak.write_summary(Path(tmp), "broad-launch", rows)
+            md = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+
+        self.assertFalse(passed, md)
+        self.assertIn("Overall verdict: **NO-GO**", md)
+        self.assertIn("aggregate Phase A SLO: **FAIL**", md)
+        self.assertIn("effective failed windows: **3,4**", md)
+        self.assertIn("tolerated phase-A tail windows: **none**", md)
+
+    def test_aggregate_phase_a_tolerates_mixed_phase_a_and_dispatcher_tail(self) -> None:
+        # Mirrors the actual 2026-05-11 soak window 1:
+        # phase_a_sent=29 plus 1 helsinki dispatcher timeout. With
+        # other windows clean, aggregate is 119/120 = 99.17% ≥ SLO,
+        # so the mixed window is tolerated.
+        rows = [
+            self._make_row(
+                verdict="NO-GO",
+                phase_a_sent=29,
+                phase_a_received=30,
+                disp_to=1,
+                violation_messages=(
+                    "scenario errored: phase A exit code 1 || "
+                    "helsinki: dispatcher_timed_out delta 1 > gate 0"
+                ),
+                start_unix="1",
+            ),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="2"),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="3"),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="4"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            passed = self.soak.write_summary(Path(tmp), "broad-launch", rows)
+            md = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+
+        self.assertTrue(passed, md)
+        self.assertIn("Overall verdict: **GO**", md)
+        self.assertIn("tolerated phase-A tail windows: **1**", md)
+
+    def test_aggregate_phase_a_does_not_excuse_non_tail_violations(self) -> None:
+        # Aggregate is 119/120 = 99.17% (would tolerate phase_a tail),
+        # but the offending window also has a suppression-ratio
+        # violation. Non-tail violations never enter the tolerated
+        # sets, so the window goes to effective_failed.
+        rows = [
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="1"),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="2"),
+            self._make_row(
+                verdict="NO-GO",
+                phase_a_sent=29,
+                phase_a_received=29,
+                violation_messages=(
+                    "phase A received 29 < gate 30 || "
+                    "nyc: suppressed_peers/known_peer_topic_pairs ratio "
+                    "0.250 > gate 0.120 (500 / 2000)"
+                ),
+                start_unix="3",
+            ),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="4"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            passed = self.soak.write_summary(Path(tmp), "broad-launch", rows)
+            md = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+
+        self.assertFalse(passed, md)
+        self.assertIn("Overall verdict: **NO-GO**", md)
+        self.assertIn("effective failed windows: **3**", md)
+
+    def test_aggregate_phase_a_does_not_excuse_drop_full(self) -> None:
+        # drop_full > 0 is a hard floor — even with perfect Phase A
+        # aggregate the window cannot be tolerated.
+        rows = [
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="1"),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="2"),
+            self._make_row(
+                verdict="NO-GO",
+                phase_a_sent=29,
+                phase_a_received=29,
+                drop_full=1,
+                violation_messages=(
+                    "phase A received 29 < gate 30 || "
+                    "nyc: recv_pump_dropped_full delta 1 > gate 0"
+                ),
+                start_unix="3",
+            ),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="4"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            passed = self.soak.write_summary(Path(tmp), "broad-launch", rows)
+            md = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+
+        self.assertFalse(passed, md)
+        self.assertIn("Overall verdict: **NO-GO**", md)
 
     def test_write_summary_keeps_phase_a_gap_as_no_go(self) -> None:
         rows = [
