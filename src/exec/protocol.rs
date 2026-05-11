@@ -255,12 +255,14 @@ mod tests {
 
     #[test]
     fn request_id_from_hex_rejects_too_short() {
-        assert!(ExecRequestId::from_hex("0123456789abcdef0123456789abcde").is_err()); // 31 chars
+        assert!(ExecRequestId::from_hex("0123456789abcdef0123456789abcde").is_err());
+        // 31 chars
     }
 
     #[test]
     fn request_id_from_hex_rejects_too_long() {
-        assert!(ExecRequestId::from_hex("0123456789abcdef0123456789abcdef00").is_err()); // 34 chars = 17 bytes
+        assert!(ExecRequestId::from_hex("0123456789abcdef0123456789abcdef00").is_err());
+        // 34 chars = 17 bytes
     }
 
     #[test]
@@ -399,7 +401,12 @@ mod tests {
     fn decode_rejects_wrong_prefix() {
         let mut payload = Vec::new();
         payload.extend_from_slice(b"x0x-exec-v2\0"); // wrong version
-        payload.extend_from_slice(&bincode::serialize(&ExecFrame::Cancel { request_id: test_request_id() }).unwrap());
+        payload.extend_from_slice(
+            &bincode::serialize(&ExecFrame::Cancel {
+                request_id: test_request_id(),
+            })
+            .unwrap(),
+        );
         let err = decode_frame_payload(&payload).unwrap_err();
         assert!(matches!(err, ProtocolError::MissingPrefix));
     }

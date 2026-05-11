@@ -148,6 +148,9 @@ pub mod exec;
 /// The x0x Constitution — The Four Laws of Intelligent Coexistence — embedded at compile time.
 pub mod constitution;
 
+/// X0X-0066 request hedging for cross-region tail-latency
+pub mod hedge;
+
 /// Shared API endpoint registry consumed by both x0xd and the x0x CLI.
 pub mod api;
 
@@ -253,6 +256,9 @@ pub struct Agent {
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
     /// Handle for the running DM inbox service.
     dm_inbox_service: tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>,
+    /// X0X-0066: per-peer EWMA tracker for the request-hedging trigger
+    /// inside `send_ack_racing_replaced`.
+    hedge_rtt_tracker: std::sync::Arc<hedge::HedgeRttTracker<ant_quic::PeerId>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -3385,9 +3391,30 @@ impl Agent {
         let machine_prefix = network::hex_prefix(&machine_id.0, 4);
         let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
 
-        // First attempt: race send_with_receive_ack against same-peer Replaced.
+        // First attempt: race send_with_receive_ack against same-peer Replaced,
+        // and (X0X-0066) against a per-peer EWMA-based hedge timer that fires
+        // a duplicate `send_with_receive_ack` when the original is still in
+        // flight at the trigger threshold. Receiver-side dedupe is provided
+        // by X0X-0060 `RecentDeliveryCache`: both sends carry identical
+        // `wire` bytes (same `request_id`), so the receiver collapses the
+        // second arrival and republishes the cached ACK outcome on the
+        // hedge stream. Whichever ACK arrives first wins.
+        let send_start = std::time::Instant::now();
         let send_fut = network.send_with_receive_ack(ant_peer_id, wire, timeout);
         tokio::pin!(send_fut);
+
+        let hedge_trigger = self.hedge_rtt_tracker.hedge_trigger(&ant_peer_id, timeout);
+        let hedge_timer = tokio::time::sleep(hedge_trigger);
+        tokio::pin!(hedge_timer);
+        type HedgeSendFut<'a> = std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<Result<(), ant_quic::NodeError>>>
+                    + Send
+                    + 'a,
+            >,
+        >;
+        let mut hedge_fut: Option<HedgeSendFut<'_>> = None;
+        let mut hedge_fired = false;
 
         let superseded_to: u64;
 
@@ -3404,7 +3431,14 @@ impl Agent {
                     // exchange errors out fast on the dying connection
                     // milliseconds before the new connection is registered.
                     match send_result {
-                        Some(Ok(())) => return Ok(dm::DmPath::RawQuicAcked),
+                        Some(Ok(())) => {
+                            self.hedge_rtt_tracker
+                                .record_success(ant_peer_id, send_start.elapsed());
+                            if hedge_fired {
+                                self.direct_messaging.record_hedge_lost();
+                            }
+                            return Ok(dm::DmPath::RawQuicAcked);
+                        }
                         Some(Err(e)) => {
                             // Drain any queued Replaced for our peer.
                             let mut queued_supersede: Option<u64> = None;
@@ -3423,6 +3457,19 @@ impl Agent {
                                 superseded_to = gen;
                                 break;
                             }
+                            // X0X-0066: if a hedge is in flight, give it a
+                            // chance to win — it may be on a fresher path
+                            // generation that has not errored. If the hedge
+                            // also errors, fall through to the original's
+                            // error reporting path.
+                            if let Some(mut hf) = hedge_fut.take() {
+                                if let Some(Ok(())) = (&mut hf).await {
+                                    self.hedge_rtt_tracker
+                                        .record_success(ant_peer_id, send_start.elapsed());
+                                    self.direct_messaging.record_hedge_won();
+                                    return Ok(dm::DmPath::RawQuicAcked);
+                                }
+                            }
                             let reason = format!("send_with_receive_ack failed: {e}");
                             return if Self::raw_quic_ack_receive_backpressured(&reason) {
                                 Err(error::NetworkError::RemoteReceiveBackpressured(reason))
@@ -3434,6 +3481,49 @@ impl Agent {
                             "network node not initialized".to_string(),
                         )),
                     }
+                }
+                hedge_result = async {
+                    match hedge_fut.as_mut() {
+                        Some(f) => f.await,
+                        None => std::future::pending().await,
+                    }
+                }, if hedge_fut.is_some() => {
+                    // X0X-0066: hedged send completed before the original.
+                    match hedge_result {
+                        Some(Ok(())) => {
+                            self.hedge_rtt_tracker
+                                .record_success(ant_peer_id, send_start.elapsed());
+                            self.direct_messaging.record_hedge_won();
+                            return Ok(dm::DmPath::RawQuicAcked);
+                        }
+                        Some(Err(_)) | None => {
+                            // Hedge failed — drop it and keep waiting for
+                            // the original (or Replaced) to resolve. Do
+                            // not propagate hedge errors: the original is
+                            // still authoritative.
+                            hedge_fut = None;
+                            self.direct_messaging.record_hedge_lost();
+                        }
+                    }
+                }
+                () = &mut hedge_timer, if !hedge_fired => {
+                    // X0X-0066: trigger threshold reached and original still
+                    // in flight. Spawn a duplicate `send_with_receive_ack`
+                    // with the SAME wire bytes; the receiver dedupes via
+                    // X0X-0060 `RecentDeliveryCache` and replays the cached
+                    // ACK outcome on the hedge stream.
+                    hedge_fired = true;
+                    self.direct_messaging.record_hedge_fired();
+                    tracing::debug!(
+                        target: "dm.hedge",
+                        from = %self_prefix,
+                        to = %agent_prefix,
+                        trigger_ms = hedge_trigger.as_millis() as u64,
+                        elapsed_ms = send_start.elapsed().as_millis() as u64,
+                        "X0X-0066: hedge timer fired; issuing duplicate send_with_receive_ack",
+                    );
+                    let fut = network.send_with_receive_ack(ant_peer_id, wire, timeout);
+                    hedge_fut = Some(Box::pin(fut));
                 }
                 replaced = replaced_rx.recv() => {
                     match replaced {
@@ -3700,6 +3790,14 @@ impl Agent {
     /// Provides low-level access to connection tracking and agent mappings.
     pub fn direct_messaging(&self) -> &std::sync::Arc<direct::DirectMessaging> {
         &self.direct_messaging
+    }
+
+    /// X0X-0066: per-peer EWMA tracker that decides when the
+    /// `send_ack_racing_replaced` hedge fires. Public so tests and
+    /// diagnostics surfaces can inspect the recorded RTTs without
+    /// reaching into private fields.
+    pub fn hedge_rtt_tracker(&self) -> &std::sync::Arc<hedge::HedgeRttTracker<ant_quic::PeerId>> {
+        &self.hedge_rtt_tracker
     }
 
     /// Check if an agent is currently connected for direct messaging.
@@ -7241,6 +7339,7 @@ impl AgentBuilder {
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
             dm_inbox_service: tokio::sync::Mutex::new(None),
+            hedge_rtt_tracker: std::sync::Arc::new(hedge::HedgeRttTracker::new()),
         })
     }
 }

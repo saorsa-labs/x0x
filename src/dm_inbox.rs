@@ -520,7 +520,10 @@ mod tests {
 
         // Verify with a different public key — must fail because the
         // derived AgentId won't match sender_agent_id in the envelope.
-        assert!(!verify_envelope_signature(&envelope, wrong_kp.public_key().as_bytes()));
+        assert!(!verify_envelope_signature(
+            &envelope,
+            wrong_kp.public_key().as_bytes()
+        ));
     }
 
     #[test]
