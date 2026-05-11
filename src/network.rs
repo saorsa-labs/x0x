@@ -859,8 +859,20 @@ impl NetworkNode {
             // pressure warnings below are the operator signal that the system is
             // leaning on this buffer and needs load shedding or a structural
             // recv-pump fix.
-            .data_channel_capacity(10_000)
-            .max_concurrent_uni_streams(10_000);
+            //
+            // X0X-0063 bumped this from 10_000 → 50_000 after the 4 h
+            // confirmatory soak on x0x 0.19.35 (sg 0.5.40, ant-quic 0.27.15)
+            // recorded **1,025,150 high_water_count events on nyc** —
+            // saturation occurring continuously at ~67/s. The 10_000 ceiling
+            // was insufficient once X0X-0061 bumped the saorsa-gossip
+            // PER_PEER_REPUBLISH_TIMEOUT 750 ms → 2500 ms, because each
+            // outbound send task now holds a data_tx slot for up to 2.5 s
+            // (3.3× the prior hold time). 50_000 gives proportional headroom.
+            // This remains a mitigation — under truly sustained overload
+            // backpressure earlier in the pubsub flush_ihave_batches loop is
+            // the proper fix.
+            .data_channel_capacity(50_000)
+            .max_concurrent_uni_streams(50_000);
 
         if let Some(bind_addr) = config.bind_addr {
             builder = builder.bind_addr(bind_addr);
