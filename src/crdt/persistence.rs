@@ -165,6 +165,135 @@ impl TaskListStorage {
     }
 }
 
-// Module-level tests kept simple to avoid type conflicts between
-// ant_quic::PeerId and saorsa_gossip_types::PeerId
-// Full integration tests are in tests/ directory
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::crdt::task_list::TaskListId;
+    use crate::crdt::TaskList;
+    use saorsa_gossip_types::PeerId;
+
+    fn test_peer_id() -> PeerId {
+        PeerId::new([0xBB; 32])
+    }
+
+    fn test_list_id(byte: u8) -> TaskListId {
+        TaskListId::new([byte; 32])
+    }
+
+    fn create_test_list(id: TaskListId, name: &str) -> TaskList {
+        TaskList::new(id, name.to_string(), test_peer_id())
+    }
+
+    #[tokio::test]
+    async fn save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x01);
+        let list = create_test_list(list_id.clone(), "test-list");
+
+        storage.save_task_list(&list_id, &list).await.unwrap();
+        let loaded = storage.load_task_list(&list_id).await.unwrap();
+
+        assert_eq!(loaded.id(), list.id());
+        assert_eq!(loaded.name(), "test-list");
+    }
+
+    #[tokio::test]
+    async fn load_nonexistent_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x02);
+
+        let result = storage.load_task_list(&list_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_task_lists_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+
+        let lists = storage.list_task_lists().await.unwrap();
+        assert!(lists.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_task_lists_after_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x03);
+        let list = create_test_list(list_id.clone(), "list-me");
+
+        storage.save_task_list(&list_id, &list).await.unwrap();
+        let lists = storage.list_task_lists().await.unwrap();
+
+        assert_eq!(lists.len(), 1);
+        assert!(lists[0].contains("03"));
+    }
+
+    #[tokio::test]
+    async fn delete_task_list_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x04);
+        let list = create_test_list(list_id.clone(), "delete-me");
+
+        storage.save_task_list(&list_id, &list).await.unwrap();
+        storage.delete_task_list(&list_id).await.unwrap();
+
+        let result = storage.load_task_list(&list_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn save_creates_directory_automatically() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested").join("deep");
+        let storage = TaskListStorage::new(nested);
+        let list_id = test_list_id(0x05);
+        let list = create_test_list(list_id.clone(), "nested-test");
+
+        storage.save_task_list(&list_id, &list).await.unwrap();
+        let loaded = storage.load_task_list(&list_id).await.unwrap();
+        assert_eq!(loaded.name(), "nested-test");
+    }
+
+    #[tokio::test]
+    async fn list_skips_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x06);
+        let list = create_test_list(list_id.clone(), "tmp-skip");
+
+        storage.save_task_list(&list_id, &list).await.unwrap();
+
+        // Write a .tmp file manually
+        let tmp_path = dir.path().join(format!("{}.tmp", list_id));
+        tokio::fs::write(&tmp_path, b"garbage").await.unwrap();
+
+        let lists = storage.list_task_lists().await.unwrap();
+        assert_eq!(lists.len(), 1); // .tmp file should be skipped
+    }
+
+    #[tokio::test]
+    async fn multiple_lists_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let id_a = test_list_id(0x0A);
+        let id_b = test_list_id(0x0B);
+        let list_a = create_test_list(id_a.clone(), "list-a");
+        let list_b = create_test_list(id_b.clone(), "list-b");
+
+        storage.save_task_list(&id_a, &list_a).await.unwrap();
+        storage.save_task_list(&id_b, &list_b).await.unwrap();
+
+        let loaded_a = storage.load_task_list(&id_a).await.unwrap();
+        let loaded_b = storage.load_task_list(&id_b).await.unwrap();
+        assert_eq!(loaded_a.name(), "list-a");
+        assert_eq!(loaded_b.name(), "list-b");
+
+        let lists = storage.list_task_lists().await.unwrap();
+        assert_eq!(lists.len(), 2);
+    }
+}
