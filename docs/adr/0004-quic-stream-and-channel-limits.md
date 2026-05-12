@@ -46,8 +46,8 @@ burst, even though QUIC connections appeared healthy.
 ## Decision
 
 Configure x0x's ant-quic node with:
-- `max_concurrent_uni_streams`: 10,000 (up from default 100)
-- `data_channel_capacity`: 1,024 (up from default 256)
+- `max_concurrent_uni_streams`: 50,000 (up from default 100; increased in later release)
+- `data_channel_capacity`: 50,000 (up from default 256; increased in later release)
 
 These values are set in `NetworkNode::new()` via ant-quic's `NodeConfig::builder()`.
 ant-quic's defaults are unchanged — this is an application-level configuration
@@ -55,21 +55,23 @@ choice specific to x0x's gossip workload.
 
 ## Why These Values
 
-### 10,000 concurrent streams
+### 50,000 concurrent streams (originally 10,000)
 
 At x0x's typical gossip rate of 1-2 messages per second per peer, with 10 connected
 peers, that's ~20 messages/second or ~1,200 messages/minute. Each stream is
 short-lived (open, write, finish), so the concurrent count is much lower than the
-total count. 10,000 provides several hours of headroom even in worst-case burst
+total count. The original design used 10,000 which provides several hours of headroom even in worst-case burst
 scenarios, without meaningful memory cost (~100 bytes per stream entry = ~1 MB total).
+This was later increased to 50,000 for additional margin.
 
-### 1,024 channel capacity
+### 50,000 channel capacity (originally 1,024)
 
 The data channel sits between ant-quic's per-connection reader tasks and the
 application's `recv()` call. With multiple connections each producing messages,
 the channel can accumulate messages faster than the single-threaded gossip dispatch
-loop processes them. 1,024 entries provides 4x the default headroom, reducing the
+loop processes them. The original design used 1,024 which provides 4x the default headroom, reducing the
 probability of reader task backpressure to near zero for x0x's workload.
+This was later increased to 50,000 for additional margin.
 
 ## Why Not Change ant-quic Defaults
 
@@ -93,4 +95,4 @@ tune them for its specific workload.
 
 3. **Unbounded streams**: Set `max_concurrent_uni_streams` to `VarInt::MAX`. This
    removes the limit entirely but could mask resource leaks or misbehaving peers.
-   A high-but-finite limit (10,000) is more defensible.
+   A high-but-finite limit (originally 10,000, later increased to 50,000) is more defensible.

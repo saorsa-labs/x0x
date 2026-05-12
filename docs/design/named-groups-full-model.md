@@ -193,13 +193,14 @@ working-tree HEAD.
 ### Honest v1 secure model
 
 x0x v1 ships **GSS** (Group Shared Secret) rekey-on-ban, not full MLS
-TreeKEM. The `security_binding` field in `GroupStateCommit` carries the
-current `gss:epoch=N` so the state chain cannot silently drift from the
-secure plane. GSS provides cross-daemon encrypt/decrypt + rekey-on-ban
-future-access revocation (proven in
-`tests/e2e_named_groups.sh` §2); it does **not** provide per-message
-forward secrecy within an epoch or MLS TreeKEM semantics. Full TreeKEM
-is planned follow-up work.
+TreeKEM. This is recorded in
+[ADR 0010](../adr/0010-gss-before-mls-treekem-for-v1-secure-groups.md).
+The `security_binding` field in `GroupStateCommit` carries the current
+`gss:epoch=N` so the state chain cannot silently drift from the secure
+plane. GSS provides cross-daemon encrypt/decrypt + rekey-on-ban
+future-access revocation (proven in `tests/e2e_named_groups.sh` §2); it
+does **not** provide per-message forward secrecy within an epoch or MLS
+TreeKEM semantics. Full TreeKEM is planned follow-up work.
 
 ## Why this exists
 

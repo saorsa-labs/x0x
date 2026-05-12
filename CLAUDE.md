@@ -8,7 +8,7 @@ Agent-to-agent gossip network for AI systems. Built on `ant-quic` (QUIC transpor
 
 ## Build & Test Commands
 
-No justfile exists yet. Use raw cargo commands:
+Standard `just` recipes are available (see `just --list`). Raw cargo commands:
 
 ```bash
 cargo fmt --all -- --check          # Format check
@@ -356,11 +356,11 @@ When running tests that SSH to multiple VPS nodes sequentially, use `-o ControlM
 
 ## API Completeness
 
-128 REST endpoints, all wired to x0xd and CLI:
+130 REST endpoints (114 unique paths), all wired to x0xd and CLI:
 - Identity + AgentCard: `GET /agent`, `GET /agent/card`, `POST /agent/card/import`
 - Presence: `GET /presence/online`, `GET /presence/foaf`, `GET /presence/find/:id`, `GET /presence/status/:id`, `GET /presence/events` (SSE)
 - Named groups: `POST/GET /groups`, `POST /groups/:id/invite`, `POST /groups/join`, policy, roles, join requests, ban/unban
-- Group discovery: `GET /groups/discover?q=`, `GET /groups/discover/nearby`, shard subscriptions (Phase C.2, designed not yet implemented)
+- Group discovery: `GET /groups/discover?q=`, `GET /groups/discover/nearby`, shard subscriptions (Phase C.2, landed)
 - KvStore: `POST/GET /stores`, `PUT/GET/DELETE /stores/:id/:key` (with access control)
 - Direct messaging: `send_direct()`, `recv_direct()`, `connect_to_agent()`
 - MLS groups: `MlsGroup::new()`, `add_member()`, `remove_member()`, `MlsCipher::encrypt/decrypt()`

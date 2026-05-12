@@ -43,7 +43,9 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 ### Honest v1 secure model — Group Shared Secret (GSS)
 
-For `MlsEncrypted` groups x0x v1 ships **GSS**, not MLS TreeKEM:
+For `MlsEncrypted` groups x0x v1 ships **GSS**, not MLS TreeKEM.
+This is an accepted architecture decision in
+[ADR 0010](../adr/0010-gss-before-mls-treekem-for-v1-secure-groups.md):
 
 - a 32-byte shared secret is generated at group creation;
 - on ban / remove, the secret is rotated to a new `epoch` and the new

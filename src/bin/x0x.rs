@@ -1682,7 +1682,7 @@ x0x (v{VERSION})
     |   +-- --check        Just check, don't apply
     |   +-- --force        Force reinstall latest version
     +-- gui                Open embedded web GUI
-    +-- routes             Print all 70 REST API routes
+    +-- routes             Print all 130 REST API routes
     +-- tree               This command tree
     +-- ws sessions        List WebSocket sessions
     +-- uninstall          Remove x0x binaries (keeps data)

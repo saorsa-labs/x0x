@@ -677,7 +677,7 @@ x0x tree               # Full command tree
 
 ```toml
 [dependencies]
-x0x = "0.16"
+x0x = "0.19"
 ```
 
 ```rust

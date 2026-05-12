@@ -12,6 +12,7 @@ This directory contains architecture decision records for x0x.
 - [ADR 0007: Three-Layer Identity Model](./0007-three-layer-identity-model.md) — machine transport identity, portable agent identity, and optional consent-gated user identity
 - [ADR 0008: Trust Evaluation System](./0008-trust-evaluation-system.md) — unified `(AgentId, MachineId)` pair evaluation with orthogonal trust levels and identity types
 - [ADR 0009: Receive-Pump Overload Policy](./0009-recv-pump-overload-policy.md) — observable PubSub load-shedding plus receive-pump diagnostics
+- [ADR 0010: GSS Before MLS TreeKEM for v1 Secure Groups](./0010-gss-before-mls-treekem-for-v1-secure-groups.md) — `MlsEncrypted` named groups use Group Shared Secret rekey-on-ban in v1, not full MLS TreeKEM
 
 ## Accepted (Phase 1 Functionally Complete)
 
