@@ -4,6 +4,87 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.42] - 2026-05-12
+
+Phase 2 portfolio release: SOTA-Borrow Phase 2 work shipped via the
+parallel team handoff + adaptive cooling primitives + qlog-style
+transport telemetry. Six tickets advanced this cycle.
+
+### Why
+
+- **X0X-0057** (review): `launch_readiness` was passing the broad-launch
+  gate silently when `/diagnostics/connectivity` was unreachable (the
+  `data_tx_high_water_count_delta == 0` check coerced missing-data to
+  zero). Now fails closed.
+- **X0X-0068** (done, in saorsa-gossip 0.5.41): bounded pubsub message
+  cache (age + bytes + per-topic telemetry).
+- **X0X-0069** (done, in saorsa-gossip 0.5.42): SWIM peer-health
+  oracle bridge surface. Cooling-decision consumption follows as
+  X0X-0069b/0073b.
+- **X0X-0072** (review): QUIC connection pool with idle eviction
+  (300s) + LRU cap (32 connections) + 60s background eviction task,
+  per iroh's pattern adapted to x0x's ant-quic architecture.
+- **X0X-0073** (review): adaptive cooling primitives shipped in
+  saorsa-gossip 0.5.43 + 0.5.44 — p95 sliding-window timeout, 0.97/sec
+  success decay, escalation clamp, Dead escalation helper.
+- **X0X-0075** (review): per-topic + per-peer suppression diagnostics
+  in saorsa-gossip 0.5.45 + qlog-style transport telemetry in ant-quic
+  0.27.22. Consumer side: `/diagnostics/gossip` carries
+  `suppressed_peers_by_topic` / `peer_scores_by_topic` /
+  `admission_state_by_peer`; `/diagnostics/connectivity` carries
+  `per_peer_transport` rows with real Quinn `PathStats` values
+  (formerly nulls).
+- **X0X-0076** (review): split-soak harnesses for proof discipline —
+  fixed-roster DM-only vs PubSub-pressure isolation.
+
+### Changed
+
+- `saorsa-gossip-*` 11-crate workspace dep bumped 0.5.42 → 0.5.45.
+  Brings X0X-0073 v2 primitives + X0X-0075 Part A diagnostics +
+  the ant-quic 0.27.22 pin.
+- ant-quic chain consumed via saorsa-gossip's pin: 0.27.15 → 0.27.22.
+  Intervening fixes: X0X-0062 cancellation-safe ACK loop (0.27.16–
+  0.27.20), X0X-0066 caller-supplied ACK-v2 id (0.27.21), X0X-0075
+  Part B `ConnectionTransportStats` (0.27.22).
+
+### Added
+
+- `NetworkNode::connection_transport_stats(peer_id)` — forwarder for
+  ant-quic's new accessor.
+- `/diagnostics/connectivity.connection_pool`: telemetry for X0X-0072
+  pool (active_count, max_connections, idle_evict_after_secs,
+  idle_evictions_total, lru_evictions_total, establish_failures_total).
+- `/diagnostics/connectivity.per_peer_transport`: Quinn path counters
+  per live peer (rtt_ms, udp_*, congestion_window, packet_loss_rate,
+  current_mtu, stream_open/data/stream_data_blocked_events, etc.).
+- `/diagnostics/gossip.pubsub_stages.{suppressed_peers_by_topic,peer_scores_by_topic,admission_state_by_peer}`
+  — topic/peer-indexed views. Backfilled in x0xd from the legacy
+  `suppressed_peers` array when the saorsa-gossip release is older
+  than 0.5.45 (forward-compat).
+- `tests/launch_soak_fixed_roster.py` (X0X-0076 Variant A): direct-DM
+  only after initial discovery.
+- `tests/launch_soak_pubsub_pressure.py` (X0X-0076 Variant B):
+  PubSub-pressure-only soak.
+- `--no-pubsub-after-discover` flag on runner + orchestrator
+  (env-var fallback `X0X_NO_PUBSUB_AFTER_DISCOVER`).
+- `launch_readiness` harness:
+  - `Optional[int]` connectivity scalars; broad-launch fails closed
+    on missing data (X0X-0057).
+  - Per-node `diagnostics_connectivity_pre_fetched` / `post_fetched`
+    booleans in summary.md + summary.csv.
+  - Top-3 suppressed-topic and transport-peer summary rows
+    (X0X-0075 visibility).
+- Coverage tooling: `coverage-thresholds.toml`,
+  `scripts/check-coverage-thresholds.py`, `just coverage-check`,
+  CI `coverage` job, PR template Rule-9 checklist.
+
+### Notes — what's NOT done this release
+
+- 4h soak validations for the three review-state tickets (X0X-0057,
+  X0X-0072, X0X-0076) remain in the ticket follow-ups.
+- X0X-0073b cooling-decision integration + X0X-0074 admission control
+  are both functionally unblocked by X0X-0075's visibility; next cycle.
+
 ## [v0.19.31] - 2026-05-07
 
 Workspace lockstep bump consuming ant-quic 0.27.12 + saorsa-gossip 0.5.36.

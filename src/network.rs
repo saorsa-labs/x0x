@@ -1284,6 +1284,19 @@ impl NetworkNode {
         Some(node.connection_health(&peer_id).await)
     }
 
+    /// X0X-0075 Part C wiring: qlog-style transport telemetry for a live peer.
+    /// Companion to `connection_health` — health answers "is the lifecycle
+    /// live?", this snapshot answers "how is the path performing right now?".
+    /// Returns `None` when the network node is not yet initialised or the
+    /// peer has no live connection.
+    pub async fn connection_transport_stats(
+        &self,
+        peer_id: AntPeerId,
+    ) -> Option<ant_quic::ConnectionTransportStats> {
+        let node = self.node.read().await.as_ref().cloned()?;
+        node.connection_transport_stats(&peer_id).await
+    }
+
     /// Send data and wait for the remote receive pipeline to acknowledge
     /// (ant-quic 0.27.1 #172). Returns `None` when the network node is not
     /// yet initialised.
