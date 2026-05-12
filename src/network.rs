@@ -1086,29 +1086,6 @@ impl NetworkNode {
         Some(node.send_with_receive_ack(&peer_id, data, timeout).await)
     }
 
-    /// X0X-0066: caller-supplied ACK-v2 request id wrapper around
-    /// `ant_quic::Node::send_with_receive_ack_with_request_id`. Two calls
-    /// with the same `(peer_id, request_id, data)` are duplicate-safe at
-    /// the receiver — ant-quic's `AckRequestDedupeCache` replays the cached
-    /// ACK on the wire without redelivering the payload to `recv()`.
-    /// Returns `None` when the network node is not yet initialised.
-    pub async fn send_with_receive_ack_with_request_id(
-        &self,
-        peer_id: AntPeerId,
-        request_id: [u8; 16],
-        data: &[u8],
-        timeout: std::time::Duration,
-    ) -> Option<Result<(), ant_quic::NodeError>> {
-        if let Err(e) = self.ensure_peer_send_ready(&peer_id).await {
-            return Some(Err(ant_quic::NodeError::Connection(e.to_string())));
-        }
-        let node = self.node.read().await.as_ref().cloned()?;
-        Some(
-            node.send_with_receive_ack_with_request_id(&peer_id, request_id, data, timeout)
-                .await,
-        )
-    }
-
     /// Subscribe to lifecycle events for all peers (ant-quic 0.27.1 #171).
     pub async fn subscribe_all_peer_events(
         &self,

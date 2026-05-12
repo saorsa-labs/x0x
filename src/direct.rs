@@ -405,10 +405,6 @@ struct DirectDiagnosticsCounters {
     subscriber_channel_lagged: AtomicU64,
     subscriber_events_evicted: AtomicU64,
     subscriber_channel_closed: AtomicU64,
-    // X0X-0066 request-hedging counters.
-    hedge_fired_total: AtomicU64,
-    hedge_won_total: AtomicU64,
-    hedge_lost_total: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -454,14 +450,6 @@ pub struct DmDiagnosticsStats {
     /// Backward-compatible alias for slow-subscriber pressure events.
     pub subscriber_channel_lagged: u64,
     pub subscriber_channel_closed: u64,
-    /// X0X-0066: hedged duplicate `send_with_receive_ack` issued because
-    /// the original send was still in flight at the per-peer EWMA-based
-    /// trigger threshold.
-    pub hedge_fired_total: u64,
-    /// X0X-0066: hedged send completed before the original.
-    pub hedge_won_total: u64,
-    /// X0X-0066: original send completed before the hedge.
-    pub hedge_lost_total: u64,
 }
 
 /// Per-peer direct-message diagnostics exposed by `/diagnostics/dm`.
@@ -785,30 +773,6 @@ impl DirectMessaging {
         });
     }
 
-    /// X0X-0066: record one hedge timer fire (a duplicate
-    /// `send_with_receive_ack` was issued because the original was
-    /// still in flight at the per-peer trigger threshold).
-    pub(crate) fn record_hedge_fired(&self) {
-        self.diagnostics
-            .hedge_fired_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// X0X-0066: record that the hedged send completed before the original.
-    pub(crate) fn record_hedge_won(&self) {
-        self.diagnostics
-            .hedge_won_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// X0X-0066: record that the original send completed before the hedge
-    /// (the hedge was issued but did not win the race).
-    pub(crate) fn record_hedge_lost(&self) {
-        self.diagnostics
-            .hedge_lost_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Record a DM inbox decode failure.
     pub(crate) fn record_incoming_decode_failed(&self) {
         self.diagnostics
@@ -888,9 +852,6 @@ impl DirectMessaging {
                 .diagnostics
                 .subscriber_channel_closed
                 .load(Ordering::Relaxed),
-            hedge_fired_total: self.diagnostics.hedge_fired_total.load(Ordering::Relaxed),
-            hedge_won_total: self.diagnostics.hedge_won_total.load(Ordering::Relaxed),
-            hedge_lost_total: self.diagnostics.hedge_lost_total.load(Ordering::Relaxed),
         };
 
         let now_ms = now_unix_ms_lossy();
