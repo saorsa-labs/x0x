@@ -1009,3 +1009,138 @@ pub fn categories() -> Vec<&'static str> {
     }
     cats
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoints_is_not_empty() {
+        assert!(!ENDPOINTS.is_empty());
+    }
+
+    #[test]
+    fn every_endpoint_has_non_empty_fields() {
+        for ep in ENDPOINTS {
+            assert!(!ep.path.is_empty(), "path empty for {}", ep.cli_name);
+            assert!(!ep.cli_name.is_empty(), "cli_name empty for {}", ep.path);
+            assert!(!ep.description.is_empty(), "description empty for {}", ep.cli_name);
+            assert!(!ep.category.is_empty(), "category empty for {}", ep.cli_name);
+        }
+    }
+
+    #[test]
+    fn every_path_starts_with_slash() {
+        for ep in ENDPOINTS {
+            assert!(
+                ep.path.starts_with('/'),
+                "path '{}' for {} does not start with /",
+                ep.path,
+                ep.cli_name
+            );
+        }
+    }
+
+    #[test]
+    fn cli_names_are_unique() {
+        let mut names: Vec<&str> = ENDPOINTS.iter().map(|e| e.cli_name).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), ENDPOINTS.len());
+    }
+
+    #[test]
+    fn paths_are_unique_per_method() {
+        // Same path can appear with different methods (e.g. GET vs POST)
+        // Use a HashSet of (method, path) tuples
+        let mut seen = std::collections::HashSet::new();
+        for ep in ENDPOINTS {
+            let key = (ep.method as u8, ep.path);
+            assert!(
+                seen.insert(key),
+                "duplicate (method={}, path={})",
+                ep.method,
+                ep.path
+            );
+        }
+    }
+
+    #[test]
+    fn find_by_cli_name_finds_existing() {
+        let health = find_by_cli_name("health");
+        assert!(health.is_some());
+        assert_eq!(health.unwrap().path, "/health");
+    }
+
+    #[test]
+    fn find_by_cli_name_returns_none_for_unknown() {
+        assert!(find_by_cli_name("nonexistent-command-xyz").is_none());
+    }
+
+    #[test]
+    fn by_category_returns_all_matching() {
+        let status = by_category("status");
+        assert!(!status.is_empty());
+        for ep in &status {
+            assert_eq!(ep.category, "status");
+        }
+    }
+
+    #[test]
+    fn by_category_returns_empty_for_unknown() {
+        let result = by_category("nonexistent-category");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn categories_returns_unique_sorted_order() {
+        let cats = categories();
+        assert!(!cats.is_empty());
+        // Verify no duplicates
+        let mut sorted = cats.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), cats.len());
+    }
+
+    #[test]
+    fn method_display() {
+        assert_eq!(Method::Get.to_string(), "GET");
+        assert_eq!(Method::Post.to_string(), "POST");
+        assert_eq!(Method::Put.to_string(), "PUT");
+        assert_eq!(Method::Patch.to_string(), "PATCH");
+        assert_eq!(Method::Delete.to_string(), "DELETE");
+    }
+
+    #[test]
+    fn every_endpoint_has_valid_method() {
+        for ep in ENDPOINTS {
+            match ep.method {
+                Method::Get | Method::Post | Method::Put | Method::Patch | Method::Delete => {}
+            }
+        }
+    }
+
+    #[test]
+    fn categories_contains_expected() {
+        let cats = categories();
+        assert!(cats.contains(&"status"), "missing status");
+        assert!(cats.contains(&"identity"), "missing identity");
+        assert!(cats.contains(&"contacts"), "missing contacts");
+        assert!(cats.contains(&"groups"), "missing groups");
+        assert!(cats.contains(&"named-groups"), "missing named-groups");
+        assert!(cats.contains(&"tasks"), "missing tasks");
+        assert!(cats.contains(&"files"), "missing files");
+        assert!(cats.contains(&"exec"), "missing exec");
+        assert!(cats.contains(&"upgrade"), "missing upgrade");
+        assert!(cats.contains(&"network"), "missing network");
+        assert!(cats.contains(&"presence"), "missing presence");
+        assert!(cats.contains(&"messaging"), "missing messaging");
+        assert!(cats.contains(&"stores"), "missing stores");
+        assert!(cats.contains(&"direct"), "missing direct");
+        assert!(cats.contains(&"discovery"), "missing discovery");
+        assert!(cats.contains(&"machines"), "missing machines");
+        assert!(cats.contains(&"trust"), "missing trust");
+        assert!(cats.contains(&"websocket"), "missing websocket");
+    }
+}

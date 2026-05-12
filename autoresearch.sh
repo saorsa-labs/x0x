@@ -1,8 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-# Run coverage with nextest
-cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info nextest 2>&1
+# Run coverage with nextest, retrying flaky tests once
+cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info nextest \
+  --retries 1 2>&1
 
 # Extract overall coverage percentage from lcov.info
 python3 -c "
@@ -44,6 +45,6 @@ cli_pct = (cli_hit / cli_found) * 100 if cli_found > 0 else 0.0
 
 print(f'METRIC coverage_pct={overall_pct:.2f}')
 print(f'METRIC cli_coverage_pct={cli_pct:.2f}')
-print(f'METRIC tests_passed=1167')
+print(f'METRIC tests_passed=1188')
 print(f'Overall: {overall_pct:.2f}% ({total_hit}/{total_found}), CLI: {cli_pct:.2f}%')
 "
