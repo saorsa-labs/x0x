@@ -1,10 +1,108 @@
 # SOTA-Borrow Phase 2 — Production Fleet Survival Plan
 
 **Status:** Ready for handoff to agent team
-**Date:** 2026-05-12
-**Author:** Coordinator session (post X0X-0066 rollback)
+**Date:** 2026-05-12 (v2 reframe per reviewer)
+**Author:** Coordinator session (post X0X-0066 rollback) + reviewer
 **Related:** [X0X-0065](../../issues/issues.jsonl), [X0X-0066](../../issues/issues.jsonl), [X0X-0067](../../issues/issues.jsonl)
 **Soak evidence:** `proofs/launch-readiness-soak-20260512T093455Z-4h-v0_19_41-rollback-98pct-certification/`
+
+## v2 reframe — the centrepiece is admission control, not cache size
+
+The v1 of this plan made cache bounding (X0X-0068) the lead lever.
+Reviewer feedback recasts the diagnosis: **rising `suppressed_peers`
+ratio in the 4h soak is the overlay going defensive**, not just a
+cache that's too big. The Hunt 12f follow-up
+(`docs/design/hunt-12f-stale-release-fast-drop.md` §147) explicitly
+forecasts this fix: *"a real PubSub admission control path for known
+low-priority topics (x0x/release, discovery anti-entropy, identity
+anti-entropy), preferably before subscriber-channel enqueue."*
+
+Substrate-level admission control + topic priority is now the
+**portfolio centrepiece** (X0X-0074). The other six layers are
+supporting infrastructure — necessary but each insufficient alone.
+
+The reviewer also flagged two prerequisites:
+
+- **X0X-0075 (per-topic + transport diagnostics)** — we currently
+  count suppression but don't know *which topics* are causing it.
+  Without that breakdown, we can't tune priorities or validate
+  X0X-0074. Blocks X0X-0074.
+- **X0X-0076 (split-soak methodology)** — current `launch_soak.py`
+  conflates DM/transport failure with overlay failure. Split into
+  fixed-roster-DM-only vs PubSub-pressure-only soaks so we can
+  isolate the variable. The X0X-0066 hedging mistake came from
+  conflating these two failure modes.
+
+The four SOTA reference threads that informed this reframe (all from
+reviewer):
+
+1. **Quinn TransportConfig + PathStats** — per-peer RTT, loss/PTO,
+   cwnd/in-flight, stream-open blocking, path generation. We don't
+   surface this.
+2. **iroh architecture lesson** — *separation* of direct connectivity
+   health from fallback/control infrastructure. Don't copy DERP, copy
+   the separation principle.
+3. **libp2p gossipsub v1.1** — peer scoring + pruning + graylisting
+   + heartbeat as first-class health mechanisms. Rising suppression
+   means the overlay is in a defensive state — not noise.
+4. **Google SRE Handling Overload** — reject/drop low-priority work
+   early, keep queues bounded, avoid retry/hedge amplification, make
+   saturation explicit.
+5. **Cloudflare quiche** — metric-heavy production practice (qlog,
+   path, congestion evidence) rather than app-level pass/fail counters.
+
+## v2 ticket portfolio (centrepiece + supporting layers)
+
+```
+                    ┌────────────────────────────────────────┐
+                    │     X0X-0074  Admission Control        │  ← centrepiece (P0)
+                    │     (Hunt 12f forecast realised)        │
+                    └────────────────────────────────────────┘
+                       ▲                            ▲
+                       │ blocked by                 │ pairs with
+       ┌───────────────┴─────────┐          ┌───────┴───────────────┐
+       │  X0X-0075  Diagnostics  │          │  X0X-0068  Bounded    │
+       │  (per-topic suppression │          │  Cache (bandwidth     │
+       │   + qlog/PathStats)     │          │  reduction lever)     │
+       │                P0       │          │                P1     │
+       └─────────────────────────┘          └───────────────────────┘
+                       ▲
+                       │ pairs with
+       ┌───────────────┴─────────┐
+       │  X0X-0076  Split-Soak   │
+       │  Methodology (variants  │
+       │  A/B/C — isolation)     │
+       │                P1       │
+       └─────────────────────────┘
+
+   Supporting infrastructure layers (after centrepiece + diagnostics land):
+
+       X0X-0073  Adaptive cooling (calibrate per-peer p95 timeouts)
+       X0X-0069  SWIM suspicion (avoid false-positive cooling)
+       X0X-0071  P1-P7 peer scoring (continuous score with decay)
+       X0X-0070  Application peer relay (cross-region fallback)
+       X0X-0072  QUIC connection pool (state-refresh / idle eviction)
+```
+
+**Recommended cadence:**
+
+1. Ship X0X-0075 diagnostics first (no acceptance soak required —
+   just instrumentation). Unblocks everything else.
+2. Ship X0X-0076 split-soak methodology in parallel. Run Variant A
+   and Variant B once X0X-0075 is in. These produce the prerequisite
+   evidence for X0X-0074 design decisions.
+3. Ship X0X-0068 cache bounding in parallel (smaller diff, bandwidth
+   reduction is independently valuable, reuses X0X-0075 telemetry
+   infrastructure).
+4. Ship X0X-0074 admission control as the centrepiece. **This is the
+   ticket that should pass the plateau 4h soak.**
+5. Then ship the supporting layers (X0X-0073, 0069, 0071, 0070, 0072)
+   in priority order, each with its own 4h soak gate.
+
+The remaining sections of this document describe the supporting
+layers in the form they had under v1 of the plan. Read them with the
+v2 reframe in mind: each layer is now scoped to "one supporting fix
+for the admission-controlled substrate", not "the primary fix".
 
 ## Why this plan exists
 
