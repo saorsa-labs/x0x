@@ -60,6 +60,11 @@ coverage-summary:
 coverage-lcov:
     cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info nextest
 
+# Run the CI-style floor gate and advisory per-module threshold report.
+coverage-check:
+    cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info --fail-under-lines 48 nextest
+    python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global
+
 # Wipe cached profraw/profdata when results look stale.
 coverage-clean:
     cargo llvm-cov clean --workspace

@@ -1,0 +1,119 @@
+# x0x coverage ratchet configuration.
+#
+# This file is intentionally data-only. CI and local tooling read it through
+# scripts/check-coverage-thresholds.py after cargo-llvm-cov emits lcov.info.
+
+[global]
+line_floor = 48.0
+allowed_pr_drop = 0.5
+exclusion_budget_percent = 2.0
+lcov_artifact = "lcov.info"
+
+[[modules]]
+name = "WS-1 CLI commands"
+owner = "WS-1"
+phase = 1
+target = 80.0
+mode = "advisory"
+paths = [
+  "src/cli/**",
+]
+
+[[modules]]
+name = "WS-2 REST/API and Agent core"
+owner = "WS-2"
+phase = 2
+target = 90.0
+mode = "advisory"
+paths = [
+  "src/lib.rs",
+  "src/api/**",
+]
+
+[[modules]]
+name = "WS-3 Exec subsystem"
+owner = "WS-3"
+phase = 2
+target = 85.0
+mode = "advisory"
+paths = [
+  "src/exec/**",
+]
+
+[[modules]]
+name = "WS-3 Direct messaging"
+owner = "WS-3"
+phase = 2
+target = 85.0
+mode = "advisory"
+paths = [
+  "src/dm.rs",
+  "src/dm_send.rs",
+  "src/dm_inbox.rs",
+]
+
+[[modules]]
+name = "WS-3 Self-update"
+owner = "WS-3"
+phase = 2
+target = 85.0
+mode = "advisory"
+paths = [
+  "src/upgrade/**",
+]
+
+[[modules]]
+name = "WS-4 CRDT and sync"
+owner = "WS-4"
+phase = 1
+target = 90.0
+mode = "advisory"
+paths = [
+  "src/crdt/**",
+  "src/kv/sync.rs",
+]
+
+[[modules]]
+name = "WS-4 Groups edge cases"
+owner = "WS-4"
+phase = 1
+target = 90.0
+mode = "advisory"
+paths = [
+  "src/groups/kem_envelope.rs",
+  "src/groups/mod.rs",
+  "src/mls/group.rs",
+]
+
+[[modules]]
+name = "WS-5 Network transport"
+owner = "WS-5"
+phase = 3
+target = 85.0
+mode = "advisory"
+paths = [
+  "src/network.rs",
+]
+
+[[modules]]
+name = "Gossip pipeline"
+owner = "WS-3"
+phase = 1
+target = 90.0
+mode = "advisory"
+paths = [
+  "src/gossip/**",
+]
+
+[[modules]]
+name = "Identity, storage, presence, contacts"
+owner = "WS-4"
+phase = 1
+target = 90.0
+mode = "advisory"
+paths = [
+  "src/identity.rs",
+  "src/storage.rs",
+  "src/presence.rs",
+  "src/contacts.rs",
+]

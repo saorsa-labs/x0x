@@ -328,7 +328,59 @@ The plan is complete when **all** of:
 
 ---
 
-## 10. References
+## 10. Handoff packet (2026-05-12)
+
+This is the work split for the first implementation wave. Keep each item as a
+separate PR so owners can move in parallel without rebasing through unrelated
+refactors.
+
+| PR | Owner | Scope | Files | Exit criteria |
+|---|---|---|---|---|
+| **WS-6a — coverage gate** | CI/tooling | Add line coverage CI, threshold config, exclusions register, PR checklist. | `.github/workflows/ci.yml`, `coverage-thresholds.toml`, `scripts/check-coverage-thresholds.py`, `docs/coverage-exclusions.md`, `.github/pull_request_template.md`, `justfile`, `docs/cicd.md` | `just --list` shows `coverage-check`; CI uploads `lcov.info`; global 48% floor is enforced. |
+| **WS-1a — CLI ApiClient pilot** | CLI | Introduce object-safe `ApiClient` around existing JSON client calls; pilot on identity commands only. | `src/cli/mod.rs`, `src/cli/commands/identity.rs` | `DaemonClient` implements `ApiClient`; identity command tests can fake `ensure_running`, `get`, `post`, and `format`. |
+| **WS-1b — CLI command sweep** | CLI | Move non-streaming command modules onto `ApiClient`, one module per commit. | `src/cli/commands/*.rs` except daemon/upgrade/streaming modules | Each refactored command has why-named tests for success, API error, and request shape. |
+| **WS-2a — router extraction** | REST/API | Move daemon router/state out of `src/bin/x0xd.rs` into library API module. | `src/bin/x0xd.rs`, `src/api/mod.rs` or `src/api/router.rs`, `Cargo.toml` | `x0xd` calls `x0x::api::build_router(...)`; integration tests can import router construction; `tower` dev-dep available for `ServiceExt::oneshot`. |
+| **WS-2b — status/identity handler tests** | REST/API | Establish in-process `tests/api_handlers` harness and first endpoint family. | `tests/api_handlers/common.rs`, `tests/api_handlers/status.rs`, `tests/api_handlers/identity.rs` | `/health`, `/status`, `/shutdown`, `/agent`, `/agent/card` have happy path and auth/error coverage where documented. |
+
+### WS-1 notes
+
+The first `ApiClient` boundary should mirror the current CLI shape, not invent a
+generic typed client yet. Use `serde_json::Value` for bodies and responses so
+the trait remains object-safe:
+
+```rust
+#[async_trait]
+pub trait ApiClient: Send + Sync {
+    async fn ensure_running(&self) -> anyhow::Result<()>;
+    async fn get(&self, path: &str) -> anyhow::Result<serde_json::Value>;
+    async fn get_query(&self, path: &str, query: &[(&str, &str)]) -> anyhow::Result<serde_json::Value>;
+    async fn post(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value>;
+    async fn post_empty(&self, path: &str) -> anyhow::Result<serde_json::Value>;
+    async fn patch(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value>;
+    async fn put(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value>;
+    async fn delete(&self, path: &str) -> anyhow::Result<serde_json::Value>;
+    fn format(&self) -> OutputFormat;
+}
+```
+
+Do not force streaming commands into this first trait. `get_stream` leaks
+`reqwest::Response` and needs a separate stream abstraction.
+
+### WS-2 notes
+
+`Router::oneshot` is not possible from integration tests yet because the real
+Axum router and handlers live privately in `src/bin/x0xd.rs`. The first REST PR
+is therefore structural: expose a library-owned `ApiState` and
+`build_router(...)`, then let the daemon wire production state into that router.
+
+Start handler coverage with status and identity endpoints. They prove auth
+middleware, state wiring, and identity access without requiring a joined gossip
+network. Leave SSE/WebSocket and network-dependent endpoints for later harness
+iterations.
+
+---
+
+## 11. References
 
 - [taiki-e/cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov)
 - [cargo-nextest coverage integration](https://nexte.st/docs/integrations/test-coverage/)
