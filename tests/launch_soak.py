@@ -311,6 +311,11 @@ def discover_windows_summary(window_dir: Path) -> Dict[str, str]:
         "max_pp_to_delta": "?",
         "max_suppressed": "?",
         "max_suppressed_ratio": "?",
+        "max_suppressed_topics": "?",
+        "top_suppressed_topics": "",
+        "max_transport_peers": "?",
+        "max_transport_rtt_ms": "?",
+        "max_transport_loss_ppm": "?",
         "max_workers": "?",
         "violations": "?",
         "violation_messages": "",
@@ -383,6 +388,16 @@ def discover_windows_summary(window_dir: Path) -> Dict[str, str]:
                     "inf" if max_suppressed_ratio == float("inf")
                     else f"{max_suppressed_ratio:.6f}"
                 )
+                out["max_suppressed_topics"] = str(_max("suppressed_topics_post"))
+                top_topics = [
+                    r.get("suppressed_topics_top3_post", "")
+                    for r in baseline_rows
+                    if r.get("suppressed_topics_top3_post")
+                ]
+                out["top_suppressed_topics"] = " | ".join(sorted(set(top_topics)))
+                out["max_transport_peers"] = str(_max("transport_peer_count_post"))
+                out["max_transport_rtt_ms"] = str(_max("transport_rtt_ms_max_post"))
+                out["max_transport_loss_ppm"] = str(_max("transport_packet_loss_ppm_max_post"))
                 out["max_workers"] = str(_max("pubsub_workers_post"))
                 csv_violation_counts = []
                 for r in baseline_rows:
@@ -578,8 +593,8 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         "",
         "## Per-window timeline",
         "",
-        "| # | start_unix | verdict | effective | phase_a | scenario_sum_disp_to | continuous_sum_disp_to | scenario_sum_drop_full | continuous_sum_drop_full | scenario_max_pp_to | continuous_max_pp_to | max_suppressed | max_suppressed_ratio | max_workers | telemetry_gaps | violations |",
-        "|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|",
+        "| # | start_unix | verdict | effective | phase_a | scenario_sum_disp_to | continuous_sum_disp_to | scenario_sum_drop_full | continuous_sum_drop_full | scenario_max_pp_to | continuous_max_pp_to | max_suppressed | max_suppressed_ratio | max_suppressed_topics | transport_peers | max_transport_rtt_ms | max_transport_loss_ppm | max_workers | telemetry_gaps | violations |",
+        "|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for i, r in enumerate(rows, 1):
         effective = "FAIL" if i in effective_failed else "PASS"
@@ -590,7 +605,12 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
             f"{r.get('sum_drop_full_delta', '?')} | {r.get('continuous_sum_drop_full_delta', '?')} | "
             f"{r['max_pp_to_delta']} | {r.get('continuous_max_pp_to_delta', '?')} | "
             f"{r['max_suppressed']} | "
-            f"{r.get('max_suppressed_ratio', '?')} | {r['max_workers']} | "
+            f"{r.get('max_suppressed_ratio', '?')} | "
+            f"{r.get('max_suppressed_topics', '?')} | "
+            f"{r.get('max_transport_peers', '?')} | "
+            f"{r.get('max_transport_rtt_ms', '?')} | "
+            f"{r.get('max_transport_loss_ppm', '?')} | "
+            f"{r['max_workers']} | "
             f"{r.get('continuous_snapshot_gaps') or 'none'} | "
             f"{r['violations']} |"
         )
@@ -651,7 +671,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "continuous_max_pp_to_delta", "continuous_sum_pp_to_delta",
             "continuous_sum_dispatcher_completed_delta",
             "continuous_snapshot_gaps", "continuous_unaccounted_gaps",
-            "max_suppressed", "max_suppressed_ratio", "max_workers", "violations",
+            "max_suppressed", "max_suppressed_ratio", "max_suppressed_topics",
+            "top_suppressed_topics", "max_transport_peers", "max_transport_rtt_ms",
+            "max_transport_loss_ppm", "max_workers", "violations",
         ])
 
     soak_start = time.time()
@@ -688,7 +710,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 info.get("continuous_snapshot_gaps", ""),
                 info.get("continuous_unaccounted_gaps", ""),
                 info["max_suppressed"],
-                info["max_suppressed_ratio"], info["max_workers"], info["violations"],
+                info["max_suppressed_ratio"], info["max_suppressed_topics"],
+                info["top_suppressed_topics"], info["max_transport_peers"],
+                info["max_transport_rtt_ms"], info["max_transport_loss_ppm"],
+                info["max_workers"], info["violations"],
             ])
 
         LOG.info(

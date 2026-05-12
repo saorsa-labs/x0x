@@ -297,16 +297,68 @@ def iptables_verify_clean_command(peer_ip: str, udp_port: int) -> str:
     return f"! iptables -C INPUT {_shell_join(iptables_rule_args(peer_ip, udp_port))} 2>/dev/null"
 
 
+def suppressed_topic_counts(ps: Dict[str, Any]) -> Dict[str, int]:
+    """Return per-topic suppressed-peer counts from new or legacy diagnostics."""
+    raw_by_topic = ps.get("suppressed_peers_by_topic")
+    counts: Dict[str, int] = {}
+    if isinstance(raw_by_topic, dict):
+        for topic, peers in raw_by_topic.items():
+            if isinstance(peers, list):
+                counts[str(topic)] = len({str(peer) for peer in peers})
+            elif isinstance(peers, int):
+                counts[str(topic)] = max(0, int(peers))
+
+    if counts:
+        return counts
+
+    rows = ps.get("suppressed_peers", []) or []
+    grouped: Dict[str, set[str]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        topic = row.get("topic")
+        peer_id = row.get("peer_id")
+        if topic is None or peer_id is None:
+            continue
+        grouped.setdefault(str(topic), set()).add(str(peer_id))
+    return {topic: len(peers) for topic, peers in grouped.items()}
+
+
+def format_top_suppressed_topics(ps: Dict[str, Any], limit: int = 3) -> str:
+    """Compact `topic:count` list for CSV/Markdown summaries."""
+    counts = suppressed_topic_counts(ps)
+    if not counts:
+        return ""
+    items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    return ";".join(f"{topic}:{count}" for topic, count in items)
+
+
+def peer_score_topic_count(ps: Dict[str, Any]) -> int:
+    """Count topics with peer-score rows from new or legacy diagnostics."""
+    by_topic = ps.get("peer_scores_by_topic")
+    if isinstance(by_topic, dict):
+        return len(by_topic)
+    rows = ps.get("peer_scores", []) or []
+    topics = {
+        str(row.get("topic"))
+        for row in rows
+        if isinstance(row, dict) and row.get("topic") is not None
+    }
+    return len(topics)
+
+
 # ── Counter extractors ────────────────────────────────────────────────
-def extract_counters(diag: Dict[str, Any]) -> Dict[str, int]:
+def extract_counters(diag: Dict[str, Any]) -> Dict[str, Any]:
     """Pull the SLO-relevant scalars out of /diagnostics/gossip."""
     disp = diag.get("dispatcher", {}).get("pubsub", {})
     rp = diag.get("recv_pump", {}).get("pubsub", {})
     ps = diag.get("pubsub_stages", {})
+    ps = ps if isinstance(ps, dict) else {}
     kinds = ps.get("message_kinds", {}) or {}
     sp = ps.get("suppressed_peers", []) or []
     scores = ps.get("peer_scores", []) or []
     topic_caches = ps.get("topic_caches", []) or []
+    topic_suppression = suppressed_topic_counts(ps)
     cache_stats = [
         row.get("cache", {}) or {}
         for row in topic_caches
@@ -332,6 +384,10 @@ def extract_counters(diag: Dict[str, Any]) -> Dict[str, int]:
         "peer_scores_eager_eligible": sum(1 for r in scores if r.get("eager_eligible")),
         "peer_scores_lazy": sum(1 for r in scores if r.get("role") == "lazy"),
         "peer_scores_excluded": sum(1 for r in scores if r.get("role") == "excluded"),
+        "peer_scores_topics_total": peer_score_topic_count(ps),
+        "suppressed_topics_total": len(topic_suppression),
+        "suppressed_topic_top_count": max(topic_suppression.values(), default=0),
+        "suppressed_topics_top3": format_top_suppressed_topics(ps),
         "pubsub_cache_topics": len(cache_stats),
         "pubsub_cache_msg_count": sum(int(c.get("msg_count", 0)) for c in cache_stats),
         "pubsub_cache_total_bytes": sum(int(c.get("total_bytes", 0)) for c in cache_stats),
@@ -369,10 +425,71 @@ CONNECTIVITY_SCALAR_FIELDS = {
     "data_tx_high_water_count",
     "gso_bundle_send_total",
     "gso_bundle_partial_send",
+    "transport_peer_count",
+    "transport_connected_count",
+    "transport_rtt_ms_max",
+    "transport_packet_loss_ppm_max",
+}
+
+NON_DELTA_FIELDS = {
+    "suppressed_topics_top3",
+    "transport_peers_top3",
 }
 
 
-def extract_connectivity_scalars(diag: Dict[str, Any]) -> Dict[str, Optional[int]]:
+def transport_rows(diag: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return per-peer transport rows when the connectivity endpoint exposes them."""
+    rows = diag.get("per_peer_transport", []) or []
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _packet_loss_ppm(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return max(0, int(float(value) * 1_000_000))
+    except (TypeError, ValueError):
+        return None
+
+
+def format_transport_peers(rows: List[Dict[str, Any]], limit: int = 3) -> str:
+    """Compact peer transport ranking for CSV/Markdown summaries."""
+    if not rows:
+        return ""
+
+    def _rank(row: Dict[str, Any]) -> Tuple[int, int, str]:
+        loss = _packet_loss_ppm(row.get("packet_loss_rate")) or 0
+        rtt = _optional_int(row.get("rtt_ms")) or 0
+        return (-loss, -rtt, str(row.get("peer_id", "")))
+
+    parts: List[str] = []
+    for row in sorted(rows, key=_rank)[:limit]:
+        peer = str(row.get("peer_id", "?"))[:12]
+        rtt = _optional_int(row.get("rtt_ms"))
+        loss = _packet_loss_ppm(row.get("packet_loss_rate"))
+        idle = _optional_int(row.get("idle_for_ms"))
+        fields = [
+            f"rtt={rtt}ms" if rtt is not None else "rtt=?",
+            f"loss={loss}ppm" if loss is not None else "loss=?",
+        ]
+        if idle is not None:
+            fields.append(f"idle={idle}ms")
+        parts.append(f"{peer}({','.join(fields)})")
+    return ";".join(parts)
+
+
+def extract_connectivity_scalars(diag: Dict[str, Any]) -> Dict[str, Any]:
     """Pull X0X-0039/X0X-0043 scalars out of /diagnostics/connectivity.
 
     Missing/null values stay distinct from zero so gate evaluation can
@@ -383,27 +500,39 @@ def extract_connectivity_scalars(diag: Dict[str, Any]) -> Dict[str, Optional[int
     gso_raw = diag.get("gso")
     data_tx = data_tx_raw if isinstance(data_tx_raw, dict) else {}
     gso = gso_raw if isinstance(gso_raw, dict) else {}
-
-    def _i(value: Any) -> Optional[int]:
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
+    has_transport_block = isinstance(diag.get("per_peer_transport"), list)
+    transports = transport_rows(diag)
+    rtts = [
+        value for value in (_optional_int(row.get("rtt_ms")) for row in transports)
+        if value is not None
+    ]
+    losses = [
+        value
+        for value in (_packet_loss_ppm(row.get("packet_loss_rate")) for row in transports)
+        if value is not None
+    ]
 
     return {
-        "data_tx_depth": _i(data_tx.get("data_tx_depth")),
-        "data_tx_capacity": _i(data_tx.get("data_tx_capacity")),
-        "data_tx_high_water_count": _i(data_tx.get("data_tx_high_water_count")),
-        "gso_bundle_send_total": _i(gso.get("bundle_send_total")),
-        "gso_bundle_partial_send": _i(gso.get("bundle_partial_send")),
+        "data_tx_depth": _optional_int(data_tx.get("data_tx_depth")),
+        "data_tx_capacity": _optional_int(data_tx.get("data_tx_capacity")),
+        "data_tx_high_water_count": _optional_int(data_tx.get("data_tx_high_water_count")),
+        "gso_bundle_send_total": _optional_int(gso.get("bundle_send_total")),
+        "gso_bundle_partial_send": _optional_int(gso.get("bundle_partial_send")),
+        "transport_peer_count": len(transports) if has_transport_block else None,
+        "transport_connected_count": (
+            sum(1 for row in transports if row.get("connected"))
+            if has_transport_block
+            else None
+        ),
+        "transport_rtt_ms_max": max(rtts, default=0) if has_transport_block else None,
+        "transport_packet_loss_ppm_max": max(losses, default=0) if has_transport_block else None,
+        "transport_peers_top3": format_transport_peers(transports),
     }
 
 
 def diff_counters(pre: Dict[str, Any], post: Dict[str, Any]) -> Dict[str, Any]:
     """Per-key delta. Monotonic counters are clamped across resets/gaps."""
-    keys = set(pre) | set(post)
+    keys = (set(pre) | set(post)) - NON_DELTA_FIELDS
 
     def _delta(key: str) -> Optional[int]:
         if key in CONNECTIVITY_SCALAR_FIELDS:
@@ -1431,9 +1560,9 @@ def write_summary_md(
         lines.append("Per-node deltas (key counters):")
         lines.append("")
         lines.append(
-            "| node | disp_to | drop_full | drop_ratio | pp_to | pp_to/completed | depth_post | suppressed_post | suppressed/known | known_pairs | workers_post |"
+            "| node | disp_to | drop_full | drop_ratio | pp_to | pp_to/completed | depth_post | suppressed_post | suppressed_topics | suppressed/known | known_pairs | workers_post |"
         )
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for node in sorted(deltas):
             d = deltas[node]
             posts = d.get("_post", {})
@@ -1453,6 +1582,7 @@ def write_summary_md(
                 f"{pp_ratio_str} | "
                 f"{posts.get('recv_pump_latest_depth', 0)} | "
                 f"{posts.get('suppressed_peers_size', 0)} | "
+                f"{posts.get('suppressed_topics_total', 0)} | "
                 f"{suppressed_ratio_str} | "
                 f"{posts.get('known_peer_topic_pairs', posts.get('peer_scores_total', 0))} | "
                 f"{posts.get('pubsub_workers', 0)} |"
@@ -1485,6 +1615,28 @@ def write_summary_md(
                 f"{scalar_for_report(d.get('gso_bundle_partial_send'))} |"
             )
         lines.append("")
+
+        lines.append("## Diagnostics (X0X-0075 suppression/transport)")
+        lines.append("")
+        lines.append(
+            "| node | top_suppressed_topics | peer_score_topics | transport_peers | "
+            "transport_connected | max_rtt_ms | max_loss_ppm | transport_top |"
+        )
+        lines.append("|---|---|---:|---:|---:|---:|---:|---|")
+        for node in sorted(deltas):
+            d = deltas[node]
+            posts = d.get("_post", {})
+            lines.append(
+                f"| {node} | "
+                f"{posts.get('suppressed_topics_top3', '') or '-'} | "
+                f"{posts.get('peer_scores_topics_total', 0)} | "
+                f"{scalar_for_report(posts.get('transport_peer_count'))} | "
+                f"{scalar_for_report(posts.get('transport_connected_count'))} | "
+                f"{scalar_for_report(posts.get('transport_rtt_ms_max'))} | "
+                f"{scalar_for_report(posts.get('transport_packet_loss_ppm_max'))} | "
+                f"{posts.get('transport_peers_top3', '') or '-'} |"
+            )
+        lines.append("")
     (proof_dir / "summary.md").write_text("\n".join(lines))
 
 
@@ -1502,12 +1654,18 @@ def write_summary_csv(
             "per_peer_timeout_to_completed_ratio", "recv_pump_drop_full_ratio",
             "recv_pump_latest_depth_post", "suppressed_peers_to_known_ratio",
             "known_peer_topic_pairs_post",
+            "suppressed_topics_post", "suppressed_topic_top_count_post",
+            "suppressed_topics_top3_post", "peer_score_topics_post",
             # X0X-0039 / X0X-0043 connectivity diagnostics scalars.
             "diagnostics_connectivity_pre_fetched",
             "diagnostics_connectivity_post_fetched",
             "data_tx_depth_post", "data_tx_capacity_post",
             "data_tx_high_water_count_delta",
             "gso_bundle_send_total_delta", "gso_bundle_partial_send_delta",
+            # X0X-0075 per-peer transport diagnostics.
+            "transport_peer_count_post", "transport_connected_count_post",
+            "transport_rtt_ms_max_post", "transport_packet_loss_ppm_max_post",
+            "transport_peers_top3_post",
         ])
         for sr, deltas, passed, violations in results:
             for node, d in deltas.items():
@@ -1530,6 +1688,10 @@ def write_summary_csv(
                     posts.get("recv_pump_latest_depth", 0),
                     "inf" if suppressed_ratio == float("inf") else f"{suppressed_ratio:.6f}",
                     posts.get("known_peer_topic_pairs", posts.get("peer_scores_total", 0)),
+                    posts.get("suppressed_topics_total", 0),
+                    posts.get("suppressed_topic_top_count", 0),
+                    posts.get("suppressed_topics_top3", ""),
+                    posts.get("peer_scores_topics_total", 0),
                     bool_for_report(d.get("diagnostics_connectivity_pre_fetched", False)),
                     bool_for_report(d.get("diagnostics_connectivity_post_fetched", False)),
                     scalar_for_report(posts.get("data_tx_depth")),
@@ -1537,6 +1699,11 @@ def write_summary_csv(
                     scalar_for_report(d.get("data_tx_high_water_count")),
                     scalar_for_report(d.get("gso_bundle_send_total")),
                     scalar_for_report(d.get("gso_bundle_partial_send")),
+                    scalar_for_report(posts.get("transport_peer_count")),
+                    scalar_for_report(posts.get("transport_connected_count")),
+                    scalar_for_report(posts.get("transport_rtt_ms_max")),
+                    scalar_for_report(posts.get("transport_packet_loss_ppm_max")),
+                    posts.get("transport_peers_top3", ""),
                 ])
 
 

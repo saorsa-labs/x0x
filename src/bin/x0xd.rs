@@ -12523,6 +12523,178 @@ async fn bootstrap_cache_stats(State(state): State<Arc<AppState>>) -> impl IntoR
     }
 }
 
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn value_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .as_object()
+        .and_then(|obj| obj.get(key))
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+fn augment_pubsub_stage_diagnostics<T>(snapshot: Option<T>) -> serde_json::Value
+where
+    T: Serialize,
+{
+    let Ok(mut value) = serde_json::to_value(snapshot) else {
+        return serde_json::Value::Null;
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return value;
+    };
+
+    if !obj.contains_key("suppressed_peers_by_topic") {
+        let mut by_topic: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if let Some(rows) = obj.get("suppressed_peers").and_then(|v| v.as_array()) {
+            for row in rows {
+                let Some(topic) = value_string_field(row, "topic") else {
+                    continue;
+                };
+                let Some(peer_id) = value_string_field(row, "peer_id") else {
+                    continue;
+                };
+                by_topic.entry(topic).or_default().push(peer_id);
+            }
+        }
+        for peers in by_topic.values_mut() {
+            peers.sort();
+            peers.dedup();
+        }
+        obj.insert(
+            "suppressed_peers_by_topic".to_string(),
+            serde_json::json!(by_topic),
+        );
+    }
+
+    if !obj.contains_key("peer_scores_by_topic") {
+        let mut suppression_by_topic_peer: BTreeMap<(String, String), serde_json::Value> =
+            BTreeMap::new();
+        if let Some(rows) = obj.get("suppressed_peers").and_then(|v| v.as_array()) {
+            for row in rows {
+                let Some(topic) = value_string_field(row, "topic") else {
+                    continue;
+                };
+                let Some(peer_id) = value_string_field(row, "peer_id") else {
+                    continue;
+                };
+                suppression_by_topic_peer.insert((topic, peer_id), row.clone());
+            }
+        }
+
+        let mut by_topic: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
+        if let Some(rows) = obj.get("peer_scores").and_then(|v| v.as_array()) {
+            for row in rows {
+                let Some(topic) = value_string_field(row, "topic") else {
+                    continue;
+                };
+                let Some(peer_id) = value_string_field(row, "peer_id") else {
+                    continue;
+                };
+                let suppressed = suppression_by_topic_peer.get(&(topic.clone(), peer_id.clone()));
+                by_topic.entry(topic).or_default().insert(
+                    peer_id,
+                    serde_json::json!({
+                        "role": row.get("role").cloned().unwrap_or(serde_json::Value::Null),
+                        "score": row.get("score").cloned().unwrap_or(serde_json::Value::Null),
+                        "send_health": row.get("send_health").cloned().unwrap_or(serde_json::Value::Null),
+                        "outbound_send_timeouts": row
+                            .get("outbound_send_timeouts")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "cooling_events": row
+                            .get("cooling_events")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "eager_eligible": row
+                            .get("eager_eligible")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "suppression_state": suppressed
+                            .and_then(|s| s.get("state"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "recent_timeout_count": suppressed
+                            .and_then(|s| s.get("recent_timeout_count"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "cooldown_ms": suppressed
+                            .and_then(|s| s.get("cooldown_ms"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "last_cool_at_unix_ms": suppressed
+                            .and_then(|s| s.get("last_suppressed_unix_ms"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    }),
+                );
+            }
+        }
+        obj.insert(
+            "peer_scores_by_topic".to_string(),
+            serde_json::json!(by_topic),
+        );
+    }
+
+    if !obj.contains_key("admission_state_by_peer") {
+        #[derive(Default)]
+        struct AdmissionCounts {
+            suppressed: usize,
+            cooled: usize,
+            recovery_probe: usize,
+            recovery_ready: usize,
+        }
+
+        let mut by_peer: BTreeMap<String, AdmissionCounts> = BTreeMap::new();
+        if let Some(rows) = obj.get("suppressed_peers").and_then(|v| v.as_array()) {
+            for row in rows {
+                let Some(peer_id) = value_string_field(row, "peer_id") else {
+                    continue;
+                };
+                let entry = by_peer.entry(peer_id).or_default();
+                entry.suppressed += 1;
+                match value_string_field(row, "state").as_deref() {
+                    Some("recovery_probe") => entry.recovery_probe += 1,
+                    Some("recovery_ready") => entry.recovery_ready += 1,
+                    _ => entry.cooled += 1,
+                }
+            }
+        }
+
+        let mut admission: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        for (peer_id, counts) in by_peer {
+            let state = if counts.cooled > 0 {
+                "cooled"
+            } else if counts.recovery_probe > 0 {
+                "recovery_probe"
+            } else if counts.recovery_ready > 0 {
+                "recovery_ready"
+            } else {
+                "alive"
+            };
+            admission.insert(
+                peer_id,
+                serde_json::json!({
+                    "state": state,
+                    "suppressed_topics_count": counts.suppressed,
+                    "cooled_topics_count": counts.cooled,
+                    "recovery_probe_topics_count": counts.recovery_probe,
+                    "recovery_ready_topics_count": counts.recovery_ready,
+                    "priority_queue_depths": {},
+                }),
+            );
+        }
+        obj.insert(
+            "admission_state_by_peer".to_string(),
+            serde_json::json!(admission),
+        );
+    }
+
+    value
+}
+
 /// GET /diagnostics/connectivity — ant-quic NodeStatus snapshot.
 ///
 /// Returns the full connectivity state so we can answer:
@@ -12549,6 +12721,65 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
             // X0X-0043: real GSO bundle send snapshot from ant-quic 0.27.13.
             let gso = network.gso_diagnostics().await;
             let connection_pool = network.connection_pool_diagnostics();
+            let now = Instant::now();
+            let mut per_peer_transport = Vec::new();
+            for peer_id in network.connected_peers().await {
+                let health = network.connection_health(peer_id).await;
+                let (
+                    connected,
+                    generation,
+                    reader_task_active,
+                    last_sent_ago_ms,
+                    last_received_ago_ms,
+                    idle_for_ms,
+                    close_reason,
+                ) = match health {
+                    Some(health) => (
+                        health.connected,
+                        health.generation,
+                        health.reader_task_active,
+                        health.last_sent_at.map(|instant| {
+                            duration_millis_u64(now.saturating_duration_since(instant))
+                        }),
+                        health.last_received_at.map(|instant| {
+                            duration_millis_u64(now.saturating_duration_since(instant))
+                        }),
+                        health.idle_for.map(duration_millis_u64),
+                        health.close_reason.map(|reason| format!("{reason:?}")),
+                    ),
+                    None => (false, None, None, None, None, None, None),
+                };
+                per_peer_transport.push(serde_json::json!({
+                    "peer_id": hex::encode(peer_id.0),
+                    "transport": "quic",
+                    "stats_available": false,
+                    "connected": connected,
+                    "generation": generation,
+                    "reader_task_active": reader_task_active,
+                    "rtt_ms": null,
+                    "udp_tx_bytes": null,
+                    "udp_rx_bytes": null,
+                    "udp_tx_datagrams": null,
+                    "udp_rx_datagrams": null,
+                    "congestion_window": null,
+                    "congestion_events": null,
+                    "lost_packets": null,
+                    "lost_bytes": null,
+                    "sent_packets": null,
+                    "sent_plpmtud_probes": null,
+                    "lost_plpmtud_probes": null,
+                    "black_holes_detected": null,
+                    "packet_loss_rate": null,
+                    "current_mtu": null,
+                    "stream_open_blocked_events": null,
+                    "data_blocked_events": null,
+                    "stream_data_blocked_events": null,
+                    "last_sent_ago_ms": last_sent_ago_ms,
+                    "last_received_ago_ms": last_received_ago_ms,
+                    "idle_for_ms": idle_for_ms,
+                    "close_reason": close_reason,
+                }));
+            }
             let snapshot = serde_json::json!({
                 "ok": true,
                 "peer_id": hex::encode(ns.peer_id.0),
@@ -12579,6 +12810,7 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                     "relayed": ns.relayed_connections,
                     "hole_punch_success_rate": ns.hole_punch_success_rate,
                 },
+                "per_peer_transport": per_peer_transport,
                 "connection_pool": connection_pool,
                 "relay": {
                     "is_relaying": ns.is_relaying,
@@ -12645,16 +12877,20 @@ async fn ack_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoRespons
 /// drops under load.
 async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.agent.gossip_stats() {
-        Some(snap) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Some(snap) => {
+            let pubsub_stages =
+                augment_pubsub_stage_diagnostics(state.agent.gossip_pubsub_stage_stats());
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
                 "ok": true,
                 "stats": snap,
-                "pubsub_stages": state.agent.gossip_pubsub_stage_stats(),
+                "pubsub_stages": pubsub_stages,
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
-            })),
-        ),
+                })),
+            )
+        }
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "ok": false, "error": "gossip runtime not initialized" })),

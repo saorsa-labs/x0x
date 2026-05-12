@@ -277,6 +277,89 @@ class LaunchReadinessGateTests(unittest.TestCase):
         self.assertEqual(3, counters["pubsub_cache_evicted_by_bytes"])
         self.assertEqual(4, counters["pubsub_cache_evicted_by_count"])
 
+    def test_extract_counters_reports_topic_suppression_diagnostics(self) -> None:
+        diag = {
+            "pubsub_stages": {
+                "suppressed_peers_by_topic": {
+                    "x0x.presence.global": ["peer-a", "peer-b"],
+                    "x0x.discovery.groups": ["peer-c"],
+                },
+                "peer_scores_by_topic": {
+                    "x0x.discovery.groups": {"peer-c": {"role": "lazy"}},
+                    "x0x.presence.global": {"peer-a": {"role": "cooled"}},
+                },
+            }
+        }
+
+        counters = self.lr.extract_counters(diag)
+
+        self.assertEqual(2, counters["suppressed_topics_total"])
+        self.assertEqual(2, counters["suppressed_topic_top_count"])
+        self.assertEqual(
+            "x0x.presence.global:2;x0x.discovery.groups:1",
+            counters["suppressed_topics_top3"],
+        )
+        self.assertEqual(2, counters["peer_scores_topics_total"])
+
+    def test_extract_counters_groups_legacy_flat_suppression_rows(self) -> None:
+        diag = {
+            "pubsub_stages": {
+                "suppressed_peers": [
+                    {"topic": "topic-a", "peer_id": "peer-1"},
+                    {"topic": "topic-a", "peer_id": "peer-1"},
+                    {"topic": "topic-a", "peer_id": "peer-2"},
+                    {"topic": "topic-b", "peer_id": "peer-3"},
+                ],
+                "peer_scores": [
+                    {"topic": "topic-a", "peer_id": "peer-1"},
+                    {"topic": "topic-b", "peer_id": "peer-3"},
+                ],
+            }
+        }
+
+        counters = self.lr.extract_counters(diag)
+
+        self.assertEqual(2, counters["suppressed_topics_total"])
+        self.assertEqual(2, counters["suppressed_topic_top_count"])
+        self.assertEqual("topic-a:2;topic-b:1", counters["suppressed_topics_top3"])
+        self.assertEqual(2, counters["peer_scores_topics_total"])
+
+    def test_extract_connectivity_scalars_reports_transport_summary(self) -> None:
+        diag = {
+            "per_peer_transport": [
+                {
+                    "peer_id": "peer-a",
+                    "connected": True,
+                    "rtt_ms": 42,
+                    "packet_loss_rate": 0.0012,
+                    "idle_for_ms": 10,
+                },
+                {
+                    "peer_id": "peer-b",
+                    "connected": False,
+                    "rtt_ms": 7,
+                    "packet_loss_rate": 0.0,
+                },
+            ]
+        }
+
+        scalars = self.lr.extract_connectivity_scalars(diag)
+
+        self.assertEqual(2, scalars["transport_peer_count"])
+        self.assertEqual(1, scalars["transport_connected_count"])
+        self.assertEqual(42, scalars["transport_rtt_ms_max"])
+        self.assertEqual(1200, scalars["transport_packet_loss_ppm_max"])
+        self.assertIn("peer-a", scalars["transport_peers_top3"])
+
+    def test_diff_counters_skips_textual_diagnostic_fields(self) -> None:
+        delta = self.lr.diff_counters(
+            {"suppressed_topics_top3": "topic-a:1"},
+            {"suppressed_topics_top3": "topic-a:2", "suppressed_topics_total": 2},
+        )
+
+        self.assertNotIn("suppressed_topics_top3", delta)
+        self.assertEqual(2, delta["suppressed_topics_total"])
+
     def test_diff_counters_clamps_pubsub_cache_eviction_resets(self) -> None:
         delta = self.lr.diff_counters(
             {
@@ -590,6 +673,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
             self.assertIn("pp_to/completed", md)
             self.assertIn("depth_post", md)
             self.assertIn("suppressed/known", md)
+            self.assertIn("X0X-0075", md)
 
             with (proof_dir / "summary.csv").open(newline="") as f:
                 rows = list(csv.reader(f))
@@ -615,6 +699,10 @@ class LaunchReadinessGateTests(unittest.TestCase):
                     "recv_pump_latest_depth_post",
                     "suppressed_peers_to_known_ratio",
                     "known_peer_topic_pairs_post",
+                    "suppressed_topics_post",
+                    "suppressed_topic_top_count_post",
+                    "suppressed_topics_top3_post",
+                    "peer_score_topics_post",
                     "diagnostics_connectivity_pre_fetched",
                     "diagnostics_connectivity_post_fetched",
                     "data_tx_depth_post",
@@ -622,6 +710,11 @@ class LaunchReadinessGateTests(unittest.TestCase):
                     "data_tx_high_water_count_delta",
                     "gso_bundle_send_total_delta",
                     "gso_bundle_partial_send_delta",
+                    "transport_peer_count_post",
+                    "transport_connected_count_post",
+                    "transport_rtt_ms_max_post",
+                    "transport_packet_loss_ppm_max_post",
+                    "transport_peers_top3_post",
                 ],
                 rows[0][10:],
             )
@@ -630,9 +723,9 @@ class LaunchReadinessGateTests(unittest.TestCase):
             self.assertEqual("7", rows[1][12])
             self.assertEqual("0.050000", rows[1][13])
             self.assertEqual("60", rows[1][14])
-            self.assertEqual("false", rows[1][15])
-            self.assertEqual("false", rows[1][16])
-            self.assertEqual("MISSING", rows[1][19])
+            self.assertEqual("false", rows[1][19])
+            self.assertEqual("false", rows[1][20])
+            self.assertEqual("MISSING", rows[1][23])
 
 
 if __name__ == "__main__":
