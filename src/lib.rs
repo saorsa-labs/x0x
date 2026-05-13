@@ -8520,3 +8520,94 @@ mod tests {
         assert!(!is_globally_routable(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1))));
     }
 
+
+#[test]
+fn push_unique_adds_new_item() {
+    let mut items = vec![1, 2, 3];
+    push_unique(&mut items, 4);
+    assert_eq!(items, vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn push_unique_skips_existing_item() {
+    let mut items = vec![1, 2, 3];
+    push_unique(&mut items, 2);
+    assert_eq!(items, vec![1, 2, 3]);
+}
+
+#[test]
+fn push_unique_works_with_empty() {
+    let mut items: Vec<i32> = vec![];
+    push_unique(&mut items, 42);
+    assert_eq!(items, vec![42]);
+}
+
+#[test]
+fn sort_discovered_machine_sorts_fields() {
+    let mut machine = DiscoveredMachine {
+        machine_id: identity::MachineId([3u8; 32]),
+        addresses: vec![
+            "10.0.0.2:5483".parse::<std::net::SocketAddr>().unwrap(),
+            "10.0.0.1:5483".parse::<std::net::SocketAddr>().unwrap(),
+        ],
+        announced_at: 100,
+        last_seen: 100,
+        machine_public_key: vec![],
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![
+            identity::MachineId([2u8; 32]),
+            identity::MachineId([1u8; 32]),
+        ],
+        relay_candidates: vec![
+            identity::MachineId([4u8; 32]),
+            identity::MachineId([3u8; 32]),
+        ],
+        agent_ids: vec![
+            identity::AgentId([2u8; 32]),
+            identity::AgentId([1u8; 32]),
+        ],
+        user_ids: vec![
+            identity::UserId([2u8; 32]),
+            identity::UserId([1u8; 32]),
+        ],
+    };
+    sort_discovered_machine(&mut machine);
+    assert_eq!(machine.addresses[0], "10.0.0.1:5483".parse::<std::net::SocketAddr>().unwrap());
+    assert_eq!(machine.addresses[1], "10.0.0.2:5483".parse::<std::net::SocketAddr>().unwrap());
+    assert_eq!(machine.reachable_via[0], identity::MachineId([1u8; 32]));
+    assert_eq!(machine.reachable_via[1], identity::MachineId([2u8; 32]));
+    assert_eq!(machine.relay_candidates[0], identity::MachineId([3u8; 32]));
+    assert_eq!(machine.relay_candidates[1], identity::MachineId([4u8; 32]));
+    assert_eq!(machine.agent_ids[0], identity::AgentId([1u8; 32]));
+    assert_eq!(machine.agent_ids[1], identity::AgentId([2u8; 32]));
+    assert_eq!(machine.user_ids[0], identity::UserId([1u8; 32]));
+    assert_eq!(machine.user_ids[1], identity::UserId([2u8; 32]));
+}
+
+#[test]
+fn deserialize_identity_announcement_rejects_empty() {
+    let result = deserialize_identity_announcement(&[]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn deserialize_machine_announcement_rejects_empty() {
+    let result = deserialize_machine_announcement(&[]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn deserialize_identity_announcement_rejects_garbage() {
+    let result = deserialize_identity_announcement(b"not-a-valid-bincode");
+    assert!(result.is_err());
+}
+
+#[test]
+fn deserialize_machine_announcement_rejects_garbage() {
+    let result = deserialize_machine_announcement(b"not-a-valid-bincode");
+    assert!(result.is_err());
+}
+
