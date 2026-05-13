@@ -663,4 +663,57 @@ argv = ["journalctl", "-u", "x0xd", "-n", "<INT>"]
         assert!(contains_shell_metachar("$(id)"));
         assert!(!contains_shell_metachar("/safe/path-1.2"));
     }
+
+
+    #[test]
+    fn default_exec_acl_path_returns_expected() {
+        let path = default_exec_acl_path();
+        let path_str = path.to_string_lossy();
+        assert!(path_str.ends_with("exec-acl.toml"), "path should end with exec-acl.toml: {path_str}");
+    }
+
+    #[test]
+    fn exec_policy_path_disabled() {
+        let policy = ExecPolicy::Disabled {
+            path: PathBuf::from("/tmp/test-acl.toml"),
+            reason: "test".to_string(),
+            loaded_at_unix_ms: 100,
+        };
+        assert_eq!(policy.path(), Path::new("/tmp/test-acl.toml"));
+    }
+
+    #[test]
+    fn exec_policy_path_enabled() {
+        let acl = ExecAcl {
+            loaded_from: PathBuf::from("/etc/x0x/exec-acl.toml"),
+            loaded_at_unix_ms: 200,
+            caps: ExecCaps::default(),
+            audit_log_path: PathBuf::from("/var/log/x0x/exec-audit.jsonl"),
+            audit_tasklist_id: None,
+            allow: vec![],
+        };
+        let policy = ExecPolicy::Enabled(acl);
+        assert_eq!(policy.path(), Path::new("/etc/x0x/exec-acl.toml"));
+    }
+
+    #[test]
+    fn exec_policy_enabled_flag() {
+        let disabled = ExecPolicy::Disabled {
+            path: PathBuf::from("test"),
+            reason: "test".to_string(),
+            loaded_at_unix_ms: 0,
+        };
+        assert!(!disabled.enabled());
+
+        let acl = ExecAcl {
+            loaded_from: PathBuf::from("test"),
+            loaded_at_unix_ms: 0,
+            caps: ExecCaps::default(),
+            audit_log_path: PathBuf::from("audit.jsonl"),
+            audit_tasklist_id: None,
+            allow: vec![],
+        };
+        let enabled = ExecPolicy::Enabled(acl);
+        assert!(enabled.enabled());
+    }
 }
