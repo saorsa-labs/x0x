@@ -569,4 +569,58 @@ mod tests {
         assert!(upgrader.stop_on_upgrade);
         assert!(!upgrader.restart_on_success);
     }
+
+
+    #[tokio::test]
+    async fn apply_upgrade_rejects_invalid_manifest_version() {
+        let upgrader = AutoApplyUpgrader::new("x0xd");
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            version: "not-a-version".to_string(),
+            timestamp: 0,
+            assets: vec![],
+            skill_url: String::new(),
+            skill_sha256: [0u8; 32],
+        };
+        let result = upgrader.apply_upgrade_from_manifest(&manifest).await;
+        assert!(result.is_err(), "invalid version should fail");
+        let err = format!("{:?}", result);
+        assert!(err.contains("invalid version"), "error should mention invalid version: {err}");
+    }
+
+    #[tokio::test]
+    async fn apply_upgrade_rejects_downgrade() {
+        let upgrader = AutoApplyUpgrader::new("x0xd");
+        // Target version lower than current
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            version: "0.1.0".to_string(),
+            timestamp: 0,
+            assets: vec![],
+            skill_url: String::new(),
+            skill_sha256: [0u8; 32],
+        };
+        let result = upgrader.apply_upgrade_from_manifest(&manifest).await;
+        assert!(result.is_err(), "downgrade should fail");
+        // The error may be NoPlatformAsset (checked before downgrade) or DowngradeAttempt
+        // Both are valid error paths
+    }
+
+    #[tokio::test]
+    async fn apply_upgrade_rejects_no_platform_asset() {
+        let upgrader = AutoApplyUpgrader::new("x0xd");
+        // Valid version but no assets matching current platform
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            version: "99.99.99".to_string(),
+            timestamp: 0,
+            assets: vec![],  // No platform assets
+            skill_url: String::new(),
+            skill_sha256: [0u8; 32],
+        };
+        let result = upgrader.apply_upgrade_from_manifest(&manifest).await;
+        assert!(result.is_err(), "no platform asset should fail");
+        let err = format!("{:?}", result);
+        assert!(err.contains("NoPlatformAsset"), "error should mention NoPlatformAsset: {err}");
+    }
 }

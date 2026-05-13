@@ -587,4 +587,24 @@ mod tests {
         // request_id should be 16 bytes
         assert_eq!(receipt.request_id.len(), 16);
     }
+
+
+    #[test]
+    fn ack_outcome_to_receipt_converts_accepted() {
+        let outcome = DmAckOutcome::Accepted;
+        let request_id = [1u8; 16];
+        let receipt = ack_outcome_to_receipt(outcome, request_id, 2).unwrap();
+        assert_eq!(receipt.request_id, request_id);
+        assert_eq!(receipt.retries_used, 2);
+        assert_eq!(receipt.path, DmPath::GossipInbox);
+    }
+
+    #[test]
+    fn ack_outcome_to_receipt_rejected_returns_error() {
+        let outcome = DmAckOutcome::RejectedByPolicy { reason: "not trusted".to_string() };
+        let result = ack_outcome_to_receipt(outcome, [2u8; 16], 1);
+        assert!(result.is_err(), "rejected should return error");
+        let err = result.unwrap_err();
+        assert!(format!("{:?}", err).contains("not trusted"), "error should contain reason");
+    }
 }
