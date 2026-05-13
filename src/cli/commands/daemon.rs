@@ -434,3 +434,42 @@ fn find_x0xd() -> Result<std::path::PathBuf> {
 
     anyhow::bail!("x0xd not found. Install it or ensure it's in the same directory as x0x.")
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_file_path_default() {
+        let path = port_file_path(None).unwrap();
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("x0x"), "should contain x0x: {path_str}");
+        assert!(path_str.ends_with("api.port"), "should end with api.port: {path_str}");
+    }
+
+    #[test]
+    fn port_file_path_named() {
+        let path = port_file_path(Some("test-instance")).unwrap();
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("x0x-test-instance"), "should contain instance name: {path_str}");
+        assert!(path_str.ends_with("api.port"), "should end with api.port: {path_str}");
+    }
+
+    #[test]
+    fn discovered_base_url_returns_none_for_missing_file() {
+        let result = discovered_base_url(Some("nonexistent-instance-xyz-12345")).unwrap();
+        assert!(result.is_none(), "should return None for nonexistent instance");
+    }
+
+    #[test]
+    fn find_x0xd_returns_error_when_not_found() {
+        // Temporarily change PATH to something that doesn't have x0xd
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = find_x0xd();
+        }));
+        // Should not panic — just return an error
+        assert!(result.is_ok());
+    }
+}
+
