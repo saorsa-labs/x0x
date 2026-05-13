@@ -601,5 +601,241 @@ mod tests {
         let result = members(&client, "group-123").await;
         assert!(result.is_ok(), "members should succeed: {:?}", result);
     }
+
+
+    #[tokio::test]
+    async fn leave_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = leave(&client, "group-123").await;
+        assert!(result.is_ok(), "leave should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn requests_returns_mock_response() {
+        let mock_resp = serde_json::json!([{"request_id": "req-1"}]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = requests(&client, "group-123").await;
+        assert!(result.is_ok(), "requests should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn cancel_request_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = cancel_request(&client, "group-123", "req-1").await;
+        assert!(result.is_ok(), "cancel_request should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn discover_returns_mock_response() {
+        let mock_resp = serde_json::json!([{"id": "group-1"}]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = discover(&client, Some("test")).await;
+        assert!(result.is_ok(), "discover should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn discover_nearby_returns_mock_response() {
+        let mock_resp = serde_json::json!([{"id": "group-1"}]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = discover_nearby(&client).await;
+        assert!(result.is_ok(), "discover_nearby should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn discover_subscriptions_returns_mock_response() {
+        let mock_resp = serde_json::json!([{"kind": "tag", "shard": 42}]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = discover_subscriptions(&client).await;
+        assert!(result.is_ok(), "discover_subscriptions should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn card_returns_mock_response() {
+        let mock_resp = serde_json::json!({"id": "group-1", "name": "test"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = card(&client, "group-123").await;
+        assert!(result.is_ok(), "card should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn messages_returns_mock_response() {
+        let mock_resp = serde_json::json!([{"id": "msg-1", "text": "hello"}]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = messages(&client, "group-123").await;
+        assert!(result.is_ok(), "messages should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn state_returns_mock_response() {
+        let mock_resp = serde_json::json!({"version": 1, "sealed": false});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = state(&client, "group-123").await;
+        assert!(result.is_ok(), "state should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn state_seal_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = state_seal(&client, "group-123").await;
+        assert!(result.is_ok(), "state_seal should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn state_withdraw_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = state_withdraw(&client, "group-123").await;
+        assert!(result.is_ok(), "state_withdraw should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn set_name_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = set_name(&client, "group-123", "new-name").await;
+        assert!(result.is_ok(), "set_name should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn ban_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = ban(&client, "group-123", "agent-456").await;
+        assert!(result.is_ok(), "ban should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn unban_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = unban(&client, "group-123", "agent-456").await;
+        assert!(result.is_ok(), "unban should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn reject_request_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = reject_request(&client, "group-123", "req-1").await;
+        assert!(result.is_ok(), "reject_request should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn invite_returns_mock_response() {
+        let mock_resp = serde_json::json!({"invite_code": "abc123"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = invite(&client, "group-123", 3600).await;
+        assert!(result.is_ok(), "invite should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn create_returns_mock_response() {
+        let mock_resp = serde_json::json!({"id": "new-group", "name": "test"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = create(&client, "test-group", None, None, None).await;
+        assert!(result.is_ok(), "create should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn add_member_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = add_member(&client, "group-123", "agent-456", None).await;
+        assert!(result.is_ok(), "add_member should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn remove_member_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = remove_member(&client, "group-123", "agent-456").await;
+        assert!(result.is_ok(), "remove_member should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn join_returns_mock_response() {
+        let mock_resp = serde_json::json!({"id": "joined-group"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = join(&client, "invite-code-123", None).await;
+        assert!(result.is_ok(), "join should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn request_access_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = request_access(&client, "group-123", None).await;
+        assert!(result.is_ok(), "request_access should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn approve_request_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = approve_request(&client, "group-123", "req-1").await;
+        assert!(result.is_ok(), "approve_request should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn discover_subscribe_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = discover_subscribe(&client, "tag", None, None).await;
+        assert!(result.is_ok(), "discover_subscribe should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn discover_unsubscribe_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = discover_unsubscribe(&client, "tag", 42).await;
+        assert!(result.is_ok(), "discover_unsubscribe should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn secure_encrypt_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ciphertext": "encrypted-data"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = secure_encrypt(&client, "group-123", b"hello").await;
+        assert!(result.is_ok(), "secure_encrypt should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn secure_reseal_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ciphertext": "resealed-data"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = secure_reseal(&client, "group-123", "agent-456").await;
+        assert!(result.is_ok(), "secure_reseal should succeed: {:?}", result);
+    }
+
 }
 
