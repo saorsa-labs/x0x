@@ -529,5 +529,20 @@ mod tests {
         let result = doctor(&client).await;
         assert!(result.is_ok(), "doctor should succeed: {:?}", result);
     }
+
+
+    #[tokio::test]
+    async fn instances_returns_empty_when_no_port_files() {
+        // In a test environment without port files, instances should return empty
+        let result = instances().await;
+        assert!(result.is_ok(), "instances should not fail: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn autostart_remove_does_not_panic() {
+        // Should not panic even without autostart configured
+        let result = autostart_remove().await;
+        assert!(result.is_ok(), "autostart_remove should not fail: {:?}", result);
+    }
 }
 

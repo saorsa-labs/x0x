@@ -179,5 +179,51 @@ mod tests {
         let result = trust_evaluate(&client, "agent-123", "machine-456").await;
         assert!(result.is_ok(), "trust_evaluate should succeed: {:?}", result);
     }
+
+
+    #[tokio::test]
+    async fn add_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = add(&client, "agent-123", "trusted", Some("my-friend")).await;
+        assert!(result.is_ok(), "add should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn update_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = update(&client, "agent-123", Some("known"), None).await;
+        assert!(result.is_ok(), "update should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn remove_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = remove(&client, "agent-123").await;
+        assert!(result.is_ok(), "remove should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn revoke_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = revoke(&client, "agent-123", "no longer needed").await;
+        assert!(result.is_ok(), "revoke should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn trust_set_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = trust_set(&client, "agent-123", "trusted").await;
+        assert!(result.is_ok(), "trust_set should succeed: {:?}", result);
+    }
 }
 

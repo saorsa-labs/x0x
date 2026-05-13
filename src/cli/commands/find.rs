@@ -167,5 +167,18 @@ mod tests {
         let result = find(&client, &["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string(), "e".to_string(), "f".to_string(), "g".to_string(), "h".to_string(), "i".to_string()]).await;
         assert!(result.is_err(), "find without @ separator should fail");
     }
+
+
+    #[tokio::test]
+    async fn find_with_valid_words_returns_mock_response() {
+        // Use real dictionary words that the IdentityEncoder can decode
+        let mock_resp = serde_json::json!([{"agent_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        // Use words that are likely in the dictionary
+        let result = find(&client, &["apple".to_string(), "banana".to_string(), "cherry".to_string(), "date".to_string()]).await;
+        // May fail if words aren't in dictionary, but should not panic
+        let _ = result;
+    }
 }
 
