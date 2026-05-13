@@ -245,15 +245,14 @@ mod tests {
     }
 }
 
-    /// Start a mock axum server that returns the given JSON for any GET request.
+    /// Start a mock axum server that returns the given JSON for any request.
     /// Returns the base URL and a shutdown sender.
     #[allow(dead_code)]
     async fn start_mock_server(response_json: serde_json::Value) -> (String, tokio::sync::oneshot::Sender<()>) {
-        use axum::Router;
-
         use std::sync::Arc;
+
         let json = Arc::new(response_json);
-        let app = Router::new().fallback(move |_req: axum::extract::Request| {
+        let app = axum::Router::new().fallback(move |_req: axum::extract::Request| {
             let json = Arc::clone(&json);
             async move {
                 let body = serde_json::to_vec(&*json).unwrap();
@@ -276,11 +275,11 @@ mod tests {
                 .ok();
         });
 
-        // Give the server a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         (format!("http://{}", addr), tx)
     }
+
 
     #[tokio::test]
     async fn health_returns_mock_response() {

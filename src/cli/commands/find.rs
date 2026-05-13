@@ -104,3 +104,68 @@ pub async fn find(client: &DaemonClient, words: &[String]) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::cli::DaemonClient;
+
+    /// Start a mock axum server that returns the given JSON for any request.
+    #[allow(dead_code)]
+    async fn start_mock_server(response_json: serde_json::Value) -> (String, tokio::sync::oneshot::Sender<()>) {
+        use std::sync::Arc;
+
+        let json = Arc::new(response_json);
+        let app = axum::Router::new().fallback(move |_req: axum::extract::Request| {
+            let json = Arc::clone(&json);
+            async move {
+                let body = serde_json::to_vec(&*json).unwrap();
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async { rx.await.ok(); })
+                .await
+                .ok();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        (format!("http://{}", addr), tx)
+    }
+
+    
+    #[tokio::test]
+    async fn find_rejects_wrong_word_count() {
+        let mock_resp = serde_json::json!({"agents": [{"agent_id": "abc123"}]});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        // 1 word should fail validation before any HTTP call
+        let result = find(&client, &["hello".to_string()]).await;
+        assert!(result.is_err(), "find with 1 word should fail");
+        let err = format!("{:?}", result);
+        assert!(err.contains("4 words"), "error should mention 4 words: {err}");
+    }
+
+    #[tokio::test]
+    async fn find_rejects_wrong_separator_position() {
+        let mock_resp = serde_json::json!({"agents": [{"agent_id": "abc123"}]});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        // 9 tokens but @ not at position 5
+        let result = find(&client, &["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string(), "e".to_string(), "f".to_string(), "g".to_string(), "h".to_string(), "i".to_string()]).await;
+        assert!(result.is_err(), "find without @ separator should fail");
+    }
+}
+

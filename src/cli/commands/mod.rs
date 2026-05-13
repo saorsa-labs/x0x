@@ -154,3 +154,4 @@ mod tests {
         assert!(matches!(json_fmt, OutputFormat::Json));
     }
 }
+
