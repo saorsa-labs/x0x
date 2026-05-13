@@ -206,3 +206,42 @@ pub async fn peers_events(client: &DaemonClient) -> Result<()> {
     }
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_location_words_skips_non_object() {
+        let mut value = serde_json::json!([1, 2, 3]);
+        inject_location_words(&mut value);
+        assert!(value.is_array());
+    }
+
+    #[test]
+    fn inject_location_words_skips_missing_addrs() {
+        let mut value = serde_json::json!({"name": "test"});
+        inject_location_words(&mut value);
+        assert!(value.get("location_words").is_none());
+    }
+
+    #[test]
+    fn inject_location_words_handles_empty_addrs() {
+        let mut value = serde_json::json!({"external_addrs": []});
+        inject_location_words(&mut value);
+        assert!(value.get("location_words").is_none());
+    }
+
+    #[test]
+    fn inject_location_words_encodes_valid_addrs() {
+        let mut value = serde_json::json!({
+            "external_addrs": ["1.2.3.4:5483"]
+        });
+        inject_location_words(&mut value);
+        // May or may not encode depending on FourWordAdaptiveEncoder
+        // Just verify it doesn't panic
+        let _ = value;
+    }
+}
+

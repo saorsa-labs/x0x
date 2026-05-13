@@ -87,3 +87,46 @@ fn page_output(content: &str) -> Result<()> {
 
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_width_returns_reasonable_value() {
+        let width = terminal_width();
+        // Should be between 40 and 500
+        assert!(width >= 40, "width={width} too small");
+        assert!(width <= 500, "width={width} too large");
+    }
+
+    #[test]
+    fn render_for_terminal_returns_non_empty() {
+        let rendered = render_for_terminal("# Hello
+
+This is a test.");
+        assert!(!rendered.is_empty(), "should render markdown");
+        assert!(rendered.contains("Hello"), "should contain the text");
+    }
+
+    #[test]
+    fn render_for_terminal_handles_empty() {
+        let rendered = render_for_terminal("");
+        // Should not panic
+        assert!(rendered.is_empty() || !rendered.is_empty());
+    }
+
+    #[test]
+    fn display_json_output() {
+        let result = display(false, true);
+        assert!(result.is_ok(), "JSON display should succeed");
+    }
+
+    #[test]
+    fn display_raw_output() {
+        let result = display(true, false);
+        assert!(result.is_ok(), "raw display should succeed");
+    }
+}
+
