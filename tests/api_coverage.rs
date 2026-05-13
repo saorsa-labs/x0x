@@ -30,6 +30,7 @@ const COVERED: &[(Method, &str)] = &[
     (Method::Get, "/agent/card"),
     (Method::Get, "/introduction"),
     (Method::Post, "/agent/card/import"),
+    (Method::Post, "/agent/sign"),
     // ── Network ─────────────────────────────────────────────────────────
     (Method::Get, "/peers"),
     // ── Presence ────────────────────────────────────────────────────────
