@@ -1518,4 +1518,106 @@ mod tests {
             Some(&1)
         );
     }
+
+
+    #[tokio::test]
+    async fn enabled_returns_false_for_disabled_policy() {
+        let service = test_service().await;
+        assert!(!service.enabled(), "disabled policy should return false");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_snapshot_returns_valid_data() {
+        let service = test_service().await;
+        let snap = service.diagnostics_snapshot().await;
+        assert!(snap.ok);
+        assert!(!snap.enabled);
+        assert_eq!(snap.active_sessions, 0);
+        assert!(snap.active_per_agent.is_empty());
+        assert_eq!(snap.totals.requests_received, 0);
+        assert_eq!(snap.totals.requests_allowed, 0);
+        assert_eq!(snap.totals.requests_denied, 0);
+    }
+
+    #[tokio::test]
+    async fn sessions_snapshot_returns_empty_for_fresh_service() {
+        let service = test_service().await;
+        let snap = service.sessions_snapshot().await;
+        assert!(snap.ok);
+        assert!(snap.pending_clients.is_empty());
+        assert!(snap.active_servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_acquire_slot_returns_some_when_available() {
+        let service = test_service().await;
+        let agent = AgentId([9; 32]);
+        let caps = ExecCaps {
+            max_concurrent_per_agent: 5,
+            max_concurrent_total: 10,
+            ..ExecCaps::default()
+        };
+        let slot = service.try_acquire_slot(agent, &caps).await;
+        assert!(slot.is_some(), "should acquire slot when under caps");
+    }
+
+    #[tokio::test]
+    async fn try_acquire_slot_respects_total_cap() {
+        let service = test_service().await;
+        let agent_a = AgentId([10; 32]);
+        let agent_b = AgentId([11; 32]);
+        let caps = ExecCaps {
+            max_concurrent_per_agent: 5,
+            max_concurrent_total: 1,
+            ..ExecCaps::default()
+        };
+        assert!(service.try_acquire_slot(agent_a, &caps).await.is_some());
+        assert!(service.try_acquire_slot(agent_b, &caps).await.is_none(), "total cap should block second agent");
+    }
+
+    #[tokio::test]
+    async fn try_acquire_slot_respects_per_agent_cap() {
+        let service = test_service().await;
+        let agent = AgentId([12; 32]);
+        let caps = ExecCaps {
+            max_concurrent_per_agent: 2,
+            max_concurrent_total: 10,
+            ..ExecCaps::default()
+        };
+        assert!(service.try_acquire_slot(agent, &caps).await.is_some());
+        assert!(service.try_acquire_slot(agent, &caps).await.is_some());
+        assert!(service.try_acquire_slot(agent, &caps).await.is_none(), "per-agent cap should block third slot");
+    }
+
+    #[tokio::test]
+    async fn release_slot_frees_capacity() {
+        let service = test_service().await;
+        let agent = AgentId([13; 32]);
+        let caps = ExecCaps {
+            max_concurrent_per_agent: 1,
+            max_concurrent_total: 1,
+            ..ExecCaps::default()
+        };
+        assert!(service.try_acquire_slot(agent, &caps).await.is_some());
+        service.release_slot(agent).await;
+        assert!(service.try_acquire_slot(agent, &caps).await.is_some(), "should re-acquire after release");
+    }
+
+    #[tokio::test]
+    async fn handle_lease_renew_returns_ok_for_unknown_session() {
+        let service = test_service().await;
+        let agent = AgentId([14; 32]);
+        let machine = MachineId([15; 32]);
+        let request_id = ExecRequestId([99; 16]);
+        service.handle_lease_renew(agent, machine, request_id).await;
+    }
+
+    #[tokio::test]
+    async fn handle_cancel_returns_ok_for_unknown_session() {
+        let service = test_service().await;
+        let agent = AgentId([16; 32]);
+        let machine = MachineId([17; 32]);
+        let request_id = ExecRequestId([98; 16]);
+        service.handle_cancel(agent, machine, request_id).await;
+    }
 }

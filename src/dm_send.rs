@@ -541,4 +541,50 @@ mod tests {
 
         assert!(matches!(outcome, BackoffWait::Ack(DmAckOutcome::Accepted)));
     }
+
+
+    #[test]
+    fn fresh_request_id_generates_unique_ids() {
+        let id1 = fresh_request_id();
+        let id2 = fresh_request_id();
+        assert_ne!(id1, id2, "two request IDs should be different");
+        assert_eq!(id1.len(), 16);
+        assert_eq!(id2.len(), 16);
+    }
+
+    #[test]
+    fn map_identity_err_converts_to_dm_error() {
+        let identity_err = IdentityError::KeyGeneration("test error".to_string());
+        let dm_err = map_identity_err(identity_err);
+        assert!(dm_err.to_string().contains("test error"));
+    }
+
+    #[test]
+    fn raw_quic_receipt_has_correct_path() {
+        let receipt = raw_quic_receipt();
+        assert_eq!(receipt.path, DmPath::RawQuic);
+        assert_eq!(receipt.retries_used, 0);
+    }
+
+    #[test]
+    fn loopback_receipt_has_correct_path() {
+        let receipt = loopback_receipt();
+        assert_eq!(receipt.path, DmPath::Loopback);
+        assert_eq!(receipt.retries_used, 0);
+    }
+
+    #[test]
+    fn raw_quic_receipt_for_path_uses_given_path() {
+        let receipt = raw_quic_receipt_for_path(DmPath::GossipInbox);
+        assert_eq!(receipt.path, DmPath::GossipInbox);
+    }
+
+    #[test]
+    fn receipt_for_path_creates_valid_receipt() {
+        let receipt = receipt_for_path(DmPath::RawQuic);
+        assert_eq!(receipt.path, DmPath::RawQuic);
+        assert_eq!(receipt.retries_used, 0);
+        // request_id should be 16 bytes
+        assert_eq!(receipt.request_id.len(), 16);
+    }
 }
