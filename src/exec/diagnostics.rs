@@ -213,3 +213,154 @@ fn now_unix_ms() -> u64 {
         Err(_) => 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::acl::AclSummary;
+    use crate::exec::protocol::{DenialReason, ExecRequestId, WarningKind};
+    use crate::identity::AgentId;
+
+    fn test_acl_summary() -> AclSummary {
+        AclSummary {
+            enabled: true,
+            loaded_from: "/test/acl.toml".to_string(),
+            loaded_at_unix_ms: 100,
+            allow_entry_count: 5,
+            command_entry_count: 10,
+            disabled_reason: None,
+        }
+    }
+
+    fn test_agent_id() -> AgentId {
+        AgentId([0xCC; 32])
+    }
+
+    fn test_request_id() -> ExecRequestId {
+        ExecRequestId([2u8; 16])
+    }
+
+    #[test]
+    fn diagnostics_new_initializes_counts_to_zero() {
+        let d = ExecDiagnostics::new(test_acl_summary());
+        let snap = d.snapshot(true, 0, HashMap::new());
+        assert!(snap.ok);
+        assert!(snap.enabled);
+        assert_eq!(snap.active_sessions, 0);
+        assert_eq!(snap.totals.requests_received, 0);
+        assert_eq!(snap.totals.requests_allowed, 0);
+        assert_eq!(snap.totals.requests_denied, 0);
+        assert_eq!(snap.totals.sessions_started, 0);
+        assert_eq!(snap.totals.sessions_completed, 0);
+        assert_eq!(snap.totals.sessions_cancelled, 0);
+        assert_eq!(snap.totals.audit_write_failures, 0);
+    }
+
+    #[test]
+    fn diagnostics_records_request_received() {
+        let d = ExecDiagnostics::new(test_acl_summary());
+        d.record_request_received();
+        d.record_request_received();
+        d.record_request_received();
+        let snap = d.snapshot(true, 0, HashMap::new());
+        assert_eq!(snap.totals.requests_received, 3);
+    }
+
+    #[test]
+    fn diagnostics_records_allowed_and_denied() {
+        let d = ExecDiagnostics::new(test_acl_summary());
+        d.record_allowed();
+        d.record_allowed();
+        d.record_denied(DenialReason::ArgvNotAllowed);
+        d.record_denied(DenialReason::ExecDisabled);
+        let snap = d.snapshot(true, 0, HashMap::new());
+        assert_eq!(snap.totals.requests_allowed, 2);
+        assert_eq!(snap.totals.requests_denied, 2);
+        assert!(snap.totals.denial_breakdown.contains_key("argv_not_allowed"));
+        assert!(snap.totals.denial_breakdown.contains_key("exec_disabled"));
+    }
+
+    #[test]
+    fn diagnostics_records_session_lifecycle() {
+        let d = ExecDiagnostics::new(test_acl_summary());
+        d.record_started();
+        d.record_started();
+        d.record_completed();
+        d.record_cancelled();
+        let snap = d.snapshot(true, 0, HashMap::new());
+        assert_eq!(snap.totals.sessions_started, 2);
+        assert_eq!(snap.totals.sessions_completed, 1);
+        assert_eq!(snap.totals.sessions_cancelled, 1);
+    }
+
+    #[test]
+    fn diagnostics_records_audit_failure() {
+        let d = ExecDiagnostics::new(test_acl_summary());
+        d.record_audit_failure();
+        let snap = d.snapshot(true, 0, HashMap::new());
+        assert_eq!(snap.totals.audit_write_failures, 1);
+    }
+
+    #[test]
+    fn diagnostics_records_cap_breach() {
+        let d = ExecDiagnostics::new(test_acl_summary());
+        d.record_cap_breach("stdout");
+        d.record_cap_breach("stdout");
+        d.record_cap_breach("stderr");
+        let snap = d.snapshot(true, 0, HashMap::new());
+        assert_eq!(snap.totals.cap_breaches.get("stdout"), Some(&2u64));
+        assert_eq!(snap.totals.cap_breaches.get("stderr"), Some(&1u64));
+    }
+
+    #[test]
+    fn diagnostics_records_warning() {
+        let d = ExecDiagnostics::new(test_acl_summary());
+        d.record_warning(
+            WarningKind::StdoutCapHit,
+            test_agent_id(),
+            test_request_id(),
+            "cat large.log".to_string(),
+            Some(16_777_216),
+        );
+        let snap = d.snapshot(true, 0, HashMap::new());
+        assert_eq!(snap.totals.cap_warnings.get("stdout_cap_hit"), Some(&1u64));
+        assert_eq!(snap.recent_warnings.len(), 1);
+        assert_eq!(snap.recent_warnings[0].argv_summary, "cat large.log");
+    }
+
+    #[test]
+    fn diagnostics_snapshot_includes_active_sessions() {
+        let d = ExecDiagnostics::new(test_acl_summary());
+        let mut per_agent = HashMap::new();
+        per_agent.insert("agent1".to_string(), 3usize);
+        let snap = d.snapshot(true, 5, per_agent);
+        assert_eq!(snap.active_sessions, 5);
+        assert_eq!(snap.active_per_agent.get("agent1"), Some(&3usize));
+    }
+
+    #[test]
+    fn diagnostics_snapshot_shows_disabled() {
+        let d = ExecDiagnostics::new(test_acl_summary());
+        let snap = d.snapshot(false, 0, HashMap::new());
+        assert!(!snap.enabled);
+    }
+
+    #[test]
+    fn diagnostics_warning_limit_respected() {
+        let d = ExecDiagnostics::new(test_acl_summary());
+        // Add more than the limit
+        for i in 0..70 {
+            d.record_warning(
+                WarningKind::StdoutCapHit,
+                test_agent_id(),
+                ExecRequestId([i as u8; 16]),
+                format!("cmd-{i}"),
+                None,
+            );
+        }
+        let snap = d.snapshot(true, 0, HashMap::new());
+        assert_eq!(snap.recent_warnings.len(), 64); // RECENT_WARNING_LIMIT
+        // Should have the most recent entries
+        assert!(snap.recent_warnings.last().unwrap().argv_summary.contains("cmd-69"));
+    }
+}
