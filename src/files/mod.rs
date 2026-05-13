@@ -171,3 +171,146 @@ pub enum FileMessage {
         sequence: u64,
     },
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn default_chunk_size_value() {
+        assert_eq!(default_chunk_size(), DEFAULT_CHUNK_SIZE);
+        assert_eq!(DEFAULT_CHUNK_SIZE, 32768);
+    }
+
+    #[test]
+    fn max_transfer_size_value() {
+        assert_eq!(MAX_TRANSFER_SIZE, 1_073_741_824);
+    }
+
+    #[test]
+    fn file_offer_roundtrip() {
+        let offer = FileOffer {
+            transfer_id: "transfer-123".to_string(),
+            filename: "test.txt".to_string(),
+            size: 1024,
+            sha256: "abc123".to_string(),
+            chunk_size: 32768,
+            total_chunks: 1,
+        };
+        let json = serde_json::to_string(&offer).unwrap();
+        let decoded: FileOffer = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.transfer_id, "transfer-123");
+        assert_eq!(decoded.filename, "test.txt");
+        assert_eq!(decoded.size, 1024);
+    }
+
+    #[test]
+    fn file_chunk_roundtrip() {
+        let chunk = FileChunk {
+            transfer_id: "transfer-123".to_string(),
+            sequence: 0,
+            data: base64::engine::general_purpose::STANDARD.encode(b"hello world"),
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let decoded: FileChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.transfer_id, "transfer-123");
+        assert_eq!(decoded.sequence, 0);
+    }
+
+    #[test]
+    fn file_complete_roundtrip() {
+        let complete = FileComplete {
+            transfer_id: "transfer-123".to_string(),
+            sha256: "abc123".to_string(),
+        };
+        let json = serde_json::to_string(&complete).unwrap();
+        let decoded: FileComplete = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.transfer_id, "transfer-123");
+    }
+
+    #[test]
+    fn transfer_direction_display() {
+        assert_eq!(TransferDirection::Sending as u8, 0);
+        assert_eq!(TransferDirection::Receiving as u8, 1);
+    }
+
+    #[test]
+    fn transfer_status_variants() {
+        assert_eq!(TransferStatus::Pending as u8, 0);
+        assert_eq!(TransferStatus::InProgress as u8, 1);
+        assert_eq!(TransferStatus::Complete as u8, 2);
+        assert_eq!(TransferStatus::Failed as u8, 3);
+        assert_eq!(TransferStatus::Rejected as u8, 4);
+    }
+
+    #[test]
+    fn transfer_state_roundtrip() {
+        let state = TransferState {
+            transfer_id: "transfer-123".to_string(),
+            direction: TransferDirection::Sending,
+            remote_agent_id: "agent-456".to_string(),
+            filename: "test.txt".to_string(),
+            total_size: 1024,
+            bytes_transferred: 512,
+            status: TransferStatus::InProgress,
+            sha256: "abc123".to_string(),
+            error: None,
+            started_at: 1000,
+            started_at_unix_ms: 1_000_000,
+            completed_at_unix_ms: None,
+            source_path: Some("/tmp/test.txt".to_string()),
+            output_path: None,
+            chunk_size: 32768,
+            total_chunks: 1,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let decoded: TransferState = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.transfer_id, "transfer-123");
+        assert_eq!(decoded.direction, TransferDirection::Sending);
+        assert_eq!(decoded.status, TransferStatus::InProgress);
+        assert_eq!(decoded.chunk_size, 32768);
+    }
+
+    #[test]
+    fn file_message_offer_roundtrip() {
+        let offer = FileOffer {
+            transfer_id: "t1".to_string(),
+            filename: "f.txt".to_string(),
+            size: 100,
+            sha256: "hash".to_string(),
+            chunk_size: 32768,
+            total_chunks: 1,
+        };
+        let msg = FileMessage::Offer(offer);
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: FileMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, FileMessage::Offer(_)));
+    }
+
+    #[test]
+    fn file_message_accept_roundtrip() {
+        let msg = FileMessage::Accept { transfer_id: "t1".to_string() };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: FileMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, FileMessage::Accept { .. }));
+    }
+
+    #[test]
+    fn file_message_reject_roundtrip() {
+        let msg = FileMessage::Reject { transfer_id: "t1".to_string(), reason: "too big".to_string() };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: FileMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, FileMessage::Reject { .. }));
+    }
+
+    #[test]
+    fn file_message_chunk_ack_roundtrip() {
+        let msg = FileMessage::ChunkAck { transfer_id: "t1".to_string(), sequence: 5 };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: FileMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, FileMessage::ChunkAck { .. }));
+    }
+}
+
