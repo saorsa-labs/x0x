@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.45] - 2026-05-13
+
+Metadata-fix release. The v0.19.44 release workflow failed validation
+because `SKILL.md` still carried `version: 0.19.41` while `Cargo.toml`
+was at 0.19.44 (`validate_release_metadata.py` `version_sync` rule).
+v0.19.44 never published. v0.19.45 bumps SKILL.md alongside Cargo.toml
+so the workflow can complete.
+
+No code changes vs v0.19.44 — same reviewer-round-3 fixes apply
+(P1.1 SWIM oracle wiring, P2.1 `x0x.directory.*` classifier).
+
 ## [v0.19.44] - 2026-05-13
 
 Reviewer round 3 corrections to the X0X-0074 admission control bundle.
