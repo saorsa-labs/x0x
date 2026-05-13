@@ -245,3 +245,165 @@ mod tests {
     }
 }
 
+    /// Start a mock axum server that returns the given JSON for any GET request.
+    /// Returns the base URL and a shutdown sender.
+    #[allow(dead_code)]
+    async fn start_mock_server(response_json: serde_json::Value) -> (String, tokio::sync::oneshot::Sender<()>) {
+        use axum::Router;
+
+        use std::sync::Arc;
+        let json = Arc::new(response_json);
+        let app = Router::new().fallback(move |_req: axum::extract::Request| {
+            let json = Arc::clone(&json);
+            async move {
+                let body = serde_json::to_vec(&*json).unwrap();
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async { rx.await.ok(); })
+                .await
+                .ok();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        (format!("http://{}", addr), tx)
+    }
+
+    #[tokio::test]
+    async fn health_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok", "version": "0.19.42"});
+        let (url, _shutdown) = start_mock_server(mock_resp.clone()).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = health(&client).await;
+        assert!(result.is_ok(), "health should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn status_returns_mock_response() {
+        let mock_resp = serde_json::json!({
+            "agent_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "peers": 5,
+            "status": "connected"
+        });
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = status(&client).await;
+        assert!(result.is_ok(), "status should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn peers_returns_mock_response() {
+        let mock_resp = serde_json::json!([{"peer_id": "abc123", "state": "connected"}]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = peers(&client).await;
+        assert!(result.is_ok(), "peers should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn presence_returns_mock_response() {
+        let mock_resp = serde_json::json!([{"agent_id": "abc", "online": true}]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = presence(&client).await;
+        assert!(result.is_ok(), "presence should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn network_status_returns_mock_response() {
+        let mock_resp = serde_json::json!({"nat_type": "FullCone", "external_addrs": ["1.2.3.4:5483"]});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = network_status(&client).await;
+        assert!(result.is_ok(), "network_status should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cache_returns_mock_response() {
+        let mock_resp = serde_json::json!([{"addr": "1.2.3.4:5483", "peer_id": "abc"}]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = bootstrap_cache(&client).await;
+        assert!(result.is_ok(), "bootstrap_cache should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_connectivity_returns_mock_response() {
+        let mock_resp = serde_json::json!({"nat_type": "FullCone", "upnp": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = diagnostics_connectivity(&client).await;
+        assert!(result.is_ok(), "diagnostics_connectivity should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_gossip_returns_mock_response() {
+        let mock_resp = serde_json::json!({"decode_to_delivery_drops": 0, "messages_received": 100});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = diagnostics_gossip(&client).await;
+        assert!(result.is_ok(), "diagnostics_gossip should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_dm_returns_mock_response() {
+        let mock_resp = serde_json::json!({"messages_sent": 50, "messages_received": 30});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = diagnostics_dm(&client).await;
+        assert!(result.is_ok(), "diagnostics_dm should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_groups_returns_mock_response() {
+        let mock_resp = serde_json::json!({"groups": [{"name": "test-group", "members": 3}]});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = diagnostics_groups(&client).await;
+        assert!(result.is_ok(), "diagnostics_groups should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn peers_probe_returns_mock_response() {
+        let mock_resp = serde_json::json!({"rtt_ms": 42});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = peers_probe(&client, "abc123", Some(5000)).await;
+        assert!(result.is_ok(), "peers_probe should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn peers_health_returns_mock_response() {
+        let mock_resp = serde_json::json!({"state": "Established", "generation": 3});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = peers_health(&client, "abc123").await;
+        assert!(result.is_ok(), "peers_health should succeed: {:?}", result);
+    }
+
+
