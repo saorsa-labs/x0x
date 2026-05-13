@@ -723,4 +723,41 @@ mod tests {
         let payload = b"x0x-other-stuff".to_vec();
         assert!(!payload.starts_with(&route.prefix));
     }
+
+
+    // ── DmInboxConfig ─────────────────────────────────────────────────
+
+    #[test]
+    fn dm_inbox_config_default_has_empty_routes() {
+        let config = DmInboxConfig::default();
+        assert!(!config.silent_reject, "silent_reject defaults to false");
+        assert!(config.typed_payload_routes.is_empty());
+    }
+
+    #[test]
+    fn dm_inbox_config_with_route_adds_entry() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<DmTypedPayload>(8);
+        let config = DmInboxConfig::default()
+            .with_typed_payload_route(b"x0x-exec-v1 ", tx);
+        assert_eq!(config.typed_payload_routes.len(), 1);
+        assert_eq!(config.typed_payload_routes[0].prefix, b"x0x-exec-v1 ");
+    }
+
+    #[test]
+    fn dm_inbox_config_with_multiple_routes() {
+        let (tx1, _rx1) = tokio::sync::mpsc::channel::<DmTypedPayload>(8);
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<DmTypedPayload>(8);
+        let config = DmInboxConfig::default()
+            .with_typed_payload_route(b"prefix-a ", tx1)
+            .with_typed_payload_route(b"prefix-b ", tx2);
+        assert_eq!(config.typed_payload_routes.len(), 2);
+    }
+
+    #[test]
+    fn dm_inbox_config_debug_does_not_panic() {
+        let config = DmInboxConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("silent_reject"));
+        assert!(debug.contains("typed_payload_routes"));
+    }
 }
