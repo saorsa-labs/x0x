@@ -136,5 +136,42 @@ mod tests {
         let result = connect(&client, &[]).await;
         assert!(result.is_err(), "connect with 0 words should fail");
     }
+
+
+    #[tokio::test]
+    async fn connect_with_valid_words_and_matching_agent() {
+        // Use the FourWordAdaptiveEncoder to encode a known address,
+        // then decode those words to get valid input for the connect function.
+        let addr_encoder = FourWordAdaptiveEncoder::new().unwrap();
+        let test_addr = "192.168.1.1:5483";
+        let words_str = addr_encoder.encode(test_addr).unwrap();
+        let words: Vec<String> = words_str.split_whitespace().map(|s| s.to_string()).collect();
+        assert_eq!(words.len(), 4, "should produce 4 words");
+
+        // Mock server returns an agent with matching address
+        let mock_resp = serde_json::json!([{
+            "agent_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "addresses": [test_addr]
+        }]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = connect(&client, &words).await;
+        assert!(result.is_ok(), "connect should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn connect_with_valid_words_no_matching_agent() {
+        let addr_encoder = FourWordAdaptiveEncoder::new().unwrap();
+        let test_addr = "10.0.0.1:5483";
+        let words_str = addr_encoder.encode(test_addr).unwrap();
+        let words: Vec<String> = words_str.split_whitespace().map(|s| s.to_string()).collect();
+
+        // Mock server returns empty agents list
+        let mock_resp = serde_json::json!([]);
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = connect(&client, &words).await;
+        assert!(result.is_err(), "connect should fail when no agent matches");
+    }
 }
 
