@@ -538,4 +538,35 @@ mod tests {
         let path = current_binary_path().unwrap();
         assert!(path.is_absolute() || !path.to_string_lossy().is_empty());
     }
+
+
+    #[test]
+    fn auto_apply_upgrader_new_defaults() {
+        let upgrader = AutoApplyUpgrader::new("x0xd");
+        assert_eq!(upgrader.binary_name, "x0xd");
+        assert!(!upgrader.stop_on_upgrade);
+        assert!(upgrader.restart_on_success);
+    }
+
+    #[test]
+    fn auto_apply_upgrader_with_stop_on_upgrade() {
+        let upgrader = AutoApplyUpgrader::new("x0x").with_stop_on_upgrade(true);
+        assert!(upgrader.stop_on_upgrade);
+    }
+
+    #[test]
+    fn auto_apply_upgrader_with_restart_on_success() {
+        let upgrader = AutoApplyUpgrader::new("x0xd").with_restart_on_success(false);
+        assert!(!upgrader.restart_on_success);
+    }
+
+    #[test]
+    fn auto_apply_upgrader_chaining() {
+        let upgrader = AutoApplyUpgrader::new("x0xd")
+            .with_stop_on_upgrade(true)
+            .with_restart_on_success(false);
+        assert_eq!(upgrader.binary_name, "x0xd");
+        assert!(upgrader.stop_on_upgrade);
+        assert!(!upgrader.restart_on_success);
+    }
 }
