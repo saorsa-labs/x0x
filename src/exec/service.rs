@@ -1519,7 +1519,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn enabled_returns_false_for_disabled_policy() {
         let service = test_service().await;
@@ -1572,7 +1571,10 @@ mod tests {
             ..ExecCaps::default()
         };
         assert!(service.try_acquire_slot(agent_a, &caps).await.is_some());
-        assert!(service.try_acquire_slot(agent_b, &caps).await.is_none(), "total cap should block second agent");
+        assert!(
+            service.try_acquire_slot(agent_b, &caps).await.is_none(),
+            "total cap should block second agent"
+        );
     }
 
     #[tokio::test]
@@ -1586,7 +1588,10 @@ mod tests {
         };
         assert!(service.try_acquire_slot(agent, &caps).await.is_some());
         assert!(service.try_acquire_slot(agent, &caps).await.is_some());
-        assert!(service.try_acquire_slot(agent, &caps).await.is_none(), "per-agent cap should block third slot");
+        assert!(
+            service.try_acquire_slot(agent, &caps).await.is_none(),
+            "per-agent cap should block third slot"
+        );
     }
 
     #[tokio::test]
@@ -1600,7 +1605,10 @@ mod tests {
         };
         assert!(service.try_acquire_slot(agent, &caps).await.is_some());
         service.release_slot(agent).await;
-        assert!(service.try_acquire_slot(agent, &caps).await.is_some(), "should re-acquire after release");
+        assert!(
+            service.try_acquire_slot(agent, &caps).await.is_some(),
+            "should re-acquire after release"
+        );
     }
 
     #[tokio::test]

@@ -346,13 +346,16 @@ mod tests {
 
     #[test]
     fn format_scalar_string() {
-        assert_eq!(format_scalar(&serde_json::Value::String("hello".into())), "hello");
+        assert_eq!(
+            format_scalar(&serde_json::Value::String("hello".into())),
+            "hello"
+        );
     }
 
     #[test]
     fn format_scalar_number() {
         assert_eq!(format_scalar(&serde_json::json!(42)), "42");
-        assert_eq!(format_scalar(&serde_json::json!(3.14)), "3.14");
+        assert_eq!(format_scalar(&serde_json::json!(2.71)), "2.71");
     }
 
     #[test]
@@ -389,7 +392,10 @@ mod tests {
         // Should either succeed (if port file exists) or fail with a clear error
         match result {
             Ok(client) => {
-                assert!(client.base_url().contains("127.0.0.1") || client.base_url().contains("localhost"));
+                assert!(
+                    client.base_url().contains("127.0.0.1")
+                        || client.base_url().contains("localhost")
+                );
             }
             Err(e) => {
                 let msg = format!("{e}");
@@ -407,7 +413,8 @@ mod tests {
 
     #[test]
     fn daemon_client_uses_http_api_override() {
-        let client = DaemonClient::new(None, Some("http://10.0.0.1:8080"), OutputFormat::Text).unwrap();
+        let client =
+            DaemonClient::new(None, Some("http://10.0.0.1:8080"), OutputFormat::Text).unwrap();
         assert_eq!(client.base_url(), "http://10.0.0.1:8080");
     }
 
@@ -415,13 +422,11 @@ mod tests {
     fn daemon_client_named_instance_no_port_file() {
         // Named instance without a port file should fail with a helpful message
         let result = DaemonClient::new(Some("nonexistent-test-instance"), None, OutputFormat::Text);
-        match result {
-            Err(e) => {
-                let msg = format!("{e}");
-                assert!(msg.contains("nonexistent-test-instance"), "msg: {msg}");
-            }
-            Ok(_) => {} // Could succeed if port file exists
+        if let Err(e) = result {
+            let msg = format!("{e}");
+            assert!(msg.contains("nonexistent-test-instance"), "msg: {msg}");
         }
+        // Ok path tolerated — port file may exist if a real daemon is running
     }
 
     #[test]
@@ -457,8 +462,12 @@ mod tests {
             let result = client.ensure_running().await;
             assert!(result.is_err());
             let msg = format!("{}", result.unwrap_err());
-            assert!(msg.contains("Daemon is not running") || msg.contains("Connection refused") || msg.contains("request failed"), "msg: {msg}");
+            assert!(
+                msg.contains("Daemon is not running")
+                    || msg.contains("Connection refused")
+                    || msg.contains("request failed"),
+                "msg: {msg}"
+            );
         });
     }
 }
-

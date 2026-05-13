@@ -276,7 +276,10 @@ mod tests {
         let snap = d.snapshot(true, 0, HashMap::new());
         assert_eq!(snap.totals.requests_allowed, 2);
         assert_eq!(snap.totals.requests_denied, 2);
-        assert!(snap.totals.denial_breakdown.contains_key("argv_not_allowed"));
+        assert!(snap
+            .totals
+            .denial_breakdown
+            .contains_key("argv_not_allowed"));
         assert!(snap.totals.denial_breakdown.contains_key("exec_disabled"));
     }
 
@@ -360,7 +363,12 @@ mod tests {
         }
         let snap = d.snapshot(true, 0, HashMap::new());
         assert_eq!(snap.recent_warnings.len(), 64); // RECENT_WARNING_LIMIT
-        // Should have the most recent entries
-        assert!(snap.recent_warnings.last().unwrap().argv_summary.contains("cmd-69"));
+                                                    // Should have the most recent entries
+        assert!(snap
+            .recent_warnings
+            .last()
+            .unwrap()
+            .argv_summary
+            .contains("cmd-69"));
     }
 }

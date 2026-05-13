@@ -436,7 +436,6 @@ fn print_signature_recovery_hint(err: &UpgradeError, current: &str) {
     eprintln!();
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,21 +450,29 @@ mod tests {
     #[test]
     fn print_signature_recovery_hint_skips_for_other_errors() {
         // Should not panic for non-signature errors
-        print_signature_recovery_hint(&UpgradeError::ManifestFetchFailed("network error".to_string()), "0.19.42");
+        print_signature_recovery_hint(
+            &UpgradeError::ManifestFetchFailed("network error".to_string()),
+            "0.19.42",
+        );
     }
 
     #[test]
     fn discover_daemon_api_returns_none_in_test_env() {
         // In a test environment without a running daemon, this should return None
         let result = discover_daemon_api();
-        assert!(result.is_none(), "should return None without a running daemon");
+        assert!(
+            result.is_none(),
+            "should return None without a running daemon"
+        );
     }
 
     #[test]
     fn read_api_token_returns_none_in_test_env() {
         // In a test environment without a configured token, this should return None
         let result = read_api_token();
-        assert!(result.is_none(), "should return None without a configured token");
+        assert!(
+            result.is_none(),
+            "should return None without a configured token"
+        );
     }
 }
-

@@ -337,7 +337,6 @@ mod tests {
         assert_eq!(version_from_tag("v1.2.3-rc1"), "1.2.3-rc1");
     }
 
-
     #[test]
     fn validate_manifest_timestamp_accepts_recent() {
         let now = std::time::SystemTime::now()

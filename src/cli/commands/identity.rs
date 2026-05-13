@@ -122,7 +122,6 @@ pub async fn import_card(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -163,7 +162,10 @@ mod tests {
             "name": "test-agent"
         });
         inject_identity_words(&encoder, &mut value);
-        assert!(value.get("identity_words").is_some(), "should add identity_words");
+        assert!(
+            value.get("identity_words").is_some(),
+            "should add identity_words"
+        );
         let words = value["identity_words"].as_str().unwrap().to_string();
         assert!(!words.is_empty(), "should produce non-empty words: {words}");
     }
@@ -173,7 +175,10 @@ mod tests {
         let encoder = IdentityEncoder::new();
         let mut value = serde_json::json!({"name": "no-id"});
         inject_identity_words(&encoder, &mut value);
-        assert!(value.get("identity_words").is_none(), "should not add words without agent_id");
+        assert!(
+            value.get("identity_words").is_none(),
+            "should not add words without agent_id"
+        );
     }
 
     #[test]
@@ -185,7 +190,10 @@ mod tests {
             "user_id": user_hex,
         });
         inject_identity_words(&encoder, &mut value);
-        assert!(value.get("identity_words").is_some(), "should add identity_words");
+        assert!(
+            value.get("identity_words").is_some(),
+            "should add identity_words"
+        );
         assert!(value.get("user_words").is_some(), "should add user_words");
     }
 
@@ -198,4 +206,3 @@ mod tests {
         assert!(value.is_array());
     }
 }
-

@@ -1590,7 +1590,6 @@ mod tests {
         assert_eq!(active_count.load(Ordering::Relaxed), 2);
     }
 
-
     // ── Helper functions ───────────────────────────────────────────────
 
     #[test]

@@ -242,12 +242,17 @@ mod tests {
         assert!(res.is_err(), "AAD mismatch must fail auth-tag check");
     }
 
-
     #[test]
     fn agent_kem_keypair_generate_creates_valid_keypair() {
         let kp = AgentKemKeypair::generate().expect("generate");
-        assert!(!kp.public_bytes.is_empty(), "public key should not be empty");
-        assert!(!kp.secret_bytes.is_empty(), "secret key should not be empty");
+        assert!(
+            !kp.public_bytes.is_empty(),
+            "public key should not be empty"
+        );
+        assert!(
+            !kp.secret_bytes.is_empty(),
+            "secret key should not be empty"
+        );
         assert_eq!(kp.public_bytes.len(), KEM_VARIANT.public_key_size());
         assert_eq!(kp.secret_bytes.len(), KEM_VARIANT.secret_key_size());
     }
@@ -256,25 +261,43 @@ mod tests {
     fn agent_kem_keypair_debug_redacts_secret() {
         let kp = AgentKemKeypair::generate().expect("generate");
         let debug = format!("{:?}", kp);
-        assert!(debug.contains("public_bytes"), "debug should show public_bytes");
+        assert!(
+            debug.contains("public_bytes"),
+            "debug should show public_bytes"
+        );
         assert!(debug.contains("<REDACTED>"), "debug should redact secret");
-        assert!(!debug.contains(&kp.secret_bytes[..4].iter().map(|b| format!("{b:x}")).collect::<String>()),
-            "debug should not leak secret bytes");
+        assert!(
+            !debug.contains(
+                &kp.secret_bytes[..4]
+                    .iter()
+                    .map(|b| format!("{b:x}"))
+                    .collect::<String>()
+            ),
+            "debug should not leak secret bytes"
+        );
     }
 
     #[test]
     fn agent_kem_keypair_generates_different_keys() {
         let kp1 = AgentKemKeypair::generate().expect("generate");
         let kp2 = AgentKemKeypair::generate().expect("generate");
-        assert_ne!(kp1.public_bytes, kp2.public_bytes, "two keypairs should have different public keys");
-        assert_ne!(kp1.secret_bytes, kp2.secret_bytes, "two keypairs should have different secret keys");
+        assert_ne!(
+            kp1.public_bytes, kp2.public_bytes,
+            "two keypairs should have different public keys"
+        );
+        assert_ne!(
+            kp1.secret_bytes, kp2.secret_bytes,
+            "two keypairs should have different secret keys"
+        );
     }
 
     #[tokio::test]
     async fn agent_kem_keypair_load_or_generate_creates_new_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kem.key");
-        let kp = AgentKemKeypair::load_or_generate(&path).await.expect("load_or_generate");
+        let kp = AgentKemKeypair::load_or_generate(&path)
+            .await
+            .expect("load_or_generate");
         assert!(!kp.public_bytes.is_empty());
         assert!(path.exists(), "key file should be created");
     }
@@ -283,16 +306,25 @@ mod tests {
     async fn agent_kem_keypair_load_or_generate_loads_existing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kem.key");
-        let kp1 = AgentKemKeypair::load_or_generate(&path).await.expect("first");
-        let kp2 = AgentKemKeypair::load_or_generate(&path).await.expect("second");
-        assert_eq!(kp1.public_bytes, kp2.public_bytes, "loading existing should return same key");
+        let kp1 = AgentKemKeypair::load_or_generate(&path)
+            .await
+            .expect("first");
+        let kp2 = AgentKemKeypair::load_or_generate(&path)
+            .await
+            .expect("second");
+        assert_eq!(
+            kp1.public_bytes, kp2.public_bytes,
+            "loading existing should return same key"
+        );
     }
 
     #[tokio::test]
     async fn agent_kem_keypair_load_or_generate_rejects_corrupted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kem.key");
-        tokio::fs::write(&path, b"not-a-valid-keypair").await.unwrap();
+        tokio::fs::write(&path, b"not-a-valid-keypair")
+            .await
+            .unwrap();
         let result = AgentKemKeypair::load_or_generate(&path).await;
         assert!(result.is_err(), "corrupted file should fail");
     }

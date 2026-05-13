@@ -539,7 +539,6 @@ mod tests {
         assert!(path.is_absolute() || !path.to_string_lossy().is_empty());
     }
 
-
     #[test]
     fn auto_apply_upgrader_new_defaults() {
         let upgrader = AutoApplyUpgrader::new("x0xd");
@@ -570,7 +569,6 @@ mod tests {
         assert!(!upgrader.restart_on_success);
     }
 
-
     #[tokio::test]
     async fn apply_upgrade_rejects_invalid_manifest_version() {
         let upgrader = AutoApplyUpgrader::new("x0xd");
@@ -585,7 +583,10 @@ mod tests {
         let result = upgrader.apply_upgrade_from_manifest(&manifest).await;
         assert!(result.is_err(), "invalid version should fail");
         let err = format!("{:?}", result);
-        assert!(err.contains("invalid version"), "error should mention invalid version: {err}");
+        assert!(
+            err.contains("invalid version"),
+            "error should mention invalid version: {err}"
+        );
     }
 
     #[tokio::test]
@@ -614,13 +615,16 @@ mod tests {
             schema_version: 1,
             version: "99.99.99".to_string(),
             timestamp: 0,
-            assets: vec![],  // No platform assets
+            assets: vec![], // No platform assets
             skill_url: String::new(),
             skill_sha256: [0u8; 32],
         };
         let result = upgrader.apply_upgrade_from_manifest(&manifest).await;
         assert!(result.is_err(), "no platform asset should fail");
         let err = format!("{:?}", result);
-        assert!(err.contains("NoPlatformAsset"), "error should mention NoPlatformAsset: {err}");
+        assert!(
+            err.contains("NoPlatformAsset"),
+            "error should mention NoPlatformAsset: {err}"
+        );
     }
 }

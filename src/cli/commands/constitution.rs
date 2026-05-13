@@ -88,7 +88,6 @@ fn page_output(content: &str) -> Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,9 +102,11 @@ mod tests {
 
     #[test]
     fn render_for_terminal_returns_non_empty() {
-        let rendered = render_for_terminal("# Hello
+        let rendered = render_for_terminal(
+            "# Hello
 
-This is a test.");
+This is a test.",
+        );
         assert!(!rendered.is_empty(), "should render markdown");
         assert!(rendered.contains("Hello"), "should contain the text");
     }
@@ -129,4 +130,3 @@ This is a test.");
         assert!(result.is_ok(), "raw display should succeed");
     }
 }
-

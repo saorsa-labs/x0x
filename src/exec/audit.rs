@@ -276,17 +276,21 @@ mod tests {
         assert!(audit.tasklist_id().is_none());
 
         // These should not panic or create files
-        audit.request(
-            test_request_id(),
-            test_agent_id(),
-            test_machine_id(),
-            &[],
-            None,
-            0,
-            0,
-        ).await;
+        audit
+            .request(
+                test_request_id(),
+                test_agent_id(),
+                test_machine_id(),
+                &[],
+                None,
+                0,
+                0,
+            )
+            .await;
         audit.started(test_request_id(), 12345).await;
-        audit.exit(test_request_id(), Some(0), None, 100, 10, 5, false).await;
+        audit
+            .exit(test_request_id(), Some(0), None, 100, 10, 5, false)
+            .await;
 
         // No audit file should exist
         assert!(!dir.path().join("audit.jsonl").exists());
@@ -299,15 +303,17 @@ mod tests {
         let diagnostics = Arc::new(ExecDiagnostics::new(policy.summary()));
         let audit = ExecAudit::new(&policy, diagnostics);
 
-        audit.request(
-            test_request_id(),
-            test_agent_id(),
-            test_machine_id(),
-            &["ls".to_string(), "-la".to_string()],
-            Some("default"),
-            100,
-            30000,
-        ).await;
+        audit
+            .request(
+                test_request_id(),
+                test_agent_id(),
+                test_machine_id(),
+                &["ls".to_string(), "-la".to_string()],
+                Some("default"),
+                100,
+                30000,
+            )
+            .await;
 
         let audit_path = dir.path().join("audit.jsonl");
         assert!(audit_path.exists(), "audit file should exist");
@@ -323,18 +329,24 @@ mod tests {
         let diagnostics = Arc::new(ExecDiagnostics::new(policy.summary()));
         let audit = ExecAudit::new(&policy, diagnostics);
 
-        audit.request(
-            test_request_id(),
-            test_agent_id(),
-            test_machine_id(),
-            &["echo".to_string()],
-            None,
-            0,
-            5000,
-        ).await;
+        audit
+            .request(
+                test_request_id(),
+                test_agent_id(),
+                test_machine_id(),
+                &["echo".to_string()],
+                None,
+                0,
+                5000,
+            )
+            .await;
         audit.started(test_request_id(), 99999).await;
-        audit.warning(test_request_id(), WarningKind::StdoutCapHit, Some(1024)).await;
-        audit.exit(test_request_id(), Some(0), None, 200, 50, 10, false).await;
+        audit
+            .warning(test_request_id(), WarningKind::StdoutCapHit, Some(1024))
+            .await;
+        audit
+            .exit(test_request_id(), Some(0), None, 200, 50, 10, false)
+            .await;
 
         let audit_path = dir.path().join("audit.jsonl");
         let content = tokio::fs::read_to_string(&audit_path).await.unwrap();
@@ -353,13 +365,15 @@ mod tests {
         let diagnostics = Arc::new(ExecDiagnostics::new(policy.summary()));
         let audit = ExecAudit::new(&policy, diagnostics);
 
-        audit.denial(
-            test_request_id(),
-            test_agent_id(),
-            test_machine_id(),
-            &["rm".to_string(), "-rf".to_string(), "/".to_string()],
-            DenialReason::ArgvNotAllowed,
-        ).await;
+        audit
+            .denial(
+                test_request_id(),
+                test_agent_id(),
+                test_machine_id(),
+                &["rm".to_string(), "-rf".to_string(), "/".to_string()],
+                DenialReason::ArgvNotAllowed,
+            )
+            .await;
 
         let audit_path = dir.path().join("audit.jsonl");
         let content = tokio::fs::read_to_string(&audit_path).await.unwrap();
@@ -376,15 +390,17 @@ mod tests {
         let diagnostics = Arc::new(ExecDiagnostics::new(policy.summary()));
         let audit = ExecAudit::new(&policy, diagnostics);
 
-        audit.request(
-            test_request_id(),
-            test_agent_id(),
-            test_machine_id(),
-            &[],
-            None,
-            0,
-            0,
-        ).await;
+        audit
+            .request(
+                test_request_id(),
+                test_agent_id(),
+                test_machine_id(),
+                &[],
+                None,
+                0,
+                0,
+            )
+            .await;
 
         let audit_path = nested.join("audit.jsonl");
         assert!(audit_path.exists(), "nested audit file should exist");
@@ -399,23 +415,25 @@ mod tests {
 
         for i in 0..5 {
             let rid = ExecRequestId([i as u8; 16]);
-            audit.request(
-                rid,
-                test_agent_id(),
-                test_machine_id(),
-                &[format!("cmd-{i}")],
-                None,
-                0,
-                0,
-            ).await;
+            audit
+                .request(
+                    rid,
+                    test_agent_id(),
+                    test_machine_id(),
+                    &[format!("cmd-{i}")],
+                    None,
+                    0,
+                    0,
+                )
+                .await;
         }
 
         let audit_path = dir.path().join("audit.jsonl");
         let content = tokio::fs::read_to_string(&audit_path).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 5);
-        for i in 0..5 {
-            assert!(lines[i].contains(&format!("cmd-{i}")));
+        for (i, line) in lines.iter().enumerate().take(5) {
+            assert!(line.contains(&format!("cmd-{i}")));
         }
     }
 

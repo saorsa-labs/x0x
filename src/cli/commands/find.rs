@@ -113,7 +113,9 @@ mod tests {
 
     /// Start a mock axum server that returns the given JSON for any request.
     #[allow(dead_code)]
-    async fn start_mock_server(response_json: serde_json::Value) -> (String, tokio::sync::oneshot::Sender<()>) {
+    async fn start_mock_server(
+        response_json: serde_json::Value,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
         use std::sync::Arc;
 
         let json = Arc::new(response_json);
@@ -135,7 +137,9 @@ mod tests {
 
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(async { rx.await.ok(); })
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
                 .await
                 .ok();
         });
@@ -145,7 +149,6 @@ mod tests {
         (format!("http://{}", addr), tx)
     }
 
-    
     #[tokio::test]
     async fn find_rejects_wrong_word_count() {
         let mock_resp = serde_json::json!({"agents": [{"agent_id": "abc123"}]});
@@ -155,7 +158,10 @@ mod tests {
         let result = find(&client, &["hello".to_string()]).await;
         assert!(result.is_err(), "find with 1 word should fail");
         let err = format!("{:?}", result);
-        assert!(err.contains("4 words"), "error should mention 4 words: {err}");
+        assert!(
+            err.contains("4 words"),
+            "error should mention 4 words: {err}"
+        );
     }
 
     #[tokio::test]
@@ -164,10 +170,23 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         // 9 tokens but @ not at position 5
-        let result = find(&client, &["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string(), "e".to_string(), "f".to_string(), "g".to_string(), "h".to_string(), "i".to_string()]).await;
+        let result = find(
+            &client,
+            &[
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string(),
+                "f".to_string(),
+                "g".to_string(),
+                "h".to_string(),
+                "i".to_string(),
+            ],
+        )
+        .await;
         assert!(result.is_err(), "find without @ separator should fail");
     }
-
 
     #[tokio::test]
     async fn find_with_valid_words_returns_mock_response() {
@@ -176,9 +195,17 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         // Use words that are likely in the dictionary
-        let result = find(&client, &["apple".to_string(), "banana".to_string(), "cherry".to_string(), "date".to_string()]).await;
+        let result = find(
+            &client,
+            &[
+                "apple".to_string(),
+                "banana".to_string(),
+                "cherry".to_string(),
+                "date".to_string(),
+            ],
+        )
+        .await;
         // May fail if words aren't in dictionary, but should not panic
         let _ = result;
     }
 }
-

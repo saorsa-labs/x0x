@@ -114,7 +114,9 @@ mod tests {
 
     /// Start a mock axum server that returns the given JSON for any request.
     #[allow(dead_code)]
-    async fn start_mock_server(response_json: serde_json::Value) -> (String, tokio::sync::oneshot::Sender<()>) {
+    async fn start_mock_server(
+        response_json: serde_json::Value,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
         use std::sync::Arc;
 
         let json = Arc::new(response_json);
@@ -136,7 +138,9 @@ mod tests {
 
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(async { rx.await.ok(); })
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
                 .await
                 .ok();
         });
@@ -146,7 +150,6 @@ mod tests {
         (format!("http://{}", addr), tx)
     }
 
-    
     #[tokio::test]
     async fn sessions_returns_mock_response() {
         let mock_resp = serde_json::json!({"status": "ok"});
@@ -164,7 +167,6 @@ mod tests {
         assert!(result.is_ok(), "diagnostics should succeed: {:?}", result);
     }
 
-
     #[tokio::test]
     async fn cancel_returns_mock_response() {
         let mock_resp = serde_json::json!({"status": "ok"});
@@ -174,4 +176,3 @@ mod tests {
         assert!(result.is_ok(), "cancel should succeed: {:?}", result);
     }
 }
-

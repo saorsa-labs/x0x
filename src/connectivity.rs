@@ -277,7 +277,6 @@ mod tests {
         assert_ne!(ConnectOutcome::Direct(a), ConnectOutcome::Unreachable);
     }
 
-
     #[test]
     fn reachability_info_from_discovered_machine() {
         let machine = DiscoveredMachine {

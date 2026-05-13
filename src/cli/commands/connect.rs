@@ -75,7 +75,6 @@ pub async fn connect(client: &DaemonClient, words: &[String]) -> Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -84,7 +83,9 @@ mod tests {
 
     /// Start a mock axum server that returns the given JSON for any request.
     #[allow(dead_code)]
-    async fn start_mock_server(response_json: serde_json::Value) -> (String, tokio::sync::oneshot::Sender<()>) {
+    async fn start_mock_server(
+        response_json: serde_json::Value,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
         use std::sync::Arc;
 
         let json = Arc::new(response_json);
@@ -106,7 +107,9 @@ mod tests {
 
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(async { rx.await.ok(); })
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
                 .await
                 .ok();
         });
@@ -125,7 +128,10 @@ mod tests {
         let result = connect(&client, &["hello".to_string()]).await;
         assert!(result.is_err(), "connect with 1 word should fail");
         let err = format!("{:?}", result);
-        assert!(err.contains("4 words"), "error should mention 4 words: {err}");
+        assert!(
+            err.contains("4 words"),
+            "error should mention 4 words: {err}"
+        );
     }
 
     #[tokio::test]
@@ -137,7 +143,6 @@ mod tests {
         assert!(result.is_err(), "connect with 0 words should fail");
     }
 
-
     #[tokio::test]
     async fn connect_with_valid_words_and_matching_agent() {
         // Use the FourWordAdaptiveEncoder to encode a known address,
@@ -145,7 +150,10 @@ mod tests {
         let addr_encoder = FourWordAdaptiveEncoder::new().unwrap();
         let test_addr = "192.168.1.1:5483";
         let words_str = addr_encoder.encode(test_addr).unwrap();
-        let words: Vec<String> = words_str.split_whitespace().map(|s| s.to_string()).collect();
+        let words: Vec<String> = words_str
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(words.len(), 4, "should produce 4 words");
 
         // Mock server returns an agent with matching address
@@ -164,7 +172,10 @@ mod tests {
         let addr_encoder = FourWordAdaptiveEncoder::new().unwrap();
         let test_addr = "10.0.0.1:5483";
         let words_str = addr_encoder.encode(test_addr).unwrap();
-        let words: Vec<String> = words_str.split_whitespace().map(|s| s.to_string()).collect();
+        let words: Vec<String> = words_str
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
 
         // Mock server returns empty agents list
         let mock_resp = serde_json::json!([]);
@@ -174,4 +185,3 @@ mod tests {
         assert!(result.is_err(), "connect should fail when no agent matches");
     }
 }
-

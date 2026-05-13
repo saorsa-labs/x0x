@@ -544,7 +544,9 @@ mod tests {
 
     /// Start a mock axum server that returns the given JSON for any request.
     #[allow(dead_code)]
-    async fn start_mock_server(response_json: serde_json::Value) -> (String, tokio::sync::oneshot::Sender<()>) {
+    async fn start_mock_server(
+        response_json: serde_json::Value,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
         use std::sync::Arc;
 
         let json = Arc::new(response_json);
@@ -566,7 +568,9 @@ mod tests {
 
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(async { rx.await.ok(); })
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
                 .await
                 .ok();
         });
@@ -576,7 +580,6 @@ mod tests {
         (format!("http://{}", addr), tx)
     }
 
-    
     #[tokio::test]
     async fn list_returns_mock_response() {
         let mock_resp = serde_json::json!({"status": "ok"});
@@ -602,7 +605,6 @@ mod tests {
         assert!(result.is_ok(), "members should succeed: {:?}", result);
     }
 
-
     #[tokio::test]
     async fn leave_returns_mock_response() {
         let mock_resp = serde_json::json!({"ok": true});
@@ -627,7 +629,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = cancel_request(&client, "group-123", "req-1").await;
-        assert!(result.is_ok(), "cancel_request should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "cancel_request should succeed: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -645,7 +651,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = discover_nearby(&client).await;
-        assert!(result.is_ok(), "discover_nearby should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "discover_nearby should succeed: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -654,7 +664,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = discover_subscriptions(&client).await;
-        assert!(result.is_ok(), "discover_subscriptions should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "discover_subscriptions should succeed: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -699,7 +713,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = state_withdraw(&client, "group-123").await;
-        assert!(result.is_ok(), "state_withdraw should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "state_withdraw should succeed: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -735,7 +753,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = reject_request(&client, "group-123", "req-1").await;
-        assert!(result.is_ok(), "reject_request should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "reject_request should succeed: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -789,7 +811,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = request_access(&client, "group-123", None).await;
-        assert!(result.is_ok(), "request_access should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "request_access should succeed: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -798,7 +824,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = approve_request(&client, "group-123", "req-1").await;
-        assert!(result.is_ok(), "approve_request should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "approve_request should succeed: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -807,7 +837,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = discover_subscribe(&client, "tag", None, None).await;
-        assert!(result.is_ok(), "discover_subscribe should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "discover_subscribe should succeed: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -816,7 +850,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = discover_unsubscribe(&client, "tag", 42).await;
-        assert!(result.is_ok(), "discover_unsubscribe should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "discover_unsubscribe should succeed: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -825,7 +863,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = secure_encrypt(&client, "group-123", b"hello").await;
-        assert!(result.is_ok(), "secure_encrypt should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "secure_encrypt should succeed: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -836,6 +878,4 @@ mod tests {
         let result = secure_reseal(&client, "group-123", "agent-456").await;
         assert!(result.is_ok(), "secure_reseal should succeed: {:?}", result);
     }
-
 }
-

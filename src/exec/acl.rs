@@ -664,12 +664,14 @@ argv = ["journalctl", "-u", "x0xd", "-n", "<INT>"]
         assert!(!contains_shell_metachar("/safe/path-1.2"));
     }
 
-
     #[test]
     fn default_exec_acl_path_returns_expected() {
         let path = default_exec_acl_path();
         let path_str = path.to_string_lossy();
-        assert!(path_str.ends_with("exec-acl.toml"), "path should end with exec-acl.toml: {path_str}");
+        assert!(
+            path_str.ends_with("exec-acl.toml"),
+            "path should end with exec-acl.toml: {path_str}"
+        );
     }
 
     #[test]

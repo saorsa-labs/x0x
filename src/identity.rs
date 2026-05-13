@@ -1071,7 +1071,6 @@ mod tests {
         assert!(card.verify().is_err());
     }
 
-
     // ── MachineId ──────────────────────────────────────────────────────
 
     #[test]
@@ -1093,7 +1092,10 @@ mod tests {
         let id = MachineId([0xCC; 32]);
         let debug = format!("{:?}", id);
         // Debug is derived, so it shows the array
-        assert!(debug.contains("204"), "should contain decimal 204 (0xCC): {debug}");
+        assert!(
+            debug.contains("204"),
+            "should contain decimal 204 (0xCC): {debug}"
+        );
     }
 
     #[test]
@@ -1138,7 +1140,10 @@ mod tests {
     fn machine_keypair_debug_redacts_secret() {
         let kp = MachineKeypair::generate().unwrap();
         let debug = format!("{:?}", kp);
-        assert!(debug.contains("<REDACTED>"), "debug should redact secret key");
+        assert!(
+            debug.contains("<REDACTED>"),
+            "debug should redact secret key"
+        );
         assert!(debug.contains("public_key"), "debug should show public_key");
     }
 
@@ -1146,7 +1151,10 @@ mod tests {
     fn agent_keypair_debug_redacts_secret() {
         let kp = AgentKeypair::generate().unwrap();
         let debug = format!("{:?}", kp);
-        assert!(debug.contains("<REDACTED>"), "debug should redact secret key");
+        assert!(
+            debug.contains("<REDACTED>"),
+            "debug should redact secret key"
+        );
     }
 
     // ── Display ────────────────────────────────────────────────────────

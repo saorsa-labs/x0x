@@ -190,7 +190,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = TaskListStorage::new(dir.path().to_path_buf());
         let list_id = test_list_id(0x01);
-        let list = create_test_list(list_id.clone(), "test-list");
+        let list = create_test_list(list_id, "test-list");
 
         storage.save_task_list(&list_id, &list).await.unwrap();
         let loaded = storage.load_task_list(&list_id).await.unwrap();
@@ -223,7 +223,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = TaskListStorage::new(dir.path().to_path_buf());
         let list_id = test_list_id(0x03);
-        let list = create_test_list(list_id.clone(), "list-me");
+        let list = create_test_list(list_id, "list-me");
 
         storage.save_task_list(&list_id, &list).await.unwrap();
         let lists = storage.list_task_lists().await.unwrap();
@@ -237,7 +237,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = TaskListStorage::new(dir.path().to_path_buf());
         let list_id = test_list_id(0x04);
-        let list = create_test_list(list_id.clone(), "delete-me");
+        let list = create_test_list(list_id, "delete-me");
 
         storage.save_task_list(&list_id, &list).await.unwrap();
         storage.delete_task_list(&list_id).await.unwrap();
@@ -252,7 +252,7 @@ mod tests {
         let nested = dir.path().join("nested").join("deep");
         let storage = TaskListStorage::new(nested);
         let list_id = test_list_id(0x05);
-        let list = create_test_list(list_id.clone(), "nested-test");
+        let list = create_test_list(list_id, "nested-test");
 
         storage.save_task_list(&list_id, &list).await.unwrap();
         let loaded = storage.load_task_list(&list_id).await.unwrap();
@@ -264,7 +264,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = TaskListStorage::new(dir.path().to_path_buf());
         let list_id = test_list_id(0x06);
-        let list = create_test_list(list_id.clone(), "tmp-skip");
+        let list = create_test_list(list_id, "tmp-skip");
 
         storage.save_task_list(&list_id, &list).await.unwrap();
 
@@ -282,8 +282,8 @@ mod tests {
         let storage = TaskListStorage::new(dir.path().to_path_buf());
         let id_a = test_list_id(0x0A);
         let id_b = test_list_id(0x0B);
-        let list_a = create_test_list(id_a.clone(), "list-a");
-        let list_b = create_test_list(id_b.clone(), "list-b");
+        let list_a = create_test_list(id_a, "list-a");
+        let list_b = create_test_list(id_b, "list-b");
 
         storage.save_task_list(&id_a, &list_a).await.unwrap();
         storage.save_task_list(&id_b, &list_b).await.unwrap();

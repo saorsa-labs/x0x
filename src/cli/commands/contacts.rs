@@ -120,7 +120,9 @@ mod tests {
 
     /// Start a mock axum server that returns the given JSON for any request.
     #[allow(dead_code)]
-    async fn start_mock_server(response_json: serde_json::Value) -> (String, tokio::sync::oneshot::Sender<()>) {
+    async fn start_mock_server(
+        response_json: serde_json::Value,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
         use std::sync::Arc;
 
         let json = Arc::new(response_json);
@@ -142,7 +144,9 @@ mod tests {
 
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(async { rx.await.ok(); })
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
                 .await
                 .ok();
         });
@@ -152,10 +156,10 @@ mod tests {
         (format!("http://{}", addr), tx)
     }
 
-    
     #[tokio::test]
     async fn list_returns_mock_response() {
-        let mock_resp = serde_json::json!({"contacts": [{"agent_id": "abc123", "trust_level": "high"}]});
+        let mock_resp =
+            serde_json::json!({"contacts": [{"agent_id": "abc123", "trust_level": "high"}]});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = list(&client).await;
@@ -163,13 +167,13 @@ mod tests {
     }
     #[tokio::test]
     async fn revocations_returns_mock_response() {
-        let mock_resp = serde_json::json!({"contacts": [{"agent_id": "abc123", "trust_level": "high"}]});
+        let mock_resp =
+            serde_json::json!({"contacts": [{"agent_id": "abc123", "trust_level": "high"}]});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = revocations(&client, "abc123").await;
         assert!(result.is_ok(), "revocations should succeed: {:?}", result);
     }
-
 
     #[tokio::test]
     async fn trust_evaluate_returns_mock_response() {
@@ -177,9 +181,12 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = trust_evaluate(&client, "agent-123", "machine-456").await;
-        assert!(result.is_ok(), "trust_evaluate should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "trust_evaluate should succeed: {:?}",
+            result
+        );
     }
-
 
     #[tokio::test]
     async fn add_returns_mock_response() {
@@ -226,4 +233,3 @@ mod tests {
         assert!(result.is_ok(), "trust_set should succeed: {:?}", result);
     }
 }
-

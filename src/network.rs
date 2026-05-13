@@ -3756,7 +3756,6 @@ mod message_tests {
         assert!(ts < 2000000000);
     }
 
-
     #[test]
     fn default_max_connections_value() {
         assert_eq!(default_max_connections(), 32);

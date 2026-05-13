@@ -1062,7 +1062,6 @@ mod tests {
         assert_eq!(info.caller_role(&stranger_hex), None);
     }
 
-
     #[test]
     fn default_invite_max_role_is_member() {
         assert_eq!(default_invite_max_role(), GroupRole::Member);

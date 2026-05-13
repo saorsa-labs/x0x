@@ -542,7 +542,6 @@ mod tests {
         assert!(matches!(outcome, BackoffWait::Ack(DmAckOutcome::Accepted)));
     }
 
-
     #[test]
     fn fresh_request_id_generates_unique_ids() {
         let id1 = fresh_request_id();
@@ -588,7 +587,6 @@ mod tests {
         assert_eq!(receipt.request_id.len(), 16);
     }
 
-
     #[test]
     fn ack_outcome_to_receipt_converts_accepted() {
         let outcome = DmAckOutcome::Accepted;
@@ -601,13 +599,17 @@ mod tests {
 
     #[test]
     fn ack_outcome_to_receipt_rejected_returns_error() {
-        let outcome = DmAckOutcome::RejectedByPolicy { reason: "not trusted".to_string() };
+        let outcome = DmAckOutcome::RejectedByPolicy {
+            reason: "not trusted".to_string(),
+        };
         let result = ack_outcome_to_receipt(outcome, [2u8; 16], 1);
         assert!(result.is_err(), "rejected should return error");
         let err = result.unwrap_err();
-        assert!(format!("{:?}", err).contains("not trusted"), "error should contain reason");
+        assert!(
+            format!("{:?}", err).contains("not trusted"),
+            "error should contain reason"
+        );
     }
-
 
     // ── send_via_gossip early validation ──────────────────────────────
 
@@ -624,9 +626,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn send_via_gossip_payload_size_check_constant() {
         use crate::dm::MAX_PAYLOAD_BYTES;
-        // Verify the constant is reasonable
+        // Documentation assertions — verify the constant is in the expected
+        // range. Both bounds are compile-time constants, so the asserts are
+        // tautological in nextest's eyes but document the invariant.
         assert!(MAX_PAYLOAD_BYTES > 0);
         assert!(MAX_PAYLOAD_BYTES <= 1024 * 1024); // Max 1MB
     }

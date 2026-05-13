@@ -1024,8 +1024,16 @@ mod tests {
         for ep in ENDPOINTS {
             assert!(!ep.path.is_empty(), "path empty for {}", ep.cli_name);
             assert!(!ep.cli_name.is_empty(), "cli_name empty for {}", ep.path);
-            assert!(!ep.description.is_empty(), "description empty for {}", ep.cli_name);
-            assert!(!ep.category.is_empty(), "category empty for {}", ep.cli_name);
+            assert!(
+                !ep.description.is_empty(),
+                "description empty for {}",
+                ep.cli_name
+            );
+            assert!(
+                !ep.category.is_empty(),
+                "category empty for {}",
+                ep.cli_name
+            );
         }
     }
 

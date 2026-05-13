@@ -76,7 +76,9 @@ mod tests {
 
     /// Start a mock axum server that returns the given JSON for any request.
     #[allow(dead_code)]
-    async fn start_mock_server(response_json: serde_json::Value) -> (String, tokio::sync::oneshot::Sender<()>) {
+    async fn start_mock_server(
+        response_json: serde_json::Value,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
         use std::sync::Arc;
 
         let json = Arc::new(response_json);
@@ -98,7 +100,9 @@ mod tests {
 
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(async { rx.await.ok(); })
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
                 .await
                 .ok();
         });
@@ -108,16 +112,15 @@ mod tests {
         (format!("http://{}", addr), tx)
     }
 
-    
     #[tokio::test]
     async fn list_returns_mock_response() {
-        let mock_resp = serde_json::json!({"agents": [{"agent_id": "abc123", "addresses": ["1.2.3.4:5483"]}]});
+        let mock_resp =
+            serde_json::json!({"agents": [{"agent_id": "abc123", "addresses": ["1.2.3.4:5483"]}]});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let result = list(&client, false).await;
         assert!(result.is_ok(), "list should succeed: {:?}", result);
     }
-
 
     #[tokio::test]
     async fn get_returns_mock_response() {
@@ -160,4 +163,3 @@ mod tests {
         assert!(result.is_ok(), "by_user should succeed: {:?}", result);
     }
 }
-

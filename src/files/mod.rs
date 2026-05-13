@@ -172,7 +172,6 @@ pub enum FileMessage {
     },
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,7 +290,9 @@ mod tests {
 
     #[test]
     fn file_message_accept_roundtrip() {
-        let msg = FileMessage::Accept { transfer_id: "t1".to_string() };
+        let msg = FileMessage::Accept {
+            transfer_id: "t1".to_string(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: FileMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, FileMessage::Accept { .. }));
@@ -299,7 +300,10 @@ mod tests {
 
     #[test]
     fn file_message_reject_roundtrip() {
-        let msg = FileMessage::Reject { transfer_id: "t1".to_string(), reason: "too big".to_string() };
+        let msg = FileMessage::Reject {
+            transfer_id: "t1".to_string(),
+            reason: "too big".to_string(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: FileMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, FileMessage::Reject { .. }));
@@ -307,10 +311,12 @@ mod tests {
 
     #[test]
     fn file_message_chunk_ack_roundtrip() {
-        let msg = FileMessage::ChunkAck { transfer_id: "t1".to_string(), sequence: 5 };
+        let msg = FileMessage::ChunkAck {
+            transfer_id: "t1".to_string(),
+            sequence: 5,
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: FileMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, FileMessage::ChunkAck { .. }));
     }
 }
-

@@ -435,7 +435,6 @@ fn find_x0xd() -> Result<std::path::PathBuf> {
     anyhow::bail!("x0xd not found. Install it or ensure it's in the same directory as x0x.")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,21 +444,33 @@ mod tests {
         let path = port_file_path(None).unwrap();
         let path_str = path.to_string_lossy();
         assert!(path_str.contains("x0x"), "should contain x0x: {path_str}");
-        assert!(path_str.ends_with("api.port"), "should end with api.port: {path_str}");
+        assert!(
+            path_str.ends_with("api.port"),
+            "should end with api.port: {path_str}"
+        );
     }
 
     #[test]
     fn port_file_path_named() {
         let path = port_file_path(Some("test-instance")).unwrap();
         let path_str = path.to_string_lossy();
-        assert!(path_str.contains("x0x-test-instance"), "should contain instance name: {path_str}");
-        assert!(path_str.ends_with("api.port"), "should end with api.port: {path_str}");
+        assert!(
+            path_str.contains("x0x-test-instance"),
+            "should contain instance name: {path_str}"
+        );
+        assert!(
+            path_str.ends_with("api.port"),
+            "should end with api.port: {path_str}"
+        );
     }
 
     #[test]
     fn discovered_base_url_returns_none_for_missing_file() {
         let result = discovered_base_url(Some("nonexistent-instance-xyz-12345")).unwrap();
-        assert!(result.is_none(), "should return None for nonexistent instance");
+        assert!(
+            result.is_none(),
+            "should return None for nonexistent instance"
+        );
     }
 
     #[test]
@@ -472,10 +483,11 @@ mod tests {
         assert!(result.is_ok());
     }
 
-
     /// Start a mock axum server that returns the given JSON for any request.
     #[allow(dead_code)]
-    async fn start_mock_server(response_json: serde_json::Value) -> (String, tokio::sync::oneshot::Sender<()>) {
+    async fn start_mock_server(
+        response_json: serde_json::Value,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
         use std::sync::Arc;
 
         let json = Arc::new(response_json);
@@ -497,7 +509,9 @@ mod tests {
 
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(async { rx.await.ok(); })
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
                 .await
                 .ok();
         });
@@ -530,7 +544,6 @@ mod tests {
         assert!(result.is_ok(), "doctor should succeed: {:?}", result);
     }
 
-
     #[tokio::test]
     async fn instances_returns_empty_when_no_port_files() {
         // In a test environment without port files, instances should return empty
@@ -542,7 +555,10 @@ mod tests {
     async fn autostart_remove_does_not_panic() {
         // Should not panic even without autostart configured
         let result = autostart_remove().await;
-        assert!(result.is_ok(), "autostart_remove should not fail: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "autostart_remove should not fail: {:?}",
+            result
+        );
     }
 }
-
