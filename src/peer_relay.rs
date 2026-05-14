@@ -11,14 +11,14 @@
 //! When a direct DM to peer `P` fails `fail_threshold` times within
 //! `fail_window`, `P` is marked `needs_relay`. The sender then picks a
 //! relay candidate `R` and wraps the (already end-to-end encrypted and
-//! origin-signed) [`DmEnvelope`] inside a [`RelayedDm`]:
+//! origin-signed) `DmEnvelope` inside a `RelayedDm`:
 //!
 //! ```text
 //! RelayedDm { header: RelayHeader { dst, sender, originated_at, sig },
 //!             inner:  DmEnvelope (opaque — e2e encrypted, origin-signed) }
 //! ```
 //!
-//! `R` verifies the [`RelayHeader`] signature (proves the relay request
+//! `R` verifies the `RelayHeader` signature (proves the relay request
 //! genuinely came from `sender`), confirms it is itself only being
 //! asked to forward — not to be the final recipient — and sends
 //! `inner` **directly** to `dst`. There is no re-wrapping: a relay
@@ -28,10 +28,10 @@
 //!
 //! ## Security
 //!
-//! - The inner [`DmEnvelope`] keeps its X0X-0060 ACK-v2 + MLS
+//! - The inner `DmEnvelope` keeps its X0X-0060 ACK-v2 + MLS
 //!   end-to-end encryption and origin ML-DSA-65 signature intact. The
 //!   relay `R` sees only the routing header — never the plaintext.
-//! - The [`RelayHeader`] is independently signed by the sender's
+//! - The `RelayHeader` is independently signed by the sender's
 //!   ML-DSA-65 agent key over domain-separated bytes, so `R` cannot be
 //!   tricked into relaying for a forged origin, and a tampered
 //!   `dst` / `originated_at` is rejected.
@@ -41,8 +41,8 @@
 //!
 //! This ships the **primitives + telemetry**: the `RelayedDm` /
 //! `RelayHeader` wire types, signed-bytes construction + verification,
-//! the [`PeerRelay`] engine (per-peer failure tracking, `needs_relay`
-//! decision, relay-candidate selection), and the [`RelayStats`]
+//! the `PeerRelay` engine (per-peer failure tracking, `needs_relay`
+//! decision, relay-candidate selection), and the `RelayStats`
 //! counters. The `RelayPolicy` is **disabled by default** — the relay
 //! path only engages when a runtime explicitly enables it. Wiring the
 //! engine into `Agent::send_direct_with_config`'s fallback path and
@@ -153,7 +153,7 @@ impl RelayHeader {
     ///
     /// Returns `true` only when all three hold. Does **not** check
     /// freshness or whether *we* are the intended relay — those are the
-    /// caller's job (see [`PeerRelay::accept_relayed`]).
+    /// caller's job (see [`PeerRelay::disposition_for`]).
     #[must_use]
     pub fn verify(&self) -> bool {
         if self.version != Self::VERSION {
