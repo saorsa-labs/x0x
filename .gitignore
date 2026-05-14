@@ -41,3 +41,4 @@ test.txt
 *next-session*.md
 NETWORK_TEST_REPORT.txt
 *_TEST_REPORT.txt
+.worktrees/
