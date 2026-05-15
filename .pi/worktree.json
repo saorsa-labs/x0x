@@ -1,0 +1,9 @@
+{
+  "dir": ".worktrees",
+  "branchPrefix": "worktree/",
+  "linkEnvFiles": true,
+  "postCreate": [
+    "cargo check --quiet 2>&1 || true"
+  ],
+  "preRemove": []
+}

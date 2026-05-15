@@ -268,12 +268,17 @@ struct DaemonUpdateConfig {
     #[serde(default = "default_true")]
     enabled: bool,
 
-    /// Maximum rollout window in minutes. Default: 1440 (24 hours).
+    /// Maximum rollout window in minutes. Default: 0 (immediate — no delay).
+    /// Set to a positive value (e.g. 1440 for 24h) to spread upgrades across
+    /// the fleet using a deterministic hash of the node MachineId.
     #[serde(default = "default_rollout_window_minutes")]
     rollout_window_minutes: u64,
 
     /// Exit cleanly for service manager restart instead of spawning.
-    #[serde(default)]
+    /// Default: true — the daemon stops with exit code 0 so that systemd
+    /// (or any supervisor with Restart=always) picks up the new binary.
+    /// Set to false to use `exec()` in-place replacement instead.
+    #[serde(default = "default_true")]
     stop_on_upgrade: bool,
 
     /// GitHub fallback poll interval in minutes. Default: 2880 (48 hours).
@@ -299,8 +304,8 @@ impl Default for DaemonUpdateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            rollout_window_minutes: 1440,
-            stop_on_upgrade: false,
+            rollout_window_minutes: 0,
+            stop_on_upgrade: true,
             fallback_check_interval_minutes: 2880,
             repo: default_update_repo(),
             include_prereleases: false,
@@ -314,7 +319,7 @@ fn default_true() -> bool {
 }
 
 fn default_rollout_window_minutes() -> u64 {
-    1440
+    0
 }
 
 fn default_fallback_check_interval_minutes() -> u64 {
