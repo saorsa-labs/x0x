@@ -133,6 +133,12 @@ pub mod dm_inbox;
 /// and `InFlightAcks` wait.
 pub mod dm_send;
 
+/// Application-level peer relay (X0X-0070) — Tailscale-style fallback that
+/// wraps an opaque, end-to-end-encrypted [`dm::DmEnvelope`] in a cleartext,
+/// signed [`peer_relay::RelayHeader`] so a third peer can forward a DM when
+/// the direct path is unreachable.
+pub mod peer_relay;
+
 /// Presence system — beacons, FOAF discovery, and online/offline events.
 pub mod presence;
 

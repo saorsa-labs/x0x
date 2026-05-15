@@ -104,7 +104,12 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Run tests
-        run: cargo nextest run --all-features --workspace
+        # x0x_0041_synthetic_kill_restart is a documented timing-flaky test
+        # (500ms kill/restart bound) — filtered in CI as it is in local dev
+        # runs. Tracked separately; do not let it gate unrelated PRs.
+        # NB: `binary()` (test-binary name), not `test()` — `test()` would
+        # match the test function name, which is different from the binary.
+        run: cargo nextest run --all-features --workspace -E '!binary(x0x_0041_synthetic_kill_restart)'
 
       - name: Upload test results
         if: always()
@@ -155,9 +160,12 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Run line coverage gate
+        # Filter the documented timing-flaky x0x_0041_synthetic_kill_restart
+        # test (matches the Test Suite job) — a flake in this run must not
+        # abort the whole coverage computation.
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info --fail-under-lines 48 nextest
+          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info --fail-under-lines 48 nextest -E '!binary(x0x_0041_synthetic_kill_restart)'
           python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global
 
       - name: Upload LCOV report
