@@ -90,7 +90,7 @@ impl AutoApplyUpgrader {
             .ok_or(UpgradeError::NoPlatformAsset)?;
 
         let target_path = current_binary_path()?;
-        let upgrader = Upgrader::new(target_path.clone(), current_version);
+        let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
         let temp_dir = upgrader.create_temp_dir()?;
 
         let archive_path = temp_dir.join("archive");
@@ -143,6 +143,33 @@ impl AutoApplyUpgrader {
         info!("Extracting binary from archive...");
         let extracted_path = temp_dir.join("extracted-binary");
         extract_binary_from_archive(&archive_path, &extracted_path, &binary_name)?;
+
+        // If we are upgrading x0xd, also check for companion x0x binary and upgrade it too.
+        if self.binary_name == "x0xd" {
+            let parent_dir = target_path
+                .parent()
+                .ok_or_else(|| UpgradeError::Other("target has no parent directory".to_string()))?;
+            let x0x_name = if cfg!(target_os = "windows") {
+                "x0x.exe"
+            } else {
+                "x0x"
+            };
+            let x0x_path = parent_dir.join(x0x_name);
+            if x0x_path.exists() {
+                info!("Found x0x CLI companion in same directory, upgrading it too...");
+                let extracted_x0x = temp_dir.join("extracted-x0x");
+                if let Err(e) = extract_binary_from_archive(&archive_path, &extracted_x0x, x0x_name)
+                {
+                    warn!("Failed to extract companion x0x binary: {e}");
+                } else {
+                    let x0x_upgrader = Upgrader::new(x0x_path.clone(), current_version.clone());
+                    match x0x_upgrader.perform_upgrade(&extracted_x0x, &target_version) {
+                        Ok(_) => info!("x0x companion upgraded successfully"),
+                        Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
+                    }
+                }
+            }
+        }
 
         // Replace binary (with backup + rollback)
         let result = upgrader.perform_upgrade(&extracted_path, &target_version)?;
