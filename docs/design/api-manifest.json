@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 130,
+  "endpoint_count": 131,
   "endpoints": [
     {
       "category": "status",
@@ -63,6 +63,13 @@
       "description": "Import agent card to contacts",
       "method": "POST",
       "path": "/agent/card/import"
+    },
+    {
+      "category": "identity",
+      "cli_name": "agent sign",
+      "description": "Detached ML-DSA-65 signature over a caller-supplied payload",
+      "method": "POST",
+      "path": "/agent/sign"
     },
     {
       "category": "network",
