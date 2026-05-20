@@ -16,7 +16,7 @@
 //! ```
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use x0x::cli::commands;
@@ -1695,6 +1695,30 @@ x0x (v{VERSION})
     Ok(())
 }
 
+fn remove_binary_file(path: &Path, output_prefix: &str) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            eprintln!("{output_prefix}Removed {}", path.display());
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "{output_prefix}Failed to remove {}: {error}",
+                path.display()
+            );
+            Err(format!("{}: {error}", path.display()))
+        }
+    }
+}
+
+fn report_binary_removal_failures(failures: &[String]) -> anyhow::Result<()> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to remove binaries: {}", failures.join("; "))
+    }
+}
+
 // ── Uninstall ──────────────────────────────────────────────────────────────
 
 async fn uninstall() -> anyhow::Result<()> {
@@ -1751,15 +1775,19 @@ async fn uninstall() -> anyhow::Result<()> {
         .await;
 
     // Remove binaries
+    let mut removal_failures = Vec::new();
     if let Some(ref d) = x0xd_path {
         if d.exists() {
-            std::fs::remove_file(d).ok();
-            eprintln!("Removed {}", d.display());
+            if let Err(error) = remove_binary_file(d, "") {
+                removal_failures.push(error);
+            }
         }
     }
     // Remove self last
-    std::fs::remove_file(&x0x_path).ok();
-    eprintln!("Removed {}", x0x_path.display());
+    if let Err(error) = remove_binary_file(&x0x_path, "") {
+        removal_failures.push(error);
+    }
+    report_binary_removal_failures(&removal_failures)?;
 
     eprintln!();
     eprintln!("x0x uninstalled. Your data and keys are preserved.");
@@ -1891,14 +1919,18 @@ async fn purge() -> anyhow::Result<()> {
     }
 
     // Remove binaries
+    let mut removal_failures = Vec::new();
     if let Some(ref d) = x0xd_path {
         if d.exists() {
-            std::fs::remove_file(d).ok();
-            eprintln!("  Removed {}", d.display());
+            if let Err(error) = remove_binary_file(d, "  ") {
+                removal_failures.push(error);
+            }
         }
     }
-    std::fs::remove_file(&x0x_path).ok();
-    eprintln!("  Removed {}", x0x_path.display());
+    if let Err(error) = remove_binary_file(&x0x_path, "  ") {
+        removal_failures.push(error);
+    }
+    report_binary_removal_failures(&removal_failures)?;
 
     eprintln!();
     eprintln!("x0x has been completely removed.");
