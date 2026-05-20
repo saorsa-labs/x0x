@@ -1,5 +1,6 @@
 //! Path discovery for destructive CLI purge.
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +57,17 @@ pub fn collect_purge_paths(data_dir: Option<&Path>, home_dir: Option<&Path>) -> 
     paths
 }
 
+pub fn agent_id_confirmation_hint(home_dir: Option<&Path>) -> anyhow::Result<String> {
+    let home_dir = home_dir.ok_or_else(|| anyhow::anyhow!("home directory is unavailable"))?;
+    let key_path = home_dir.join(".x0x/agent.key");
+    let data = std::fs::read(&key_path)
+        .with_context(|| format!("failed to read {}", key_path.display()))?;
+    let keypair = crate::storage::deserialize_agent_keypair(&data)
+        .with_context(|| format!("failed to parse {}", key_path.display()))?;
+
+    Ok(hex::encode(&keypair.agent_id().as_bytes()[..4]))
+}
+
 fn push_existing_dir(paths: &mut Vec<PurgePath>, kind: PurgePathKind, path: PathBuf) {
     if path.is_dir() {
         paths.push(PurgePath { kind, path });
@@ -64,7 +76,9 @@ fn push_existing_dir(paths: &mut Vec<PurgePath>, kind: PurgePathKind, path: Path
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_purge_paths, PurgePathKind};
+    use super::{agent_id_confirmation_hint, collect_purge_paths, PurgePathKind};
+    use crate::identity::AgentKeypair;
+    use crate::storage::serialize_agent_keypair;
 
     #[test]
     fn includes_named_instance_data_dirs() -> std::io::Result<()> {
@@ -109,6 +123,50 @@ mod tests {
         assert!(!paths.iter().any(|path| path.path == unrelated_data));
         assert!(!paths.iter().any(|path| path.path == named_data_file));
         assert!(!paths.iter().any(|path| path.path == misleading_home_data));
+
+        Ok(())
+    }
+
+    #[test]
+    fn agent_id_confirmation_hint_errors_when_key_is_missing() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let result = agent_id_confirmation_hint(Some(tmp.path()));
+
+        assert!(result.is_err());
+        assert!(!matches!(result.as_deref(), Ok("unknown")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn agent_id_confirmation_hint_errors_when_key_is_corrupt() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let key_dir = tmp.path().join(".x0x");
+        std::fs::create_dir_all(&key_dir)?;
+        std::fs::write(key_dir.join("agent.key"), b"not an agent key")?;
+
+        let result = agent_id_confirmation_hint(Some(tmp.path()));
+
+        assert!(result.is_err());
+        assert!(!matches!(result.as_deref(), Ok("unknown")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn agent_id_confirmation_hint_returns_first_eight_hex_chars() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let key_dir = tmp.path().join(".x0x");
+        std::fs::create_dir_all(&key_dir)?;
+
+        let keypair = AgentKeypair::generate()?;
+        let expected = hex::encode(&keypair.agent_id().as_bytes()[..4]);
+        std::fs::write(
+            key_dir.join("agent.key"),
+            serialize_agent_keypair(&keypair)?,
+        )?;
+
+        assert_eq!(agent_id_confirmation_hint(Some(tmp.path()))?, expected);
 
         Ok(())
     }

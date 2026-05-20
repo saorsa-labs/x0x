@@ -1870,22 +1870,13 @@ async fn purge() -> anyhow::Result<()> {
     input.clear();
     eprintln!();
     eprintln!("\x1b[33mStep 3/3: Verify your agent ID.\x1b[0m");
-    // Try to read agent ID from key file
-    let agent_id_hint = if let Some(home) = dirs::home_dir() {
-        let key_path = home.join(".x0x/agent.key");
-        if key_path.exists() {
-            match std::fs::read(&key_path) {
-                Ok(data) => match x0x::storage::deserialize_agent_keypair(&data) {
-                    Ok(kp) => hex::encode(&kp.agent_id().as_bytes()[..4]),
-                    Err(_) => "unknown".to_string(),
-                },
-                Err(_) => "unknown".to_string(),
-            }
-        } else {
-            "unknown".to_string()
+    let agent_id_hint = match commands::purge::agent_id_confirmation_hint(home_dir.as_deref()) {
+        Ok(hint) => hint,
+        Err(error) => {
+            eprintln!("Cannot verify your agent ID: {error:#}");
+            eprintln!("Cancelled without removing data.");
+            return Ok(());
         }
-    } else {
-        "unknown".to_string()
     };
     eprintln!("Your agent ID starts with: {agent_id_hint}...");
     eprint!("Type the first 8 characters of your agent ID to confirm: ");
