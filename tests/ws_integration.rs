@@ -91,6 +91,68 @@ async fn ws_subscribe_topic(
     panic!("did not receive subscribed frame after subscribe command");
 }
 
+async fn ws_unsubscribe_topic(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    topic: &str,
+) {
+    ws_send(
+        ws,
+        &format!(r#"{{"type":"unsubscribe","topics":["{topic}"]}}"#),
+    )
+    .await;
+
+    let mut confirmed = false;
+    for _ in 0..5 {
+        let Some(msg) = ws_recv_text(ws, 5).await else {
+            break;
+        };
+        let Ok(frame) = serde_json::from_str::<Value>(&msg) else {
+            continue;
+        };
+        match frame["type"].as_str() {
+            Some("unsubscribed") => {
+                confirmed = true;
+                break;
+            }
+            Some("pong") | Some("connected") => continue,
+            _ => {}
+        }
+    }
+
+    assert!(confirmed, "did not receive unsubscribed frame");
+}
+
+async fn ws_recv_topic_message(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    topic: &str,
+    timeout_secs: u64,
+) -> Option<Value> {
+    tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    if frame["type"].as_str() == Some("message")
+                        && frame["topic"].as_str() == Some(topic)
+                    {
+                        return Some(frame);
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .unwrap_or(None)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -170,6 +232,79 @@ async fn ws_subscribe_publish_receive() {
     );
 
     ws.close(None).await.expect("close");
+}
+
+/// Unsubscribe removes only that session's topic forwarder; duplicate subscribe is idempotent.
+#[tokio::test]
+#[ignore]
+async fn ws_unsubscribe_stops_forwarder_and_repeat_subscribe_is_idempotent() {
+    let d = daemon().await;
+    let client = client_with_auth(&d);
+    let topic = format!("unsubscribe-test-{}", rand::random::<u32>());
+
+    let mut unsubscribed = ws_connect(&d, "/ws").await;
+    let _ = ws_recv_text(&mut unsubscribed, 5).await;
+    ws_subscribe_topic(&mut unsubscribed, &topic).await;
+    ws_subscribe_topic(&mut unsubscribed, &topic).await;
+
+    let mut subscribed = ws_connect(&d, "/ws").await;
+    let _ = ws_recv_text(&mut subscribed, 5).await;
+    ws_subscribe_topic(&mut subscribed, &topic).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let first_payload =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"first");
+    let first_status = client
+        .post(d.url("/publish"))
+        .json(&json!({"topic": &topic, "payload": &first_payload}))
+        .send()
+        .await
+        .ok()
+        .map(|resp| resp.status().as_u16());
+    assert_eq!(first_status, Some(200));
+
+    let first = ws_recv_topic_message(&mut unsubscribed, &topic, 10).await;
+    assert_eq!(
+        first.as_ref().and_then(|frame| frame["payload"].as_str()),
+        Some(first_payload.as_str())
+    );
+    assert!(
+        ws_recv_topic_message(&mut unsubscribed, &topic, 1)
+            .await
+            .is_none(),
+        "repeat subscribe delivered a duplicate message"
+    );
+    let _ = ws_recv_topic_message(&mut subscribed, &topic, 10).await;
+
+    ws_unsubscribe_topic(&mut unsubscribed, &topic).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let second_payload =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"second");
+    let second_status = client
+        .post(d.url("/publish"))
+        .json(&json!({"topic": &topic, "payload": &second_payload}))
+        .send()
+        .await
+        .ok()
+        .map(|resp| resp.status().as_u16());
+    assert_eq!(second_status, Some(200));
+
+    let second = ws_recv_topic_message(&mut subscribed, &topic, 10).await;
+    assert_eq!(
+        second.as_ref().and_then(|frame| frame["payload"].as_str()),
+        Some(second_payload.as_str())
+    );
+    assert!(
+        ws_recv_topic_message(&mut unsubscribed, &topic, 1)
+            .await
+            .is_none(),
+        "unsubscribed session received a topic message"
+    );
+
+    unsubscribed.close(None).await.ok();
+    subscribed.close(None).await.ok();
 }
 
 /// Session shows up in /ws/sessions while connected.

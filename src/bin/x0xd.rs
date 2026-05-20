@@ -622,8 +622,8 @@ struct WsSession {
     subscribed_topics: HashSet<String>,
     /// Whether this session receives direct messages.
     receives_direct: bool,
-    /// Handles for spawned per-session forwarder tasks (aborted on cleanup).
-    forwarder_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Per-topic forwarder tasks for this session (aborted on unsubscribe/cleanup).
+    topic_forwarders: HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 /// Shared state for a single gossip topic subscription shared across WS sessions.
@@ -13312,7 +13312,7 @@ async fn handle_ws_connection(
         id: session_id.clone(),
         subscribed_topics: HashSet::new(),
         receives_direct: direct_mode,
-        forwarder_handles: Vec::new(),
+        topic_forwarders: HashMap::new(),
     };
     state
         .ws_sessions
@@ -13407,10 +13407,12 @@ async fn handle_ws_connection(
     // Cleanup: remove session, abort per-session forwarders
     let subscribed_topics =
         if let Some(session) = state.ws_sessions.write().await.remove(&session_id) {
-            for h in session.forwarder_handles {
-                h.abort();
+            let mut subscribed_topics = session.subscribed_topics;
+            for (topic, handle) in session.topic_forwarders {
+                subscribed_topics.insert(topic);
+                handle.abort();
             }
-            session.subscribed_topics
+            subscribed_topics
         } else {
             HashSet::new()
         };
@@ -13474,7 +13476,19 @@ async fn handle_ws_command(
         WsInbound::Subscribe { topics } => {
             // Shared fan-out: one gossip subscription per topic, broadcast to all WS sessions
             let mut handles = Vec::new();
+            let already_subscribed = {
+                let sessions = state.ws_sessions.read().await;
+                let Some(session) = sessions.get(session_id) else {
+                    return;
+                };
+                session.subscribed_topics.clone()
+            };
+            let mut requested_topics = HashSet::new();
             for topic in &topics {
+                if !requested_topics.insert(topic.clone()) || already_subscribed.contains(topic) {
+                    continue;
+                }
+
                 let broadcast_rx = {
                     let mut ws_topics = state.ws_topics.write().await;
                     if let Some(ts) = ws_topics.get_mut(topic) {
@@ -13536,25 +13550,54 @@ async fn handle_ws_command(
                         }
                     }
                 });
-                handles.push(handle);
+                handles.push((topic.clone(), handle));
             }
 
             // Store handles in session for cleanup
-            if let Some(session) = state.ws_sessions.write().await.get_mut(session_id) {
-                session.subscribed_topics.extend(topics.iter().cloned());
-                session.forwarder_handles.extend(handles);
+            let mut orphaned_handles = Vec::new();
+            {
+                let mut sessions = state.ws_sessions.write().await;
+                if let Some(session) = sessions.get_mut(session_id) {
+                    for (topic, handle) in handles {
+                        session.subscribed_topics.insert(topic.clone());
+                        if let Some(previous) = session.topic_forwarders.insert(topic, handle) {
+                            previous.abort();
+                        }
+                    }
+                } else {
+                    orphaned_handles = handles;
+                }
+            }
+            for (topic, handle) in orphaned_handles {
+                handle.abort();
+                cleanup_ws_topic_if_empty(state, &topic, session_id).await;
             }
 
             let _ = tx.send(WsOutbound::Subscribed { topics });
         }
 
         WsInbound::Unsubscribe { topics } => {
+            let mut handles = Vec::new();
+            let mut topics_to_cleanup = Vec::new();
             if let Some(session) = state.ws_sessions.write().await.get_mut(session_id) {
+                let mut requested_topics = HashSet::new();
                 for t in &topics {
-                    session.subscribed_topics.remove(t);
+                    if !requested_topics.insert(t.clone()) {
+                        continue;
+                    }
+                    let removed_subscription = session.subscribed_topics.remove(t);
+                    if let Some(handle) = session.topic_forwarders.remove(t) {
+                        handles.push(handle);
+                        topics_to_cleanup.push(t.clone());
+                    } else if removed_subscription {
+                        topics_to_cleanup.push(t.clone());
+                    }
                 }
             }
-            for topic in &topics {
+            for handle in handles {
+                handle.abort();
+            }
+            for topic in &topics_to_cleanup {
                 cleanup_ws_topic_if_empty(state, topic, session_id).await;
             }
             let _ = tx.send(WsOutbound::Unsubscribed { topics });
