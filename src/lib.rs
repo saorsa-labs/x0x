@@ -491,6 +491,10 @@ pub const IDENTITY_TTL_SECS: u64 = 900;
 const DISCOVERY_REBROADCAST_STATE_CAP: usize = 1024;
 const DISCOVERY_REBROADCAST_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+fn discovery_record_is_live(_announced_at: u64, last_seen: u64, cutoff: u64) -> bool {
+    last_seen >= cutoff
+}
+
 fn should_rebroadcast_discovery_once<K>(
     state: &mut std::collections::HashMap<K, std::time::Instant>,
     key: K,
@@ -4066,7 +4070,7 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|a| a.last_seen >= cutoff)
+            .filter(|a| discovery_record_is_live(a.announced_at, a.last_seen, cutoff))
             .cloned()
             .collect();
         agents.sort_by_key(|a| a.agent_id.0);
@@ -4090,7 +4094,10 @@ impl Agent {
         let mut seen = std::collections::HashSet::new();
         let mut agents = Vec::new();
 
-        for agent in cache.values().filter(|agent| agent.last_seen >= cutoff) {
+        for agent in cache
+            .values()
+            .filter(|agent| discovery_record_is_live(agent.announced_at, agent.last_seen, cutoff))
+        {
             if seen.insert(agent.agent_id) {
                 agents.push(agent.clone());
             }
@@ -4173,7 +4180,7 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|m| m.announced_at >= cutoff)
+            .filter(|m| discovery_record_is_live(m.announced_at, m.last_seen, cutoff))
             .cloned()
             .collect();
         machines.sort_by_key(|m| m.machine_id.0);
@@ -4257,7 +4264,10 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|m| m.announced_at >= cutoff && m.user_ids.contains(&user_id))
+            .filter(|m| {
+                discovery_record_is_live(m.announced_at, m.last_seen, cutoff)
+                    && m.user_ids.contains(&user_id)
+            })
             .cloned()
             .collect();
         machines.sort_by_key(|m| m.machine_id.0);
@@ -4353,7 +4363,7 @@ impl Agent {
             .read()
             .await
             .get(&user_id)
-            .filter(|u| u.announced_at >= cutoff)
+            .filter(|u| discovery_record_is_live(u.announced_at, u.last_seen, cutoff))
             .cloned())
     }
 
@@ -4370,7 +4380,7 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|u| u.announced_at >= cutoff)
+            .filter(|u| discovery_record_is_live(u.announced_at, u.last_seen, cutoff))
             .cloned()
             .collect();
         users.sort_by_key(|u| u.user_id.0);
@@ -5598,7 +5608,7 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|a| a.last_seen >= cutoff)
+            .filter(|a| discovery_record_is_live(a.announced_at, a.last_seen, cutoff))
             .map(|a| a.agent_id)
             .collect();
         agents.sort_by_key(|a| a.0);
@@ -5962,7 +5972,10 @@ impl Agent {
             .read()
             .await
             .values()
-            .filter(|a| a.announced_at >= cutoff && a.user_id == Some(user_id))
+            .filter(|a| {
+                discovery_record_is_live(a.announced_at, a.last_seen, cutoff)
+                    && a.user_id == Some(user_id)
+            })
             .cloned()
             .collect())
     }
@@ -7776,6 +7789,15 @@ mod tests {
             (7_u8, 43_u64),
             now + std::time::Duration::from_secs(20),
         ));
+    }
+
+    #[test]
+    fn discovery_ttl_uses_local_last_seen_not_sender_timestamp() {
+        let cutoff = 900;
+
+        assert!(discovery_record_is_live(100, 1_000, cutoff));
+        assert!(discovery_record_is_live(10_000, cutoff, cutoff));
+        assert!(!discovery_record_is_live(10_000, cutoff - 1, cutoff));
     }
 
     #[test]
