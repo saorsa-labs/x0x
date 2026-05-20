@@ -1234,7 +1234,18 @@ fn deserialize_identity_announcement(
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-        .allow_trailing_bytes()
+        .reject_trailing_bytes()
+        .deserialize(payload)
+}
+
+fn deserialize_user_announcement(
+    payload: &[u8],
+) -> std::result::Result<UserAnnouncement, Box<bincode::ErrorKind>> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+        .reject_trailing_bytes()
         .deserialize(payload)
 }
 
@@ -4573,16 +4584,8 @@ impl Agent {
                         continue;
                     }
                     DiscoveryMessage::User(msg) => {
-                        let decoded = {
-                            use bincode::Options;
-                            bincode::options()
-                                .with_fixint_encoding()
-                                .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-                                .allow_trailing_bytes()
-                                .deserialize::<UserAnnouncement>(&msg.payload)
-                        };
                         let raw_payload = msg.payload.clone();
-                        let announcement = match decoded {
+                        let announcement = match deserialize_user_announcement(&raw_payload) {
                             Ok(a) => a,
                             Err(e) => {
                                 tracing::debug!(
@@ -8331,6 +8334,28 @@ mod tests {
         assert_eq!(decoded_machine.addresses, machine.addresses);
     }
 
+    #[tokio::test]
+    async fn deserialize_identity_announcement_rejects_trailing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent = Agent::builder()
+            .with_machine_key(temp.path().join("machine.key"))
+            .with_agent_key_path(temp.path().join("agent.key"))
+            .with_agent_cert_path(temp.path().join("agent.cert"))
+            .with_contact_store_path(temp.path().join("contacts.json"))
+            .build()
+            .await
+            .unwrap();
+
+        let announcement = agent.build_identity_announcement(false, false).unwrap();
+        let mut bytes = bincode::serialize(&announcement).unwrap();
+        bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+        assert!(
+            deserialize_identity_announcement(&bytes).is_err(),
+            "identity announcements with trailing bytes must be rejected"
+        );
+    }
+
     /// An announcement with None for all NAT fields (e.g. network not started)
     /// round-trips correctly.
     #[test]
@@ -8415,6 +8440,21 @@ mod tests {
         announcement.verify().expect("freshly-signed must verify");
         assert_eq!(announcement.user_id, user_kp.user_id());
         assert_eq!(announcement.agent_certificates.len(), 2);
+    }
+
+    #[test]
+    fn deserialize_user_announcement_rejects_trailing_bytes() {
+        let user_kp = identity::UserKeypair::generate().unwrap();
+        let agent_kp = identity::AgentKeypair::generate().unwrap();
+        let cert = identity::AgentCertificate::issue(&user_kp, &agent_kp).unwrap();
+        let announcement = UserAnnouncement::sign(&user_kp, vec![cert], 1234).unwrap();
+        let mut bytes = bincode::serialize(&announcement).unwrap();
+        bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+        assert!(
+            deserialize_user_announcement(&bytes).is_err(),
+            "user announcements with trailing bytes must be rejected"
+        );
     }
 
     #[test]
