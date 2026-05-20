@@ -1777,36 +1777,25 @@ async fn purge() -> anyhow::Result<()> {
     eprintln!("This will permanently delete:");
     eprintln!();
 
-    let mut paths_to_remove: Vec<std::path::PathBuf> = Vec::new();
-
-    // Data directory
-    if let Some(data_dir) = dirs::data_dir().map(|d| d.join("x0x")) {
-        if data_dir.exists() {
-            eprintln!(
+    let data_dir = dirs::data_dir();
+    let home_dir = dirs::home_dir();
+    let paths_to_remove =
+        commands::purge::collect_purge_paths(data_dir.as_deref(), home_dir.as_deref());
+    for purge_path in &paths_to_remove {
+        match purge_path.kind {
+            commands::purge::PurgePathKind::Data => eprintln!(
                 "  Data:    {} (contacts, groups, stores, transfers)",
-                data_dir.display()
-            );
-            paths_to_remove.push(data_dir);
-        }
-    }
-    // Keys directory
-    if let Some(home) = dirs::home_dir().map(|h| h.join(".x0x")) {
-        if home.exists() {
-            eprintln!(
+                purge_path.path.display()
+            ),
+            commands::purge::PurgePathKind::InstanceData => {
+                eprintln!("  Instance: {} (data)", purge_path.path.display());
+            }
+            commands::purge::PurgePathKind::Keys => eprintln!(
                 "  Keys:    {} (machine.key, agent.key, agent.cert)",
-                home.display()
-            );
-            paths_to_remove.push(home);
-        }
-    }
-    // Named instances
-    if let Some(home) = dirs::home_dir() {
-        for entry in std::fs::read_dir(&home).into_iter().flatten().flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with(".x0x-") && entry.path().is_dir() {
-                eprintln!("  Instance: {}", entry.path().display());
-                paths_to_remove.push(entry.path());
+                purge_path.path.display()
+            ),
+            commands::purge::PurgePathKind::LegacyInstanceKeys => {
+                eprintln!("  Instance: {} (legacy keys)", purge_path.path.display());
             }
         }
     }
@@ -1892,11 +1881,11 @@ async fn purge() -> anyhow::Result<()> {
         .output()
         .await;
 
-    for path in &paths_to_remove {
-        if path.is_dir() {
-            match std::fs::remove_dir_all(path) {
-                Ok(()) => eprintln!("  Removed {}", path.display()),
-                Err(e) => eprintln!("  Failed to remove {}: {}", path.display(), e),
+    for purge_path in &paths_to_remove {
+        if purge_path.path.is_dir() {
+            match std::fs::remove_dir_all(&purge_path.path) {
+                Ok(()) => eprintln!("  Removed {}", purge_path.path.display()),
+                Err(e) => eprintln!("  Failed to remove {}: {}", purge_path.path.display(), e),
             }
         }
     }
