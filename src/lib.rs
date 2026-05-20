@@ -398,6 +398,16 @@ pub fn is_publicly_advertisable(addr: std::net::SocketAddr) -> bool {
     addr.port() > 0 && is_globally_routable(addr.ip())
 }
 
+fn filter_publicly_advertisable_addrs<I>(addresses: I) -> Vec<std::net::SocketAddr>
+where
+    I: IntoIterator<Item = std::net::SocketAddr>,
+{
+    addresses
+        .into_iter()
+        .filter(|addr| is_publicly_advertisable(*addr))
+        .collect()
+}
+
 pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
     fn is_cgnat(v4: std::net::Ipv4Addr) -> bool {
         v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64
@@ -1303,6 +1313,7 @@ fn build_machine_announcement_for_identity(
     reachable_via: Vec<identity::MachineId>,
     relay_candidates: Vec<identity::MachineId>,
 ) -> error::Result<MachineAnnouncement> {
+    let addresses = filter_publicly_advertisable_addrs(addresses);
     let machine_public_key = identity.machine_keypair().public_key().as_bytes().to_vec();
     let unsigned = MachineAnnouncementUnsigned {
         machine_id: identity.machine_id(),
@@ -4505,25 +4516,17 @@ impl Agent {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(0, |d| d.as_secs());
 
-                        let public_addrs: Vec<std::net::SocketAddr> = announcement
-                            .addresses
-                            .iter()
-                            .copied()
-                            .filter(|a| is_globally_routable(a.ip()))
-                            .collect();
-                        if !public_addrs.is_empty() {
+                        let filtered_addresses = filter_publicly_advertisable_addrs(
+                            announcement.addresses.iter().copied(),
+                        );
+                        if !filtered_addresses.is_empty() {
                             if let Some(ref bc) = &bootstrap_cache {
                                 let peer_id = ant_quic::PeerId(announcement.machine_id.0);
-                                bc.add_from_connection(peer_id, public_addrs, None).await;
+                                bc.add_from_connection(peer_id, filtered_addresses.clone(), None)
+                                    .await;
                             }
                         }
 
-                        let filtered_addresses: Vec<std::net::SocketAddr> = announcement
-                            .addresses
-                            .iter()
-                            .copied()
-                            .filter(|a| is_publicly_advertisable(*a))
-                            .collect();
                         let filtered_addr_count = filtered_addresses.len();
                         upsert_discovered_machine(
                             &machine_cache,
@@ -4707,26 +4710,23 @@ impl Agent {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
 
-                // Add only globally-routable addresses to the persistent
-                // bootstrap cache. Private/LAN addresses are kept in the
-                // ephemeral discovery cache (below) for same-network
-                // connectivity, but must not persist across restarts where
-                // they become stale dead-ends for remote nodes.
+                // Add only globally-advertisable addresses to the persistent
+                // bootstrap cache. Legacy peers may still ship LAN, CGNAT,
+                // loopback, or port-zero entries, but those are not useful
+                // outside link-local discovery and must not become dial
+                // candidates for globally propagated announcements.
+                let filtered_addresses =
+                    filter_publicly_advertisable_addrs(announcement.addresses.iter().copied());
+                let filtered_addr_count = filtered_addresses.len();
                 {
-                    let public_addrs: Vec<std::net::SocketAddr> = announcement
-                        .addresses
-                        .iter()
-                        .copied()
-                        .filter(|a| is_globally_routable(a.ip()))
-                        .collect();
-                    if !public_addrs.is_empty() {
+                    if !filtered_addresses.is_empty() {
                         if let Some(ref bc) = &bootstrap_cache {
                             let peer_id = ant_quic::PeerId(announcement.machine_id.0);
-                            bc.add_from_connection(peer_id, public_addrs.clone(), None)
+                            bc.add_from_connection(peer_id, filtered_addresses.clone(), None)
                                 .await;
                             tracing::debug!(
                                 "Added {} public addresses to bootstrap cache for agent {:?} (machine {:?})",
-                                public_addrs.len(),
+                                filtered_addresses.len(),
                                 announcement.agent_id,
                                 hex::encode(&announcement.machine_id.0[..8]),
                             );
@@ -4742,18 +4742,11 @@ impl Agent {
                 // address lists are preserved (the `AlreadyConnected` path in
                 // `connect_to_agent` handles gossip peers we only reach by
                 // an existing QUIC connection).
-                let filtered_addresses: Vec<std::net::SocketAddr> = announcement
-                    .addresses
-                    .iter()
-                    .copied()
-                    .filter(|a| is_publicly_advertisable(*a))
-                    .collect();
-                let filtered_addr_count = filtered_addresses.len();
                 let discovered_agent = DiscoveredAgent {
                     agent_id: announcement.agent_id,
                     machine_id: announcement.machine_id,
                     user_id: announcement.user_id,
-                    addresses: filtered_addresses,
+                    addresses: filtered_addresses.clone(),
                     announced_at: announcement.announced_at,
                     last_seen: now,
                     machine_public_key: announcement.machine_public_key.clone(),
@@ -4840,7 +4833,7 @@ impl Agent {
                 // The gossip topology refresh (every 1s) will add the new peer to
                 // PlumTree topic trees once the QUIC connection is established.
                 if announcement.agent_id != own_agent_id
-                    && !announcement.addresses.is_empty()
+                    && !filtered_addresses.is_empty()
                     && !auto_connect_attempted.contains(&announcement.agent_id)
                 {
                     if let Some(ref net) = &network {
@@ -4848,7 +4841,7 @@ impl Agent {
                         if !net.is_connected(&ant_peer).await {
                             auto_connect_attempted.insert(announcement.agent_id);
                             let net = std::sync::Arc::clone(net);
-                            let addresses = announcement.addresses.clone();
+                            let addresses = filtered_addresses.clone();
                             tokio::spawn(async move {
                                 for addr in &addresses {
                                     match net.connect_addr(*addr).await {
@@ -4885,7 +4878,9 @@ impl Agent {
 
     fn announcement_addresses(&self) -> Vec<std::net::SocketAddr> {
         match self.network.as_ref().and_then(|n| n.local_addr()) {
-            Some(addr) if addr.port() > 0 => collect_local_interface_addrs(addr.port()),
+            Some(addr) if addr.port() > 0 => {
+                filter_publicly_advertisable_addrs(collect_local_interface_addrs(addr.port()))
+            }
             _ => Vec::new(),
         }
     }
@@ -4919,6 +4914,7 @@ impl Agent {
                 "human identity disclosure requires explicit human consent — set human_consent: true in the request body",
             )));
         }
+        let addresses = filter_publicly_advertisable_addrs(addresses);
 
         let (user_id, agent_certificate) = if include_user_identity {
             let user_id = self.user_id().ok_or_else(|| {
@@ -7843,6 +7839,72 @@ mod tests {
             !is_publicly_advertisable(sa("203.0.113.10:5483")),
             "TEST-NET-3 documentation range"
         );
+    }
+
+    #[test]
+    fn public_address_filter_drops_global_discovery_unsafe_candidates() {
+        let filtered = filter_publicly_advertisable_addrs(vec![
+            sa("127.0.0.1:5483"),
+            sa("10.1.2.3:5483"),
+            sa("100.64.1.1:5483"),
+            sa("169.254.1.1:5483"),
+            sa("1.2.3.4:0"),
+            sa("[::1]:5483"),
+            sa("[fd00::1]:5483"),
+            sa("8.8.8.8:5483"),
+            sa("[2001:db8::1]:5483"),
+        ]);
+
+        assert_eq!(filtered, vec![sa("8.8.8.8:5483"), sa("[2001:db8::1]:5483")]);
+    }
+
+    #[tokio::test]
+    async fn announcement_builders_filter_global_discovery_addresses() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .build()
+            .await
+            .expect("agent");
+        let addresses = vec![
+            sa("192.168.1.5:5483"),
+            sa("100.64.1.1:5483"),
+            sa("1.2.3.4:0"),
+            sa("8.8.8.8:5483"),
+            sa("[fd00::1]:5483"),
+            sa("[2001:db8::1]:5483"),
+        ];
+        let expected = vec![sa("8.8.8.8:5483"), sa("[2001:db8::1]:5483")];
+
+        let identity_announcement = agent
+            .build_identity_announcement_with_addrs(
+                false,
+                false,
+                addresses.clone(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("identity announcement");
+        assert_eq!(identity_announcement.addresses, expected);
+        identity_announcement
+            .verify()
+            .expect("filtered identity announcement verifies");
+
+        let machine_announcement = build_machine_announcement_for_identity(
+            &agent.identity,
+            addresses,
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("machine announcement");
+        assert_eq!(machine_announcement.addresses, expected);
+        machine_announcement
+            .verify()
+            .expect("filtered machine announcement verifies");
     }
 
     #[test]
