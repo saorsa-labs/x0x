@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post, put};
@@ -1954,20 +1954,17 @@ async fn main() -> Result<()> {
         .route("/gui/", get(serve_gui))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer({
-            // Restrict CORS to localhost origins only.
+            // Restrict CORS to exact loopback origins only.
             // The daemon API is a local control plane — external origins must not access it.
             use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin};
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(|origin, _| {
-                    let o = origin.as_bytes();
-                    o.starts_with(b"http://127.0.0.1")
-                        || o.starts_with(b"http://localhost")
-                        || o.starts_with(b"http://[::1]")
+                    is_allowed_loopback_origin(origin)
                 }))
                 .allow_methods(AllowMethods::any())
                 .allow_headers(AllowHeaders::any())
         })
-        // Bearer-token authentication: all endpoints except /health and /gui
+        // Bearer-token authentication: all control-plane endpoints.
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -2026,11 +2023,13 @@ async fn main() -> Result<()> {
 ///
 /// Exempts:
 /// - `OPTIONS` (CORS preflight — browsers send these without auth headers)
-/// - `/health`, `/gui`, `/gui/` (must be accessible without a token)
+/// - `/health`
+/// - `/constitution` resources
 ///
 /// Accepts `?token=` query parameter on endpoints that browsers cannot send
-/// headers on: WebSocket (`/ws`, `/ws/direct`) and SSE (`/events`,
-/// `/direct/events`).
+/// headers on: the GUI bootstrap (`/gui`, `/gui/`), WebSocket (`/ws`,
+/// `/ws/direct`), and SSE (`/events`, `/direct/events`,
+/// `/peers/events`, `/presence/events`).
 ///
 /// All other endpoints require `Authorization: Bearer <token>`.
 async fn auth_middleware(
@@ -2045,8 +2044,8 @@ async fn auth_middleware(
 
     let path = req.uri().path();
 
-    // Exempt: health check, GUI serving, and constitution
-    if path == "/health" || path == "/gui" || path == "/gui/" || path.starts_with("/constitution") {
+    // Exempt: health check and public constitution resources.
+    if is_auth_exempt_path(path) {
         return next.run(req).await;
     }
 
@@ -2063,8 +2062,7 @@ async fn auth_middleware(
 
     // Endpoints where browsers cannot set headers: accept ?token= query param.
     // WebSocket upgrades and SSE (EventSource API has no header support).
-    let accepts_query_token = matches!(path, "/ws" | "/ws/direct" | "/events" | "/direct/events");
-    if accepts_query_token {
+    if accepts_query_token(path) {
         if let Some(query) = req.uri().query() {
             for pair in query.split('&') {
                 if let Some(token) = pair.strip_prefix("token=") {
@@ -2081,6 +2079,74 @@ async fn auth_middleware(
         axum::Json(serde_json::json!({"error": "missing or invalid Authorization: Bearer token"})),
     )
         .into_response()
+}
+
+fn is_auth_exempt_path(path: &str) -> bool {
+    path == "/health" || path.starts_with("/constitution")
+}
+
+fn accepts_query_token(path: &str) -> bool {
+    matches!(
+        path,
+        "/gui"
+            | "/gui/"
+            | "/ws"
+            | "/ws/direct"
+            | "/events"
+            | "/direct/events"
+            | "/peers/events"
+            | "/presence/events"
+    )
+}
+
+fn is_allowed_loopback_origin(origin: &HeaderValue) -> bool {
+    origin
+        .to_str()
+        .ok()
+        .is_some_and(is_allowed_loopback_origin_str)
+}
+
+fn is_allowed_loopback_origin_str(origin: &str) -> bool {
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains('/') || authority.contains('@') {
+        return false;
+    }
+
+    let Some(host) = origin_host_without_port(authority) else {
+        return false;
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn origin_host_without_port(authority: &str) -> Option<&str> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, port) = rest.split_once(']')?;
+        if port.is_empty() || valid_origin_port(port.strip_prefix(':')?) {
+            Some(host)
+        } else {
+            None
+        }
+    } else {
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            Some(_) => return None,
+            None => (authority, None),
+        };
+        if port.is_none_or(valid_origin_port) {
+            Some(host)
+        } else {
+            None
+        }
+    }
+}
+
+fn valid_origin_port(port: &str) -> bool {
+    !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
 /// Load or generate an API bearer token.
@@ -10926,15 +10992,13 @@ async fn update_task(
 /// The embedded GUI HTML, compiled into the binary.
 const GUI_HTML: &str = include_str!("../gui/x0x-gui.html");
 
-/// GET /gui — serve the embedded GUI with API token injected.
-///
-/// Injects `const X0X_TOKEN='<token>';` into the HTML so the GUI can
-/// authenticate API calls and WebSocket connections automatically.
-async fn serve_gui(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let injected = format!("<script>const X0X_TOKEN='{}';</script>", state.api_token);
-    // Replace the dedicated marker rather than relying on the first <script> tag.
-    let html = GUI_HTML.replace("<!-- X0X_TOKEN_INJECTION_POINT -->", &injected);
-    axum::response::Html(html)
+/// GET /gui — serve the embedded GUI shell.
+async fn serve_gui() -> impl IntoResponse {
+    axum::response::Html(render_gui_html())
+}
+
+fn render_gui_html() -> String {
+    GUI_HTML.replace("<!-- X0X_TOKEN_INJECTION_POINT -->", "")
 }
 
 // ---------------------------------------------------------------------------
@@ -14644,6 +14708,58 @@ mod tests {
 
         assert!(!cache.contains_key("expired"));
         assert!(cache.contains_key("fresh"));
+    }
+
+    #[test]
+    fn cors_origin_allows_only_exact_loopback_hosts() {
+        for origin in [
+            "http://localhost",
+            "http://localhost:12700",
+            "https://localhost",
+            "http://127.0.0.1",
+            "http://127.0.0.1:12700",
+            "http://[::1]",
+            "http://[::1]:12700",
+        ] {
+            assert!(
+                is_allowed_loopback_origin_str(origin),
+                "expected loopback origin to be allowed: {origin}"
+            );
+        }
+
+        for origin in [
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://[::1].evil.example",
+            "http://evil.localhost",
+            "http://localhost@evil.example",
+            "http://localhost:bad",
+            "ftp://localhost",
+            "null",
+        ] {
+            assert!(
+                !is_allowed_loopback_origin_str(origin),
+                "expected spoofed/non-loopback origin to be rejected: {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_requires_auth_but_accepts_query_token_bootstrap() {
+        assert!(!is_auth_exempt_path("/gui"));
+        assert!(!is_auth_exempt_path("/gui/"));
+        assert!(accepts_query_token("/gui"));
+        assert!(accepts_query_token("/gui/"));
+        assert!(accepts_query_token("/peers/events"));
+        assert!(accepts_query_token("/presence/events"));
+    }
+
+    #[test]
+    fn rendered_gui_does_not_disclose_api_token() {
+        let html = render_gui_html();
+
+        assert!(!html.contains("super-secret-api-token"));
+        assert!(!html.contains("X0X_TOKEN"));
     }
 
     #[test]

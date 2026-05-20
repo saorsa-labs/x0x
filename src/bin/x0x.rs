@@ -1069,8 +1069,11 @@ async fn run(
         Commands::Gui => {
             // Ensure daemon is running and open GUI in browser
             client.ensure_running().await?;
-            let url = format!("{}/gui", client.base_url());
-            eprintln!("x0x GUI: {url}");
+            let Some(token) = client.api_token() else {
+                anyhow::bail!("API token not found; set X0X_API_TOKEN or restart x0xd");
+            };
+            let url = format!("{}/gui?token={token}", client.base_url());
+            eprintln!("x0x GUI: {}/gui", client.base_url());
 
             let opened = {
                 #[cfg(target_os = "macos")]
@@ -1098,7 +1101,7 @@ async fn run(
             };
 
             if !opened {
-                eprintln!("Could not open browser. Open the URL above manually.");
+                eprintln!("Could not open browser. Open this URL manually: {url}");
             }
             Ok(())
         }

@@ -663,8 +663,21 @@ const savedCard=LS.get('card_link','');
    JS SECTION 2: API & WEBSOCKET
    ═══════════════════════════════════════════════════════════════════ */
 const BASE=location.origin;
-// API token injected by x0xd at serve time (see X0X_TOKEN global)
-const API_TOKEN=typeof X0X_TOKEN!=='undefined'?X0X_TOKEN:'';
+function readApiToken(){
+  try{
+    const params=new URLSearchParams(location.search);
+    const token=params.get('token')||'';
+    if(token){
+      sessionStorage.setItem('x0x_api_token',token);
+      params.delete('token');
+      const qs=params.toString();
+      history.replaceState(null,'',location.pathname+(qs?'?'+qs:'')+location.hash);
+      return token;
+    }
+    return sessionStorage.getItem('x0x_api_token')||'';
+  }catch(e){return ''}
+}
+const API_TOKEN=readApiToken();
 const WS_URL=BASE.replace(/^http/,'ws')+'/ws/direct'+(API_TOKEN?'?token='+API_TOKEN:'');
 let ws=null;
 const wsSubs=new Set();
