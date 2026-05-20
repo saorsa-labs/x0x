@@ -304,26 +304,54 @@ fn named_group_endpoints() -> Vec<(Method, &'static str)> {
         .collect()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum GuiParityStatus {
+    Wired,
+    Deferred,
+    Missing,
+}
+
+fn deferred_paths() -> HashSet<(String, String)> {
+    DEFERRED
+        .iter()
+        .map(|(m, p, _)| (format!("{m}"), (*p).to_string()))
+        .collect()
+}
+
+fn is_deferred(method: Method, path: &str, deferred: &HashSet<(String, String)>) -> bool {
+    deferred.contains(&(format!("{method}"), path.to_string()))
+}
+
+fn classify_gui_endpoint(
+    method: Method,
+    path: &str,
+    calls: &[ApiCall],
+    deferred: &HashSet<(String, String)>,
+) -> GuiParityStatus {
+    if is_deferred(method, path, deferred) {
+        GuiParityStatus::Deferred
+    } else if gui_covers(method, path, calls) {
+        GuiParityStatus::Wired
+    } else {
+        GuiParityStatus::Missing
+    }
+}
+
 #[test]
 fn gui_named_group_parity_against_manifest() {
     let all = named_group_endpoints();
     let call_sites = gui_api_calls();
-    let deferred: HashSet<(String, String)> = DEFERRED
-        .iter()
-        .map(|(m, p, _)| (format!("{m}"), (*p).to_string()))
-        .collect();
+    let deferred = deferred_paths();
 
     let mut covered = Vec::new();
     let mut deferred_seen = Vec::new();
     let mut missing = Vec::new();
 
     for (method, path) in &all {
-        if gui_covers(*method, path, &call_sites) {
-            covered.push((*method, *path));
-        } else if deferred.contains(&(format!("{method}"), (*path).to_string())) {
-            deferred_seen.push((*method, *path));
-        } else {
-            missing.push((*method, *path));
+        match classify_gui_endpoint(*method, path, &call_sites, &deferred) {
+            GuiParityStatus::Wired => covered.push((*method, *path)),
+            GuiParityStatus::Deferred => deferred_seen.push((*method, *path)),
+            GuiParityStatus::Missing => missing.push((*method, *path)),
         }
     }
 
@@ -365,6 +393,27 @@ fn gui_named_group_parity_against_manifest() {
             .map(|(m, p)| format!("  {m} {p}"))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+#[test]
+fn deferred_entries_remain_deferred_when_a_gui_call_matches() {
+    let deferred = deferred_paths();
+    let method = Method::Post;
+    let path = "/groups/:id/members";
+    let calls = [ApiCall {
+        expr: "'/groups/' + groupId + '/members'".to_string(),
+        method: Some("POST".to_string()),
+    }];
+
+    assert!(
+        gui_covers(method, path, &calls),
+        "mock call must match before this can prove classification order"
+    );
+    assert_eq!(
+        classify_gui_endpoint(method, path, &calls, &deferred),
+        GuiParityStatus::Deferred,
+        "DEFERRED endpoints must remain visible as gaps until the entry is removed"
     );
 }
 
@@ -432,14 +481,11 @@ fn gui_renders_admin_controls_inline() {
 /// the exact covered/deferred/missing split is visible without
 /// needing stdout capture.
 #[test]
-fn emit_gui_parity_report() {
+fn emit_gui_parity_report() -> std::io::Result<()> {
     use std::io::Write as _;
     let all = named_group_endpoints();
     let call_sites = gui_api_calls();
-    let deferred: HashSet<(String, String)> = DEFERRED
-        .iter()
-        .map(|(m, p, _)| (format!("{m}"), (*p).to_string()))
-        .collect();
+    let deferred = deferred_paths();
 
     let mut lines = Vec::new();
     lines.push(format!(
@@ -450,20 +496,24 @@ fn emit_gui_parity_report() {
     let mut deferred_count = 0usize;
     let mut missing_count = 0usize;
     for (method, path) in &all {
-        if gui_covers(*method, path, &call_sites) {
-            wired += 1;
-            lines.push(format!("  WIRED     {method} {path}"));
-        } else if deferred.contains(&(format!("{method}"), (*path).to_string())) {
-            deferred_count += 1;
-            let reason = DEFERRED
-                .iter()
-                .find(|(m, p, _)| m == method && p == path)
-                .map(|(_, _, r)| *r)
-                .unwrap_or("—");
-            lines.push(format!("  DEFERRED  {method} {path}  // {reason}"));
-        } else {
-            missing_count += 1;
-            lines.push(format!("  MISSING   {method} {path}"));
+        match classify_gui_endpoint(*method, path, &call_sites, &deferred) {
+            GuiParityStatus::Wired => {
+                wired += 1;
+                lines.push(format!("  WIRED     {method} {path}"));
+            }
+            GuiParityStatus::Deferred => {
+                deferred_count += 1;
+                let reason = DEFERRED
+                    .iter()
+                    .find(|(m, p, _)| m == method && p == path)
+                    .map(|(_, _, r)| *r)
+                    .unwrap_or("—");
+                lines.push(format!("  DEFERRED  {method} {path}  // {reason}"));
+            }
+            GuiParityStatus::Missing => {
+                missing_count += 1;
+                lines.push(format!("  MISSING   {method} {path}"));
+            }
         }
     }
     lines.push(format!(
@@ -476,9 +526,10 @@ fn emit_gui_parity_report() {
         "/tests/proof-reports/parity/gui-named-groups-coverage.txt"
     );
     if let Some(parent) = std::path::Path::new(path).parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    let mut f = std::fs::File::create(path).expect("write coverage report");
-    writeln!(f, "{}", lines.join("\n")).expect("write coverage report");
+    let mut f = std::fs::File::create(path)?;
+    writeln!(f, "{}", lines.join("\n"))?;
     eprintln!("[gui_named_group_parity] coverage report → {path}");
+    Ok(())
 }
