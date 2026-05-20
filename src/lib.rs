@@ -273,6 +273,16 @@ impl std::fmt::Debug for Agent {
     }
 }
 
+impl Drop for Agent {
+    fn drop(&mut self) {
+        if let Ok(mut handle_guard) = self.heartbeat_handle.try_lock() {
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 /// A message received from the gossip network.
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -2771,6 +2781,8 @@ impl Agent {
     /// persisted to disk. The background maintenance task saves periodically,
     /// but this guarantees a final save.
     pub async fn shutdown(&self) {
+        self.stop_identity_heartbeat().await;
+
         // Shut down presence beacons.
         if let Some(ref pw) = self.presence {
             pw.shutdown().await;
@@ -2782,6 +2794,24 @@ impl Agent {
                 tracing::warn!("Failed to save bootstrap cache on shutdown: {e}");
             } else {
                 tracing::info!("Bootstrap cache saved on shutdown");
+            }
+        }
+    }
+
+    async fn stop_identity_heartbeat(&self) {
+        let handle = {
+            let mut handle_guard = self.heartbeat_handle.lock().await;
+            handle_guard.take()
+        };
+
+        if let Some(handle) = handle {
+            handle.abort();
+            match handle.await {
+                Ok(()) => tracing::debug!("Identity heartbeat task stopped"),
+                Err(e) if e.is_cancelled() => {
+                    tracing::debug!("Identity heartbeat task aborted")
+                }
+                Err(e) => tracing::warn!("Identity heartbeat task failed during shutdown: {e}"),
             }
         }
     }
@@ -8071,6 +8101,43 @@ mod tests {
         } else {
             addr
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_identity_heartbeat_task() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_for_task = std::sync::Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _drop_flag = DropFlag(dropped_for_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("heartbeat task started");
+
+        *agent.heartbeat_handle.lock().await = Some(handle);
+        assert!(agent.heartbeat_handle.lock().await.is_some());
+
+        agent.shutdown().await;
+        assert!(agent.heartbeat_handle.lock().await.is_none());
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
