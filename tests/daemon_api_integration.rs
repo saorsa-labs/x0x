@@ -111,7 +111,7 @@ async fn daemon_api_agent_sign_roundtrip() {
         .unwrap();
 
     assert_eq!(r["ok"], true);
-    assert_eq!(r["algorithm"], "ML-DSA-65");
+    assert_eq!(r["algorithm"], "x0x.agent-sign.v1.ml-dsa-65");
     let agent_id_hex = r["agent_id"].as_str().expect("agent_id is a hex string");
     let public_key_b64 = r["public_key_b64"]
         .as_str()

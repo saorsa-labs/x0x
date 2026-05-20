@@ -3956,6 +3956,9 @@ async fn import_agent_card(
 /// envelope (≤1 KiB in practice) while still bounding worst-case work.
 const AGENT_SIGN_MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 
+/// Stable scheme identifier returned by `POST /agent/sign`.
+const AGENT_SIGN_SCHEME_ID: &str = "x0x.agent-sign.v1.ml-dsa-65";
+
 /// POST /agent/sign — produce a detached ML-DSA-65 signature over a
 /// caller-supplied payload using this agent's signing key.
 ///
@@ -3974,11 +3977,14 @@ const AGENT_SIGN_MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 /// Payload. `payload_b64` is base64-decoded and signed verbatim. The
 /// caller is responsible for choosing a canonical serialization of any
 /// structured payload (e.g. `serde_canonical_json`, `postcard`, or an
-/// explicit field-order convention).
+/// explicit field-order convention). Callers should also domain-separate
+/// payloads (for example, with an application/type/version prefix) so a
+/// signature produced for one protocol cannot be replayed as another.
 ///
 /// Response. Returns the agent_id (hex, 32 bytes), the agent's public
-/// key (base64), the signature (base64), and the algorithm identifier.
-/// All values are wire-format ready for inclusion in the signed record.
+/// key (base64), the signature (base64), and the stable signing scheme
+/// identifier. All values are wire-format ready for inclusion in the
+/// signed record.
 async fn agent_sign(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AgentSignRequest>,
@@ -4050,7 +4056,7 @@ async fn agent_sign(
             "agent_id": agent_id_hex,
             "public_key_b64": public_key_b64,
             "signature_b64": signature_b64,
-            "algorithm": "ML-DSA-65",
+            "algorithm": AGENT_SIGN_SCHEME_ID,
         })),
     )
 }
