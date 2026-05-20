@@ -112,6 +112,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Import agent card to contacts",
         category: "identity",
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/agent/sign",
+        cli_name: "agent sign",
+        description: "Detached ML-DSA-65 signature over a caller-supplied payload",
+        category: "identity",
+    },
     // ── Network ─────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,
