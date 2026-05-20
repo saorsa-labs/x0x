@@ -4,10 +4,14 @@
 //! VPS nodes and from local machines behind NAT.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 use x0x::{network::NetworkConfig, Agent};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type TestResult<T> = Result<T, BoxError>;
 
 /// Global VPS bootstrap nodes (from Phase 3.1 deployment)
 const VPS_NODES: &[&str] = &[
@@ -19,14 +23,50 @@ const VPS_NODES: &[&str] = &[
     "170.64.176.102:5483",  // saorsa-9 (Sydney)
 ];
 
+struct VpsAgentPaths {
+    machine_key: PathBuf,
+    agent_key: PathBuf,
+    user_key: PathBuf,
+    agent_cert: PathBuf,
+    peer_cache_dir: PathBuf,
+}
+
+fn vps_agent_paths(base_dir: &Path) -> VpsAgentPaths {
+    VpsAgentPaths {
+        machine_key: base_dir.join("machine.key"),
+        agent_key: base_dir.join("agent.key"),
+        user_key: base_dir.join("user.key"),
+        agent_cert: base_dir.join("agent.cert"),
+        peer_cache_dir: base_dir.join("peers"),
+    }
+}
+
+struct VpsTestAgent {
+    agent: Agent,
+    _temp_dir: TempDir,
+}
+
+impl std::ops::Deref for VpsTestAgent {
+    type Target = Agent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.agent
+    }
+}
+
 /// Helper to create agent with VPS bootstrap nodes.
-async fn create_agent_with_vps_bootstrap() -> Result<Agent, Box<dyn std::error::Error>> {
+async fn create_agent_with_vps_bootstrap() -> TestResult<VpsTestAgent> {
     let temp_dir = TempDir::new()?;
+    let paths = vps_agent_paths(temp_dir.path());
     let bootstrap_addrs: Vec<SocketAddr> =
         VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
 
     let agent = Agent::builder()
-        .with_machine_key(temp_dir.path().join("machine.key"))
+        .with_machine_key(paths.machine_key)
+        .with_agent_key_path(paths.agent_key)
+        .with_user_key_path(paths.user_key)
+        .with_agent_cert_path(paths.agent_cert)
+        .with_peer_cache_dir(paths.peer_cache_dir)
         .with_network_config(NetworkConfig {
             bind_addr: Some("0.0.0.0:0".parse()?),
             bootstrap_nodes: bootstrap_addrs,
@@ -35,7 +75,24 @@ async fn create_agent_with_vps_bootstrap() -> Result<Agent, Box<dyn std::error::
         .build()
         .await?;
 
-    Ok(agent)
+    Ok(VpsTestAgent {
+        agent,
+        _temp_dir: temp_dir,
+    })
+}
+
+#[test]
+fn vps_agent_paths_are_isolated_under_fixture_dir() -> TestResult<()> {
+    let temp_dir = TempDir::new()?;
+    let paths = vps_agent_paths(temp_dir.path());
+
+    assert!(paths.machine_key.starts_with(temp_dir.path()));
+    assert!(paths.agent_key.starts_with(temp_dir.path()));
+    assert!(paths.user_key.starts_with(temp_dir.path()));
+    assert!(paths.agent_cert.starts_with(temp_dir.path()));
+    assert!(paths.peer_cache_dir.starts_with(temp_dir.path()));
+
+    Ok(())
 }
 
 /// Test 1: Verify all VPS nodes are reachable and healthy.
@@ -185,43 +242,43 @@ async fn test_connection_stability() {
 /// the VPS mesh can handle concurrent connections.
 #[tokio::test]
 #[ignore = "requires VPS testnet - run with --ignored"]
-async fn test_concurrent_connections() {
+async fn test_concurrent_connections() -> TestResult<()> {
     let num_agents = 10;
     let mut handles = Vec::new();
 
-    for i in 0..num_agents {
+    for _ in 0..num_agents {
         let handle = tokio::spawn(async move {
-            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let temp_dir = TempDir::new()?;
+            let paths = vps_agent_paths(temp_dir.path());
             let bootstrap_addrs: Vec<SocketAddr> =
                 VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
 
             let agent = Agent::builder()
-                .with_machine_key(temp_dir.path().join(format!("machine-{}.key", i)))
+                .with_machine_key(paths.machine_key)
+                .with_agent_key_path(paths.agent_key)
+                .with_user_key_path(paths.user_key)
+                .with_agent_cert_path(paths.agent_cert)
+                .with_peer_cache_dir(paths.peer_cache_dir)
                 .with_network_config(NetworkConfig {
-                    bind_addr: Some("0.0.0.0:0".parse().unwrap()),
+                    bind_addr: Some("0.0.0.0:0".parse()?),
                     bootstrap_nodes: bootstrap_addrs,
                     ..Default::default()
                 })
                 .build()
-                .await
-                .expect("Failed to create agent");
+                .await?;
 
-            agent.join_network().await.expect("Failed to join network");
+            agent.join_network().await?;
 
             // Brief delay to stabilize
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            true
+            Ok::<(), BoxError>(())
         });
         handles.push(handle);
     }
 
     // Wait for all agents to connect
-    let results: Vec<bool> = futures::future::join_all(handles)
-        .await
-        .into_iter()
-        .map(|r| r.expect("Task panicked"))
-        .collect();
+    let results = futures::future::join_all(handles).await;
 
     // All agents should connect successfully
     assert_eq!(
@@ -229,10 +286,11 @@ async fn test_concurrent_connections() {
         num_agents,
         "All agents should complete connection"
     );
-    assert!(
-        results.iter().all(|&r| r),
-        "All agents should connect successfully"
-    );
+    for result in results {
+        result??;
+    }
+
+    Ok(())
 }
 
 /// Test 5: VPS node discovery and peer exchange.
