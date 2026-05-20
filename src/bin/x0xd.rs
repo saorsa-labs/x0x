@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13901,6 +13901,14 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
         }
     }
 
+    if !is_safe_file_transfer_id(&offer.transfer_id) {
+        tracing::warn!(
+            "Rejected file offer from {sender_hex}: invalid transfer id {}",
+            offer.transfer_id
+        );
+        return;
+    }
+
     // Size limit check
     if offer.size > x0x::files::MAX_TRANSFER_SIZE {
         tracing::warn!(
@@ -13955,6 +13963,23 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
             "sender": sender_hex,
         }),
     });
+}
+
+fn is_safe_file_transfer_id(transfer_id: &str) -> bool {
+    match uuid::Uuid::parse_str(transfer_id) {
+        Ok(uuid) => transfer_id == uuid.hyphenated().to_string(),
+        Err(_) => false,
+    }
+}
+
+fn safe_file_transfer_part_path(
+    transfers_dir: &FsPath,
+    transfer_id: &str,
+) -> std::result::Result<PathBuf, String> {
+    if !is_safe_file_transfer_id(transfer_id) {
+        return Err(format!("invalid file transfer id: {transfer_id}"));
+    }
+    Ok(transfers_dir.join(format!("{transfer_id}.part")))
 }
 
 /// Handle an incoming accept — start streaming chunks to the receiver.
@@ -14225,8 +14250,14 @@ async fn handle_file_reject(
 /// Clean up partial file and hasher state for a failed transfer.
 async fn cleanup_failed_transfer(state: &Arc<AppState>, transfer_id: &str) {
     // Remove .part file
-    let part_path = state.transfers_dir.join(format!("{transfer_id}.part"));
-    let _ = tokio::fs::remove_file(&part_path).await;
+    match safe_file_transfer_part_path(&state.transfers_dir, transfer_id) {
+        Ok(part_path) => {
+            let _ = tokio::fs::remove_file(&part_path).await;
+        }
+        Err(e) => {
+            tracing::warn!("Skipping partial file cleanup: {e}");
+        }
+    }
 
     // Remove hasher + any buffered out-of-order chunks
     state.receive_hashers.write().await.remove(transfer_id);
@@ -14365,7 +14396,7 @@ async fn apply_ready_file_chunks(
 ) -> std::result::Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let part_path = state.transfers_dir.join(format!("{transfer_id}.part"));
+    let part_path = safe_file_transfer_part_path(&state.transfers_dir, transfer_id)?;
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -14470,7 +14501,19 @@ async fn finalize_received_transfer(
     transfer_id: &str,
     expected_sha256: &str,
 ) {
-    let part_path = state.transfers_dir.join(format!("{transfer_id}.part"));
+    let part_path = match safe_file_transfer_part_path(&state.transfers_dir, transfer_id) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::error!("Cannot finalize received transfer: {e}");
+            let mut transfers = state.file_transfers.write().await;
+            if let Some(t) = transfers.get_mut(transfer_id) {
+                t.status = x0x::files::TransferStatus::Failed;
+                t.error = Some(e);
+                t.completed_at_unix_ms = Some(file_transfer_now().1);
+            }
+            return;
+        }
+    };
 
     let computed_hash = {
         let mut hashers = state.receive_hashers.write().await;
@@ -14921,6 +14964,43 @@ mod tests {
             after_ttl,
         );
         assert_eq!(decision_after_ttl, ReleaseRebroadcastDecision::Rebroadcast);
+    }
+
+    #[test]
+    fn safe_file_transfer_id_accepts_canonical_uuid() {
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        assert!(is_safe_file_transfer_id(&transfer_id));
+
+        let transfers_dir = PathBuf::from("/tmp/x0x-transfers");
+        let part_path = safe_file_transfer_part_path(&transfers_dir, &transfer_id);
+        assert_eq!(
+            part_path,
+            Ok(transfers_dir.join(format!("{transfer_id}.part")))
+        );
+    }
+
+    #[test]
+    fn safe_file_transfer_id_rejects_path_traversal_and_noncanonical_ids() {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let invalid_ids = vec![
+            "../../escape".to_string(),
+            "../escape".to_string(),
+            "subdir/file".to_string(),
+            r"subdir\file".to_string(),
+            "..".to_string(),
+            String::new(),
+            uuid.to_uppercase(),
+            format!("urn:uuid:{uuid}"),
+            format!("{{{uuid}}}"),
+        ];
+
+        for transfer_id in invalid_ids {
+            assert!(!is_safe_file_transfer_id(&transfer_id));
+            assert!(
+                safe_file_transfer_part_path(FsPath::new("/tmp/x0x-transfers"), &transfer_id)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
