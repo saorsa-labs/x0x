@@ -10,6 +10,7 @@
 //! x0x-keygen embed-rust --key public.key
 //! ```
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -111,12 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (public_key, secret_key) = dsa.generate_keypair()?;
 
             // Write secret key (contains both secret and public portions)
-            std::fs::write(&output, secret_key.to_bytes())?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))?;
-            }
+            write_secret_key(&output, &secret_key.to_bytes())?;
 
             // Also write the public key alongside
             let public_path = output.with_extension("pub");
@@ -241,6 +237,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn write_secret_key(path: &Path, key_bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+    file.write_all(key_bytes)?;
+    file.sync_all()
 }
 
 /// Known platform archive mappings: (target triple, archive prefix, extension).
