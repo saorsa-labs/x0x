@@ -60,6 +60,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 semver = "1.0"
 sha2 = "0.10"
 flate2 = "1.0"
+fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-65"] }
 tar = "0.4"
 zip = "2.0"
 tracing = "0.1"
