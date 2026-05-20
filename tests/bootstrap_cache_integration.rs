@@ -3,7 +3,11 @@
 
 //! Integration tests for the bootstrap cache (ant_quic::BootstrapCache) integration.
 
-use std::{ffi::OsString, path::Path};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use x0x::Agent;
@@ -35,6 +39,11 @@ impl Drop for EnvVarOverride {
 fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
     let message = error.to_string();
     message.contains("All socket binds failed") && message.contains("Operation not permitted")
+}
+
+fn path_snapshot(path: &Path) -> Option<(bool, u64, Option<SystemTime>)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.is_dir(), metadata.len(), metadata.modified().ok()))
 }
 
 /// Helper: build an agent with a temp peer cache directory.
@@ -132,15 +141,33 @@ async fn test_cache_persists_across_restarts() {
 async fn test_default_cache_dir_when_not_specified() {
     let _env_lock = ENV_LOCK.lock().await;
     let temp = TempDir::new().unwrap();
+    let real_cache_paths = std::env::var_os("HOME").map(|home| {
+        let dir = PathBuf::from(home).join(".x0x").join("peers");
+        let cache_file = dir.join("bootstrap_cache.json");
+        let lock_file = dir.join("bootstrap_cache.json.lock");
+        (
+            dir.clone(),
+            path_snapshot(&dir),
+            cache_file.clone(),
+            path_snapshot(&cache_file),
+            lock_file.clone(),
+            path_snapshot(&lock_file),
+        )
+    });
     let home_dir = temp.path().join("home");
     let xdg_cache_dir = temp.path().join("xdg-cache");
     let xdg_config_dir = temp.path().join("xdg-config");
     let xdg_data_dir = temp.path().join("xdg-data");
+    let default_cache_dir = home_dir.join(".x0x").join("peers");
     std::fs::create_dir_all(&home_dir).expect("create isolated home");
     let _home = EnvVarOverride::set("HOME", &home_dir);
     let _xdg_cache = EnvVarOverride::set("XDG_CACHE_HOME", &xdg_cache_dir);
     let _xdg_config = EnvVarOverride::set("XDG_CONFIG_HOME", &xdg_config_dir);
     let _xdg_data = EnvVarOverride::set("XDG_DATA_HOME", &xdg_data_dir);
+    assert!(
+        !default_cache_dir.exists(),
+        "isolated default cache directory should start absent"
+    );
 
     // Build with network config but without explicit cache dir.
     // Should use default (~/.x0x/peers/) inside the isolated HOME.
@@ -160,7 +187,33 @@ async fn test_default_cache_dir_when_not_specified() {
     }
 
     assert!(
-        home_dir.join(".x0x").join("peers").exists(),
+        default_cache_dir.exists(),
         "default cache directory should be created under isolated HOME"
     );
+
+    if let Some((
+        real_cache_dir,
+        real_cache_dir_before,
+        real_cache_file,
+        real_cache_file_before,
+        real_cache_lock_file,
+        real_cache_lock_file_before,
+    )) = real_cache_paths
+    {
+        assert_eq!(
+            path_snapshot(&real_cache_dir),
+            real_cache_dir_before,
+            "real HOME cache directory should not be created or modified"
+        );
+        assert_eq!(
+            path_snapshot(&real_cache_file),
+            real_cache_file_before,
+            "real HOME cache file should not be created or modified"
+        );
+        assert_eq!(
+            path_snapshot(&real_cache_lock_file),
+            real_cache_lock_file_before,
+            "real HOME cache lock file should not be created or modified"
+        );
+    }
 }
