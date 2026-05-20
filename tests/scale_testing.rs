@@ -90,8 +90,24 @@ fn percentile(values: &[u64], p: u8) -> f64 {
     }
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
-    let idx = ((p as f64 / 100.0) * sorted.len() as f64).ceil() as usize;
+    let rank = ((p as f64 / 100.0) * sorted.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1);
     sorted[idx.min(sorted.len() - 1)] as f64
+}
+
+#[test]
+fn test_percentile_uses_nearest_rank_index() {
+    let values: Vec<u64> = (1..=100).collect();
+
+    assert_eq!(percentile(&values, 95), 95.0);
+    assert_eq!(percentile(&values, 99), 99.0);
+}
+
+#[test]
+fn test_percentile_handles_small_and_empty_inputs() {
+    assert_eq!(percentile(&[10, 20], 50), 10.0);
+    assert_eq!(percentile(&[10, 20], 100), 20.0);
+    assert_eq!(percentile(&[], 95), 0.0);
 }
 
 /// Test 1: CRDT convergence with 10 agents, 50 tasks
