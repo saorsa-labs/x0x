@@ -93,6 +93,19 @@ fn cfg_b(a_addr: std::net::SocketAddr, vps: bool) -> NetworkConfig {
     }
 }
 
+/// Build a NetworkConfig for Agent B with only live VPS bootstrap nodes.
+fn cfg_b_vps_only() -> NetworkConfig {
+    use x0x::network::DEFAULT_BOOTSTRAP_PEERS;
+    NetworkConfig {
+        bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+        bootstrap_nodes: DEFAULT_BOOTSTRAP_PEERS
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect(),
+        ..Default::default()
+    }
+}
+
 /// Rendezvous advertisement validity used in VPS tests: 1 hour in milliseconds.
 const RENDEZVOUS_VALIDITY_MS: u64 = 3_600_000;
 
@@ -470,9 +483,9 @@ async fn test_vps_late_join_heartbeat_discovery() {
 
 #[ignore = "requires live VPS bootstrap nodes (UDP port 5483 must be accessible)"]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_vps_rendezvous_find_agent() {
-    let dir_a = TempDir::new().unwrap();
-    let dir_b = TempDir::new().unwrap();
+async fn test_vps_rendezvous_find_agent() -> Result<(), Box<dyn std::error::Error>> {
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
 
     let agent_a = Agent::builder()
         .with_machine_key(dir_a.path().join("machine.key"))
@@ -480,37 +493,31 @@ async fn test_vps_rendezvous_find_agent() {
         .with_network_config(cfg_a_vps(12))
         .with_heartbeat_interval(4)
         .build()
-        .await
-        .unwrap();
-    agent_a.join_network().await.unwrap();
-    agent_a
-        .advertise_identity(RENDEZVOUS_VALIDITY_MS)
-        .await
-        .unwrap();
-
-    let a_addr = agent_a
-        .bound_addr()
-        .await
-        .expect("agent A must have a bound address");
+        .await?;
+    agent_a.join_network().await?;
 
     let agent_b = Agent::builder()
         .with_machine_key(dir_b.path().join("machine.key"))
         .with_agent_key_path(dir_b.path().join("agent.key"))
-        .with_network_config(cfg_b(a_addr, true))
+        .with_network_config(cfg_b_vps_only())
         .build()
-        .await
-        .unwrap();
-    agent_b.join_network().await.unwrap();
+        .await?;
+    agent_b.join_network().await?;
 
-    let result = agent_b
-        .find_agent(agent_a.agent_id())
-        .await
-        .expect("find_agent must not error");
+    let target_id = agent_a.agent_id();
+    let lookup = agent_b.find_agent_rendezvous(target_id, 10);
+    let advertise = async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        agent_a.advertise_identity(RENDEZVOUS_VALIDITY_MS).await
+    };
+    let (result, ()) = tokio::try_join!(lookup, advertise)?;
 
     assert!(
         result.is_some(),
-        "find_agent should locate Agent A within 10s"
+        "find_agent_rendezvous should locate Agent A within 10s"
     );
+
+    Ok(())
 }
 
 #[ignore = "requires live VPS bootstrap nodes (UDP port 5483 must be accessible)"]
