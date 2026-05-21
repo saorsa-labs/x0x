@@ -68,6 +68,12 @@ fn unix_timestamp_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn wait_until_clock_after(timestamp: u64) {
+    while unix_timestamp_ms() <= timestamp {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn anti_entropy_callback(
     target: Arc<AntiEntropyManager<TaskList>>,
     sender: PeerId,
@@ -307,7 +313,7 @@ fn test_simple_partition_recovery() {
 /// Scenario: Both groups claim the same task during partition, verify earliest-wins resolution.
 /// This prevents claim stealing - first to claim keeps the task.
 #[test]
-fn test_partition_conflicting_claims() {
+fn test_partition_conflicting_claims() -> Result<()> {
     let task_list_id = list_id(2);
     let contested_task_id = task_id(100);
 
@@ -317,60 +323,63 @@ fn test_partition_conflicting_claims() {
 
     // Group A: 2 replicas
     let mut group_a: Vec<TaskList> = (1..=2)
-        .map(|i| {
+        .map(|i| -> Result<TaskList> {
             let mut list = TaskList::new(task_list_id, "Contested List".to_string(), peer_id(i));
-            list.add_task(initial_task.clone(), peer_id(1), 1)
-                .expect("Failed to add initial task");
-            list
+            list.add_task(initial_task.clone(), peer_id(1), 1)?;
+            Ok(list)
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     // Group B: 2 replicas
     let mut group_b: Vec<TaskList> = (3..=4)
-        .map(|i| {
+        .map(|i| -> Result<TaskList> {
             let mut list = TaskList::new(task_list_id, "Contested List".to_string(), peer_id(i));
-            list.add_task(initial_task.clone(), peer_id(1), 1)
-                .expect("Failed to add initial task");
-            list
+            list.add_task(initial_task.clone(), peer_id(1), 1)?;
+            Ok(list)
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
-    // Partition: Group A claims task (timestamp t1, later)
-    let timestamp_b = unix_timestamp_ms();
-    group_b[0]
-        .claim_task(&contested_task_id, agent_id(2), peer_id(2), timestamp_b)
-        .expect("Group B claim failed");
+    // Partition: Group A claims first. claim_task's fourth argument is the
+    // OR-Set sequence tag; TaskItem::claim generates the conflict timestamp.
+    group_a[0].claim_task(&contested_task_id, agent_id(1), peer_id(1), 2)?;
+    let group_a_claim_timestamp = group_a[0]
+        .get_task(&contested_task_id)
+        .and_then(|task| task.current_state().timestamp())
+        .ok_or_else(|| anyhow!("Group A claim should have a timestamp"))?;
 
-    // Partition: Group B claims task (timestamp t2, earlier)
-    let timestamp_a = timestamp_b - 100; // Earlier timestamp wins
-    group_a[0]
-        .claim_task(&contested_task_id, agent_id(1), peer_id(1), timestamp_a)
-        .expect("Group A claim failed");
+    wait_until_clock_after(group_a_claim_timestamp);
+
+    // Partition: Group B claims after the clock advances, using its own sequence tag.
+    group_b[0].claim_task(&contested_task_id, agent_id(2), peer_id(3), 2)?;
+    let group_b_claim_timestamp = group_b[0]
+        .get_task(&contested_task_id)
+        .and_then(|task| task.current_state().timestamp())
+        .ok_or_else(|| anyhow!("Group B claim should have a timestamp"))?;
+    ensure!(
+        group_b_claim_timestamp > group_a_claim_timestamp,
+        "Group B claim timestamp should be later than Group A"
+    );
 
     // Internal propagation within groups
     {
         let a0 = group_a[0].clone();
-        group_a[1].merge(&a0).expect("Group A propagation failed");
+        group_a[1].merge(&a0)?;
     }
     {
         let b0 = group_b[0].clone();
-        group_b[1].merge(&b0).expect("Group B propagation failed");
+        group_b[1].merge(&b0)?;
     }
 
     // Network heals: merge groups
     for replica_a in &mut group_a {
         for replica_b in &group_b {
-            replica_a
-                .merge(replica_b)
-                .expect("Cross-group merge failed");
+            replica_a.merge(replica_b)?;
         }
     }
 
     for replica_b in &mut group_b {
         for replica_a in &group_a {
-            replica_b
-                .merge(replica_a)
-                .expect("Cross-group merge failed");
+            replica_b.merge(replica_a)?;
         }
     }
 
@@ -379,18 +388,20 @@ fn test_partition_conflicting_claims() {
     for replica in group_a.iter().chain(group_b.iter()) {
         let task = replica
             .get_task(&contested_task_id)
-            .expect("Task should exist");
-        assert!(task.current_state().is_claimed(), "Task should be claimed");
-
-        // Earliest claim (Group A, timestamp_a) should win
-        if let Some(claiming_agent) = task.current_state().claimed_by() {
-            assert_eq!(
-                claiming_agent,
-                &agent_id(1),
-                "Earliest claim (Group A, agent 1) should win - prevents claim stealing"
-            );
-        }
+            .ok_or_else(|| anyhow!("Task should exist"))?;
+        let state = task.current_state();
+        ensure!(state.is_claimed(), "Task should be claimed");
+        ensure!(
+            state.claimed_by().copied() == Some(agent_id(1)),
+            "Earliest claim (Group A, agent 1) should win - prevents claim stealing"
+        );
+        ensure!(
+            state.timestamp() == Some(group_a_claim_timestamp),
+            "Winning claim should keep Group A's timestamp"
+        );
     }
+
+    Ok(())
 }
 
 /// Test 3: Asymmetric partition - one group sees partial updates
