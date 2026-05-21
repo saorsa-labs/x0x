@@ -17,18 +17,19 @@ use x0x::{network::NetworkConfig, Agent};
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a local agent with an isolated key store and the default (loopback)
+/// Build a local agent with an isolated key store, peer cache, and the default (loopback)
 /// network config.  Does NOT call `join_network()` — the caller must do so
 /// if network connectivity is needed.
 ///
-/// Both machine key and agent key are stored in an isolated `TempDir` so that
-/// concurrent calls do not share key files (which would produce duplicate AgentIds).
+/// Machine key, agent key, and peer cache are stored in an isolated `TempDir` so that
+/// concurrent calls do not share key files or network cache state.
 /// The `TempDir` is returned alongside the agent so the caller keeps it alive.
 async fn build_local_agent() -> (Agent, TempDir) {
     let tmp = TempDir::new().unwrap();
     let agent = Agent::builder()
         .with_machine_key(tmp.path().join("machine.key"))
         .with_agent_key_path(tmp.path().join("agent.key"))
+        .with_peer_cache_dir(tmp.path().join("peers"))
         .with_network_config(NetworkConfig::default())
         .build()
         .await
