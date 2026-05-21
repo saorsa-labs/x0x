@@ -251,14 +251,31 @@ async fn test_concurrent_metadata_updates() {
         right[0].merge(&left[0]).expect("Failed to merge back");
     }
 
-    // All replicas should converge to latest title (Title v5)
+    let metadata_snapshot = |task: &TaskItem| {
+        (
+            task.title().to_string(),
+            task.description().to_string(),
+            task.assignee().copied(),
+            task.priority(),
+            *task.created_by(),
+            task.created_at(),
+        )
+    };
+    let expected_metadata =
+        metadata_snapshot(replicas[0].get_task(&tid).expect("Task should exist"));
+    assert_eq!(
+        expected_metadata.0, "Title v5",
+        "Latest metadata title should win"
+    );
+
+    // All replicas should converge to latest title (Title v5) and identical metadata.
     for replica in &replicas {
         let task = replica.get_task(&tid).expect("Task should exist");
-        // LWW-Register: latest timestamp wins
-        // This test verifies merge doesn't lose data
-        assert!(
-            task.title().starts_with("Title"),
-            "Title should be preserved"
+        assert_eq!(task.title(), "Title v5", "Latest metadata title should win");
+        assert_eq!(
+            metadata_snapshot(task),
+            expected_metadata,
+            "Task metadata should converge exactly across replicas"
         );
     }
 }
