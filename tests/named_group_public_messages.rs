@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Phase E integration tests: public-group messaging.
 //!
 //! Pure Rust tests over the `public_message` module — no daemon
