@@ -154,31 +154,40 @@ async fn get_state(d: &AgentInstance, group_id: &str) -> Value {
         .expect("state json")
 }
 
+fn state_commit_keys(state: &Value) -> Option<(&str, u64)> {
+    let hash = state["state_hash"]
+        .as_str()
+        .filter(|hash| !hash.is_empty())?;
+    let revision = state["state_revision"].as_u64()?;
+    Some((hash, revision))
+}
+
 async fn wait_state_match_keys(
     a: &AgentInstance,
     a_group_id: &str,
     b: &AgentInstance,
     b_group_id: &str,
 ) -> (String, u64) {
-    let matched = wait_until(Duration::from_secs(30), || async {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         let a_state = get_state(a, a_group_id).await;
         let b_state = get_state(b, b_group_id).await;
-        a_state["ok"] == true
-            && b_state["ok"] == true
-            && a_state["state_hash"] == b_state["state_hash"]
-            && a_state["state_revision"] == b_state["state_revision"]
-    })
-    .await;
-    if !matched {
-        let a_state = get_state(a, a_group_id).await;
-        let b_state = get_state(b, b_group_id).await;
-        panic!("state did not converge within timeout: alice={a_state:?} bob={b_state:?}");
+        let a_keys = state_commit_keys(&a_state);
+        let b_keys = state_commit_keys(&b_state);
+
+        if a_state["ok"] == true && b_state["ok"] == true && a_keys.is_some() && a_keys == b_keys {
+            if let Some((hash, revision)) = a_keys {
+                return (hash.to_string(), revision);
+            }
+        }
+
+        let timed_out = tokio::time::Instant::now() >= deadline;
+        assert!(
+            !timed_out,
+            "state did not converge within timeout: alice={a_state:?} bob={b_state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let state = get_state(a, a_group_id).await;
-    (
-        state["state_hash"].as_str().unwrap_or_default().to_string(),
-        state["state_revision"].as_u64().unwrap_or_default(),
-    )
 }
 
 async fn wait_state_match(a: &AgentInstance, b: &AgentInstance, group_id: &str) -> (String, u64) {
@@ -499,6 +508,8 @@ async fn d4_join_request_events_converge_via_signed_commits_once() {
     assert_eq!(req3["ok"], true, "request3 response: {req3:?}");
     let req3_id = req3["request_id"].as_str().unwrap_or_default().to_string();
     wait_request_status(alice, &alice_group_id, &req3_id, "pending").await;
+    let (_pending_hash, pending_rev) =
+        wait_state_match_keys(alice, &alice_group_id, bob, &bob_group_id).await;
 
     let approve = authed_client(alice)
         .post(alice.url(&format!(
@@ -508,7 +519,16 @@ async fn d4_join_request_events_converge_via_signed_commits_once() {
         .await
         .expect("approve request3");
     assert_eq!(approve.status(), StatusCode::OK);
-    let (_hash6, _rev6) = wait_state_match_keys(alice, &alice_group_id, bob, &bob_group_id).await;
+    let (approved_hash, approved_rev) =
+        wait_state_match_keys(alice, &alice_group_id, bob, &bob_group_id).await;
+    assert!(
+        !approved_hash.is_empty(),
+        "approval should converge on a non-empty state hash"
+    );
+    assert!(
+        approved_rev > pending_rev,
+        "approval should advance revision from {pending_rev} to {approved_rev}"
+    );
     wait_request_status(alice, &alice_group_id, &req3_id, "approved").await;
 
     let bob_agent_id = bob.agent_id().await;
