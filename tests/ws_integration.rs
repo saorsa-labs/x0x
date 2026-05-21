@@ -452,11 +452,13 @@ async fn ws_concurrent_subscribers() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish N messages via REST
+    let mut expected_payloads = Vec::new();
     for i in 0..n_messages {
         let payload = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             format!("msg-{i}").as_bytes(),
         );
+        expected_payloads.push(payload.clone());
         client
             .post(d.url("/publish"))
             .json(&json!({"topic": &topic, "payload": payload}))
@@ -466,16 +468,30 @@ async fn ws_concurrent_subscribers() {
     }
 
     // Each client should receive all messages
+    expected_payloads.sort();
     for (idx, ws) in clients.iter_mut().enumerate() {
-        let mut received = 0;
+        let mut received_payloads = Vec::new();
         for _ in 0..n_messages {
-            if ws_recv_text(ws, 5).await.is_some() {
-                received += 1;
+            let Some(frame) = ws_recv_topic_message(ws, &topic, 5).await else {
+                break;
+            };
+            let payload = frame["payload"].as_str().map(str::to_owned);
+            assert!(
+                payload.is_some(),
+                "Client {idx} received topic message without payload: {frame}"
+            );
+            if let Some(payload) = payload {
+                received_payloads.push(payload);
             }
         }
+        received_payloads.sort();
+        assert_eq!(
+            received_payloads, expected_payloads,
+            "Client {idx} should receive all published payloads exactly once"
+        );
         assert!(
-            received >= 1,
-            "Client {idx} should receive at least 1 message, got {received}"
+            ws_recv_topic_message(ws, &topic, 1).await.is_none(),
+            "Client {idx} received more than {n_messages} topic messages"
         );
     }
 
