@@ -79,6 +79,8 @@ jobs:
         run: cargo nextest run --all-features --test daemon_api_integration -- --ignored
       - name: Run named group integration tests
         run: cargo nextest run --all-features --test named_group_integration -- --ignored
+      - name: Run named group D4 signed commit integration tests
+        run: cargo nextest run --all-features --test named_group_d4_apply -- --ignored
       - name: Run GUI smoke tests
         run: cargo nextest run --all-features --test gui_smoke
       - name: Run WebSocket tests
