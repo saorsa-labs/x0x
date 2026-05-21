@@ -5,10 +5,58 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use x0x::identity::{AgentId, MachineId};
 use x0x::network::NetworkConfig;
-use x0x::{Agent, DirectMessage};
+use x0x::{Agent, DirectMessage, DiscoveredAgent};
+
+fn loopback_network_config() -> NetworkConfig {
+    NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+        bootstrap_nodes: Vec::new(),
+        port_mapping_enabled: false,
+        ..NetworkConfig::default()
+    }
+}
+
+fn normalize_loopback(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    if addr.ip().is_unspecified() {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            addr.port(),
+        )
+    } else {
+        addr
+    }
+}
+
+fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string();
+    message.contains("Operation not permitted")
+        && (message.contains("All socket binds failed")
+            || message.contains("Failed to bind UDP socket")
+            || message.contains("bind UDP socket")
+            || message.contains("network initialization failed"))
+}
+
+fn discovered_agent(agent: &Agent, addr: std::net::SocketAddr, now_secs: u64) -> DiscoveredAgent {
+    DiscoveredAgent {
+        agent_id: agent.agent_id(),
+        machine_id: agent.machine_id(),
+        user_id: None,
+        addresses: vec![addr],
+        announced_at: now_secs,
+        last_seen: now_secs,
+        machine_public_key: vec![],
+        nat_type: None,
+        can_receive_direct: Some(true),
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+    }
+}
 
 /// Helper to create a test agent with isolated storage.
 async fn create_test_agent(temp_dir: &TempDir, name: &str) -> Agent {
@@ -26,6 +74,30 @@ async fn create_test_agent(temp_dir: &TempDir, name: &str) -> Agent {
         .build()
         .await
         .expect("Failed to create test agent")
+}
+
+/// Helper to create a loopback-only test agent with isolated storage.
+async fn create_loopback_test_agent(
+    temp_dir: &TempDir,
+    name: &str,
+) -> Result<Option<Agent>, Box<dyn std::error::Error>> {
+    let machine_key_path = temp_dir.path().join(format!("{name}_machine.key"));
+    let agent_key_path = temp_dir.path().join(format!("{name}_agent.key"));
+    let contacts_path = temp_dir.path().join(format!("{name}_contacts.json"));
+
+    match Agent::builder()
+        .with_machine_key(machine_key_path)
+        .with_agent_key_path(agent_key_path)
+        .with_contact_store_path(contacts_path)
+        .with_peer_cache_disabled()
+        .with_network_config(loopback_network_config())
+        .build()
+        .await
+    {
+        Ok(agent) => Ok(Some(agent)),
+        Err(error) if is_network_bind_permission_error(&error) => Ok(None),
+        Err(error) => Err(Box::new(error)),
+    }
 }
 
 /// Test basic DirectMessage creation and field access.
@@ -107,6 +179,72 @@ async fn test_send_direct_agent_not_found() {
         "Expected DmError::RecipientKeyUnavailable, got: {:?}",
         err
     );
+}
+
+/// Test a successful public send_direct/subscribe_direct flow over loopback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_send_direct_loopback_delivery_between_agents(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new().unwrap();
+    let Some(alice) = create_loopback_test_agent(&temp_dir, "alice").await? else {
+        return Ok(());
+    };
+    let Some(bob) = create_loopback_test_agent(&temp_dir, "bob").await? else {
+        return Ok(());
+    };
+
+    alice.join_network().await?;
+    bob.join_network().await?;
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let alice_addr = normalize_loopback(alice_network.bound_addr().await.expect("alice bound"));
+    let bob_addr = normalize_loopback(bob_network.bound_addr().await.expect("bob bound"));
+    let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+
+    let connected = alice_network.connect_addr(bob_addr).await?;
+    assert_eq!(connected.0, bob.machine_id().0);
+
+    let connected_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < connected_deadline {
+        if alice_network.is_connected(&bob_peer).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(alice_network.is_connected(&bob_peer).await);
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    alice
+        .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr, now_secs))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr, now_secs))
+        .await;
+    alice
+        .direct_messaging()
+        .mark_connected(bob.agent_id(), bob.machine_id())
+        .await;
+
+    let payload = b"direct-message-success-path".to_vec();
+    let mut bob_rx = bob.subscribe_direct();
+
+    let receipt = alice.send_direct(&bob.agent_id(), payload.clone()).await?;
+    assert_eq!(receipt.path, x0x::dm::DmPath::RawQuic);
+
+    let received = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("bob should receive direct message")
+        .expect("bob direct subscription remains open");
+    assert_eq!(received.sender, alice.agent_id());
+    assert_eq!(received.machine_id, alice.machine_id());
+    assert_eq!(received.payload, payload);
+    assert_eq!(received.payload_str(), Some("direct-message-success-path"));
+    assert!(received.verified);
+
+    Ok(())
 }
 
 /// Test the DirectMessageReceiver subscription mechanism.
@@ -224,15 +362,6 @@ fn test_direct_messaging_decode_too_short() {
     assert!(result.is_err());
 }
 
-// Note: Full end-to-end tests requiring two agents to actually connect
-// over the network are more complex and require either:
-// 1. Local loopback testing with bind to different ports
-// 2. Test fixtures with mock network
-// 3. Running on the actual testnet
-//
-// Those tests would be added in a follow-up when the infrastructure
-// for spawning multiple local agents with direct connectivity is available.
-//
 // Additional behaviors covered by code but not easily unit-testable:
 // - recv_direct_annotated() returns all messages with trust annotations
 // - Network layer drops oversized direct messages (>16MB + 32 bytes)
