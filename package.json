@@ -32,6 +32,7 @@
   },
   "files": [
     "scripts/",
+    "index.d.ts",
     "SKILL.md",
     ".well-known/"
   ],
