@@ -20,6 +20,11 @@ fn make_peer_id(bytes: [u8; 32]) -> PeerId {
     PeerId::from_pubkey(&bytes)
 }
 
+fn make_alternate_peer_id(mut bytes: [u8; 32]) -> PeerId {
+    bytes[0] ^= 0x80;
+    make_peer_id(bytes)
+}
+
 fn make_task_item(title: &str, agent_id: AgentId, peer_id: PeerId) -> TaskItem {
     let task_id = TaskId::new(title, &agent_id, 1000);
     let metadata = TaskMetadata::new(title, "description", 128, agent_id, 1000);
@@ -29,6 +34,56 @@ fn make_task_item(title: &str, agent_id: AgentId, peer_id: PeerId) -> TaskItem {
 fn make_task_list(name: &str, peer_id: PeerId) -> TaskList {
     let id = TaskListId::new([0u8; 32]);
     TaskList::new(id, name.to_string(), peer_id)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TaskSnapshot {
+    id: TaskId,
+    state: CheckboxState,
+    title: String,
+    description: String,
+    assignee: Option<AgentId>,
+    priority: u8,
+    created_by: AgentId,
+    created_at: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TaskListSnapshot {
+    id: TaskListId,
+    name: String,
+    ordered_task_ids: Vec<TaskId>,
+    tasks_by_id: Vec<TaskSnapshot>,
+}
+
+fn task_snapshot(task: &TaskItem) -> TaskSnapshot {
+    TaskSnapshot {
+        id: *task.id(),
+        state: task.current_state(),
+        title: task.title().to_string(),
+        description: task.description().to_string(),
+        assignee: task.assignee().copied(),
+        priority: task.priority(),
+        created_by: *task.created_by(),
+        created_at: task.created_at(),
+    }
+}
+
+fn task_list_snapshot(list: &TaskList) -> TaskListSnapshot {
+    let ordered_tasks = list.tasks_ordered();
+    let ordered_task_ids = ordered_tasks.iter().map(|task| *task.id()).collect();
+    let mut tasks_by_id: Vec<_> = ordered_tasks
+        .iter()
+        .map(|task| task_snapshot(task))
+        .collect();
+    tasks_by_id.sort_by_key(|task| *task.id.as_bytes());
+
+    TaskListSnapshot {
+        id: *list.id(),
+        name: list.name().to_string(),
+        ordered_task_ids,
+        tasks_by_id,
+    }
 }
 
 // ── TaskId Properties ──────────────────────────────────────────────────
@@ -78,9 +133,10 @@ proptest! {
         let agent = AgentId(agent_bytes);
         let state = CheckboxState::claim(agent, timestamp);
         prop_assert!(state.is_ok(), "claim should succeed");
-        match state.unwrap() {
-            CheckboxState::Claimed { .. } => {}
-            other => prop_assert!(false, "Expected Claimed, got {:?}", other),
+        match state {
+            Ok(CheckboxState::Claimed { .. }) => {}
+            Ok(other) => prop_assert!(false, "Expected Claimed, got {:?}", other),
+            Err(err) => prop_assert!(false, "claim should succeed: {:?}", err),
         }
     }
 
@@ -93,9 +149,10 @@ proptest! {
         let agent = AgentId(agent_bytes);
         let state = CheckboxState::complete(agent, timestamp);
         prop_assert!(state.is_ok(), "complete should succeed");
-        match state.unwrap() {
-            CheckboxState::Done { .. } => {}
-            other => prop_assert!(false, "Expected Done, got {:?}", other),
+        match state {
+            Ok(CheckboxState::Done { .. }) => {}
+            Ok(other) => prop_assert!(false, "Expected Done, got {:?}", other),
+            Err(err) => prop_assert!(false, "complete should succeed: {:?}", err),
         }
     }
 }
@@ -133,7 +190,7 @@ proptest! {
         let peer = make_peer_id(peer_bytes);
         let mut task = make_task_item("test", agent, peer);
 
-        task.claim(agent, peer, 1).expect("claim");
+        prop_assert!(task.claim(agent, peer, 1).is_ok(), "claim should succeed");
         let result = task.complete(agent, peer, 2);
         prop_assert!(result.is_ok(), "complete on claimed should succeed");
 
@@ -155,17 +212,21 @@ proptest! {
 
         let mut a = make_task_item("test", agent, peer);
         let mut b = make_task_item("test", agent, peer);
-        b.claim(agent, peer, 1).ok();
+        prop_assert!(b.claim(agent, peer, 1).is_ok(), "claim should succeed");
+        b.update_title("updated title".to_string(), peer);
+        b.update_description("updated description".to_string(), peer);
+        b.update_assignee(Some(agent), peer);
+        b.update_priority(255, peer);
 
         // First merge
-        a.merge(&b).expect("merge1");
-        let state_after_one = a.current_state();
+        prop_assert!(a.merge(&b).is_ok(), "first merge should succeed");
+        let snapshot_after_one = task_snapshot(&a);
 
         // Second merge (same b)
-        a.merge(&b).expect("merge2");
-        let state_after_two = a.current_state();
+        prop_assert!(a.merge(&b).is_ok(), "second merge should succeed");
+        let snapshot_after_two = task_snapshot(&a);
 
-        prop_assert_eq!(state_after_one, state_after_two, "merge should be idempotent");
+        prop_assert_eq!(snapshot_after_one, snapshot_after_two, "merge should be idempotent");
     }
 }
 
@@ -187,7 +248,7 @@ proptest! {
         let metadata = TaskMetadata::new("task-1", "desc", 128, agent, 1000);
         let task = TaskItem::new(task_id, metadata, peer);
         let seq = list.next_seq();
-        list.add_task(task, peer, seq).expect("add");
+        prop_assert!(list.add_task(task, peer, seq).is_ok(), "add should succeed");
 
         prop_assert!(list.version() > v_before, "version should increment after add");
     }
@@ -223,19 +284,24 @@ proptest! {
         // Add a task to b
         let task_id = TaskId::new("from-b", &agent, 1000);
         let metadata = TaskMetadata::new("from-b", "desc", 128, agent, 1000);
-        let task = TaskItem::new(task_id, metadata, peer);
+        let mut task = TaskItem::new(task_id, metadata, peer);
+        task.update_title("from-b updated".to_string(), peer);
+        task.update_description("from-b updated desc".to_string(), peer);
+        task.update_assignee(Some(agent), peer);
+        task.update_priority(200, peer);
         let seq = b.next_seq();
-        b.add_task(task, peer, seq).expect("add to b");
+        prop_assert!(b.add_task(task, peer, seq).is_ok(), "add to b should succeed");
+        b.update_name("test updated".to_string(), peer);
 
         // First merge
-        a.merge(&b).expect("merge1");
-        let tasks_after_one: Vec<_> = a.tasks_ordered().iter().map(|t| *t.id()).collect();
+        prop_assert!(a.merge(&b).is_ok(), "first merge should succeed");
+        let snapshot_after_one = task_list_snapshot(&a);
 
         // Second merge (idempotent)
-        a.merge(&b).expect("merge2");
-        let tasks_after_two: Vec<_> = a.tasks_ordered().iter().map(|t| *t.id()).collect();
+        prop_assert!(a.merge(&b).is_ok(), "second merge should succeed");
+        let snapshot_after_two = task_list_snapshot(&a);
 
-        prop_assert_eq!(tasks_after_one, tasks_after_two, "merge should be idempotent");
+        prop_assert_eq!(snapshot_after_one, snapshot_after_two, "merge should be idempotent");
     }
 
     /// TaskList merge is commutative: A⊕B produces same tasks as B⊕A.
@@ -245,42 +311,41 @@ proptest! {
         agent_bytes in prop::array::uniform32(any::<u8>()),
     ) {
         let peer = make_peer_id(peer_bytes);
+        let other_peer = make_alternate_peer_id(peer_bytes);
         let agent = AgentId(agent_bytes);
 
         let mut a = make_task_list("test", peer);
         let mut b = make_task_list("test", peer);
 
-        // Add different tasks to each
-        let task_a = TaskItem::new(
-            TaskId::new("task-a", &agent, 1000),
-            TaskMetadata::new("task-a", "desc", 128, agent, 1000),
-            peer,
-        );
+        // Add the same task to each replica, then diverge observable state.
+        let task_id = TaskId::new("shared-task", &agent, 1000);
+        let metadata = TaskMetadata::new("shared-task", "desc", 128, agent, 1000);
+        let mut task_a = TaskItem::new(task_id, metadata.clone(), peer);
+        prop_assert!(task_a.claim(agent, peer, 2).is_ok(), "claim should succeed");
+        task_a.update_title("title from a".to_string(), peer);
         let seq_a = a.next_seq();
-        a.add_task(task_a, peer, seq_a).expect("add to a");
+        prop_assert!(a.add_task(task_a, peer, seq_a).is_ok(), "add to a should succeed");
+        a.update_name("list from a".to_string(), peer);
 
-        let task_b = TaskItem::new(
-            TaskId::new("task-b", &agent, 2000),
-            TaskMetadata::new("task-b", "desc", 128, agent, 2000),
-            peer,
-        );
+        let mut task_b = TaskItem::new(task_id, metadata, other_peer);
+        task_b.update_description("desc from b".to_string(), other_peer);
+        task_b.update_assignee(Some(agent), other_peer);
+        task_b.update_priority(255, other_peer);
         let seq_b = b.next_seq();
-        b.add_task(task_b, peer, seq_b).expect("add to b");
+        prop_assert!(
+            b.add_task(task_b, other_peer, seq_b).is_ok(),
+            "add to b should succeed"
+        );
+        b.update_name("list from b".to_string(), other_peer);
 
         // A⊕B
         let mut ab = a.clone();
-        ab.merge(&b).expect("merge a⊕b");
+        prop_assert!(ab.merge(&b).is_ok(), "merge a⊕b should succeed");
 
         // B⊕A
         let mut ba = b.clone();
-        ba.merge(&a).expect("merge b⊕a");
+        prop_assert!(ba.merge(&a).is_ok(), "merge b⊕a should succeed");
 
-        // Both should contain the same tasks (order may differ)
-        let mut ab_ids: Vec<_> = ab.tasks_ordered().iter().map(|t| *t.id()).collect();
-        let mut ba_ids: Vec<_> = ba.tasks_ordered().iter().map(|t| *t.id()).collect();
-        ab_ids.sort_by_key(|id| *id.as_bytes());
-        ba_ids.sort_by_key(|id| *id.as_bytes());
-
-        prop_assert_eq!(ab_ids, ba_ids, "merge should be commutative (same task set)");
+        prop_assert_eq!(task_list_snapshot(&ab), task_list_snapshot(&ba), "merge should be commutative");
     }
 }
