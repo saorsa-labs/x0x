@@ -6,20 +6,31 @@
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use x0x::files::{
-    FileChunk, FileComplete, FileMessage, FileOffer, TransferDirection, TransferState,
-    TransferStatus, DEFAULT_CHUNK_SIZE, MAX_TRANSFER_SIZE,
+    receive_chunk_expected_sequence, received_file_base_name, received_file_output_name,
+    total_chunks_for_size, FileChunk, FileChunkValidationError, FileComplete, FileMessage,
+    FileOffer, TransferDirection, TransferState, TransferStatus, DEFAULT_CHUNK_SIZE,
+    MAX_TRANSFER_SIZE,
 };
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[derive(Debug)]
+struct UnexpectedVariant(&'static str);
+
+impl std::fmt::Display for UnexpectedVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "expected {} variant", self.0)
+    }
+}
+
+impl std::error::Error for UnexpectedVariant {}
 
 // ---------------------------------------------------------------------------
 // Helper: build a TransferState for testing
 // ---------------------------------------------------------------------------
 
 fn make_sending_transfer(size: u64, chunk_size: usize) -> TransferState {
-    let total_chunks = if size == 0 {
-        0
-    } else {
-        size.div_ceil(chunk_size as u64)
-    };
+    let total_chunks = total_chunks_for_size(size, chunk_size);
     TransferState {
         transfer_id: "test-xfer".to_string(),
         direction: TransferDirection::Sending,
@@ -41,11 +52,7 @@ fn make_sending_transfer(size: u64, chunk_size: usize) -> TransferState {
 }
 
 fn make_receiving_transfer(size: u64, chunk_size: usize) -> TransferState {
-    let total_chunks = if size == 0 {
-        0
-    } else {
-        size.div_ceil(chunk_size as u64)
-    };
+    let total_chunks = total_chunks_for_size(size, chunk_size);
     TransferState {
         transfer_id: "test-recv".to_string(),
         direction: TransferDirection::Receiving,
@@ -71,7 +78,7 @@ fn make_receiving_transfer(size: u64, chunk_size: usize) -> TransferState {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn file_offer_roundtrip() {
+fn file_offer_roundtrip() -> TestResult {
     let msg = FileMessage::Offer(FileOffer {
         transfer_id: "xfer-001".into(),
         filename: "report.pdf".into(),
@@ -80,109 +87,109 @@ fn file_offer_roundtrip() {
         chunk_size: DEFAULT_CHUNK_SIZE,
         total_chunks: 2,
     });
-    let json = serde_json::to_vec(&msg).unwrap();
-    let decoded: FileMessage = serde_json::from_slice(&json).unwrap();
+    let json = serde_json::to_vec(&msg)?;
+    let decoded: FileMessage = serde_json::from_slice(&json)?;
     let json_str = String::from_utf8_lossy(&json);
     assert!(
         json_str.contains("\"type\":\"file-offer\""),
         "got: {json_str}"
     );
     // Verify Offer fields survived roundtrip
-    if let FileMessage::Offer(offer) = decoded {
-        assert_eq!(offer.transfer_id, "xfer-001");
-        assert_eq!(offer.filename, "report.pdf");
-        assert_eq!(offer.size, 123_456);
-        assert_eq!(offer.total_chunks, 2);
-    } else {
-        panic!("expected Offer variant");
-    }
+    let FileMessage::Offer(offer) = decoded else {
+        return Err(UnexpectedVariant("Offer").into());
+    };
+    assert_eq!(offer.transfer_id, "xfer-001");
+    assert_eq!(offer.filename, "report.pdf");
+    assert_eq!(offer.size, 123_456);
+    assert_eq!(offer.total_chunks, 2);
+    Ok(())
 }
 
 #[test]
-fn file_accept_roundtrip() {
+fn file_accept_roundtrip() -> TestResult {
     let msg = FileMessage::Accept {
         transfer_id: "xfer-002".into(),
     };
-    let json = serde_json::to_vec(&msg).unwrap();
+    let json = serde_json::to_vec(&msg)?;
     let json_str = String::from_utf8_lossy(&json);
     assert!(
         json_str.contains("\"type\":\"file-accept\""),
         "got: {json_str}"
     );
-    let decoded: FileMessage = serde_json::from_slice(&json).unwrap();
-    if let FileMessage::Accept { transfer_id } = decoded {
-        assert_eq!(transfer_id, "xfer-002");
-    } else {
-        panic!("expected Accept variant");
-    }
+    let decoded: FileMessage = serde_json::from_slice(&json)?;
+    let FileMessage::Accept { transfer_id } = decoded else {
+        return Err(UnexpectedVariant("Accept").into());
+    };
+    assert_eq!(transfer_id, "xfer-002");
+    Ok(())
 }
 
 #[test]
-fn file_reject_roundtrip() {
+fn file_reject_roundtrip() -> TestResult {
     let msg = FileMessage::Reject {
         transfer_id: "xfer-003".into(),
         reason: "too large".into(),
     };
-    let json = serde_json::to_vec(&msg).unwrap();
+    let json = serde_json::to_vec(&msg)?;
     let json_str = String::from_utf8_lossy(&json);
     assert!(
         json_str.contains("\"type\":\"file-reject\""),
         "got: {json_str}"
     );
-    let decoded: FileMessage = serde_json::from_slice(&json).unwrap();
-    if let FileMessage::Reject {
+    let decoded: FileMessage = serde_json::from_slice(&json)?;
+    let FileMessage::Reject {
         transfer_id,
         reason,
     } = decoded
-    {
-        assert_eq!(transfer_id, "xfer-003");
-        assert_eq!(reason, "too large");
-    } else {
-        panic!("expected Reject variant");
-    }
+    else {
+        return Err(UnexpectedVariant("Reject").into());
+    };
+    assert_eq!(transfer_id, "xfer-003");
+    assert_eq!(reason, "too large");
+    Ok(())
 }
 
 #[test]
-fn file_chunk_roundtrip() {
+fn file_chunk_roundtrip() -> TestResult {
     let msg = FileMessage::Chunk(FileChunk {
         transfer_id: "xfer-004".into(),
         sequence: 7,
         data: base64::engine::general_purpose::STANDARD.encode([0xDE, 0xAD, 0xBE, 0xEF]),
     });
-    let json = serde_json::to_vec(&msg).unwrap();
+    let json = serde_json::to_vec(&msg)?;
     let json_str = String::from_utf8_lossy(&json);
     assert!(
         json_str.contains("\"type\":\"file-chunk\""),
         "got: {json_str}"
     );
-    let decoded: FileMessage = serde_json::from_slice(&json).unwrap();
-    if let FileMessage::Chunk(chunk) = decoded {
-        assert_eq!(chunk.transfer_id, "xfer-004");
-        assert_eq!(chunk.sequence, 7);
-    } else {
-        panic!("expected Chunk variant");
-    }
+    let decoded: FileMessage = serde_json::from_slice(&json)?;
+    let FileMessage::Chunk(chunk) = decoded else {
+        return Err(UnexpectedVariant("Chunk").into());
+    };
+    assert_eq!(chunk.transfer_id, "xfer-004");
+    assert_eq!(chunk.sequence, 7);
+    Ok(())
 }
 
 #[test]
-fn file_complete_roundtrip() {
+fn file_complete_roundtrip() -> TestResult {
     let msg = FileMessage::Complete(FileComplete {
         transfer_id: "xfer-005".into(),
         sha256: "abc".into(),
     });
-    let json = serde_json::to_vec(&msg).unwrap();
+    let json = serde_json::to_vec(&msg)?;
     let json_str = String::from_utf8_lossy(&json);
     assert!(
         json_str.contains("\"type\":\"file-complete\""),
         "got: {json_str}"
     );
-    let decoded: FileMessage = serde_json::from_slice(&json).unwrap();
-    if let FileMessage::Complete(complete) = decoded {
-        assert_eq!(complete.transfer_id, "xfer-005");
-        assert_eq!(complete.sha256, "abc");
-    } else {
-        panic!("expected Complete variant");
-    }
+    let decoded: FileMessage = serde_json::from_slice(&json)?;
+    let FileMessage::Complete(complete) = decoded else {
+        return Err(UnexpectedVariant("Complete").into());
+    };
+    assert_eq!(complete.transfer_id, "xfer-005");
+    assert_eq!(complete.sha256, "abc");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +260,7 @@ fn total_chunks_exact_multiple() {
 fn total_chunks_large_file() {
     // 1 MiB / current chunk size, rounded up.
     const ONE_MIB: u64 = 1 << 20;
-    let expected = ONE_MIB.div_ceil(DEFAULT_CHUNK_SIZE as u64);
+    let expected = total_chunks_for_size(ONE_MIB, DEFAULT_CHUNK_SIZE);
     let ts = make_sending_transfer(ONE_MIB, DEFAULT_CHUNK_SIZE);
     assert_eq!(ts.total_chunks, expected);
 }
@@ -275,8 +282,10 @@ fn max_transfer_size_is_one_gib() {
 #[test]
 fn expected_sequence_starts_at_zero() {
     let ts = make_receiving_transfer(200_000, DEFAULT_CHUNK_SIZE);
-    let expected = ts.bytes_transferred / ts.chunk_size as u64;
-    assert_eq!(expected, 0);
+    assert_eq!(
+        receive_chunk_expected_sequence(&ts, &ts.remote_agent_id),
+        Ok(0)
+    );
 }
 
 #[test]
@@ -288,18 +297,24 @@ fn expected_sequence_advances_with_chunks() {
 
     // After one full chunk
     ts.bytes_transferred = DEFAULT_CHUNK_SIZE as u64;
-    let expected = ts.bytes_transferred / ts.chunk_size as u64;
-    assert_eq!(expected, 1);
+    assert_eq!(
+        receive_chunk_expected_sequence(&ts, &ts.remote_agent_id),
+        Ok(1)
+    );
 
     // After two full chunks
     ts.bytes_transferred = (DEFAULT_CHUNK_SIZE * 2) as u64;
-    let expected = ts.bytes_transferred / ts.chunk_size as u64;
-    assert_eq!(expected, 2);
+    assert_eq!(
+        receive_chunk_expected_sequence(&ts, &ts.remote_agent_id),
+        Ok(2)
+    );
 
     // After partial third chunk
     ts.bytes_transferred = two_chunks_plus_tail;
-    let expected = ts.bytes_transferred / ts.chunk_size as u64;
-    assert_eq!(expected, 2);
+    assert_eq!(
+        receive_chunk_expected_sequence(&ts, &ts.remote_agent_id),
+        Ok(2)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -324,42 +339,59 @@ fn cumulative_size_detects_overflow() {
 // 7. Path traversal protection
 // ---------------------------------------------------------------------------
 
-fn sanitize_filename(name: &str) -> String {
-    std::path::Path::new(name)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".to_string())
-}
-
 #[test]
 fn sanitize_strips_parent_traversal() {
-    assert_eq!(sanitize_filename("../../../etc/passwd"), "passwd");
+    assert_eq!(
+        received_file_base_name("../../../etc/passwd", "download"),
+        "passwd"
+    );
 }
 
 #[test]
 fn sanitize_strips_absolute_path() {
-    assert_eq!(sanitize_filename("/etc/shadow"), "shadow");
+    assert_eq!(received_file_base_name("/etc/shadow", "download"), "shadow");
 }
 
 #[test]
 fn sanitize_preserves_normal_filename() {
-    assert_eq!(sanitize_filename("report.pdf"), "report.pdf");
+    assert_eq!(
+        received_file_base_name("report.pdf", "download"),
+        "report.pdf"
+    );
 }
 
 #[test]
 fn sanitize_handles_nested_traversal() {
-    assert_eq!(sanitize_filename("foo/../../bar/baz.txt"), "baz.txt");
+    assert_eq!(
+        received_file_base_name("foo/../../bar/baz.txt", "download"),
+        "baz.txt"
+    );
 }
 
 #[test]
 fn sanitize_handles_dots_only() {
-    assert_eq!(sanitize_filename(".."), "download");
+    assert_eq!(received_file_base_name("..", "download"), "download");
 }
 
 #[test]
 fn sanitize_handles_empty_after_strip() {
     // "/" has no file_name component
-    assert_eq!(sanitize_filename("/"), "download");
+    assert_eq!(received_file_base_name("/", "download"), "download");
+}
+
+#[test]
+fn received_output_path_stays_under_transfers_dir() {
+    let transfer_id = "550e8400-e29b-41d4-a716-446655440000";
+    let output_name = received_file_output_name(transfer_id, "../../../etc/passwd");
+    let transfers_dir = std::path::Path::new("/tmp/x0x-transfers-test");
+    let final_path = transfers_dir.join(&output_name);
+
+    assert_eq!(output_name, "550e8400_passwd");
+    assert!(final_path.starts_with(transfers_dir));
+    assert_eq!(
+        final_path.file_name().and_then(|name| name.to_str()),
+        Some(output_name.as_str())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -404,23 +436,38 @@ fn chunk_rejected_if_status_pending() {
         status: TransferStatus::Pending,
         ..make_receiving_transfer(100_000, DEFAULT_CHUNK_SIZE)
     };
-    // Chunks should only be processed when status is InProgress
-    assert_ne!(ts.status, TransferStatus::InProgress);
+    assert_eq!(
+        receive_chunk_expected_sequence(&ts, &ts.remote_agent_id),
+        Err(FileChunkValidationError::WrongStatus)
+    );
 }
 
 #[test]
 fn chunk_rejected_if_direction_sending() {
     let ts = make_sending_transfer(100_000, DEFAULT_CHUNK_SIZE);
-    // Chunks should only be written for Receiving transfers
-    assert_eq!(ts.direction, TransferDirection::Sending);
-    assert_ne!(ts.direction, TransferDirection::Receiving);
+    assert_eq!(
+        receive_chunk_expected_sequence(&ts, &ts.remote_agent_id),
+        Err(FileChunkValidationError::WrongDirection)
+    );
+}
+
+#[test]
+fn chunk_rejected_if_sender_does_not_match_offer() {
+    let ts = make_receiving_transfer(100_000, DEFAULT_CHUNK_SIZE);
+    let wrong_sender = "0".repeat(64);
+    assert_eq!(
+        receive_chunk_expected_sequence(&ts, &wrong_sender),
+        Err(FileChunkValidationError::WrongSender)
+    );
 }
 
 #[test]
 fn chunk_accepted_only_when_in_progress_receiving() {
     let ts = make_receiving_transfer(100_000, DEFAULT_CHUNK_SIZE);
-    assert_eq!(ts.direction, TransferDirection::Receiving);
-    assert_eq!(ts.status, TransferStatus::InProgress);
+    assert_eq!(
+        receive_chunk_expected_sequence(&ts, &ts.remote_agent_id),
+        Ok(0)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +475,7 @@ fn chunk_accepted_only_when_in_progress_receiving() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn transfer_state_deserializes_without_optional_fields() {
+fn transfer_state_deserializes_without_optional_fields() -> TestResult {
     // Simulate a JSON from an older version that lacks new fields
     let json = serde_json::json!({
         "transfer_id": "old-xfer",
@@ -442,7 +489,7 @@ fn transfer_state_deserializes_without_optional_fields() {
         "error": null,
         "started_at": 12345
     });
-    let ts: TransferState = serde_json::from_value(json).unwrap();
+    let ts: TransferState = serde_json::from_value(json)?;
     assert_eq!(ts.transfer_id, "old-xfer");
     assert!(ts.source_path.is_none());
     assert!(ts.output_path.is_none());
@@ -450,6 +497,7 @@ fn transfer_state_deserializes_without_optional_fields() {
     assert_eq!(ts.total_chunks, 0); // serde default
     assert_eq!(ts.started_at_unix_ms, 0); // serde default
     assert!(ts.completed_at_unix_ms.is_none()); // serde default
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +509,7 @@ fn file_offer_total_chunks_consistent() {
     // Use a size chosen relative to DEFAULT_CHUNK_SIZE so the assertion
     // stays honest when the constant changes.
     let size = (DEFAULT_CHUNK_SIZE as u64) * 3 + 200;
-    let computed = size.div_ceil(DEFAULT_CHUNK_SIZE as u64);
+    let computed = total_chunks_for_size(size, DEFAULT_CHUNK_SIZE);
     let offer = FileOffer {
         transfer_id: "tc1".into(),
         filename: "f.bin".into(),

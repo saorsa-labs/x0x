@@ -5,6 +5,7 @@
 //! by default.
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Default chunk size: 32 KiB raw.
 ///
@@ -20,6 +21,15 @@ pub const DEFAULT_CHUNK_SIZE: usize = 32768;
 
 /// Maximum file transfer size: 1 GB.
 pub const MAX_TRANSFER_SIZE: u64 = 1_073_741_824;
+
+/// Compute the number of chunks needed for a transfer.
+pub fn total_chunks_for_size(size: u64, chunk_size: usize) -> u64 {
+    if size == 0 || chunk_size == 0 {
+        0
+    } else {
+        size.div_ceil(chunk_size as u64)
+    }
+}
 
 /// A file transfer offer sent to initiate transfer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +133,54 @@ pub struct TransferState {
     /// Total number of chunks.
     #[serde(default)]
     pub total_chunks: u64,
+}
+
+/// Reason a received file chunk cannot be accepted for a transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChunkValidationError {
+    /// Chunks can only be applied to receiving transfers.
+    WrongDirection,
+    /// Chunks can only be applied while the transfer is in progress.
+    WrongStatus,
+    /// Chunks must come from the agent that sent the original offer.
+    WrongSender,
+}
+
+/// Return the next accepted chunk sequence for a receiving transfer.
+pub fn receive_chunk_expected_sequence(
+    transfer: &TransferState,
+    sender_agent_id: &str,
+) -> Result<u64, FileChunkValidationError> {
+    if transfer.direction != TransferDirection::Receiving {
+        return Err(FileChunkValidationError::WrongDirection);
+    }
+    if transfer.status != TransferStatus::InProgress {
+        return Err(FileChunkValidationError::WrongStatus);
+    }
+    if transfer.remote_agent_id != sender_agent_id {
+        return Err(FileChunkValidationError::WrongSender);
+    }
+    Ok(if transfer.chunk_size > 0 {
+        transfer.bytes_transferred / transfer.chunk_size as u64
+    } else {
+        0
+    })
+}
+
+/// Sanitize a received filename down to a single path component.
+pub fn received_file_base_name(raw_filename: &str, fallback: &str) -> String {
+    Path::new(raw_filename)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Build the final received filename used by the daemon.
+pub fn received_file_output_name(transfer_id: &str, raw_filename: &str) -> String {
+    let base_name = received_file_base_name(raw_filename, transfer_id);
+    let id_prefix = transfer_id.get(..8).unwrap_or(transfer_id);
+    format!("{id_prefix}_{base_name}")
 }
 
 /// Default chunk size for serde deserialization.

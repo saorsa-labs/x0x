@@ -2448,11 +2448,7 @@ async fn file_send_handler(
     let (now_secs, now_ms) = file_transfer_now();
 
     let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
-    let total_chunks = if size == 0 {
-        0
-    } else {
-        size.div_ceil(chunk_size as u64)
-    };
+    let total_chunks = x0x::files::total_chunks_for_size(size, chunk_size);
 
     let transfer = x0x::files::TransferState {
         transfer_id: transfer_id.clone(),
@@ -14366,11 +14362,9 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
     let expected_sequence = {
         let transfers = state.file_transfers.read().await;
         match transfers.get(&chunk.transfer_id) {
-            Some(t)
-                if t.direction == x0x::files::TransferDirection::Receiving
-                    && t.status == x0x::files::TransferStatus::InProgress =>
-            {
-                if t.remote_agent_id != sender_hex {
+            Some(t) => match x0x::files::receive_chunk_expected_sequence(t, &sender_hex) {
+                Ok(sequence) => sequence,
+                Err(x0x::files::FileChunkValidationError::WrongSender) => {
                     tracing::warn!(
                         "Chunk from wrong agent for {}: expected {} got {sender_hex}",
                         chunk.transfer_id,
@@ -14378,21 +14372,16 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
                     );
                     return;
                 }
-                if t.chunk_size > 0 {
-                    t.bytes_transferred / t.chunk_size as u64
-                } else {
-                    0
+                Err(_) => {
+                    tracing::warn!(
+                        "Ignoring chunk for transfer {} (dir={:?} status={:?})",
+                        chunk.transfer_id,
+                        t.direction,
+                        t.status
+                    );
+                    return;
                 }
-            }
-            Some(t) => {
-                tracing::warn!(
-                    "Ignoring chunk for transfer {} (dir={:?} status={:?})",
-                    chunk.transfer_id,
-                    t.direction,
-                    t.status
-                );
-                return;
-            }
+            },
             None => {
                 tracing::warn!("Ignoring chunk for unknown transfer {}", chunk.transfer_id);
                 return;
@@ -14652,16 +14641,7 @@ async fn finalize_received_transfer(
             .map(|t| t.filename.clone())
             .unwrap_or_else(|| transfer_id.to_string())
     };
-    let base_name = std::path::Path::new(&raw_filename)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| transfer_id.to_string());
-    let id_prefix = if transfer_id.len() >= 8 {
-        &transfer_id[..8]
-    } else {
-        transfer_id
-    };
-    let filename = format!("{id_prefix}_{base_name}");
+    let filename = x0x::files::received_file_output_name(transfer_id, &raw_filename);
 
     let final_path = state.transfers_dir.join(&filename);
     if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
