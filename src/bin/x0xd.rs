@@ -2098,7 +2098,10 @@ fn is_allowed_loopback_origin_str(origin: &str) -> bool {
     let Some(host) = origin_host_without_port(authority) else {
         return false;
     };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    // Literal loopback IPs only. The `localhost` hostname is intentionally rejected:
+    // its resolution can be redirected (/etc/hosts, split-horizon DNS, OSes that map it
+    // off-loopback), so it is not a trustworthy origin for the local control plane.
+    matches!(host, "127.0.0.1" | "::1")
 }
 
 fn origin_host_without_port(authority: &str) -> Option<&str> {
@@ -14828,11 +14831,8 @@ mod tests {
     }
 
     #[test]
-    fn cors_origin_allows_only_exact_loopback_hosts() {
+    fn cors_origin_allows_only_literal_loopback_ips() {
         for origin in [
-            "http://localhost",
-            "http://localhost:12700",
-            "https://localhost",
             "http://127.0.0.1",
             "http://127.0.0.1:12700",
             "http://[::1]",
@@ -14840,11 +14840,16 @@ mod tests {
         ] {
             assert!(
                 is_allowed_loopback_origin_str(origin),
-                "expected loopback origin to be allowed: {origin}"
+                "expected literal loopback IP origin to be allowed: {origin}"
             );
         }
 
         for origin in [
+            // `localhost` hostname is rejected — resolution can be redirected.
+            "http://localhost",
+            "http://localhost:12700",
+            "https://localhost",
+            // spoofed / non-loopback
             "http://localhost.evil.example",
             "http://127.0.0.1.evil.example",
             "http://[::1].evil.example",
@@ -14856,7 +14861,7 @@ mod tests {
         ] {
             assert!(
                 !is_allowed_loopback_origin_str(origin),
-                "expected spoofed/non-loopback origin to be rejected: {origin}"
+                "expected non-IP-loopback origin to be rejected: {origin}"
             );
         }
     }
