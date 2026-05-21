@@ -104,11 +104,25 @@ async fn connection_health_after_connect_is_observable() {
         .expect("connect_addr");
     sleep(Duration::from_millis(200)).await;
 
-    // `ConnectionHealth` is opaque but `Debug` renders the lifecycle state +
-    // timestamps. A probe after inspecting health proves the call doesn't
-    // invalidate the connection.
-    let health = sender.connection_health(&receiver_id).await;
-    let _ = format!("{health:?}");
+    let health = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let health = sender.connection_health(&receiver_id).await;
+            if health.connected
+                && health.generation.is_some()
+                && health.reader_task_active == Some(true)
+            {
+                break health;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "connection_health never reported a live receiver snapshot: {health:?}"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    };
+    assert_eq!(health.close_reason, None);
+
     sender
         .probe_peer(&receiver_id, Duration::from_secs(10))
         .await
