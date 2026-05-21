@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Network timeout behavior tests
 
 use saorsa_gossip_transport::GossipTransport;
