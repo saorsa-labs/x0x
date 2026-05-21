@@ -3452,8 +3452,21 @@ impl Agent {
         let machine_prefix = network::hex_prefix(&machine_id.0, 4);
         let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
 
+        let ack_race_test_hook = self.direct_messaging.raw_quic_ack_race_test_hook();
+
         // First attempt: race send_with_receive_ack against same-peer Replaced.
-        let send_fut = network.send_with_receive_ack(ant_peer_id, wire, timeout);
+        let send_fut = async {
+            if let Some(hook) = ack_race_test_hook.as_ref() {
+                hook.notify_first_attempt_started();
+            }
+            let result = network
+                .send_with_receive_ack(ant_peer_id, wire, timeout)
+                .await;
+            if let Some(hook) = ack_race_test_hook.as_ref() {
+                hook.hold_first_attempt_result().await;
+            }
+            result
+        };
         tokio::pin!(send_fut);
 
         let superseded_to: u64;
@@ -3569,6 +3582,9 @@ impl Agent {
         // is the one ant-quic is replacing). Wait briefly for the new
         // connection's `is_connected` to flip true before reissuing.
         let new_generation = superseded_to;
+        if let Some(hook) = ack_race_test_hook.as_ref() {
+            hook.notify_replaced_short_circuit();
+        }
         tracing::info!(
             target: "dm.trace",
             stage = "raw_quic_ack_replaced_short_circuit",

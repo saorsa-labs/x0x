@@ -96,6 +96,61 @@ const DIRECT_DIAGNOSTICS_MIN_RETAIN: usize = 1024;
 /// [`DirectMessaging::current_generation`] after a lag.
 const LIFECYCLE_REPLACED_BROADCAST_CAPACITY: usize = 256;
 
+#[doc(hidden)]
+pub struct RawQuicAckRaceTestHook {
+    first_attempt_started: Notify,
+    first_attempt_result_release: Notify,
+    replaced_short_circuit: Notify,
+}
+
+impl std::fmt::Debug for RawQuicAckRaceTestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawQuicAckRaceTestHook")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for RawQuicAckRaceTestHook {
+    fn default() -> Self {
+        Self {
+            first_attempt_started: Notify::new(),
+            first_attempt_result_release: Notify::new(),
+            replaced_short_circuit: Notify::new(),
+        }
+    }
+}
+
+impl RawQuicAckRaceTestHook {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn wait_first_attempt_started(&self) {
+        self.first_attempt_started.notified().await;
+    }
+
+    pub fn release_first_attempt_result(&self) {
+        self.first_attempt_result_release.notify_one();
+    }
+
+    pub async fn wait_replaced_short_circuit(&self) {
+        self.replaced_short_circuit.notified().await;
+    }
+
+    pub(crate) fn notify_first_attempt_started(&self) {
+        self.first_attempt_started.notify_one();
+    }
+
+    pub(crate) async fn hold_first_attempt_result(&self) {
+        self.first_attempt_result_release.notified().await;
+    }
+
+    pub(crate) fn notify_replaced_short_circuit(&self) {
+        self.replaced_short_circuit.notify_one();
+    }
+}
+
 /// A direct message received from another agent.
 ///
 /// # Security Note
@@ -512,6 +567,9 @@ pub struct DirectMessaging {
     /// Late or absent subscribers do not block the producer.
     lifecycle_replaced_tx: broadcast::Sender<(MachineId, u64)>,
 
+    /// Test hook for deterministic raw-QUIC ACK/Replaced race coverage.
+    raw_quic_ack_race_test_hook: Arc<Mutex<Option<Arc<RawQuicAckRaceTestHook>>>>,
+
     /// Internal sender for the receiver task.
     internal_tx: mpsc::Sender<DirectMessage>,
 
@@ -548,6 +606,7 @@ impl DirectMessaging {
             peer_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_replaced_tx,
+            raw_quic_ack_race_test_hook: Arc::new(Mutex::new(None)),
             internal_tx,
             internal_rx: Arc::new(tokio::sync::Mutex::new(internal_rx)),
         }
@@ -643,6 +702,27 @@ impl DirectMessaging {
     #[must_use]
     pub fn subscribe_lifecycle_replaced(&self) -> broadcast::Receiver<(MachineId, u64)> {
         self.lifecycle_replaced_tx.subscribe()
+    }
+
+    #[doc(hidden)]
+    pub fn set_raw_quic_ack_race_test_hook_for_testing(
+        &self,
+        hook: Option<Arc<RawQuicAckRaceTestHook>>,
+    ) {
+        match self.raw_quic_ack_race_test_hook.lock() {
+            Ok(mut guard) => *guard = hook,
+            Err(e) => tracing::error!("raw QUIC ACK race test hook poisoned: {e}"),
+        }
+    }
+
+    pub(crate) fn raw_quic_ack_race_test_hook(&self) -> Option<Arc<RawQuicAckRaceTestHook>> {
+        match self.raw_quic_ack_race_test_hook.lock() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                tracing::error!("raw QUIC ACK race test hook poisoned: {e}");
+                None
+            }
+        }
     }
 
     /// Record a closing/closed lifecycle state for a machine.
