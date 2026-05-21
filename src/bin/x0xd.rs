@@ -7227,6 +7227,9 @@ async fn apply_named_group_metadata_event(
                     role = ?role,
                     "MemberJoined: rejecting non-member role"
                 );
+                state
+                    .groups_diagnostics
+                    .record_member_joined_rejected_non_member_role(&resolved_group_key);
                 return false;
             }
 
@@ -7273,6 +7276,11 @@ async fn apply_named_group_metadata_event(
             if let Err(reason) =
                 next.consume_issued_invite(&invite_secret, &member_agent_id, role, ts_ms, now_ms)
             {
+                if reason == "invite_secret_unknown" {
+                    state
+                        .groups_diagnostics
+                        .record_member_joined_rejected_invite_secret_unknown(&resolved_group_key);
+                }
                 tracing::debug!(
                     group_id = %resolved_group_key,
                     inviter = %inviter_agent_id,

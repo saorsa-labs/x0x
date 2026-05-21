@@ -159,6 +159,19 @@ async fn diagnostics_groups(d: &AgentInstance) -> Value {
     resp.json().await.expect("diagnostics json")
 }
 
+async fn group_diagnostic_counter(d: &AgentInstance, group_id: &str, counter: &str) -> u64 {
+    let diag = diagnostics_groups(d).await;
+    diag["groups"]
+        .as_array()
+        .and_then(|groups| {
+            groups
+                .iter()
+                .find(|g| g["group_id"].as_str() == Some(group_id))
+        })
+        .and_then(|g| g[counter].as_u64())
+        .unwrap_or_default()
+}
+
 async fn group_details(d: &AgentInstance, group_id: &str) -> Value {
     authed_client(d)
         .get(d.url(&format!("/groups/{group_id}")))
@@ -415,6 +428,13 @@ async fn forged_member_joined_admin_role_or_secret_is_rejected() {
         .to_string();
     let invite = create_invite(alice, &group_id).await;
     let parsed = x0x::groups::invite::SignedInvite::from_link(&invite).expect("parse invite");
+    let bob_aid = bob.agent_id().await;
+    let admin_rejected_before = group_diagnostic_counter(
+        alice,
+        &group_id,
+        "member_joined_events_rejected_non_member_role",
+    )
+    .await;
     let forged = signed_member_joined_event(
         bob,
         &group_id,
@@ -427,13 +447,31 @@ async fn forged_member_joined_admin_role_or_secret_is_rejected() {
     let published = publish_raw(bob, &metadata_topic, &payload).await;
     assert_eq!(published["ok"], true, "publish forged event: {published:?}");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let bob_aid = bob.agent_id().await;
+    let admin_rejected = wait_until(Duration::from_secs(15), || async {
+        group_diagnostic_counter(
+            alice,
+            &group_id,
+            "member_joined_events_rejected_non_member_role",
+        )
+        .await
+            > admin_rejected_before
+    })
+    .await;
+    assert!(
+        admin_rejected,
+        "alice never reported rejecting forged admin MemberJoined",
+    );
     assert!(
         !list_members(alice, &group_id).await.contains(&bob_aid),
         "forged admin MemberJoined unexpectedly admitted bob",
     );
 
+    let unknown_secret_rejected_before = group_diagnostic_counter(
+        alice,
+        &group_id,
+        "member_joined_events_rejected_invite_secret_unknown",
+    )
+    .await;
     let forged_secret = signed_member_joined_event(
         bob,
         &group_id,
@@ -448,7 +486,20 @@ async fn forged_member_joined_admin_role_or_secret_is_rejected() {
         published["ok"], true,
         "publish forged secret event: {published:?}"
     );
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let unknown_secret_rejected = wait_until(Duration::from_secs(15), || async {
+        group_diagnostic_counter(
+            alice,
+            &group_id,
+            "member_joined_events_rejected_invite_secret_unknown",
+        )
+        .await
+            > unknown_secret_rejected_before
+    })
+    .await;
+    assert!(
+        unknown_secret_rejected,
+        "alice never reported rejecting forged unknown-secret MemberJoined",
+    );
     assert!(
         !list_members(alice, &group_id).await.contains(&bob_aid),
         "forged unknown-secret MemberJoined unexpectedly admitted bob",
