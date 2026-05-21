@@ -5,6 +5,7 @@
 //!
 //! Before running: cargo build --release --bin x0xd
 
+use anyhow::{ensure, Context, Result};
 use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::Value;
@@ -906,75 +907,203 @@ async fn daemon_api_group_not_found() {
 // Task Lists (5)
 // ===========================================================================
 
-#[tokio::test]
-#[ignore]
-async fn daemon_api_create_task_list() {
-    let d = daemon().await;
-    let r: Value = ca(&d)
-        .post(d.url("/task-lists"))
-        .json(&serde_json::json!({"name": "test", "topic": "test-tasks"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(r["ok"], true);
-}
+async fn create_task_list_item(d: &DaemonFixture, title: &str) -> Result<(String, String)> {
+    let client = ca(d);
+    let topic = format!("task-lifecycle-{}", rand::random::<u32>());
 
-#[tokio::test]
-#[ignore]
-async fn daemon_api_add_task() {
-    let d = daemon().await;
-    let cr: Value = ca(&d)
+    let create = client
         .post(d.url("/task-lists"))
-        .json(&serde_json::json!({"name": "t", "topic": "t-tasks"}))
+        .json(&serde_json::json!({"name": "task lifecycle", "topic": topic}))
         .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let lid = cr["id"]
+        .await?;
+    ensure!(
+        create.status() == StatusCode::CREATED,
+        "create task list status: {}",
+        create.status()
+    );
+
+    let create_body: Value = create.json().await?;
+    ensure!(
+        create_body["ok"].as_bool() == Some(true),
+        "create task list response: {create_body:?}"
+    );
+    let list_id = create_body["id"]
         .as_str()
-        .unwrap_or(cr["task_list_id"].as_str().unwrap_or(""));
-    if !lid.is_empty() {
-        let r: Value = ca(&d)
-            .post(d.url(&format!("/task-lists/{lid}/tasks")))
-            .json(&serde_json::json!({"title": "Test task"}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(r["ok"], true);
-    }
+        .with_context(|| format!("create task list response missing id: {create_body:?}"))?
+        .to_string();
+    ensure!(!list_id.is_empty(), "create task list id was empty");
+
+    let add = client
+        .post(d.url(&format!("/task-lists/{list_id}/tasks")))
+        .json(&serde_json::json!({"title": title}))
+        .send()
+        .await?;
+    ensure!(
+        add.status() == StatusCode::CREATED,
+        "add task status: {}",
+        add.status()
+    );
+
+    let add_body: Value = add.json().await?;
+    ensure!(
+        add_body["ok"].as_bool() == Some(true),
+        "add task response: {add_body:?}"
+    );
+    let task_id = add_body["task_id"]
+        .as_str()
+        .with_context(|| format!("add task response missing task_id: {add_body:?}"))?
+        .to_string();
+    ensure!(
+        task_id.len() == 64,
+        "add task response missing 64-char task_id: {add_body:?}"
+    );
+
+    Ok((list_id, task_id))
+}
+
+async fn list_task_list_items(d: &DaemonFixture, list_id: &str) -> Result<Value> {
+    let response = ca(d)
+        .get(d.url(&format!("/task-lists/{list_id}/tasks")))
+        .send()
+        .await?;
+    ensure!(
+        response.status() == StatusCode::OK,
+        "list tasks status: {}",
+        response.status()
+    );
+
+    let body: Value = response.json().await?;
+    ensure!(
+        body["ok"].as_bool() == Some(true),
+        "list tasks response: {body:?}"
+    );
+    ensure!(body["tasks"].is_array(), "tasks response: {body:?}");
+    Ok(body)
+}
+
+async fn update_task_item(
+    d: &DaemonFixture,
+    list_id: &str,
+    task_id: &str,
+    action: &str,
+) -> Result<()> {
+    let response = ca(d)
+        .patch(d.url(&format!("/task-lists/{list_id}/tasks/{task_id}")))
+        .json(&serde_json::json!({"action": action}))
+        .send()
+        .await?;
+    ensure!(
+        response.status() == StatusCode::OK,
+        "update task status: {}",
+        response.status()
+    );
+
+    let body: Value = response.json().await?;
+    ensure!(
+        body["ok"].as_bool() == Some(true),
+        "update task response: {body:?}"
+    );
+    Ok(())
+}
+
+fn task_state<'a>(body: &'a Value, task_id: &str) -> Option<&'a str> {
+    body["tasks"]
+        .as_array()
+        .and_then(|tasks| {
+            tasks
+                .iter()
+                .find(|task| task["id"].as_str() == Some(task_id))
+        })
+        .and_then(|task| task["state"].as_str())
 }
 
 #[tokio::test]
 #[ignore]
-async fn daemon_api_list_tasks() {
+async fn daemon_api_create_task_list() -> Result<()> {
     let d = daemon().await;
-    let r = ca(&d).get(d.url("/task-lists")).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    let r = ca(&d)
+        .post(d.url("/task-lists"))
+        .json(&serde_json::json!({
+            "name": "test",
+            "topic": format!("test-tasks-{}", rand::random::<u32>()),
+        }))
+        .send()
+        .await?;
+    ensure!(
+        r.status() == StatusCode::CREATED,
+        "create task list status: {}",
+        r.status()
+    );
+
+    let r: Value = r.json().await?;
+    ensure!(
+        r["ok"].as_bool() == Some(true),
+        "create task list response: {r:?}"
+    );
+    ensure!(r["id"].is_string(), "create task list response: {r:?}");
+    Ok(())
 }
 
 #[tokio::test]
 #[ignore]
-async fn daemon_api_claim_task() {
-    // Tested via the update_task endpoint with action: "claim"
+async fn daemon_api_add_task() -> Result<()> {
     let d = daemon().await;
-    let r = ca(&d).get(d.url("/task-lists")).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    create_task_list_item(&d, "Test task").await?;
+    Ok(())
 }
 
 #[tokio::test]
 #[ignore]
-async fn daemon_api_complete_task() {
+async fn daemon_api_list_tasks() -> Result<()> {
     let d = daemon().await;
-    let r = ca(&d).get(d.url("/task-lists")).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    let (list_id, task_id) = create_task_list_item(&d, "List me").await?;
+
+    let r = ca(&d).get(d.url("/task-lists")).send().await?;
+    ensure!(
+        r.status() == StatusCode::OK,
+        "list task lists status: {}",
+        r.status()
+    );
+
+    let listed = list_task_list_items(&d, &list_id).await?;
+    ensure!(
+        task_state(&listed, &task_id) == Some("empty"),
+        "listed task response: {listed:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_claim_task() -> Result<()> {
+    let d = daemon().await;
+    let (list_id, task_id) = create_task_list_item(&d, "Claim me").await?;
+
+    update_task_item(&d, &list_id, &task_id, "claim").await?;
+
+    let listed = list_task_list_items(&d, &list_id).await?;
+    ensure!(
+        task_state(&listed, &task_id).is_some_and(|state| state.starts_with("claimed:")),
+        "claimed task response: {listed:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_complete_task() -> Result<()> {
+    let d = daemon().await;
+    let (list_id, task_id) = create_task_list_item(&d, "Complete me").await?;
+
+    update_task_item(&d, &list_id, &task_id, "claim").await?;
+    update_task_item(&d, &list_id, &task_id, "complete").await?;
+
+    let listed = list_task_list_items(&d, &list_id).await?;
+    ensure!(
+        task_state(&listed, &task_id).is_some_and(|state| state.starts_with("done:")),
+        "completed task response: {listed:?}"
+    );
+    Ok(())
 }
 
 // ===========================================================================
