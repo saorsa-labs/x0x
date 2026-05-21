@@ -370,30 +370,31 @@ fn subscription_set_json_roundtrip() {
 #[test]
 fn cache_search_across_tag_name_id() {
     let mut cache = DirectoryShardCache::default();
-    let mut c1 = make_card(
+    let c1 = make_card(
         "rust-group",
         1,
         false,
         GroupDiscoverability::PublicDirectory,
-        vec!["rust".into(), "async".into()],
-        "Rust Workers",
+        vec!["systems".into(), "async".into()],
+        "Runtime Workers",
     );
-    c1.group_id = "rust-group".into();
     let c2 = make_card(
-        "python-group",
+        "ml-group",
         1,
         false,
         GroupDiscoverability::PublicDirectory,
-        vec!["python".into()],
+        vec!["data".into()],
         "Python ML",
     );
     cache.insert(ShardKind::Tag, 1, c1);
     cache.insert(ShardKind::Tag, 2, c2);
 
     // Tag hit
-    assert_eq!(cache.search("rust").len(), 1);
+    assert_eq!(cache.search("systems").len(), 1);
     // Name hit (case-insensitive)
     assert_eq!(cache.search("python").len(), 1);
+    // ID hit
+    assert_eq!(cache.search("rust-group").len(), 1);
     // No match
     assert_eq!(cache.search("go").len(), 0);
 }
