@@ -250,15 +250,28 @@ async fn daemon_api_publish_bad_base64() {
 
 #[tokio::test]
 #[ignore]
-async fn daemon_api_direct_send_not_found() {
+async fn daemon_api_direct_send_not_found() -> Result<()> {
     let d = daemon().await;
     let r = ca(&d)
         .post(d.url("/direct/send"))
         .json(&serde_json::json!({"agent_id": fake_id(), "payload": b64(b"hi")}))
         .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_server_error() || r.status() == StatusCode::NOT_FOUND);
+        .await?;
+    let status = r.status();
+    let body: Value = r.json().await?;
+    ensure!(
+        status == StatusCode::NOT_FOUND,
+        "unknown direct-send recipient returned {status}: {body:?}"
+    );
+    ensure!(
+        body["ok"].as_bool() == Some(false),
+        "unexpected direct-send error body: {body:?}"
+    );
+    ensure!(
+        body["error"].as_str() == Some("recipient_key_unavailable"),
+        "unexpected direct-send error body: {body:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]
