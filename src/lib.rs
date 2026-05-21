@@ -21,12 +21,13 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use x0x::Agent;
+//! use x0x::{network::NetworkConfig, Agent};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Create an agent with default configuration
-//! // This automatically connects to 6 global bootstrap nodes
+//! // Create an online agent with the default network configuration.
+//! // Omitting with_network_config builds an offline identity-only agent.
 //! let agent = Agent::builder()
+//!     .with_network_config(NetworkConfig::default())
 //!     .build()
 //!     .await?;
 //!
@@ -44,7 +45,8 @@
 //!
 //! ## Bootstrap Nodes
 //!
-//! Agents automatically connect to Saorsa Labs' global bootstrap network:
+//! Agents configured with [`network::NetworkConfig`]`::default()` connect to
+//! Saorsa Labs' global bootstrap network:
 //! - NYC, US · SFO, US · Helsinki, FI
 //! - Nuremberg, DE · Singapore, SG · Sydney, JP
 //!
@@ -1746,10 +1748,12 @@ impl HeartbeatContext {
 }
 
 impl Agent {
-    /// Create a new agent with default configuration.
+    /// Create a new offline agent with default identity configuration.
     ///
     /// This generates a fresh identity with both machine and agent keypairs.
     /// The machine keypair is stored persistently in `~/.x0x/machine.key`.
+    /// Network and gossip runtime setup is opt-in via
+    /// [`Agent::builder()`] and [`AgentBuilder::with_network_config()`].
     ///
     /// For more control, use [`Agent::builder()`].
     pub async fn new() -> error::Result<Self> {
@@ -1762,6 +1766,7 @@ impl Agent {
     /// - Custom machine key path via `with_machine_key()`
     /// - Imported agent keypair via `with_agent_key()`
     /// - User identity via `with_user_key()` or `with_user_key_path()`
+    /// - Network and gossip runtime via `with_network_config()` (opt-in)
     pub fn builder() -> AgentBuilder {
         AgentBuilder {
             machine_key_path: None,
@@ -6809,7 +6814,9 @@ impl AgentBuilder {
 
     /// Set network configuration for P2P communication.
     ///
-    /// If not set, default network configuration is used.
+    /// If not set, the agent is built without a network node or gossip
+    /// runtime. Use `NetworkConfig::default()` to connect through the default
+    /// bootstrap nodes.
     ///
     /// # Arguments
     ///
