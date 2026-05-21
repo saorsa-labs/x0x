@@ -47,7 +47,7 @@ proptest! {
 
     #[test]
     fn connect_outcome_display_not_empty(addr in arb_addr()) {
-        for o in [ConnectOutcome::Direct(addr), ConnectOutcome::Coordinated(addr), ConnectOutcome::NotFound, ConnectOutcome::Unreachable] {
+        for o in [ConnectOutcome::Direct(addr), ConnectOutcome::Coordinated(addr), ConnectOutcome::NotFound, ConnectOutcome::Unreachable, ConnectOutcome::AlreadyConnected] {
             let display = format!("{}", o);
             prop_assert!(!display.is_empty());
         }
