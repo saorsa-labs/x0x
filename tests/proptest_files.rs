@@ -107,6 +107,38 @@ fn max_transfer_size_is_at_least_one_chunk() {
 }
 
 #[test]
+fn chunk_math_covers_transfer_size_boundary() {
+    let chunk = DEFAULT_CHUNK_SIZE as u64;
+    let cases = [
+        (0, 0, 0),
+        (1, 1, 1),
+        (chunk, 1, DEFAULT_CHUNK_SIZE),
+        (chunk + 1, 2, 1),
+        (
+            MAX_TRANSFER_SIZE - chunk,
+            (MAX_TRANSFER_SIZE - chunk) / chunk,
+            DEFAULT_CHUNK_SIZE,
+        ),
+        (
+            MAX_TRANSFER_SIZE - 1,
+            MAX_TRANSFER_SIZE / chunk,
+            DEFAULT_CHUNK_SIZE - 1,
+        ),
+        (
+            MAX_TRANSFER_SIZE,
+            MAX_TRANSFER_SIZE / chunk,
+            DEFAULT_CHUNK_SIZE,
+        ),
+        (MAX_TRANSFER_SIZE + 1, MAX_TRANSFER_SIZE / chunk + 1, 1),
+    ];
+
+    for (size, expected_chunks, expected_last) in cases {
+        assert_eq!(chunk_count(size, DEFAULT_CHUNK_SIZE), expected_chunks);
+        assert_eq!(last_chunk_size(size, DEFAULT_CHUNK_SIZE), expected_last);
+    }
+}
+
+#[test]
 fn sha256_deterministic() {
     use sha2::{Digest, Sha256};
 
