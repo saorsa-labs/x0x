@@ -3,12 +3,15 @@
 //! These tests verify QUIC hole punching works correctly across the 6 global
 //! VPS nodes and from local machines behind NAT.
 
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tempfile::TempDir;
 use tokio::time::timeout;
-use x0x::{network::NetworkConfig, Agent};
+use x0x::{network::NetworkConfig, network::NetworkNode, Agent};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<T> = Result<T, BoxError>;
@@ -22,6 +25,199 @@ const VPS_NODES: &[&str] = &[
     "152.42.210.67:5483",   // saorsa-8 (Singapore)
     "170.64.176.102:5483",  // saorsa-9 (Sydney)
 ];
+
+fn test_error(message: impl Into<String>) -> BoxError {
+    std::io::Error::other(message.into()).into()
+}
+
+fn timeout_error(message: impl Into<String>) -> BoxError {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, message.into()).into()
+}
+
+fn vps_bootstrap_addrs() -> TestResult<Vec<SocketAddr>> {
+    let mut addrs = Vec::with_capacity(VPS_NODES.len());
+    for raw_addr in VPS_NODES {
+        let addr = raw_addr.parse::<SocketAddr>().map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid VPS bootstrap address {raw_addr}: {err}"),
+            )
+        })?;
+        addrs.push(addr);
+    }
+    Ok(addrs)
+}
+
+fn agent_network(agent: &Agent) -> TestResult<Arc<NetworkNode>> {
+    agent
+        .network()
+        .cloned()
+        .ok_or_else(|| test_error("agent should have network runtime after join"))
+}
+
+async fn join_vps_network(agent: &Agent) -> TestResult<()> {
+    timeout(Duration::from_secs(30), agent.join_network())
+        .await
+        .map_err(|_| timeout_error("network join timed out after 30 seconds"))??;
+    Ok(())
+}
+
+async fn connect_all_vps_nodes(
+    agent: &Agent,
+    per_node_timeout: Duration,
+) -> TestResult<Vec<(SocketAddr, ant_quic::PeerId)>> {
+    let network = agent_network(agent)?;
+    let mut connected = Vec::with_capacity(VPS_NODES.len());
+
+    for addr in vps_bootstrap_addrs()? {
+        let peer_id = timeout(per_node_timeout, network.connect_addr(addr))
+            .await
+            .map_err(|_| {
+                timeout_error(format!(
+                    "connection to VPS node {addr} timed out after {per_node_timeout:?}"
+                ))
+            })?
+            .map_err(|err| test_error(format!("connection to VPS node {addr} failed: {err}")))?;
+        connected.push((addr, peer_id));
+    }
+
+    Ok(connected)
+}
+
+async fn assert_vps_peer_set(
+    agent: &Agent,
+    connected_vps_nodes: &[(SocketAddr, ant_quic::PeerId)],
+) -> TestResult<()> {
+    assert_eq!(
+        connected_vps_nodes.len(),
+        VPS_NODES.len(),
+        "every configured VPS bootstrap address must be probed"
+    );
+
+    let unique_vps_peers: HashSet<[u8; 32]> = connected_vps_nodes
+        .iter()
+        .map(|(_, peer_id)| peer_id.0)
+        .collect();
+    assert_eq!(
+        unique_vps_peers.len(),
+        connected_vps_nodes.len(),
+        "VPS bootstrap addresses should resolve to distinct remote peers"
+    );
+
+    let network = agent_network(agent)?;
+    let live_peer_ids: HashSet<[u8; 32]> = network
+        .connected_peers()
+        .await
+        .into_iter()
+        .map(|peer_id| peer_id.0)
+        .collect();
+    let missing: Vec<String> = connected_vps_nodes
+        .iter()
+        .filter(|(_, peer_id)| !live_peer_ids.contains(&peer_id.0))
+        .map(|(addr, peer_id)| format!("{addr} ({peer_id:?})"))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "VPS nodes connected by address must remain in the live peer table; missing: {}",
+        missing.join(", ")
+    );
+    assert!(
+        live_peer_ids.len() >= VPS_NODES.len(),
+        "expected at least {} live VPS peers, got {}",
+        VPS_NODES.len(),
+        live_peer_ids.len()
+    );
+
+    Ok(())
+}
+
+async fn probe_vps_peers(
+    agent: &Agent,
+    connected_vps_nodes: &[(SocketAddr, ant_quic::PeerId)],
+) -> TestResult<()> {
+    let network = agent_network(agent)?;
+
+    for (addr, peer_id) in connected_vps_nodes {
+        let rtt = timeout(
+            Duration::from_secs(5),
+            network.probe_peer(*peer_id, Duration::from_secs(5)),
+        )
+        .await
+        .map_err(|_| timeout_error(format!("probe to VPS node {addr} timed out")))?
+        .ok_or_else(|| test_error("network runtime missing during VPS probe"))?
+        .map_err(|err| test_error(format!("probe to VPS node {addr} failed: {err}")))?;
+
+        println!("VPS node {addr} probe RTT: {rtt:?}");
+        assert!(
+            rtt < Duration::from_secs(2),
+            "probe RTT to VPS node {addr} ({peer_id:?}) too high: {rtt:?}"
+        );
+    }
+
+    Ok(())
+}
+
+fn is_publicly_routable(addr: SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_multicast()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1])))
+        }
+        IpAddr::V6(ip) => {
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast())
+        }
+    }
+}
+
+async fn wait_for_public_external_addrs(
+    agent: &Agent,
+    wait_duration: Duration,
+) -> TestResult<Vec<SocketAddr>> {
+    let network = agent_network(agent)?;
+    let deadline = Instant::now() + wait_duration;
+    let mut last_external_addrs = Vec::new();
+
+    loop {
+        if let Some(status) = network.node_status().await {
+            let public_addrs: Vec<SocketAddr> = status
+                .external_addrs
+                .iter()
+                .copied()
+                .filter(|addr| is_publicly_routable(*addr))
+                .collect();
+
+            if !public_addrs.is_empty() {
+                return Ok(public_addrs);
+            }
+
+            last_external_addrs = status.external_addrs;
+        }
+
+        if Instant::now() >= deadline {
+            return Err(timeout_error(format!(
+                "timed out waiting for a public external address; last observed addresses: {last_external_addrs:?}"
+            )));
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
 
 struct VpsAgentPaths {
     machine_key: PathBuf,
@@ -58,8 +254,7 @@ impl std::ops::Deref for VpsTestAgent {
 async fn create_agent_with_vps_bootstrap() -> TestResult<VpsTestAgent> {
     let temp_dir = TempDir::new()?;
     let paths = vps_agent_paths(temp_dir.path());
-    let bootstrap_addrs: Vec<SocketAddr> =
-        VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
+    let bootstrap_addrs = vps_bootstrap_addrs()?;
 
     let agent = Agent::builder()
         .with_machine_key(paths.machine_key)
@@ -82,6 +277,32 @@ async fn create_agent_with_vps_bootstrap() -> TestResult<VpsTestAgent> {
 }
 
 #[test]
+fn vps_bootstrap_addresses_are_well_formed() -> TestResult<()> {
+    let addrs = vps_bootstrap_addrs()?;
+    let unique_addrs: HashSet<SocketAddr> = addrs.iter().copied().collect();
+
+    assert_eq!(
+        addrs.len(),
+        VPS_NODES.len(),
+        "all configured VPS bootstrap nodes must parse"
+    );
+    assert_eq!(
+        unique_addrs.len(),
+        addrs.len(),
+        "VPS bootstrap addresses should be unique"
+    );
+    for addr in addrs {
+        assert_ne!(addr.port(), 0, "VPS bootstrap node must use a real port");
+        assert!(
+            !addr.ip().is_unspecified(),
+            "VPS bootstrap node must not use an unspecified IP: {addr}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn vps_agent_paths_are_isolated_under_fixture_dir() -> TestResult<()> {
     let temp_dir = TempDir::new()?;
     let paths = vps_agent_paths(temp_dir.path());
@@ -101,30 +322,15 @@ fn vps_agent_paths_are_isolated_under_fixture_dir() -> TestResult<()> {
 /// Success indicates NAT traversal is working (local NAT → public VPS).
 #[tokio::test]
 #[ignore = "requires VPS testnet - run with --ignored"]
-async fn test_vps_nodes_reachable() {
-    let agent = create_agent_with_vps_bootstrap()
-        .await
-        .expect("Failed to create agent");
+async fn test_vps_nodes_reachable() -> TestResult<()> {
+    let agent = create_agent_with_vps_bootstrap().await?;
 
-    // Join network with VPS bootstrap nodes
-    let join_result = timeout(Duration::from_secs(30), agent.join_network()).await;
-    assert!(
-        join_result.is_ok(),
-        "Network join timed out after 30 seconds"
-    );
-    assert!(join_result.unwrap().is_ok(), "Failed to join network");
+    join_vps_network(&agent).await?;
 
-    // Give time for connections to establish
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    let connected_vps_nodes = connect_all_vps_nodes(&agent, Duration::from_secs(15)).await?;
+    assert_vps_peer_set(&agent, &connected_vps_nodes).await?;
 
-    // Verify agent is connected to network
-    assert!(
-        agent.network().is_some(),
-        "Agent should have network runtime after join"
-    );
-
-    // TODO: Add peer count verification when NetworkRuntime exposes peer list
-    // For now, successful join indicates at least one VPS connection succeeded
+    Ok(())
 }
 
 /// Test 2: Measure connection latency to each VPS node.
@@ -132,41 +338,15 @@ async fn test_vps_nodes_reachable() {
 /// This test measures round-trip time to verify NAT hole punching performance.
 #[tokio::test]
 #[ignore = "requires VPS testnet - run with --ignored"]
-async fn test_connection_latency() {
-    let agent = create_agent_with_vps_bootstrap()
-        .await
-        .expect("Failed to create agent");
+async fn test_connection_latency() -> TestResult<()> {
+    let agent = create_agent_with_vps_bootstrap().await?;
 
-    agent.join_network().await.expect("Failed to join network");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    join_vps_network(&agent).await?;
+    let connected_vps_nodes = connect_all_vps_nodes(&agent, Duration::from_secs(15)).await?;
+    assert_vps_peer_set(&agent, &connected_vps_nodes).await?;
+    probe_vps_peers(&agent, &connected_vps_nodes).await?;
 
-    // Subscribe to test topic to measure message round-trip
-    let mut subscription = agent
-        .subscribe("latency-test")
-        .await
-        .expect("Failed to subscribe");
-
-    // Publish test message
-    let start = std::time::Instant::now();
-    agent
-        .publish("latency-test", b"ping".to_vec())
-        .await
-        .expect("Failed to publish");
-
-    // Wait for message echo (should come back from gossip mesh)
-    let recv_result = timeout(Duration::from_secs(5), subscription.recv()).await;
-    assert!(recv_result.is_ok(), "Message receive timed out");
-
-    let latency = start.elapsed();
-    println!("Message round-trip latency: {:?}", latency);
-
-    // Latency should be reasonable for local → VPS → local
-    // Allow up to 2 seconds for global gossip propagation
-    assert!(
-        latency < Duration::from_secs(2),
-        "Latency too high: {:?}",
-        latency
-    );
+    Ok(())
 }
 
 /// Test 3: Connection pool stability over time.
@@ -174,18 +354,19 @@ async fn test_connection_latency() {
 /// This test verifies connections remain stable and don't drop unexpectedly.
 #[tokio::test]
 #[ignore = "requires VPS testnet - run with --ignored"]
-async fn test_connection_stability() {
-    let agent = create_agent_with_vps_bootstrap()
-        .await
-        .expect("Failed to create agent");
+async fn test_connection_stability() -> TestResult<()> {
+    let agent = create_agent_with_vps_bootstrap().await?;
 
-    agent.join_network().await.expect("Failed to join network");
+    join_vps_network(&agent).await?;
+    let connected_vps_nodes = connect_all_vps_nodes(&agent, Duration::from_secs(15)).await?;
+    assert_vps_peer_set(&agent, &connected_vps_nodes).await?;
 
     // Subscribe to test topic
-    let mut subscription = agent
-        .subscribe("stability-test")
-        .await
-        .expect("Failed to subscribe");
+    let topic = format!(
+        "stability-test-{}",
+        hex::encode(&agent.machine_id().as_bytes()[..8])
+    );
+    let mut subscription = agent.subscribe(&topic).await?;
 
     // Send messages periodically for 5 minutes
     let test_duration = Duration::from_secs(300);
@@ -197,12 +378,8 @@ async fn test_connection_stability() {
     while start.elapsed() < test_duration {
         // Publish message
         agent
-            .publish(
-                "stability-test",
-                format!("msg-{}", message_count).into_bytes(),
-            )
-            .await
-            .expect("Failed to publish");
+            .publish(&topic, format!("msg-{}", message_count).into_bytes())
+            .await?;
         message_count += 1;
 
         // Try to receive any messages (non-blocking)
@@ -234,6 +411,10 @@ async fn test_connection_stability() {
         received_count > 0,
         "Should have received at least some messages back"
     );
+    assert_vps_peer_set(&agent, &connected_vps_nodes).await?;
+    probe_vps_peers(&agent, &connected_vps_nodes).await?;
+
+    Ok(())
 }
 
 /// Test 4: Multiple concurrent agents connecting to VPS mesh.
@@ -250,8 +431,7 @@ async fn test_concurrent_connections() -> TestResult<()> {
         let handle = tokio::spawn(async move {
             let temp_dir = TempDir::new()?;
             let paths = vps_agent_paths(temp_dir.path());
-            let bootstrap_addrs: Vec<SocketAddr> =
-                VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
+            let bootstrap_addrs = vps_bootstrap_addrs()?;
 
             let agent = Agent::builder()
                 .with_machine_key(paths.machine_key)
@@ -268,9 +448,12 @@ async fn test_concurrent_connections() -> TestResult<()> {
                 .await?;
 
             agent.join_network().await?;
+            let connected_vps_nodes =
+                connect_all_vps_nodes(&agent, Duration::from_secs(15)).await?;
 
             // Brief delay to stabilize
             tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_vps_peer_set(&agent, &connected_vps_nodes).await?;
 
             Ok::<(), BoxError>(())
         });
@@ -298,22 +481,18 @@ async fn test_concurrent_connections() -> TestResult<()> {
 /// This test verifies agents can discover all VPS nodes through peer exchange.
 #[tokio::test]
 #[ignore = "requires VPS testnet - run with --ignored"]
-async fn test_vps_discovery() {
-    let agent = create_agent_with_vps_bootstrap()
-        .await
-        .expect("Failed to create agent");
+async fn test_vps_discovery() -> TestResult<()> {
+    let agent = create_agent_with_vps_bootstrap().await?;
 
-    agent.join_network().await.expect("Failed to join network");
+    join_vps_network(&agent).await?;
 
     // Wait for peer exchange to propagate (HyParView)
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // TODO: Query peer list from NetworkRuntime when API available
-    // For now, successful join indicates discovery is working
+    let connected_vps_nodes = connect_all_vps_nodes(&agent, Duration::from_secs(15)).await?;
+    assert_vps_peer_set(&agent, &connected_vps_nodes).await?;
 
-    // Verify agent can publish to network (all VPS nodes should receive)
-    let result = agent.publish("discovery-test", b"hello".to_vec()).await;
-    assert!(result.is_ok(), "Should be able to publish to network");
+    Ok(())
 }
 
 /// Test 6: Verify external address discovery works.
@@ -322,20 +501,19 @@ async fn test_vps_discovery() {
 /// through the VPS mesh (similar to STUN but using QUIC).
 #[tokio::test]
 #[ignore = "requires VPS testnet - run with --ignored"]
-async fn test_external_address_discovery() {
-    let agent = create_agent_with_vps_bootstrap()
-        .await
-        .expect("Failed to create agent");
+async fn test_external_address_discovery() -> TestResult<()> {
+    let agent = create_agent_with_vps_bootstrap().await?;
 
-    agent.join_network().await.expect("Failed to join network");
+    join_vps_network(&agent).await?;
+    let connected_vps_nodes = connect_all_vps_nodes(&agent, Duration::from_secs(15)).await?;
+    assert_vps_peer_set(&agent, &connected_vps_nodes).await?;
 
-    // Wait for external address discovery
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    let public_addrs = wait_for_public_external_addrs(&agent, Duration::from_secs(10)).await?;
 
-    // TODO: Expose external address from NetworkRuntime API
-    // For now, verify join succeeded (indicates address discovery worked)
     assert!(
-        agent.network().is_some(),
-        "Network should be initialized after join"
+        !public_addrs.is_empty(),
+        "external address discovery should return at least one public address"
     );
+
+    Ok(())
 }
