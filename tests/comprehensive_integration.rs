@@ -17,6 +17,7 @@ use x0x::dm::{
 use x0x::dm_inbox::verify_envelope_signature;
 use x0x::identity::{AgentId, AgentKeypair};
 use x0x::mls::{MlsCipher, MlsGroup, MlsKeySchedule};
+use x0x::Agent;
 
 // ============================================================================
 // TASK 8: Property-Based CRDT Tests
@@ -424,38 +425,61 @@ async fn test_mls_post_compromise_security() -> anyhow::Result<()> {
 // Note: Actual benchmarks use criterion in benches/ directory.
 // These are integration-level performance tests.
 
-#[test]
-fn test_agent_creation_performance() {
+fn bytes_from_counter(counter: u64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&counter.to_le_bytes());
+    bytes
+}
+
+fn task_id_from_counter(counter: u64) -> TaskId {
+    TaskId::from_bytes(bytes_from_counter(counter))
+}
+
+fn agent_id_from_counter(counter: u64) -> AgentId {
+    AgentId(bytes_from_counter(counter))
+}
+
+#[tokio::test]
+async fn test_agent_creation_performance() -> anyhow::Result<()> {
     use std::time::Instant;
 
+    let temp = tempfile::TempDir::new()?;
     let start = Instant::now();
-    let _agent_id = AgentId(rand::random::<[u8; 32]>());
+    let agent = Agent::builder()
+        .with_machine_key(temp.path().join("machine.key"))
+        .with_agent_key_path(temp.path().join("agent.key"))
+        .with_peer_cache_dir(temp.path().join("peers"))
+        .build()
+        .await?;
     let elapsed = start.elapsed();
 
+    assert_ne!(agent.agent_id(), AgentId([0u8; 32]));
     println!("Agent creation time: {:?}", elapsed);
     assert!(
         elapsed.as_millis() < 100,
         "Agent creation should be < 100ms"
     );
+    Ok(())
 }
 
 #[test]
 fn test_task_list_add_performance() {
     use std::time::Instant;
 
+    const TASK_COUNT: u64 = 1000;
     let list_id = TaskListId::new([5u8; 32]);
     let peer_id = PeerId::new([1u8; 32]);
     let mut list = TaskList::new(list_id, "Perf Test".to_string(), peer_id);
 
     let start = Instant::now();
 
-    for i in 0..1000 {
-        let task_id = TaskId::from_bytes([i as u8; 32]);
+    for i in 0..TASK_COUNT {
+        let task_id = task_id_from_counter(i);
         let meta = TaskMetadata {
             title: format!("Task {}", i),
             description: String::new(),
             priority: 128,
-            created_by: AgentId([i as u8; 32]),
+            created_by: agent_id_from_counter(i),
             owner: None,
             created_at: 1000 + i,
             tags: vec![],
@@ -465,7 +489,8 @@ fn test_task_list_add_performance() {
     }
 
     let elapsed = start.elapsed();
-    let per_task = elapsed.as_micros() / 1000;
+    assert_eq!(list.tasks_ordered().len(), TASK_COUNT as usize);
+    let per_task = elapsed.as_micros() / u128::from(TASK_COUNT);
 
     println!("Added 1000 tasks in {:?} ({} μs/task)", elapsed, per_task);
     assert!(per_task < 1000, "add_task should be < 1ms per task");
@@ -482,28 +507,36 @@ fn test_crdt_merge_performance() {
     let mut list1 = TaskList::new(list_id, "List1".to_string(), peer1);
     let mut list2 = TaskList::new(list_id, "List2".to_string(), peer2);
 
+    const TASKS_PER_REPLICA: u64 = 100;
+
     // Add 100 tasks to each
-    for i in 0..100 {
-        let task_id = TaskId::from_bytes([i; 32]);
+    for i in 0..TASKS_PER_REPLICA {
         let meta = TaskMetadata {
             title: format!("Task {}", i),
             description: String::new(),
             priority: 128,
-            created_by: AgentId([i; 32]),
+            created_by: agent_id_from_counter(i),
             owner: None,
-            created_at: 1000 + u64::from(i),
+            created_at: 1000 + i,
             tags: vec![],
         };
-        let task1 = TaskItem::new(task_id, meta.clone(), peer1);
-        let task2 = TaskItem::new(task_id, meta, peer2);
-        list1.add_task(task1, peer1, i as u64).unwrap();
-        list2.add_task(task2, peer2, i as u64).unwrap();
+        let task1 = TaskItem::new(task_id_from_counter(i), meta.clone(), peer1);
+        let task2 = TaskItem::new(task_id_from_counter(TASKS_PER_REPLICA + i), meta, peer2);
+        list1.add_task(task1, peer1, i).unwrap();
+        list2.add_task(task2, peer2, i).unwrap();
     }
+
+    assert_eq!(list1.tasks_ordered().len(), TASKS_PER_REPLICA as usize);
+    assert_eq!(list2.tasks_ordered().len(), TASKS_PER_REPLICA as usize);
 
     let start = Instant::now();
     list1.merge(&list2).unwrap();
     let elapsed = start.elapsed();
 
+    assert_eq!(
+        list1.tasks_ordered().len(),
+        (TASKS_PER_REPLICA * 2) as usize
+    );
     println!("Merged 100 tasks in {:?}", elapsed);
     assert!(elapsed.as_millis() < 10, "Merge should be < 10ms");
 }
