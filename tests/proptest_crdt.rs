@@ -307,36 +307,41 @@ proptest! {
     /// TaskList merge is commutative: A⊕B produces same tasks as B⊕A.
     #[test]
     fn task_list_merge_commutative(
-        peer_bytes in prop::array::uniform32(any::<u8>()),
+        peer_a_bytes in prop::array::uniform32(any::<u8>()),
+        peer_b_bytes in prop::array::uniform32(any::<u8>()),
         agent_bytes in prop::array::uniform32(any::<u8>()),
     ) {
-        let peer = make_peer_id(peer_bytes);
-        let other_peer = make_alternate_peer_id(peer_bytes);
+        let peer_a = make_peer_id(peer_a_bytes);
+        let peer_b = if peer_a_bytes == peer_b_bytes {
+            make_alternate_peer_id(peer_b_bytes)
+        } else {
+            make_peer_id(peer_b_bytes)
+        };
         let agent = AgentId(agent_bytes);
 
-        let mut a = make_task_list("test", peer);
-        let mut b = make_task_list("test", peer);
+        let mut a = make_task_list("test", peer_a);
+        let mut b = make_task_list("test", peer_b);
 
         // Add the same task to each replica, then diverge observable state.
         let task_id = TaskId::new("shared-task", &agent, 1000);
         let metadata = TaskMetadata::new("shared-task", "desc", 128, agent, 1000);
-        let mut task_a = TaskItem::new(task_id, metadata.clone(), peer);
-        prop_assert!(task_a.claim(agent, peer, 2).is_ok(), "claim should succeed");
-        task_a.update_title("title from a".to_string(), peer);
+        let mut task_a = TaskItem::new(task_id, metadata.clone(), peer_a);
+        prop_assert!(task_a.claim(agent, peer_a, 2).is_ok(), "claim should succeed");
+        task_a.update_title("title from a".to_string(), peer_a);
         let seq_a = a.next_seq();
-        prop_assert!(a.add_task(task_a, peer, seq_a).is_ok(), "add to a should succeed");
-        a.update_name("list from a".to_string(), peer);
+        prop_assert!(a.add_task(task_a, peer_a, seq_a).is_ok(), "add to a should succeed");
+        a.update_name("list from a".to_string(), peer_a);
 
-        let mut task_b = TaskItem::new(task_id, metadata, other_peer);
-        task_b.update_description("desc from b".to_string(), other_peer);
-        task_b.update_assignee(Some(agent), other_peer);
-        task_b.update_priority(255, other_peer);
+        let mut task_b = TaskItem::new(task_id, metadata, peer_b);
+        task_b.update_description("desc from b".to_string(), peer_b);
+        task_b.update_assignee(Some(agent), peer_b);
+        task_b.update_priority(255, peer_b);
         let seq_b = b.next_seq();
         prop_assert!(
-            b.add_task(task_b, other_peer, seq_b).is_ok(),
+            b.add_task(task_b, peer_b, seq_b).is_ok(),
             "add to b should succeed"
         );
-        b.update_name("list from b".to_string(), other_peer);
+        b.update_name("list from b".to_string(), peer_b);
 
         // A⊕B
         let mut ab = a.clone();
