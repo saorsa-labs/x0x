@@ -254,6 +254,18 @@ fn pull_targets_finds_missing_and_stale() {
             "t",
         ),
     );
+    cache.insert(
+        ShardKind::Tag,
+        1,
+        make_card(
+            "g2",
+            3,
+            false,
+            GroupDiscoverability::PublicDirectory,
+            vec![],
+            "t",
+        ),
+    );
     let peer = vec![
         DigestEntry {
             group_id: "g1".into(), // local rev 5, peer rev 5 → skip
@@ -262,7 +274,13 @@ fn pull_targets_finds_missing_and_stale() {
             expires_at: 100_000,
         },
         DigestEntry {
-            group_id: "g2".into(), // unknown locally → pull
+            group_id: "g2".into(), // local rev 3, peer rev 7 → pull stale
+            revision: 7,
+            state_hash: "h7".into(),
+            expires_at: 100_000,
+        },
+        DigestEntry {
+            group_id: "g3".into(), // unknown locally → pull missing
             revision: 1,
             state_hash: "h1".into(),
             expires_at: 100_000,
@@ -270,6 +288,7 @@ fn pull_targets_finds_missing_and_stale() {
     ];
     let pulls = cache.pull_targets(ShardKind::Tag, 1, &peer);
     assert!(pulls.contains(&"g2".to_string()));
+    assert!(pulls.contains(&"g3".to_string()));
     assert!(!pulls.contains(&"g1".to_string()));
 }
 
