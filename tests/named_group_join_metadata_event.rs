@@ -409,6 +409,137 @@ fn group_role_as_u8_is_stable_across_releases() {
     assert_eq!(GroupRole::Guest.as_u8(), 4);
 }
 
+/// Wire-tamper regression: a valid MemberJoined payload must bind signed
+/// fields to the signature. Mutating the signed role after signature
+/// generation must fail before Alice reaches the role-policy rejection path,
+/// while the unmodified payload from the same helper remains acceptable.
+#[tokio::test]
+async fn tampered_member_joined_signed_role_is_rejected_before_role_policy() {
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let group_id = create_public_open_group(alice, "Reject Tampered Role").await;
+    let details = group_details(alice, &group_id).await;
+    let metadata_topic = details["metadata_topic"].as_str().map(ToString::to_string);
+    assert!(
+        metadata_topic.is_some(),
+        "group details missing metadata_topic: {details:?}",
+    );
+    let Some(metadata_topic) = metadata_topic else {
+        return;
+    };
+    let invite = create_invite(alice, &group_id).await;
+    let parsed = x0x::groups::invite::SignedInvite::from_link(&invite);
+    assert!(parsed.is_ok(), "parse invite failed");
+    let Ok(parsed) = parsed else {
+        return;
+    };
+    let bob_aid = bob.agent_id().await;
+
+    let role_rejected_before = group_diagnostic_counter(
+        alice,
+        &group_id,
+        "member_joined_events_rejected_non_member_role",
+    )
+    .await;
+    let applied_before =
+        group_diagnostic_counter(alice, &group_id, "member_joined_events_applied").await;
+
+    let valid = signed_member_joined_event(
+        bob,
+        &group_id,
+        &parsed.inviter,
+        &parsed.invite_secret,
+        x0x::groups::GroupRole::Member,
+    )
+    .await;
+    let mut tampered = valid.clone();
+    tampered["role"] = serde_json::json!("admin");
+
+    let payload = serde_json::to_vec(&tampered);
+    assert!(payload.is_ok(), "tampered event json failed");
+    let Ok(payload) = payload else {
+        return;
+    };
+    let published = publish_raw(bob, &metadata_topic, &payload).await;
+    assert_eq!(
+        published["ok"], true,
+        "publish tampered event: {published:?}"
+    );
+
+    let admitted_after_tamper = wait_until(Duration::from_secs(15), || async {
+        list_members(alice, &group_id).await.contains(&bob_aid)
+    })
+    .await;
+    assert!(
+        !admitted_after_tamper,
+        "tampered MemberJoined unexpectedly admitted bob",
+    );
+    assert_eq!(
+        group_diagnostic_counter(
+            alice,
+            &group_id,
+            "member_joined_events_rejected_non_member_role",
+        )
+        .await,
+        role_rejected_before,
+        "tampered role reached role-policy rejection instead of signature verification",
+    );
+    assert_eq!(
+        group_diagnostic_counter(alice, &group_id, "member_joined_events_applied").await,
+        applied_before,
+        "tampered MemberJoined unexpectedly applied",
+    );
+
+    let payload = serde_json::to_vec(&valid);
+    assert!(payload.is_ok(), "valid event json failed");
+    let Ok(payload) = payload else {
+        return;
+    };
+    let published = publish_raw(bob, &metadata_topic, &payload).await;
+    assert_eq!(
+        published["ok"], true,
+        "publish valid control event: {published:?}"
+    );
+    let control_applied = wait_until(Duration::from_secs(15), || async {
+        group_diagnostic_counter(alice, &group_id, "member_joined_events_applied").await
+            > applied_before
+            && list_members(alice, &group_id).await.contains(&bob_aid)
+    })
+    .await;
+    assert!(
+        control_applied,
+        "valid MemberJoined control did not admit bob",
+    );
+
+    let details = group_details(alice, &group_id).await;
+    let members = details["members"].as_array();
+    assert!(
+        members.is_some(),
+        "group details missing members: {details:?}"
+    );
+    let Some(members) = members else {
+        return;
+    };
+    let bob_row = members
+        .iter()
+        .find(|m| m["agent_id"].as_str() == Some(bob_aid.as_str()));
+    assert!(bob_row.is_some(), "missing bob member row: {members:?}");
+    let Some(bob_row) = bob_row else {
+        return;
+    };
+    assert_eq!(
+        bob_row["role"], "member",
+        "valid control must admit bob only as member",
+    );
+
+    let _ = authed_client(alice)
+        .delete(alice.url(&format!("/groups/{group_id}")))
+        .send()
+        .await;
+}
+
 /// Security regression: a joiner who holds a valid invite must not be able
 /// to self-promote by publishing a `MemberJoined { role: admin }` payload,
 /// and a joiner without a minted secret must not be admitted. Forged events
