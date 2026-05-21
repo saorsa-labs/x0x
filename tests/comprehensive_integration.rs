@@ -4,7 +4,7 @@
 //! security validation, performance benchmarking placeholders, and
 //! test automation documentation.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use proptest::prelude::*;
 use saorsa_gossip_types::PeerId;
