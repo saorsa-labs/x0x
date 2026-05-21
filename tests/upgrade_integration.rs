@@ -218,17 +218,16 @@ fn manifest_gossip_payload_roundtrip() {
 
 #[test]
 fn manifest_signature_roundtrip() {
-    let (_pk, sk) = generate_keypair();
+    let (pk, sk) = generate_keypair();
     let manifest = make_manifest("3.0.0");
     let manifest_json = serde_json::to_vec(&manifest).unwrap();
 
-    // Sign the manifest JSON
     let sig = sign_with_context(&sk, &manifest_json).expect("sign");
+    let payload = encode_signed_manifest(&manifest_json, &sig);
+    let (decoded_json, decoded_sig) = decode_signed_manifest(&payload).expect("decode");
 
-    // Verify using the raw bytes function (same key)
-    let (pk, _) = generate_keypair(); // different key — should fail
-    let result = verify_bytes_signature_with_key(&manifest_json, &sig, &pk);
-    assert!(result.is_err(), "wrong key should fail");
+    verify_bytes_signature_with_key(decoded_json, decoded_sig, &pk)
+        .expect("decoded manifest signature should verify");
 }
 
 #[test]
