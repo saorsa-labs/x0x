@@ -90,12 +90,14 @@ async fn test_user_identity_in_announcement() {
 /// via discovered_agents_unfiltered().
 #[tokio::test]
 async fn test_ttl_expiry_removes_from_presence() -> Result<(), Box<dyn std::error::Error>> {
+    const IDENTITY_TTL_SECS: u64 = 2;
+
     let dir = TempDir::new()?;
     let Some(agent) = build_or_skip_network_bind_error(
         Agent::builder()
             .with_machine_key(dir.path().join("machine.key"))
             .with_agent_key_path(dir.path().join("agent.key"))
-            .with_identity_ttl(2)
+            .with_identity_ttl(IDENTITY_TTL_SECS)
             .with_network_config(hermetic_network_config())
             .with_peer_cache_disabled(),
     )
@@ -115,8 +117,10 @@ async fn test_ttl_expiry_removes_from_presence() -> Result<(), Box<dyn std::erro
     let presence = agent.presence().await?;
     assert!(!presence.is_empty(), "entry should be visible immediately");
 
-    // Wait for TTL to expire (TTL = 2s, sleep 3s)
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let stale_last_seen = now.saturating_sub(IDENTITY_TTL_SECS + 1);
+    agent
+        .insert_discovered_agent_for_testing(fake_agent_with_timestamps(now, stale_last_seen))
+        .await;
 
     let presence_after = agent.presence().await?;
     assert!(
@@ -390,12 +394,16 @@ async fn test_vps_round_trip() {
 // ---------------------------------------------------------------------------
 
 fn fake_agent(last_seen: u64) -> DiscoveredAgent {
+    fake_agent_with_timestamps(last_seen, last_seen)
+}
+
+fn fake_agent_with_timestamps(announced_at: u64, last_seen: u64) -> DiscoveredAgent {
     DiscoveredAgent {
         agent_id: x0x::identity::AgentId([1u8; 32]),
         machine_id: x0x::identity::MachineId([2u8; 32]),
         user_id: None,
         addresses: Vec::new(),
-        announced_at: last_seen,
+        announced_at,
         last_seen,
         machine_public_key: Vec::new(),
         nat_type: None,
