@@ -1,9 +1,17 @@
 //! Property-based tests for trust evaluation.
 
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 use x0x::contacts::{Contact, ContactStore, IdentityType, TrustLevel};
 use x0x::identity::{AgentId, MachineId};
 use x0x::trust::{TrustContext, TrustDecision, TrustEvaluator};
+
+fn temp_contact_store() -> Result<(ContactStore, tempfile::TempDir), TestCaseError> {
+    let dir = tempfile::TempDir::new()
+        .map_err(|err| TestCaseError::fail(format!("failed to create temp dir: {err}")))?;
+    let store = ContactStore::new(dir.path().join("contacts.json"));
+    Ok((store, dir))
+}
 
 fn make_contact(agent: AgentId, trust: TrustLevel, id_type: IdentityType) -> Contact {
     Contact {
@@ -23,7 +31,7 @@ proptest! {
         let a = AgentId(ab);
         let m = MachineId(mb);
         let c = make_contact(a, TrustLevel::Blocked, IdentityType::Pinned);
-        let mut s = ContactStore::new(std::path::PathBuf::from("/tmp/x0x-proptest-trust"));
+        let (mut s, _dir) = temp_contact_store()?;
         s.add(c);
         let ctx = TrustContext { agent_id: &a, machine_id: &m };
         prop_assert_eq!(TrustEvaluator::new(&s).evaluate(&ctx), TrustDecision::RejectBlocked);
@@ -33,7 +41,7 @@ proptest! {
     fn unknown_agent_returns_unknown(ab in prop::array::uniform32(any::<u8>()), mb in prop::array::uniform32(any::<u8>())) {
         let a = AgentId(ab);
         let m = MachineId(mb);
-        let s = ContactStore::new(std::path::PathBuf::from("/tmp/x0x-proptest-trust"));
+        let (s, _dir) = temp_contact_store()?;
         let ctx = TrustContext { agent_id: &a, machine_id: &m };
         prop_assert_eq!(TrustEvaluator::new(&s).evaluate(&ctx), TrustDecision::Unknown);
     }
@@ -47,7 +55,7 @@ proptest! {
         let a = AgentId(ab);
         let m = MachineId(mb);
         let c = make_contact(a, trust, IdentityType::Anonymous);
-        let mut s = ContactStore::new(std::path::PathBuf::from("/tmp/x0x-proptest-trust"));
+        let (mut s, _dir) = temp_contact_store()?;
         s.add(c);
         let ctx = TrustContext { agent_id: &a, machine_id: &m };
         let e = TrustEvaluator::new(&s);
@@ -59,7 +67,7 @@ proptest! {
         let a = AgentId(ab);
         let m = MachineId(mb);
         let c = make_contact(a, TrustLevel::Known, IdentityType::Anonymous);
-        let mut s = ContactStore::new(std::path::PathBuf::from("/tmp/x0x-proptest-trust"));
+        let (mut s, _dir) = temp_contact_store()?;
         s.add(c);
         let before = format!("{:?}", s);
         let ctx = TrustContext { agent_id: &a, machine_id: &m };
