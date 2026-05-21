@@ -465,6 +465,8 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+const INTEGRATION_WORKFLOW: &str = include_str!("../.github/workflows/integration.yml");
+
 /// Verifies every endpoint in the ENDPOINTS registry has a corresponding
 /// entry in the COVERED list. Fails with a clear message listing missing
 /// endpoints when a new endpoint is added without test coverage.
@@ -493,6 +495,21 @@ fn all_endpoints_covered() {
          AND point it at a real test marker outside tests/api_coverage.rs\n",
         missing.len(),
         missing.join("\n")
+    );
+}
+
+/// Verifies daemon-backed named-group behavior is required by the CI-visible
+/// validation path, not only claimed by the daemon-free COVERED list.
+#[test]
+fn named_group_ignored_integration_suite_is_required_by_ci() {
+    const REQUIRED_COMMAND: &str = "cargo nextest run --all-features --test \
+                                   named_group_integration --run-ignored ignored-only";
+
+    assert!(
+        INTEGRATION_WORKFLOW.contains(REQUIRED_COMMAND),
+        "\n\nThe named-group REST endpoints in COVERED rely on \
+         tests/named_group_integration.rs for daemon-backed behavior. \
+         Keep that ignored test binary wired into CI with:\n  {REQUIRED_COMMAND}\n"
     );
 }
 
