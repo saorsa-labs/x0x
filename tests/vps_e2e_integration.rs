@@ -2,23 +2,26 @@
 //!
 //! ## Test categories
 //!
-//! - **Local e2e** (no `#[ignore]`): Two agents on loopback, directly
-//!   connected via explicit bootstrap address. Tests the full library stack
-//!   without network access. Suitable for CI.
+//! - **Local loopback e2e** (`#[ignore = "requires real QUIC loopback connections"]`):
+//!   Two agents on loopback, directly connected via explicit bootstrap address.
+//!   Tests the full library stack without VPS access, but is timing-sensitive
+//!   on macOS dual-stack and must be run explicitly.
 //!
 //! - **VPS e2e** (`#[ignore = "requires live VPS bootstrap nodes"]`):
 //!   Same tests but with VPS bootstrap nodes added. Must be run from a
 //!   machine with UDP access to port 5483 on the VPS nodes (not behind
 //!   restrictive NAT). Run from a VPS or with UDP 5483 open.
 //!
-//! Run local tests:
+//! Default cargo/nextest runs skip these ignored e2e tests.
+//!
+//! Run local loopback tests:
 //! ```bash
-//! cargo nextest run --test vps_e2e_integration
+//! cargo nextest run --test vps_e2e_integration --run-ignored only test_local_
 //! ```
 //!
 //! Run VPS tests (from a machine with QUIC/UDP access):
 //! ```bash
-//! cargo nextest run --test vps_e2e_integration --run-ignored only
+//! cargo nextest run --test vps_e2e_integration --run-ignored only test_vps_
 //! ```
 //!
 //! ## Coverage
