@@ -458,23 +458,59 @@ async fn daemon_api_add_contact_rejects_unknown_field_alias() {
 /// returns the same FromStr error as POST /contacts.
 #[tokio::test]
 #[ignore]
-async fn daemon_api_import_card_invalid_trust_level_rejected() {
+async fn daemon_api_import_card_invalid_trust_level_rejected() -> Result<()> {
     let d = daemon().await;
-    let r = ca(&d)
+    let client = ca(&d);
+    let card: Value = client
+        .get(d.url("/agent/card"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let card_link = card["link"]
+        .as_str()
+        .context("agent card response missing link")?;
+    let card_agent_id = card["card"]["agent_id"]
+        .as_str()
+        .context("agent card response missing card.agent_id")?;
+
+    let r = client
         .post(d.url("/agent/card/import"))
         .json(&serde_json::json!({
-            "card": "x0x://agent/not-a-real-card",
+            "card": card_link,
             "trust_level": "completely-bogus",
         }))
         .send()
-        .await
-        .unwrap();
-    // The card itself is invalid first, OR we hit the trust-level branch —
-    // either way it is a 400 with a structured error, not a silent default.
-    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-    let body: Value = r.json().await.unwrap();
-    assert_eq!(body["ok"], false);
-    assert!(body["error"].is_string());
+        .await?;
+    ensure!(
+        r.status() == StatusCode::BAD_REQUEST,
+        "expected BAD_REQUEST, got {}",
+        r.status()
+    );
+    let body: Value = r.json().await?;
+    ensure!(
+        body["ok"].as_bool() == Some(false),
+        "unexpected import response: {body:?}"
+    );
+    let error = body["error"]
+        .as_str()
+        .context("import response missing error")?;
+    ensure!(
+        error.contains("invalid trust level: completely-bogus"),
+        "unexpected error: {error}"
+    );
+
+    let contacts: Value = client.get(d.url("/contacts")).send().await?.json().await?;
+    let contact_entries = contacts["contacts"]
+        .as_array()
+        .context("contacts response missing contacts array")?;
+    ensure!(
+        !contact_entries
+            .iter()
+            .any(|contact| contact["agent_id"].as_str() == Some(card_agent_id)),
+        "invalid trust import added contact: {contacts:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]
