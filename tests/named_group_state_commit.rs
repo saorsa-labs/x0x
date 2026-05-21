@@ -133,6 +133,41 @@ fn state_hash_covers_policy_changes() {
 }
 
 #[test]
+fn state_hash_covers_public_meta_changes() {
+    let owner = AgentKeypair::generate().unwrap();
+    let g = build_owner_group(&owner, "T");
+    let h0 = g.state_hash.clone();
+
+    let mut renamed = g.clone();
+    renamed.name = "Renamed".into();
+    renamed.recompute_state_hash();
+    assert_ne!(h0, renamed.state_hash, "name must affect state_hash");
+
+    let mut described = g.clone();
+    described.description = "New description".into();
+    described.recompute_state_hash();
+    assert_ne!(
+        h0, described.state_hash,
+        "description must affect state_hash"
+    );
+
+    let mut tagged = g.clone();
+    tagged.tags = vec!["ai".into(), "rust".into()];
+    tagged.recompute_state_hash();
+    assert_ne!(h0, tagged.state_hash, "tags must affect state_hash");
+
+    let mut avatar = g.clone();
+    avatar.avatar_url = Some("https://example.invalid/avatar.png".into());
+    avatar.recompute_state_hash();
+    assert_ne!(h0, avatar.state_hash, "avatar must affect state_hash");
+
+    let mut banner = g.clone();
+    banner.banner_url = Some("https://example.invalid/banner.png".into());
+    banner.recompute_state_hash();
+    assert_ne!(h0, banner.state_hash, "banner must affect state_hash");
+}
+
+#[test]
 fn state_hash_covers_ban_transition() {
     let owner = AgentKeypair::generate().unwrap();
     let bob = AgentKeypair::generate().unwrap();
@@ -160,6 +195,17 @@ fn state_hash_covers_security_epoch_rotation() {
         .as_deref()
         .unwrap_or("")
         .contains("epoch=1"));
+}
+
+#[test]
+fn state_hash_covers_withdrawal_transition() {
+    let owner = AgentKeypair::generate().unwrap();
+    let mut g = build_owner_group(&owner, "T");
+    let h0 = g.state_hash.clone();
+
+    g.withdrawn = true;
+    g.recompute_state_hash();
+    assert_ne!(h0, g.state_hash, "withdrawal must affect state_hash");
 }
 
 #[test]
