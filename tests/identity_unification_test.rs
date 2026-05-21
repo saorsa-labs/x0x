@@ -9,6 +9,23 @@
 use tempfile::TempDir;
 use x0x::{network::NetworkConfig, Agent};
 
+fn isolated_network_config() -> NetworkConfig {
+    NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback bind address")),
+        bootstrap_nodes: Vec::new(),
+        port_mapping_enabled: false,
+        ..NetworkConfig::default()
+    }
+}
+
+fn socket_bind_blocked(err: &impl std::fmt::Display) -> bool {
+    let message = err.to_string();
+    message.contains("Failed to bind UDP socket")
+        && (message.contains("Operation not permitted")
+            || message.contains("Permission denied")
+            || message.contains("os error 1"))
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: Machine ID is non-zero on build
 // ---------------------------------------------------------------------------
@@ -216,4 +233,43 @@ async fn test_machine_public_key_derives_machine_id() {
         agent.machine_id(),
         "SHA-256(machine_public_key) must equal agent.machine_id()"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Transport PeerId matches machine_id
+// ---------------------------------------------------------------------------
+
+/// A network-backed agent must expose the same ant-quic `PeerId` bytes as
+/// its x0x `machine_id`, proving the QUIC transport uses the machine key.
+#[tokio::test]
+async fn test_transport_peer_id_matches_machine_id() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new().unwrap();
+    let agent = match Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_peer_cache_disabled()
+        .with_network_config(isolated_network_config())
+        .build()
+        .await
+    {
+        Ok(agent) => agent,
+        Err(err) if socket_bind_blocked(&err) => {
+            eprintln!("skipping transport PeerId assertion: UDP bind is not permitted");
+            return Ok(());
+        }
+        Err(err) => return Err(Box::new(err) as Box<dyn std::error::Error>),
+    };
+
+    let transport_peer_id = agent
+        .network()
+        .expect("network-backed agent should expose NetworkNode")
+        .peer_id();
+
+    assert_eq!(
+        transport_peer_id.0,
+        agent.machine_id().0,
+        "ant-quic transport PeerId must be derived from the same machine key as MachineId"
+    );
+
+    Ok(())
 }
