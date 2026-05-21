@@ -585,69 +585,95 @@ async fn named_group_rejoin_after_leave() {
 }
 
 // ===========================================================================
-// 9. Multiple Members (simulated via display names)
+// 9. Multiple Members with display names
 // ===========================================================================
 
-/// On a single daemon we cannot have truly separate agents. Instead, we
-/// exercise the member tracking by creating a group, joining via invite
-/// multiple times (leave + rejoin with different display names), and
-/// verifying the display_names map in group info grows accordingly.
-///
-/// This tests that the daemon correctly tracks display names set via the
-/// PUT /groups/:id/display-name endpoint after successive joins.
+/// Exercise member tracking with two real daemon identities and verify group
+/// info retains distinct display names for both members after an invite join.
 #[tokio::test]
 #[ignore]
 async fn named_group_multiple_display_names() {
-    let d = daemon().await;
-    let (group_id, _) = create_group(&d, "Multi-Name Group", "", Some("Alice")).await;
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
 
-    // Verify initial member
-    let info: Value = authed_client(&d)
-        .get(d.url(&format!("/groups/{group_id}")))
-        .send()
+    let alice_agent_id = alice.agent_id().await;
+    let bob_agent_id = bob.agent_id().await;
+
+    let create: Value = alice
+        .post(
+            "/groups",
+            serde_json::json!({"name":"Multi-Name Group","display_name":"Alice"}),
+        )
         .await
-        .unwrap()
         .json()
         .await
-        .unwrap();
-    assert_eq!(info["ok"], true);
-    let members = info["members"].as_array().unwrap();
+        .unwrap_or_default();
+    assert_eq!(create["ok"], true, "create response: {create:?}");
+    let group_id = create["group_id"].as_str().unwrap_or_default().to_string();
     assert!(
-        !members.is_empty(),
-        "should have at least 1 member after creation"
+        !group_id.is_empty(),
+        "group_id should be present: {create:?}"
     );
 
-    // Update display name to "Bob" (simulating a different persona)
-    let r: Value = authed_client(&d)
-        .put(d.url(&format!("/groups/{group_id}/display-name")))
-        .json(&serde_json::json!({"name": "Bob"}))
-        .send()
+    let invite: Value = alice
+        .post(&format!("/groups/{group_id}/invite"), serde_json::json!({}))
         .await
-        .unwrap()
         .json()
         .await
-        .unwrap();
-    assert_eq!(r["ok"], true);
+        .unwrap_or_default();
+    let invite_link = invite["invite_link"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !invite_link.is_empty(),
+        "invite link should be present: {invite:?}"
+    );
 
-    // Verify the updated name appears
-    let info2: Value = authed_client(&d)
-        .get(d.url(&format!("/groups/{group_id}")))
-        .send()
+    let bob_join: Value = bob
+        .post(
+            "/groups/join",
+            serde_json::json!({"invite": invite_link, "display_name": "Bob"}),
+        )
         .await
-        .unwrap()
         .json()
         .await
-        .unwrap();
-    let members2 = info2["members"].as_array().unwrap();
-    let has_bob = members2.iter().any(|m| m["display_name"] == "Bob");
-    assert!(has_bob, "Bob should appear in members: {members2:?}");
+        .unwrap_or_default();
+    assert_eq!(bob_join["ok"], true, "join response: {bob_join:?}");
+    let bob_group_id = bob_join["group_id"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
 
-    // Cleanup
-    authed_client(&d)
-        .delete(d.url(&format!("/groups/{group_id}")))
-        .send()
-        .await
-        .unwrap();
+    let alice_sees_both_names = wait_until(Duration::from_secs(15), || async {
+        let info: Value = alice
+            .get(&format!("/groups/{group_id}"))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        info["members"]
+            .as_array()
+            .map(|members| {
+                let has_alice = members
+                    .iter()
+                    .any(|m| m["agent_id"] == alice_agent_id && m["display_name"] == "Alice");
+                let has_bob = members
+                    .iter()
+                    .any(|m| m["agent_id"] == bob_agent_id && m["display_name"] == "Bob");
+                members.len() >= 2 && has_alice && has_bob
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        alice_sees_both_names,
+        "alice never observed distinct Alice and Bob display names"
+    );
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+    let _ = bob.delete(&format!("/groups/{bob_group_id}")).await;
 }
 
 // ===========================================================================
