@@ -20,7 +20,7 @@
 
 use x0x::groups::{
     compute_policy_hash, compute_public_meta_hash, compute_roster_root, ActionKind, ApplyError,
-    GroupDiscoverability, GroupInfo, GroupPolicyPreset, GroupRole,
+    GroupDiscoverability, GroupInfo, GroupPolicyPreset, GroupRole, GroupStateCommit,
 };
 use x0x::identity::{AgentId, AgentKeypair};
 
@@ -312,23 +312,36 @@ fn apply_commit_rejects_unauthorized_signer() {
 }
 
 #[test]
-fn apply_commit_rejects_post_withdrawal_non_withdrawal() {
-    let owner = AgentKeypair::generate().unwrap();
+fn apply_commit_rejects_post_withdrawal_non_withdrawal() -> Result<(), Box<dyn std::error::Error>> {
+    let owner = AgentKeypair::generate()?;
     let mut g = build_owner_group(&owner, "T");
-    let _ = g.seal_withdrawal(&owner, 1_000).unwrap();
+    let _ = g.seal_withdrawal(&owner, 1_000)?;
     assert!(g.withdrawn);
 
-    // Try to apply a new non-withdrawal commit from the same owner — must
-    // reject because the group is terminated.
-    g.description = "try to reopen".into();
-    let resurrect = g.seal_commit(&owner, 2_000);
-    // seal_commit itself succeeds (authoring a commit is allowed), but
-    // it will carry withdrawn=true because g.withdrawn stays true.
-    let commit = resurrect.unwrap();
-    assert!(
-        commit.withdrawn,
-        "commits after withdrawal must stay withdrawn"
+    // Try to apply a new non-withdrawal owner action from the same owner —
+    // must reject because the group is terminated.
+    g.policy = GroupPolicyPreset::PublicAnnounce.to_policy();
+    let commit = GroupStateCommit::sign(
+        g.stable_group_id().to_string(),
+        g.state_revision.saturating_add(1),
+        Some(g.state_hash.clone()),
+        compute_roster_root(&g.members_v2),
+        compute_policy_hash(&g.policy),
+        compute_public_meta_hash(&g.public_meta()),
+        g.security_binding.clone(),
+        false,
+        2_000,
+        &owner,
     );
+    let commit = commit?;
+    assert!(!commit.withdrawn);
+
+    let result = g.apply_commit(&commit, ActionKind::OwnerOnly);
+    assert!(
+        matches!(&result, Err(ApplyError::Withdrawn)),
+        "expected Withdrawn, got: {result:?}"
+    );
+    Ok(())
 }
 
 #[test]
