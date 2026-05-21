@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import queue
 import sys
 import unittest
@@ -21,11 +22,26 @@ def load_runner():
     return module
 
 
+def load_mesh():
+    script = Path(__file__).with_name("e2e_vps_mesh.py")
+    spec = importlib.util.spec_from_file_location("e2e_vps_mesh", script)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.next_id = 1
+        self.published: list[tuple[str, bytes]] = []
         self.subscribed: list[str] = []
         self.unsubscribed: list[str] = []
+
+    def publish(self, topic: str, payload: bytes) -> None:
+        self.published.append((topic, payload))
 
     def subscribe(self, topic: str) -> dict[str, str]:
         sub_id = f"sub-{self.next_id}"
@@ -42,6 +58,7 @@ class X0xTestRunnerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.runner_mod = load_runner()
+        cls.mesh = load_mesh()
 
     def test_resubscribe_replaces_stale_control_topic_subscriptions(self) -> None:
         client = FakeClient()
@@ -115,6 +132,39 @@ class X0xTestRunnerTests(unittest.TestCase):
             },
             source_aid=None,
         )
+
+        self.assertTrue(runner._pubsub_disabled_after_discover)
+        self.assertEqual([], sorted(runner._subscription_ids))
+        self.assertEqual(sorted(first_ids.values()), sorted(client.unsubscribed))
+
+        runner._subscribe_control_topics()
+        self.assertEqual(
+            [self.runner_mod.DISCOVER_TOPIC, self.runner_mod.LEGACY_CONTROL_TOPIC],
+            client.subscribed,
+        )
+
+    def test_discover_payload_flag_unsubscribes_control_topics(self) -> None:
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner(
+            "nyc",
+            client,
+            no_pubsub_after_discover=False,
+        )
+        runner._subscribe_control_topics()
+        first_ids = dict(runner._subscription_ids)
+
+        self.mesh.publish_discover(
+            client,
+            "a" * 64,
+            "discover-1",
+            no_pubsub_after_discover=True,
+        )
+        self.assertEqual(self.mesh.DISCOVER_TOPIC, client.published[0][0])
+        payload = json.loads(client.published[0][1])
+        self.assertTrue(payload["no_pubsub_after_discover"])
+        self.assertTrue(payload["params"]["no_pubsub_after_discover"])
+
+        runner._dispatch_command(payload, source_aid=None)
 
         self.assertTrue(runner._pubsub_disabled_after_discover)
         self.assertEqual([], sorted(runner._subscription_ids))
