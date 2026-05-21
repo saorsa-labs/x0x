@@ -228,60 +228,169 @@ fn looks_like_path_arg(expr: &str) -> bool {
     matches!(bytes[0], b'\'' | b'"' | b'`') && bytes[1] == b'/'
 }
 
-/// Does the call's expression text contain every literal segment of
-/// `template` in order? Parameter segments (`:foo`) are skipped.
-fn expr_contains_template(expr: &str, template: &str) -> bool {
-    // Build an ordered list of literal segments. Anchor on the leading
-    // `/` so `/groups/:id/members` requires `/groups/` AND `/members`
-    // (each with a `/` prefix to avoid false hits like
-    // `groups-discover` matching `/groups`).
-    let mut segments: Vec<String> = Vec::new();
-    let mut buf = String::new();
-    for raw in template.split('/').filter(|s| !s.is_empty()) {
-        if raw.starts_with(':') {
-            if !buf.is_empty() {
-                segments.push(format!("/{buf}"));
-                buf.clear();
+#[derive(Debug, PartialEq, Eq)]
+enum PathSegment {
+    Literal(String),
+    Dynamic,
+}
+
+fn path_segments(path: &str) -> Vec<PathSegment> {
+    let path = path.find('?').map_or(path, |index| &path[..index]);
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            if segment == ":" || segment.starts_with(':') {
+                PathSegment::Dynamic
+            } else {
+                PathSegment::Literal(segment.to_string())
+            }
+        })
+        .collect()
+}
+
+fn template_path_segments(template: &str) -> Vec<PathSegment> {
+    path_segments(template)
+}
+
+fn expr_path_segments(expr: &str) -> Vec<PathSegment> {
+    let bytes = expr.as_bytes();
+    let mut normalized = String::new();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => i = append_quoted_literal(expr, i, &mut normalized),
+            b'`' => i = append_template_literal(expr, i, &mut normalized),
+            b'+' | b' ' | b'\n' | b'\r' | b'\t' => i += 1,
+            _ => {
+                normalized.push(':');
+                i = skip_dynamic_operand(bytes, i);
+            }
+        }
+    }
+
+    path_segments(&normalized)
+}
+
+fn append_quoted_literal(expr: &str, start: usize, normalized: &mut String) -> usize {
+    let bytes = expr.as_bytes();
+    let quote = bytes[start];
+    let mut i = start + 1;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' {
+            if let Some(next) = bytes.get(i + 1) {
+                normalized.push(*next as char);
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if c == quote {
+            return i + 1;
+        }
+        normalized.push(c as char);
+        i += 1;
+    }
+
+    i
+}
+
+fn append_template_literal(expr: &str, start: usize, normalized: &mut String) -> usize {
+    let bytes = expr.as_bytes();
+    let mut i = start + 1;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if let Some(next) = bytes.get(i + 1) {
+                    normalized.push(*next as char);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            b'`' => return i + 1,
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                normalized.push(':');
+                i = skip_template_placeholder(bytes, i + 2);
+            }
+            c => {
+                normalized.push(c as char);
+                i += 1;
+            }
+        }
+    }
+
+    i
+}
+
+fn skip_dynamic_operand(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = start;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
             }
         } else {
-            if !buf.is_empty() {
-                buf.push('/');
+            match c {
+                b'\'' | b'"' | b'`' => in_str = Some(c),
+                b'(' | b'{' | b'[' => depth += 1,
+                b')' | b'}' | b']' => depth = depth.saturating_sub(1),
+                b'+' if depth == 0 => return i,
+                _ => {}
             }
-            buf.push_str(raw);
         }
+        i += 1;
     }
-    if !buf.is_empty() {
-        segments.push(format!("/{buf}"));
-    }
-    if segments.is_empty() {
-        // Root-only path like "/" — accept if `expr` contains it.
-        return expr.contains('/');
-    }
-    let mut cursor = 0usize;
-    for seg in &segments {
-        // Allow either the bare literal segment OR a literal followed
-        // by an immediate quote-end so we don't accidentally match
-        // `/groups/cards` against the literal `/groups`.
-        match expr[cursor..].find(seg.as_str()) {
-            Some(p) => {
-                let abs = cursor + p;
-                let after = abs + seg.len();
-                let next = expr.as_bytes().get(after).copied();
-                let ok_boundary = matches!(
-                    next,
-                    Some(b'/') | Some(b'\'') | Some(b'"') | Some(b'`') | Some(b'?')
-                ) || next.is_none();
-                if !ok_boundary {
-                    // Skip this match; try later in the string.
-                    cursor = abs + 1;
-                    continue;
-                }
-                cursor = after;
+
+    i
+}
+
+fn skip_template_placeholder(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = start;
+
+    while i < bytes.len() && depth > 0 {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
             }
-            None => return false,
+            if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                b'\'' | b'"' | b'`' => in_str = Some(c),
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
         }
+        i += 1;
     }
-    true
+
+    i
+}
+
+/// Does the call's expression text contain the same ordered path
+/// segments as `template`? Parameter segments (`:foo`) must be backed
+/// by a dynamic expression segment in the GUI call.
+fn expr_contains_template(expr: &str, template: &str) -> bool {
+    expr_path_segments(expr) == template_path_segments(template)
 }
 
 fn gui_covers(method: Method, path: &str, calls: &[ApiCall]) -> bool {
@@ -335,6 +444,21 @@ fn classify_gui_endpoint(
     } else {
         GuiParityStatus::Missing
     }
+}
+
+#[test]
+fn expr_contains_template_matches_complete_path_segments() {
+    assert!(!expr_contains_template("'/groups/cards/import'", "/groups"));
+    assert!(!expr_contains_template("'/groups'", "/groups/:id"));
+    assert!(expr_contains_template("'/groups/'+gid", "/groups/:id"));
+    assert!(expr_contains_template(
+        "`/groups/${gid}/members/${aid}/role`",
+        "/groups/:id/members/:agent_id/role"
+    ));
+    assert!(expr_contains_template(
+        "'/groups/discover?q='+encodeURIComponent(q)",
+        "/groups/discover"
+    ));
 }
 
 #[test]
