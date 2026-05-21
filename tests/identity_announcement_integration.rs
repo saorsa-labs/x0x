@@ -343,15 +343,16 @@ fn test_rendezvous_and_identity_shard_numbers_match() {
 
 #[ignore = "requires gossip overlay propagation between two agents"]
 #[tokio::test]
-async fn test_identity_announcement_round_trip() {
-    let (agent_a, agent_b, _dir_a, _dir_b) = two_local_agents().await;
-    agent_a.announce_identity(false, false).await.unwrap();
+async fn test_identity_announcement_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    let (agent_a, agent_b, _dir_a, _dir_b) = two_local_agents().await?;
+    agent_a.announce_identity(false, false).await?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let discovered = agent_b.discovered_agents().await.unwrap();
+    let discovered = agent_b.discovered_agents().await?;
     assert!(
         discovered.iter().any(|a| a.agent_id == agent_a.agent_id()),
         "agent B should discover agent A after announcement"
     );
+    Ok(())
 }
 
 #[ignore = "requires live VPS bootstrap nodes"]
@@ -416,9 +417,10 @@ fn hermetic_network_config() -> NetworkConfig {
 }
 
 #[allow(dead_code)]
-async fn two_local_agents() -> (Agent, Agent, TempDir, TempDir) {
-    let dir_a = TempDir::new().unwrap();
-    let dir_b = TempDir::new().unwrap();
+async fn two_local_agents() -> Result<(Agent, Agent, TempDir, TempDir), Box<dyn std::error::Error>>
+{
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
     let cfg_a = hermetic_network_config();
     let agent_a = Agent::builder()
         .with_machine_key(dir_a.path().join("machine.key"))
@@ -426,13 +428,16 @@ async fn two_local_agents() -> (Agent, Agent, TempDir, TempDir) {
         .with_network_config(cfg_a)
         .with_peer_cache_disabled()
         .build()
-        .await
-        .unwrap();
-    agent_a.join_network().await.unwrap();
+        .await?;
+    agent_a.join_network().await?;
 
     let a_addr = agent_a
-        .local_addr()
-        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+        .bound_addr()
+        .await
+        .ok_or_else(|| std::io::Error::other("agent A did not report a bound address"))?;
+    if a_addr.port() == 0 {
+        return Err(std::io::Error::other("agent A reported port 0 as its bound address").into());
+    }
     let cfg_b = NetworkConfig {
         bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         bootstrap_nodes: vec![a_addr],
@@ -445,9 +450,8 @@ async fn two_local_agents() -> (Agent, Agent, TempDir, TempDir) {
         .with_network_config(cfg_b)
         .with_peer_cache_disabled()
         .build()
-        .await
-        .unwrap();
-    agent_b.join_network().await.unwrap();
+        .await?;
+    agent_b.join_network().await?;
 
-    (agent_a, agent_b, dir_a, dir_b)
+    Ok((agent_a, agent_b, dir_a, dir_b))
 }
