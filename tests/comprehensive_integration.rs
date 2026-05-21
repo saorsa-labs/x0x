@@ -6,7 +6,7 @@
 
 use proptest::prelude::*;
 use saorsa_gossip_types::PeerId;
-use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
+use x0x::crdt::{CheckboxState, TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
 use x0x::identity::AgentId;
 
 // ============================================================================
@@ -26,6 +26,54 @@ fn peer_id_strategy() -> impl Strategy<Value = PeerId> {
 /// Strategy to generate random TaskId
 fn task_id_strategy() -> impl Strategy<Value = TaskId> {
     any::<[u8; 32]>().prop_map(TaskId::from_bytes)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TaskSnapshot {
+    id: TaskId,
+    state: CheckboxState,
+    title: String,
+    description: String,
+    assignee: Option<AgentId>,
+    priority: u8,
+    created_by: AgentId,
+    created_at: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TaskListSnapshot {
+    id: TaskListId,
+    ordered_task_ids: Vec<TaskId>,
+    tasks_by_id: Vec<TaskSnapshot>,
+}
+
+fn task_snapshot(task: &TaskItem) -> TaskSnapshot {
+    TaskSnapshot {
+        id: *task.id(),
+        state: task.current_state(),
+        title: task.title().to_string(),
+        description: task.description().to_string(),
+        assignee: task.assignee().copied(),
+        priority: task.priority(),
+        created_by: *task.created_by(),
+        created_at: task.created_at(),
+    }
+}
+
+fn task_list_snapshot(list: &TaskList) -> TaskListSnapshot {
+    let ordered_tasks = list.tasks_ordered();
+    let ordered_task_ids = ordered_tasks.iter().map(|task| *task.id()).collect();
+    let mut tasks_by_id: Vec<_> = ordered_tasks
+        .iter()
+        .map(|task| task_snapshot(task))
+        .collect();
+    tasks_by_id.sort_by_key(|task| *task.id.as_bytes());
+
+    TaskListSnapshot {
+        id: *list.id(),
+        ordered_task_ids,
+        tasks_by_id,
+    }
 }
 
 proptest! {
@@ -57,16 +105,18 @@ proptest! {
 
         // Order 1: list_a gets task1 first, then task2
         let mut list_a = TaskList::new(list_id, "A".to_string(), peer_id1);
-        list_a.add_task(task1.clone(), peer_id1, 1).unwrap();
-        list_a.add_task(task2.clone(), peer_id2, 2).unwrap();
+        prop_assert!(list_a.add_task(task1.clone(), peer_id1, 1).is_ok());
+        prop_assert!(list_a.add_task(task2.clone(), peer_id2, 2).is_ok());
 
         // Order 2: list_b gets task2 first, then task1
         let mut list_b = TaskList::new(list_id, "B".to_string(), peer_id2);
-        list_b.add_task(task2, peer_id2, 1).unwrap();
-        list_b.add_task(task1, peer_id1, 2).unwrap();
+        prop_assert!(list_b.add_task(task2, peer_id2, 1).is_ok());
+        prop_assert!(list_b.add_task(task1, peer_id1, 2).is_ok());
 
-        // After adding in opposite order, they should have same task count
-        prop_assert_eq!(list_a.tasks_ordered().len(), list_b.tasks_ordered().len());
+        // After adding in opposite order and merging, they should have identical state.
+        prop_assert!(list_a.merge(&list_b).is_ok());
+        prop_assert!(list_b.merge(&list_a).is_ok());
+        prop_assert_eq!(task_list_snapshot(&list_a), task_list_snapshot(&list_b));
     }
 
     /// Property: Merge idempotence
@@ -134,7 +184,7 @@ proptest! {
             tags: vec![],
         };
         let task1 = TaskItem::new(task_id1, meta1, peer1);
-        list_a.add_task(task1, peer1, 1).unwrap();
+        prop_assert!(list_a.add_task(task1, peer1, 1).is_ok());
 
         // Replica B adds task2
         let meta2 = TaskMetadata {
@@ -147,16 +197,17 @@ proptest! {
             tags: vec![],
         };
         let task2 = TaskItem::new(task_id2, meta2, peer2);
-        list_b.add_task(task2, peer2, 2).unwrap();
+        prop_assert!(list_b.add_task(task2, peer2, 2).is_ok());
 
         // Bidirectional merge
-        list_a.merge(&list_b).unwrap();
-        list_b.merge(&list_a).unwrap();
+        prop_assert!(list_a.merge(&list_b).is_ok());
+        prop_assert!(list_b.merge(&list_a).is_ok());
 
         // Both should have 2 tasks (or 1 if task_id1 == task_id2)
         let expected_tasks = if task_id1 == task_id2 { 1 } else { 2 };
         prop_assert_eq!(list_a.tasks_ordered().len(), expected_tasks);
         prop_assert_eq!(list_b.tasks_ordered().len(), expected_tasks);
+        prop_assert_eq!(task_list_snapshot(&list_a), task_list_snapshot(&list_b));
     }
 }
 
