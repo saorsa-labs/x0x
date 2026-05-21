@@ -2,8 +2,9 @@
 //!
 //! Ignored by default because it spawns real x0xd daemons.
 
+use futures_util::FutureExt;
 use serde_json::Value;
-use std::{sync::OnceLock, time::Duration};
+use std::{panic::AssertUnwindSafe, sync::OnceLock, time::Duration};
 
 #[path = "harness/src/cluster.rs"]
 mod cluster;
@@ -172,6 +173,102 @@ async fn peer_count(d: &AgentInstance) -> usize {
         .map_or(0, |entries| entries.len())
 }
 
+async fn delete_group(d: &AgentInstance, group_id: &str) {
+    let _ = authed_client(d)
+        .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await;
+}
+
+async fn prove_moderated_public_receive(
+    alice: &AgentInstance,
+    bob: &AgentInstance,
+    local_group_id: &str,
+) {
+    let policy = patch_group_policy(
+        alice,
+        local_group_id,
+        serde_json::json!({
+            "discoverability": "public_directory",
+            "admission": "open_join",
+            "confidentiality": "signed_public",
+            "read_access": "public",
+            "write_access": "moderated_public"
+        }),
+    )
+    .await;
+    assert_eq!(policy["ok"], true, "policy patch failed: {policy:?}");
+
+    let warmup = authed_client(alice)
+        .post(alice.url(&format!("/groups/{local_group_id}/send")))
+        .json(&serde_json::json!({"body": "owner warmup", "kind": "chat"}))
+        .send()
+        .await
+        .expect("warmup send request")
+        .json::<Value>()
+        .await
+        .expect("warmup send json");
+    assert_eq!(warmup["ok"], true, "warmup send failed: {warmup:?}");
+
+    let card = get_group_card(alice, local_group_id).await;
+    let stable_group_id = card["group_id"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !stable_group_id.is_empty(),
+        "group card missing stable group_id: {card:?}"
+    );
+
+    let imported = import_group_card(bob, &card).await;
+    assert_eq!(imported["ok"], true, "bob import failed: {imported:?}");
+    let bob_group_id = imported["group_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        bob_group_id, stable_group_id,
+        "bob should address the imported stub by stable group id"
+    );
+
+    // Prime alice's listener on the local route. Internally this should subscribe
+    // using the stable group id and still resolve the local group correctly.
+    let _ = get_messages(alice, local_group_id).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let body = format!("hello moderated {}", rand::random::<u16>());
+    let mut received = false;
+    for _attempt in 0..3 {
+        let sent = authed_client(bob)
+            .post(bob.url(&format!("/groups/{bob_group_id}/send")))
+            .json(&serde_json::json!({"body": body, "kind": "chat"}))
+            .send()
+            .await
+            .expect("bob moderated send request")
+            .json::<Value>()
+            .await
+            .expect("bob moderated send json");
+        assert_eq!(sent["ok"], true, "bob moderated send failed: {sent:?}");
+
+        received = wait_until(Duration::from_secs(8), || async {
+            let msgs = get_messages(alice, local_group_id).await;
+            msgs["messages"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|m| m["body"].as_str() == Some(body.as_str()))
+            })
+        })
+        .await;
+        if received {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let final_msgs = get_messages(alice, local_group_id).await;
+    assert!(
+        received,
+        "alice never received bob's moderated_public message: {final_msgs:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore]
 async fn e_moderated_public_positive_cross_daemon_receive() {
@@ -215,91 +312,11 @@ async fn e_moderated_public_positive_cross_daemon_receive() {
     )
     .await;
 
-    let policy = patch_group_policy(
-        alice,
-        &local_group_id,
-        serde_json::json!({
-            "discoverability": "public_directory",
-            "admission": "open_join",
-            "confidentiality": "signed_public",
-            "read_access": "public",
-            "write_access": "moderated_public"
-        }),
-    )
-    .await;
-    assert_eq!(policy["ok"], true, "policy patch failed: {policy:?}");
-
-    let warmup = authed_client(alice)
-        .post(alice.url(&format!("/groups/{local_group_id}/send")))
-        .json(&serde_json::json!({"body": "owner warmup", "kind": "chat"}))
-        .send()
-        .await
-        .expect("warmup send request")
-        .json::<Value>()
-        .await
-        .expect("warmup send json");
-    assert_eq!(warmup["ok"], true, "warmup send failed: {warmup:?}");
-
-    let card = get_group_card(alice, &local_group_id).await;
-    let stable_group_id = card["group_id"].as_str().unwrap_or_default().to_string();
-    assert!(
-        !stable_group_id.is_empty(),
-        "group card missing stable group_id: {card:?}"
-    );
-
-    let imported = import_group_card(bob, &card).await;
-    assert_eq!(imported["ok"], true, "bob import failed: {imported:?}");
-    let bob_group_id = imported["group_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    assert_eq!(
-        bob_group_id, stable_group_id,
-        "bob should address the imported stub by stable group id"
-    );
-
-    // Prime alice's listener on the local route. Internally this should subscribe
-    // using the stable group id and still resolve the local group correctly.
-    let _ = get_messages(alice, &local_group_id).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let body = format!("hello moderated {}", rand::random::<u16>());
-    let mut received = false;
-    for _attempt in 0..3 {
-        let sent = authed_client(bob)
-            .post(bob.url(&format!("/groups/{bob_group_id}/send")))
-            .json(&serde_json::json!({"body": body, "kind": "chat"}))
-            .send()
-            .await
-            .expect("bob moderated send request")
-            .json::<Value>()
-            .await
-            .expect("bob moderated send json");
-        assert_eq!(sent["ok"], true, "bob moderated send failed: {sent:?}");
-
-        received = wait_until(Duration::from_secs(8), || async {
-            let msgs = get_messages(alice, &local_group_id).await;
-            msgs["messages"].as_array().is_some_and(|messages| {
-                messages
-                    .iter()
-                    .any(|m| m["body"].as_str() == Some(body.as_str()))
-            })
-        })
+    let proof = AssertUnwindSafe(prove_moderated_public_receive(alice, bob, &local_group_id))
+        .catch_unwind()
         .await;
-        if received {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    delete_group(alice, &local_group_id).await;
+    if let Err(panic) = proof {
+        std::panic::resume_unwind(panic);
     }
-
-    let final_msgs = get_messages(alice, &local_group_id).await;
-    assert!(
-        received,
-        "alice never received bob's moderated_public message: {final_msgs:?}"
-    );
-
-    let _ = authed_client(alice)
-        .delete(alice.url(&format!("/groups/{local_group_id}")))
-        .send()
-        .await;
 }
