@@ -139,3 +139,22 @@ strip = "none"
 # Embed debuginfo in the binary so gdb / perf on remote VPS can resolve
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
+
+# TEMPORARY (clawpatch validation): build x0x against the local clawpatched
+# ant-quic (+137) and saorsa-gossip (+6) working trees instead of the published
+# crates.io releases, so the full E2E + soak proves out the unreleased fixes.
+# Revert (or replace with published version bumps) once the dependency changes
+# are released.
+[patch.crates-io]
+ant-quic = { path = "../ant-quic" }
+saorsa-gossip-coordinator = { path = "../saorsa-gossip/crates/coordinator" }
+saorsa-gossip-crdt-sync = { path = "../saorsa-gossip/crates/crdt-sync" }
+saorsa-gossip-groups = { path = "../saorsa-gossip/crates/groups" }
+saorsa-gossip-identity = { path = "../saorsa-gossip/crates/identity" }
+saorsa-gossip-membership = { path = "../saorsa-gossip/crates/membership" }
+saorsa-gossip-presence = { path = "../saorsa-gossip/crates/presence" }
+saorsa-gossip-pubsub = { path = "../saorsa-gossip/crates/pubsub" }
+saorsa-gossip-rendezvous = { path = "../saorsa-gossip/crates/rendezvous" }
+saorsa-gossip-runtime = { path = "../saorsa-gossip/crates/runtime" }
+saorsa-gossip-transport = { path = "../saorsa-gossip/crates/transport" }
+saorsa-gossip-types = { path = "../saorsa-gossip/crates/types" }
