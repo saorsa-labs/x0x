@@ -306,11 +306,14 @@ jobs:
 
       - name: Generate and sign release manifest
         run: |
-          # Collect all archives into a flat directory for manifest generation
+          # Collect all archives AND their ML-DSA-65 signatures into a flat
+          # directory for manifest generation. x0x-keygen manifest requires each
+          # archive's sibling .sig to live alongside it in --assets-dir.
           mkdir -p manifest-assets
           for archive in artifacts/release-*/*.tar.gz artifacts/release-*/*.zip; do
             [ -f "$archive" ] || continue
             cp "$archive" manifest-assets/
+            [ -f "${archive}.sig" ] && cp "${archive}.sig" manifest-assets/
           done
           # Strip 'v' prefix from tag for version string
           VERSION="${GITHUB_REF_NAME#v}"
