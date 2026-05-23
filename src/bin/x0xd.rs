@@ -704,6 +704,16 @@ struct SubscribeRequest {
     topic: String,
 }
 
+/// POST /agent/sign request body — a single base64-encoded payload to
+/// sign with the agent's ML-DSA-65 secret key.
+#[derive(Debug, Deserialize)]
+struct AgentSignRequest {
+    /// Base64-encoded bytes to sign. The signature is computed over these
+    /// bytes verbatim — the caller is responsible for choosing a canonical
+    /// serialization for any structured payload.
+    payload_b64: String,
+}
+
 /// POST /announce request body.
 #[derive(Debug, Default, Deserialize)]
 struct AnnounceIdentityRequest {
@@ -1748,6 +1758,7 @@ async fn main() -> Result<()> {
         .route("/introduction", get(introduction))
         .route("/agent/card", get(get_agent_card))
         .route("/agent/card/import", post(import_agent_card))
+        .route("/agent/sign", post(agent_sign))
         .route("/announce", post(announce_identity))
         .route("/peers", get(peers))
         .route("/network/status", get(network_status))
@@ -3979,6 +3990,116 @@ async fn import_agent_card(
             "trust_level": format!("{trust:?}"),
             "groups": card.groups.len(),
             "stores": card.stores.len(),
+        })),
+    )
+}
+
+/// Maximum payload size accepted by `POST /agent/sign`, in bytes.
+/// Comfortably larger than any realistic audit-event or governance-vote
+/// envelope (≤1 KiB in practice) while still bounding worst-case work.
+const AGENT_SIGN_MAX_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// Stable scheme identifier returned by `POST /agent/sign`.
+const AGENT_SIGN_SCHEME_ID: &str = "x0x.agent-sign.v1.ml-dsa-65";
+
+/// POST /agent/sign — produce a detached ML-DSA-65 signature over a
+/// caller-supplied payload using this agent's signing key.
+///
+/// Rationale. x0xd already signs gossip frames at the transport layer
+/// (saorsa-gossip-identity), but transport-layer signatures don't survive
+/// a database read. Applications that persist signed records to disk or
+/// to distributed storage (audit logs, governance votes, content
+/// metadata) need a detached signature that can be verified later from
+/// the stored bytes alone, by a verifier that may have never been on the
+/// network when the signature was issued. This endpoint provides that
+/// primitive without exposing the secret key itself.
+///
+/// Authentication. Bearer-token authenticated like every other endpoint
+/// — only callers with the agent's local API token can sign as the agent.
+///
+/// Payload. `payload_b64` is base64-decoded and signed verbatim. The
+/// caller is responsible for choosing a canonical serialization of any
+/// structured payload (e.g. `serde_canonical_json`, `postcard`, or an
+/// explicit field-order convention). Callers should also domain-separate
+/// payloads (for example, with an application/type/version prefix) so a
+/// signature produced for one protocol cannot be replayed as another.
+///
+/// Response. Returns the agent_id (hex, 32 bytes), the agent's public
+/// key (base64), the signature (base64), and the stable signing scheme
+/// identifier. All values are wire-format ready for inclusion in the
+/// signed record.
+async fn agent_sign(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AgentSignRequest>,
+) -> impl IntoResponse {
+    let payload = match base64::engine::general_purpose::STANDARD.decode(&req.payload_b64) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("invalid base64 payload: {e}"),
+                })),
+            );
+        }
+    };
+
+    if payload.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "payload must be non-empty",
+            })),
+        );
+    }
+
+    if payload.len() > AGENT_SIGN_MAX_PAYLOAD_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "payload exceeds maximum signable size of {} bytes",
+                    AGENT_SIGN_MAX_PAYLOAD_BYTES
+                ),
+            })),
+        );
+    }
+
+    let identity = state.agent.identity();
+    let keypair = identity.agent_keypair();
+
+    let signature = match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        keypair.secret_key(),
+        &payload,
+    ) {
+        Ok(sig) => sig,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("signing failed: {e:?}"),
+                })),
+            );
+        }
+    };
+
+    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.as_bytes());
+    let public_key_b64 =
+        base64::engine::general_purpose::STANDARD.encode(keypair.public_key().as_bytes());
+    let agent_id_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "agent_id": agent_id_hex,
+            "public_key_b64": public_key_b64,
+            "signature_b64": signature_b64,
+            "algorithm": AGENT_SIGN_SCHEME_ID,
         })),
     )
 }

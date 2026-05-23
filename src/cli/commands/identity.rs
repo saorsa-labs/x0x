@@ -1,8 +1,10 @@
 //! Identity CLI commands.
 
 use crate::cli::{print_value, DaemonClient};
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
+use base64::Engine;
 use four_word_networking::IdentityEncoder;
+use std::io::Read;
 
 /// Compute 4-word speakable identity from a hex agent/user ID.
 fn identity_words(encoder: &IdentityEncoder, hex_id: &str) -> Option<String> {
@@ -118,6 +120,44 @@ pub async fn import_card(
         body["trust_level"] = serde_json::Value::String(tl.to_string());
     }
     let resp = client.post("/agent/card/import", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x agent sign` — POST /agent/sign
+///
+/// Reads bytes from `--file <PATH>` (or stdin when path is `-`) OR uses
+/// `--payload-b64 <BASE64>` directly, base64-encodes the bytes, and asks
+/// the daemon to produce a detached ML-DSA-65 signature. The daemon signs
+/// exact bytes; callers should canonicalize structured payloads and
+/// domain-separate them before signing.
+pub async fn sign(
+    client: &DaemonClient,
+    file: Option<&str>,
+    payload_b64: Option<&str>,
+) -> Result<()> {
+    client.ensure_running().await?;
+
+    let payload_b64 = match (file, payload_b64) {
+        (Some(path), None) => {
+            let bytes = if path == "-" {
+                let mut buf = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .context("failed to read stdin")?;
+                buf
+            } else {
+                std::fs::read(path).with_context(|| format!("failed to read file: {path}"))?
+            };
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+        (None, Some(b64)) => b64.to_string(),
+        (Some(_), Some(_)) => bail!("pass either --file or --payload-b64, not both"),
+        (None, None) => bail!("pass either --file <PATH> or --payload-b64 <BASE64>"),
+    };
+
+    let body = serde_json::json!({ "payload_b64": payload_b64 });
+    let resp = client.post("/agent/sign", &body).await?;
     print_value(client.format(), &resp);
     Ok(())
 }

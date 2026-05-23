@@ -94,6 +94,104 @@ async fn daemon_api_agent() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_agent_sign_roundtrip() {
+    let d = daemon().await;
+
+    // Sign an arbitrary payload.
+    let payload = b"the bytes a downstream app would put into an audit record";
+    let body = serde_json::json!({ "payload_b64": b64(payload) });
+
+    let r: Value = ca(&d)
+        .post(d.url("/agent/sign"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["algorithm"], "x0x.agent-sign.v1.ml-dsa-65");
+    let agent_id_hex = r["agent_id"].as_str().expect("agent_id is a hex string");
+    let public_key_b64 = r["public_key_b64"]
+        .as_str()
+        .expect("public_key_b64 is a base64 string");
+    let signature_b64 = r["signature_b64"]
+        .as_str()
+        .expect("signature_b64 is a base64 string");
+
+    // agent_id matches the agent's hex id.
+    let agent_resp: Value = ca(&d)
+        .get(d.url("/agent"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(agent_resp["agent_id"].as_str().unwrap(), agent_id_hex);
+
+    // Signature verifies under the returned public key.
+    let pk_bytes = base64::engine::general_purpose::STANDARD
+        .decode(public_key_b64)
+        .expect("public key decodes from base64");
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64)
+        .expect("signature decodes from base64");
+
+    let public_key = ant_quic::MlDsaPublicKey::from_bytes(&pk_bytes)
+        .expect("public_key_b64 parses as an ML-DSA-65 public key");
+    let signature = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+        .expect("signature_b64 parses as an ML-DSA-65 signature");
+
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&public_key, payload, &signature)
+        .expect("signature verifies under the agent's public key");
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_sign_rejects_empty_payload() {
+    let d = daemon().await;
+    let r = ca(&d)
+        .post(d.url("/agent/sign"))
+        .json(&serde_json::json!({ "payload_b64": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_sign_rejects_invalid_base64() {
+    let d = daemon().await;
+    let r = ca(&d)
+        .post(d.url("/agent/sign"))
+        .json(&serde_json::json!({ "payload_b64": "@@@not-base64@@@" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_sign_rejects_oversize_payload() {
+    let d = daemon().await;
+    // Just over the 256 KiB cap.
+    let oversize = vec![0u8; 256 * 1024 + 1];
+    let r = ca(&d)
+        .post(d.url("/agent/sign"))
+        .json(&serde_json::json!({ "payload_b64": b64(&oversize) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_peers() {
     let d = daemon().await;
     let r = ca(&d).get(d.url("/peers")).send().await.unwrap();

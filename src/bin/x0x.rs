@@ -309,6 +309,17 @@ enum AgentSub {
         #[arg(long, default_value = "known")]
         trust: String,
     },
+    /// Produce a detached ML-DSA-65 signature over a payload using this
+    /// agent's signing key. Pass either `--file <PATH>` (use `-` for
+    /// stdin) or `--payload-b64 <BASE64>`.
+    Sign {
+        /// Path to a file whose bytes will be signed verbatim. Use `-` for stdin.
+        #[arg(long, conflicts_with = "payload_b64")]
+        file: Option<String>,
+        /// Base64-encoded bytes to sign.
+        #[arg(long)]
+        payload_b64: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1117,6 +1128,9 @@ async fn run(
             Some(AgentSub::Introduction) => commands::identity::introduction(&client).await,
             Some(AgentSub::Import { card, trust }) => {
                 commands::identity::import_card(&client, &card, Some(trust.as_str())).await
+            }
+            Some(AgentSub::Sign { file, payload_b64 }) => {
+                commands::identity::sign(&client, file.as_deref(), payload_b64.as_deref()).await
             }
         },
         Commands::Announce {
