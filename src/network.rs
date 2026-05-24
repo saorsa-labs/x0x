@@ -451,6 +451,11 @@ pub struct RecvPumpStreamSnapshot {
     pub dequeued_total: u64,
     /// Frames dropped because the bounded receive queue was full.
     pub dropped_full: u64,
+    /// Recoverable control frames (IHAVE/IWANT/AntiEntropy) proactively shed
+    /// while the queue was near-full, to preserve data (EAGER) delivery
+    /// (ADR 0010). Distinct from `dropped_full`: an intentional, recoverable
+    /// shed, not a hard data loss.
+    pub shed_priority: u64,
     /// Frames dropped because the receive queue was closed.
     pub dropped_closed: u64,
     /// Most recently sampled queue depth.
@@ -497,6 +502,7 @@ struct RecvPumpStreamDiagnostics {
     enqueued_total: std::sync::atomic::AtomicU64,
     dequeued_total: std::sync::atomic::AtomicU64,
     dropped_full: std::sync::atomic::AtomicU64,
+    shed_priority: std::sync::atomic::AtomicU64,
     dropped_closed: std::sync::atomic::AtomicU64,
     latest_depth: std::sync::atomic::AtomicU64,
     max_depth: std::sync::atomic::AtomicU64,
@@ -520,6 +526,12 @@ impl RecvPumpStreamDiagnostics {
 
     fn record_dropped_full(&self, depth: usize, capacity: usize) {
         self.dropped_full
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.record_depth(depth, capacity);
+    }
+
+    fn record_shed_priority(&self, depth: usize, capacity: usize) {
+        self.shed_priority
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.record_depth(depth, capacity);
     }
@@ -577,6 +589,9 @@ impl RecvPumpStreamDiagnostics {
             enqueued_total,
             dequeued_total,
             dropped_full: self.dropped_full.load(std::sync::atomic::Ordering::Relaxed),
+            shed_priority: self
+                .shed_priority
+                .load(std::sync::atomic::Ordering::Relaxed),
             dropped_closed: self
                 .dropped_closed
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -693,6 +708,11 @@ impl RecvPumpDiagnostics {
         self.stream(stream_type)
             .record_dropped_full(depth, capacity);
         self.with_peer(peer_id, |peer| peer.dropped_full(stream_type));
+    }
+
+    fn record_shed_priority(&self, stream_type: GossipStreamType, depth: usize, capacity: usize) {
+        self.stream(stream_type)
+            .record_shed_priority(depth, capacity);
     }
 
     fn record_dropped_closed(&self, stream_type: GossipStreamType, depth: usize, capacity: usize) {
@@ -849,6 +869,29 @@ fn channel_pressure_exceeds_warn_threshold(available: usize, max: usize) -> bool
     available.saturating_mul(5) < max
 }
 
+/// True when the PubSub forward channel is more than 90% full, i.e.
+/// `available < max/10` (on the production 10k channel that is >9000 used; on
+/// small channels integer rounding makes it slightly stricter). Above this the
+/// recv pump proactively sheds recoverable control frames (IHAVE/IWANT/AntiEntropy)
+/// before they consume the last slots, preserving data (EAGER) delivery
+/// (ADR 0010). Refines ADR 0009's flat PubSub try_send/drop policy into a
+/// priority-aware shed; the kind-peek is gated on this threshold so the
+/// steady-state hot path pays no decode cost.
+fn channel_pressure_exceeds_shed_threshold(available: usize, max: usize) -> bool {
+    available.saturating_mul(10) < max
+}
+
+/// ADR 0010: PubSub frame kinds that are safe to shed under near-overload
+/// because they are recoverable by PlumTree's lazy-push recovery. EAGER (data)
+/// and tree-maintenance frames (Prune/Graft) are never shed here.
+fn is_pubsub_shed_eligible(kind: saorsa_gossip_types::MessageKind) -> bool {
+    use saorsa_gossip_types::MessageKind;
+    matches!(
+        kind,
+        MessageKind::IHave | MessageKind::IWant | MessageKind::AntiEntropy
+    )
+}
+
 fn channel_depth<T>(tx: &mpsc::Sender<T>) -> usize {
     tx.max_capacity().saturating_sub(tx.capacity())
 }
@@ -909,6 +952,10 @@ fn warn_forward_channel_pressure<T>(
 enum ForwardGossipOutcome {
     Enqueued,
     DroppedFull,
+    /// A recoverable PubSub control frame was proactively shed under
+    /// near-overload to preserve EAGER delivery (ADR 0010). Like
+    /// `DroppedFull`, the recv pump skips it; counted in `shed_priority`.
+    Shed,
 }
 
 async fn forward_gossip_payload(
@@ -929,6 +976,33 @@ async fn forward_gossip_payload(
     };
 
     if stream_type == GossipStreamType::PubSub {
+        // ADR 0010: under near-overload (>90% full, available < max/10), proactively shed
+        // recoverable control frames (IHAVE/IWANT/AntiEntropy) so the last
+        // slots stay available for data (EAGER). The kind-peek is gated on the
+        // shed threshold, so the steady-state path keeps ADR 0009's flat
+        // try_send behavior with no decode cost.
+        if channel_pressure_exceeds_shed_threshold(tx.capacity(), max)
+            && saorsa_gossip_pubsub::peek_message_kind(&message.data)
+                .is_some_and(is_pubsub_shed_eligible)
+        {
+            let depth = channel_depth(tx);
+            diagnostics.record_shed_priority(stream_type, depth, max);
+            if channel_drop_warn_limiter().should_emit(
+                channel_pressure_key(channel_name, Some(stream_type)),
+                Instant::now(),
+                CHANNEL_PRESSURE_INFO_INTERVAL,
+            ) {
+                warn!(
+                    peer = ?peer_id,
+                    stream = ?stream_type,
+                    channel = channel_name,
+                    depth,
+                    max,
+                    "[1/6 network] shedding recoverable PubSub control frame (channel >90% full) to preserve EAGER delivery (ADR 0010; rate-limited; see recv_pump.pubsub.shed_priority)"
+                );
+            }
+            return Ok(ForwardGossipOutcome::Shed);
+        }
         return match tx.try_send(message) {
             Ok(()) => {
                 diagnostics.record_enqueued(stream_type, channel_depth(tx), max);
@@ -2365,7 +2439,9 @@ impl NetworkNode {
 
                         match forward_result {
                             Ok(ForwardGossipOutcome::Enqueued) => {}
-                            Ok(ForwardGossipOutcome::DroppedFull) => continue,
+                            Ok(ForwardGossipOutcome::DroppedFull | ForwardGossipOutcome::Shed) => {
+                                continue
+                            }
                             Err(e) => {
                                 error!("Failed to forward gossip message: {}", e);
                                 break;
@@ -3536,6 +3612,112 @@ mod pressure_tests {
         rx.recv().await.expect("first message");
         let snapshot = diagnostics.snapshot();
         assert_eq!(snapshot.bulk.dropped_full, 0);
+    }
+
+    #[tokio::test]
+    async fn recv_pump_pubsub_sheds_control_under_near_full_but_preserves_eager() {
+        // ADR 0010: when the PubSub channel is near-full (>90%, available < max/10), recoverable
+        // control frames (IHAVE/IWANT/AntiEntropy) are shed so the last slots
+        // stay available for data (EAGER). EAGER is never silently shed — when
+        // the channel is truly full it hard-drops (dropped_full) as ADR 0009
+        // already specified. WHY it matters: preserving EAGER under bursts
+        // keeps payload delivery flowing while sacrificing only frames that
+        // PlumTree can recover via IHAVE/IWANT.
+        use saorsa_gossip_pubsub::GossipMessage;
+        use saorsa_gossip_types::{MessageHeader, MessageKind, TopicId};
+
+        fn frame(kind: MessageKind) -> Bytes {
+            let msg = GossipMessage {
+                header: MessageHeader {
+                    version: 1,
+                    topic: TopicId::new([0u8; 32]),
+                    msg_id: [0u8; 32],
+                    kind,
+                    hop: 0,
+                    ttl: 10,
+                },
+                payload: None,
+                signature: Vec::new(),
+                public_key: Vec::new(),
+            };
+            postcard::to_stdvec(&msg).expect("frame serializes").into()
+        }
+
+        // Capacity 20: the shed threshold (available*10 < max) activates at
+        // available <= 1, so 19/20 full still leaves one slot to prove the
+        // control frame is shed while EAGER claims that slot.
+        let (tx, _rx) = mpsc::channel::<GossipPayload>(20);
+        let diagnostics = RecvPumpDiagnostics::new();
+        let peer = ant_quic::PeerId([11; 32]);
+
+        for _ in 0..19 {
+            tx.try_send(GossipPayload {
+                peer_id: peer,
+                data: Bytes::from_static(b"x"),
+                enqueued_at: Instant::now(),
+            })
+            .expect("prefill should fit");
+        }
+        assert_eq!(tx.capacity(), 1, "channel should have one free slot");
+
+        // IHAVE (recoverable control) is shed; the free slot is preserved.
+        let ihave = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            frame(MessageKind::IHave),
+            "recv_pubsub_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ihave, ForwardGossipOutcome::Shed);
+        assert_eq!(
+            tx.capacity(),
+            1,
+            "shedding a control frame must not consume the preserved slot"
+        );
+
+        // EAGER (data) is NOT shed: it claims the preserved slot.
+        let eager = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            frame(MessageKind::Eager),
+            "recv_pubsub_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(eager, ForwardGossipOutcome::Enqueued);
+        assert_eq!(tx.capacity(), 0, "EAGER must claim the preserved slot");
+
+        // Channel now full: EAGER hard-drops (dropped_full), never silently shed.
+        let eager_full = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            frame(MessageKind::Eager),
+            "recv_pubsub_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(eager_full, ForwardGossipOutcome::DroppedFull);
+
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(
+            snapshot.pubsub.shed_priority, 1,
+            "exactly one recoverable control frame shed"
+        );
+        assert_eq!(
+            snapshot.pubsub.dropped_full, 1,
+            "EAGER hard-dropped exactly once when the channel was full"
+        );
+        assert_eq!(
+            snapshot.pubsub.enqueued_total, 1,
+            "exactly one EAGER enqueued into the preserved slot"
+        );
     }
 
     #[tokio::test]

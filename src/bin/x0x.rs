@@ -1580,29 +1580,6 @@ async fn run(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bare_presence_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
-        let cli = Cli::try_parse_from(["x0x", "presence"])?;
-        match cli.command {
-            Commands::Presence { sub: None } => Ok(()),
-            _ => anyhow::bail!("expected bare presence to parse without nested subcommand"),
-        }
-    }
-
-    #[test]
-    fn bare_ws_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
-        let cli = Cli::try_parse_from(["x0x", "ws"])?;
-        match cli.command {
-            Commands::Ws { sub: None } => Ok(()),
-            _ => anyhow::bail!("expected bare ws to parse without nested subcommand"),
-        }
-    }
-}
-
 // ── Tree view ──────────────────────────────────────────────────────────────
 
 fn print_command_tree() -> anyhow::Result<()> {
@@ -1966,4 +1943,27 @@ async fn purge() -> anyhow::Result<()> {
     eprintln!("x0x has been completely removed.");
     eprintln!("To reinstall: curl -sfL https://x0x.md | sh");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_presence_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "presence"])?;
+        match cli.command {
+            Commands::Presence { sub: None } => Ok(()),
+            _ => anyhow::bail!("expected bare presence to parse without nested subcommand"),
+        }
+    }
+
+    #[test]
+    fn bare_ws_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "ws"])?;
+        match cli.command {
+            Commands::Ws { sub: None } => Ok(()),
+            _ => anyhow::bail!("expected bare ws to parse without nested subcommand"),
+        }
+    }
 }

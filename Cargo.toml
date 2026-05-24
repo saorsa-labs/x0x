@@ -139,3 +139,19 @@ strip = "none"
 # Embed debuginfo in the binary so gdb / perf on remote VPS can resolve
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
+
+# TEMP (soak/dev): build against the local saorsa-gossip branch carrying the
+# pubsub fan-out detach (fix 1) + peek_message_kind for ADR 0010 (fix 2).
+# Remove when releasing — replace with the published saorsa-gossip 0.5.53 dep.
+[patch.crates-io]
+saorsa-gossip-coordinator = { path = "../saorsa-gossip/crates/coordinator" }
+saorsa-gossip-crdt-sync = { path = "../saorsa-gossip/crates/crdt-sync" }
+saorsa-gossip-groups = { path = "../saorsa-gossip/crates/groups" }
+saorsa-gossip-identity = { path = "../saorsa-gossip/crates/identity" }
+saorsa-gossip-membership = { path = "../saorsa-gossip/crates/membership" }
+saorsa-gossip-presence = { path = "../saorsa-gossip/crates/presence" }
+saorsa-gossip-pubsub = { path = "../saorsa-gossip/crates/pubsub" }
+saorsa-gossip-rendezvous = { path = "../saorsa-gossip/crates/rendezvous" }
+saorsa-gossip-runtime = { path = "../saorsa-gossip/crates/runtime" }
+saorsa-gossip-transport = { path = "../saorsa-gossip/crates/transport" }
+saorsa-gossip-types = { path = "../saorsa-gossip/crates/types" }
