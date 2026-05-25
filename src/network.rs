@@ -2236,7 +2236,7 @@ impl NetworkNode {
             .map_err(|e| NetworkError::ConnectionFailed(format!("send failed: {}", e)))?;
         self.note_connection_pool_activity(*peer_id).await;
 
-        info!(
+        debug!(
             "[1/6 network] send_direct: {} bytes to peer {:?}",
             payload.len(),
             peer_id
@@ -2369,7 +2369,7 @@ impl NetworkNode {
                                 continue;
                             }
 
-                            info!(
+                            debug!(
                                 "[1/6 network] recv direct: {} bytes from peer {:?}",
                                 payload.len(),
                                 peer_id
@@ -2394,7 +2394,7 @@ impl NetworkNode {
                         // Extract payload (everything after the type byte)
                         let payload = Bytes::copy_from_slice(&data[1..]);
 
-                        info!(
+                        debug!(
                             "[1/6 network] recv: {} bytes ({:?}) from peer {:?}",
                             data.len() - 1,
                             stream_type,
@@ -2713,7 +2713,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         drop(node_guard);
         self.note_connection_pool_activity(ant_peer).await;
 
-        info!(
+        debug!(
             "[1/6 network] send: {} bytes ({:?}) to peer {:?}",
             buf.len(),
             stream_type,

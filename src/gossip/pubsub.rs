@@ -382,7 +382,7 @@ impl PubSubManager {
         tokio::spawn(async move {
             while let Some((_peer, encoded_payload)) = plumtree_rx.recv().await {
                 stats.incoming_total.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
+                tracing::debug!(
                     topic = %sub_topic,
                     payload_len = encoded_payload.len(),
                     "[4/6 pubsub] received from PlumTree, decoding"
@@ -397,7 +397,7 @@ impl PubSubManager {
                     continue;
                 };
                 stats.incoming_decoded.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
+                tracing::debug!(
                     topic = %sub_topic,
                     msg_topic = %message.topic,
                     "[4/6 pubsub] decoded, forwarding to subscriber channel"

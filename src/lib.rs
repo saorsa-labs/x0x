@@ -2966,7 +2966,7 @@ impl Agent {
             let receipt = dm_send::loopback_receipt();
             self.direct_messaging
                 .record_outgoing_succeeded(*to, receipt.path);
-            tracing::info!(
+            tracing::debug!(
                 target: "dm.trace",
                 stage = "outbound_send_returned_ok",
                 request_id = %hex::encode(receipt.request_id),
@@ -3310,7 +3310,7 @@ impl Agent {
             return Err(error::NetworkError::AgentNotConnected(agent_id.0));
         }
 
-        tracing::info!(
+        tracing::debug!(
             target: "dm.trace",
             stage = "path_chosen",
             sender = %hex::encode(self.identity.agent_id().as_bytes()),
@@ -3326,7 +3326,7 @@ impl Agent {
         // message bytes, not merely that the local socket accepted them.
         let send_result = if let Some(timeout) = receive_ack_timeout {
             let wire = direct::DirectMessaging::encode_message(&self.identity.agent_id(), payload)?;
-            tracing::info!(
+            tracing::debug!(
                 target: "dm.trace",
                 stage = "wire_encoded",
                 sender = %hex::encode(self.identity.agent_id().as_bytes()),
@@ -3353,7 +3353,7 @@ impl Agent {
             )
             .await
         } else {
-            tracing::info!(
+            tracing::debug!(
                 target: "dm.trace",
                 stage = "wire_encoded",
                 sender = %hex::encode(self.identity.agent_id().as_bytes()),
@@ -3376,7 +3376,7 @@ impl Agent {
                     dm::DmPath::RawQuicAcked => "raw_quic_acked",
                     dm::DmPath::GossipInbox => "gossip_inbox",
                 };
-                tracing::info!(
+                tracing::debug!(
                     target: "dm.trace",
                     stage = "outbound_send_returned_ok",
                     sender = %hex::encode(self.identity.agent_id().as_bytes()),
@@ -3585,7 +3585,7 @@ impl Agent {
         if let Some(hook) = ack_race_test_hook.as_ref() {
             hook.notify_replaced_short_circuit();
         }
-        tracing::info!(
+        tracing::debug!(
             target: "dm.trace",
             stage = "raw_quic_ack_replaced_short_circuit",
             from = %self_prefix,
@@ -6291,7 +6291,7 @@ impl Agent {
                 let payload_bytes = data.len();
                 let digest = direct::dm_payload_digest_hex(&data);
 
-                tracing::info!(
+                tracing::debug!(
                     target: "dm.trace",
                     stage = "inbound_envelope_received",
                     sender = %hex::encode(sender.as_bytes()),
@@ -6322,7 +6322,7 @@ impl Agent {
                     Some(evaluator.evaluate(&ctx))
                 };
 
-                tracing::info!(
+                tracing::debug!(
                     target: "dm.trace",
                     stage = "inbound_trust_evaluated",
                     sender = %hex::encode(sender.as_bytes()),
@@ -6353,7 +6353,7 @@ impl Agent {
                     .handle_incoming(machine_id, sender, data, verified, trust_decision)
                     .await;
 
-                tracing::info!(
+                tracing::debug!(
                     target: "dm.trace",
                     stage = "inbound_broadcast_published",
                     sender = %hex::encode(sender.as_bytes()),

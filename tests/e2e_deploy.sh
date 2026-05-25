@@ -137,6 +137,53 @@ for node in "${NODE_NAMES[@]}"; do
         continue
     fi
 
+    # Enforce a hard log budget so verbose daemon output can never fill the
+    # disk (a runaway /var/log/syslog at ~14-18 GB/day once truncated a binary
+    # mid-deploy and contaminated a soak). journald capped at 1G; rsyslog's
+    # syslog/messages rotated at maxsize 200M x5 compressed; logrotate run
+    # hourly (stock cadence is daily — too slow for busy bootstrap nodes).
+    # Idempotent: safe to re-run every deploy. x0xd itself now logs per-packet
+    # recv/send at DEBUG (not INFO), so steady-state volume is already low.
+    echo -n "    Enforcing log budget (<5G)... "
+    if $SSH root@"$ip" '
+        mkdir -p /etc/systemd/journald.conf.d
+        printf "[Journal]\nSystemMaxUse=1G\nSystemMaxFileSize=200M\n" > /etc/systemd/journald.conf.d/99-x0x-cap.conf
+        systemctl restart systemd-journald 2>/dev/null || true
+        if [ -f /etc/logrotate.d/rsyslog ] && [ ! -f /etc/logrotate.d/rsyslog.x0x-bak ]; then
+            mv /etc/logrotate.d/rsyslog /etc/logrotate.d/rsyslog.x0x-bak
+        fi
+        cat > /etc/logrotate.d/x0x-logcap <<"LRCONF"
+/var/log/syslog
+/var/log/messages
+/var/log/kern.log
+/var/log/auth.log
+/var/log/daemon.log
+/var/log/user.log
+/var/log/debug
+{
+    su root adm
+    rotate 5
+    maxsize 200M
+    missingok
+    notifempty
+    nocreate
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate 2>/dev/null || systemctl kill -s HUP rsyslog 2>/dev/null || true
+    endpostrotate
+}
+LRCONF
+        printf "#!/bin/sh\n/usr/sbin/logrotate /etc/logrotate.conf 2>/dev/null || true\n" > /etc/cron.hourly/x0x-logrotate
+        chmod 0755 /etc/cron.hourly/x0x-logrotate
+        /usr/sbin/logrotate -f /etc/logrotate.conf >/dev/null 2>&1 || true
+    ' 2>/dev/null; then
+        echo -e "${GREEN}done${NC}"
+    else
+        echo -e "${YELLOW}log-cap setup failed (continuing)${NC}"
+    fi
+
     # Mesh test runner — single Python script + systemd unit + env file.
     # The runner subscribes to the test-control gossip topic so the Mac
     # harness can drive matrix tests through one SSH tunnel instead of

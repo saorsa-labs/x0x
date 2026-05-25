@@ -91,7 +91,7 @@ pub async fn send_via_gossip(
     let wire = envelope.to_wire_bytes().map_err(map_identity_err)?;
     let topic = DmInboxService::inbox_topic_name(&recipient_agent_id);
 
-    tracing::info!(
+    tracing::debug!(
         target: "dm.trace",
         stage = "path_chosen",
         request_id = %hex::encode(request_id),
@@ -99,7 +99,7 @@ pub async fn send_via_gossip(
         path = "gossip_inbox",
         timeout_ms = config.timeout_per_attempt.as_millis() as u64,
     );
-    tracing::info!(
+    tracing::debug!(
         target: "dm.trace",
         stage = "wire_encoded",
         request_id = %hex::encode(request_id),
@@ -120,7 +120,7 @@ pub async fn send_via_gossip(
         if attempt > 0 {
             match rx.try_recv() {
                 Ok(outcome) => {
-                    tracing::info!(
+                    tracing::debug!(
                         target: "dm.trace",
                         stage = "outbound_send_returned_ok",
                         request_id = %hex::encode(request_id),
@@ -159,7 +159,7 @@ pub async fn send_via_gossip(
 
         match attempt_result {
             Ok(Ok(outcome)) => {
-                tracing::info!(
+                tracing::debug!(
                     target: "dm.trace",
                     stage = "outbound_send_returned_ok",
                     request_id = %hex::encode(request_id),
@@ -181,7 +181,7 @@ pub async fn send_via_gossip(
                     .await?;
                     match wait_outcome {
                         BackoffWait::Ack(outcome) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "dm.trace",
                                 stage = "outbound_send_returned_ok",
                                 request_id = %hex::encode(request_id),
@@ -193,7 +193,7 @@ pub async fn send_via_gossip(
                             return ack_outcome_to_receipt(outcome, request_id, attempt);
                         }
                         BackoffWait::ReplacedShortCircuit { new_generation } => {
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "dm.trace",
                                 stage = "outbound_send_replaced_short_circuit",
                                 request_id = %hex::encode(request_id),
@@ -211,7 +211,7 @@ pub async fn send_via_gossip(
     }
 
     if let Ok(outcome) = rx.try_recv() {
-        tracing::info!(
+        tracing::debug!(
             target: "dm.trace",
             stage = "outbound_send_returned_ok",
             request_id = %hex::encode(request_id),

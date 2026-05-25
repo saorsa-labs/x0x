@@ -11657,7 +11657,7 @@ async fn direct_send(
                 x0x::dm::DmPath::RawQuic => "raw_quic",
                 x0x::dm::DmPath::RawQuicAcked => "raw_quic_acked",
             };
-            tracing::info!(
+            tracing::debug!(
                 target: "dm.trace",
                 stage = "accepted_at_api",
                 request_id = %hex::encode(receipt.request_id),
@@ -11808,7 +11808,7 @@ async fn direct_events_sse(
                     let Some(msg) = maybe_msg else {
                         break;
                     };
-                    tracing::info!(
+                    tracing::debug!(
                         target: "dm.trace",
                         stage = "inbound_sse_yielded",
                         sender = %hex::encode(msg.sender.as_bytes()),
