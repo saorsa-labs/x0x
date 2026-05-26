@@ -24,7 +24,7 @@ Maintainers only need to decide these points before implementation:
 |---|---|
 | Secure abstraction | Add a `SecureContext`-style boundary so KvStore sync does not depend directly on one group-key backend. |
 | Secure backend target | Maintainers should choose whether v1 binds `SecureContext` to the named-group GSS secure plane, the current MLS/TreeKEM module, or an abstraction with both backends. |
-| Author binding | Require sign-then-encrypt: each mutation is ML-DSA-65-signed by the author before it is sealed. |
+| Author binding | Require sign-then-encrypt: each mutation is ML-DSA-65-signed by the author, with `author_id` bound inside the signed bytes, before it is sealed. |
 | AAD contract | Bind at least domain/version, `group_id`, `store_id`, and epoch. Do not bind `state_hash` unless maintainers explicitly want stricter stale-state rejection. |
 | Rekey behavior | After rekey, publish a current-state checkpoint/snapshot at the new epoch. Do not require late joiners to receive historical epoch keys. |
 | API shape | Prefer `POST /groups/:id/stores` as the primary group-scoped API; keep existing `/stores` signed/plaintext behavior compatible. |
@@ -270,7 +270,7 @@ state from `GroupInfo`:
 - `secret_epoch`;
 - `stable_group_id()`;
 - `secure_message_key()` / `derive_message_key(secret, epoch, group_id)`;
-- ChaCha20-Poly1305 with a fresh random nonce per record.
+- the AEAD and nonce strategy chosen by maintainers for encrypted store records.
 
 If maintainers choose the MLS/TreeKEM module, `SecureContext` should expose the
 equivalent current epoch, seal/open, and membership checks from that backend. In
@@ -304,11 +304,16 @@ The signed bytes should include at least:
 - `group_id`;
 - `store_id`;
 - epoch;
+- author id;
 - mutation kind: delta or checkpoint;
 - canonical serialized payload bytes.
 
-The author id must be derivable from, or verified against, the included public
-key. A record signed by one agent but claiming another agent id must be rejected.
+The author id must be deterministically derived from the included ML-DSA-65
+public key using the same derivation as `AgentId::from_public_key` (currently a
+32-byte public-key hash). Receivers must derive the `AgentId` from the included
+public key, compare it to the claimed `author_id`, and reject the record before
+signature verification or authorization if they differ. A record signed by one
+agent but claiming another agent id must be rejected.
 
 ### AEAD envelope and AAD
 
@@ -327,16 +332,23 @@ EncryptedKvStoreRecordV1 {
 }
 ```
 
+The epoch is plaintext so receivers can select the right backend epoch/key before
+decryption. That is an intentional tradeoff: observers can see epoch boundaries
+even though they cannot decrypt the record contents.
+
 AAD should be deterministic and domain-separated. Recommended minimum:
 
 ```text
 x0x.kv.encrypted-record.v1 || group_id || store_id || epoch
 ```
 
-For ChaCha20-Poly1305, a fresh random 96-bit nonce per record is acceptable at
-expected application-state volumes. High-churn stores should consider
-XChaCha20-Poly1305 with a 192-bit nonce, or a persisted per-store/per-epoch
-counter-based nonce strategy, to avoid birthday-bound concerns.
+Preferred nonce strategy: use XChaCha20-Poly1305 with a 192-bit nonce if the
+chosen secure backend accepts that AEAD for store records. If maintainers choose
+ChaCha20-Poly1305 with a 96-bit nonce, the implementation should guarantee nonce
+uniqueness per epoch key, preferably with a persisted per-store/per-epoch
+counter. Random 96-bit nonces should be used only with an explicit per-epoch-key
+record bound; around 2^32 records under one key gives roughly 2^-32 collision
+risk by the birthday bound.
 
 Do not bind `state_hash` by default. Binding `state_hash` would make records
 tighter to a specific signed group-state revision, but it also risks dropping
@@ -366,12 +378,14 @@ For an encrypted store, the subscriber should:
 1. Decode the encrypted envelope.
 2. Recompute AAD from envelope metadata and local store binding.
 3. Open the ciphertext with the group secure context for that epoch.
-4. Verify the signed inner record domain, `group_id`, `store_id`, epoch, author
-   public key, author id, and signature.
-5. Check that the author is allowed to write under the store's agreed
+4. Parse the included ML-DSA-65 public key, derive `AgentId` from it, and require
+   it to equal the claimed author id.
+5. Verify the signed inner record domain, `group_id`, `store_id`, epoch, author
+   id, and signature with the derived author's public key.
+6. Check that the author is allowed to write under the store's agreed
    authorization model, at minimum active group membership for v1.
-6. Merge the decrypted delta or checkpoint.
-7. Drop undecryptable, unauthenticated, cross-store, stale, or unauthorized
+7. Merge the decrypted delta or checkpoint.
+8. Drop undecryptable, unauthenticated, cross-store, stale, or unauthorized
    records without applying them.
 
 Logging should avoid printing decrypted keys or values.
@@ -436,12 +450,21 @@ and secure-secret distribution.
 
 Open implementation choice: who publishes the checkpoint?
 
-Acceptable options include:
+This is a checkpoint-authority decision, not just an availability decision. A
+valid-AEAD checkpoint can rewrite the visible store, so receivers need a rule for
+whose checkpoints are authoritative. A removed or soon-to-be-removed member must
+not be able to pre-publish a stale or malicious checkpoint that remaining members
+apply after a rekey.
+
+Candidate mitigations include:
 
 - the authority/admin who caused the rekey publishes immediately;
-- deterministic election among active members;
-- any member may publish, with receivers accepting the newest valid checkpoint by
-  a monotonic checkpoint sequence or CRDT version.
+- checkpoint publication requires a quorum or co-signature from active members;
+- receivers accept the highest checkpoint sequence only from a non-removed
+  authority on the winning group-state branch;
+- checkpoints include the relevant `GroupStateCommit` / removed-member set, and
+  receivers verify both the checkpoint author and their own membership against
+  that state before applying.
 
 This choice should be made by maintainers because it interacts with group
 authority, offline behavior, and anti-entropy.
@@ -528,6 +551,8 @@ This design does not provide:
 - deletion of plaintext or ciphertext already received by a removed member;
 - hiding network-level traffic timing, topic membership, or approximate message
   sizes;
+- hiding the timing or frequency of epoch rotations from gossip observers,
+  because the encrypted envelope carries epoch in plaintext for key selection;
 - per-store or per-key write policy unless maintainers choose to include that in
   v1. With active group membership as the only write rule, any active member can
   overwrite or delete any key under LWW semantics;
