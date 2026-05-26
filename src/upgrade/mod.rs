@@ -87,8 +87,15 @@ impl Upgrader {
 
     /// Atomically replace the target binary with the new one.
     ///
-    /// On Unix, this uses `fs::rename` which is atomic on the same filesystem.
-    /// The `new_binary` path should be on the same filesystem as the target.
+    /// On Unix, this uses `fs::rename` which is atomic on the same filesystem
+    /// — including when the target is the currently-running executable. The
+    /// `new_binary` path should be on the same filesystem as the target.
+    ///
+    /// On Windows a running executable is locked and cannot be renamed over in
+    /// place, so this falls back to [`replace_via_sideline`]: the live binary
+    /// is moved aside (it stays locked until this process exits and is then
+    /// reclaimed by [`sweep_stale_upgrade_artifacts`] on the next launch) and
+    /// the new binary is moved into its place.
     pub fn atomic_replace(&self, new_binary: &Path) -> Result<(), UpgradeError> {
         #[cfg(unix)]
         {
@@ -96,10 +103,14 @@ impl Upgrader {
             // Preserve executable permissions
             std::fs::set_permissions(new_binary, std::fs::Permissions::from_mode(0o755))
                 .map_err(|e| UpgradeError::ReplaceFailed { source: e })?;
+            std::fs::rename(new_binary, &self.target_path)
+                .map_err(|e| UpgradeError::ReplaceFailed { source: e })?;
         }
 
-        std::fs::rename(new_binary, &self.target_path)
-            .map_err(|e| UpgradeError::ReplaceFailed { source: e })?;
+        #[cfg(not(unix))]
+        {
+            replace_via_sideline(&self.target_path, new_binary)?;
+        }
 
         debug!("Atomic replacement complete");
         Ok(())
@@ -166,6 +177,92 @@ impl Upgrader {
             }
         }
     }
+}
+
+/// Replace `target` with `new_binary` by moving the existing file aside first.
+///
+/// Required on Windows, where a running executable is locked and cannot be
+/// renamed over in place — but a locked file *can* be moved aside. The moved
+/// file (`<name>.x0xold-<nanos>`) stays locked until the old process exits and
+/// is reclaimed by [`sweep_stale_upgrade_artifacts`] on the next launch. On any
+/// failure the sideline is rolled back so the original binary is never lost.
+///
+/// Used by [`Upgrader::atomic_replace`] on non-Unix targets; defined for all
+/// platforms so its logic is exercised by tests on Unix CI.
+pub fn replace_via_sideline(target: &Path, new_binary: &Path) -> Result<(), UpgradeError> {
+    let sidelined = sideline_path_for(target);
+    std::fs::rename(target, &sidelined).map_err(|e| UpgradeError::ReplaceFailed { source: e })?;
+    if let Err(e) = std::fs::rename(new_binary, target) {
+        // Restore the original so a failed replace can't leave us binaryless.
+        let _ = std::fs::rename(&sidelined, target);
+        return Err(UpgradeError::ReplaceFailed { source: e });
+    }
+    Ok(())
+}
+
+/// Compute the move-aside path for `target`, using the `.x0xold-<nanos>` marker
+/// that [`sweep_stale_upgrade_artifacts`] recognises and reclaims.
+fn sideline_path_for(target: &Path) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".x0xold-{unique}"));
+    target.with_file_name(name)
+}
+
+/// Reclaim leftover upgrade artifacts from interrupted or failed attempts.
+///
+/// Two kinds of debris accumulate in the binary's directory:
+/// - `.x0x-upgrade-*` temp dirs (each holds a downloaded archive plus the
+///   extracted binary, tens of MB). A failed binary replace used to leave one
+///   behind on every attempt — the cause of the Windows disk-fill loop.
+/// - `*.x0xold-*` binaries sidelined by [`replace_via_sideline`], which stay
+///   locked until the old process exits and so can only be reclaimed later.
+///
+/// Temp dirs younger than `dir_min_age` are left untouched so a concurrent
+/// in-flight apply (this process's, or a co-located instance's) is never
+/// disturbed. Sidelined binaries are always best-effort removed — the process
+/// that locked one has, by definition, exited before this runs (a delete of a
+/// still-locked file simply fails and is retried on a future launch).
+///
+/// Returns the number of entries removed. All removal is best-effort.
+pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duration) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            debug!(dir = %dir.display(), error = %e, "Cannot scan for stale upgrade artifacts");
+            return 0;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        let path = entry.path();
+        if name.starts_with(".x0x-upgrade-") {
+            // Age-gate temp dirs so an in-flight apply is never deleted.
+            let old_enough = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age >= dir_min_age);
+            if old_enough && std::fs::remove_dir_all(&path).is_ok() {
+                info!(path = %path.display(), "Removed stale upgrade temp dir");
+                removed += 1;
+            }
+        } else if name.contains(".x0xold-") && std::fs::remove_file(&path).is_ok() {
+            info!(path = %path.display(), "Removed sidelined binary from prior upgrade");
+            removed += 1;
+        }
+    }
+    removed
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -357,5 +454,68 @@ mod tests {
     #[test]
     fn test_max_binary_size_constant() {
         assert_eq!(MAX_BINARY_SIZE_BYTES, 200 * 1024 * 1024);
+    }
+
+    #[test]
+    fn replace_via_sideline_swaps_binary_and_keeps_old_aside() {
+        // Encodes the Windows self-replace contract: the new binary lands at the
+        // target path and the old one is preserved under a sweepable marker, so a
+        // crash mid-restart can never leave the install without a working binary.
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("x0xd.exe");
+        fs::write(&target, b"old binary").unwrap();
+        let new_binary = create_test_binary(&dir, "extracted-binary", b"new binary");
+
+        replace_via_sideline(&target, &new_binary).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new binary");
+        let sidelined: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".x0xold-"))
+            .collect();
+        assert_eq!(sidelined.len(), 1, "exactly one sidelined binary expected");
+        assert_eq!(fs::read(sidelined[0].path()).unwrap(), b"old binary");
+    }
+
+    #[test]
+    fn sweep_reclaims_sidelined_binaries_but_spares_fresh_temp_dirs() {
+        // A successful upgrade leaves both a fresh temp dir (about to be cleaned
+        // by the caller) and a sidelined binary (locked until restart). The sweep
+        // must reclaim the latter without nuking an in-flight apply's temp dir.
+        let dir = TempDir::new().unwrap();
+        let fresh_temp = dir.path().join(".x0x-upgrade-123-456");
+        fs::create_dir_all(&fresh_temp).unwrap();
+        let sidelined = dir.path().join("x0xd.exe.x0xold-789");
+        fs::write(&sidelined, b"old").unwrap();
+        let backup = dir.path().join("x0xd.exe.backup");
+        fs::write(&backup, b"backup").unwrap();
+
+        let removed =
+            sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::from_secs(3600));
+
+        assert_eq!(removed, 1, "only the sidelined binary should be removed");
+        assert!(
+            fresh_temp.exists(),
+            "fresh temp dir must survive the age gate"
+        );
+        assert!(!sidelined.exists(), "sidelined binary must be reclaimed");
+        assert!(backup.exists(), "unrelated .backup file must be left alone");
+    }
+
+    #[test]
+    fn sweep_reclaims_aged_temp_dirs() {
+        // Orphaned temp dirs from a previous run are the disk-fill debris; with a
+        // zero min-age every such dir qualifies and must be removed.
+        let dir = TempDir::new().unwrap();
+        let stale = dir.path().join(".x0x-upgrade-1-1");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("archive"), vec![0u8; 1024]).unwrap();
+        fs::write(stale.join("extracted-binary"), vec![0u8; 1024]).unwrap();
+
+        let removed = sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::from_secs(0));
+
+        assert_eq!(removed, 1);
+        assert!(!stale.exists());
     }
 }

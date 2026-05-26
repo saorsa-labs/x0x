@@ -12,6 +12,31 @@ use super::manifest::{current_platform_target, ReleaseManifest};
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
 use super::{UpgradeError, UpgradeResult, Upgrader};
 
+/// Removes an upgrade temp dir when dropped, so it is never leaked on an
+/// early-return error path (e.g. a failed binary replace on Windows, which
+/// otherwise left a ~50 MB archive + extracted binary behind on every attempt).
+///
+/// The success path explicitly removes the temp dir *before* triggering the
+/// restart, because the restart `exec()`s (Unix) or `exit()`s without unwinding,
+/// so this guard would not otherwise run there.
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => debug!(
+                path = %self.path.display(),
+                error = %e,
+                "Failed to remove upgrade temp dir on cleanup"
+            ),
+        }
+    }
+}
+
 /// Auto-apply upgrader that handles the full download → verify → extract → replace → restart flow.
 pub struct AutoApplyUpgrader {
     /// Which binary to extract from the archive (e.g. "x0xd", "x0x").
@@ -92,6 +117,10 @@ impl AutoApplyUpgrader {
         let target_path = current_binary_path()?;
         let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
         let temp_dir = upgrader.create_temp_dir()?;
+        // Guarantees temp-dir removal on every early-return error path below.
+        let _temp_guard = TempDirGuard {
+            path: temp_dir.clone(),
+        };
 
         let archive_path = temp_dir.join("archive");
         let sig_path = temp_dir.join("archive.sig");

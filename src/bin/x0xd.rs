@@ -1612,6 +1612,28 @@ async fn main() -> Result<()> {
     let self_published_release_manifests =
         Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
 
+    // Reclaim upgrade debris left by previous failed/interrupted attempts:
+    // orphaned `.x0x-upgrade-*` temp dirs and `*.x0xold-*` sidelined binaries.
+    // Runs unconditionally (cheap one-shot dir scan) so a machine that hit the
+    // old disk-fill loop is cleaned up even if updates are now disabled.
+    tokio::spawn(async {
+        let removed = tokio::task::spawn_blocking(|| {
+            let exe = x0x::upgrade::apply::current_binary_path().ok()?;
+            let dir = exe.parent()?.to_path_buf();
+            Some(x0x::upgrade::sweep_stale_upgrade_artifacts(
+                &dir,
+                Duration::from_secs(3600),
+            ))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        if removed > 0 {
+            tracing::info!(removed, "Reclaimed stale upgrade artifacts at startup");
+        }
+    });
+
     // Gossip-based release subscription (primary update mechanism)
     if config.update.enabled && config.update.gossip_updates {
         let update_config = config.update.clone();
@@ -3027,8 +3049,19 @@ async fn run_gossip_update_listener(
     // message ID each time — so PlumTree's transport-layer dedup cannot suppress re-sends.
     let mut rebroadcasted_versions: HashMap<String, Instant> = HashMap::new();
 
+    // Track versions that failed to *apply* so a release that can never succeed
+    // in this environment (e.g. a locked binary that won't replace) is not
+    // re-downloaded and re-extracted on every gossip receipt. Without this the
+    // gossip path retried indefinitely — the cause of the Windows disk-fill
+    // loop. Mirrors the backoff in run_fallback_github_poll.
+    let mut failed_apply_versions: HashMap<String, Instant> = HashMap::new();
+    const APPLY_RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
+
     while let Some(msg) = release_sub.recv().await {
         tracing::info!("Received release manifest via gossip");
+
+        // Drop expired backoff entries so the map stays bounded.
+        failed_apply_versions.retain(|_, failed_at| failed_at.elapsed() < APPLY_RETRY_AFTER);
 
         // Decode wire format: length-prefixed manifest JSON + signature
         let (manifest_json, sig) = match decode_signed_manifest(&msg.payload) {
@@ -3144,6 +3177,20 @@ async fn run_gossip_update_listener(
         // Update SKILL.md if changed (independent of binary update)
         update_skill_if_changed(&manifest, &data_dir).await;
 
+        // Skip versions that recently failed to apply. A release that can never
+        // succeed here would otherwise re-download and re-extract on every
+        // gossip receipt; the backoff caps that to one attempt per 30 minutes.
+        if let Some(failed_at) = failed_apply_versions.get(&manifest.version) {
+            if failed_at.elapsed() < APPLY_RETRY_AFTER {
+                tracing::debug!(
+                    version = %manifest.version,
+                    "Skipping recently failed upgrade v{} (apply backoff active)",
+                    manifest.version
+                );
+                continue;
+            }
+        }
+
         tracing::info!(
             version = %manifest.version,
             "Applying upgrade immediately"
@@ -3158,9 +3205,11 @@ async fn run_gossip_update_listener(
             }
             Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
                 tracing::warn!(%reason, "Upgrade rolled back");
+                failed_apply_versions.insert(manifest.version.clone(), Instant::now());
             }
             Err(e) => {
                 tracing::error!(error = %e, "Upgrade failed: {e}");
+                failed_apply_versions.insert(manifest.version.clone(), Instant::now());
             }
             _ => {}
         }
