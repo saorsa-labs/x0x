@@ -1088,7 +1088,15 @@ async fn run(
         Commands::UserId { sub } => match sub {
             UserIdSub::Create { path } => {
                 let resolved = commands::user_id::create(path.clone()).await?;
-                println!("Created user identity keypair at {}", resolved.display());
+                match format {
+                    OutputFormat::Json => x0x::cli::print_value(
+                        format,
+                        &serde_json::json!({ "path": resolved.to_string_lossy() }),
+                    ),
+                    OutputFormat::Text => {
+                        println!("Created user identity keypair at {}", resolved.display());
+                    }
+                }
                 return Ok(());
             }
         },
