@@ -8,6 +8,19 @@ All notable changes to this project will be documented in this file.
 
 - **`POST /agent/sign`**: detached ML-DSA-65 signature over a caller-supplied payload using the running agent's signing key. Bearer-token authenticated; payloads are capped at 256 KiB. Response includes the agent_id (hex), the agent's public key (base64), the signature (base64), and the stable signing scheme identifier (`"x0x.agent-sign.v1.ml-dsa-65"`). Intended for applications that persist signed records to disk or distributed storage (audit logs, governance votes, content metadata) where transport-layer gossip signing doesn't survive a database read. Callers sign exact bytes, so applications must canonicalize structured payloads and should domain-separate them with an application/type/version prefix before signing. Matching CLI: `x0x agent sign --file <PATH>` (or `--payload-b64 <BASE64>`). Coverage: `daemon_api_agent_sign_*` integration tests + `api_coverage` registry entry.
 
+## [v0.19.52] - 2026-05-29
+
+### Changed
+
+- Bump `ant-quic` 0.27.24 → 0.27.25 and `saorsa-gossip` 0.5.57 → 0.5.58.
+  ant-quic 0.27.25 fixes an intermittent direct-message failure
+  (`invalid ACK-v2 response envelope: len=0`): a transient mid-exchange
+  ACK-v2 response-stream drop is now retried duplicate-safely (same request
+  id, receiver replays the cached outcome) instead of surfacing as a hard
+  `ConnectionFailed`. No x0x code changes — the fix flows through the
+  `send_with_receive_ack` DM path transparently. Validated by a local
+  2-node DM soak: 4,912/4,912 ACKed DMs, 0 errors, 0 `len=0` occurrences.
+
 ## [v0.19.45] - 2026-05-13
 
 Metadata-fix release. The v0.19.44 release workflow failed validation
