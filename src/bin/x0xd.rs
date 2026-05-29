@@ -1772,6 +1772,30 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Background named-group metadata listener on the direct channel — applies
+    // authority-authored review commits (approve / reject) that are
+    // direct-delivered to a requester before they are grafted into the
+    // metadata topic's gossip mesh (see `deliver_named_group_event_to_agent`).
+    // This mirrors the per-group metadata topic-subscription apply loop; the
+    // shared apply handler re-validates the signed commit, enforces the same
+    // authorization checks, and is idempotent, so applying via both the direct
+    // and gossip channels is safe.
+    {
+        let meta_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut rx = meta_state.agent.subscribe_direct();
+            loop {
+                let Some(msg) = rx.recv().await else { break };
+                let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
+                else {
+                    continue; // not a named-group metadata event
+                };
+                apply_named_group_metadata_event(&meta_state, event, msg.sender, msg.verified)
+                    .await;
+            }
+        });
+    }
+
     // Build router
     let app = Router::new()
         .route("/health", get(health))
@@ -6466,6 +6490,54 @@ async fn publish_named_group_metadata_event(
     }
 }
 
+/// Deliver a named-group metadata event directly to a single recipient over
+/// the authenticated direct-message channel, in addition to the metadata-topic
+/// gossip publish.
+///
+/// Review decisions (approve / reject) target a requester who has only just
+/// imported the group card and is not yet grafted into the authority's
+/// PlumTree eager-push mesh for the metadata topic. Gossip cannot backfill a
+/// message published before the receiver is in the eager set, so the
+/// authority-authored, chain-linked commit can fail to reach the one peer that
+/// must converge. The direct path closes that gap. The receiver applies the
+/// event through the same [`apply_named_group_metadata_event`] path used for
+/// gossip, which re-validates the signed commit, enforces the same
+/// authorization, and is idempotent — so this is an additive delivery channel
+/// that neither weakens authorization nor risks a double apply.
+async fn deliver_named_group_event_to_agent(
+    state: &AppState,
+    recipient_hex: &str,
+    event: &NamedGroupMetadataEvent,
+) {
+    let recipient = match parse_agent_id_hex(recipient_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                requester = %recipient_hex,
+                "cannot direct-deliver named-group event: invalid requester id: {e}"
+            );
+            return;
+        }
+    };
+    let payload = match serde_json::to_vec(event) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!("failed to serialize named-group event for direct delivery: {e}");
+            return;
+        }
+    };
+    if let Err(e) = state
+        .agent
+        .send_direct_with_config(&recipient, payload, direct_message_send_config())
+        .await
+    {
+        tracing::warn!(
+            requester = %recipient_hex,
+            "failed to direct-deliver named-group review event: {e}"
+        );
+    }
+}
+
 async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     let handle = state.group_metadata_tasks.write().await.remove(group_id);
     if let Some(handle) = handle {
@@ -8889,7 +8961,20 @@ async fn remove_named_group_member(
 ///
 /// Returns `{ group_id, genesis, state_revision, state_hash,
 /// prev_state_hash, security_binding, withdrawn, roster_root,
-/// policy_hash, public_meta_hash }`. Available to any active member.
+/// policy_hash, public_meta_hash }`.
+///
+/// Available to anyone holding the group stub — active members and
+/// non-member card importers alike. Every field returned here is part of
+/// the group's **public projection**: it is exactly the data already
+/// published in the signed `GroupCard` (state_hash, revision,
+/// prev_state_hash) plus derived commitments (roster_root, policy_hash,
+/// public_meta_hash) that are hashes, never member content. The named-groups
+/// model (`docs/design/named-groups-full-model.md`) requires non-members to
+/// be able to view the public card and converge on the authoritative public
+/// state of a discoverable group; private member content (chat, files, KV,
+/// secure presence) is never exposed here. Non-discoverable groups cannot be
+/// stubbed by a non-member (no card to import), so they 404 above for
+/// outsiders rather than relying on this gate.
 async fn get_group_state(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -8901,13 +8986,6 @@ async fn get_group_state(
             Json(serde_json::json!({ "ok": false, "error": "group not found" })),
         );
     };
-    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    if !info.has_active_member(&local_hex) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "not a member" })),
-        );
-    }
     let roster_root = x0x::groups::compute_roster_root(&info.members_v2);
     let policy_hash = x0x::groups::compute_policy_hash(&info.policy);
     let public_meta_hash = x0x::groups::compute_public_meta_hash(&info.public_meta());
@@ -9935,10 +10013,11 @@ async fn approve_join_request(
         request_id,
         revision,
         actor: caller_hex,
-        requester_agent_id: requester_hex,
+        requester_agent_id: requester_hex.clone(),
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    deliver_named_group_event_to_agent(&state, &requester_hex, &event).await;
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -10006,10 +10085,11 @@ async fn reject_join_request(
         group_id: event_group_id,
         request_id,
         actor: caller_hex,
-        requester_agent_id: requester_hex,
+        requester_agent_id: requester_hex.clone(),
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    deliver_named_group_event_to_agent(&state, &requester_hex, &event).await;
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))

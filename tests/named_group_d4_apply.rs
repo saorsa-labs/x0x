@@ -294,7 +294,12 @@ async fn d4_stateful_events_converge_via_signed_commits_once() {
     assert_eq!(b0["ok"], true, "bob state: {b0:?}");
 
     // Bring alice's roster into the same effective access state as bob's
-    // local invite-joined view before testing later metadata commits.
+    // local invite-joined view before testing later metadata commits. Joining
+    // via invite already propagates a MemberJoined commit that adds bob to
+    // alice's roster, so this re-add commonly returns 409 Conflict (already a
+    // member) rather than 200 — both are correct. The wait_state_match below
+    // confirms the rosters actually converge regardless of which path aligned
+    // them.
     let bob_agent_id = bob.agent_id().await;
     let resp = authed_client(alice)
         .post(alice.url(&format!("/groups/{group_id}/members")))
@@ -302,7 +307,11 @@ async fn d4_stateful_events_converge_via_signed_commits_once() {
         .send()
         .await
         .expect("add bob request");
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.status() == StatusCode::OK || resp.status() == StatusCode::CONFLICT,
+        "aligning bob membership should succeed or report already-a-member, got {}",
+        resp.status()
+    );
     let (_hash0, rev0) = wait_state_match(alice, bob, &group_id).await;
 
     // Owner-authored metadata edit.
@@ -588,6 +597,13 @@ async fn d4_mls_ban_commit_advances_binding_and_converges() {
     assert_eq!(join["ok"], true, "join response: {join:?}");
     let _ = wait_state_available(bob, &group_id).await;
 
+    // Ensure bob is in alice's roster before the ban flow. Joining via invite
+    // already propagates a MemberJoined commit that adds bob to alice's roster,
+    // so by the time we reach here alice usually has bob already — re-adding
+    // then returns 409 Conflict, which is correct, not a failure. Accept either
+    // a fresh add (200) or the already-a-member case (409); the subsequent
+    // wait_state_match confirms both daemons actually converge on bob's
+    // membership regardless of which path aligned the roster.
     let bob_agent_id = bob.agent_id().await;
     let resp = authed_client(alice)
         .post(alice.url(&format!("/groups/{group_id}/members")))
@@ -595,7 +611,11 @@ async fn d4_mls_ban_commit_advances_binding_and_converges() {
         .send()
         .await
         .expect("align bob membership");
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.status() == StatusCode::OK || resp.status() == StatusCode::CONFLICT,
+        "aligning bob membership should succeed or report already-a-member, got {}",
+        resp.status()
+    );
     let (_hash0, rev0) = wait_state_match(alice, bob, &group_id).await;
 
     let charlie_id = hex::encode([0x44u8; 32]);
