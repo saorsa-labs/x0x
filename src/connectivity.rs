@@ -139,6 +139,243 @@ impl std::fmt::Display for ConnectOutcome {
     }
 }
 
+// ─── Transport environment assessment (ADR-0011 §4) ──────────────────────────
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+/// QUIC's mandatory minimum Initial datagram size (`ant-quic`
+/// `MIN_INITIAL_SIZE`). A path that cannot carry a datagram this large cannot
+/// complete a QUIC handshake on any port.
+pub const QUIC_MIN_MTU: u16 = 1200;
+
+/// MTU at or below which a path is critically constrained — only a few bytes of
+/// headroom above the QUIC floor, so any extra tunnel/option overhead drops the
+/// handshake. WireGuard-style full-tunnel VPNs commonly land here.
+pub const MTU_CRITICAL_THRESHOLD: u16 = 1252;
+
+/// MTU below which a path is "constrained" — still works but is small enough to
+/// indicate a tunnel/VPN rather than a native ~1500-byte link.
+pub const MTU_CONSTRAINED_THRESHOLD: u16 = 1400;
+
+/// IPv4 CIDR blocks whose appearance as a node's **own external address**
+/// indicates traffic is egressing through Cloudflare (WARP / "1.1.1.1: Faster
+/// Internet" full-tunnel mode, or a Cloudflare tunnel). A normal ISP customer
+/// never has a Cloudflare anycast IP as their public source address, so this is
+/// a high-signal heuristic for the WARP class of UDP-hostile path. `(network,
+/// prefix_len)`.
+const CLOUDFLARE_WARP_V4_RANGES: &[(Ipv4Addr, u8)] = &[
+    (Ipv4Addr::new(104, 16, 0, 0), 12), // 104.16.0.0 – 104.31.255.255 (incl. WARP 104.28.x egress)
+    (Ipv4Addr::new(172, 64, 0, 0), 13), // 172.64.0.0 – 172.71.255.255
+];
+
+/// Cloudflare WARP IPv6 egress prefix (`2606:4700::/32`).
+const CLOUDFLARE_WARP_V6_RANGE: (Ipv6Addr, u8) =
+    (Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0), 32);
+
+/// RFC 6598 carrier-grade NAT range (`100.64.0.0/10`). A node whose external
+/// address is in this block sits behind CGNAT and cannot receive unsolicited
+/// inbound — it must relay. Distinct from a VPN: no split-tunnel fix applies.
+const CGNAT_V4_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(100, 64, 0, 0), 10);
+
+fn v4_in_cidr(addr: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let mask: u32 = u32::MAX << (32 - prefix);
+    (u32::from(addr) & mask) == (u32::from(net) & mask)
+}
+
+fn v6_in_cidr(addr: Ipv6Addr, net: Ipv6Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let mask: u128 = u128::MAX << (128 - prefix);
+    (u128::from(addr) & mask) == (u128::from(net) & mask)
+}
+
+/// Whether `ip` looks like a Cloudflare WARP / full-tunnel-VPN egress address.
+fn is_vpn_egress(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => CLOUDFLARE_WARP_V4_RANGES
+            .iter()
+            .any(|&(net, prefix)| v4_in_cidr(v4, net, prefix)),
+        IpAddr::V6(v6) => {
+            let (net, prefix) = CLOUDFLARE_WARP_V6_RANGE;
+            v6_in_cidr(v6, net, prefix)
+        }
+    }
+}
+
+/// Whether `ip` is in the RFC 6598 CGNAT range.
+fn is_cgnat(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let (net, prefix) = CGNAT_V4_RANGE;
+            v4_in_cidr(v4, net, prefix)
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// Observed transport facts fed into [`assess_transport_environment`].
+///
+/// Kept as a plain input struct (not the live `NodeStatus`) so the assessment
+/// logic is pure and unit-testable independent of the network stack.
+#[derive(Debug, Clone, Default)]
+pub struct TransportObservation {
+    /// External (reflexive) addresses ant-quic has observed for this node.
+    pub external_addrs: Vec<SocketAddr>,
+    /// Whether ant-quic believes this node can receive direct inbound.
+    pub can_receive_direct: Option<bool>,
+    /// Count of currently connected peers.
+    pub connected_peers: usize,
+    /// Smallest `current_mtu` observed across connected peers, if any.
+    pub min_observed_mtu: Option<u16>,
+    /// Total lost PLPMTUD probes across connected peers.
+    pub lost_plpmtud_probes: u64,
+    /// Total black-hole detections across connected peers.
+    pub black_holes_detected: u64,
+}
+
+/// Structured assessment of the local transport environment (ADR-0011 §4).
+///
+/// Turns the silent "x0x just can't connect behind my VPN" failure into a
+/// self-service signal: detects full-tunnel-VPN / constrained-MTU / CGNAT paths
+/// and emits actionable guidance. Serialized into `/diagnostics/connectivity`
+/// as `transport_environment` and printed by `x0xd --doctor`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TransportEnvironment {
+    /// True if any degradation signal fired (the node's P2P may be impaired).
+    pub degraded: bool,
+    /// A full-tunnel VPN (Cloudflare WARP) appears to be in the path.
+    pub vpn_suspected: bool,
+    /// The node sits behind carrier-grade NAT (RFC 6598).
+    pub cgnat_suspected: bool,
+    /// The path MTU is small enough to threaten QUIC's 1200-byte Initial.
+    pub constrained_mtu: bool,
+    /// MTU is at/below the critical threshold (near the QUIC floor).
+    pub mtu_critical: bool,
+    /// Smallest MTU observed across peers, if any peer reported one.
+    pub min_observed_mtu: Option<u16>,
+    /// Total lost PLPMTUD probes (a blocked larger-packet path indicator).
+    pub lost_plpmtud_probes: u64,
+    /// Total black-hole detections.
+    pub black_holes_detected: u64,
+    /// The external address that matched a VPN egress range, if any.
+    pub vpn_egress_addr: Option<String>,
+    /// Human-readable reasons each signal fired (for logs / doctor output).
+    pub reasons: Vec<String>,
+    /// Actionable guidance for the operator, present only when `degraded`.
+    pub guidance: Option<String>,
+}
+
+/// Assess the local transport environment from observed transport facts.
+///
+/// Pure function: same inputs always yield the same assessment. The heuristics
+/// (ADR-0011 §4) are intentionally conservative — they flag *suspected*
+/// degradation and explain why, rather than asserting a diagnosis.
+#[must_use]
+pub fn assess_transport_environment(obs: &TransportObservation) -> TransportEnvironment {
+    let mut reasons = Vec::new();
+
+    // 1. VPN egress: an external address inside a known WARP/Cloudflare range.
+    let vpn_egress_addr = obs
+        .external_addrs
+        .iter()
+        .find(|a| is_vpn_egress(a.ip()))
+        .map(|a| a.to_string());
+    let vpn_suspected = vpn_egress_addr.is_some();
+    if let Some(addr) = &vpn_egress_addr {
+        reasons.push(format!(
+            "external address {addr} is in a Cloudflare WARP / full-tunnel-VPN egress range"
+        ));
+    }
+
+    // 2. CGNAT: external address in RFC 6598 space.
+    let cgnat_suspected = obs.external_addrs.iter().any(|a| is_cgnat(a.ip()));
+    if cgnat_suspected {
+        reasons.push(
+            "external address is in the RFC 6598 carrier-grade NAT range (100.64.0.0/10); \
+             direct inbound is not possible — connections must relay"
+                .to_string(),
+        );
+    }
+
+    // 3. Constrained MTU: a small discovered MTU, or lost PLPMTUD probes /
+    //    detected black holes that indicate larger packets are being dropped.
+    let mtu_critical = obs
+        .min_observed_mtu
+        .is_some_and(|m| m <= MTU_CRITICAL_THRESHOLD);
+    let constrained_mtu = obs
+        .min_observed_mtu
+        .is_some_and(|m| m < MTU_CONSTRAINED_THRESHOLD)
+        || obs.lost_plpmtud_probes > 0
+        || obs.black_holes_detected > 0;
+    if let Some(mtu) = obs.min_observed_mtu {
+        if mtu < MTU_CONSTRAINED_THRESHOLD {
+            reasons.push(format!(
+                "path MTU {mtu} is constrained (< {MTU_CONSTRAINED_THRESHOLD}); QUIC needs {QUIC_MIN_MTU}"
+            ));
+        }
+    }
+    if obs.lost_plpmtud_probes > 0 {
+        reasons.push(format!(
+            "{} PLPMTUD probe(s) lost — a larger-packet path is being blocked",
+            obs.lost_plpmtud_probes
+        ));
+    }
+    if obs.black_holes_detected > 0 {
+        reasons.push(format!(
+            "{} path black-hole(s) detected",
+            obs.black_holes_detected
+        ));
+    }
+
+    // 4. No direct reachability with no working connections — a generic
+    //    "handshakes aren't completing" signal, most actionable when paired
+    //    with a VPN/MTU signal above.
+    let no_inbound_no_peers = obs.can_receive_direct == Some(false) && obs.connected_peers == 0;
+    if no_inbound_no_peers {
+        reasons.push("node cannot receive direct inbound and has no connected peers".to_string());
+    }
+
+    let degraded = vpn_suspected || constrained_mtu || (cgnat_suspected && no_inbound_no_peers);
+
+    let guidance = if !degraded {
+        None
+    } else if vpn_suspected || constrained_mtu {
+        Some(
+            "Full-tunnel VPN (e.g. Cloudflare WARP) or constrained-MTU path detected; \
+             x0x P2P is degraded. Use split-tunnel mode and exclude x0x, or switch the VPN \
+             to DNS-only / 1.1.1.1 mode. x0x bootstrap nodes also listen on UDP/443, which \
+             traverses most port-throttling networks; MTU below 1200 cannot run QUIC on any \
+             port."
+                .to_string(),
+        )
+    } else {
+        Some(
+            "Carrier-grade NAT detected and no peers connected; direct inbound is impossible. \
+             x0x will relay through bootstrap/relay nodes — ensure UDP/443 and UDP/5483 \
+             outbound are not blocked."
+                .to_string(),
+        )
+    };
+
+    TransportEnvironment {
+        degraded,
+        vpn_suspected,
+        cgnat_suspected,
+        constrained_mtu,
+        mtu_critical,
+        min_observed_mtu: obs.min_observed_mtu,
+        lost_plpmtud_probes: obs.lost_plpmtud_probes,
+        black_holes_detected: obs.black_holes_detected,
+        vpn_egress_addr,
+        reasons,
+        guidance,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +562,96 @@ mod tests {
         assert!(info.addresses.is_empty());
         assert!(info.nat_type.is_none());
         assert!(info.can_receive_direct.is_none());
+    }
+
+    fn obs(external: &[&str]) -> TransportObservation {
+        TransportObservation {
+            external_addrs: external.iter().map(|s| s.parse().unwrap()).collect(),
+            can_receive_direct: Some(true),
+            connected_peers: 5,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn healthy_native_path_is_not_degraded() {
+        // WHY: a normal residential/public IP with peers connected must never be
+        // flagged — false positives would scare users into breaking working setups.
+        let env = assess_transport_environment(&obs(&["203.0.113.7:5483"]));
+        assert!(!env.degraded);
+        assert!(!env.vpn_suspected);
+        assert!(env.guidance.is_none());
+    }
+
+    #[test]
+    fn warp_egress_address_is_flagged_as_vpn() {
+        // WHY: a Cloudflare WARP egress IP (104.28.x) as our *own* external
+        // address is the canonical UDP-hostile path ADR-0011 targets; it must
+        // produce VPN guidance so the user can split-tunnel.
+        let env = assess_transport_environment(&obs(&["104.28.5.9:5483"]));
+        assert!(env.vpn_suspected);
+        assert!(env.degraded);
+        let guidance = env.guidance.expect("degraded path must carry guidance");
+        assert!(guidance.contains("split-tunnel"));
+        assert_eq!(env.vpn_egress_addr.as_deref(), Some("104.28.5.9:5483"));
+    }
+
+    #[test]
+    fn cloudflare_v6_egress_is_flagged() {
+        let env = assess_transport_environment(&obs(&["[2606:4700:abcd::1]:5483"]));
+        assert!(env.vpn_suspected);
+    }
+
+    #[test]
+    fn ordinary_cloudflare_adjacent_ip_outside_ranges_is_clean() {
+        // WHY: the heuristic must be tight. 104.32.x is just outside 104.16/12
+        // and must not trip the VPN flag, or every nearby ISP would be mislabelled.
+        let env = assess_transport_environment(&obs(&["104.32.0.1:5483"]));
+        assert!(!env.vpn_suspected);
+    }
+
+    #[test]
+    fn cgnat_with_no_peers_is_degraded_but_distinct_from_vpn() {
+        // WHY: CGNAT and VPN need different guidance — a split-tunnel tip is
+        // useless behind carrier NAT. They must not be conflated.
+        let mut o = obs(&["100.100.1.1:5483"]);
+        o.can_receive_direct = Some(false);
+        o.connected_peers = 0;
+        let env = assess_transport_environment(&o);
+        assert!(env.cgnat_suspected);
+        assert!(!env.vpn_suspected);
+        assert!(env.degraded);
+        assert!(env.guidance.unwrap().contains("Carrier-grade NAT"));
+    }
+
+    #[test]
+    fn cgnat_with_working_peers_is_not_degraded() {
+        // WHY: CGNAT alone, while peers are connected (relayed), is normal and
+        // working — don't alarm the user.
+        let env = assess_transport_environment(&obs(&["100.100.1.1:5483"]));
+        assert!(env.cgnat_suspected);
+        assert!(!env.degraded);
+    }
+
+    #[test]
+    fn sub_floor_mtu_is_critical_and_degraded() {
+        // WHY: an MTU near/below the 1200 QUIC floor is the hard-failure case;
+        // it must surface as critical so the user knows port 443 won't save them.
+        let mut o = obs(&["203.0.113.7:5483"]);
+        o.min_observed_mtu = Some(1232);
+        let env = assess_transport_environment(&o);
+        assert!(env.constrained_mtu);
+        assert!(env.mtu_critical);
+        assert!(env.degraded);
+    }
+
+    #[test]
+    fn lost_plpmtud_probes_alone_signal_constrained_mtu() {
+        let mut o = obs(&["203.0.113.7:5483"]);
+        o.lost_plpmtud_probes = 3;
+        let env = assess_transport_environment(&o);
+        assert!(env.constrained_mtu);
+        assert!(env.degraded);
+        assert!(!env.mtu_critical, "no MTU value reported, so not critical");
     }
 }

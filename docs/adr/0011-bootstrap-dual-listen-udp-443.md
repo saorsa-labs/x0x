@@ -34,11 +34,28 @@ unprivileged and inbound is relayed anyway.
 
 ## Decision
 
-1. **Bootstrap and relay nodes dual-listen on UDP/443 *and* UDP/5483.** They run
-   as root on the VPS fleet, so binding 443 is free. Implemented via ant-quic's
-   existing `NatTraversalConfig.additional_bind_addrs` (one node identity, an
-   additional bound socket on 443 alongside 5483 — analogous to the existing
-   dual-stack v4/v6 binding). No new node identity.
+1. **Each bootstrap / relay VPS is reachable on UDP/443 *and* UDP/5483.**
+   Achieved by running **two single-port `x0xd` listeners per host**: a
+   dedicated root-run instance bound to `0.0.0.0:443` *and* the original
+   instance on `:5483`. Each listener is a normal, unmodified node binding one
+   port (its existing dual-stack path already serves both IPv4 and IPv6 on that
+   port), so **no ant-quic change is required**.
+
+   > **Implementation note / supersedes the original draft.** This ADR first
+   > proposed one node dual-*listening* on both ports via ant-quic's
+   > `NatTraversalConfig.additional_bind_addrs`. Investigation (2026-05-30)
+   > found that field does **not** bind a second socket — it only *advertises*
+   > an additional NAT candidate; a quinn/ant-quic `Endpoint` binds exactly one
+   > UDP socket, and a single endpoint cannot reply from the specific local
+   > *port* a client dialed (its send path routes only by address family). True
+   > single-identity dual-listen would require a new multi-socket transport
+   > feature in ant-quic (a per-remote source-socket affinity map) — real work
+   > with same-day prod risk. The two-listener model delivers the same user
+   > outcome (a bootstrap reachable on 443) with zero transport changes, so it
+   > was chosen. Cost: a host presents **two** seed hints / identities instead
+   > of one dual-homed identity, and runs one extra `x0xd`. Identity is
+   > key-based, so two listeners are simply two entries in the seed list
+   > (see [[0001-bootstrap-peers-are-seed-hints-only]]).
 2. **Clients never bind a privileged port.** The client listener stays on the
    high port (5483 or ephemeral). `additional_bind_addrs` defaults to empty, so
    client behaviour is unchanged and never needs root.
@@ -63,13 +80,25 @@ unprivileged and inbound is relayed anyway.
   throttling/DPI and rides a better-tuned path but is not a universal fix. The
   only complete answer for sub-1200-MTU paths is a future TCP/HTTP fallback
   transport (out of scope here).
-- **Migration:** bootstrap nodes dual-listen (443 + 5483) so old (5483-only)
-  and new clients both connect; seed list keeps 5483 entries. Heterogeneous
-  meshes are fine — identity is key-based and actual ports propagate via
-  announcements; only the seed list has a fixed assumption, and it carries both.
+- **Migration:** each bootstrap host keeps its `:5483` listener *and* adds a
+  `:443` listener, so old (5483-only) and new clients both connect; the seed
+  list carries both `IP:443` and `IP:5483` per host. Heterogeneous meshes are
+  fine — identity is key-based and actual ports propagate via announcements;
+  only the seed list has a fixed assumption, and it carries both. Deploy order:
+  stand up `:443` listeners and open UDP/443 **before** shipping the client
+  release that advertises `:443`, so no client ever dials a dead port.
 - **Ops:** open UDP/443 on the bootstrap fleet; ensure nothing else holds
-  UDP/443 there (TCP/443 web is independent of UDP/443). Bootstrap-node config
-  sets `additional_bind_addrs = ["0.0.0.0:443"]`.
+  UDP/443 there (TCP/443 web is independent of UDP/443). Each host gains a
+  second service (e.g. `x0xd-443.service`) running as root with its own state
+  dir and `bind_address = "[::]:443"`; the existing `:5483` service is
+  unchanged. Deploy with `.deployment/deploy-443.sh` (generates the `:443`
+  config from the host's live `/etc/x0x/x0xd.toml` so it can't drift).
+- **Self-update caveat:** both services exec the same `/opt/x0x/x0xd`, but the
+  self-updater only restarts `x0xd.service`. After a binary upgrade the `:443`
+  instance keeps running the old image until it is restarted
+  (`systemctl restart x0xd-443`) or the host reboots. Re-running
+  `deploy-443.sh` restarts it. (A future improvement is to add `x0xd-443` to
+  the updater's restart set.)
 
 ## Supersedes / relates to
 

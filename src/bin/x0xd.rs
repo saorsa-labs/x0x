@@ -2836,6 +2836,36 @@ async fn run_doctor(config: &DaemonConfig) -> Result<()> {
                 }
             }
         }
+
+        // ADR-0011 §4: full-tunnel-VPN / constrained-MTU environment check.
+        if let Ok(resp) = client
+            .get(format!("{base}/diagnostics/connectivity"))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    match body.get("transport_environment") {
+                        Some(env)
+                            if env.get("degraded").and_then(|v| v.as_bool()) == Some(true) =>
+                        {
+                            let guidance = env
+                                .get("guidance")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("transport path is degraded");
+                            print_warn(&format!("transport environment degraded: {guidance}"));
+                            if let Some(reasons) = env.get("reasons").and_then(|v| v.as_array()) {
+                                for reason in reasons.iter().filter_map(|r| r.as_str()) {
+                                    println!("        • {reason}");
+                                }
+                            }
+                        }
+                        Some(_) => print_pass("transport environment: healthy"),
+                        None => {}
+                    }
+                }
+            }
+        }
     } else {
         // Check if port is free (daemon not running) or blocked (conflict)
         match tokio::net::TcpListener::bind(config.api_address).await {
@@ -13027,6 +13057,12 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
             let connection_pool = network.connection_pool_diagnostics();
             let now = Instant::now();
             let mut per_peer_transport = Vec::new();
+            // ADR-0011 §4: accumulate path-quality signals across peers so the
+            // transport-environment assessment can spot a constrained-MTU /
+            // black-holed path even when only some peers are affected.
+            let mut min_observed_mtu: Option<u16> = None;
+            let mut lost_plpmtud_probes_total: u64 = 0;
+            let mut black_holes_total: u64 = 0;
             for peer_id in network.connected_peers().await {
                 let health = network.connection_health(peer_id).await;
                 let transport_stats = network.connection_transport_stats(peer_id).await;
@@ -13055,7 +13091,13 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                     None => (false, None, None, None, None, None, None),
                 };
                 let row = match transport_stats {
-                    Some(ts) => serde_json::json!({
+                    Some(ts) => {
+                        if let Some(mtu) = ts.current_mtu {
+                            min_observed_mtu = Some(min_observed_mtu.map_or(mtu, |m| m.min(mtu)));
+                        }
+                        lost_plpmtud_probes_total += ts.lost_plpmtud_probes;
+                        black_holes_total += ts.black_holes_detected;
+                        serde_json::json!({
                         "peer_id": hex::encode(peer_id.0),
                         "transport": "quic",
                         "stats_available": true,
@@ -13084,7 +13126,8 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                         "last_received_ago_ms": ts.last_received_ago_ms.or(last_received_ago_ms),
                         "idle_for_ms": ts.idle_for_ms.or(idle_for_ms),
                         "close_reason": close_reason,
-                    }),
+                        })
+                    }
                     None => serde_json::json!({
                         "peer_id": hex::encode(peer_id.0),
                         "transport": "quic",
@@ -13118,6 +13161,17 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                 };
                 per_peer_transport.push(row);
             }
+            // ADR-0011 §4: full-tunnel-VPN / constrained-MTU / CGNAT assessment.
+            let transport_environment = x0x::connectivity::assess_transport_environment(
+                &x0x::connectivity::TransportObservation {
+                    external_addrs: ns.external_addrs.clone(),
+                    can_receive_direct: Some(ns.can_receive_direct),
+                    connected_peers: ns.connected_peers,
+                    min_observed_mtu,
+                    lost_plpmtud_probes: lost_plpmtud_probes_total,
+                    black_holes_detected: black_holes_total,
+                },
+            );
             let snapshot = serde_json::json!({
                 "ok": true,
                 "peer_id": hex::encode(ns.peer_id.0),
@@ -13174,6 +13228,8 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                     "bundle_send_total": gso.as_ref().map(|g| g.bundle_send_total),
                     "bundle_partial_send": gso.as_ref().map(|g| g.bundle_partial_send),
                 },
+                // ADR-0011 §4: structured full-tunnel-VPN / constrained-MTU signal.
+                "transport_environment": transport_environment,
             });
             (StatusCode::OK, Json(snapshot))
         }

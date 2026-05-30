@@ -14,13 +14,13 @@
 //! Agents automatically connect to these bootstrap nodes
 //! unless overridden with `AgentBuilder::with_network_config`.
 //!
-//! Default bootstrap nodes:
-//! - `142.93.199.50:5483` - NYC, US (DigitalOcean)
-//! - `147.182.234.192:5483` - SFO, US (DigitalOcean)
-//! - `65.21.157.229:5483` - Helsinki, FI (Hetzner)
-//! - `116.203.101.172:5483` - Nuremberg, DE (Hetzner)
-//! - `152.42.210.67:5483` - Singapore, SG (DigitalOcean)
-//! - `170.64.176.102:5483` - Sydney, AU (DigitalOcean)
+//! Default bootstrap nodes (each reachable on UDP/443 *and* UDP/5483 — ADR-0011):
+//! - `142.93.199.50` - NYC, US (DigitalOcean)
+//! - `147.182.234.192` - SFO, US (DigitalOcean)
+//! - `65.21.157.229` - Helsinki, FI (Hetzner)
+//! - `116.203.101.172` - Nuremberg, DE (Hetzner)
+//! - `152.42.210.67` - Singapore, SG (DigitalOcean)
+//! - `170.64.176.102` - Sydney, AU (DigitalOcean)
 
 use crate::error::{NetworkError, NetworkResult};
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
@@ -114,7 +114,8 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// roles. They form a globally distributed mesh providing bootstrap, NAT traversal,
 /// and rendezvous services.
 ///
-/// All nodes bind to `[::]:5483` (dual-stack: accepts both IPv4 and IPv6).
+/// Each node runs two listeners (ADR-0011): a root instance on `[::]:443` and
+/// the original on `[::]:5483` (both dual-stack: accept IPv4 and IPv6).
 /// IPv6 addresses are included for nodes that have global IPv6 connectivity.
 ///
 /// Locations:
@@ -135,7 +136,42 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// shipped in ant-quic; rewiring `Endpoint::connect` is intentionally out of
 /// scope for X0X-0038 (per the SOTA-Borrow plan: "Don't yet rip out direct
 /// mDNS / bootstrap-cache callers in p2p_endpoint.rs").
+///
+/// ## Dual port: UDP/443 and UDP/5483 (ADR-0011)
+///
+/// Each bootstrap VPS runs **two** `x0xd` listeners: a dedicated root-run
+/// instance bound to UDP/443 *and* the original instance on UDP/5483. The
+/// `:443` entries are listed first because that destination port traverses
+/// full-tunnel VPNs (Cloudflare WARP), corporate/hotel/CGNAT, and mobile
+/// carrier networks that carry mainstream HTTP/3 (UDP/443) cleanly but
+/// throttle or drop arbitrary high UDP ports like 5483. Dialing a low
+/// *destination* port is unprivileged (ephemeral high source port), so
+/// clients never need elevation. Both ports are dialed in parallel
+/// (`BootstrapConnector::connect_multiple`); the `:5483` entries are retained
+/// for backward compatibility with pre-ADR-0011 clients and unrestricted
+/// networks. Identity is key-based, so the two listeners on a host are simply
+/// distinct seed hints (see [[0001-bootstrap-peers-are-seed-hints-only]]).
+///
+/// MTU caveat: UDP/443 mitigates port throttling/DPI but does not raise a
+/// path's MTU. A path that cannot carry QUIC's 1200-byte Initial cannot run
+/// QUIC on any port.
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
+    // ── UDP/443 (preferred; traverses WARP / full-tunnel VPN / CGNAT / DPI) ──
+    // IPv4
+    "142.93.199.50:443",   // NYC
+    "147.182.234.192:443", // SFO
+    "65.21.157.229:443",   // Helsinki
+    "116.203.101.172:443", // Nuremberg
+    "152.42.210.67:443",   // Singapore
+    "170.64.176.102:443",  // Sydney
+    // IPv6
+    "[2604:a880:400:d1:0:3:7db3:f001]:443", // NYC
+    "[2604:a880:4:1d0:0:1:6ba1:f000]:443",  // SFO
+    "[2a01:4f9:c012:684b::1]:443",          // Helsinki
+    "[2a01:4f8:1c1a:31e6::1]:443",          // Nuremberg
+    "[2400:6180:0:d2:0:2:d30b:d000]:443",   // Singapore
+    "[2400:6180:10:200::ba69:b000]:443",    // Sydney
+    // ── UDP/5483 (original; backward-compatible with pre-ADR-0011 clients) ──
     // IPv4
     "142.93.199.50:5483",   // NYC
     "147.182.234.192:5483", // SFO
@@ -2845,11 +2881,13 @@ mod tests {
 
         assert!(config.bind_addr.is_none());
 
-        // Verify default bootstrap nodes are included
+        // Verify default bootstrap nodes are included. ADR-0011: each of the 6
+        // VPS is seeded on both UDP/443 and UDP/5483, in IPv4 and IPv6 →
+        // 6 nodes × 2 ports × 2 families = 24 entries when IPv6 is available.
         assert_eq!(
             config.bootstrap_nodes.len(),
-            12,
-            "Should have 12 default bootstrap nodes (6 IPv4 + 6 IPv6)"
+            24,
+            "Should have 24 default bootstrap nodes (6 nodes × {{443,5483}} × {{IPv4,IPv6}})"
         );
 
         // Verify specific bootstrap addresses
