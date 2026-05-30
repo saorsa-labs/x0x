@@ -9,7 +9,7 @@
 #
 # The 443 config is generated FROM the host's live /etc/x0x/x0xd.toml so it
 # can never drift from the running :5483 config: only bind_address, data_dir,
-# machine_key_path and health_address are overridden.
+# machine_key_path and api_address are overridden.
 #
 # Usage:
 #   ./deploy-443.sh <node|all>        # deploy
@@ -52,7 +52,7 @@ if [ -z "$TARGET" ]; then err "usage: $0 [--verify] <node|all>"; exit 2; fi
 REMOTE_DEPLOY=$(cat <<'EOF'
 set -eu
 DRY="${1:-0}"
-LIVE=/etc/x0x/x0xd.toml
+LIVE=/etc/x0x/config.toml
 GEN=/etc/x0x/x0xd-443.toml
 DATA_DIR=/var/lib/x0x-443
 do_run() { if [ "$DRY" = 1 ]; then echo "  DRY: $*"; else eval "$@"; fi; }
@@ -79,7 +79,10 @@ cp "$LIVE" "$TMP"
 override bind_address '"[::]:443"'
 override data_dir "\"$DATA_DIR/data\""
 override machine_key_path "\"$DATA_DIR/machine.key\""
-override health_address '"127.0.0.1:12643"'
+# Distinct REST API port: x0xd binds api_address with `?` (fatal on conflict),
+# and prod x0xd.service already holds 127.0.0.1:12600. The :443 listener needs
+# its own port or it cannot start alongside the :5483 instance.
+override api_address '"127.0.0.1:12643"'
 
 echo "--- generated $GEN (diff vs live) ---"
 diff -u "$LIVE" "$TMP" || true
