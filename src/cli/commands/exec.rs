@@ -151,6 +151,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_rejects_empty_argv_before_http() {
+        let mock_resp = serde_json::json!({"status": "unused"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = run(&client, &"aa".repeat(32), &[], None, None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("usage: x0x exec"));
+    }
+
+    #[tokio::test]
+    async fn run_posts_json_response() {
+        let mock_resp = serde_json::json!({"request_id": "req-1", "code": 0});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let argv = vec!["echo".to_string(), "ok".to_string()];
+        let result = run(&client, &"aa".repeat(32), &argv, Some(2), None).await;
+        assert!(result.is_ok(), "run should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn run_reads_stdin_file_and_posts_json_response() {
+        let mock_resp = serde_json::json!({"request_id": "req-2", "code": 0});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let stdin_path = dir.path().join("stdin.txt");
+        std::fs::write(&stdin_path, b"stdin bytes").unwrap();
+        let argv = vec!["cat".to_string()];
+        let result = run(&client, &"aa".repeat(32), &argv, None, Some(&stdin_path)).await;
+        assert!(
+            result.is_ok(),
+            "run with stdin file should succeed: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn run_errors_when_stdin_file_missing() {
+        let mock_resp = serde_json::json!({"status": "unused"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let missing = tempfile::tempdir().unwrap().path().join("missing.txt");
+        let argv = vec!["cat".to_string()];
+        let result = run(&client, &"aa".repeat(32), &argv, None, Some(&missing)).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to read stdin file"));
+    }
+
+    #[tokio::test]
+    async fn run_text_mode_reports_denial_signal_and_nonzero_exit() {
+        for (resp, expected) in [
+            (
+                serde_json::json!({"denial_reason": "exec_disabled"}),
+                "remote exec denied",
+            ),
+            (serde_json::json!({"signal": 15}), "terminated by signal 15"),
+            (serde_json::json!({"code": 7}), "exited with code 7"),
+        ] {
+            let (url, _shutdown) = start_mock_server(resp).await;
+            let client =
+                DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Text).unwrap();
+            let argv = vec!["echo".to_string(), "ok".to_string()];
+            let result = run(&client, &"aa".repeat(32), &argv, None, None).await;
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn run_text_mode_rejects_invalid_stdout_base64() {
+        let mock_resp = serde_json::json!({"stdout_b64": "%%%"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Text).unwrap();
+        let argv = vec!["echo".to_string(), "ok".to_string()];
+        let result = run(&client, &"aa".repeat(32), &argv, None, None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid stdout_b64"));
+    }
+
+    #[tokio::test]
+    async fn cancel_with_agent_id_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "cancelled"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = cancel(&client, "req-123", Some(&"aa".repeat(32))).await;
+        assert!(
+            result.is_ok(),
+            "cancel with agent should succeed: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
     async fn sessions_returns_mock_response() {
         let mock_resp = serde_json::json!({"status": "ok"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
