@@ -1351,7 +1351,35 @@ pub struct ExecServerSessionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use crate::exec::acl::{AllowEntry, AllowedCommand, AllowedToken};
+    use std::path::{Path, PathBuf};
+
+    fn test_acl(agent_id: AgentId, machine_id: MachineId) -> ExecAcl {
+        ExecAcl {
+            loaded_from: PathBuf::from("exec-acl.toml"),
+            loaded_at_unix_ms: 1,
+            caps: ExecCaps {
+                max_stdin_bytes: 4,
+                max_duration_secs: 5,
+                default_cwd: Some(PathBuf::from("/tmp")),
+                ..ExecCaps::default()
+            },
+            audit_log_path: PathBuf::from("audit.jsonl"),
+            audit_tasklist_id: None,
+            allow: vec![AllowEntry {
+                description: Some("test command".to_string()),
+                agent_id,
+                machine_id,
+                max_duration_secs: Some(3),
+                commands: vec![AllowedCommand {
+                    argv: vec![
+                        AllowedToken::Literal("echo".to_string()),
+                        AllowedToken::Literal("ok".to_string()),
+                    ],
+                }],
+            }],
+        }
+    }
 
     async fn test_service() -> Arc<ExecService> {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -1618,6 +1646,194 @@ mod tests {
     #[test]
     fn status_signal_none_returns_none() {
         assert_eq!(status_signal(None), None);
+    }
+
+    fn denied(result: Result<CheckedRequest, DenialReason>) -> DenialReason {
+        match result {
+            Ok(_) => panic!("request unexpectedly allowed"),
+            Err(reason) => reason,
+        }
+    }
+
+    #[tokio::test]
+    async fn check_request_accepts_matching_acl_entry() {
+        let service = test_service().await;
+        let agent = AgentId([31; 32]);
+        let machine = MachineId([32; 32]);
+        let acl = test_acl(agent, machine);
+        let argv = vec!["echo".to_string(), "ok".to_string()];
+
+        let checked = service
+            .check_request(
+                &acl,
+                agent,
+                machine,
+                &argv,
+                Some(&b"in".to_vec()),
+                2_500,
+                None,
+            )
+            .expect("request should be allowed");
+        assert_eq!(checked.max_duration, Duration::from_secs(3));
+        assert_eq!(checked.cwd, Some(PathBuf::from("/tmp")));
+        assert_eq!(checked.description.as_deref(), Some("test command"));
+    }
+
+    #[tokio::test]
+    async fn check_request_rejects_empty_argv_and_cwd() {
+        let service = test_service().await;
+        let agent = AgentId([33; 32]);
+        let machine = MachineId([34; 32]);
+        let acl = test_acl(agent, machine);
+        assert_eq!(
+            denied(service.check_request(&acl, agent, machine, &[], None, 1_000, None)),
+            DenialReason::ArgvNotAllowed
+        );
+        assert_eq!(
+            denied(service.check_request(
+                &acl,
+                agent,
+                machine,
+                &["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                Some(&"/tmp".to_string()),
+            )),
+            DenialReason::CwdNotAllowed
+        );
+    }
+
+    #[tokio::test]
+    async fn check_request_rejects_shell_meta_and_unknown_pair() {
+        let service = test_service().await;
+        let agent = AgentId([35; 32]);
+        let machine = MachineId([36; 32]);
+        let acl = test_acl(agent, machine);
+        assert_eq!(
+            denied(service.check_request(
+                &acl,
+                agent,
+                machine,
+                &["echo".to_string(), "ok;rm".to_string()],
+                None,
+                1_000,
+                None,
+            )),
+            DenialReason::ShellMetacharInArgv
+        );
+        assert_eq!(
+            denied(service.check_request(
+                &acl,
+                AgentId([99; 32]),
+                machine,
+                &["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                None,
+            )),
+            DenialReason::AgentMachineNotInAcl
+        );
+    }
+
+    #[tokio::test]
+    async fn check_request_rejects_unmatched_argv_stdin_and_timeout() {
+        let service = test_service().await;
+        let agent = AgentId([37; 32]);
+        let machine = MachineId([38; 32]);
+        let acl = test_acl(agent, machine);
+        assert_eq!(
+            denied(service.check_request(
+                &acl,
+                agent,
+                machine,
+                &["echo".to_string(), "nope".to_string()],
+                None,
+                1_000,
+                None,
+            )),
+            DenialReason::ArgvNotAllowed
+        );
+        assert_eq!(
+            denied(service.check_request(
+                &acl,
+                agent,
+                machine,
+                &["echo".to_string(), "ok".to_string()],
+                Some(&b"too long".to_vec()),
+                1_000,
+                None,
+            )),
+            DenialReason::StdinTooLarge
+        );
+        assert_eq!(
+            denied(service.check_request(
+                &acl,
+                agent,
+                machine,
+                &["echo".to_string(), "ok".to_string()],
+                None,
+                4_000,
+                None,
+            )),
+            DenialReason::TimeoutTooLarge
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_to_pending_client_delivers_frame_and_ignores_missing_client() {
+        let service = test_service().await;
+        let request_id = ExecRequestId([39; 16]);
+        let target = AgentId([40; 32]);
+        let (tx, mut rx) = mpsc::channel(1);
+        service.pending_clients.lock().await.insert(
+            request_id,
+            PendingClient {
+                target,
+                tx,
+                argv_summary: "echo frame".to_string(),
+                started_at: Instant::now(),
+            },
+        );
+
+        let frame = ExecFrame::Warning {
+            request_id,
+            kind: WarningKind::StdoutApproachingCap,
+            message: "near cap".to_string(),
+        };
+        service.forward_to_pending_client(request_id, frame).await;
+        assert!(matches!(rx.recv().await, Some(ExecFrame::Warning { .. })));
+        service
+            .forward_to_pending_client(ExecRequestId([41; 16]), ExecFrame::Cancel { request_id })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn handle_cancel_sends_explicit_cancel_for_matching_session_only() {
+        let service = test_service().await;
+        let request_id = ExecRequestId([42; 16]);
+        let agent = AgentId([43; 32]);
+        let machine = MachineId([44; 32]);
+        let (cancel_tx, mut cancel_rx) = watch::channel(CancelReason::DurationCap);
+        service.active_servers.lock().await.insert(
+            request_id,
+            ActiveServerSession {
+                agent_id: agent,
+                machine_id: machine,
+                cancel_tx,
+                lease_deadline: Arc::new(Mutex::new(Instant::now() + Duration::from_secs(10))),
+                last_activity: Arc::new(Mutex::new(Instant::now())),
+                argv_summary: "cancel".to_string(),
+                started_at: Instant::now(),
+            },
+        );
+
+        service
+            .handle_cancel(AgentId([99; 32]), machine, request_id)
+            .await;
+        assert_eq!(*cancel_rx.borrow(), CancelReason::DurationCap);
+        service.handle_cancel(agent, machine, request_id).await;
+        cancel_rx.changed().await.expect("cancel update");
+        assert_eq!(*cancel_rx.borrow(), CancelReason::ExplicitCancel);
     }
 
     #[tokio::test]
