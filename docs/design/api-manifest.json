@@ -137,7 +137,7 @@
     {
       "category": "network",
       "cli_name": "diagnostics connectivity",
-      "description": "Ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS)",
+      "description": "Connectivity snapshot (NodeStatus + transport_environment VPN/MTU assessment)",
       "method": "GET",
       "path": "/diagnostics/connectivity"
     },
