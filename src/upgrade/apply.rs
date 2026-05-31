@@ -683,4 +683,62 @@ mod tests {
             "error should mention NoPlatformAsset: {err}"
         );
     }
+
+    async fn serve_once(response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}/archive")
+    }
+
+    #[tokio::test]
+    async fn download_to_file_writes_successful_response_body() {
+        let dir = TempDir::new().unwrap();
+        let destination = dir.path().join("downloaded.bin");
+        let body = "download bytes";
+        let url = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        ))
+        .await;
+
+        download_to_file(&url, &destination).await.unwrap();
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn download_to_file_rejects_http_error_status() {
+        let dir = TempDir::new().unwrap();
+        let destination = dir.path().join("downloaded.bin");
+        let url =
+            serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found".to_string())
+                .await;
+
+        let result = download_to_file(&url, &destination).await;
+        assert!(matches!(result, Err(UpgradeError::DownloadError(_))));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn download_to_file_rejects_oversized_content_length() {
+        let dir = TempDir::new().unwrap();
+        let destination = dir.path().join("downloaded.bin");
+        let too_large = super::super::MAX_BINARY_SIZE_BYTES + 1;
+        let url = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {too_large}\r\n\r\n"
+        ))
+        .await;
+
+        let result = download_to_file(&url, &destination).await;
+        assert!(matches!(result, Err(UpgradeError::BinaryTooLarge { .. })));
+        assert!(!destination.exists());
+    }
 }

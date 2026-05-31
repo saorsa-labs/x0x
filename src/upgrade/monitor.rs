@@ -446,4 +446,123 @@ mod tests {
         assert!(release.body.is_none());
         assert!(release.assets.is_empty());
     }
+
+    async fn serve_manifest_assets(
+        manifest_status: &'static str,
+        manifest_body: &'static [u8],
+        sig_status: &'static str,
+        sig_body: &'static [u8],
+    ) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let n = socket.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (status, body) = if req.starts_with("GET /manifest ") {
+                    (manifest_status, manifest_body)
+                } else {
+                    (sig_status, sig_body)
+                };
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+        });
+        (
+            format!("http://{addr}/manifest"),
+            format!("http://{addr}/sig"),
+        )
+    }
+
+    fn release_with_manifest_urls(manifest_url: String, sig_url: String) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: "v99.99.99".to_string(),
+            body: None,
+            assets: vec![
+                GitHubAsset {
+                    name: "release-manifest.json".to_string(),
+                    browser_download_url: manifest_url,
+                },
+                GitHubAsset {
+                    name: "release-manifest.json.sig".to_string(),
+                    browser_download_url: sig_url,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_verified_manifest_rejects_missing_manifest_asset() {
+        let monitor = UpgradeMonitor::new("saorsa-labs/x0x", "x0xd", "0.19.42").unwrap();
+        let release = GitHubRelease {
+            tag_name: "v0.19.43".to_string(),
+            body: None,
+            assets: vec![GitHubAsset {
+                name: "release-manifest.json.sig".to_string(),
+                browser_download_url: "https://example.com/manifest.sig".to_string(),
+            }],
+        };
+
+        let err = monitor.fetch_verified_manifest(&release).await.unwrap_err();
+        assert!(format!("{err:?}").contains("release-manifest.json"));
+    }
+
+    #[tokio::test]
+    async fn fetch_verified_manifest_rejects_missing_signature_asset() {
+        let monitor = UpgradeMonitor::new("saorsa-labs/x0x", "x0xd", "0.19.42").unwrap();
+        let release = GitHubRelease {
+            tag_name: "v0.19.43".to_string(),
+            body: None,
+            assets: vec![GitHubAsset {
+                name: "release-manifest.json".to_string(),
+                browser_download_url: "https://example.com/manifest.json".to_string(),
+            }],
+        };
+
+        let err = monitor.fetch_verified_manifest(&release).await.unwrap_err();
+        assert!(format!("{err:?}").contains("release-manifest.json.sig"));
+    }
+
+    #[tokio::test]
+    async fn fetch_verified_manifest_rejects_manifest_http_error() {
+        let (manifest_url, sig_url) =
+            serve_manifest_assets("500 Internal Server Error", b"boom", "200 OK", b"sig").await;
+        let monitor = UpgradeMonitor::new("saorsa-labs/x0x", "x0xd", "0.19.42").unwrap();
+        let release = release_with_manifest_urls(manifest_url, sig_url);
+
+        let err = monitor.fetch_verified_manifest(&release).await.unwrap_err();
+        assert!(matches!(err, UpgradeError::ManifestFetchFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_verified_manifest_rejects_signature_http_error() {
+        let manifest = br#"{"schema_version":1,"version":"99.99.99","timestamp":0,"assets":[],"skill_url":"","skill_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let (manifest_url, sig_url) =
+            serve_manifest_assets("200 OK", manifest, "404 Not Found", b"missing").await;
+        let monitor = UpgradeMonitor::new("saorsa-labs/x0x", "x0xd", "0.19.42").unwrap();
+        let release = release_with_manifest_urls(manifest_url, sig_url);
+
+        let err = monitor.fetch_verified_manifest(&release).await.unwrap_err();
+        assert!(matches!(err, UpgradeError::ManifestFetchFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_verified_manifest_rejects_invalid_signature_bytes() {
+        let manifest = br#"{"schema_version":1,"version":"99.99.99","timestamp":0,"assets":[],"skill_url":"","skill_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let (manifest_url, sig_url) =
+            serve_manifest_assets("200 OK", manifest, "200 OK", b"not a valid signature").await;
+        let monitor = UpgradeMonitor::new("saorsa-labs/x0x", "x0xd", "0.19.42").unwrap();
+        let release = release_with_manifest_urls(manifest_url, sig_url);
+
+        let err = monitor.fetch_verified_manifest(&release).await.unwrap_err();
+        assert!(matches!(err, UpgradeError::ManifestSignatureInvalid));
+    }
 }
