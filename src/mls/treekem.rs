@@ -194,6 +194,18 @@ impl TreeKemMlsGroup {
         joiner: AgentId,
         joiner_key_package: &[u8],
     ) -> Result<AddMemberOutput> {
+        // Reject re-adding an agent this instance already tracks. saorsa-mls
+        // does NOT dedup — `tree.add_leaf` would assign a *second* leaf to the
+        // same agent, and the `agent_to_leaf` insert below would overwrite the
+        // first, orphaning it (a later remove would leave the first leaf live
+        // and able to decrypt). The authoritative dedup is the named-group
+        // roster in `src/groups`; this guard catches the common case locally.
+        if self.agent_to_leaf.contains_key(&joiner) {
+            return Err(MlsError::MlsOperation(format!(
+                "agent {:?} is already a member of this group",
+                joiner.as_bytes()
+            )));
+        }
         let kp: KeyPackage = decode(joiner_key_package, "joiner key package")?;
         let (commit, welcome) = self
             .inner
@@ -253,6 +265,15 @@ impl TreeKemMlsGroup {
 
     /// Produce a `Commit` removing `member` from the group. The caller delivers
     /// it to all remaining members.
+    ///
+    /// **Resolution caveat (Phase 1/2):** this instance can only resolve agents
+    /// it added itself, plus its own leaf — `process_commit` cannot learn the
+    /// `AgentId` of members *another* daemon added (the wire `Commit` carries
+    /// only `(leaf, KeyPackage)`, no `AgentId`, and the AgentId↔identity binding
+    /// is not wired until ADR-0012 Phase 2/4). Drive removal from the
+    /// authoritative named-group roster (`src/groups`), which knows every
+    /// member's `AgentId`, rather than relying on this instance's best-effort
+    /// map.
     ///
     /// # Errors
     /// Returns [`MlsError::MemberNotInGroup`] if the agent's leaf is unknown to
@@ -338,6 +359,14 @@ impl TreeKemMlsGroup {
     }
 
     /// Restore a group from a snapshot, re-supplying the member identity.
+    ///
+    /// Only restorable for a member whose `MemberIdentity` the caller still
+    /// holds — i.e. one created via [`Self::prepare_member`] /
+    /// [`Self::join_from_welcome`]. A group made with [`Self::create`] cannot be
+    /// restored yet, because `create` generates its identity internally and does
+    /// not expose it; persisting the owning identity across restarts requires an
+    /// upstream saorsa-mls change (`MemberIdentity` `#[serde(skip)]`s its secret
+    /// keys) and is tracked in ADR-0012 Phase 4.
     ///
     /// # Errors
     /// Returns [`MlsError`] if the snapshot is malformed or the identity does
@@ -444,6 +473,24 @@ mod tests {
             restored.is_err(),
             "restoring a snapshot with a mismatched identity must fail"
         );
+    }
+
+    #[test]
+    fn duplicate_add_is_rejected() {
+        // Adding the same agent twice must be refused — saorsa-mls would
+        // otherwise create a second orphaned leaf for the same agent.
+        let mut alice = TreeKemMlsGroup::create(b"g".to_vec(), agent(1)).expect("create");
+        let bob_id = agent(2);
+        let bob = TreeKemMlsGroup::prepare_member(bob_id).expect("prepare");
+        let kp = bob.key_package_bytes().to_vec();
+        alice.add_member(bob_id, &kp).expect("first add ok");
+
+        let bob2 = TreeKemMlsGroup::prepare_member(bob_id).expect("prepare again");
+        let err = alice
+            .add_member(bob_id, bob2.key_package_bytes())
+            .unwrap_err();
+        assert!(matches!(err, MlsError::MlsOperation(_)));
+        assert_eq!(alice.member_count(), 2, "duplicate add must not grow the tree");
     }
 
     #[test]
