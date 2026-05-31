@@ -134,6 +134,73 @@ mod tests {
         (format!("http://{}", addr), tx)
     }
 
+    async fn start_sse_server(body: &'static str) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let app = axum::Router::new().fallback(move |_req: axum::extract::Request| async move {
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://{}", addr), tx)
+    }
+
+    #[tokio::test]
+    async fn publish_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true, "topic": "test-topic"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = publish(&client, "test-topic", "hello").await;
+        assert!(result.is_ok(), "publish should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true, "subscription_id": "sub-1"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = unsubscribe(&client, "sub-1").await;
+        assert!(result.is_ok(), "unsubscribe should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn events_streams_json_sse_frame() {
+        let (url, _shutdown) =
+            start_sse_server("data: {\"topic\":\"test\",\"payload\":\"aGVsbG8=\"}\n\n").await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = events(&client).await;
+        assert!(result.is_ok(), "events should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn events_streams_text_sse_frame() {
+        let (url, _shutdown) = start_sse_server("data: plain event\n\n").await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Text).unwrap();
+        let result = events(&client).await;
+        assert!(result.is_ok(), "events should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn stream_sse_handles_split_frames_and_ignores_non_data_lines() {
+        let (url, _shutdown) =
+            start_sse_server("event: message\ndata: {\"ok\":true}\n\n: comment\n\n").await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Text).unwrap();
+        let result = stream_sse(&client, "/events").await;
+        assert!(result.is_ok(), "stream_sse should succeed: {:?}", result);
+    }
+
     #[tokio::test]
     async fn subscribe_returns_mock_response() {
         let mock_resp = serde_json::json!({"topics": ["test-topic"]});
