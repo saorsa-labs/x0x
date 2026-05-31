@@ -424,6 +424,34 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn backoff_wait_zero_delay_returns_none_without_consuming_ack() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tx.send(DmAckOutcome::Accepted).expect("send ack");
+
+        let outcome = wait_for_ack_or_backoff(&mut rx, Duration::ZERO)
+            .await
+            .expect("zero-delay wait should not fail");
+
+        assert_eq!(outcome, None);
+        assert_eq!(
+            rx.try_recv().expect("ack still pending"),
+            DmAckOutcome::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn backoff_wait_errors_when_ack_sender_dropped() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<DmAckOutcome>();
+        drop(tx);
+
+        let err = wait_for_ack_or_backoff(&mut rx, Duration::from_secs(1))
+            .await
+            .expect_err("closed waiter should be a publish failure");
+
+        assert!(matches!(err, DmError::PublishFailed(_)));
+    }
+
+    #[tokio::test]
     async fn backoff_wait_returns_late_ack_before_retry() {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -447,6 +475,22 @@ mod tests {
             .expect("backoff timeout is not an error");
 
         assert_eq!(outcome, None);
+    }
+
+    #[tokio::test]
+    async fn x0x_0041_zero_delay_returns_elapsed_even_with_hint() {
+        let (_ack_tx, mut rx) = tokio::sync::oneshot::channel::<DmAckOutcome>();
+        let (_replaced_tx, replaced_rx) = tokio::sync::broadcast::channel::<(MachineId, u64)>(1);
+        let mut hint = DmLifecycleHint {
+            recipient_machine_id: MachineId([0x44; 32]),
+            replaced_rx,
+        };
+
+        let outcome = wait_for_ack_or_backoff_or_replaced(&mut rx, Duration::ZERO, Some(&mut hint))
+            .await
+            .expect("zero-delay wait should not fail");
+
+        assert!(matches!(outcome, BackoffWait::Elapsed));
     }
 
     /// X0X-0041: a `Replaced` event for the target peer fires during the
@@ -517,6 +561,51 @@ mod tests {
         assert!(matches!(outcome, BackoffWait::Elapsed));
     }
 
+    #[tokio::test]
+    async fn x0x_0041_closed_replaced_channel_falls_back_to_ack_wait() {
+        let (ack_tx, mut rx) = tokio::sync::oneshot::channel();
+        let (replaced_tx, replaced_rx) = tokio::sync::broadcast::channel::<(MachineId, u64)>(1);
+        drop(replaced_tx);
+        let mut hint = DmLifecycleHint {
+            recipient_machine_id: MachineId([0x55; 32]),
+            replaced_rx,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = ack_tx.send(DmAckOutcome::Accepted);
+        });
+
+        let outcome =
+            wait_for_ack_or_backoff_or_replaced(&mut rx, Duration::from_secs(1), Some(&mut hint))
+                .await
+                .expect("closed replaced channel should fall back to ack wait");
+
+        assert!(matches!(outcome, BackoffWait::Ack(DmAckOutcome::Accepted)));
+    }
+
+    #[tokio::test]
+    async fn x0x_0041_lagged_replaced_channel_drains_target_event() {
+        let (_ack_tx, mut rx) = tokio::sync::oneshot::channel::<DmAckOutcome>();
+        let (replaced_tx, replaced_rx) = tokio::sync::broadcast::channel::<(MachineId, u64)>(1);
+        let target = MachineId([0x66; 32]);
+        let mut hint = DmLifecycleHint {
+            recipient_machine_id: target,
+            replaced_rx,
+        };
+        let _ = replaced_tx.send((MachineId([0x67; 32]), 1));
+        let _ = replaced_tx.send((target, 7));
+
+        let outcome =
+            wait_for_ack_or_backoff_or_replaced(&mut rx, Duration::from_secs(1), Some(&mut hint))
+                .await
+                .expect("lagged channel should drain target event");
+
+        match outcome {
+            BackoffWait::ReplacedShortCircuit { new_generation } => assert_eq!(new_generation, 7),
+            other => panic!("expected replacement short-circuit, got {other:?}"),
+        }
+    }
+
     /// X0X-0041: a late ACK during the backoff still wins over a same-peer
     /// supersede when the ACK fires first.
     #[tokio::test]
@@ -540,6 +629,30 @@ mod tests {
                 .expect("wait should not error");
 
         assert!(matches!(outcome, BackoffWait::Ack(DmAckOutcome::Accepted)));
+    }
+
+    #[test]
+    fn inflight_guard_drop_cancels_unresolved_waiter() {
+        let inflight = Arc::new(InFlightAcks::new());
+        let request_id = [0x88; 16];
+        let _rx = inflight.register(request_id);
+        assert_eq!(inflight.outstanding(), 1);
+        {
+            let _guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
+        }
+        assert_eq!(inflight.outstanding(), 0);
+    }
+
+    #[test]
+    fn inflight_guard_mark_resolved_preserves_waiter_on_drop() {
+        let inflight = Arc::new(InFlightAcks::new());
+        let request_id = [0x89; 16];
+        let _rx = inflight.register(request_id);
+        let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
+        guard.mark_resolved();
+        drop(guard);
+        assert_eq!(inflight.outstanding(), 1);
+        inflight.cancel(&request_id);
     }
 
     #[test]
