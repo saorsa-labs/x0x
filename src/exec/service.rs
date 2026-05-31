@@ -1964,6 +1964,92 @@ mod tests {
         assert_eq!(*cancel_rx.borrow(), CancelReason::ExplicitCancel);
     }
 
+    fn inbound_payload(verified: bool, trust_decision: Option<TrustDecision>) -> DmTypedPayload {
+        DmTypedPayload {
+            sender: AgentId([53; 32]),
+            machine_id: MachineId([54; 32]),
+            payload: Vec::new(),
+            verified,
+            trust_decision,
+            received_at_unix_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_request_denies_unverified_sender_before_policy() {
+        let service = test_service().await;
+        Arc::clone(&service)
+            .handle_request(
+                inbound_payload(false, Some(TrustDecision::Accept)),
+                ExecRequestId([55; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                None,
+            )
+            .await;
+
+        let snap = service.diagnostics_snapshot().await;
+        assert_eq!(snap.totals.requests_received, 1);
+        assert_eq!(snap.totals.requests_denied, 1);
+        assert_eq!(
+            snap.totals
+                .denial_breakdown
+                .get(DenialReason::UnverifiedSender.as_str()),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_denies_non_accept_trust_decision() {
+        let service = test_service().await;
+        Arc::clone(&service)
+            .handle_request(
+                inbound_payload(true, Some(TrustDecision::AcceptWithFlag)),
+                ExecRequestId([56; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                None,
+            )
+            .await;
+
+        let snap = service.diagnostics_snapshot().await;
+        assert_eq!(snap.totals.requests_received, 1);
+        assert_eq!(snap.totals.requests_denied, 1);
+        assert_eq!(
+            snap.totals
+                .denial_breakdown
+                .get(DenialReason::TrustRejected.as_str()),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_denies_when_exec_policy_disabled() {
+        let service = test_service().await;
+        Arc::clone(&service)
+            .handle_request(
+                inbound_payload(true, Some(TrustDecision::Accept)),
+                ExecRequestId([57; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                None,
+            )
+            .await;
+
+        let snap = service.diagnostics_snapshot().await;
+        assert_eq!(snap.totals.requests_received, 1);
+        assert_eq!(snap.totals.requests_denied, 1);
+        assert_eq!(
+            snap.totals
+                .denial_breakdown
+                .get(DenialReason::ExecDisabled.as_str()),
+            Some(&1)
+        );
+    }
+
     #[tokio::test]
     async fn try_acquire_slot_returns_some_when_available() {
         let service = test_service().await;
