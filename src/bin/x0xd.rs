@@ -17032,6 +17032,152 @@ mod tests {
     }
 
     #[test]
+    fn member_joined_canonical_binds_treekem_keypackage() {
+        let base = canonical_member_joined_bytes(
+            "group",
+            Some("stable"),
+            &"22".repeat(32),
+            "pubkey",
+            x0x::groups::GroupRole::Member,
+            Some("Alice"),
+            &"11".repeat(32),
+            "invite-secret",
+            42,
+            Some("key-package-a"),
+        );
+        let changed = canonical_member_joined_bytes(
+            "group",
+            Some("stable"),
+            &"22".repeat(32),
+            "pubkey",
+            x0x::groups::GroupRole::Member,
+            Some("Alice"),
+            &"11".repeat(32),
+            "invite-secret",
+            42,
+            Some("key-package-b"),
+        );
+        let legacy = canonical_member_joined_bytes(
+            "group",
+            Some("stable"),
+            &"22".repeat(32),
+            "pubkey",
+            x0x::groups::GroupRole::Member,
+            Some("Alice"),
+            &"11".repeat(32),
+            "invite-secret",
+            42,
+            None,
+        );
+
+        assert_ne!(base, changed);
+        assert_ne!(base, legacy);
+    }
+
+    #[test]
+    fn phase3_metadata_events_accept_legacy_json_defaults() {
+        let joined: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "member_joined",
+            "group_id": "aa",
+            "member_agent_id": "22",
+            "member_public_key_b64": "cHVi",
+            "role": "member",
+            "inviter_agent_id": "11",
+            "invite_secret": "secret",
+            "ts_ms": 1,
+            "signature_b64": "c2ln"
+        }))
+        .expect("legacy member_joined should deserialize");
+        match joined {
+            NamedGroupMetadataEvent::MemberJoined {
+                treekem_key_package_b64,
+                ..
+            } => assert_eq!(treekem_key_package_b64, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let added: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "member_added",
+            "group_id": "aa",
+            "revision": 1,
+            "actor": "11",
+            "agent_id": "22",
+            "display_name": null
+        }))
+        .expect("legacy member_added should deserialize");
+        match added {
+            NamedGroupMetadataEvent::MemberAdded {
+                treekem_commit_b64,
+                treekem_welcome_b64,
+                treekem_epoch,
+                ..
+            } => {
+                assert_eq!(treekem_commit_b64, None);
+                assert_eq!(treekem_welcome_b64, None);
+                assert_eq!(treekem_epoch, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let banned: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "member_banned",
+            "group_id": "aa",
+            "revision": 1,
+            "actor": "11",
+            "agent_id": "22"
+        }))
+        .expect("legacy member_banned should deserialize");
+        match banned {
+            NamedGroupMetadataEvent::MemberBanned {
+                treekem_commit_b64,
+                treekem_epoch,
+                ..
+            } => {
+                assert_eq!(treekem_commit_b64, None);
+                assert_eq!(treekem_epoch, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase3_metadata_classifier_allows_completed_membership_events() {
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            group_id: "aa".to_string(),
+            revision: 1,
+            actor: "11".to_string(),
+            agent_id: "22".to_string(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: Some("dw==".to_string()),
+            treekem_epoch: Some(1),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&member_added));
+
+        let member_banned = NamedGroupMetadataEvent::MemberBanned {
+            group_id: "aa".to_string(),
+            revision: 1,
+            actor: "11".to_string(),
+            agent_id: "22".to_string(),
+            secret_epoch: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_epoch: Some(1),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&member_banned));
+
+        let member_unbanned = NamedGroupMetadataEvent::MemberUnbanned {
+            group_id: "aa".to_string(),
+            revision: 1,
+            actor: "11".to_string(),
+            agent_id: "22".to_string(),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&member_unbanned));
+    }
+
+    #[test]
     fn treekem_membership_guard_returns_501_without_mutating() {
         let creator = AgentId([7; 32]);
         let mut info = x0x::groups::GroupInfo::with_policy(
