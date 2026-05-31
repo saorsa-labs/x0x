@@ -26,6 +26,7 @@ fn active(hex_id: &str, role: GroupRole) -> GroupMember {
         added_by: None,
         removed_by: None,
         kem_public_key_b64: None,
+        treekem_key_package_b64: None,
     }
 }
 

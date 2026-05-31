@@ -97,6 +97,16 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8], what: &str) -> Result<T> {
     postcard::from_bytes(bytes).map_err(|e| MlsError::MlsOperation(format!("decode {what}: {e}")))
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedTreeKemSnapshot {
+    version: u8,
+    inner_snapshot: Vec<u8>,
+    agent_to_leaf: Vec<([u8; 32], u32)>,
+}
+
+const PERSISTED_SNAPSHOT_VERSION: u8 = 1;
+const PERSISTED_SNAPSHOT_MAGIC: &[u8; 4] = b"XTK1";
+
 /// A member's freshly-minted identity plus the public key package to hand to an
 /// inviter. The holder keeps the (private) identity until a `Welcome` arrives,
 /// then consumes it via [`TreeKemMlsGroup::join_from_welcome`].
@@ -300,15 +310,17 @@ impl TreeKemMlsGroup {
     /// Returns [`MlsError`] if the commit is malformed or fails verification.
     pub fn process_commit(&mut self, commit: &[u8]) -> Result<()> {
         let commit: TreeKemCommit = decode(commit, "commit")?;
-        // Forget any leaves this commit removes (best-effort map maintenance).
+        let mut next_agent_to_leaf = self.agent_to_leaf.clone();
         if !commit.removed_leaves.is_empty() {
             let removed: std::collections::HashSet<u32> =
                 commit.removed_leaves.iter().copied().collect();
-            self.agent_to_leaf.retain(|_, leaf| !removed.contains(leaf));
+            next_agent_to_leaf.retain(|_, leaf| !removed.contains(leaf));
         }
         self.inner
             .process_commit(&commit)
-            .map_err(|e| MlsError::SaorsaMls(format!("treekem process_commit: {e}")))
+            .map_err(|e| MlsError::SaorsaMls(format!("treekem process_commit: {e}")))?;
+        self.agent_to_leaf = next_agent_to_leaf;
+        Ok(())
     }
 
     /// Produce a `Commit` removing `member` from the group. The caller delivers
@@ -330,6 +342,33 @@ impl TreeKemMlsGroup {
         let leaf = self.agent_to_leaf.get(&member).copied().ok_or_else(|| {
             MlsError::MemberNotInGroup(format!("unknown leaf for {:?}", member.as_bytes()))
         })?;
+        self.remove_leaf_for_member(member, leaf)
+    }
+
+    /// Produce a `Commit` removing `member`, but only after verifying that the
+    /// resolved leaf's public TreeKEM keys still match the authoritative roster
+    /// key package for that agent.
+    ///
+    /// This closes the stale-map wrong-leaf hazard: the best-effort
+    /// `agent_to_leaf` map can identify a candidate leaf, but the public keys in
+    /// the ratchet tree must match the roster's KeyPackage before removal is
+    /// allowed.
+    pub fn remove_member_verified(
+        &mut self,
+        member: AgentId,
+        expected_key_package: &[u8],
+    ) -> Result<Vec<u8>> {
+        let kp: KeyPackage = decode(expected_key_package, "expected member key package")?;
+        let leaf = self.inner.find_leaf_by_key_package(&kp).ok_or_else(|| {
+            MlsError::MemberNotInGroup(format!(
+                "no active TreeKEM leaf matching roster KeyPackage for {:?}",
+                member.as_bytes()
+            ))
+        })?;
+        self.remove_leaf_for_member(member, leaf)
+    }
+
+    fn remove_leaf_for_member(&mut self, member: AgentId, leaf: u32) -> Result<Vec<u8>> {
         let commit = self
             .inner
             .remove_member(leaf)
@@ -401,9 +440,25 @@ impl TreeKemMlsGroup {
     /// # Errors
     /// Returns [`MlsError`] on snapshot/encode failure.
     pub fn to_snapshot_bytes(&self) -> Result<Vec<u8>> {
-        self.inner
+        let inner_snapshot = self
+            .inner
             .to_snapshot_bytes()
-            .map_err(|e| MlsError::MlsOperation(format!("treekem snapshot: {e}")))
+            .map_err(|e| MlsError::MlsOperation(format!("treekem snapshot: {e}")))?;
+        let agent_to_leaf = self
+            .agent_to_leaf
+            .iter()
+            .map(|(agent, leaf)| (*agent.as_bytes(), *leaf))
+            .collect();
+        let mut bytes = PERSISTED_SNAPSHOT_MAGIC.to_vec();
+        bytes.extend(encode(
+            &PersistedTreeKemSnapshot {
+                version: PERSISTED_SNAPSHOT_VERSION,
+                inner_snapshot,
+                agent_to_leaf,
+            },
+            "persisted treekem snapshot",
+        )?);
+        Ok(bytes)
     }
 
     /// Restore a group from a snapshot for `member`, re-deriving the identity
@@ -424,9 +479,34 @@ impl TreeKemMlsGroup {
     /// identity does not own a leaf in the snapshot (wrong `seed`).
     pub fn restore(snapshot: &[u8], member: AgentId, seed: &[u8; 32]) -> Result<Self> {
         let identity = Self::identity_from_seed(seed)?;
-        let inner = TreeKemGroup::from_snapshot_bytes(snapshot, identity)
+        let (inner_snapshot, persisted_map) = if let Some(wrapped) =
+            snapshot.strip_prefix(PERSISTED_SNAPSHOT_MAGIC)
+        {
+            let persisted: PersistedTreeKemSnapshot =
+                decode(wrapped, "persisted treekem snapshot")?;
+            if persisted.version != PERSISTED_SNAPSHOT_VERSION {
+                return Err(MlsError::MlsOperation(format!(
+                    "unsupported treekem snapshot version {}",
+                    persisted.version
+                )));
+            }
+            (persisted.inner_snapshot, Some(persisted.agent_to_leaf))
+        } else {
+            match decode::<PersistedTreeKemSnapshot>(snapshot, "legacy persisted treekem snapshot")
+            {
+                Ok(persisted) if persisted.version == PERSISTED_SNAPSHOT_VERSION => {
+                    (persisted.inner_snapshot, Some(persisted.agent_to_leaf))
+                }
+                _ => (snapshot.to_vec(), None),
+            }
+        };
+        let inner = TreeKemGroup::from_snapshot_bytes(&inner_snapshot, identity)
             .map_err(|e| MlsError::MlsOperation(format!("treekem restore: {e}")))?;
-        let mut agent_to_leaf = HashMap::new();
+        let mut agent_to_leaf: HashMap<AgentId, u32> = persisted_map
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(agent, leaf)| (AgentId(agent), leaf))
+            .collect();
         if let Some(leaf) = inner.own_leaf() {
             agent_to_leaf.insert(member, leaf);
         }
@@ -514,6 +594,16 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_bytes_have_magic_header_and_restore() {
+        let alice_id = agent(1);
+        let g = TreeKemMlsGroup::create(b"magic".to_vec(), alice_id, &seed(1)).expect("create");
+        let snap = g.to_snapshot_bytes().expect("snapshot");
+        assert!(snap.starts_with(PERSISTED_SNAPSHOT_MAGIC));
+        let restored = TreeKemMlsGroup::restore(&snap, alice_id, &seed(1)).expect("restore");
+        assert_eq!(restored.epoch(), g.epoch());
+    }
+
+    #[test]
     fn restart_persistence_creator_restores_and_decrypts() {
         // Alice creates a group and adds Bob, then "restarts": her live group is
         // dropped and rebuilt from (snapshot bytes + re-derived identity). The
@@ -543,6 +633,26 @@ mod tests {
         let ct = bob.encrypt_message(b"after restart").expect("encrypt");
         let pt = alice2.decrypt_message(&ct).expect("restored alice decrypt");
         assert_eq!(pt, b"after restart");
+    }
+
+    #[test]
+    fn owner_restore_preserves_leaf_map_for_remove() {
+        let alice_id = agent(1);
+        let bob_id = agent(2);
+        let mut alice =
+            TreeKemMlsGroup::create(b"persist-map".to_vec(), alice_id, &seed(1)).expect("create");
+        let bob_prepared = TreeKemMlsGroup::prepare_member(bob_id, &seed(2)).expect("prepare");
+        alice
+            .add_member(bob_id, bob_prepared.key_package_bytes())
+            .expect("add bob");
+        let snap = alice.to_snapshot_bytes().expect("snapshot");
+
+        let mut restored = TreeKemMlsGroup::restore(&snap, alice_id, &seed(1)).expect("restore");
+        let remove_commit = restored
+            .remove_member(bob_id)
+            .expect("remove after restore");
+        assert!(!remove_commit.is_empty());
+        assert_eq!(restored.member_count(), 1);
     }
 
     #[test]
@@ -660,6 +770,35 @@ mod tests {
             alice.member_count(),
             2,
             "duplicate add must not grow the tree"
+        );
+    }
+
+    #[test]
+    fn verified_remove_uses_roster_keypackage_not_stale_leaf_map() {
+        let alice_id = agent(1);
+        let bob_id = agent(2);
+        let carol_id = agent(3);
+        let mut alice = TreeKemMlsGroup::create(b"verified-remove".to_vec(), alice_id, &seed(1))
+            .expect("create");
+        let bob = TreeKemMlsGroup::prepare_member(bob_id, &seed(2)).expect("bob prepare");
+        let bob_kp = bob.key_package_bytes().to_vec();
+        alice.add_member(bob_id, &bob_kp).expect("add bob");
+        let carol = TreeKemMlsGroup::prepare_member(carol_id, &seed(3)).expect("carol prepare");
+        let carol_kp = carol.key_package_bytes().to_vec();
+        alice.add_member(carol_id, &carol_kp).expect("add carol");
+        let bob_leaf = alice.agent_to_leaf[&bob_id];
+        let carol_leaf = alice.agent_to_leaf[&carol_id];
+        alice.agent_to_leaf.insert(bob_id, carol_leaf);
+        alice.agent_to_leaf.insert(carol_id, bob_leaf);
+
+        let remove_commit = alice
+            .remove_member_verified(bob_id, &bob_kp)
+            .expect("roster KeyPackage must resolve Bob's real leaf despite stale map");
+        assert!(!remove_commit.is_empty());
+        assert_eq!(alice.member_count(), 2);
+        assert!(
+            alice.remove_member_verified(carol_id, &carol_kp).is_ok(),
+            "Carol must still be removable after Bob, proving the stale map did not remove her"
         );
     }
 

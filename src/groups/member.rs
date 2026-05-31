@@ -114,6 +114,11 @@ pub struct GroupMember {
     /// Phase D.2).
     #[serde(default)]
     pub kem_public_key_b64: Option<String>,
+    /// Base64 TreeKEM KeyPackage used to bind this roster entry to its ratchet
+    /// tree leaf. Required for verified TreeKEM removals; absent for legacy GSS
+    /// members and old pre-Phase-3 rosters.
+    #[serde(default)]
+    pub treekem_key_package_b64: Option<String>,
 }
 
 impl GroupMember {
@@ -131,6 +136,7 @@ impl GroupMember {
             added_by: None,
             removed_by: None,
             kem_public_key_b64: None,
+            treekem_key_package_b64: None,
         }
     }
 
@@ -153,6 +159,7 @@ impl GroupMember {
             added_by,
             removed_by: None,
             kem_public_key_b64: None,
+            treekem_key_package_b64: None,
         }
     }
 

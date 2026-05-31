@@ -723,6 +723,7 @@ impl GroupInfo {
                 added_by,
                 removed_by: None,
                 kem_public_key_b64,
+                treekem_key_package_b64: None,
             });
     }
 
@@ -732,6 +733,20 @@ impl GroupInfo {
     pub fn set_member_kem_public_key(&mut self, agent_id_hex: &str, kem_public_key_b64: String) {
         if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
             m.kem_public_key_b64 = Some(kem_public_key_b64);
+            m.updated_at = now_millis();
+        }
+    }
+
+    /// Record the TreeKEM KeyPackage that binds a roster member to a ratchet
+    /// tree leaf. Receivers use this before removal to avoid trusting a stale
+    /// best-effort `AgentId -> leaf` map.
+    pub fn set_member_treekem_key_package(
+        &mut self,
+        agent_id_hex: &str,
+        treekem_key_package_b64: String,
+    ) {
+        if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
+            m.treekem_key_package_b64 = Some(treekem_key_package_b64);
             m.updated_at = now_millis();
         }
     }
@@ -766,6 +781,7 @@ impl GroupInfo {
                 added_by: None,
                 removed_by: banned_by,
                 kem_public_key_b64: None,
+                treekem_key_package_b64: None,
             });
     }
 

@@ -7100,6 +7100,7 @@ async fn apply_named_group_metadata_event(
                         requester_user_id: None,
                         requested_role: x0x::groups::GroupRole::Member,
                         message: message.clone(),
+                        treekem_key_package_b64: None,
                         created_at: ts,
                         reviewed_at: None,
                         reviewed_by: None,
@@ -7123,6 +7124,7 @@ async fn apply_named_group_metadata_event(
                                 added_by: None,
                                 removed_by: None,
                                 kem_public_key_b64: Some(kem_b64),
+                                treekem_key_package_b64: None,
                             });
                     }
                 },
@@ -10819,7 +10821,6 @@ fn treekem_metadata_event_requires_phase3(event: &NamedGroupMetadataEvent) -> bo
             | NamedGroupMetadataEvent::MemberRemoved { .. }
             | NamedGroupMetadataEvent::MemberBanned { .. }
             | NamedGroupMetadataEvent::MemberUnbanned { .. }
-            | NamedGroupMetadataEvent::GroupDeleted { .. }
             | NamedGroupMetadataEvent::JoinRequestCreated { .. }
             | NamedGroupMetadataEvent::JoinRequestApproved { .. }
             | NamedGroupMetadataEvent::MemberJoined { .. }
@@ -15746,7 +15747,7 @@ mod tests {
     }
 
     #[test]
-    fn treekem_metadata_event_phase3_classifier_catches_roster_mutations() {
+    fn treekem_metadata_event_phase3_classifier_allows_owner_delete() {
         let event = NamedGroupMetadataEvent::MemberRemoved {
             group_id: "aa".repeat(16),
             revision: 1,
@@ -15762,7 +15763,7 @@ mod tests {
             actor: "11".repeat(32),
             commit: None,
         };
-        assert!(treekem_metadata_event_requires_phase3(&event));
+        assert!(!treekem_metadata_event_requires_phase3(&event));
 
         let event = NamedGroupMetadataEvent::MemberRoleUpdated {
             group_id: "aa".repeat(16),
