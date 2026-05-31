@@ -56,13 +56,11 @@ fn agent_id_to_member_id(agent_id: &AgentId) -> MemberId {
 }
 
 fn encode<T: Serialize>(value: &T, what: &str) -> Result<Vec<u8>> {
-    postcard::to_stdvec(value)
-        .map_err(|e| MlsError::MlsOperation(format!("encode {what}: {e}")))
+    postcard::to_stdvec(value).map_err(|e| MlsError::MlsOperation(format!("encode {what}: {e}")))
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8], what: &str) -> Result<T> {
-    postcard::from_bytes(bytes)
-        .map_err(|e| MlsError::MlsOperation(format!("decode {what}: {e}")))
+    postcard::from_bytes(bytes).map_err(|e| MlsError::MlsOperation(format!("decode {what}: {e}")))
 }
 
 /// A member's freshly-minted identity plus the public key package to hand to an
@@ -96,7 +94,10 @@ impl std::fmt::Debug for PreparedMember {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedMember")
             .field("agent", &self.agent)
-            .field("key_package_bytes", &format!("{} bytes", self.key_package_bytes.len()))
+            .field(
+                "key_package_bytes",
+                &format!("{} bytes", self.key_package_bytes.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -114,11 +115,11 @@ pub struct AddMemberOutput {
 }
 
 /// A real TreeKEM group as held by one member, keyed by x0x [`AgentId`].
+///
+/// Restore re-supplies the member identity separately (via a [`PreparedMember`]),
+/// so the live group does not retain it — see [`Self::from_snapshot_bytes`].
 pub struct TreeKemMlsGroup {
     inner: TreeKemGroup,
-    /// Retained so [`Self::to_snapshot_bytes`] / restore can re-supply the
-    /// long-term identity the inner group does not serialize.
-    identity: MemberIdentity,
     /// Best-effort `AgentId → leaf` map, populated from operations this instance
     /// performs (own leaf, members it adds). The named-group roster
     /// (`src/groups`) is the authoritative roster; this exists so the wrapper
@@ -150,7 +151,7 @@ impl TreeKemMlsGroup {
         let member_id = agent_id_to_member_id(&creator);
         let identity = MemberIdentity::generate_with_suite(member_id, Self::suite())
             .map_err(|e| MlsError::Identity(format!("creator identity: {e}")))?;
-        let inner = TreeKemGroup::create(group_id, identity.clone())
+        let inner = TreeKemGroup::create(group_id, identity)
             .map_err(|e| MlsError::SaorsaMls(format!("treekem create: {e}")))?;
 
         let mut agent_to_leaf = HashMap::new();
@@ -159,7 +160,6 @@ impl TreeKemMlsGroup {
         }
         Ok(Self {
             inner,
-            identity,
             agent_to_leaf,
         })
     }
@@ -174,7 +174,7 @@ impl TreeKemMlsGroup {
         let member_id = agent_id_to_member_id(&agent);
         let identity = MemberIdentity::generate_with_suite(member_id, Self::suite())
             .map_err(|e| MlsError::Identity(format!("member identity: {e}")))?;
-        let key_package_bytes = encode(identity.key_package(), "key package")?;
+        let key_package_bytes = encode(&identity.key_package, "key package")?;
         Ok(PreparedMember {
             agent,
             identity,
@@ -231,8 +231,7 @@ impl TreeKemMlsGroup {
     pub fn join_from_welcome(prepared: PreparedMember, welcome: &[u8]) -> Result<Self> {
         let welcome: TreeKemWelcome = decode(welcome, "welcome")?;
         let joiner = prepared.agent;
-        let identity = prepared.identity;
-        let inner = TreeKemGroup::from_welcome(&welcome, identity.clone())
+        let inner = TreeKemGroup::from_welcome(&welcome, prepared.identity)
             .map_err(|e| MlsError::Welcome(format!("treekem from_welcome: {e}")))?;
 
         let mut agent_to_leaf = HashMap::new();
@@ -241,7 +240,6 @@ impl TreeKemMlsGroup {
         }
         Ok(Self {
             inner,
-            identity,
             agent_to_leaf,
         })
     }
@@ -373,8 +371,7 @@ impl TreeKemMlsGroup {
     /// not match.
     pub fn from_snapshot_bytes(snapshot: &[u8], prepared: PreparedMember) -> Result<Self> {
         let joiner = prepared.agent;
-        let identity = prepared.identity;
-        let inner = TreeKemGroup::from_snapshot_bytes(snapshot, identity.clone())
+        let inner = TreeKemGroup::from_snapshot_bytes(snapshot, prepared.identity)
             .map_err(|e| MlsError::MlsOperation(format!("treekem restore: {e}")))?;
         let mut agent_to_leaf = HashMap::new();
         if let Some(leaf) = inner.own_leaf() {
@@ -382,7 +379,6 @@ impl TreeKemMlsGroup {
         }
         Ok(Self {
             inner,
-            identity,
             agent_to_leaf,
         })
     }
@@ -434,7 +430,9 @@ mod tests {
         assert_eq!(bob.member_count(), 2);
 
         // Alice → Bob: real cross-instance decryption (FS/PCS path).
-        let ct = alice.encrypt_message(b"welcome to the group").expect("encrypt");
+        let ct = alice
+            .encrypt_message(b"welcome to the group")
+            .expect("encrypt");
         let pt = bob.decrypt_message(&ct).expect("bob decrypt");
         assert_eq!(pt, b"welcome to the group");
 
@@ -490,7 +488,11 @@ mod tests {
             .add_member(bob_id, bob2.key_package_bytes())
             .unwrap_err();
         assert!(matches!(err, MlsError::MlsOperation(_)));
-        assert_eq!(alice.member_count(), 2, "duplicate add must not grow the tree");
+        assert_eq!(
+            alice.member_count(),
+            2,
+            "duplicate add must not grow the tree"
+        );
     }
 
     #[test]

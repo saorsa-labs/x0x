@@ -13,10 +13,12 @@ pub mod cipher;
 pub mod error;
 pub mod group;
 pub mod keys;
+pub mod treekem;
 pub mod welcome;
 
 pub use cipher::MlsCipher;
 pub use error::{MlsError, Result};
 pub use group::{CommitOperation, MlsCommit, MlsGroup, MlsGroupContext, MlsMemberInfo};
 pub use keys::MlsKeySchedule;
+pub use treekem::{TreeKemMlsGroup, TreeKemPlane};
 pub use welcome::MlsWelcome;

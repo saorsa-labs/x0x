@@ -38,6 +38,14 @@ pub enum MlsError {
     #[error("MLS operation failed: {0}")]
     MlsOperation(String),
 
+    /// Member identity generation or handling failed.
+    #[error("MLS identity error: {0}")]
+    Identity(String),
+
+    /// Welcome (join) message creation or processing failed.
+    #[error("MLS welcome error: {0}")]
+    Welcome(String),
+
     /// Error from the saorsa-mls backend.
     #[error("saorsa-mls: {0}")]
     SaorsaMls(String),
