@@ -5535,6 +5535,12 @@ enum NamedGroupMetadataEvent {
         /// Required for MlsEncrypted groups; optional for others.
         #[serde(default)]
         requester_kem_public_key_b64: Option<String>,
+        /// Base64 postcard-encoded TreeKEM KeyPackage for ADR-0012 Phase 3
+        /// joins. Present for TreeKEM groups so an approver can produce the
+        /// real Commit/Welcome pair; absent for legacy GSS groups and old
+        /// requests.
+        #[serde(default)]
+        treekem_key_package_b64: Option<String>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -5544,6 +5550,15 @@ enum NamedGroupMetadataEvent {
         revision: u64,
         actor: String,
         requester_agent_id: String,
+        /// Base64 postcard-encoded TreeKEM Commit for existing members.
+        #[serde(default)]
+        treekem_commit_b64: Option<String>,
+        /// Base64 postcard-encoded TreeKEM Welcome for the requester.
+        #[serde(default)]
+        treekem_welcome_b64: Option<String>,
+        /// TreeKEM epoch after applying `treekem_commit_b64`.
+        #[serde(default)]
+        treekem_epoch: Option<u64>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -7059,6 +7074,7 @@ async fn apply_named_group_metadata_event(
             message,
             ts,
             requester_kem_public_key_b64,
+            treekem_key_package_b64,
             commit,
             ..
         } => {
@@ -7100,7 +7116,7 @@ async fn apply_named_group_metadata_event(
                         requester_user_id: None,
                         requested_role: x0x::groups::GroupRole::Member,
                         message: message.clone(),
-                        treekem_key_package_b64: None,
+                        treekem_key_package_b64: treekem_key_package_b64.clone(),
                         created_at: ts,
                         reviewed_at: None,
                         reviewed_by: None,
@@ -7124,8 +7140,11 @@ async fn apply_named_group_metadata_event(
                                 added_by: None,
                                 removed_by: None,
                                 kem_public_key_b64: Some(kem_b64),
-                                treekem_key_package_b64: None,
+                                treekem_key_package_b64: treekem_key_package_b64.clone(),
                             });
+                    }
+                    if let Some(kp_b64) = treekem_key_package_b64.clone() {
+                        next.set_member_treekem_key_package(&requester_agent_id, kp_b64);
                     }
                 },
             ) else {
@@ -7141,6 +7160,9 @@ async fn apply_named_group_metadata_event(
             revision,
             actor,
             requester_agent_id,
+            treekem_commit_b64,
+            treekem_welcome_b64,
+            treekem_epoch,
             commit,
             ..
         } => {
@@ -7165,6 +7187,21 @@ async fn apply_named_group_metadata_event(
             if info.is_banned(&requester_agent_id) {
                 return false;
             }
+            let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                let Some(commit_b64) = treekem_commit_b64 else {
+                    return false;
+                };
+                let Some(welcome_b64) = treekem_welcome_b64 else {
+                    return false;
+                };
+                let Some(epoch) = treekem_epoch else {
+                    return false;
+                };
+                Some((commit_b64, welcome_b64, epoch))
+            } else {
+                None
+            };
+            let request_key_package_b64 = req_snapshot.treekem_key_package_b64.clone();
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
                 &current,
@@ -7184,12 +7221,100 @@ async fn apply_named_group_metadata_event(
                         Some(actor.clone()),
                         None,
                     );
+                    if let Some(kp_b64) = request_key_package_b64.clone() {
+                        next.set_member_treekem_key_package(&requester_agent_id, kp_b64);
+                    }
+                    if let Some((_, _, epoch)) = treekem_payload.as_ref() {
+                        next.secret_epoch = *epoch;
+                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                    }
                 },
             ) else {
                 return false;
             };
-            *info = next.clone();
             drop(groups);
+            if let Some((commit_b64, welcome_b64, _epoch)) = treekem_payload {
+                use base64::Engine as _;
+                let commit_bytes =
+                    match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return false,
+                    };
+                if requester_agent_id == local_agent_hex {
+                    let welcome_bytes =
+                        match base64::engine::general_purpose::STANDARD.decode(welcome_b64) {
+                            Ok(bytes) => bytes,
+                            Err(_) => return false,
+                        };
+                    let group_id_bytes = match hex::decode(&next.mls_group_id) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return false,
+                    };
+                    let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+                    let prepared = match x0x::mls::TreeKemMlsGroup::prepare_member(
+                        state.agent.agent_id(),
+                        &seed,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(e) => {
+                            tracing::warn!(group_id = %resolved_group_key, "failed to prepare local TreeKEM identity for welcome: {e}");
+                            return false;
+                        }
+                    };
+                    let tk = match x0x::mls::TreeKemMlsGroup::join_from_welcome(
+                        prepared,
+                        &welcome_bytes,
+                    ) {
+                        Ok(group) => group,
+                        Err(e) => {
+                            tracing::warn!(group_id = %resolved_group_key, "failed to join TreeKEM group from Welcome: {e}");
+                            return false;
+                        }
+                    };
+                    if let Err(e) =
+                        persist_treekem_snapshot(&state.treekem_dir, &resolved_group_key, &tk).await
+                    {
+                        tracing::error!(group_id = %resolved_group_key, "failed to persist joined TreeKEM snapshot: {e}");
+                        return false;
+                    }
+                    state.treekem_groups.write().await.insert(
+                        resolved_group_key.clone(),
+                        Arc::new(tokio::sync::Mutex::new(tk)),
+                    );
+                } else {
+                    let group = {
+                        let map = state.treekem_groups.read().await;
+                        map.get(&resolved_group_key).cloned()
+                    };
+                    let Some(group) = group else {
+                        return false;
+                    };
+                    {
+                        let mut guard = group.lock().await;
+                        if let Err(e) = guard.process_commit(&commit_bytes) {
+                            tracing::warn!(group_id = %resolved_group_key, "failed to process TreeKEM add commit: {e}");
+                            return false;
+                        }
+                        if let Err(e) = persist_treekem_snapshot(
+                            &state.treekem_dir,
+                            &resolved_group_key,
+                            &guard,
+                        )
+                        .await
+                        {
+                            tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after add commit: {e}");
+                            return false;
+                        }
+                    }
+                }
+            }
+            {
+                let mut groups = state.named_groups.write().await;
+                let Some(info) = groups.get_mut(&resolved_group_key) else {
+                    return false;
+                };
+                *info = next.clone();
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
@@ -9937,9 +10062,6 @@ async fn create_join_request(
                 ),
             );
         }
-        if let Some(resp) = treekem_membership_unsupported(info) {
-            return resp;
-        }
         if info.is_banned(&caller_hex) {
             return (
                 StatusCode::FORBIDDEN,
@@ -9963,12 +10085,44 @@ async fn create_join_request(
             );
         }
 
-        let request = x0x::groups::JoinRequest::new(
+        let mut request = x0x::groups::JoinRequest::new(
             info.mls_group_id.clone(),
             caller_hex.clone(),
             req_body.message.clone(),
             now_ms,
         );
+        if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+            use base64::Engine as _;
+            let group_id_bytes = match hex::decode(&info.mls_group_id) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            serde_json::json!({ "ok": false, "error": format!("invalid TreeKEM group id: {e}") }),
+                        ),
+                    );
+                }
+            };
+            let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+            let prepared = match x0x::mls::TreeKemMlsGroup::prepare_member(
+                state.agent.agent_id(),
+                &seed,
+            ) {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            serde_json::json!({ "ok": false, "error": format!("failed to prepare TreeKEM KeyPackage: {e}") }),
+                        ),
+                    );
+                }
+            };
+            request.treekem_key_package_b64 = Some(
+                base64::engine::general_purpose::STANDARD.encode(prepared.key_package_bytes()),
+            );
+        }
         info.join_requests
             .insert(request.request_id.clone(), request.clone());
         let commit = match info.seal_commit(signing_kp, now_ms) {
@@ -10004,6 +10158,7 @@ async fn create_join_request(
         message: request.message.clone(),
         ts: request.created_at,
         requester_kem_public_key_b64: Some(requester_kem_b64),
+        treekem_key_package_b64: request.treekem_key_package_b64.clone(),
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -10026,6 +10181,15 @@ async fn approve_join_request(
     Path((id, request_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    {
+        let groups = state.named_groups.read().await;
+        if let Some(info) = groups.get(&id) {
+            if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                drop(groups);
+                return approve_treekem_join_request(state, id, request_id, caller_hex).await;
+            }
+        }
+    }
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
@@ -10179,6 +10343,196 @@ async fn approve_join_request(
         revision,
         actor: caller_hex,
         requester_agent_id: requester_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        treekem_epoch: None,
+        commit: Some(commit),
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    deliver_named_group_event_to_agent(&state, &requester_hex, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "revision": revision })),
+    )
+}
+
+async fn approve_treekem_join_request(
+    state: Arc<AppState>,
+    id: String,
+    request_id: String,
+    caller_hex: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
+
+    let (mut next, metadata_topic, event_group_id, requester_hex, requester_id, kp_bytes) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+            return e;
+        }
+        let Some(req) = info.join_requests.get(&request_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "request not found" })),
+            );
+        };
+        if !req.is_pending() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "ok": false, "error": "request is not pending" })),
+            );
+        }
+        if info.is_banned(&req.requester_agent_id) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "ok": false, "error": "requester is banned" })),
+            );
+        }
+        let requester_id = match parse_agent_id_hex(&req.requester_agent_id) {
+            Ok(id) => id,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": e })),
+                );
+            }
+        };
+        let Some(kp_b64) = req.treekem_key_package_b64.clone() else {
+            return (
+                StatusCode::FAILED_DEPENDENCY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "request is missing TreeKEM KeyPackage"
+                })),
+            );
+        };
+        let kp_bytes = match base64::engine::general_purpose::STANDARD.decode(kp_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "request TreeKEM KeyPackage is not valid base64"
+                    })),
+                );
+            }
+        };
+        (
+            info.clone(),
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            req.requester_agent_id.clone(),
+            requester_id,
+            kp_bytes,
+        )
+    };
+
+    let group = {
+        let map = state.treekem_groups.read().await;
+        map.get(&id).cloned()
+    };
+    let Some(group) = group else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM group not loaded — restart or re-share required"
+            })),
+        );
+    };
+    let mut guard = group.lock().await;
+    let treekem_epoch = guard.epoch().saturating_add(1);
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    if let Some(req) = next.join_requests.get_mut(&request_id) {
+        req.status = x0x::groups::JoinRequestStatus::Approved;
+        req.reviewed_by = Some(caller_hex.clone());
+        req.reviewed_at = Some(now_ms);
+    }
+    next.add_member(
+        requester_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(caller_hex.clone()),
+        None,
+    );
+    next.set_member_treekem_key_package(
+        &requester_hex,
+        base64::engine::general_purpose::STANDARD.encode(&kp_bytes),
+    );
+    next.secret_epoch = treekem_epoch;
+    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    let revision = next.roster_revision;
+    let commit = match next.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
+    let out = match guard.add_member(requester_id, &kp_bytes) {
+        Ok(out) => out,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("TreeKEM add_member failed: {e}")
+                })),
+            );
+        }
+    };
+    if guard.epoch() != treekem_epoch {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM epoch did not advance as expected"
+            })),
+        );
+    }
+    if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, &id, &guard).await {
+        tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after approval: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "failed to persist secure group state"
+            })),
+        );
+    }
+    let treekem_commit = out.commit;
+    let treekem_welcome = out.welcome;
+    drop(guard);
+
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.insert(id.clone(), next.clone());
+    }
+    save_named_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::JoinRequestApproved {
+        group_id: event_group_id,
+        request_id,
+        revision,
+        actor: caller_hex,
+        requester_agent_id: requester_hex.clone(),
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_welcome_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(treekem_welcome),
+        ),
+        treekem_epoch: Some(treekem_epoch),
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -10821,8 +11175,6 @@ fn treekem_metadata_event_requires_phase3(event: &NamedGroupMetadataEvent) -> bo
             | NamedGroupMetadataEvent::MemberRemoved { .. }
             | NamedGroupMetadataEvent::MemberBanned { .. }
             | NamedGroupMetadataEvent::MemberUnbanned { .. }
-            | NamedGroupMetadataEvent::JoinRequestCreated { .. }
-            | NamedGroupMetadataEvent::JoinRequestApproved { .. }
             | NamedGroupMetadataEvent::MemberJoined { .. }
     )
 }
@@ -15757,6 +16109,31 @@ mod tests {
         };
         assert!(treekem_metadata_event_requires_phase3(&event));
 
+        let event = NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: "aa".repeat(16),
+            request_id: "req".to_string(),
+            requester_agent_id: "22".repeat(32),
+            message: None,
+            ts: 1,
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: Some("a2V5".to_string()),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&event));
+
+        let event = NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id: "aa".repeat(16),
+            request_id: "req".to_string(),
+            revision: 2,
+            actor: "11".repeat(32),
+            requester_agent_id: "22".repeat(32),
+            treekem_commit_b64: Some("Y29tbWl0".to_string()),
+            treekem_welcome_b64: Some("d2VsY29tZQ==".to_string()),
+            treekem_epoch: Some(1),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&event));
+
         let event = NamedGroupMetadataEvent::GroupDeleted {
             group_id: "aa".repeat(16),
             revision: 1,
@@ -15784,6 +16161,49 @@ mod tests {
             commit: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&event));
+    }
+
+    #[test]
+    fn treekem_join_request_events_accept_legacy_json_defaults() {
+        let created: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "join_request_created",
+            "group_id": "aa",
+            "request_id": "req",
+            "requester_agent_id": "22",
+            "message": null,
+            "ts": 1
+        }))
+        .expect("legacy created event should deserialize");
+        match created {
+            NamedGroupMetadataEvent::JoinRequestCreated {
+                treekem_key_package_b64,
+                ..
+            } => assert_eq!(treekem_key_package_b64, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let approved: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "join_request_approved",
+            "group_id": "aa",
+            "request_id": "req",
+            "revision": 2,
+            "actor": "11",
+            "requester_agent_id": "22"
+        }))
+        .expect("legacy approved event should deserialize");
+        match approved {
+            NamedGroupMetadataEvent::JoinRequestApproved {
+                treekem_commit_b64,
+                treekem_welcome_b64,
+                treekem_epoch,
+                ..
+            } => {
+                assert_eq!(treekem_commit_b64, None);
+                assert_eq!(treekem_welcome_b64, None);
+                assert_eq!(treekem_epoch, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
