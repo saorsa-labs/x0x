@@ -1501,6 +1501,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stderr_output_caps_warn_truncate_and_keep_draining() {
+        let service = test_service().await;
+        let request_id = ExecRequestId([45; 16]);
+        let target = AgentId([46; 32]);
+        let caps = ExecCaps {
+            max_stderr_bytes: 8,
+            warn_stderr_bytes: 4,
+            ..ExecCaps::default()
+        };
+        let total = Arc::new(AtomicU64::new(0));
+        let truncated = Arc::new(AtomicBool::new(false));
+        let seq = Arc::new(AtomicU32::new(0));
+        let last_activity = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(5)));
+        let data = vec![b'e'; 32];
+
+        service
+            .stream_output(
+                data.as_slice(),
+                target,
+                request_id,
+                StreamKind::Stderr,
+                caps,
+                Arc::clone(&total),
+                Arc::clone(&truncated),
+                Arc::clone(&seq),
+                Arc::clone(&last_activity),
+                "stderr-test".to_string(),
+            )
+            .await;
+
+        assert_eq!(total.load(Ordering::Relaxed), data.len() as u64);
+        assert!(truncated.load(Ordering::Relaxed));
+        let snapshot = service.diagnostics_snapshot().await;
+        assert_eq!(snapshot.totals.cap_breaches.get("stderr"), Some(&1));
+        assert_eq!(
+            snapshot.totals.cap_warnings.get("stderr_approaching_cap"),
+            Some(&1)
+        );
+        assert_eq!(snapshot.totals.cap_warnings.get("stderr_cap_hit"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn stream_output_below_threshold_records_bytes_without_warning() {
+        let service = test_service().await;
+        let total = Arc::new(AtomicU64::new(0));
+        let truncated = Arc::new(AtomicBool::new(false));
+        let seq = Arc::new(AtomicU32::new(0));
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let caps = ExecCaps {
+            max_stdout_bytes: 100,
+            warn_stdout_bytes: 90,
+            ..ExecCaps::default()
+        };
+
+        service
+            .stream_output(
+                b"small".as_slice(),
+                AgentId([47; 32]),
+                ExecRequestId([48; 16]),
+                StreamKind::Stdout,
+                caps,
+                Arc::clone(&total),
+                Arc::clone(&truncated),
+                Arc::clone(&seq),
+                Arc::clone(&last_activity),
+                "small-output".to_string(),
+            )
+            .await;
+
+        assert_eq!(total.load(Ordering::Relaxed), 5);
+        assert!(!truncated.load(Ordering::Relaxed));
+        assert_eq!(seq.load(Ordering::Relaxed), 1);
+        let snapshot = service.diagnostics_snapshot().await;
+        assert!(snapshot.totals.cap_breaches.is_empty());
+        assert!(snapshot.totals.cap_warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_renew_ignores_wrong_sender_or_machine() {
+        let service = test_service().await;
+        let request_id = ExecRequestId([49; 16]);
+        let agent = AgentId([50; 32]);
+        let machine = MachineId([51; 32]);
+        let (cancel_tx, _cancel_rx) = watch::channel(CancelReason::DurationCap);
+        let original_deadline = Instant::now() - Duration::from_secs(1);
+        let lease_deadline = Arc::new(Mutex::new(original_deadline));
+        service.active_servers.lock().await.insert(
+            request_id,
+            ActiveServerSession {
+                agent_id: agent,
+                machine_id: machine,
+                cancel_tx,
+                lease_deadline: Arc::clone(&lease_deadline),
+                last_activity: Arc::new(Mutex::new(Instant::now())),
+                argv_summary: "lease mismatch".to_string(),
+                started_at: Instant::now(),
+            },
+        );
+
+        service
+            .handle_lease_renew(AgentId([99; 32]), machine, request_id)
+            .await;
+        assert_eq!(*lease_deadline.lock().await, original_deadline);
+        service
+            .handle_lease_renew(agent, MachineId([98; 32]), request_id)
+            .await;
+        assert_eq!(*lease_deadline.lock().await, original_deadline);
+    }
+
+    #[tokio::test]
+    async fn record_session_activity_updates_timestamp() {
+        let last_activity = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10)));
+        let before = *last_activity.lock().await;
+        ExecService::record_session_activity(&last_activity).await;
+        assert!(*last_activity.lock().await > before);
+    }
+
+    #[tokio::test]
+    async fn release_slot_without_existing_count_is_noop() {
+        let service = test_service().await;
+        let agent = AgentId([52; 32]);
+        service.release_slot(agent).await;
+        let counts = service.active_counts.lock().await;
+        assert_eq!(counts.total, 0);
+        assert!(!counts.per_agent.contains_key(&agent));
+    }
+
+    #[tokio::test]
     async fn duration_cap_terminates_child_promptly() {
         if !Path::new("/bin/sleep").exists() {
             return;
