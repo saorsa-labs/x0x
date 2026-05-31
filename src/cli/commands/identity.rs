@@ -166,6 +166,42 @@ pub async fn sign(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::cli::{DaemonClient, OutputFormat};
+
+    async fn start_mock_server(
+        response_json: serde_json::Value,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        use std::sync::Arc;
+
+        let json = Arc::new(response_json);
+        let app = axum::Router::new().fallback(move |_req: axum::extract::Request| {
+            let json = Arc::clone(&json);
+            async move {
+                let body = serde_json::to_vec(&*json).unwrap();
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+                .ok();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://{}", addr), tx)
+    }
 
     #[test]
     fn identity_words_encodes_known_hex() {
@@ -244,5 +280,101 @@ mod tests {
         inject_identity_words(&encoder, &mut value);
         // Should not panic, should not modify array
         assert!(value.is_array());
+    }
+
+    #[tokio::test]
+    async fn agent_fetches_identity_and_injects_words() {
+        let mock_resp = serde_json::json!({
+            "agent_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "user_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        });
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+        let result = agent(&client).await;
+        assert!(result.is_ok(), "agent should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn user_id_returns_mock_response() {
+        let mock_resp = serde_json::json!({"user_id": "user-1"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+        let result = user_id(&client).await;
+        assert!(result.is_ok(), "user_id should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn announce_posts_mock_response() {
+        let mock_resp = serde_json::json!({"announced": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+        let result = announce(&client, true, true).await;
+        assert!(result.is_ok(), "announce should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn card_handles_shareable_link_response() {
+        let mock_resp = serde_json::json!({"link": "x0x-card:abc", "ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+        let result = card(&client, Some("Alice"), true).await;
+        assert!(result.is_ok(), "card should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn introduction_returns_mock_response() {
+        let mock_resp = serde_json::json!({"introduction": "hello"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+        let result = introduction(&client).await;
+        assert!(result.is_ok(), "introduction should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn import_card_posts_mock_response() {
+        let mock_resp = serde_json::json!({"imported": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+        let result = import_card(&client, "x0x-card:abc", Some("trusted")).await;
+        assert!(result.is_ok(), "import_card should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn sign_posts_payload_b64_response() {
+        let mock_resp = serde_json::json!({"signature_b64": "c2ln"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+        let result = sign(&client, None, Some("aGVsbG8=")).await;
+        assert!(result.is_ok(), "sign should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn sign_reads_file_payload() {
+        let mock_resp = serde_json::json!({"signature_b64": "c2ln"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let result = sign(&client, path.to_str(), None).await;
+        assert!(result.is_ok(), "sign file should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn sign_rejects_ambiguous_or_missing_payload() {
+        let mock_resp = serde_json::json!({"unused": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+
+        let both = sign(&client, Some("-"), Some("aGVsbG8=")).await;
+        assert!(both.is_err());
+        assert!(both.unwrap_err().to_string().contains("pass either --file"));
+
+        let neither = sign(&client, None, None).await;
+        assert!(neither.is_err());
+        assert!(neither
+            .unwrap_err()
+            .to_string()
+            .contains("pass either --file <PATH>"));
     }
 }
