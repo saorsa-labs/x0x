@@ -213,6 +213,7 @@ struct DaemonConfig {
 pub const DEFAULT_QUIC_PORT: u16 = 5483;
 
 const GROUP_BACKGROUND_PUBLISH_DELAY: Duration = Duration::from_secs(8);
+const NAMED_GROUP_METADATA_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn default_bootstrap_peers() -> Vec<SocketAddr> {
     x0x::network::DEFAULT_BOOTSTRAP_PEERS
@@ -6585,8 +6586,23 @@ async fn publish_named_group_metadata_event(
 ) {
     match serde_json::to_vec(event) {
         Ok(bytes) => {
-            if let Err(e) = state.agent.publish(metadata_topic, bytes).await {
-                tracing::warn!(topic = %metadata_topic, "failed to publish named-group metadata event: {e}");
+            match tokio::time::timeout(
+                NAMED_GROUP_METADATA_PUBLISH_TIMEOUT,
+                state.agent.publish(metadata_topic, bytes),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(topic = %metadata_topic, "failed to publish named-group metadata event: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        topic = %metadata_topic,
+                        timeout_ms = NAMED_GROUP_METADATA_PUBLISH_TIMEOUT.as_millis() as u64,
+                        "timed out publishing named-group metadata event"
+                    );
+                }
             }
         }
         Err(e) => tracing::warn!("failed to serialize named-group metadata event: {e}"),
@@ -9671,10 +9687,9 @@ async fn add_treekem_named_group_member(
     }
     drop(guard);
 
-    {
-        let mut groups = state.named_groups.write().await;
-        groups.insert(id.clone(), next.clone());
-    }
+    let mut groups = state.named_groups.write().await;
+    groups.insert(id.clone(), next.clone());
+    drop(groups);
     save_named_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::MemberAdded {
@@ -9921,10 +9936,9 @@ async fn leave_treekem_group(
     }
     drop(guard);
 
-    {
-        let mut groups = state.named_groups.write().await;
-        groups.remove(&id);
-    }
+    let mut groups = state.named_groups.write().await;
+    groups.remove(&id);
+    drop(groups);
     state.group_card_cache.write().await.remove(&id);
     state.mls_groups.write().await.remove(&id);
     state.treekem_groups.write().await.remove(&id);
@@ -10104,10 +10118,9 @@ async fn remove_treekem_named_group_member(
     }
     drop(guard);
 
-    {
-        let mut groups = state.named_groups.write().await;
-        groups.insert(id.clone(), next.clone());
-    }
+    let mut groups = state.named_groups.write().await;
+    groups.insert(id.clone(), next.clone());
+    drop(groups);
     save_named_groups(&state).await;
     save_mls_groups(&state).await;
 
@@ -11002,10 +11015,9 @@ async fn ban_treekem_group_member(
         );
     }
     drop(guard);
-    {
-        let mut groups = state.named_groups.write().await;
-        groups.insert(id.clone(), next.clone());
-    }
+    let mut groups = state.named_groups.write().await;
+    groups.insert(id.clone(), next.clone());
+    drop(groups);
     save_named_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::MemberBanned {
@@ -11220,13 +11232,10 @@ async fn create_join_request(
             }
         };
         let creator_hex = hex::encode(info.creator.as_bytes());
-        (
-            info.metadata_topic.clone(),
-            info.stable_group_id().to_string(),
-            request,
-            creator_hex,
-            commit,
-        )
+        let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        drop(groups);
+        (metadata_topic, event_group_id, request, creator_hex, commit)
     };
 
     save_named_groups(&state).await;
@@ -11324,11 +11333,15 @@ async fn approve_join_request(
                 );
             }
         };
+        let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        let revision = info.roster_revision;
+        drop(groups);
         (
-            info.metadata_topic.clone(),
-            info.stable_group_id().to_string(),
+            metadata_topic,
+            event_group_id,
             requester_hex,
-            info.roster_revision,
+            revision,
             commit,
         )
     };
@@ -11603,10 +11616,9 @@ async fn approve_treekem_join_request(
     let treekem_welcome = out.welcome;
     drop(guard);
 
-    {
-        let mut groups = state.named_groups.write().await;
-        groups.insert(id.clone(), next.clone());
-    }
+    let mut groups = state.named_groups.write().await;
+    groups.insert(id.clone(), next.clone());
+    drop(groups);
     save_named_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::JoinRequestApproved {
@@ -11677,12 +11689,10 @@ async fn reject_join_request(
                 );
             }
         };
-        (
-            info.metadata_topic.clone(),
-            info.stable_group_id().to_string(),
-            requester_hex,
-            commit,
-        )
+        let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        drop(groups);
+        (metadata_topic, event_group_id, requester_hex, commit)
     };
 
     save_named_groups(&state).await;
@@ -11747,12 +11757,10 @@ async fn cancel_join_request(
                 );
             }
         };
-        (
-            info.metadata_topic.clone(),
-            info.stable_group_id().to_string(),
-            requester_hex,
-            commit,
-        )
+        let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        drop(groups);
+        (metadata_topic, event_group_id, requester_hex, commit)
     };
 
     save_named_groups(&state).await;
