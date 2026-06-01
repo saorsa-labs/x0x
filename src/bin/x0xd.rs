@@ -5451,6 +5451,10 @@ struct AddNamedGroupMemberRequest {
     agent_id: String,
     #[serde(default)]
     display_name: Option<String>,
+    /// Base64 postcard-encoded TreeKEM KeyPackage supplied by the target.
+    /// Required when directly adding to a TreeKEM group.
+    #[serde(default)]
+    treekem_key_package_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9380,8 +9384,9 @@ async fn add_named_group_member(
                 ),
             );
         }
-        if let Some(resp) = treekem_membership_unsupported(info) {
-            return resp;
+        if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+            drop(named_groups);
+            return add_treekem_named_group_member(state, id, agent_id, req).await;
         }
 
         let agent_hex = hex::encode(agent_id.as_bytes());
@@ -9456,6 +9461,171 @@ async fn add_named_group_member(
             "ok": true,
             "group_id": id,
             "epoch": epoch,
+            "member_count": members.len(),
+            "members": members,
+        })),
+    )
+}
+
+async fn add_treekem_named_group_member(
+    state: Arc<AppState>,
+    id: String,
+    agent_id: AgentId,
+    req: AddNamedGroupMemberRequest,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+
+    let local_agent = state.agent.agent_id();
+    let actor_hex = hex::encode(local_agent.as_bytes());
+    let agent_hex = hex::encode(agent_id.as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
+    let Some(kp_b64) = req.treekem_key_package_b64.clone() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM direct add requires treekem_key_package_b64 from the target"
+            })),
+        );
+    };
+    let kp_bytes = match base64::engine::general_purpose::STANDARD.decode(&kp_b64) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "treekem_key_package_b64 is not valid base64"
+                })),
+            );
+        }
+    };
+
+    let (mut next, metadata_topic, event_group_id) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if local_agent != info.creator {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    serde_json::json!({ "ok": false, "error": "only the creator can add members" }),
+                ),
+            );
+        }
+        if info.has_member(&agent_hex) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "ok": false, "error": "member already present" })),
+            );
+        }
+        (
+            info.clone(),
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+        )
+    };
+
+    let group = {
+        let map = state.treekem_groups.read().await;
+        map.get(&id).cloned()
+    };
+    let Some(group) = group else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(
+                serde_json::json!({ "ok": false, "error": "TreeKEM group not loaded — restart or re-share required" }),
+            ),
+        );
+    };
+    let mut guard = group.lock().await;
+    let treekem_epoch = guard.epoch().saturating_add(1);
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.add_member(
+        agent_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(actor_hex.clone()),
+        req.display_name.clone(),
+    );
+    if let Some(display_name) = req.display_name.clone() {
+        next.set_display_name(&agent_hex, display_name);
+    }
+    next.set_member_treekem_key_package(&agent_hex, kp_b64);
+    next.secret_epoch = treekem_epoch;
+    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    let commit = match next.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
+    let out = match guard.add_member(agent_id, &kp_bytes) {
+        Ok(out) => out,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("TreeKEM add_member failed: {e}") }),
+                ),
+            );
+        }
+    };
+    if guard.epoch() != treekem_epoch {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({ "ok": false, "error": "TreeKEM epoch did not advance as expected" }),
+            ),
+        );
+    }
+    if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, &id, &guard).await {
+        tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after direct add: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({ "ok": false, "error": "failed to persist secure group state" }),
+            ),
+        );
+    }
+    drop(guard);
+
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.insert(id.clone(), next.clone());
+    }
+    save_named_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: event_group_id,
+        revision,
+        actor: actor_hex,
+        agent_id: agent_hex.clone(),
+        display_name: req.display_name,
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(out.commit)),
+        treekem_welcome_b64: Some(base64::engine::general_purpose::STANDARD.encode(out.welcome)),
+        treekem_epoch: Some(treekem_epoch),
+        commit: Some(commit),
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    deliver_named_group_event_to_agent(&state, &agent_hex, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
+
+    let members = named_group_member_values(&next);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": id,
+            "epoch": treekem_epoch,
             "member_count": members.len(),
             "members": members,
         })),
@@ -17072,6 +17242,18 @@ mod tests {
 
         assert_ne!(base, changed);
         assert_ne!(base, legacy);
+    }
+
+    #[test]
+    fn direct_add_request_defaults_without_treekem_keypackage() {
+        let req: AddNamedGroupMemberRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "22",
+            "display_name": "Bob"
+        }))
+        .expect("request should deserialize");
+        assert_eq!(req.agent_id, "22");
+        assert_eq!(req.display_name.as_deref(), Some("Bob"));
+        assert_eq!(req.treekem_key_package_b64, None);
     }
 
     #[test]
