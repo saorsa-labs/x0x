@@ -531,7 +531,33 @@ async fn named_group_leave() {
 #[ignore]
 async fn named_group_rejoin_after_leave() {
     let d = daemon().await;
-    let (group_id, _) = create_group(&d, "Rejoin Group", "", Some("Alice")).await;
+    // Uses a public_open (GSS) group: on a non-secure group, rejoin-via-invite
+    // restores the joiner into the local roster synchronously. The default
+    // private_secure preset is now secure-by-default TreeKEM (ADR-0012), where
+    // the join awaits the anchor's authoritative MemberAdded — a different flow
+    // than this single-daemon roster-restore test exercises.
+    let create_r: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Rejoin Group",
+            "description": "",
+            "display_name": "Alice",
+            "preset": "public_open"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group_id = create_r["group_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !group_id.is_empty(),
+        "create public_open group: {create_r:?}"
+    );
 
     // Generate invite before leaving
     let invite_resp: Value = authed_client(&d)
