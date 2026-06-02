@@ -529,7 +529,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Require ClawHub token
         env:
@@ -659,6 +659,20 @@ jobs:
           });
           NODE
 
+      # Status-aware, pending-tolerant verification.
+      #
+      # ClawHub runs an ASYNCHRONOUS multi-scanner pipeline (static analysis +
+      # VirusTotal + SkillSpector -> ClawScan verdict) that routinely takes
+      # longer than this release run. The publish step above already succeeded;
+      # the release must NOT be failed merely because the scan clock has not
+      # finished. We therefore key off the SecuritySnapshot `status` enum
+      # (clean | suspicious | malicious | pending | error) and resolve as:
+      #   clean      -> success
+      #   malicious  -> FAIL (a malicious verdict must block the release)
+      #   suspicious -> WARN, succeed (still published + installable; surfaces
+      #                 the summary so SKILL.md content can be improved to clean)
+      #   pending/error/not-yet-listed -> keep polling; tolerate on timeout
+      #                 (ClawHub finalizes asynchronously)
       - name: Verify published version after security scan
         env:
           CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
@@ -674,72 +688,94 @@ jobs:
             const mode = process.env.CLAWHUB_PUBLISH_MODE || 'latest';
 
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-            const expectedDescription =
-              mode === 'selected'
-                ? `version ${version} with completed security scan`
-                : `latest=${version} with completed security scan`;
+            const auth = { Accept: 'application/json', Authorization: `Bearer ${token}` };
+            const MAX_ATTEMPTS = 40; // ~10 minutes at 15s spacing
 
-            for (let attempt = 1; attempt <= 20; attempt += 1) {
-              const versionResponse = await fetch(
+            // Best-effort: the /verify envelope carries a human-readable summary.
+            const fetchSummary = async () => {
+              try {
+                const r = await fetch(
+                  `${registry}/api/v1/skills/x0x/verify?version=${encodeURIComponent(version)}`,
+                  { headers: auth },
+                );
+                if (!r.ok) return '';
+                const j = await r.json();
+                return j?.security?.summary ?? '';
+              } catch {
+                return '';
+              }
+            };
+
+            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+              const res = await fetch(
                 `${registry}/api/v1/skills/x0x/versions/${encodeURIComponent(version)}`,
-                {
-                  headers: {
-                    Accept: 'application/json',
-                    Authorization: `Bearer ${token}`,
-                  },
-                },
+                { headers: auth },
               );
+              const bodyText = await res.text();
 
-              const versionBodyText = await versionResponse.text();
-              console.log(`attempt ${attempt}: version status=${versionResponse.status}`);
-              console.log(versionBodyText);
-
-              let versionJson = null;
-              let observedVersion = null;
-              let scanComplete = false;
-              if (versionResponse.ok) {
-                versionJson = JSON.parse(versionBodyText);
-                observedVersion = versionJson?.version?.version ?? null;
-                scanComplete = versionJson?.version?.security?.hasScanResult === true;
+              let observed = null;
+              let status = null; // clean | suspicious | malicious | pending | error
+              if (res.ok) {
+                try {
+                  const json = JSON.parse(bodyText);
+                  observed = json?.version?.version ?? null;
+                  status = json?.version?.security?.status ?? null;
+                } catch {
+                  // fall through; treat as not-yet-parseable
+                }
               }
 
+              // The `latest` pointer only gates the "latest" publish mode.
               let latestMatches = mode !== 'latest';
               if (mode === 'latest') {
-                const latestResponse = await fetch(`${registry}/api/v1/skills/x0x`, {
-                  headers: {
-                    Accept: 'application/json',
-                    Authorization: `Bearer ${token}`,
-                  },
-                });
-
-                const latestBodyText = await latestResponse.text();
-                console.log(`attempt ${attempt}: latest status=${latestResponse.status}`);
-                console.log(latestBodyText);
-
-                if (latestResponse.ok) {
-                  const latestJson = JSON.parse(latestBodyText);
-                  latestMatches = latestJson?.latestVersion?.version === version;
+                const lr = await fetch(`${registry}/api/v1/skills/x0x`, { headers: auth });
+                if (lr.ok) {
+                  const lj = await lr.json();
+                  latestMatches = lj?.latestVersion?.version === version;
                 }
               }
 
-              if (observedVersion === version && latestMatches && scanComplete) {
-                if (mode === 'selected') {
-                  console.log(`::notice::ClawHub already contains x0x@${version}`);
-                } else {
-                  console.log(`::notice::ClawHub latest version is now ${version}`);
+              console.log(
+                `attempt ${attempt}: http=${res.status} version=${observed} security.status=${status} latestMatches=${latestMatches}`,
+              );
+
+              if (observed === version) {
+                if (status === 'malicious') {
+                  const summary = await fetchSummary();
+                  if (summary) console.error(`ClawScan: ${summary}`);
+                  throw new Error(`ClawHub flagged x0x@${version} as MALICIOUS — blocking release`);
                 }
-                return;
+                if (status === 'suspicious') {
+                  const summary = await fetchSummary();
+                  console.log(
+                    `::warning title=ClawHub scan: suspicious::x0x@${version} is published and installable, but ClawScan rates it "suspicious". ${summary} Review SKILL.md to reach a clean verdict.`,
+                  );
+                  return;
+                }
+                if (status === 'clean' && latestMatches) {
+                  console.log(
+                    `::notice::ClawHub: x0x@${version} scanned clean${mode === 'latest' ? ' and promoted to latest' : ''}.`,
+                  );
+                  return;
+                }
+                // status === clean but latest not moved yet, or pending/error: keep waiting.
               }
 
-              if (attempt < 20) {
+              if (attempt < MAX_ATTEMPTS) {
                 console.log(
-                  `attempt ${attempt}: ClawHub has not exposed ${expectedDescription} yet; retrying in 15s`,
+                  `attempt ${attempt}: not terminal yet (status=${status ?? 'unlisted'}); retrying in 15s`,
                 );
                 await sleep(15_000);
               }
             }
 
-            throw new Error(`ClawHub did not report ${expectedDescription} within 5 minutes`);
+            // Scan/listing still settling. Publishing already succeeded, and
+            // ClawHub finalizes asynchronously — do NOT fail the release on the
+            // scan clock. A genuine malicious verdict is caught above if it
+            // lands within the window; later finalization is surfaced out-of-band.
+            console.log(
+              `::warning title=ClawHub scan pending::x0x@${version} uploaded, but the security scan / latest promotion did not finalize within ~10 minutes. ClawHub finalizes asynchronously — not failing the release.`,
+            );
           })().catch((error) => {
             console.error(error);
             process.exit(1);
