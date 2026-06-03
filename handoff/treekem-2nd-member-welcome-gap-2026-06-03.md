@@ -68,6 +68,89 @@ while the 1st is Active, asserts BOTH converge into the tree (encrypt on treekem
 This is the regression surface that catches the bug — the local `d4_mls_ban` test only
 checks roster *state*, not Welcome processing, so it cannot catch this.
 
+## Refined root cause (investigation 2026-06-03, evidence-backed)
+
+Narrowed from "TreeKEM logic" to **the anchor's join-result *reply send* to the
+2nd member timing out during the join flow**. Evidence chain:
+
+1. The 2nd member reaches the owner's roster (owner-side `group_membership_lock`
+   fix works) and falls back to polling the anchor (`poll_join_result_until_treekem_ready`
+   → `JoinResultMessage::FetchRequest`).
+2. The anchor **receives** the FetchRequest, finds the staged result, and calls
+   `send_direct_with_config(m2, Result, direct_message_send_config())` — which
+   **times out**: `WARN failed to send join-result response: timed out after 1
+   retries over 12.003s member=<m2>`. The 2nd member's journal shows nothing
+   (it never receives the Result).
+3. It is **NOT** any of: gap-check (`is_local_welcome` correctly bypasses gaps
+   for a member's own `MemberAdded`), config (`direct_message_send_config()` ==
+   `DmSendConfig::default()`, same as plain `/direct/send`), payload size
+   (isolated DMs anchor→m2 up to 48 KB succeed via `gossip_inbox` in ~1 s; 64 KB
+   is a clean 400 over `MAX_PAYLOAD_BYTES`), or raw node connectivity (isolated
+   plain DM anchor→nuremberg AND anchor→singapore succeed in <1 s via
+   `gossip_inbox`).
+4. So the **same** anchor→m2 DM that works in ~1 s in isolation times out at 12 s
+   **only inside the concurrent multi-member join flow** (m2 polling + applying +
+   fetching its Welcome, anchor adding + serving). 1st member never fails because
+   the anchor's reply to it lands before that contention builds.
+
+### Leading hypotheses for the team
+- **App-level gossip-inbox ACK stall**: the gossip-inbox path waits for m2's
+  authenticated *application* ACK. During the join flow m2 is busy (repeated
+  poll-Result applies + `fetch_treekem_welcome` round-trip), so the ACK is
+  delayed past the 12 s send timeout. Plain DM in isolation ACKs in ~1 s.
+- **Lock-across-network-fetch (introduced by the 0.21.0 fix — check this first)**:
+  `apply_named_group_metadata_event_inner` holds the per-group
+  `group_membership_lock` for the WHOLE apply, and the `MemberAdded` arm calls
+  `fetch_treekem_welcome` (a network round-trip to the anchor) *while holding the
+  lock* (src/bin/x0xd.rs ~7807). On m2, repeated poll-Result applies then
+  serialize behind a lock held across a network call → m2's processing/ACK
+  stalls. **Candidate fix:** do not hold `group_membership_lock` across the
+  Welcome-blob fetch — fetch first (no lock), then take the lock only for the
+  state mutation; or make the join-result delivery non-blocking + idempotent so a
+  slow ACK doesn't wedge the anchor's join-result listener task.
+- **Anchor listener head-of-line blocking**: the join-result listener `.await`s
+  the 12 s send inline, so it can't service m2's rapid re-polls (every ~2 s)
+  during the timeout — spawning the send would decouple it.
+
+### UPDATE: lead #2 (lock-across-fetch) ruled OUT as the primary lever
+
+Read of `src/dm_inbox.rs:322-355`: the gossip-inbox ACK is `publish_ack(Accepted)`
+sent **immediately after enqueuing** the message into the typed-payload route
+channel (`route.sender.send(typed).await`), **not** after the application apply.
+So m2 holding `group_membership_lock` during its apply does **not** directly delay
+the ACK the anchor is waiting on → the lock-scope change will **not** fix the
+anchor→m2 send timeout. (The lock is still worth not holding across a network
+call on principle, but it is not the root cause.)
+
+The ACK *can* be delayed only via **route-channel backpressure**: m2's membership
+consumer is single-threaded and **blocks on the network Welcome-blob fetch**
+(`fetch_treekem_welcome`, itself an anchor→m2 round-trip on the same flaky path).
+If that fetch hangs, the consumer stalls, the route channel fills,
+`route.sender.send().await` blocks, and the ACK is delayed → the anchor's send
+times out. Self-reinforcing with the anchor's own welcome-blob serve timing out.
+
+### Real fix directions (transport / flow — team domain)
+
+1. **Reliable anchor→member membership delivery under load.** The anchor→m2
+   `send_direct` (join-result Result AND Welcome blob) times out (12s) under the
+   concurrent join flow though it succeeds in ~1s in isolation. Make these
+   critical membership sends robust: warm/raw-QUIC-first to a just-active member,
+   a longer/adaptive ACK window, or idempotent retry that doesn't wedge the
+   listener.
+2. **Don't block the membership-event consumer on a network Welcome fetch.** The
+   single consumer awaiting `fetch_treekem_welcome` causes route-channel
+   backpressure that delays ACKs. Fetch the Welcome without blocking the consumer
+   (e.g. inline the Welcome bytes in the `MemberAdded` for the 2nd+ member when it
+   fits under `MAX_PAYLOAD_BYTES`, or fetch+apply on a per-member task).
+
+### Suggested next steps
+1. Add temporary instrumentation to confirm whether m2's `fetch_treekem_welcome`
+   completes (and whether m2 holds the membership lock across it) during a
+   failing run.
+2. Try the lock-scope fix (release before the Welcome fetch) and re-run
+   `tests/e2e_treekem_membership.py --member2` on testnet.
+3. Consider a longer / fallback-friendly send for join-result delivery.
+
 ## Recommendation
 
 - Treat multi-member secure participation as **not shipped** until the 2nd-member
