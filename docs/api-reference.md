@@ -332,8 +332,14 @@ Cards and commits carry ML-DSA-65 signatures. Peers verify both the
 signature and the chain link (`prev_state_hash`) before accepting; stale
 revisions are silently dropped.
 
-**Honest scope — v1 secure model is GSS, not MLS TreeKEM.** See
-`docs/primers/groups.md` for what GSS provides and does not provide.
+**Secure-group plane (ADR-0012, x0x 0.21.0):** private groups (`private_secure`
+preset — `Hidden` + `MlsEncrypted`) run **real TreeKEM** (forward secrecy +
+post-compromise security). **Single-member** private groups work end-to-end
+(invite → join → bidirectional secure → ban → forward secrecy). **Multi-member
+limitation:** a 2nd+ member converges into the owner's roster but its
+`MemberAdded`+`Welcome` is not yet delivered, so it cannot yet encrypt — tracked
+follow-up. Public encrypted presets (`public_request_secure`) and grandfathered
+groups remain on the legacy **GSS** plane. See `docs/primers/groups.md`.
 
 ## Collaborative task lists
 

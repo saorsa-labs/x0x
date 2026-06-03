@@ -1,6 +1,6 @@
 # ADR 0010: GSS Before MLS TreeKEM for v1 Secure Groups
 
-- Status: Accepted
+- Status: Accepted, but **forward path superseded by [ADR 0012](./0012-treekem-default-secure-groups.md)** (accepted/shipped in x0x 0.21.0). New **private** secure groups now run real TreeKEM, not GSS; GSS applies only to grandfathered groups and public encrypted presets.
 - Date: 2026-05-11
 - Superseded (forward path) by: [ADR 0012](./0012-treekem-default-secure-groups.md)
   on 2026-05-30, now that `saorsa-mls 0.3.6` ships real TreeKEM. This ADR still

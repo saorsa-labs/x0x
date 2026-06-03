@@ -8,6 +8,8 @@ This document expands and effectively supersedes the narrower ideas in `docs/des
 
 Implementation is in progress across multiple phases and branches. This document is the architecture target, not proof that the target has been reached. Signoff requires the implementation and review gates described below.
 
+> **Shipped milestone (x0x 0.21.0, 2026-06-03):** secure-by-default **TreeKEM** for private groups (ADR-0012, now *Accepted*). **Single-member** private secure groups are fully functional end-to-end (invite → join → Welcome → bidirectional secure → ban/epoch-advance → forward secrecy, verified on testnet). 0.21.0 also fixed owner-side **multi-member roster convergence** (serialized per group by `group_membership_lock`). **Known limitation:** for a 2nd+ member the owner's roster converges but the joiner's `MemberAdded`+`Welcome` is not yet delivered (joiner's anchor-poll times out) → multi-member *secure participation* is a tracked follow-up. Public encrypted presets remain on the GSS plane (ADR-0010 forward-path scope).
+
 ### Execution phases
 
 | Phase | Scope | Purpose | Status |

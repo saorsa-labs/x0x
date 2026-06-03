@@ -41,11 +41,27 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://$API/groups/<group_id>/state/withdraw"
 ```
 
-### Honest v1 secure model — Group Shared Secret (GSS)
+### Secure-group planes — TreeKEM (private) and GSS (public/legacy)
 
-For `MlsEncrypted` groups x0x v1 ships **GSS**, not MLS TreeKEM.
-This is an accepted architecture decision in
-[ADR 0010](../adr/0010-gss-before-mls-treekem-for-v1-secure-groups.md):
+As of **x0x 0.21.0** ([ADR 0012](../adr/0012-treekem-default-secure-groups.md),
+now *Accepted*), **private** secure groups (`private_secure` preset — `Hidden` +
+`MlsEncrypted`) run **real TreeKEM** (forward secrecy + post-compromise security).
+**Single-member** private groups work end-to-end (invite → join → `Welcome` →
+bidirectional secure → ban/epoch-advance → forward secrecy, verified on testnet).
+0.21.0 also fixed owner-side **multi-member roster convergence** (serialized per
+group by `group_membership_lock`).
+
+> **Known limitation (multi-member):** for a 2nd+ member the owner's roster
+> converges, but the joiner's `MemberAdded`+`Welcome` is not yet delivered (the
+> joiner's anchor-poll times out), so it never enters the tree and cannot
+> encrypt. Multi-member *secure participation* is a tracked follow-up; today,
+> rely on single-member private secure groups.
+
+The **Group Shared Secret (GSS)** plane below remains in use for **public**
+encrypted presets (`public_request_secure`) and **grandfathered** groups created
+before the cutover — see
+[ADR 0010](../adr/0010-gss-before-mls-treekem-for-v1-secure-groups.md) (forward
+path superseded by ADR 0012):
 
 - a 32-byte shared secret is generated at group creation;
 - on ban / remove, the secret is rotated to a new `epoch` and the new

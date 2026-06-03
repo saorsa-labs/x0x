@@ -213,8 +213,39 @@ def _poll_member_in_tree(member: X0xClient, gid: str, settle_secs: float) -> boo
     return False
 
 
+def _invite_join_converge(anchor: X0xClient, gid: str, member: X0xClient,
+                          member_agent: str, settle_secs: float, idx: int,
+                          tag: str, timed) -> Optional[IterResult]:
+    """Mint an invite, join `member`, and converge it into the anchor roster AND
+    the TreeKEM tree. Returns None on success, or a failing IterResult.
+
+    `tag` distinguishes timing/step labels per member (e.g. "m1", "m2") so a
+    multi-member iteration's steps don't collide. The second+ member exercises
+    exactly the path 0.21.0 repaired: a new joiner converging while an earlier
+    member is already Active (a stale-clone GroupInfo overwrite used to drop the
+    new joiner's invite -> invite_secret_unknown -> never converges)."""
+    inv = timed(f"invite_{tag}", lambda: anchor.req(
+        "POST", f"/groups/{gid}/invite", body={}))
+    link = inv.get("invite_link") or inv.get("invite") or ""
+    if not link:
+        return IterResult(False, f"invite_{tag}", f"no invite link: {inv}")
+    timed(f"join_{tag}", lambda: member.req(
+        "POST", "/groups/join", body={"invite": link, "display_name": f"{tag}-{idx}"}))
+    if not timed(f"converge_roster_{tag}", lambda: _poll_member_active(
+            anchor, gid, member_agent, settle_secs)):
+        return IterResult(False, f"converge_roster_{tag}",
+                          f"{tag} not Active in anchor roster")
+    if not timed(f"converge_member_{tag}", lambda: _poll_member_in_tree(
+            member, gid, settle_secs)):
+        return IterResult(False, f"converge_member_{tag}",
+                          f"{tag} never joined the TreeKEM tree (Welcome not processed)")
+    return None
+
+
 def run_iteration(anchor: X0xClient, member: X0xClient, member_agent: str,
-                  settle_secs: float, idx: int) -> IterResult:
+                  settle_secs: float, idx: int,
+                  member2: Optional[X0xClient] = None,
+                  member2_agent: str = "") -> IterResult:
     t: Dict[str, float] = {}
     gid = ""
     cur = {"step": "start"}
@@ -235,48 +266,68 @@ def run_iteration(anchor: X0xClient, member: X0xClient, member_agent: str,
         if not gid:
             return IterResult(False, "create", f"no group_id: {created}", t)
 
-        # 2. anchor mints an invite
-        inv = timed("invite", lambda: anchor.req(
-            "POST", f"/groups/{gid}/invite", body={}))
-        link = inv.get("invite_link") or inv.get("invite") or ""
-        if not link:
-            return IterResult(False, "invite", f"no invite link: {inv}", t)
+        # 2-4. first member: invite -> join -> converge (roster + tree)
+        fail = _invite_join_converge(
+            anchor, gid, member, member_agent, settle_secs, idx, "m1", timed)
+        if fail:
+            fail.timings = t
+            return fail
 
-        # 3. member joins via invite (drives the MemberJoined/Welcome flow)
-        timed("join", lambda: member.req(
-            "POST", "/groups/join", body={"invite": link, "display_name": f"m{idx}"}))
+        # 4c. MULTI-MEMBER (the 0.21.0 fix surface): add a SECOND member while
+        #     the first is already Active. Then re-confirm the first is STILL
+        #     Active in the anchor roster (a second add must not clobber it).
+        if member2 is not None:
+            fail = _invite_join_converge(
+                anchor, gid, member2, member2_agent, settle_secs, idx, "m2", timed)
+            if fail:
+                fail.timings = t
+                return fail
+            if not timed("m1_still_active", lambda: _poll_member_active(
+                    anchor, gid, member_agent, settle_secs)):
+                return IterResult(False, "m1_still_active",
+                                  "first member dropped from roster after second add", t)
 
-        # 4a. anchor-roster convergence (necessary, not sufficient)
-        if not timed("converge_roster", lambda: _poll_member_active(
-                anchor, gid, member_agent, settle_secs)):
-            return IterResult(False, "converge_roster",
-                              "member not Active in anchor roster", t)
-        # 4b. member genuinely JOINED the tree (processed the Welcome): it can
-        #     encrypt on the treekem plane. Guards against the roster-Active-but-
-        #     Welcome-not-processed false-green (harness review HIGH #1).
-        if not timed("converge_member", lambda: _poll_member_in_tree(
-                member, gid, settle_secs)):
-            return IterResult(False, "converge_member",
-                              "member never joined the TreeKEM tree (Welcome not processed)", t)
-
-        # 5. cross-daemon secure round-trip, BOTH directions, asserting the
-        #    treekem plane on every leg (no silent GSS fallback).
-        msg_am = f"a->m #{idx}"
-        if timed("member_decrypt", lambda: _tk_decrypt(
+        # 5. cross-daemon secure round-trip, asserting the treekem plane on every
+        #    leg (no silent GSS fallback). anchor<->m1 both ways; with m2 present,
+        #    anchor<->m2 and m1<->m2 too (all members share the same epoch tree).
+        msg_am = f"a->m1 #{idx}"
+        if timed("m1_decrypt", lambda: _tk_decrypt(
                 member, gid, _tk_encrypt(anchor, gid, msg_am))) != msg_am:
-            return IterResult(False, "member_decrypt", "a->m payload mismatch", t)
-        msg_ma = f"m->a #{idx}"
+            return IterResult(False, "m1_decrypt", "a->m1 payload mismatch", t)
+        msg_ma = f"m1->a #{idx}"
         if timed("anchor_decrypt", lambda: _tk_decrypt(
                 anchor, gid, _tk_encrypt(member, gid, msg_ma))) != msg_ma:
-            return IterResult(False, "anchor_decrypt", "m->a payload mismatch", t)
+            return IterResult(False, "anchor_decrypt", "m1->a payload mismatch", t)
+        if member2 is not None:
+            msg_am2 = f"a->m2 #{idx}"
+            if timed("m2_decrypt", lambda: _tk_decrypt(
+                    member2, gid, _tk_encrypt(anchor, gid, msg_am2))) != msg_am2:
+                return IterResult(False, "m2_decrypt", "a->m2 payload mismatch", t)
+            msg_m12 = f"m1->m2 #{idx}"
+            if timed("m1_to_m2", lambda: _tk_decrypt(
+                    member2, gid, _tk_encrypt(member, gid, msg_m12))) != msg_m12:
+                return IterResult(False, "m1_to_m2", "m1->m2 payload mismatch", t)
 
-        # 6. ban the member (verified TreeKEM removal + epoch advance)
+        # 6. ban the LAST-added member (m2 if present, else m1): verified TreeKEM
+        #    removal + epoch advance.
+        ban_target = member2_agent if member2 is not None else member_agent
+        banned_client = member2 if member2 is not None else member
+        ban_tag = "m2" if member2 is not None else "m1"
         timed("ban", lambda: anchor.req(
-            "POST", f"/groups/{gid}/ban/{member_agent}", body={}))
+            "POST", f"/groups/{gid}/ban/{ban_target}", body={}))
 
-        # 7. forward secrecy: the member was PROVEN in-tree above, so a post-ban
-        #    failure to decrypt fresh anchor content is genuine FS, not "never
-        #    joined". Poll over the window: a LEAK = member recovers the matching
+        # 6b. with a second member present, the NON-banned member (m1) must
+        #     survive the ban — still Active and still able to encrypt on the
+        #     post-ban epoch tree (epoch advanced under it without eviction).
+        if member2 is not None:
+            if not timed("m1_survives_ban", lambda: _poll_member_in_tree(
+                    member, gid, settle_secs)):
+                return IterResult(False, "m1_survives_ban",
+                                  "non-banned member lost the TreeKEM tree after ban", t)
+
+        # 7. forward secrecy: the banned member was PROVEN in-tree above, so a
+        #    post-ban failure to decrypt fresh anchor content is genuine FS, not
+        #    "never joined". Poll: a LEAK = banned member recovers the matching
         #    plaintext at any point; any error/non-match = FS holding.
         def fs_check() -> Optional[str]:
             deadline = time.monotonic() + min(settle_secs, 45.0)
@@ -285,8 +336,8 @@ def run_iteration(anchor: X0xClient, member: X0xClient, member_agent: str,
                 secret = f"post-ban #{idx}-{n}"
                 ct = _tk_encrypt(anchor, gid, secret)  # anchor at post-ban epoch
                 try:
-                    if _tk_decrypt(member, gid, ct) == secret:
-                        return "banned member decrypted post-ban content"
+                    if _tk_decrypt(banned_client, gid, ct) == secret:
+                        return f"banned member ({ban_tag}) decrypted post-ban content"
                 except (ApiError, AssertionError):
                     pass  # rejection / not-loaded = FS holds (member is out)
                 n += 1
@@ -315,6 +366,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--tokens-file", default=None)
     p.add_argument("--anchor", default="nyc")
     p.add_argument("--member", default="sfo")
+    p.add_argument("--member2", default=None,
+                   help="optional second member node — exercises multi-member "
+                        "TreeKEM convergence (the 0.21.0 fix surface)")
     p.add_argument("--iterations", type=int, default=1)
     p.add_argument("--settle-secs", type=float, default=90.0,
                    help="max time to wait for cross-daemon membership convergence")
@@ -330,16 +384,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     banner(net)
     tokens_path = args.tokens_file or str(net.token_file)
     tokens = load_tokens(tokens_path, var_prefix=net.var_prefix)
-    for role, name in (("anchor", args.anchor), ("member", args.member)):
+    roles = [("anchor", args.anchor), ("member", args.member)]
+    if args.member2:
+        roles.append(("member2", args.member2))
+    for role, name in roles:
         if name not in tokens:
             LOG.error("no token/IP for %s node %r in %s", role, name, tokens_path)
             return 2
 
     a_ip, a_tok = tokens[args.anchor]
     m_ip, m_tok = tokens[args.member]
-    a_tun = m_tun = None
+    a_tun = m_tun = m2_tun = None
     try:
-        LOG.info("opening tunnels: anchor=%s member=%s", args.anchor, args.member)
+        LOG.info("opening tunnels: anchor=%s member=%s%s", args.anchor, args.member,
+                 f" member2={args.member2}" if args.member2 else "")
         a_tun = start_tunnel(a_ip)
         m_tun = start_tunnel(m_ip)
         anchor = X0xClient(f"http://127.0.0.1:{a_tun.local_port}", a_tok)
@@ -349,9 +407,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             LOG.error("could not resolve member agent_id")
             return 2
 
+        member2 = None
+        member2_agent = ""
+        if args.member2:
+            m2_ip, m2_tok = tokens[args.member2]
+            m2_tun = start_tunnel(m2_ip)
+            member2 = X0xClient(f"http://127.0.0.1:{m2_tun.local_port}", m2_tok)
+            member2_agent = member2.req("GET", "/agent").get("agent_id", "")
+            if not member2_agent:
+                LOG.error("could not resolve member2 agent_id")
+                return 2
+
         passed = 0
         for i in range(1, args.iterations + 1):
-            r = run_iteration(anchor, member, member_agent, args.settle_secs, i)
+            r = run_iteration(anchor, member, member_agent, args.settle_secs, i,
+                              member2=member2, member2_agent=member2_agent)
             if r.ok:
                 passed += 1
                 LOG.info("iter %d/%d PASS  timings=%s", i, args.iterations, r.timings)
@@ -366,6 +436,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             stop_tunnel(a_tun)
         if m_tun:
             stop_tunnel(m_tun)
+        if m2_tun:
+            stop_tunnel(m2_tun)
 
 
 if __name__ == "__main__":
