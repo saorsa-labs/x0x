@@ -16,7 +16,7 @@
 //! x0xd --list                           # list running instances
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -214,6 +214,10 @@ pub const DEFAULT_QUIC_PORT: u16 = 5483;
 
 const GROUP_BACKGROUND_PUBLISH_DELAY: Duration = Duration::from_secs(8);
 const NAMED_GROUP_METADATA_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+const TREEKEM_PENDING_EVENTS_PER_GROUP_CAP: usize = 64;
+const TREEKEM_EVENT_LOG_PER_GROUP_CAP: usize = 128;
+const TREEKEM_CATCHUP_RESPONSE_EVENT_CAP: usize = 32;
+const TREEKEM_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
 
 fn default_bootstrap_peers() -> Vec<SocketAddr> {
     x0x::network::DEFAULT_BOOTSTRAP_PEERS
@@ -444,6 +448,27 @@ struct AppState {
     pending_welcome_waiters: RwLock<HashMap<String, Vec<WelcomeFetchWaiter>>>,
     /// Per-active Welcome blob transfer ack slots.
     pending_welcome_acks: RwLock<HashMap<String, Arc<FileChunkAckSlot>>>,
+    /// Bounded per-group queue for verified TreeKEM membership events that
+    /// arrived before local TreeKEM readiness or ahead of our state frontier.
+    treekem_pending_events: RwLock<HashMap<String, VecDeque<PendingTreeKemMetadataEvent>>>,
+    /// Bounded per-group log of locally authored/applied TreeKEM membership
+    /// events used to satisfy explicit catch-up requests.
+    treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,
+    /// Anti-spam throttle for outbound catch-up requests.
+    treekem_catchup_throttle: RwLock<HashMap<String, Instant>>,
+    /// Per-group serialization for authoritative membership mutations. The
+    /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
+    /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates
+    /// the live MLS tree, then commits the roster — across several locks, not
+    /// one. The gossip metadata listener and the direct-channel listener call
+    /// `apply_named_group_metadata_event` for the same group concurrently, so
+    /// without serialization two stale clones can both pass the
+    /// `has_active_member` check, both consume the bearer invite, and double-add
+    /// to the MLS tree (the second add fails "already a member") while the
+    /// roster is clobbered or never committed — leaving tree and roster
+    /// permanently diverged. This per-group mutex serializes those applies so
+    /// the second observes the committed add and cleanly no-ops.
+    group_membership_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     /// Live real-TreeKEM groups (ADR-0012), keyed by group-id hex. Each is
     /// wrapped in its own async mutex so a group's encrypt/decrypt/commit op
     /// and the snapshot-persist that follows it are serialized per group
@@ -1534,6 +1559,10 @@ async fn main() -> Result<()> {
         pending_welcome_receives: RwLock::new(HashMap::new()),
         pending_welcome_waiters: RwLock::new(HashMap::new()),
         pending_welcome_acks: RwLock::new(HashMap::new()),
+        treekem_pending_events: RwLock::new(HashMap::new()),
+        treekem_event_log: RwLock::new(HashMap::new()),
+        treekem_catchup_throttle: RwLock::new(HashMap::new()),
+        group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
         ws_sessions: RwLock::new(HashMap::new()),
@@ -1846,6 +1875,43 @@ async fn main() -> Result<()> {
                     continue;
                 };
                 handle_welcome_blob_message(&welcome_state, &msg.sender, welcome_msg).await;
+            }
+        });
+    }
+
+    // Background TreeKEM catch-up listener — explicit anti-entropy for
+    // order-sensitive membership events that arrive before local readiness or
+    // ahead of the local epoch/state frontier.
+    {
+        let catchup_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut rx = catchup_state.agent.subscribe_direct();
+            loop {
+                let Some(msg) = rx.recv().await else { break };
+                if let Ok(request) = serde_json::from_slice::<TreeKemCatchupRequest>(&msg.payload) {
+                    if request.message_type == "treekem_catchup_request" {
+                        handle_treekem_catchup_request(
+                            &catchup_state,
+                            &msg.sender,
+                            msg.verified,
+                            request,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
+                {
+                    if response.message_type == "treekem_catchup_response" {
+                        handle_treekem_catchup_response(
+                            &catchup_state,
+                            &msg.sender,
+                            msg.verified,
+                            response,
+                        )
+                        .await;
+                    }
+                }
             }
         });
     }
@@ -5541,6 +5607,33 @@ struct PendingWelcomeReceive {
     received_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
+struct PendingTreeKemMetadataEvent {
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    queued_at: Instant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TreeKemCatchupRequest {
+    message_type: String,
+    group_id: String,
+    requester_agent_id: String,
+    from_revision: u64,
+    from_treekem_epoch: u64,
+    current_state_hash: String,
+    missing_prev_state_hash: Option<String>,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TreeKemCatchupResponse {
+    message_type: String,
+    group_id: String,
+    events: Vec<NamedGroupMetadataEvent>,
+    truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum JoinResultMessage {
@@ -6793,6 +6886,76 @@ fn spawn_named_group_event_delivery(
     });
 }
 
+fn spawn_named_group_event_delivery_after(
+    state: &AppState,
+    recipient_hex: &str,
+    event: &NamedGroupMetadataEvent,
+    delay: Duration,
+) {
+    let recipient = match parse_agent_id_hex(recipient_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                requester = %recipient_hex,
+                "cannot delayed-direct-deliver named-group event: invalid requester id: {e}"
+            );
+            return;
+        }
+    };
+    let payload = match serde_json::to_vec(event) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                "failed to serialize named-group event for delayed direct delivery: {e}"
+            );
+            return;
+        }
+    };
+    let agent = Arc::clone(&state.agent);
+    let requester = recipient_hex.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if let Err(e) = agent
+            .send_direct_with_config(&recipient, payload, direct_message_send_config())
+            .await
+        {
+            tracing::warn!(
+                requester = %requester,
+                "failed to delayed-direct-deliver named-group event: {e}"
+            );
+        }
+    });
+}
+
+fn spawn_named_group_event_delivery_to_active_members(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    extra_recipients: &[String],
+) {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut recipients = HashSet::new();
+    for member in info.active_members() {
+        if !member.agent_id.eq_ignore_ascii_case(&local_agent_hex) {
+            recipients.insert(member.agent_id.clone());
+        }
+    }
+    for recipient in extra_recipients {
+        if !recipient.eq_ignore_ascii_case(&local_agent_hex) {
+            recipients.insert(recipient.clone());
+        }
+    }
+    for recipient in recipients {
+        spawn_named_group_event_delivery(state, &recipient, event);
+        spawn_named_group_event_delivery_after(
+            state,
+            &recipient,
+            event,
+            GROUP_BACKGROUND_PUBLISH_DELAY,
+        );
+    }
+}
+
 async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     let handle = state.group_metadata_tasks.write().await.remove(group_id);
     if let Some(handle) = handle {
@@ -6887,11 +7050,602 @@ async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id:
     }
 }
 
+struct TreeKemMembershipFrontier<'a> {
+    group_id: &'a str,
+    revision: u64,
+    epoch: Option<u64>,
+    commit: &'a x0x::groups::GroupStateCommit,
+    actor: &'a str,
+    target: &'a str,
+}
+
+fn treekem_membership_event_frontier(
+    event: &NamedGroupMetadataEvent,
+) -> Option<TreeKemMembershipFrontier<'_>> {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded {
+            group_id,
+            revision,
+            actor,
+            agent_id,
+            treekem_epoch,
+            commit: Some(commit),
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberRemoved {
+            group_id,
+            revision,
+            actor,
+            agent_id,
+            treekem_epoch,
+            commit: Some(commit),
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberBanned {
+            group_id,
+            revision,
+            actor,
+            agent_id,
+            treekem_epoch,
+            commit: Some(commit),
+            ..
+        } => Some(TreeKemMembershipFrontier {
+            group_id,
+            revision: *revision,
+            epoch: *treekem_epoch,
+            commit,
+            actor,
+            target: agent_id,
+        }),
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id,
+            revision,
+            actor,
+            requester_agent_id,
+            treekem_epoch,
+            commit: Some(commit),
+            ..
+        } => Some(TreeKemMembershipFrontier {
+            group_id,
+            revision: *revision,
+            epoch: *treekem_epoch,
+            commit,
+            actor,
+            target: requester_agent_id,
+        }),
+        _ => None,
+    }
+}
+
+fn treekem_membership_event_key(event: &NamedGroupMetadataEvent) -> Option<String> {
+    let frontier = treekem_membership_event_frontier(event)?;
+    let kind = match event {
+        NamedGroupMetadataEvent::MemberAdded { .. } => "add",
+        NamedGroupMetadataEvent::MemberRemoved { .. } => "remove",
+        NamedGroupMetadataEvent::MemberBanned { .. } => "ban",
+        NamedGroupMetadataEvent::JoinRequestApproved { .. } => "approve",
+        _ => return None,
+    };
+    Some(format!(
+        "{}:{kind}:{}:{}:{}:{}",
+        frontier.group_id,
+        frontier.revision,
+        frontier.epoch.unwrap_or_default(),
+        frontier.actor,
+        frontier.target
+    ))
+}
+
+fn treekem_membership_event_sort_key(event: &NamedGroupMetadataEvent) -> (u64, u64) {
+    treekem_membership_event_frontier(event)
+        .map(|frontier| (frontier.revision, frontier.epoch.unwrap_or_default()))
+        .unwrap_or_default()
+}
+
+fn treekem_event_is_local_welcome(event: &NamedGroupMetadataEvent, local_agent_hex: &str) -> bool {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => agent_id == local_agent_hex,
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            requester_agent_id, ..
+        } => requester_agent_id == local_agent_hex,
+        _ => false,
+    }
+}
+
+async fn current_treekem_epoch(state: &AppState, group_id: &str) -> Option<u64> {
+    let group = state.treekem_groups.read().await.get(group_id).cloned();
+    let group = group?;
+    let epoch = group.lock().await.epoch();
+    Some(epoch)
+}
+
+fn authorized_treekem_membership_event_for_queue(
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    sender_hex: &str,
+    creator_hex: &str,
+) -> bool {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded {
+            actor,
+            commit: Some(_),
+            treekem_commit_b64: Some(_),
+            treekem_epoch: Some(_),
+            ..
+        } => sender_hex == creator_hex && actor == sender_hex,
+        NamedGroupMetadataEvent::MemberRemoved {
+            actor,
+            agent_id,
+            commit: Some(_),
+            treekem_commit_b64: Some(_),
+            treekem_epoch: Some(_),
+            ..
+        } => (sender_hex == creator_hex || sender_hex == agent_id) && actor == sender_hex,
+        NamedGroupMetadataEvent::MemberBanned {
+            actor,
+            agent_id,
+            commit: Some(_),
+            treekem_commit_b64: Some(_),
+            treekem_epoch: Some(_),
+            ..
+        } => {
+            actor == sender_hex
+                && info
+                    .caller_role(actor)
+                    .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
+                && info.caller_role(agent_id) != Some(x0x::groups::GroupRole::Owner)
+        }
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            actor,
+            requester_agent_id,
+            request_id,
+            commit: Some(_),
+            treekem_commit_b64: Some(_),
+            treekem_epoch: Some(_),
+            ..
+        } => {
+            actor == sender_hex
+                && info
+                    .caller_role(actor)
+                    .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
+                && info.join_requests.get(request_id).is_some_and(|req| {
+                    req.is_pending() && req.requester_agent_id == *requester_agent_id
+                })
+        }
+        _ => false,
+    }
+}
+
+fn treekem_state_frontier_gap_reason(
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    local_agent_hex: &str,
+    local_epoch: Option<u64>,
+) -> Option<String> {
+    if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+        return None;
+    }
+    let frontier = treekem_membership_event_frontier(event)?;
+    let is_local_welcome = treekem_event_is_local_welcome(event, local_agent_hex);
+    if !is_local_welcome {
+        if frontier.commit.revision <= info.state_revision
+            || frontier.revision <= info.roster_revision
+        {
+            return None;
+        }
+        if frontier.commit.revision > info.state_revision.saturating_add(1)
+            || frontier.revision > info.roster_revision.saturating_add(1)
+        {
+            return Some("revision_gap".to_string());
+        }
+        if frontier.commit.prev_state_hash.as_deref() != Some(info.state_hash.as_str()) {
+            return Some("state_hash_gap".to_string());
+        }
+    }
+    if let Some(epoch) = frontier.epoch {
+        match local_epoch {
+            Some(local_epoch) if !is_local_welcome && epoch > local_epoch.saturating_add(1) => {
+                return Some("treekem_epoch_gap".to_string());
+            }
+            None if !is_local_welcome => return Some("treekem_not_ready".to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+async fn should_queue_treekem_membership_event(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    local_agent_hex: &str,
+) -> Option<String> {
+    let local_epoch = current_treekem_epoch(state, group_id).await;
+    treekem_state_frontier_gap_reason(info, event, local_agent_hex, local_epoch)
+}
+
+async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupMetadataEvent) {
+    let Some(frontier) = treekem_membership_event_frontier(event) else {
+        return;
+    };
+    let mut logs = state.treekem_event_log.write().await;
+    let log = logs.entry(frontier.group_id.to_string()).or_default();
+    if let Some(key) = treekem_membership_event_key(event) {
+        if log
+            .iter()
+            .filter_map(treekem_membership_event_key)
+            .any(|existing| existing == key)
+        {
+            return;
+        }
+    }
+    log.push_back(event.clone());
+    while log.len() > TREEKEM_EVENT_LOG_PER_GROUP_CAP {
+        log.pop_front();
+    }
+}
+
+async fn queue_treekem_membership_event(
+    state: &Arc<AppState>,
+    group_id: &str,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    reason: &str,
+) {
+    let queued = PendingTreeKemMetadataEvent {
+        event: event.clone(),
+        sender,
+        queued_at: Instant::now(),
+    };
+    let key = treekem_membership_event_key(&event);
+    {
+        let mut pending = state.treekem_pending_events.write().await;
+        let queue = pending.entry(group_id.to_string()).or_default();
+        if let Some(key) = key.as_deref() {
+            if queue
+                .iter()
+                .filter_map(|pending| treekem_membership_event_key(&pending.event))
+                .any(|existing| existing == key)
+            {
+                return;
+            }
+        }
+        queue.push_back(queued);
+        queue
+            .make_contiguous()
+            .sort_by_key(|pending| treekem_membership_event_sort_key(&pending.event));
+        while queue.len() > TREEKEM_PENDING_EVENTS_PER_GROUP_CAP {
+            queue.pop_front();
+        }
+    }
+    tracing::warn!(group_id = %group_id, reason, "queued TreeKEM membership event pending catch-up/replay");
+    request_treekem_catchup_for_gap(state, group_id, &event, sender).await;
+}
+
+async fn request_treekem_catchup_for_gap(
+    state: &Arc<AppState>,
+    group_id: &str,
+    event: &NamedGroupMetadataEvent,
+    sender: AgentId,
+) {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let Some(frontier) = treekem_membership_event_frontier(event) else {
+        return;
+    };
+    let (from_revision, from_epoch, current_state_hash) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id) else {
+            return;
+        };
+        (
+            info.state_revision,
+            info.secret_epoch,
+            info.state_hash.clone(),
+        )
+    };
+    let mut peers = Vec::new();
+    if !frontier.actor.eq_ignore_ascii_case(&local_agent_hex) {
+        if let Ok(peer) = parse_agent_id_hex(frontier.actor) {
+            peers.push(peer);
+        }
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    if sender_hex != local_agent_hex && !peers.contains(&sender) {
+        peers.push(sender);
+    }
+    for peer in peers {
+        let peer_hex = hex::encode(peer.as_bytes());
+        let throttle_key = format!("{group_id}:{peer_hex}:{from_revision}:{from_epoch}");
+        {
+            let mut throttle = state.treekem_catchup_throttle.write().await;
+            if throttle
+                .get(&throttle_key)
+                .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+            {
+                continue;
+            }
+            throttle.insert(throttle_key, Instant::now());
+        }
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: group_id.to_string(),
+            requester_agent_id: local_agent_hex.clone(),
+            from_revision,
+            from_treekem_epoch: from_epoch,
+            current_state_hash: current_state_hash.clone(),
+            missing_prev_state_hash: frontier.commit.prev_state_hash.clone(),
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        let payload = match serde_json::to_vec(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(group_id = %group_id, "failed to serialize TreeKEM catch-up request: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = state
+            .agent
+            .send_direct_with_config(&peer, payload, direct_message_send_config())
+            .await
+        {
+            tracing::debug!(group_id = %group_id, peer = %peer_hex, "TreeKEM catch-up request failed: {e}");
+        }
+    }
+}
+
+async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
+    let entries = {
+        let mut pending = state.treekem_pending_events.write().await;
+        let Some(queue) = pending.get_mut(group_id) else {
+            return;
+        };
+        let mut entries: Vec<_> = queue.drain(..).collect();
+        entries.retain(|pending| pending.queued_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+        entries.sort_by_key(|pending| treekem_membership_event_sort_key(&pending.event));
+        entries
+    };
+    let mut still_pending = VecDeque::new();
+    for pending in entries {
+        let applied = apply_named_group_metadata_event_inner(
+            state,
+            pending.event.clone(),
+            pending.sender,
+            true,
+            false,
+        )
+        .await;
+        if !applied && treekem_membership_event_frontier(&pending.event).is_some() {
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let info = {
+                let groups = state.named_groups.read().await;
+                groups.get(group_id).cloned()
+            };
+            if let Some(info) = info {
+                if should_queue_treekem_membership_event(
+                    state,
+                    group_id,
+                    &info,
+                    &pending.event,
+                    &local_agent_hex,
+                )
+                .await
+                .is_some()
+                {
+                    still_pending.push_back(pending);
+                }
+            }
+        }
+    }
+    if !still_pending.is_empty() {
+        let mut pending = state.treekem_pending_events.write().await;
+        let queue = pending.entry(group_id.to_string()).or_default();
+        for item in still_pending {
+            queue.push_back(item);
+        }
+        while queue.len() > TREEKEM_PENDING_EVENTS_PER_GROUP_CAP {
+            queue.pop_front();
+        }
+    }
+}
+
+async fn handle_treekem_catchup_request(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    request: TreeKemCatchupRequest,
+) {
+    if !verified || request.message_type != "treekem_catchup_request" {
+        return;
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    if sender_hex != request.requester_agent_id {
+        return;
+    }
+    let (authorized, log_keys) = {
+        let groups = state.named_groups.read().await;
+        if let Some((key, info)) = groups.get_key_value(&request.group_id).or_else(|| {
+            groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == request.group_id)
+        }) {
+            let mut keys = vec![
+                request.group_id.clone(),
+                key.clone(),
+                info.stable_group_id().to_string(),
+            ];
+            keys.sort();
+            keys.dedup();
+            (info.has_active_member(&sender_hex), keys)
+        } else {
+            (false, vec![request.group_id.clone()])
+        }
+    };
+    let target_of_cached_add = {
+        let logs = state.treekem_event_log.read().await;
+        log_keys.iter().any(|key| {
+            logs.get(key).is_some_and(|events| {
+                events.iter().any(|event| match event {
+                    NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => {
+                        agent_id == &sender_hex
+                    }
+                    NamedGroupMetadataEvent::JoinRequestApproved {
+                        requester_agent_id, ..
+                    } => requester_agent_id == &sender_hex,
+                    _ => false,
+                })
+            })
+        })
+    };
+    if !authorized && !target_of_cached_add {
+        tracing::warn!(group_id = %request.group_id, requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
+        return;
+    }
+    let mut events = {
+        let logs = state.treekem_event_log.read().await;
+        let mut events = Vec::new();
+        for key in &log_keys {
+            if let Some(logged) = logs.get(key) {
+                events.extend(logged.iter().cloned());
+            }
+        }
+        events
+            .into_iter()
+            .filter(|event| {
+                treekem_membership_event_frontier(event).is_some_and(|frontier| {
+                    frontier.revision > request.from_revision
+                        || frontier.epoch.unwrap_or_default() > request.from_treekem_epoch
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    events.sort_by_key(treekem_membership_event_sort_key);
+    let truncated = events.len() > request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP);
+    events.truncate(request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP));
+    let response = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: request.group_id.clone(),
+        events,
+        truncated,
+    };
+    let payload = match serde_json::to_vec(&response) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(group_id = %request.group_id, "failed to serialize TreeKEM catch-up response: {e}");
+            return;
+        }
+    };
+    if let Err(e) = state
+        .agent
+        .send_direct_with_config(sender, payload, direct_message_send_config())
+        .await
+    {
+        tracing::warn!(group_id = %request.group_id, requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
+    }
+}
+
+async fn handle_treekem_catchup_response(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    response: TreeKemCatchupResponse,
+) {
+    if !verified || response.message_type != "treekem_catchup_response" {
+        return;
+    }
+    let was_truncated = response.truncated;
+    let mut events = response.events;
+    events.sort_by_key(treekem_membership_event_sort_key);
+    for event in events {
+        apply_named_group_metadata_event(state, event, *sender, true).await;
+    }
+    replay_pending_treekem_events(state, &response.group_id).await;
+    if was_truncated {
+        tracing::warn!(
+            group_id = %response.group_id,
+            sender = %hex::encode(sender.as_bytes()),
+            "TreeKEM catch-up response was truncated; requesting next page"
+        );
+        request_treekem_catchup_page(state, &response.group_id, sender).await;
+    }
+}
+
+async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, peer: &AgentId) {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (from_revision, from_epoch, current_state_hash) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_id)
+        }) else {
+            return;
+        };
+        (
+            info.state_revision,
+            info.secret_epoch,
+            info.state_hash.clone(),
+        )
+    };
+    let request = TreeKemCatchupRequest {
+        message_type: "treekem_catchup_request".to_string(),
+        group_id: group_id.to_string(),
+        requester_agent_id: local_agent_hex,
+        from_revision,
+        from_treekem_epoch: from_epoch,
+        current_state_hash,
+        missing_prev_state_hash: None,
+        limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+    };
+    let payload = match serde_json::to_vec(&request) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(group_id = %group_id, "failed to serialize paged TreeKEM catch-up request: {e}");
+            return;
+        }
+    };
+    if let Err(e) = state
+        .agent
+        .send_direct_with_config(peer, payload, direct_message_send_config())
+        .await
+    {
+        tracing::debug!(group_id = %group_id, peer = %hex::encode(peer.as_bytes()), "paged TreeKEM catch-up request failed: {e}");
+    }
+}
+
+/// Get-or-create the per-group membership serialization mutex. See
+/// [`AppState::group_membership_locks`] for why membership applies must be
+/// serialized per group.
+async fn group_membership_lock(state: &AppState, group_key: &str) -> Arc<Mutex<()>> {
+    {
+        let locks = state.group_membership_locks.read().await;
+        if let Some(lock) = locks.get(group_key) {
+            return Arc::clone(lock);
+        }
+    }
+    let mut locks = state.group_membership_locks.write().await;
+    Arc::clone(
+        locks
+            .entry(group_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
 async fn apply_named_group_metadata_event(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
     sender: AgentId,
     verified: bool,
+) -> bool {
+    apply_named_group_metadata_event_inner(state, event, sender, verified, true).await
+}
+
+async fn apply_named_group_metadata_event_inner(
+    state: &Arc<AppState>,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    verified: bool,
+    allow_queue: bool,
 ) -> bool {
     if !verified {
         return false;
@@ -6916,9 +7670,9 @@ async fn apply_named_group_metadata_event(
     };
 
     let sender_hex = hex::encode(sender.as_bytes());
-    let (resolved_group_key, info) = {
+    let resolved_group_key = {
         let groups = state.named_groups.read().await;
-        let resolved_group_key = if groups.contains_key(&group_id) {
+        if groups.contains_key(&group_id) {
             group_id.clone()
         } else if let Some((key, _)) = groups
             .iter()
@@ -6927,11 +7681,24 @@ async fn apply_named_group_metadata_event(
             key.clone()
         } else {
             return false;
-        };
+        }
+    };
+    // Serialize every membership apply for this group across the concurrent
+    // gossip metadata listener and direct-channel listener. Held for the rest
+    // of the apply so the load-mutate-commit sequence below cannot interleave
+    // with a duplicate of the same event arriving on the other transport. The
+    // direct-DM delivery added for reliability means the owner now receives the
+    // same `MemberJoined` on two independent tasks at once; without this guard
+    // they double-add to the MLS tree and clobber the roster. `info` is loaded
+    // *under* the guard so no stale clone from a racing apply is in flight.
+    let membership_lock = group_membership_lock(state, &resolved_group_key).await;
+    let _membership_guard = membership_lock.lock().await;
+    let info = {
+        let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&resolved_group_key).cloned() else {
             return false;
         };
-        (resolved_group_key, info)
+        info
     };
     let creator_hex = hex::encode(info.creator.as_bytes());
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -6944,6 +7711,27 @@ async fn apply_named_group_metadata_event(
         );
         return false;
     }
+
+    if allow_queue
+        && treekem_membership_event_frontier(&event).is_some()
+        && authorized_treekem_membership_event_for_queue(&info, &event, &sender_hex, &creator_hex)
+    {
+        if let Some(reason) = should_queue_treekem_membership_event(
+            state,
+            &resolved_group_key,
+            &info,
+            &event,
+            &local_agent_hex,
+        )
+        .await
+        {
+            queue_treekem_membership_event(state, &resolved_group_key, event, sender, &reason)
+                .await;
+            return false;
+        }
+    }
+
+    let event_for_log = event.clone();
 
     match event {
         NamedGroupMetadataEvent::MemberAdded {
@@ -7114,7 +7902,8 @@ async fn apply_named_group_metadata_event(
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             save_mls_groups(state).await;
-            false
+            remember_treekem_membership_event(state, &event_for_log).await;
+            true
         }
         NamedGroupMetadataEvent::MemberRemoved {
             revision,
@@ -7238,7 +8027,8 @@ async fn apply_named_group_metadata_event(
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             save_mls_groups(state).await;
-            false
+            remember_treekem_membership_event(state, &event_for_log).await;
+            true
         }
         NamedGroupMetadataEvent::GroupDeleted {
             revision,
@@ -7483,7 +8273,8 @@ async fn apply_named_group_metadata_event(
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
-            false
+            remember_treekem_membership_event(state, &event_for_log).await;
+            true
         }
         NamedGroupMetadataEvent::MemberUnbanned {
             revision,
@@ -7799,7 +8590,8 @@ async fn apply_named_group_metadata_event(
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
-            false
+            remember_treekem_membership_event(state, &event_for_log).await;
+            true
         }
         NamedGroupMetadataEvent::JoinRequestRejected {
             request_id,
@@ -8351,7 +9143,13 @@ async fn apply_named_group_metadata_event(
             };
             stage_join_result(state, &event_group_id, &member_agent_id, event.clone()).await;
             publish_named_group_metadata_event(state, &metadata_topic, &event).await;
-            spawn_named_group_event_delivery(state, &member_agent_id, &event);
+            remember_treekem_membership_event(state, &event).await;
+            spawn_named_group_event_delivery_to_active_members(
+                state,
+                &next,
+                &event,
+                std::slice::from_ref(&member_agent_id),
+            );
             maybe_publish_group_card_after_state_change(state, &resolved_group_key).await;
             tracing::info!(
                 group_id = %resolved_group_key,
@@ -9243,6 +10041,12 @@ async fn create_group_invite(
         Ok(r) => r,
         Err(resp) => return resp.into_response(),
     };
+    // Serialize this group-state mutation against concurrent membership applies
+    // and the other API mutators (see `AppState::group_membership_locks`): every
+    // read-modify-write of one group's `GroupInfo` must hold this lock, or a
+    // stale-clone apply storing afterward overwrites the invite we record here.
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
     let (link, mls_group_id, group_name, expires_at) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
@@ -9518,8 +10322,19 @@ async fn join_group_via_invite(
                     // event for an already-active member is a no-op), so
                     // double-publish is safe.
                     publish_named_group_metadata_event(&state, &info.metadata_topic, &event).await;
+                    // TreeKEM membership is order-sensitive: gossip remains the
+                    // broadcast path, but the join trigger must reach the inviter
+                    // reliably so they can produce the authoritative add commit.
+                    spawn_named_group_event_delivery(&state, &invite.inviter, &event);
+                    spawn_named_group_event_delivery_after(
+                        &state,
+                        &invite.inviter,
+                        &event,
+                        GROUP_BACKGROUND_PUBLISH_DELAY,
+                    );
                     let state_for_replay = Arc::clone(&state);
                     let topic_for_replay = info.metadata_topic.clone();
+                    let inviter_for_replay = invite.inviter.clone();
                     let event_for_replay = event;
                     tokio::spawn(async move {
                         tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
@@ -9529,6 +10344,11 @@ async fn join_group_via_invite(
                             &event_for_replay,
                         )
                         .await;
+                        spawn_named_group_event_delivery(
+                            &state_for_replay,
+                            &inviter_for_replay,
+                            &event_for_replay,
+                        );
                     });
                 }
                 Err(e) => {
@@ -9651,6 +10471,12 @@ async fn add_named_group_member(
     let local_agent = state.agent.agent_id();
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`). Held across the delegation to the
+    // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
 
     let (metadata_topic, event, members, epoch) = {
         let mut named_groups = state.named_groups.write().await;
@@ -9904,7 +10730,13 @@ async fn add_treekem_named_group_member(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    spawn_named_group_event_delivery(&state, &agent_hex, &event);
+    remember_treekem_membership_event(&state, &event).await;
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &next,
+        &event,
+        std::slice::from_ref(&agent_hex),
+    );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     let members = named_group_member_values(&next);
@@ -9936,6 +10768,11 @@ async fn remove_named_group_member(
     };
     let local_agent = state.agent.agent_id();
     let local_agent_hex = hex::encode(local_agent.as_bytes());
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`). Held across the delegation to the
+    // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
     {
         let groups = state.named_groups.read().await;
         if let Some(info) = groups.get(&id) {
@@ -10161,6 +10998,7 @@ async fn leave_treekem_group(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_treekem_membership_event(&state, &event).await;
 
     (
         StatusCode::OK,
@@ -10334,6 +11172,13 @@ async fn remove_treekem_named_group_member(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_treekem_membership_event(&state, &event).await;
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &next,
+        &event,
+        std::slice::from_ref(&agent_id_hex),
+    );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -10522,6 +11367,12 @@ async fn leave_group(
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`). Held across the delegation to the
+    // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
+
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return (
@@ -10688,6 +11539,10 @@ async fn update_named_group(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return (
@@ -10953,6 +11808,11 @@ async fn ban_group_member(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`). Held across the delegation to the
+    // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return (
@@ -11224,13 +12084,20 @@ async fn ban_treekem_group_member(
         group_id: event_group_id,
         revision,
         actor: caller_hex,
-        agent_id: agent_id_hex,
+        agent_id: agent_id_hex.clone(),
         secret_epoch: None,
         treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
         treekem_epoch: Some(treekem_epoch),
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_treekem_membership_event(&state, &event).await;
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &next,
+        &event,
+        std::slice::from_ref(&agent_id_hex),
+    );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -11475,6 +12342,11 @@ async fn approve_join_request(
     Path((id, request_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`). Held across the delegation to the
+    // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
     {
         let groups = state.named_groups.read().await;
         if let Some(info) = groups.get(&id) {
@@ -11837,7 +12709,13 @@ async fn approve_treekem_join_request(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    spawn_named_group_event_delivery(&state, &requester_hex, &event);
+    remember_treekem_membership_event(&state, &event).await;
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &next,
+        &event,
+        std::slice::from_ref(&requester_hex),
+    );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -18631,6 +19509,134 @@ mod tests {
             commit: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&member_unbanned));
+    }
+
+    #[test]
+    fn treekem_pending_event_helpers_dedupe_and_sort_by_frontier() {
+        fn fake_commit(revision: u64, prev: &str) -> x0x::groups::GroupStateCommit {
+            x0x::groups::GroupStateCommit {
+                group_id: "aa".to_string(),
+                revision,
+                prev_state_hash: Some(prev.to_string()),
+                roster_root: "roster".to_string(),
+                policy_hash: "policy".to_string(),
+                public_meta_hash: "meta".to_string(),
+                security_binding: Some(format!("treekem:epoch={revision}")),
+                state_hash: format!("state-{revision}"),
+                withdrawn: false,
+                committed_by: "11".to_string(),
+                committed_at: revision,
+                signer_public_key: "pub".to_string(),
+                signature: "sig".to_string(),
+            }
+        }
+
+        let add_epoch_2 = NamedGroupMetadataEvent::MemberAdded {
+            group_id: "aa".to_string(),
+            revision: 2,
+            actor: "11".to_string(),
+            agent_id: "22".to_string(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: Some("dw==".to_string()),
+            welcome_ref: None,
+            treekem_epoch: Some(2),
+            commit: Some(fake_commit(2, "state-1")),
+        };
+        let ban_epoch_3 = NamedGroupMetadataEvent::MemberBanned {
+            group_id: "aa".to_string(),
+            revision: 3,
+            actor: "11".to_string(),
+            agent_id: "33".to_string(),
+            secret_epoch: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_epoch: Some(3),
+            commit: Some(fake_commit(3, "state-2")),
+        };
+
+        assert_eq!(treekem_membership_event_sort_key(&ban_epoch_3), (3, 3));
+        assert_eq!(treekem_membership_event_sort_key(&add_epoch_2), (2, 2));
+        assert_ne!(
+            treekem_membership_event_key(&add_epoch_2),
+            treekem_membership_event_key(&ban_epoch_3)
+        );
+        assert_eq!(
+            treekem_membership_event_key(&add_epoch_2),
+            treekem_membership_event_key(&add_epoch_2.clone())
+        );
+    }
+
+    #[test]
+    fn treekem_local_welcome_does_not_queue_on_authority_state_gap() {
+        let local_agent_hex = "22".repeat(32);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            AgentId([9; 32]),
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.state_revision = 0;
+        info.roster_revision = 0;
+        info.state_hash = "joiner-stub-hash".to_string();
+        let commit = x0x::groups::GroupStateCommit {
+            group_id: "aa".to_string(),
+            revision: 10,
+            prev_state_hash: Some("authority-prev-hash".to_string()),
+            roster_root: "roster".to_string(),
+            policy_hash: "policy".to_string(),
+            public_meta_hash: "meta".to_string(),
+            security_binding: Some("treekem:epoch=10".to_string()),
+            state_hash: "authority-state-10".to_string(),
+            withdrawn: false,
+            committed_by: "11".to_string(),
+            committed_at: 10,
+            signer_public_key: "pub".to_string(),
+            signature: "sig".to_string(),
+        };
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: "aa".to_string(),
+            revision: 10,
+            actor: "11".to_string(),
+            agent_id: local_agent_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: Some("dw==".to_string()),
+            welcome_ref: None,
+            treekem_epoch: Some(10),
+            commit: Some(commit),
+        };
+
+        assert_eq!(
+            treekem_state_frontier_gap_reason(&info, &event, &local_agent_hex, None),
+            None
+        );
+    }
+
+    #[test]
+    fn treekem_catchup_messages_use_explicit_type_tags() {
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: "aa".to_string(),
+            requester_agent_id: "22".to_string(),
+            from_revision: 1,
+            from_treekem_epoch: 1,
+            current_state_hash: "state-1".to_string(),
+            missing_prev_state_hash: Some("state-2".to_string()),
+            limit: 8,
+        };
+        let encoded = serde_json::to_value(&request).expect("catch-up request serializes");
+        assert_eq!(encoded["message_type"], "treekem_catchup_request");
+
+        let response = TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: "aa".to_string(),
+            events: Vec::new(),
+            truncated: false,
+        };
+        let encoded = serde_json::to_value(&response).expect("catch-up response serializes");
+        assert_eq!(encoded["message_type"], "treekem_catchup_response");
     }
 
     #[test]

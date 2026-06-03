@@ -522,37 +522,55 @@ async fn d4_join_request_events_converge_via_signed_commits() {
 #[ignore]
 async fn d4_mls_ban_commit_advances_binding_and_converges() {
     let _guard = suite_lock().await;
-    let pair = pair().await;
-    let alice = &pair.alice;
-    let bob = &pair.bob;
+    // Use a fresh, OWNED trio (not the `cluster()` `&'static` singleton): the
+    // singleton's 3 daemons live for the whole test binary and are never
+    // dropped, so they linger on the loopback interface alongside every other
+    // d4 test's `pair()` daemons (3 + 2 = 5 concurrent QUIC endpoints). That
+    // contention is exactly the dual-stack-loopback hazard documented in
+    // `.config/nextest.toml`, and it intermittently stalls `d4_stateful`'s
+    // gossip convergence. An owned trio is killed when this test returns.
+    let cluster = cluster::trio_with_extra_config("").await;
+    let alice = &cluster.alice;
+    let bob = &cluster.bob;
+    let charlie = &cluster.charlie;
 
     // `private_secure` resolves to secure-by-default TreeKEM (ADR-0012). A ban is
-    // a verified TreeKEM removal that advances the group epoch. With single-
-    // committer TreeKEM the owner bans a REAL joined member (KeyPackage exchanged
-    // via the invite/Welcome flow); a fake agent_id cannot be added/banned on the
-    // TreeKEM plane. Convergence is observed by polling roster membership +
-    // the owner's epoch-bound `security_binding` (per-leaf TreeKEM states differ,
-    // so an exact cross-daemon state_hash match does not hold here).
+    // a verified TreeKEM removal that advances the group epoch. The owner bans a
+    // REAL invite-joined member (KeyPackage exchanged via invite/Welcome), while
+    // another non-banned member observes convergence. Per-leaf TreeKEM state hashes
+    // differ, so this test checks epoch-bound security bindings + roster state.
     let group_id = create_group_preset(alice, "D4 Ban", "treekem ban path", "private_secure").await;
-    let invite = create_invite(alice, &group_id).await;
-    let join = join_via_invite(bob, &invite, "bob-ban").await;
-    assert_eq!(join["ok"], true, "join response: {join:?}");
+
+    let bob_invite = create_invite(alice, &group_id).await;
+    let bob_join = join_via_invite(bob, &bob_invite, "bob-ban-observer").await;
+    assert_eq!(bob_join["ok"], true, "bob join response: {bob_join:?}");
     let _ = wait_state_available(bob, &group_id).await;
 
-    // Converge: the owner's authoritative MemberAdded (Commit+Welcome) makes bob
-    // Active in alice's roster.
+    let charlie_invite = create_invite(alice, &group_id).await;
+    let charlie_join = join_via_invite(charlie, &charlie_invite, "charlie-ban-target").await;
+    assert_eq!(
+        charlie_join["ok"], true,
+        "charlie join response: {charlie_join:?}"
+    );
+    let _ = wait_state_available(charlie, &group_id).await;
+
+    // Converge: the owner's authoritative MemberAdded commits make both real
+    // members Active in alice's roster before the ban.
     let bob_agent_id = bob.agent_id().await;
+    let charlie_agent_id = charlie.agent_id().await;
     let active = wait_until(Duration::from_secs(90), || async {
         let members = get_members(alice, &group_id).await;
         member_state(&members, &bob_agent_id).as_deref() == Some("active")
+            && member_state(&members, &charlie_agent_id).as_deref() == Some("active")
     })
     .await;
     assert!(
         active,
-        "bob did not become active in alice's TreeKEM roster"
+        "bob and charlie did not become active in alice's TreeKEM roster"
     );
 
-    // The group is on the TreeKEM plane before the ban.
+    // The group is on the TreeKEM plane before the ban for both owner and
+    // non-banned observer.
     let pre = get_state(alice, &group_id).await;
     let pre_binding = pre["security_binding"]
         .as_str()
@@ -560,35 +578,50 @@ async fn d4_mls_ban_commit_advances_binding_and_converges() {
         .to_string();
     assert!(
         pre_binding.starts_with("treekem:epoch="),
-        "pre-ban binding should be on the treekem plane, got {pre_binding:?}"
+        "pre-ban alice binding should be on the treekem plane, got {pre_binding:?}"
+    );
+    let bob_pre = get_state(bob, &group_id).await;
+    let bob_pre_binding = bob_pre["security_binding"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        bob_pre_binding.starts_with("treekem:epoch="),
+        "pre-ban bob binding should be on the treekem plane, got {bob_pre_binding:?}"
     );
 
-    // Ban bob: verified TreeKEM removal + epoch advance.
+    // Ban charlie: verified TreeKEM removal + epoch advance. Bob remains in the
+    // group and must observe the removal, proving cross-daemon convergence.
     let resp = authed_client(alice)
-        .post(alice.url(&format!("/groups/{group_id}/ban/{bob_agent_id}")))
+        .post(alice.url(&format!("/groups/{group_id}/ban/{charlie_agent_id}")))
         .send()
         .await
-        .expect("ban bob");
+        .expect("ban charlie");
     assert_eq!(resp.status(), StatusCode::OK, "ban status");
 
-    // The ban advances the TreeKEM epoch (binding changes) and bob converges to
-    // `banned` in the owner's roster.
+    // The ban advances the owner's TreeKEM epoch, and charlie converges to
+    // `banned` in both the owner and non-banned observer rosters.
     let advanced = wait_until(Duration::from_secs(90), || async {
-        let state = get_state(alice, &group_id).await;
-        let binding = state["security_binding"].as_str().unwrap_or_default();
-        binding.starts_with("treekem:epoch=") && binding != pre_binding
+        let alice_state = get_state(alice, &group_id).await;
+        let alice_binding = alice_state["security_binding"].as_str().unwrap_or_default();
+        alice_binding.starts_with("treekem:epoch=") && alice_binding != pre_binding
     })
     .await;
     assert!(
         advanced,
-        "ban should advance the treekem epoch binding from {pre_binding:?}"
+        "ban should advance alice's treekem epoch binding from {pre_binding:?}"
     );
     let banned = wait_until(Duration::from_secs(90), || async {
-        let members = get_members(alice, &group_id).await;
-        member_state(&members, &bob_agent_id).as_deref() == Some("banned")
+        let alice_members = get_members(alice, &group_id).await;
+        let bob_members = get_members(bob, &group_id).await;
+        member_state(&alice_members, &charlie_agent_id).as_deref() == Some("banned")
+            && member_state(&bob_members, &charlie_agent_id).as_deref() == Some("banned")
     })
     .await;
-    assert!(banned, "bob should converge to `banned` in alice's roster");
+    assert!(
+        banned,
+        "charlie should converge to `banned` in alice and bob rosters"
+    );
 
     let _ = authed_client(alice)
         .delete(alice.url(&format!("/groups/{group_id}")))

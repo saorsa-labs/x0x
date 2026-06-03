@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.21.0] - 2026-06-03
+
+### Fixed
+
+- **Multi-member TreeKEM convergence (the core fix)**: adding a *second* (or later) member to a private secure (TreeKEM) group could leave that member permanently unconverged — the owner's roster stayed empty or the new joiner's invite was silently dropped (`invite_secret_unknown`), so the joiner polled forever. Root cause: every group-state mutation did a `clone → mutate → store_named_group_info(clone)` **blind last-writer-wins overwrite** of the whole `GroupInfo`, with no per-group serialization. The owner now receives the same `MemberJoined` concurrently over gossip **and** direct delivery, so two stale-clone applies would each pass the `has_active_member` check, each consume the bearer invite, and double-add to the MLS tree (`already a member`) while clobbering the roster / a freshly-issued invite. Fixed with a per-group `group_membership_lock` that serializes **all** read-modify-write of a single group's `GroupInfo` — the owner-side apply path (gossip + direct listeners) and every API mutator (`create_invite`, add, remove, ban, approve, leave, update). Single-level locking (inner TreeKEM helpers stay unlocked) keeps it deadlock-free. Verified: the 3-daemon ban/convergence test passes 41/41 under soak, and the full workspace suite (1662 tests) stays green.
+
+### Added
+
+- **Order-sensitive TreeKEM membership reliability**: authoritative membership events are no longer gossip-only. The joiner direct-DMs `MemberJoined` to the inviter (immediately and again after the background-publish delay), and authoritative TreeKEM commits (`MemberAdded` / remove / ban / join-request approval) are direct-delivered to the new joiner plus all active members, with gossip retained as broadcast backup.
+- **Bounded TreeKEM pending/replay + explicit catch-up anti-entropy**: verified membership events that arrive before local TreeKEM readiness or ahead of the local scalar frontier (`prev_state_hash` / `state_revision` / `roster_revision` / `treekem_epoch`) are queued (bounded per group) and trigger explicit, throttled `TreeKemCatchupRequest` / `TreeKemCatchupResponse` direct messages. Responses are authorization-gated and always re-processed through the regular signed-metadata apply path.
+
+### Changed
+
+- **`AGENTS.md` clippy-gate guidance corrected**: the pre-submit clippy command is now the standard `cargo clippy --all-features --all-targets -- -D warnings` that CI actually gates on; the extra `-D clippy::panic` / `-D clippy::unwrap_used` / `-D clippy::expect_used` denies are removed because they trip on existing test code and are stricter than CI.
+- **`d4_mls_ban` strengthened to a real 3-daemon convergence test**: owner + non-banned observer + a real invite-joined ban target; it now verifies the banned member converges to `banned` in *both* the owner's and the non-banned observer's rosters, and that the owner's TreeKEM epoch advances. Uses a fresh, **owned** trio (not the process-global `cluster()` singleton, whose daemons are never dropped and lingered on the loopback interface, intermittently stalling `d4_stateful`'s gossip convergence).
+
 ## [v0.20.2] - 2026-06-02
 
 ### Fixed
