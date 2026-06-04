@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.21.1] - 2026-06-04
+
+### Fixed
+
+- **Multi-member TreeKEM convergence (2nd+ member never entered the tree).** A second (or later) member reached the owner's roster but its `MemberAdded` / `Welcome` was received and then **silently rejected** — it never entered the TreeKEM tree and could not encrypt/decrypt (the v0.21.0 "known limitation"). Root cause: TreeKEM `MemberAdded` events carry signed state commits whose state-hash validation commits to the roster root, but the invite *joiner stub* did not carry the authority's current state-chain frontier or roster, so the joiner failed signed state-chain validation **before** applying the Welcome (no error logged — needed new `treekem.trace`). Fixed by seeding invites with the authority's base state (`base_state_revision` / `base_state_hash` / `base_prev_state_hash` / `base_members_v2`); local Welcome events with state gaps now queue/catch-up instead of silently failing; TreeKEM catch-up responses paginate one event at a time to stay under the DM payload cap. Cross-region testnet e2e (`tests/e2e_treekem_membership.py --member2`) now passes (m1 + m2 converge, 3-way secure round-trips, ban + forward-secrecy).
+- **`X0X-0074d` Critical-gate overflow flood under sustained load** (via saorsa-gossip 0.5.62). 0.5.59 pruned ghost/disconnected eager peers, but Critical sends could still queue behind a slow peer with no queue-wait bound — a full 64-deep Critical FIFO took ~64×send-timeout to drain, producing runaway `X0X-0074d` WARN bursts. 0.5.62 rechecks connectivity at claim time, bounds the Critical-gate wait, and treats a full Critical gate as threshold pressure that immediately cools the peer/topic instead of spamming overflow WARNs. Validated: a 3.5h testnet churn soak held `X0X-0074d=0` and `invalid epoch=0` on all 6 nodes (was thousands of overflows per ~6 min before).
+
+### Changed
+
+- Bumped saorsa-gossip **0.5.58 → 0.5.62** across all 10 crates; consume the bounded Critical-gate + saturation-cooling surfaces and the transport-connectivity hook.
+
+### Known limitations
+
+- **High-churn multi-member TreeKEM convergence is not yet fully reliable.** A 3.5h testnet soak (150 rapid create→2-member-join→ban→delete cycles on 3 fixed cross-region nodes) passed 117/150 (78%); failures are `Welcome not processed`, clustered in degradation windows. They are driven by send-timeout / Critical-gate-saturation cooling accumulating under sustained load and starving the chunked Welcome-blob fetch (`failed to fetch TreeKEM Welcome`) — **not** a TreeKEM/state bug (`invalid epoch=0`, `X0X-0074d=0` throughout). Single-member and low-churn multi-member groups converge reliably. The cooling-vs-Welcome-fetch interaction is a tracked follow-up (see `handoff/cooling-vs-welcome-fetch-2026-06-04.md`).
+
 ## [v0.21.0] - 2026-06-03
 
 ### Fixed
