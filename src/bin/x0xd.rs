@@ -216,7 +216,11 @@ const GROUP_BACKGROUND_PUBLISH_DELAY: Duration = Duration::from_secs(8);
 const NAMED_GROUP_METADATA_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 const TREEKEM_PENDING_EVENTS_PER_GROUP_CAP: usize = 64;
 const TREEKEM_EVENT_LOG_PER_GROUP_CAP: usize = 128;
-const TREEKEM_CATCHUP_RESPONSE_EVENT_CAP: usize = 32;
+// TreeKEM MemberAdded events carry signed state commits plus commit/welcome
+// references and are ~35-40 KiB each on the wire. Two events in one catch-up
+// response exceed the direct-message payload cap, so paginate one event at a
+// time and rely on the existing `truncated` next-page loop.
+const TREEKEM_CATCHUP_RESPONSE_EVENT_CAP: usize = 1;
 const TREEKEM_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
 
 fn default_bootstrap_peers() -> Vec<SocketAddr> {
@@ -1857,6 +1861,13 @@ async fn main() -> Result<()> {
                 let Ok(join_msg) = serde_json::from_slice::<JoinResultMessage>(&msg.payload) else {
                     continue;
                 };
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "direct_classified_join_result",
+                    sender = %hex::encode(msg.sender.as_bytes()),
+                    len = msg.payload.len(),
+                    verified = msg.verified,
+                );
                 handle_join_result_message(&join_result_state, &msg.sender, join_msg).await;
             }
         });
@@ -1874,6 +1885,13 @@ async fn main() -> Result<()> {
                 else {
                     continue;
                 };
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "direct_classified_welcome_blob",
+                    sender = %hex::encode(msg.sender.as_bytes()),
+                    len = msg.payload.len(),
+                    verified = msg.verified,
+                );
                 handle_welcome_blob_message(&welcome_state, &msg.sender, welcome_msg).await;
             }
         });
@@ -1934,6 +1952,14 @@ async fn main() -> Result<()> {
                 else {
                     continue; // not a named-group metadata event
                 };
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "direct_classified_metadata_event",
+                    sender = %hex::encode(msg.sender.as_bytes()),
+                    len = msg.payload.len(),
+                    verified = msg.verified,
+                    event = named_group_metadata_event_kind(&event),
+                );
                 apply_named_group_metadata_event(&meta_state, event, msg.sender, msg.verified)
                     .await;
             }
@@ -5646,6 +5672,26 @@ enum JoinResultMessage {
     },
 }
 
+fn named_group_metadata_event_kind(event: &NamedGroupMetadataEvent) -> &'static str {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded { .. } => "member_added",
+        NamedGroupMetadataEvent::MemberRemoved { .. } => "member_removed",
+        NamedGroupMetadataEvent::GroupDeleted { .. } => "group_deleted",
+        NamedGroupMetadataEvent::PolicyUpdated { .. } => "policy_updated",
+        NamedGroupMetadataEvent::MemberRoleUpdated { .. } => "member_role_updated",
+        NamedGroupMetadataEvent::MemberBanned { .. } => "member_banned",
+        NamedGroupMetadataEvent::MemberUnbanned { .. } => "member_unbanned",
+        NamedGroupMetadataEvent::JoinRequestCreated { .. } => "join_request_created",
+        NamedGroupMetadataEvent::JoinRequestApproved { .. } => "join_request_approved",
+        NamedGroupMetadataEvent::JoinRequestRejected { .. } => "join_request_rejected",
+        NamedGroupMetadataEvent::JoinRequestCancelled { .. } => "join_request_cancelled",
+        NamedGroupMetadataEvent::GroupCardPublished { .. } => "group_card_published",
+        NamedGroupMetadataEvent::GroupMetadataUpdated { .. } => "group_metadata_updated",
+        NamedGroupMetadataEvent::MemberJoined { .. } => "member_joined",
+        NamedGroupMetadataEvent::SecureShareDelivered { .. } => "secure_share_delivered",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WelcomeBlobMessage {
@@ -7227,20 +7273,17 @@ fn treekem_state_frontier_gap_reason(
     }
     let frontier = treekem_membership_event_frontier(event)?;
     let is_local_welcome = treekem_event_is_local_welcome(event, local_agent_hex);
-    if !is_local_welcome {
-        if frontier.commit.revision <= info.state_revision
-            || frontier.revision <= info.roster_revision
-        {
-            return None;
-        }
-        if frontier.commit.revision > info.state_revision.saturating_add(1)
-            || frontier.revision > info.roster_revision.saturating_add(1)
-        {
-            return Some("revision_gap".to_string());
-        }
-        if frontier.commit.prev_state_hash.as_deref() != Some(info.state_hash.as_str()) {
-            return Some("state_hash_gap".to_string());
-        }
+    if frontier.commit.revision <= info.state_revision || frontier.revision <= info.roster_revision
+    {
+        return None;
+    }
+    if frontier.commit.revision > info.state_revision.saturating_add(1)
+        || frontier.revision > info.roster_revision.saturating_add(1)
+    {
+        return Some("revision_gap".to_string());
+    }
+    if frontier.commit.prev_state_hash.as_deref() != Some(info.state_hash.as_str()) {
+        return Some("state_hash_gap".to_string());
     }
     if let Some(epoch) = frontier.epoch {
         match local_epoch {
@@ -7561,7 +7604,8 @@ async fn handle_treekem_catchup_response(
     }
     replay_pending_treekem_events(state, &response.group_id).await;
     if was_truncated {
-        tracing::warn!(
+        tracing::debug!(
+            target: "treekem.trace",
             group_id = %response.group_id,
             sender = %hex::encode(sender.as_bytes()),
             "TreeKEM catch-up response was truncated; requesting next page"
@@ -7647,7 +7691,24 @@ async fn apply_named_group_metadata_event_inner(
     verified: bool,
     allow_queue: bool,
 ) -> bool {
+    let event_kind = named_group_metadata_event_kind(&event);
+    let sender_hex = hex::encode(sender.as_bytes());
+    tracing::debug!(
+        target: "treekem.trace",
+        stage = "apply_metadata_event_entry",
+        event = event_kind,
+        sender = %sender_hex,
+        verified,
+        allow_queue,
+    );
     if !verified {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "apply_metadata_event_reject",
+            reason = "unverified",
+            event = event_kind,
+            sender = %sender_hex,
+        );
         return false;
     }
 
@@ -7669,7 +7730,6 @@ async fn apply_named_group_metadata_event_inner(
         | NamedGroupMetadataEvent::SecureShareDelivered { group_id, .. } => group_id.clone(),
     };
 
-    let sender_hex = hex::encode(sender.as_bytes());
     let resolved_group_key = {
         let groups = state.named_groups.read().await;
         if groups.contains_key(&group_id) {
@@ -7680,6 +7740,14 @@ async fn apply_named_group_metadata_event_inner(
         {
             key.clone()
         } else {
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "apply_metadata_event_reject",
+                reason = "unknown_group",
+                event = event_kind,
+                group_id = %group_id,
+                sender = %sender_hex,
+            );
             return false;
         }
     };
@@ -7709,6 +7777,14 @@ async fn apply_named_group_metadata_event_inner(
             group_id = %resolved_group_key,
             "ignoring TreeKEM metadata membership event without Phase 3 Commit/Welcome transport"
         );
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "apply_metadata_event_reject",
+            reason = "missing_phase3_transport",
+            event = event_kind,
+            group_id = %resolved_group_key,
+            sender = %sender_hex,
+        );
         return false;
     }
 
@@ -7725,6 +7801,14 @@ async fn apply_named_group_metadata_event_inner(
         )
         .await
         {
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "apply_metadata_event_queued",
+                reason = %reason,
+                event = event_kind,
+                group_id = %resolved_group_key,
+                sender = %sender_hex,
+            );
             queue_treekem_membership_event(state, &resolved_group_key, event, sender, &reason)
                 .await;
             return false;
@@ -7767,7 +7851,7 @@ async fn apply_named_group_metadata_event_inner(
                 None
             };
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let next = match apply_stateful_event_to_group(
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -7787,8 +7871,26 @@ async fn apply_named_group_metadata_event_inner(
                         next.security_binding = Some(format!("treekem:epoch={epoch}"));
                     }
                 },
-            ) else {
-                return false;
+            ) {
+                Ok(next) => next,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "apply_metadata_event_reject",
+                        reason = "member_added_state_commit_apply_failed",
+                        group_id = %resolved_group_key,
+                        member = %agent_id,
+                        sender = %sender_hex,
+                        revision,
+                        commit_revision = commit.revision,
+                        local_state_revision = current.state_revision,
+                        local_roster_revision = current.roster_revision,
+                        local_state_hash = %current.state_hash,
+                        commit_prev_state_hash = ?commit.prev_state_hash,
+                        error = %e,
+                    );
+                    return false;
+                }
             };
             if let Some((commit_b64, welcome_b64, welcome_ref, epoch)) = treekem_payload {
                 use base64::Engine as _;
@@ -7862,26 +7964,54 @@ async fn apply_named_group_metadata_event_inner(
                         let map = state.treekem_groups.read().await;
                         map.get(&resolved_group_key).cloned()
                     };
-                    let Some(group) = group else {
-                        return false;
-                    };
-                    let mut guard = group.lock().await;
-                    if let Err(e) = guard.process_commit(&commit_bytes) {
-                        tracing::warn!(group_id = %resolved_group_key, "failed to process TreeKEM MemberAdded commit: {e}");
-                        return false;
-                    }
-                    if guard.epoch() != epoch {
-                        return false;
-                    }
-                    if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
-                        state,
-                        &resolved_group_key,
-                        next.clone(),
-                        &guard,
-                    )
-                    .await
-                    {
-                        tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after MemberAdded commit: {e}");
+                    if let Some(group) = group {
+                        let mut guard = group.lock().await;
+                        if let Err(e) = guard.process_commit(&commit_bytes) {
+                            tracing::warn!(group_id = %resolved_group_key, "failed to process TreeKEM MemberAdded commit: {e}");
+                            return false;
+                        }
+                        if guard.epoch() != epoch {
+                            return false;
+                        }
+                        if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                            state,
+                            &resolved_group_key,
+                            next.clone(),
+                            &guard,
+                        )
+                        .await
+                        {
+                            tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after MemberAdded commit: {e}");
+                            return false;
+                        }
+                    } else if !info.has_active_member(&local_agent_hex) {
+                        // This daemon is a pre-Welcome joiner catching up on
+                        // authority-signed state commits for members who joined
+                        // before it. It has no TreeKEM ratchet yet, so it
+                        // cannot process their TreeKEM commits. Applying the
+                        // signed metadata commit advances the roster/state hash
+                        // so the joiner's own later MemberAdded Welcome can
+                        // validate against the correct frontier.
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "member_added_pre_welcome_state_only_apply",
+                            group_id = %resolved_group_key,
+                            member = %agent_id,
+                            local = %local_agent_hex,
+                            revision,
+                            epoch,
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "apply_metadata_event_reject",
+                            reason = "member_added_missing_local_treekem_group",
+                            group_id = %resolved_group_key,
+                            member = %agent_id,
+                            local = %local_agent_hex,
+                            revision,
+                            epoch,
+                        );
                         return false;
                     }
                 }
@@ -10076,6 +10206,10 @@ async fn create_group_invite(
         invite.group_description = Some(info.description.clone());
         invite.policy = Some(info.policy.clone());
         invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
+        invite.base_state_revision = Some(info.state_revision);
+        invite.base_state_hash = Some(info.state_hash.clone());
+        invite.base_members_v2 = Some(info.members_v2.clone());
+        invite.base_prev_state_hash = info.prev_state_hash.clone();
         invite.secure_plane = Some(info.secure_plane);
         invite.base_secret_epoch = Some(info.secret_epoch);
         invite.base_security_binding = info.security_binding.clone();
@@ -10229,6 +10363,17 @@ async fn join_group_via_invite(
                     .base_security_binding
                     .clone()
                     .or_else(|| Some(format!("treekem:epoch={}", info.secret_epoch)));
+                if let Some(base_revision) = invite.base_state_revision {
+                    info.state_revision = base_revision;
+                    info.roster_revision = info.roster_revision.max(base_revision);
+                }
+                if let Some(base_members) = invite.base_members_v2.clone() {
+                    info.members_v2 = base_members;
+                }
+                if let Some(base_state_hash) = invite.base_state_hash.clone() {
+                    info.state_hash = base_state_hash;
+                    info.prev_state_hash = invite.base_prev_state_hash.clone();
+                }
             } else {
                 info.add_member(
                     joiner_hex.clone(),
@@ -10244,7 +10389,9 @@ async fn join_group_via_invite(
                     info.set_member_treekem_key_package(&joiner_hex, kp_b64);
                 }
             }
-            info.recompute_state_hash();
+            if !invite_is_treekem || invite.base_state_hash.is_none() {
+                info.recompute_state_hash();
+            }
 
             let chat_topic = info.general_chat_topic();
 
@@ -17421,14 +17568,47 @@ async fn stage_join_result(
     event: NamedGroupMetadataEvent,
 ) {
     let key = join_result_key(group_id, member_agent_id);
+    let event_kind = named_group_metadata_event_kind(&event);
+    let (has_commit, has_commit_b64, has_inline_welcome, welcome_ref_id, treekem_epoch) =
+        match &event {
+            NamedGroupMetadataEvent::MemberAdded {
+                commit,
+                treekem_commit_b64,
+                treekem_welcome_b64,
+                welcome_ref,
+                treekem_epoch,
+                ..
+            } => (
+                commit.is_some(),
+                treekem_commit_b64.is_some(),
+                treekem_welcome_b64.is_some(),
+                welcome_ref.as_ref().map(|w| w.welcome_id.clone()),
+                *treekem_epoch,
+            ),
+            _ => (false, false, false, None, None),
+        };
     let mut results = state.pending_join_results.write().await;
     results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
     results.insert(
-        key,
+        key.clone(),
         PendingJoinResult {
             event,
             created_at: Instant::now(),
         },
+    );
+    tracing::debug!(
+        target: "treekem.trace",
+        stage = "stage_join_result",
+        key = %key,
+        group_id = %group_id,
+        member = %member_agent_id,
+        event = event_kind,
+        has_commit,
+        has_commit_b64,
+        has_inline_welcome,
+        welcome_ref = ?welcome_ref_id,
+        treekem_epoch = ?treekem_epoch,
+        pending_count = results.len(),
     );
 }
 
@@ -17443,20 +17623,47 @@ async fn handle_join_result_message(
             member_agent_id,
         } => {
             let sender_hex = hex::encode(sender.as_bytes());
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "fetch_request_received",
+                group_id = %group_id,
+                member = %member_agent_id,
+                sender = %sender_hex,
+            );
             if sender_hex != member_agent_id {
                 tracing::warn!(group_id = %group_id, sender = %sender_hex, member = %member_agent_id, "ignoring unauthorized join-result fetch");
                 return;
             }
             let key = join_result_key(&group_id, &member_agent_id);
-            let event = {
+            let (event, pending_count) = {
                 let mut results = state.pending_join_results.write().await;
                 results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
-                results.get(&key).map(|pending| pending.event.clone())
+                (
+                    results.get(&key).map(|pending| pending.event.clone()),
+                    results.len(),
+                )
             };
             let Some(event) = event else {
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "fetch_request_lookup_miss",
+                    key = %key,
+                    group_id = %group_id,
+                    member = %member_agent_id,
+                    pending_count,
+                );
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;
             };
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "fetch_request_lookup_hit",
+                key = %key,
+                group_id = %group_id,
+                member = %member_agent_id,
+                event = named_group_metadata_event_kind(&event),
+                pending_count,
+            );
             let response = JoinResultMessage::Result {
                 event: Box::new(event),
             };
@@ -17467,16 +17674,50 @@ async fn handle_join_result_message(
                     return;
                 }
             };
+            let payload_len = payload.len();
+            let payload_hash = hex::encode(blake3::hash(&payload).as_bytes());
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "join_result_send_start",
+                group_id = %group_id,
+                member = %member_agent_id,
+                payload_len,
+                payload_hash = %payload_hash,
+            );
             if let Err(e) = state
                 .agent
                 .send_direct_with_config(sender, payload, direct_message_send_config())
                 .await
             {
                 tracing::warn!(group_id = %group_id, member = %member_agent_id, "failed to send join-result response: {e}");
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "join_result_send_err",
+                    group_id = %group_id,
+                    member = %member_agent_id,
+                    payload_len,
+                    payload_hash = %payload_hash,
+                    error = %e,
+                );
+            } else {
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "join_result_send_ok",
+                    group_id = %group_id,
+                    member = %member_agent_id,
+                    payload_len,
+                    payload_hash = %payload_hash,
+                );
             }
         }
         JoinResultMessage::Result { event } => {
             let event = *event;
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "join_result_received",
+                event = named_group_metadata_event_kind(&event),
+                sender = %hex::encode(sender.as_bytes()),
+            );
             let (group_id, member_agent_id) = match &event {
                 NamedGroupMetadataEvent::MemberAdded {
                     group_id, agent_id, ..
@@ -17539,12 +17780,43 @@ async fn poll_join_result_until_treekem_ready(
                 return;
             }
         };
+        let payload_len = payload.len();
+        let payload_hash = hex::encode(blake3::hash(&payload).as_bytes());
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "fetch_request_send_start",
+            group_id = %group_id,
+            event_group_id = %event_group_id,
+            member = %member_agent_id,
+            payload_len,
+            payload_hash = %payload_hash,
+        );
         if let Err(e) = state
             .agent
             .send_direct_with_config(&inviter, payload, direct_message_send_config())
             .await
         {
             tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "fetch_request_send_err",
+                group_id = %group_id,
+                event_group_id = %event_group_id,
+                member = %member_agent_id,
+                payload_len,
+                payload_hash = %payload_hash,
+                error = %e,
+            );
+        } else {
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "fetch_request_send_ok",
+                group_id = %group_id,
+                event_group_id = %event_group_id,
+                member = %member_agent_id,
+                payload_len,
+                payload_hash = %payload_hash,
+            );
         }
         tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
     }
@@ -19205,6 +19477,10 @@ mod tests {
         invite.policy = Some(authority.policy.clone());
         invite.genesis_creation_nonce =
             authority.genesis.as_ref().map(|g| g.creation_nonce.clone());
+        invite.base_state_revision = Some(authority.state_revision);
+        invite.base_state_hash = Some(authority.state_hash.clone());
+        invite.base_members_v2 = Some(authority.members_v2.clone());
+        invite.base_prev_state_hash = authority.prev_state_hash.clone();
         invite.secure_plane = Some(authority.secure_plane);
         invite.base_secret_epoch = Some(authority.secret_epoch);
         invite.base_security_binding = authority.security_binding.clone();
@@ -19231,9 +19507,71 @@ mod tests {
         stub.shared_secret = None;
         stub.secret_epoch = invite.base_secret_epoch.unwrap_or_default();
         stub.security_binding = invite.base_security_binding.clone();
-        stub.recompute_state_hash();
+        stub.state_revision = invite.base_state_revision.unwrap_or_default();
+        stub.roster_revision = stub.roster_revision.max(stub.state_revision);
+        if let Some(base_members) = invite.base_members_v2.clone() {
+            stub.members_v2 = base_members;
+        }
+        if let Some(base_state_hash) = invite.base_state_hash.clone() {
+            stub.state_hash = base_state_hash;
+            stub.prev_state_hash = invite.base_prev_state_hash.clone();
+        } else {
+            stub.recompute_state_hash();
+        }
 
         assert_eq!(stub.state_hash, authority.state_hash);
+        assert_eq!(stub.state_revision, authority.state_revision);
+    }
+
+    #[test]
+    fn local_treekem_welcome_with_state_gap_is_queued() {
+        let local_agent_hex = "22".repeat(32);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            AgentId([1; 32]),
+            "aa".repeat(32),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.state_revision = 1;
+        info.roster_revision = 1;
+        info.state_hash = "rev1".to_string();
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: info.stable_group_id().to_string(),
+            revision: 3,
+            actor: "11".repeat(32),
+            agent_id: local_agent_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: None,
+            welcome_ref: Some(WelcomeRef {
+                welcome_id: "welcome".to_string(),
+                byte_len: 1,
+                source: "11".repeat(32),
+            }),
+            treekem_epoch: Some(3),
+            commit: Some(x0x::groups::GroupStateCommit {
+                group_id: info.stable_group_id().to_string(),
+                revision: 3,
+                prev_state_hash: Some("rev2".to_string()),
+                roster_root: String::new(),
+                policy_hash: String::new(),
+                public_meta_hash: String::new(),
+                security_binding: Some("treekem:epoch=3".to_string()),
+                state_hash: "rev3".to_string(),
+                withdrawn: false,
+                committed_by: "11".repeat(32),
+                committed_at: 1,
+                signer_public_key: String::new(),
+                signature: String::new(),
+            }),
+        };
+
+        assert_eq!(
+            treekem_state_frontier_gap_reason(&info, &event, &local_agent_hex, None),
+            Some("revision_gap".to_string())
+        );
     }
 
     #[test]
@@ -19567,7 +19905,7 @@ mod tests {
     }
 
     #[test]
-    fn treekem_local_welcome_does_not_queue_on_authority_state_gap() {
+    fn treekem_local_welcome_queues_on_authority_state_gap() {
         let local_agent_hex = "22".repeat(32);
         let mut info = x0x::groups::GroupInfo::with_policy(
             "secure".to_string(),
@@ -19610,7 +19948,7 @@ mod tests {
 
         assert_eq!(
             treekem_state_frontier_gap_reason(&info, &event, &local_agent_hex, None),
-            None
+            Some("revision_gap".to_string())
         );
     }
 
