@@ -222,6 +222,8 @@ const TREEKEM_EVENT_LOG_PER_GROUP_CAP: usize = 128;
 // time and rely on the existing `truncated` next-page loop.
 const TREEKEM_CATCHUP_RESPONSE_EVENT_CAP: usize = 1;
 const TREEKEM_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
+const DM_INBOX_START_MAX_ATTEMPTS: u32 = 120;
+const DM_INBOX_START_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 fn default_bootstrap_peers() -> Vec<SocketAddr> {
     x0x::network::DEFAULT_BOOTSTRAP_PEERS
@@ -1668,22 +1670,26 @@ async fn main() -> Result<()> {
 
     // Join network in background — API is available immediately
     let join_agent = Arc::clone(&agent);
-    let join_kem = Arc::clone(&agent_kem_keypair);
-    let join_exec_route_tx = exec_dm_tx.clone();
     let rendezvous_enabled = config.rendezvous_enabled;
     let rendezvous_validity_ms = config.rendezvous_validity_ms;
+
+    // Start the DM inbox as soon as join_network has created the gossip
+    // runtime. join_network may keep working through slow bootstrap/cache
+    // peers for a long time; the daemon must still be able to receive gossip
+    // DMs once `/agent/card` advertises a KEM key.
+    let dm_inbox_agent = Arc::clone(&agent);
+    let dm_inbox_kem = Arc::clone(&agent_kem_keypair);
+    let dm_inbox_exec_route_tx = exec_dm_tx.clone();
+    tokio::spawn(start_dm_inbox_when_gossip_ready(
+        dm_inbox_agent,
+        dm_inbox_kem,
+        dm_inbox_exec_route_tx,
+    ));
+
     tokio::spawn(async move {
         match join_agent.join_network().await {
             Ok(()) => {
                 tracing::info!("Network joined");
-                // Start the DM inbox service now that the KEM keypair is
-                // loaded. This upgrades the capability advert so peers
-                // learn about gossip DM support within seconds.
-                let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
-                    .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, join_exec_route_tx);
-                if let Err(e) = join_agent.start_dm_inbox(join_kem, dm_inbox_config).await {
-                    tracing::warn!("Failed to start DM inbox service: {e}");
-                }
                 if rendezvous_enabled {
                     if let Err(e) = join_agent.advertise_identity(rendezvous_validity_ms).await {
                         tracing::warn!("Initial rendezvous advertisement failed: {e}");
@@ -2512,10 +2518,58 @@ fn file_transfer_now() -> (u64, u64) {
 }
 
 fn direct_message_send_config() -> x0x::dm::DmSendConfig {
-    // Generic daemon DMs use the capability-aware gossip-inbox path when the
-    // recipient advertises it. That path has an authenticated application-level
-    // ACK, which is the delivery semantic users and the mesh harness need.
-    x0x::dm::DmSendConfig::default()
+    // Generic daemon/UI DMs use the capability-aware gossip-inbox path when the
+    // recipient advertises it, but the REST API reports success after the local
+    // gossip publish. Live meshes can deliver the payload while dropping the
+    // reverse ACK; surfacing that as 504 makes users resend messages that the
+    // recipient already displayed. The attempt budget must also cover
+    // saorsa-gossip's Critical fan-out gate plus per-peer send budget under
+    // load; the 4s library default is too short for the live daemon mesh.
+    x0x::dm::DmSendConfig {
+        timeout_per_attempt: Duration::from_secs(8),
+        require_gossip_ack: false,
+        ..x0x::dm::DmSendConfig::default()
+    }
+}
+
+async fn start_dm_inbox_when_gossip_ready(
+    agent: Arc<x0x::Agent>,
+    kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
+    exec_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+) {
+    for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
+        let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
+            .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, exec_route_tx.clone());
+        match agent
+            .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
+            .await
+        {
+            Ok(()) => {
+                if let Err(e) = agent.start_capability_advert_service().await {
+                    tracing::warn!(
+                        attempt,
+                        "Capability advert service not ready after DM inbox start: {e}"
+                    );
+                }
+                tracing::info!(
+                    attempt,
+                    "DM inbox service started independently of network join completion"
+                );
+                return;
+            }
+            Err(e) if attempt < DM_INBOX_START_MAX_ATTEMPTS => {
+                tracing::debug!(attempt, "DM inbox not ready yet: {e}");
+                tokio::time::sleep(DM_INBOX_START_RETRY_DELAY).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attempts = DM_INBOX_START_MAX_ATTEMPTS,
+                    "Failed to start DM inbox service: {e}"
+                );
+                return;
+            }
+        }
+    }
 }
 
 fn file_transfer_send_config() -> x0x::dm::DmSendConfig {
@@ -4081,6 +4135,12 @@ struct CardQuery {
     /// Whether to include group invites.
     #[serde(default)]
     include_groups: Option<bool>,
+    /// Include loopback/private interface addresses for local testnet cards.
+    ///
+    /// The default remains false so copy-pasteable cards do not leak
+    /// unroutable RFC1918/loopback addresses to remote recipients.
+    #[serde(default)]
+    include_local_addresses: bool,
 }
 
 /// Populate `addresses` with locally-discovered globally-routable interfaces.
@@ -4089,9 +4149,9 @@ struct CardQuery {
 /// be shared anywhere. They must only carry globally-advertisable addresses —
 /// a card minted inside a Vultr VPC must not embed `10.200.0.1:5483` or
 /// recipients in London will spend ~50s dialing a black hole.
-fn discover_local_card_addresses(port: u16, addresses: &mut Vec<String>) {
+fn discover_local_card_addresses(port: u16, addresses: &mut Vec<String>, include_local: bool) {
     for addr in x0x::collect_local_interface_addrs(port) {
-        if !x0x::is_publicly_advertisable(addr) {
+        if !include_local && !x0x::is_publicly_advertisable(addr) {
             continue;
         }
         let s = addr.to_string();
@@ -4127,10 +4187,14 @@ async fn get_agent_card(
             card.addresses = ns
                 .external_addrs
                 .iter()
-                .filter(|a| x0x::is_publicly_advertisable(**a))
+                .filter(|a| query.include_local_addresses || x0x::is_publicly_advertisable(**a))
                 .map(|a| a.to_string())
                 .collect();
-            discover_local_card_addresses(ns.local_addr.port(), &mut card.addresses);
+            discover_local_card_addresses(
+                ns.local_addr.port(),
+                &mut card.addresses,
+                query.include_local_addresses,
+            );
         }
     }
 
@@ -4227,6 +4291,7 @@ async fn import_agent_card(
         last_seen: None,
         identity_type: x0x::contacts::IdentityType::default(),
         machines: Vec::new(),
+        dm_capabilities: card.dm_capabilities.clone(),
     };
 
     state.contacts.write().await.add(contact);
@@ -4243,17 +4308,25 @@ async fn import_agent_card(
         .filter_map(|a| a.parse().ok())
         .collect();
 
+    let capability_store = state.agent.capability_store();
+    let mut inserted_dm_capability = false;
     if machine_id_bytes != [0u8; 32] {
         if let Some(caps) = card.dm_capabilities.clone() {
             if caps.gossip_inbox && !caps.kem_public_key.is_empty() {
-                state.agent.capability_store().insert(
-                    agent_id,
-                    x0x::identity::MachineId(machine_id_bytes),
-                    caps,
-                );
+                capability_store.insert(agent_id, x0x::identity::MachineId(machine_id_bytes), caps);
+                inserted_dm_capability = true;
             }
         }
     }
+    tracing::debug!(
+        target: "dm.trace",
+        stage = "agent_card_import_capability",
+        agent_id = %hex::encode(agent_id.as_bytes()),
+        machine_id = %hex::encode(machine_id_bytes),
+        card_has_capability = card.dm_capabilities.is_some(),
+        inserted = inserted_dm_capability,
+        capability_store_entries = capability_store.len(),
+    );
 
     if machine_id_bytes != [0u8; 32] || !addresses.is_empty() {
         state
@@ -5294,6 +5367,7 @@ async fn add_contact(
         last_seen: None,
         identity_type: x0x::contacts::IdentityType::default(),
         machines: Vec::new(),
+        dm_capabilities: None,
     };
 
     state.contacts.write().await.add(contact);
@@ -7942,10 +8016,12 @@ async fn apply_named_group_metadata_event_inner(
                             Err(_) => return false,
                         }
                     } else if let Some(welcome_ref) = welcome_ref {
-                        match fetch_treekem_welcome(state, &group_id, &welcome_ref).await {
+                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
+                            .await
+                        {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                tracing::warn!(group_id = %resolved_group_key, welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob: {e}");
+                                tracing::warn!(group_id = %resolved_group_key, welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
                                 return false;
                             }
                         }
@@ -8665,10 +8741,12 @@ async fn apply_named_group_metadata_event_inner(
                             Err(_) => return false,
                         }
                     } else if let Some(welcome_ref) = welcome_ref {
-                        match fetch_treekem_welcome(state, &group_id, &welcome_ref).await {
+                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
+                            .await
+                        {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                tracing::warn!(group_id = %resolved_group_key, welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob: {e}");
+                                tracing::warn!(group_id = %resolved_group_key, welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
                                 return false;
                             }
                         }
@@ -16412,6 +16490,7 @@ async fn dm_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "per_peer": per_peer,
             "subscriber_count": subscriber_count,
             "subscriber_capacity": subscriber_capacity,
+            "capability_store_entries": state.agent.capability_store().len(),
         })),
     )
 }
@@ -17609,6 +17688,12 @@ const JOIN_RESULT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
 const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
+    Duration::ZERO,
+    Duration::from_secs(5),
+    Duration::from_secs(20),
+    Duration::from_secs(60),
+];
 
 fn welcome_id_for_bytes(bytes: &[u8]) -> String {
     hex::encode(blake3::hash(bytes).as_bytes())
@@ -17905,6 +17990,16 @@ async fn stage_treekem_welcome(
     }
 }
 
+fn welcome_blob_send_config(msg: &WelcomeBlobMessage) -> x0x::dm::DmSendConfig {
+    match msg {
+        WelcomeBlobMessage::Chunk { .. } => file_transfer_send_config(),
+        WelcomeBlobMessage::FetchRequest { .. }
+        | WelcomeBlobMessage::Offer { .. }
+        | WelcomeBlobMessage::ChunkAck { .. }
+        | WelcomeBlobMessage::Complete { .. } => direct_message_send_config(),
+    }
+}
+
 async fn send_welcome_blob_message(
     state: &Arc<AppState>,
     agent_id: &AgentId,
@@ -17920,7 +18015,7 @@ async fn send_welcome_blob_message(
     }
     state
         .agent
-        .send_direct_with_config(agent_id, payload, file_transfer_send_config())
+        .send_direct_with_config(agent_id, payload, welcome_blob_send_config(msg))
         .await
         .map_err(|e| e.to_string())
 }
@@ -17944,15 +18039,46 @@ async fn notify_welcome_waiters(
 
 async fn cleanup_welcome_fetch_state(state: &Arc<AppState>, welcome_id: &str) {
     state
-        .pending_welcome_waiters
-        .write()
-        .await
-        .remove(welcome_id);
-    state
         .pending_welcome_receives
         .write()
         .await
         .remove(welcome_id);
+    state
+        .pending_welcome_waiters
+        .write()
+        .await
+        .remove(welcome_id);
+}
+
+async fn fetch_treekem_welcome_with_retries(
+    state: &Arc<AppState>,
+    group_id: &str,
+    welcome_ref: &WelcomeRef,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut last_error = None;
+    for (attempt, delay) in WELCOME_FETCH_RETRY_DELAYS.iter().enumerate() {
+        if !delay.is_zero() {
+            tokio::time::sleep(*delay).await;
+        }
+        match fetch_treekem_welcome(state, group_id, welcome_ref).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                tracing::warn!(
+                    target: "welcome.trace",
+                    stage = "fetch_retry_failed",
+                    group_id,
+                    welcome_id = %welcome_ref.welcome_id,
+                    attempt,
+                    next_delay_ms = ?WELCOME_FETCH_RETRY_DELAYS
+                        .get(attempt + 1)
+                        .map(|d| d.as_millis() as u64),
+                    error = %e,
+                );
+                last_error = Some(e);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "TreeKEM Welcome fetch did not run".to_string()))
 }
 
 async fn fetch_treekem_welcome(
@@ -17966,33 +18092,61 @@ async fn fetch_treekem_welcome(
     let source = parse_agent_id_hex(&welcome_ref.source)?;
     let total_chunks =
         x0x::files::total_chunks_for_size(welcome_ref.byte_len, x0x::files::DEFAULT_CHUNK_SIZE);
-    state.pending_welcome_receives.write().await.insert(
-        welcome_ref.welcome_id.clone(),
-        PendingWelcomeReceive {
-            group_id: group_id.to_string(),
-            source: welcome_ref.source.clone(),
-            byte_len: welcome_ref.byte_len,
-            total_chunks,
-            chunks: BTreeMap::new(),
-            received_bytes: 0,
-        },
-    );
     let (tx, rx) = oneshot::channel();
-    state
-        .pending_welcome_waiters
-        .write()
-        .await
-        .entry(welcome_ref.welcome_id.clone())
-        .or_default()
-        .push(tx);
-
-    let request = WelcomeBlobMessage::FetchRequest {
-        group_id: group_id.to_string(),
-        welcome_id: welcome_ref.welcome_id.clone(),
+    let should_send_fetch = {
+        let mut receives = state.pending_welcome_receives.write().await;
+        let should_send_fetch = match receives.get(&welcome_ref.welcome_id) {
+            Some(existing)
+                if existing.group_id == group_id
+                    && existing.source == welcome_ref.source
+                    && existing.byte_len == welcome_ref.byte_len
+                    && existing.total_chunks == total_chunks =>
+            {
+                tracing::debug!(
+                    target: "welcome.trace",
+                    stage = "fetch_join_inflight",
+                    group_id,
+                    welcome_id = %welcome_ref.welcome_id,
+                );
+                false
+            }
+            Some(_) => {
+                return Err("conflicting in-flight TreeKEM Welcome fetch".to_string());
+            }
+            None => {
+                receives.insert(
+                    welcome_ref.welcome_id.clone(),
+                    PendingWelcomeReceive {
+                        group_id: group_id.to_string(),
+                        source: welcome_ref.source.clone(),
+                        byte_len: welcome_ref.byte_len,
+                        total_chunks,
+                        chunks: BTreeMap::new(),
+                        received_bytes: 0,
+                    },
+                );
+                true
+            }
+        };
+        state
+            .pending_welcome_waiters
+            .write()
+            .await
+            .entry(welcome_ref.welcome_id.clone())
+            .or_default()
+            .push(tx);
+        should_send_fetch
     };
-    if let Err(e) = send_welcome_blob_message(state, &source, &request).await {
-        cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
-        return Err(e);
+
+    if should_send_fetch {
+        let request = WelcomeBlobMessage::FetchRequest {
+            group_id: group_id.to_string(),
+            welcome_id: welcome_ref.welcome_id.clone(),
+        };
+        if let Err(e) = send_welcome_blob_message(state, &source, &request).await {
+            cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+            return Err(e);
+        }
     }
 
     let received = match tokio::time::timeout(WELCOME_FETCH_TIMEOUT, rx).await {
@@ -18128,6 +18282,21 @@ async fn stream_welcome_blob(
 ) {
     let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
     let total_chunks = x0x::files::total_chunks_for_size(pending.bytes.len() as u64, chunk_size);
+    let ack_slot = Arc::new(FileChunkAckSlot::new());
+    {
+        let mut acks = state.pending_welcome_acks.write().await;
+        if acks.contains_key(welcome_id) {
+            tracing::debug!(
+                target: "welcome.trace",
+                stage = "stream_duplicate_ignored",
+                welcome_id,
+                recipient = %hex::encode(recipient.as_bytes()),
+            );
+            return;
+        }
+        acks.insert(welcome_id.to_string(), Arc::clone(&ack_slot));
+    }
+
     let offer = WelcomeBlobMessage::Offer {
         group_id: pending.group_id.clone(),
         welcome_id: welcome_id.to_string(),
@@ -18138,6 +18307,7 @@ async fn stream_welcome_blob(
     };
     if let Err(e) = send_welcome_blob_message(state, recipient, &offer).await {
         tracing::warn!(welcome_id, "failed to send Welcome blob offer: {e}");
+        state.pending_welcome_acks.write().await.remove(welcome_id);
         return;
     }
     tracing::debug!(
@@ -18148,13 +18318,6 @@ async fn stream_welcome_blob(
         total_chunks,
         byte_len = pending.bytes.len() as u64,
     );
-
-    let ack_slot = Arc::new(FileChunkAckSlot::new());
-    state
-        .pending_welcome_acks
-        .write()
-        .await
-        .insert(welcome_id.to_string(), Arc::clone(&ack_slot));
 
     for (sequence, chunk) in pending.bytes.chunks(chunk_size).enumerate() {
         let sequence = sequence as u64;
@@ -19695,6 +19858,26 @@ mod tests {
         let parsed = serde_json::from_slice::<JoinResultMessage>(&result_payload);
         assert!(parsed.is_ok(), "join-result response deserializes");
         assert!(matches!(parsed, Ok(JoinResultMessage::Result { .. })));
+    }
+
+    #[test]
+    fn welcome_blob_control_messages_keep_gossip_fallback() {
+        let fetch = WelcomeBlobMessage::FetchRequest {
+            group_id: "aa".repeat(32),
+            welcome_id: "bb".repeat(32),
+        };
+        let fetch_config = welcome_blob_send_config(&fetch);
+        assert!(!fetch_config.prefer_raw_quic_if_connected);
+        assert!(!fetch_config.stop_fallback_on_raw_error);
+
+        let chunk = WelcomeBlobMessage::Chunk {
+            welcome_id: "bb".repeat(32),
+            sequence: 0,
+            data: "Yw==".to_string(),
+        };
+        let chunk_config = welcome_blob_send_config(&chunk);
+        assert!(chunk_config.prefer_raw_quic_if_connected);
+        assert!(chunk_config.stop_fallback_on_raw_error);
     }
 
     #[test]
