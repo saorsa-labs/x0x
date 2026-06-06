@@ -11617,10 +11617,31 @@ async fn leave_group(
             commit: Some(commit),
         }
     };
+    // Creator-delete: capture the roster before teardown so we can direct-
+    // deliver the GroupDeleted commit. The gossip publish below is a single
+    // eager broadcast, and we stop the metadata listener immediately after —
+    // leaving no anti-entropy source — so a member not currently grafted into
+    // the eager mesh would otherwise never learn of the deletion.
+    let delete_recipients: Vec<String> = if is_creator {
+        info.members_v2
+            .keys()
+            .filter(|member| member.as_str() != local_agent_hex)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     drop(groups);
 
     save_named_groups(&state).await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // Mirror the join/approve/reject path: also push the chain-linked
+    // GroupDeleted commit over the authenticated direct channel to each known
+    // member, since gossip cannot backfill it after teardown. Idempotent and
+    // re-validated on apply, so this is purely additive.
+    for recipient_hex in &delete_recipients {
+        spawn_named_group_event_delivery(&state, recipient_hex, &event);
+    }
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     state.named_groups.write().await.remove(&id);
