@@ -7913,17 +7913,27 @@ async fn apply_named_group_metadata_event_inner(
     );
     // The transport `verified` flag asserts the sender's AgentId→MachineId
     // binding is in our identity-discovery cache — a best-effort annotation
-    // populated asynchronously from gossip announcements. A terminal
-    // `GroupDeleted` carries a self-authenticating ML-DSA-signed state commit
-    // (`validate_apply` → `verify_structure` proves the signer authored it and
-    // is the group Owner), so its authority does not depend on that cache. The
-    // delete is also one-shot — the creator stops its metadata listener and
-    // drops the group immediately, leaving no anti-entropy source — so unlike
-    // membership events it cannot recover from a transient unverified drop.
-    // Let it through; authority is re-checked from the signed commit below.
+    // populated asynchronously from gossip announcements. Both a terminal
+    // `GroupDeleted` and a `MemberRemoved` carry a self-authenticating
+    // ML-DSA-signed state commit (`validate_apply` → `verify_structure` proves
+    // the signer authored it), so their authority does not depend on that
+    // cache. Both are also delivery-critical to a peer that is not (or no
+    // longer) in the metadata-topic eager mesh and cannot be backfilled by the
+    // single gossip broadcast: the deleted group's members, and — for removal —
+    // the *removed member itself*, which is direct-delivered the commit so it
+    // learns it was cut from the roster. A transient unverified drop of either
+    // is unrecoverable, so let them through; the apply arms below re-check
+    // authority from the signed commit (GroupDeleted: OwnerOnly via
+    // `commit.committed_by`; MemberRemoved: creator/self auth + signed-commit
+    // validation). The authenticated DM `sender_hex` is reliable regardless of
+    // the cache, so bypassing `verified` does not weaken membership
+    // authorization — only the racy cache annotation is skipped.
     let bypass_verified = matches!(
         event,
         NamedGroupMetadataEvent::GroupDeleted {
+            commit: Some(_),
+            ..
+        } | NamedGroupMetadataEvent::MemberRemoved {
             commit: Some(_),
             ..
         }
