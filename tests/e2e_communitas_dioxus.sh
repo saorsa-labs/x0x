@@ -126,8 +126,21 @@ if [ -z "$HELLO" ] || ! echo "$HELLO" | jq -e '.ok == true' >/dev/null 2>&1; the
 fi
 record "app.handshake" "pass"
 
-# Probe a handful of golden paths via the test hook.
-for op in agent.identity presence.online groups.list stores.list diagnostics.gossip; do
+# Probe a handful of golden paths via the current Dioxus test hook. These ops
+# exercise the Communitas typed x0x client against the live daemon.
+for op in \
+    identity.agent_card \
+    identity.user_id \
+    identity.export_keypairs \
+    connectivity.discover_agents \
+    connectivity.four_word_bootstrap \
+    groups.discover \
+    kv.create_list \
+    kv.put_get_delete \
+    kv.access_policy_setup \
+    presence.foaf \
+    upgrade.check
+do
     send '{"op":"'"$op"'"}'
     RESP="$(read_response || true)"
     if echo "$RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
@@ -136,17 +149,5 @@ for op in agent.identity presence.online groups.list stores.list diagnostics.gos
         record "$op" "fail" "${RESP:-no response}"
     fi
 done
-
-# Full DM round-trip.
-TOPIC="dioxus-e2e-$RANDOM"
-send '{"op":"pubsub.subscribe","topic":"'"$TOPIC"'"}'
-read_response >/dev/null || true
-send '{"op":"pubsub.publish","topic":"'"$TOPIC"'","payload":"hello-dioxus"}'
-RESP="$(read_response || true)"
-if echo "$RESP" | jq -e '.delivered == true' >/dev/null 2>&1; then
-    record "pubsub.roundtrip" "pass"
-else
-    record "pubsub.roundtrip" "fail" "${RESP:-no response}"
-fi
 
 kill "$APP_PID" 2>/dev/null || true

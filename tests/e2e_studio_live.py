@@ -42,6 +42,7 @@ if not LOCAL_X0XD.exists():
     LOCAL_X0XD = ROOT / "target" / "release" / "x0xd"
 REMOTE_X0XD = os.environ.get("REMOTE_X0XD", "/Users/studio1/.local/bin/x0xd")
 KEEP = os.environ.get("KEEP_X0X_STUDIO_LIVE") == "1"
+MANIFEST_PATH = os.environ.get("X0X_STUDIO_MANIFEST")
 
 
 def pick_tcp_port() -> int:
@@ -69,6 +70,7 @@ REMOTE_API = int(os.environ.get("REMOTE_API_PORT", "0"))
 REMOTE_QUIC = int(os.environ.get("REMOTE_QUIC_PORT", "0"))
 PROCS: list[subprocess.Popen[Any]] = []
 PASSES = 0
+REMOTE_PID: str | None = None
 
 
 def log(message: str) -> None:
@@ -346,6 +348,11 @@ def pubsub_topic(event: dict[str, Any]) -> str:
 
 
 def cleanup(success: bool) -> None:
+    if KEEP:
+        log("KEEP_X0X_STUDIO_LIVE=1; leaving run-created daemons and SSH tunnel running")
+        log(f"left local_dir={LOCAL_DIR}")
+        log(f"left remote_dir={REMOTE_DIR}")
+        return
     for proc in reversed(PROCS):
         try:
             proc.terminate()
@@ -400,7 +407,7 @@ def write_config(path: Path, api_port: int, quic_port: int, data_dir: str) -> No
 
 
 def start_daemons() -> tuple[str, str]:
-    global REMOTE_API, REMOTE_QUIC
+    global REMOTE_API, REMOTE_QUIC, REMOTE_PID
     if REMOTE_API <= 0 or REMOTE_QUIC <= 0:
         REMOTE_API, REMOTE_QUIC = pick_remote_tcp_ports(2)
     if REMOTE_API == REMOTE_QUIC:
@@ -482,7 +489,8 @@ cat {shlex.quote(REMOTE_DIR)}/pid
         input_text=remote_script,
         timeout=30,
     )
-    log(f"remote_pid={proc.stdout.strip()}")
+    REMOTE_PID = proc.stdout.strip()
+    log(f"remote_pid={REMOTE_PID}")
     ok("studio daemon started")
 
     tunnel = subprocess.Popen(
@@ -505,6 +513,52 @@ cat {shlex.quote(REMOTE_DIR)}/pid
     studio_token = ssh(f"cat {shlex.quote(REMOTE_DIR)}/api-token", timeout=15).stdout.strip()
     ok("studio token created")
     return local_token, studio_token
+
+
+def write_manifest(
+    local_token: str,
+    studio_token: str,
+    mac: dict[str, str] | None = None,
+    studio: dict[str, str] | None = None,
+) -> None:
+    if not MANIFEST_PATH:
+        return
+    manifest = {
+        "run_id": RUN_ID,
+        "keep": KEEP,
+        "studio_ssh_target": STUDIO,
+        "local": {
+            "name": LOCAL_NAME,
+            "api_base": f"http://127.0.0.1:{LOCAL_API}",
+            "api_port": LOCAL_API,
+            "quic_port": LOCAL_QUIC,
+            "token": local_token,
+            "data_dir": str(LOCAL_DIR),
+            "pid": PROCS[0].pid if PROCS else None,
+            "agent": mac,
+        },
+        "studio": {
+            "name": REMOTE_NAME,
+            "api_base": f"http://127.0.0.1:{TUNNEL_PORT}",
+            "tunnel_port": TUNNEL_PORT,
+            "remote_api_port": REMOTE_API,
+            "remote_quic_port": REMOTE_QUIC,
+            "token": studio_token,
+            "remote_dir": REMOTE_DIR,
+            "remote_pid": REMOTE_PID,
+            "agent": studio,
+        },
+        "ssh_tunnel": {
+            "local_port": TUNNEL_PORT,
+            "remote_host": "127.0.0.1",
+            "remote_port": REMOTE_API,
+            "pid": PROCS[-1].pid if PROCS else None,
+        },
+    }
+    path = Path(MANIFEST_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    ok("studio run manifest written", str(path))
 
 
 def assert_gui(studio_token: str) -> None:
@@ -1107,6 +1161,7 @@ def main() -> int:
         local_token, studio_token = start_daemons()
         assert_gui(studio_token)
         mac, studio = connect_agents(local_token, studio_token)
+        write_manifest(local_token, studio_token, mac, studio)
         direct_messages(local_token, studio_token, mac["agent_id"], studio["agent_id"])
         contacts(local_token, studio_token, mac, studio)
         diagnostics_and_signing(local_token, studio_token)

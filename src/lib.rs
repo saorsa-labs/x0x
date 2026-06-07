@@ -430,6 +430,75 @@ where
         .collect()
 }
 
+fn is_local_discovery_addr(addr: std::net::SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_unspecified()
+                && !v4.is_broadcast()
+                && !v4.is_documentation()
+                && !v4.is_link_local()
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            !v6.is_unspecified() && (segs[0] & 0xffc0) != 0xfe80 && (segs[0] & 0xfff0) != 0xfec0
+        }
+    }
+}
+
+fn filter_local_discovery_addrs<I>(addresses: I) -> Vec<std::net::SocketAddr>
+where
+    I: IntoIterator<Item = std::net::SocketAddr>,
+{
+    let mut filtered = Vec::new();
+    for addr in addresses {
+        if is_local_discovery_addr(addr) && !filtered.contains(&addr) {
+            filtered.push(addr);
+        }
+    }
+    filtered
+}
+
+fn filter_discovery_announcement_addrs<I>(
+    addresses: I,
+    allow_local_scope: bool,
+) -> Vec<std::net::SocketAddr>
+where
+    I: IntoIterator<Item = std::net::SocketAddr>,
+{
+    if allow_local_scope {
+        filter_local_discovery_addrs(addresses)
+    } else {
+        filter_publicly_advertisable_addrs(addresses)
+    }
+}
+
+fn local_scoped_bootstrap_addr(addr: std::net::SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || is_cgnat_v4(v4) || v4.is_link_local()
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            v6.is_loopback() || (segs[0] & 0xfe00) == 0xfc00 || (segs[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn allow_local_discovery_addresses(config: &network::NetworkConfig) -> bool {
+    config.bootstrap_nodes.is_empty()
+        || config
+            .bootstrap_nodes
+            .iter()
+            .copied()
+            .all(local_scoped_bootstrap_addr)
+}
+
 pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
     fn is_cgnat(v4: std::net::Ipv4Addr) -> bool {
         v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64
@@ -493,6 +562,63 @@ pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
 
     ranked.sort_by_key(|(priority, addr)| (*priority, addr.is_ipv6()));
     ranked.into_iter().map(|(_, addr)| addr).collect()
+}
+
+fn is_cgnat_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64
+}
+
+fn same_v4_24(a: std::net::Ipv4Addr, b: std::net::Ipv4Addr) -> bool {
+    let a = a.octets();
+    let b = b.octets();
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+}
+
+fn local_direct_probe_priority(
+    addr: std::net::SocketAddr,
+    local_v4s: &[std::net::Ipv4Addr],
+) -> Option<u8> {
+    let std::net::IpAddr::V4(v4) = addr.ip() else {
+        return None;
+    };
+    if addr.port() == 0 || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+        return None;
+    }
+    if local_v4s.iter().any(|local| same_v4_24(*local, v4)) {
+        return Some(0);
+    }
+    if v4.is_private() {
+        return Some(1);
+    }
+    if is_cgnat_v4(v4) {
+        return Some(2);
+    }
+    None
+}
+
+fn local_direct_probe_addrs_with_local_v4s(
+    addresses: &[std::net::SocketAddr],
+    local_v4s: &[std::net::Ipv4Addr],
+) -> Vec<std::net::SocketAddr> {
+    let mut ranked = addresses
+        .iter()
+        .copied()
+        .filter_map(|addr| local_direct_probe_priority(addr, local_v4s).map(|rank| (rank, addr)))
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(rank, addr)| (*rank, *addr));
+    ranked.dedup_by_key(|(_, addr)| *addr);
+    ranked.into_iter().map(|(_, addr)| addr).collect()
+}
+
+fn local_direct_probe_addrs(addresses: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    let local_v4s = collect_local_interface_addrs(0)
+        .into_iter()
+        .filter_map(|addr| match addr.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect::<Vec<_>>();
+    local_direct_probe_addrs_with_local_v4s(addresses, &local_v4s)
 }
 
 /// Default interval between identity heartbeat re-announcements (seconds).
@@ -1176,6 +1302,16 @@ impl AnnouncementAssistSnapshot {
     }
 }
 
+struct IdentityAnnouncementBuildOptions<'a> {
+    include_user_identity: bool,
+    human_consent: bool,
+    addresses: Vec<std::net::SocketAddr>,
+    assist_snapshot: Option<&'a AnnouncementAssistSnapshot>,
+    reachable_via: Vec<identity::MachineId>,
+    relay_candidates: Vec<identity::MachineId>,
+    allow_local_scope: bool,
+}
+
 fn push_unique<T: Copy + PartialEq>(items: &mut Vec<T>, item: T) {
     if !items.contains(&item) {
         items.push(item);
@@ -1356,8 +1492,9 @@ fn build_machine_announcement_for_identity(
     assist_snapshot: Option<&AnnouncementAssistSnapshot>,
     reachable_via: Vec<identity::MachineId>,
     relay_candidates: Vec<identity::MachineId>,
+    allow_local_scope: bool,
 ) -> error::Result<MachineAnnouncement> {
-    let addresses = filter_publicly_advertisable_addrs(addresses);
+    let addresses = filter_discovery_announcement_addrs(addresses, allow_local_scope);
     let machine_public_key = identity.machine_keypair().public_key().as_bytes().to_vec();
     let unsigned = MachineAnnouncementUnsigned {
         machine_id: identity.machine_id(),
@@ -1486,6 +1623,7 @@ struct HeartbeatContext {
     /// heartbeats include `user_id` and `agent_certificate` so they don't
     /// erase a consented disclosure.
     user_identity_consented: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    allow_local_discovery_addrs: bool,
 }
 
 impl HeartbeatContext {
@@ -1548,13 +1686,13 @@ impl HeartbeatContext {
             }
         }
 
-        // Heartbeat announcements propagate over global gossip. We MUST NOT
-        // include LAN-scope addresses here — LAN-peer discovery is handled by
-        // ant-quic's first-party mDNS, and shipping RFC1918/ULA/link-local
-        // addresses to remote peers causes them to burn ~50s per candidate on
-        // a dial that can never succeed (see investigation 2026-04-15, report
-        // tests/proof-reports/MDNS_VS_GOSSIP_ADDRESS_SCOPE_20260415.md).
-        addresses.retain(|a| is_publicly_advertisable(*a));
+        // Global bootstrap partitions must not ship LAN-scope addresses over
+        // gossip: remote peers cannot reach them and each dead dial consumes
+        // connect budget. Explicit local/testnet partitions are different; they
+        // need signed LAN/loopback hints because there may be no public endpoint
+        // or mDNS bridge between the isolated daemons.
+        addresses =
+            filter_discovery_announcement_addrs(addresses, self.allow_local_discovery_addrs);
 
         // Query reachability plus stable relay/coordinator capability from
         // the network layer. Runtime activity is logged separately so we do
@@ -1673,6 +1811,7 @@ impl HeartbeatContext {
             Some(&assist_snapshot),
             reachable_via.clone(),
             relay_candidates.clone(),
+            self.allow_local_discovery_addrs,
         )?;
         tracing::debug!(
             target: "x0x::discovery",
@@ -2298,6 +2437,65 @@ impl Agent {
         }
 
         let dial_timeout = std::time::Duration::from_secs(8);
+        let direct_probe_addrs = local_direct_probe_addrs(&info.addresses);
+
+        // Agent cards minted for a local dogfood run often contain both
+        // reachable LAN IPv4 hints and globally-scoped IPv6/Tailscale hints
+        // that may be stale or firewalled. Probe local IPv4 first so a bad
+        // multi-address peer dial cannot consume the full API timeout before
+        // the reachable LAN path is attempted.
+        for addr in &direct_probe_addrs {
+            match tokio::time::timeout(dial_timeout, network.connect_addr(*addr)).await {
+                Ok(Ok(connected_peer_id)) => {
+                    let real_machine_id = identity::MachineId(connected_peer_id.0);
+                    if let Some(ref bc) = self.bootstrap_cache {
+                        bc.add_from_connection(connected_peer_id, vec![*addr], None)
+                            .await;
+                    }
+                    {
+                        let mut cache = self.identity_discovery_cache.write().await;
+                        if let Some(entry) = cache.get_mut(agent_id) {
+                            entry.machine_id = real_machine_id;
+                        }
+                    }
+                    self.direct_messaging
+                        .mark_connected(agent.agent_id, real_machine_id)
+                        .await;
+                    tracing::info!(
+                        target: "x0x::connect",
+                        stage = "connect_to_agent",
+                        %agent_prefix,
+                        strategy = "local_direct_first",
+                        outcome = "direct",
+                        selected_addr = %addr,
+                        family = "v4",
+                        dur_ms = call_start.elapsed().as_millis() as u64,
+                        "local direct dial succeeded"
+                    );
+                    return Ok(connectivity::ConnectOutcome::Direct(*addr));
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        %agent_prefix,
+                        strategy = "local_direct_first",
+                        %addr,
+                        error = %e,
+                        "local direct dial failed"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        %agent_prefix,
+                        strategy = "local_direct_first",
+                        %addr,
+                        timeout_s = dial_timeout.as_secs(),
+                        "local direct dial timed out"
+                    );
+                }
+            }
+        }
 
         // 3. If we know the peer's machine ID, prefer a peer-authenticated dial
         //    with explicit address hints first. This is more reliable for agent
@@ -2374,6 +2572,9 @@ impl Agent {
         //    direct probe, especially for the first nodes in a new network.
         if info.should_attempt_direct() {
             for addr in &info.addresses {
+                if direct_probe_addrs.contains(addr) {
+                    continue;
+                }
                 match tokio::time::timeout(dial_timeout, network.connect_addr(*addr)).await {
                     Ok(Ok(connected_peer_id)) => {
                         // Use the real PeerId from the QUIC handshake (may differ
@@ -4070,10 +4271,14 @@ impl Agent {
             }
         }
 
-        // Same rule as HeartbeatContext::announce() — gossip is global, so
-        // LAN-scope addresses must never be published here. See the scope
-        // analysis report under tests/proof-reports/ for details.
-        addresses.retain(|a| is_publicly_advertisable(*a));
+        let allow_local_scope = self
+            .network
+            .as_ref()
+            .is_some_and(|network| allow_local_discovery_addresses(network.config()));
+        // Same rule as HeartbeatContext::announce(): global bootstrap partitions
+        // publish only globally-routable endpoints, while explicit local/testnet
+        // partitions may publish LAN/loopback hints for same-partition peers.
+        addresses = filter_discovery_announcement_addrs(addresses, allow_local_scope);
 
         // Emit coordinator / relay hints only when direct inbound is not
         // known to work. See HeartbeatContext::announce() for rationale.
@@ -4091,14 +4296,16 @@ impl Agent {
             (Vec::new(), Vec::new())
         };
 
-        let announcement = self.build_identity_announcement_with_addrs(
-            include_user_identity,
-            human_consent,
-            addresses,
-            Some(&assist_snapshot),
-            reachable_via,
-            relay_candidates,
-        )?;
+        let announcement =
+            self.build_identity_announcement_with_addrs(IdentityAnnouncementBuildOptions {
+                include_user_identity,
+                human_consent,
+                addresses,
+                assist_snapshot: Some(&assist_snapshot),
+                reachable_via,
+                relay_candidates,
+                allow_local_scope,
+            })?;
         tracing::debug!(
             target: "x0x::discovery",
             announcement_kind = "explicit",
@@ -4120,6 +4327,7 @@ impl Agent {
             Some(&assist_snapshot),
             announcement.reachable_via.clone(),
             announcement.relay_candidates.clone(),
+            allow_local_scope,
         )?;
         tracing::debug!(
             target: "x0x::discovery",
@@ -4629,6 +4837,9 @@ impl Agent {
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let direct_messaging = std::sync::Arc::clone(&self.direct_messaging);
         let network = self.network.as_ref().map(std::sync::Arc::clone);
+        let allow_local_scope = network
+            .as_ref()
+            .is_some_and(|network| allow_local_discovery_addresses(network.config()));
         let own_agent_id = self.agent_id();
         let own_machine_id = self.machine_id();
         let own_user_id = self.user_id();
@@ -4736,23 +4947,27 @@ impl Agent {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(0, |d| d.as_secs());
 
-                        let filtered_addresses = filter_publicly_advertisable_addrs(
+                        let bootstrap_addresses = filter_publicly_advertisable_addrs(
                             announcement.addresses.iter().copied(),
                         );
-                        if !filtered_addresses.is_empty() {
+                        if !bootstrap_addresses.is_empty() {
                             if let Some(ref bc) = &bootstrap_cache {
                                 let peer_id = ant_quic::PeerId(announcement.machine_id.0);
-                                bc.add_from_connection(peer_id, filtered_addresses.clone(), None)
+                                bc.add_from_connection(peer_id, bootstrap_addresses.clone(), None)
                                     .await;
                             }
                         }
 
-                        let filtered_addr_count = filtered_addresses.len();
+                        let discovery_addresses = filter_discovery_announcement_addrs(
+                            announcement.addresses.iter().copied(),
+                            allow_local_scope,
+                        );
+                        let filtered_addr_count = discovery_addresses.len();
                         upsert_discovered_machine(
                             &machine_cache,
                             DiscoveredMachine::from_machine_announcement(
                                 &announcement,
-                                filtered_addresses,
+                                discovery_addresses,
                                 now,
                             ),
                         )
@@ -4927,18 +5142,23 @@ impl Agent {
                 // loopback, or port-zero entries, but those are not useful
                 // outside link-local discovery and must not become dial
                 // candidates for globally propagated announcements.
-                let filtered_addresses =
+                let bootstrap_addresses =
                     filter_publicly_advertisable_addrs(announcement.addresses.iter().copied());
-                let filtered_addr_count = filtered_addresses.len();
+                let discovery_addresses = filter_discovery_announcement_addrs(
+                    announcement.addresses.iter().copied(),
+                    allow_local_scope,
+                );
+                let filtered_addr_count = discovery_addresses.len();
+                let auto_connect_addresses = discovery_addresses.clone();
                 {
-                    if !filtered_addresses.is_empty() {
+                    if !bootstrap_addresses.is_empty() {
                         if let Some(ref bc) = &bootstrap_cache {
                             let peer_id = ant_quic::PeerId(announcement.machine_id.0);
-                            bc.add_from_connection(peer_id, filtered_addresses.clone(), None)
+                            bc.add_from_connection(peer_id, bootstrap_addresses.clone(), None)
                                 .await;
                             tracing::debug!(
                                 "Added {} public addresses to bootstrap cache for agent {:?} (machine {:?})",
-                                filtered_addresses.len(),
+                                bootstrap_addresses.len(),
                                 announcement.agent_id,
                                 hex::encode(&announcement.machine_id.0[..8]),
                             );
@@ -4946,19 +5166,16 @@ impl Agent {
                     }
                 }
 
-                // Cache the announcement with its address list filtered to
-                // globally-advertisable scope only. Legacy peers that still
-                // ship RFC1918/ULA/loopback entries in their announcements
-                // must not force us to keep dialing their unreachable LAN
-                // addresses — LAN discovery is ant-quic's mDNS job. Empty
-                // address lists are preserved (the `AlreadyConnected` path in
-                // `connect_to_agent` handles gossip peers we only reach by
-                // an existing QUIC connection).
+                // Cache public addresses on global partitions, but keep
+                // LAN/loopback hints on explicit local/testnet partitions.
+                // Empty address lists are preserved (the `AlreadyConnected`
+                // path in `connect_to_agent` handles gossip peers we only reach
+                // by an existing QUIC connection).
                 let discovered_agent = DiscoveredAgent {
                     agent_id: announcement.agent_id,
                     machine_id: announcement.machine_id,
                     user_id: announcement.user_id,
-                    addresses: filtered_addresses.clone(),
+                    addresses: discovery_addresses,
                     announced_at: announcement.announced_at,
                     last_seen: now,
                     machine_public_key: announcement.machine_public_key.clone(),
@@ -5045,7 +5262,7 @@ impl Agent {
                 // The gossip topology refresh (every 1s) will add the new peer to
                 // PlumTree topic trees once the QUIC connection is established.
                 if announcement.agent_id != own_agent_id
-                    && !filtered_addresses.is_empty()
+                    && !auto_connect_addresses.is_empty()
                     && !auto_connect_attempted.contains(&announcement.agent_id)
                 {
                     if let Some(ref net) = &network {
@@ -5053,7 +5270,7 @@ impl Agent {
                         if !net.is_connected(&ant_peer).await {
                             auto_connect_attempted.insert(announcement.agent_id);
                             let net = std::sync::Arc::clone(net);
-                            let addresses = filtered_addresses.clone();
+                            let addresses = auto_connect_addresses.clone();
                             tokio::spawn(async move {
                                 for addr in &addresses {
                                     match net.connect_addr(*addr).await {
@@ -5090,9 +5307,12 @@ impl Agent {
 
     fn announcement_addresses(&self) -> Vec<std::net::SocketAddr> {
         match self.network.as_ref().and_then(|n| n.local_addr()) {
-            Some(addr) if addr.port() > 0 => {
-                filter_publicly_advertisable_addrs(collect_local_interface_addrs(addr.port()))
-            }
+            Some(addr) if addr.port() > 0 => filter_discovery_announcement_addrs(
+                collect_local_interface_addrs(addr.port()),
+                self.network
+                    .as_ref()
+                    .is_some_and(|network| allow_local_discovery_addresses(network.config())),
+            ),
             _ => Vec::new(),
         }
     }
@@ -5102,31 +5322,36 @@ impl Agent {
         include_user_identity: bool,
         human_consent: bool,
     ) -> error::Result<IdentityAnnouncement> {
-        self.build_identity_announcement_with_addrs(
+        self.build_identity_announcement_with_addrs(IdentityAnnouncementBuildOptions {
             include_user_identity,
             human_consent,
-            self.announcement_addresses(),
-            None,
-            Vec::new(),
-            Vec::new(),
-        )
+            addresses: self.announcement_addresses(),
+            assist_snapshot: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            allow_local_scope: false,
+        })
     }
 
     fn build_identity_announcement_with_addrs(
         &self,
-        include_user_identity: bool,
-        human_consent: bool,
-        addresses: Vec<std::net::SocketAddr>,
-        assist_snapshot: Option<&AnnouncementAssistSnapshot>,
-        reachable_via: Vec<identity::MachineId>,
-        relay_candidates: Vec<identity::MachineId>,
+        options: IdentityAnnouncementBuildOptions<'_>,
     ) -> error::Result<IdentityAnnouncement> {
+        let IdentityAnnouncementBuildOptions {
+            include_user_identity,
+            human_consent,
+            addresses,
+            assist_snapshot,
+            reachable_via,
+            relay_candidates,
+            allow_local_scope,
+        } = options;
         if include_user_identity && !human_consent {
             return Err(error::IdentityError::Storage(std::io::Error::other(
                 "human identity disclosure requires explicit human consent — set human_consent: true in the request body",
             )));
         }
-        let addresses = filter_publicly_advertisable_addrs(addresses);
+        let addresses = filter_discovery_announcement_addrs(addresses, allow_local_scope);
 
         let (user_id, agent_certificate) = if include_user_identity {
             let user_id = self.user_id().ok_or_else(|| {
@@ -5498,6 +5723,7 @@ impl Agent {
                 cache: std::sync::Arc::clone(&self.identity_discovery_cache),
                 machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
                 user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
+                allow_local_discovery_addrs: allow_local_discovery_addresses(network.config()),
             };
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -6020,6 +6246,10 @@ impl Agent {
         let mut sub = runtime.pubsub().subscribe(shard_topic).await;
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
+        let allow_local_scope = self
+            .network
+            .as_ref()
+            .is_some_and(|network| allow_local_discovery_addresses(network.config()));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
         loop {
@@ -6034,12 +6264,10 @@ impl Agent {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map_or(0, |d| d.as_secs());
-                            let filtered: Vec<std::net::SocketAddr> = ann
-                                .addresses
-                                .iter()
-                                .copied()
-                                .filter(|a| is_publicly_advertisable(*a))
-                                .collect();
+                            let filtered = filter_discovery_announcement_addrs(
+                                ann.addresses.iter().copied(),
+                                allow_local_scope,
+                            );
                             let addrs = filtered.clone();
                             let discovered_agent = DiscoveredAgent {
                                 agent_id: ann.agent_id,
@@ -6133,6 +6361,10 @@ impl Agent {
         let shard_topic = shard_topic_for_machine(&machine_id);
         let mut sub = runtime.pubsub().subscribe(shard_topic).await;
         let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
+        let allow_local_scope = self
+            .network
+            .as_ref()
+            .is_some_and(|network| allow_local_discovery_addresses(network.config()));
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.clamp(1, 60));
 
@@ -6148,12 +6380,10 @@ impl Agent {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map_or(0, |d| d.as_secs());
-                            let filtered: Vec<std::net::SocketAddr> = ann
-                                .addresses
-                                .iter()
-                                .copied()
-                                .filter(|a| is_publicly_advertisable(*a))
-                                .collect();
+                            let filtered = filter_discovery_announcement_addrs(
+                                ann.addresses.iter().copied(),
+                                allow_local_scope,
+                            );
                             let discovered = DiscoveredMachine::from_machine_announcement(
                                 &ann,
                                 filtered,
@@ -6270,6 +6500,9 @@ impl Agent {
             None,
             Vec::new(),
             Vec::new(),
+            self.network
+                .as_ref()
+                .is_some_and(|network| allow_local_discovery_addresses(network.config())),
         )
     }
 
@@ -6569,6 +6802,7 @@ impl Agent {
                 "network not initialized — cannot start heartbeat",
             )));
         };
+        let allow_local_discovery_addrs = allow_local_discovery_addresses(network.config());
         let ctx = HeartbeatContext {
             identity: std::sync::Arc::clone(&self.identity),
             runtime,
@@ -6577,6 +6811,7 @@ impl Agent {
             cache: std::sync::Arc::clone(&self.identity_discovery_cache),
             machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
             user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
+            allow_local_discovery_addrs,
         };
         let handle = tokio::task::spawn(async move {
             let mut ticker =
@@ -8114,6 +8349,74 @@ mod tests {
         assert_eq!(filtered, vec![sa("8.8.8.8:5483"), sa("[2001:db8::1]:5483")]);
     }
 
+    #[test]
+    fn local_discovery_filter_keeps_same_partition_candidates() {
+        let filtered = filter_discovery_announcement_addrs(
+            vec![
+                sa("127.0.0.1:5483"),
+                sa("10.1.2.3:5483"),
+                sa("100.64.1.1:5483"),
+                sa("169.254.1.1:5483"),
+                sa("1.2.3.4:0"),
+                sa("[::1]:5483"),
+                sa("[fd00::1]:5483"),
+                sa("8.8.8.8:5483"),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            filtered,
+            vec![
+                sa("127.0.0.1:5483"),
+                sa("10.1.2.3:5483"),
+                sa("100.64.1.1:5483"),
+                sa("[::1]:5483"),
+                sa("[fd00::1]:5483"),
+                sa("8.8.8.8:5483"),
+            ],
+        );
+    }
+
+    #[test]
+    fn local_discovery_scope_tracks_bootstrap_partition() {
+        let mut config = network::NetworkConfig {
+            bootstrap_nodes: Vec::new(),
+            ..network::NetworkConfig::default()
+        };
+        assert!(allow_local_discovery_addresses(&config));
+
+        config.bootstrap_nodes = vec![sa("127.0.0.1:5483"), sa("192.168.1.10:5483")];
+        assert!(allow_local_discovery_addresses(&config));
+
+        config.bootstrap_nodes = vec![sa("127.0.0.1:5483"), sa("8.8.8.8:5483")];
+        assert!(!allow_local_discovery_addresses(&config));
+    }
+
+    #[test]
+    fn local_direct_probe_addrs_prioritizes_same_lan_ipv4() {
+        let local = [std::net::Ipv4Addr::new(192, 168, 1, 212)];
+        let ranked = local_direct_probe_addrs_with_local_v4s(
+            &[
+                sa("100.118.167.101:27749"),
+                sa("192.168.0.1:27749"),
+                sa("192.168.1.108:27749"),
+                sa("[2a0d:3344:32d:2e10::1]:27749"),
+                sa("[fd7a:115c:a1e0::b01:a7ac]:27749"),
+            ],
+            &local,
+        );
+
+        assert_eq!(
+            ranked,
+            vec![
+                sa("192.168.1.108:27749"),
+                sa("192.168.0.1:27749"),
+                sa("100.118.167.101:27749"),
+            ],
+        );
+    }
+
     #[tokio::test]
     async fn announcement_builders_filter_global_discovery_addresses() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8134,14 +8437,15 @@ mod tests {
         let expected = vec![sa("8.8.8.8:5483"), sa("[2001:db8::1]:5483")];
 
         let identity_announcement = agent
-            .build_identity_announcement_with_addrs(
-                false,
-                false,
-                addresses.clone(),
-                None,
-                Vec::new(),
-                Vec::new(),
-            )
+            .build_identity_announcement_with_addrs(IdentityAnnouncementBuildOptions {
+                include_user_identity: false,
+                human_consent: false,
+                addresses: addresses.clone(),
+                assist_snapshot: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                allow_local_scope: false,
+            })
             .expect("identity announcement");
         assert_eq!(identity_announcement.addresses, expected);
         identity_announcement
@@ -8155,6 +8459,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            false,
         )
         .expect("machine announcement");
         assert_eq!(machine_announcement.addresses, expected);

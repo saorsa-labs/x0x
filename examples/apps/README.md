@@ -13,7 +13,22 @@ open examples/apps/x0x-chat.html      # macOS
 xdg-open examples/apps/x0x-chat.html  # Linux
 ```
 
-The apps connect to `http://localhost:12700` by default. If x0xd is running on a different port, edit the `API_URL` constant at the top of each file.
+The apps connect to `http://localhost:12700` by default. To target another daemon without editing files, pass `api` and `token` query parameters:
+
+```text
+x0x-chat.html?api=http://127.0.0.1:51555&token=<api-token>
+```
+
+The apps remember those values in `localStorage` as `x0x.apiBase` and `x0x.apiToken`. WebSocket apps derive their `ws://.../ws?token=...` endpoint from the configured API base.
+
+When using an authenticated daemon from a browser, serve these files from a loopback HTTP origin so the daemon CORS policy can allow the request:
+
+```bash
+cd examples/apps
+python3 -m http.server 8080 --bind 127.0.0.1
+```
+
+Then open `http://127.0.0.1:8080/x0x-chat.html?api=http://127.0.0.1:12700&token=<api-token>`.
 
 ## Apps
 

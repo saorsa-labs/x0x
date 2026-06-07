@@ -112,11 +112,16 @@ header h1 span { color: var(--cyan); }
 </div>
 
 <script>
-const API_URL = "http://localhost:12700";
+const CONFIG = new URLSearchParams(location.search);
+const API_URL = (CONFIG.get("api") || localStorage.getItem("x0x.apiBase") || "http://localhost:12700").replace(/\/$/, "");
+const API_TOKEN = CONFIG.get("token") || localStorage.getItem("x0x.apiToken") || "";
+if (CONFIG.get("api")) localStorage.setItem("x0x.apiBase", API_URL);
+if (CONFIG.get("token")) localStorage.setItem("x0x.apiToken", API_TOKEN);
 let boardId = null, agentId = "", pollTimer = null, knownIds = new Set();
 
 async function api(path, opts = {}) {
-  const r = await fetch(API_URL + path, { ...opts, headers: { "Content-Type": "application/json", ...opts.headers } });
+  const headers = { "Content-Type": "application/json", ...(API_TOKEN ? { Authorization: "Bearer " + API_TOKEN } : {}), ...opts.headers };
+  const r = await fetch(API_URL + path, { ...opts, headers });
   return r.json();
 }
 function truncate(id) { return id ? id.slice(0, 8) + "…" : ""; }
@@ -178,12 +183,14 @@ function openBoard(id, name) {
   document.getElementById("newTask").addEventListener("keydown", e => { if (e.key === "Enter") addTask(); });
 }
 
+function normState(state) { return String(state || "").toLowerCase(); }
+
 function renderCard(t, colState) {
   const isNew = !knownIds.has(t.id); knownIds.add(t.id);
   const assignee = t.assignee || "";
   let btn = "";
-  if (colState === "Empty") btn = '<button class="card-btn claim" onclick="claimTask(\'' + t.id + "')\">" + "Claim</button>";
-  else if (colState === "Claimed") btn = '<button class="card-btn done" onclick="completeTask(\'' + t.id + "')\">" + "Done</button>";
+  if (colState === "empty") btn = '<button class="card-btn claim" onclick="claimTask(\'' + t.id + "')\">" + "Claim</button>";
+  else if (colState === "claimed") btn = '<button class="card-btn done" onclick="completeTask(\'' + t.id + "')\">" + "Done</button>";
   return '<div class="card' + (isNew ? " entering" : "") + '">' +
     '<div class="card-title">' + esc(t.title || "Untitled") + "</div>" +
     (t.description ? '<div class="card-desc">' + esc(t.description) + "</div>" : "") +
@@ -195,12 +202,12 @@ async function refresh() {
   try {
     const res = await api("/task-lists/" + boardId + "/tasks");
     const tasks = res.tasks || [];
-    const todo = tasks.filter(t => t.state === "Empty");
-    const prog = tasks.filter(t => t.state === "Claimed");
-    const done = tasks.filter(t => t.state === "Done");
-    document.getElementById("todoCards").innerHTML = todo.map(t => renderCard(t, "Empty")).join("");
-    document.getElementById("progressCards").innerHTML = prog.map(t => renderCard(t, "Claimed")).join("");
-    document.getElementById("doneCards").innerHTML = done.map(t => renderCard(t, "Done")).join("");
+    const todo = tasks.filter(t => normState(t.state) === "empty");
+    const prog = tasks.filter(t => normState(t.state).startsWith("claimed"));
+    const done = tasks.filter(t => normState(t.state).startsWith("done") || normState(t.state).startsWith("completed"));
+    document.getElementById("todoCards").innerHTML = todo.map(t => renderCard(t, "empty")).join("");
+    document.getElementById("progressCards").innerHTML = prog.map(t => renderCard(t, "claimed")).join("");
+    document.getElementById("doneCards").innerHTML = done.map(t => renderCard(t, "done")).join("");
     document.getElementById("countTodo").textContent = todo.length + " to do";
     document.getElementById("countProgress").textContent = prog.length + " in progress";
     document.getElementById("countDone").textContent = done.length + " done";
@@ -216,7 +223,7 @@ async function addTask() {
   const title = input.value.trim();
   if (!title || !boardId) return;
   input.value = "";
-  await api("/task-lists/" + boardId + "/tasks", { method: "POST", body: JSON.stringify({ title }) });
+  await api("/task-lists/" + boardId + "/tasks", { method: "POST", body: JSON.stringify({ title, description: "" }) });
   refresh();
 }
 

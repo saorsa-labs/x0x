@@ -2597,6 +2597,16 @@ fn file_transfer_send_config() -> x0x::dm::DmSendConfig {
     config
 }
 
+fn file_transfer_control_send_config() -> x0x::dm::DmSendConfig {
+    let mut config = file_transfer_send_config();
+    // Offer/accept/reject/complete are low-volume control messages. They must
+    // not be fire-and-forget: a stale raw connection can otherwise report local
+    // send success while the peer never updates transfer state.
+    config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
+    config.stop_fallback_on_raw_error = false;
+    config
+}
+
 /// Maximum number of file chunks a sender may have in flight (sent but
 /// not yet acked) at any time. Caps the broadcast/queue pressure that
 /// caused the 100M chunk-loss regression on 2026-04-30 — the previous
@@ -2710,7 +2720,7 @@ async fn send_file_message(
     let payload = serde_json::to_vec(msg).map_err(|e| format!("serialization failed: {e}"))?;
     state
         .agent
-        .send_direct_with_config(agent_id, payload, file_transfer_send_config())
+        .send_direct_with_config(agent_id, payload, file_transfer_control_send_config())
         .await
         .map_err(|e| e.to_string())
 }
@@ -2740,7 +2750,11 @@ async fn file_send_handler(
         .unwrap_or("unnamed");
     let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
     let sha256 = body.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
-    let source_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let mut source_path = body
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     if agent_id_hex.is_empty() || sha256.is_empty() {
         return (
@@ -2762,6 +2776,66 @@ async fn file_send_handler(
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let (now_secs, now_ms) = file_transfer_now();
 
+    if source_path.is_empty() {
+        if let Some(data_b64) = body
+            .get("data_b64")
+            .or_else(|| body.get("data_base64"))
+            .and_then(|v| v.as_str())
+        {
+            let data = match base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                Ok(data) => data,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "error": format!("invalid data_b64: {e}")
+                        })),
+                    );
+                }
+            };
+            if data.len() as u64 != size {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "data_b64 length does not match size"
+                    })),
+                );
+            }
+            let actual_sha = hex::encode(Sha256::digest(&data));
+            if !sha256.eq_ignore_ascii_case(&actual_sha) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "data_b64 sha256 mismatch"
+                    })),
+                );
+            }
+            if let Err(e) = tokio::fs::create_dir_all(&state.transfers_dir).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("failed to create transfer spool: {e}")
+                    })),
+                );
+            }
+            let spool_path = state.transfers_dir.join(format!("{transfer_id}.send"));
+            if let Err(e) = tokio::fs::write(&spool_path, data).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("failed to spool upload: {e}")
+                    })),
+                );
+            }
+            source_path = spool_path.to_string_lossy().into_owned();
+        }
+    }
+
     let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
     let total_chunks = x0x::files::total_chunks_for_size(size, chunk_size);
 
@@ -2781,7 +2855,7 @@ async fn file_send_handler(
         source_path: if source_path.is_empty() {
             None
         } else {
-            Some(source_path.to_string())
+            Some(source_path)
         },
         output_path: None,
         chunk_size,
@@ -7349,10 +7423,20 @@ fn authorized_treekem_membership_event_for_queue(
             actor,
             agent_id,
             commit: Some(_),
-            treekem_commit_b64: Some(_),
-            treekem_epoch: Some(_),
+            treekem_commit_b64,
+            treekem_epoch,
             ..
-        } => (sender_hex == creator_hex || sender_hex == agent_id) && actor == sender_hex,
+        } => {
+            let creator_remove = sender_hex == creator_hex
+                && actor == sender_hex
+                && treekem_commit_b64.is_some()
+                && treekem_epoch.is_some();
+            let self_leave = sender_hex == agent_id
+                && actor == sender_hex
+                && treekem_commit_b64.is_none()
+                && treekem_epoch.is_none();
+            creator_remove || self_leave
+        }
         NamedGroupMetadataEvent::MemberBanned {
             actor,
             agent_id,
@@ -7827,7 +7911,24 @@ async fn apply_named_group_metadata_event_inner(
         verified,
         allow_queue,
     );
-    if !verified {
+    // The transport `verified` flag asserts the sender's AgentId→MachineId
+    // binding is in our identity-discovery cache — a best-effort annotation
+    // populated asynchronously from gossip announcements. A terminal
+    // `GroupDeleted` carries a self-authenticating ML-DSA-signed state commit
+    // (`validate_apply` → `verify_structure` proves the signer authored it and
+    // is the group Owner), so its authority does not depend on that cache. The
+    // delete is also one-shot — the creator stops its metadata listener and
+    // drops the group immediately, leaving no anti-entropy source — so unlike
+    // membership events it cannot recover from a transient unverified drop.
+    // Let it through; authority is re-checked from the signed commit below.
+    let bypass_verified = matches!(
+        event,
+        NamedGroupMetadataEvent::GroupDeleted {
+            commit: Some(_),
+            ..
+        }
+    );
+    if !verified && !bypass_verified {
         tracing::debug!(
             target: "treekem.trace",
             stage = "apply_metadata_event_reject",
@@ -8186,13 +8287,20 @@ async fn apply_named_group_metadata_event_inner(
                 x0x::groups::ActionKind::AdminOrHigher
             };
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-                let Some(commit_b64) = treekem_commit_b64 else {
-                    return false;
-                };
-                let Some(epoch) = treekem_epoch else {
-                    return false;
-                };
-                Some((commit_b64, epoch))
+                if self_leave_auth {
+                    if treekem_commit_b64.is_some() || treekem_epoch.is_some() {
+                        return false;
+                    }
+                    None
+                } else {
+                    let Some(commit_b64) = treekem_commit_b64 else {
+                        return false;
+                    };
+                    let Some(epoch) = treekem_epoch else {
+                        return false;
+                    };
+                    Some((commit_b64, epoch))
+                }
             } else {
                 None
             };
@@ -8297,11 +8405,22 @@ async fn apply_named_group_metadata_event_inner(
             let Some(commit) = commit else {
                 return false;
             };
-            if sender_hex != creator_hex || actor != sender_hex {
+            // Authority comes from the signed commit, not the transport
+            // sender. `validate_apply` (below) verifies the ML-DSA signature
+            // and that the signer (`commit.committed_by`) holds the Owner role
+            // — `OwnerOnly`. The `actor` field is advisory metadata, so we only
+            // require it to name the cryptographically-verified signer; we do
+            // *not* gate on `sender_hex`, which is the relaying/transport peer
+            // (wrong for gossip-relayed copies) and unreliable for an
+            // unverified direct delete. The signer must be this group's
+            // creator, preserving the original creator-only delete semantics.
+            // This lets a creator's terminal delete apply on a joiner whose
+            // identity-discovery cache hasn't yet bound the creator's AgentId.
+            if actor != commit.committed_by || commit.committed_by != creator_hex {
                 return false;
             }
             let current = info.clone();
-            if apply_stateful_event_to_group(
+            if let Err(e) = apply_stateful_event_to_group(
                 &current,
                 &commit,
                 x0x::groups::ActionKind::OwnerOnly,
@@ -8309,9 +8428,16 @@ async fn apply_named_group_metadata_event_inner(
                     next.roster_revision = revision.max(next.roster_revision);
                     next.updated_at = commit.committed_at;
                 },
-            )
-            .is_err()
-            {
+            ) {
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "apply_metadata_event_reject",
+                    reason = "group_deleted_state_commit_apply_failed",
+                    error = %e,
+                    event = event_kind,
+                    group_id = %resolved_group_key,
+                    sender = %sender_hex,
+                );
                 return false;
             }
             state.named_groups.write().await.remove(&resolved_group_key);
@@ -11160,17 +11286,51 @@ async fn remove_named_group_member(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeKemLeaveDisposition {
+    ActiveMember,
+    LocalOnlyDrop,
+    CreatorMustDelete,
+}
+
+fn treekem_leave_disposition(
+    info: &x0x::groups::GroupInfo,
+    local_agent: AgentId,
+    local_agent_hex: &str,
+) -> TreeKemLeaveDisposition {
+    if local_agent == info.creator {
+        TreeKemLeaveDisposition::CreatorMustDelete
+    } else if info.has_active_member(local_agent_hex) {
+        TreeKemLeaveDisposition::ActiveMember
+    } else {
+        TreeKemLeaveDisposition::LocalOnlyDrop
+    }
+}
+
+async fn drop_local_named_group_state(state: &AppState, id: &str, reason: &str) {
+    state.named_groups.write().await.remove(id);
+    state.group_card_cache.write().await.remove(id);
+    state.mls_groups.write().await.remove(id);
+    state.treekem_groups.write().await.remove(id);
+    let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
+    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(group_id = %id, reason = %reason, "failed to remove TreeKEM snapshot while dropping local group state: {e}");
+        }
+    }
+    save_named_groups(state).await;
+    save_mls_groups(state).await;
+}
+
 async fn leave_treekem_group(
     state: Arc<AppState>,
     id: String,
     local_agent: AgentId,
     local_agent_hex: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    use base64::Engine as _;
-
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
-    let (mut next, metadata_topic, event_group_id, name) = {
+    let (mut next, metadata_topic, event_group_id, name, disposition) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return (
@@ -11178,46 +11338,35 @@ async fn leave_treekem_group(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if local_agent == info.creator {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "creator must delete the group" })),
-            );
-        }
-        if !info.has_active_member(&local_agent_hex) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "ok": false, "error": "not a member" })),
-            );
-        }
+        let disposition = treekem_leave_disposition(info, local_agent, &local_agent_hex);
         (
             info.clone(),
             info.metadata_topic.clone(),
             info.stable_group_id().to_string(),
             info.name.clone(),
+            disposition,
         )
     };
+    match disposition {
+        TreeKemLeaveDisposition::CreatorMustDelete => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "creator must delete the group" })),
+            );
+        }
+        TreeKemLeaveDisposition::LocalOnlyDrop => {
+            drop_local_named_group_state(&state, &id, "treekem_non_active_leave").await;
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "left": name, "local_only": true })),
+            );
+        }
+        TreeKemLeaveDisposition::ActiveMember => {}
+    }
 
-    let group = {
-        let map = state.treekem_groups.read().await;
-        map.get(&id).cloned()
-    };
-    let Some(group) = group else {
-        return (
-            StatusCode::FAILED_DEPENDENCY,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "TreeKEM group not loaded — restart or re-share required"
-            })),
-        );
-    };
-    let mut guard = group.lock().await;
-    let treekem_epoch = guard.epoch().saturating_add(1);
     next.roster_revision = next.roster_revision.saturating_add(1);
     let revision = next.roster_revision;
     next.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
-    next.secret_epoch = treekem_epoch;
-    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
     let commit = match next.seal_commit(signing_kp, now_ms) {
         Ok(c) => c,
         Err(e) => {
@@ -11227,28 +11376,6 @@ async fn leave_treekem_group(
             );
         }
     };
-    let treekem_commit = match guard.remove_member(local_agent) {
-        Ok(commit) => commit,
-        Err(e) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("TreeKEM self removal failed: {e}")
-                })),
-            );
-        }
-    };
-    if guard.epoch() != treekem_epoch {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "TreeKEM epoch did not advance as expected"
-            })),
-        );
-    }
-    drop(guard);
 
     let mut groups = state.named_groups.write().await;
     groups.remove(&id);
@@ -11270,8 +11397,8 @@ async fn leave_treekem_group(
         revision,
         actor: local_agent_hex.clone(),
         agent_id: local_agent_hex,
-        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
-        treekem_epoch: Some(treekem_epoch),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -19340,6 +19467,28 @@ mod tests {
         x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, b"test-signature")
     }
 
+    fn fake_group_state_commit(
+        group_id: &str,
+        revision: u64,
+        committed_by: &str,
+    ) -> x0x::groups::GroupStateCommit {
+        x0x::groups::GroupStateCommit {
+            group_id: group_id.to_string(),
+            revision,
+            prev_state_hash: Some(format!("state-{}", revision.saturating_sub(1))),
+            roster_root: "roster".to_string(),
+            policy_hash: "policy".to_string(),
+            public_meta_hash: "meta".to_string(),
+            security_binding: Some("treekem:epoch=1".to_string()),
+            state_hash: format!("state-{revision}"),
+            withdrawn: false,
+            committed_by: committed_by.to_string(),
+            committed_at: revision,
+            signer_public_key: "pub".to_string(),
+            signature: "sig".to_string(),
+        }
+    }
+
     fn sample_group_card(group_id: &str, revision: u64, issued_at: u64) -> x0x::groups::GroupCard {
         x0x::groups::GroupCard {
             group_id: group_id.to_string(),
@@ -19714,6 +19863,119 @@ mod tests {
     }
 
     #[test]
+    fn treekem_self_leave_metadata_is_authorized_without_transport_commit() {
+        let creator = AgentId([0x11; 32]);
+        let creator_hex = hex::encode(creator.as_bytes());
+        let member_hex = "22".repeat(32);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            creator,
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        let group_id = info.stable_group_id().to_string();
+
+        let self_leave = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision: 2,
+            actor: member_hex.clone(),
+            agent_id: member_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit: Some(fake_group_state_commit(&group_id, 2, &member_hex)),
+        };
+
+        assert!(authorized_treekem_membership_event_for_queue(
+            &info,
+            &self_leave,
+            &member_hex,
+            &creator_hex
+        ));
+        assert!(!authorized_treekem_membership_event_for_queue(
+            &info,
+            &self_leave,
+            &creator_hex,
+            &creator_hex
+        ));
+
+        let admin_remove_without_treekem = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision: 3,
+            actor: creator_hex.clone(),
+            agent_id: member_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit: Some(fake_group_state_commit(&group_id, 3, &creator_hex)),
+        };
+        assert!(!authorized_treekem_membership_event_for_queue(
+            &info,
+            &admin_remove_without_treekem,
+            &creator_hex,
+            &creator_hex
+        ));
+
+        let admin_remove_with_treekem = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision: 4,
+            actor: creator_hex.clone(),
+            agent_id: member_hex,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_epoch: Some(2),
+            commit: Some(fake_group_state_commit(&group_id, 4, &creator_hex)),
+        };
+        assert!(authorized_treekem_membership_event_for_queue(
+            &info,
+            &admin_remove_with_treekem,
+            &creator_hex,
+            &creator_hex
+        ));
+    }
+
+    #[test]
+    fn treekem_leave_disposition_allows_local_pending_stub_cleanup() {
+        let creator = AgentId([0x11; 32]);
+        let member = AgentId([0x22; 32]);
+        let creator_hex = hex::encode(creator.as_bytes());
+        let member_hex = hex::encode(member.as_bytes());
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            creator,
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+
+        assert_eq!(
+            treekem_leave_disposition(&info, creator, &creator_hex),
+            TreeKemLeaveDisposition::CreatorMustDelete
+        );
+        assert_eq!(
+            treekem_leave_disposition(&info, member, &member_hex),
+            TreeKemLeaveDisposition::LocalOnlyDrop
+        );
+
+        info.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(creator_hex.clone()),
+            None,
+        );
+        assert_eq!(
+            treekem_leave_disposition(&info, member, &member_hex),
+            TreeKemLeaveDisposition::ActiveMember
+        );
+
+        info.remove_member(&member_hex, Some(creator_hex));
+        assert_eq!(
+            treekem_leave_disposition(&info, member, &member_hex),
+            TreeKemLeaveDisposition::LocalOnlyDrop
+        );
+    }
+
+    #[test]
     fn treekem_invite_stub_matches_authority_base_hash() {
         let creator = AgentId([7; 32]);
         let group_id = "ab".repeat(32);
@@ -19900,6 +20162,22 @@ mod tests {
         let chunk_config = welcome_blob_send_config(&chunk);
         assert!(chunk_config.prefer_raw_quic_if_connected);
         assert!(chunk_config.stop_fallback_on_raw_error);
+    }
+
+    #[test]
+    fn file_transfer_control_messages_are_acked_but_chunks_are_windowed() {
+        let control = file_transfer_control_send_config();
+        assert!(control.prefer_raw_quic_if_connected);
+        assert!(!control.stop_fallback_on_raw_error);
+        assert_eq!(
+            control.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
+
+        let chunk = file_transfer_send_config();
+        assert!(chunk.prefer_raw_quic_if_connected);
+        assert!(chunk.stop_fallback_on_raw_error);
+        assert_eq!(chunk.raw_quic_receive_ack_timeout, None);
     }
 
     #[test]

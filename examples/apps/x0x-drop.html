@@ -90,8 +90,12 @@ input[type=file]{display:none}
   </div>
 </main>
 <script>
-const API_URL = "http://localhost:12700";
-let selectedAgent = null, chosenFile = null, fileHash = null;
+const CONFIG = new URLSearchParams(location.search);
+const API_URL = (CONFIG.get("api") || localStorage.getItem("x0x.apiBase") || "http://localhost:12700").replace(/\/$/, "");
+const API_TOKEN = CONFIG.get("token") || localStorage.getItem("x0x.apiToken") || "";
+if (CONFIG.get("api")) localStorage.setItem("x0x.apiBase", API_URL);
+if (CONFIG.get("token")) localStorage.setItem("x0x.apiToken", API_TOKEN);
+let selectedAgent = null, chosenFile = null, fileHash = null, fileDataB64 = null, myAgentId = null;
 
 function trunc(s, n) { n = n || 12; return s ? s.slice(0, n) + "…" : "—"; }
 function fmtSize(b) {
@@ -100,14 +104,36 @@ function fmtSize(b) {
   return (b / 1073741824).toFixed(2) + " GB";
 }
 function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
-async function api(path, opts) { try { const r = await fetch(API_URL + path, opts); return await r.json(); } catch { return null; } }
+function arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(out);
+}
+async function api(path, opts = {}) {
+  try {
+    const headers = { ...(API_TOKEN ? { Authorization: "Bearer " + API_TOKEN } : {}), ...opts.headers };
+    const r = await fetch(API_URL + path, { ...opts, headers });
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
 
 async function checkHealth() {
   const d = await api("/health");
   const on = d && d.ok !== undefined;
   document.getElementById("conn-dot").className = "dot" + (on ? " on" : "");
   document.getElementById("conn-label").textContent = on ? "Connected" : "Disconnected";
-  if (on) { const a = await api("/agent"); if (a && a.agent_id) document.getElementById("my-id").textContent = trunc(a.agent_id, 16); }
+  if (on) {
+    const a = await api("/agent");
+    if (a && a.agent_id) {
+      myAgentId = a.agent_id;
+      document.getElementById("my-id").textContent = trunc(a.agent_id, 16);
+    }
+  }
   return on;
 }
 
@@ -115,8 +141,9 @@ let agents = [];
 async function fetchAgents() {
   const d = await api("/agents/discovered");
   const el = document.getElementById("agent-list");
-  if (!d || !d.agents || !d.agents.length) { el.innerHTML = '<div class="empty">No agents discovered</div>'; agents = []; return; }
-  agents = d.agents;
+  agents = ((d && d.agents) || []).filter(a => a.agent_id && a.agent_id !== myAgentId);
+  if (!agents.length) { el.innerHTML = '<div class="empty">No remote agents discovered</div>'; selectedAgent = null; updateSendBtn(); return; }
+  if (selectedAgent && !agents.some(a => a.agent_id === selectedAgent)) selectedAgent = null;
   el.innerHTML = agents.map(a => {
     const sel = selectedAgent === a.agent_id ? " sel" : "";
     const trust = a.trust_level || "Unknown";
@@ -135,25 +162,26 @@ dz.addEventListener("drop", ev => { if (ev.dataTransfer.files.length) handleFile
 document.getElementById("fileIn").addEventListener("change", ev => { if (ev.target.files.length) handleFile(ev.target.files[0]); });
 
 async function handleFile(f) {
-  chosenFile = f; fileHash = null;
+  chosenFile = f; fileHash = null; fileDataB64 = null;
   dz.classList.add("has-file");
   dz.innerHTML = '<div class="file-info"><div style="font-size:2.5em;margin-bottom:8px">&#128196;</div><div class="fname">' + esc(f.name) + '</div><div class="fsize">' + fmtSize(f.size) + '</div><div class="fhash mono">Hashing…</div></div>';
   const buf = await f.arrayBuffer();
   const hash = await crypto.subtle.digest("SHA-256", buf);
   fileHash = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
+  fileDataB64 = arrayBufferToBase64(buf);
   dz.querySelector(".fhash").textContent = "SHA-256: " + fileHash.slice(0, 16) + "…";
   updateSendBtn();
 }
-function updateSendBtn() { document.getElementById("send-btn").style.display = (chosenFile && fileHash && selectedAgent) ? "" : "none"; }
+function updateSendBtn() { document.getElementById("send-btn").style.display = (chosenFile && fileHash && fileDataB64 && selectedAgent) ? "" : "none"; }
 
 async function sendFile() {
-  if (!chosenFile || !fileHash || !selectedAgent) return;
+  if (!chosenFile || !fileHash || !fileDataB64 || !selectedAgent) return;
   const btn = document.getElementById("send-btn");
   btn.textContent = "Sending…"; btn.style.pointerEvents = "none";
-  const d = await api("/files/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agent_id: selectedAgent, filename: chosenFile.name, size: chosenFile.size, sha256: fileHash }) });
+  const d = await api("/files/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agent_id: selectedAgent, filename: chosenFile.name, size: chosenFile.size, sha256: fileHash, data_b64: fileDataB64 }) });
   btn.textContent = "Send File"; btn.style.pointerEvents = "";
   if (d && d.transfer_id) {
-    chosenFile = null; fileHash = null; selectedAgent = null;
+    chosenFile = null; fileHash = null; fileDataB64 = null; selectedAgent = null;
     dz.classList.remove("has-file");
     dz.innerHTML = '<div class="drop-icon">&#8693;</div><div class="drop-text">Drop files here or click to select</div>';
     updateSendBtn(); fetchAgents();
