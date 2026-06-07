@@ -2532,6 +2532,15 @@ fn direct_message_send_config() -> x0x::dm::DmSendConfig {
     }
 }
 
+fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
+    // Named-group metadata applies require `DirectMessage::verified == true`.
+    // The gossip-inbox DM path verifies the signed DM envelope and marks the
+    // bridged direct message verified. Raw QUIC can only mark messages
+    // verified when the receiver already has a fresh AgentId -> MachineId
+    // binding, so it must remain a fallback rather than preempting gossip.
+    direct_message_send_config()
+}
+
 async fn start_dm_inbox_when_gossip_ready(
     agent: Arc<x0x::Agent>,
     kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
@@ -6138,6 +6147,13 @@ async fn publish_secure_share(
         actor: actor_hex.to_string(),
     };
     publish_named_group_metadata_event(state, metadata_topic, &event).await;
+    spawn_named_group_event_delivery(state, recipient_hex, &event);
+    spawn_named_group_event_delivery_after(
+        state,
+        recipient_hex,
+        &event,
+        GROUP_BACKGROUND_PUBLISH_DELAY,
+    );
     true
 }
 
@@ -7031,7 +7047,7 @@ fn spawn_named_group_event_delivery(
     let requester = recipient_hex.to_string();
     tokio::spawn(async move {
         if let Err(e) = agent
-            .send_direct_with_config(&recipient, payload, direct_message_send_config())
+            .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
             .await
         {
             tracing::warn!(
@@ -7072,7 +7088,7 @@ fn spawn_named_group_event_delivery_after(
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
         if let Err(e) = agent
-            .send_direct_with_config(&recipient, payload, direct_message_send_config())
+            .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
             .await
         {
             tracing::warn!(
@@ -11859,6 +11875,7 @@ async fn update_named_group(
     let updated_desc = info.description.clone();
     let metadata_topic = info.metadata_topic.clone();
     let event_group_id = info.stable_group_id().to_string();
+    let delivery_roster = info.clone();
     drop(groups);
     save_named_groups(&state).await;
 
@@ -11871,6 +11888,7 @@ async fn update_named_group(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -11959,6 +11977,7 @@ async fn update_group_policy(
     let metadata_topic = info.metadata_topic.clone();
     let event_group_id = info.stable_group_id().to_string();
     let policy_clone = info.policy.clone();
+    let delivery_roster = info.clone();
     drop(groups);
     save_named_groups(&state).await;
 
@@ -11970,6 +11989,7 @@ async fn update_group_policy(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -12062,6 +12082,7 @@ async fn update_member_role(
     };
     let metadata_topic = info.metadata_topic.clone();
     let event_group_id = info.stable_group_id().to_string();
+    let delivery_roster = info.clone();
     drop(groups);
     save_named_groups(&state).await;
 
@@ -12074,6 +12095,7 @@ async fn update_member_role(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -19878,6 +19900,15 @@ mod tests {
         let chunk_config = welcome_blob_send_config(&chunk);
         assert!(chunk_config.prefer_raw_quic_if_connected);
         assert!(chunk_config.stop_fallback_on_raw_error);
+    }
+
+    #[test]
+    fn named_group_metadata_delivery_prefers_verified_gossip_inbox() {
+        let config = named_group_direct_delivery_config();
+
+        assert!(!config.prefer_raw_quic_if_connected);
+        assert!(!config.require_gossip);
+        assert!(!config.stop_fallback_on_raw_error);
     }
 
     #[test]

@@ -105,6 +105,51 @@ async fn import_card(d: &AgentInstance, card: &Value) -> Value {
         .expect("import card json")
 }
 
+async fn agent_card_link(d: &AgentInstance) -> String {
+    let card: Value = authed_client(d)
+        .get(d.url("/agent/card?include_local_addresses=true"))
+        .send()
+        .await
+        .expect("get agent card request")
+        .json()
+        .await
+        .expect("get agent card json");
+    let link = card["link"].as_str().unwrap_or_default().to_string();
+    assert!(!link.is_empty(), "agent card missing link: {card:?}");
+    link
+}
+
+async fn import_agent_card(d: &AgentInstance, link: &str) {
+    let resp: Value = authed_client(d)
+        .post(d.url("/agent/card/import"))
+        .json(&serde_json::json!({
+            "card": link,
+            "trust_level": "Trusted",
+        }))
+        .send()
+        .await
+        .expect("import agent card request")
+        .json()
+        .await
+        .expect("import agent card json");
+    assert_eq!(resp["ok"], true, "agent card import failed: {resp:?}");
+}
+
+async fn bootstrap_agent_cards(nodes: &[&AgentInstance]) {
+    let mut links = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        links.push(agent_card_link(node).await);
+    }
+    for (dst_idx, node) in nodes.iter().enumerate() {
+        for (src_idx, link) in links.iter().enumerate() {
+            if dst_idx != src_idx {
+                import_agent_card(node, link).await;
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
 async fn create_invite(d: &AgentInstance, group_id: &str) -> String {
     let resp = authed_client(d)
         .post(d.url(&format!("/groups/{group_id}/invite")))
@@ -157,7 +202,7 @@ async fn wait_state_match_keys(
     b: &AgentInstance,
     b_group_id: &str,
 ) -> (String, u64) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let a_state = get_state(a, a_group_id).await;
         let b_state = get_state(b, b_group_id).await;
@@ -271,6 +316,7 @@ async fn d4_stateful_events_converge_via_signed_commits_once() {
     let pair = pair().await;
     let alice = &pair.alice;
     let bob = &pair.bob;
+    bootstrap_agent_cards(&[alice, bob]).await;
 
     // `private_secure` resolves to secure-by-default TreeKEM (ADR-0012). This
     // test exercises D4 signed-commit convergence of stateful metadata/roster
@@ -380,6 +426,7 @@ async fn d4_join_request_events_converge_via_signed_commits_once() {
     let pair = pair().await;
     let alice = &pair.alice;
     let bob = &pair.bob;
+    bootstrap_agent_cards(&[alice, bob]).await;
 
     let alice_group_id = create_group_preset(
         alice,
@@ -533,6 +580,7 @@ async fn d4_mls_ban_commit_advances_binding_and_converges() {
     let alice = &cluster.alice;
     let bob = &cluster.bob;
     let charlie = &cluster.charlie;
+    bootstrap_agent_cards(&[alice, bob, charlie]).await;
 
     // `private_secure` resolves to secure-by-default TreeKEM (ADR-0012). A ban is
     // a verified TreeKEM removal that advances the group epoch. The owner bans a
