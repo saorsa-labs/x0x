@@ -150,4 +150,23 @@ do
     fi
 done
 
+# NOTE (PR #99): the previous `pubsub.roundtrip` assertion was removed here, NOT
+# silently dropped. The Dioxus e2e hook (communitas-dioxus/src/e2e_test_mode.rs)
+# no longer dispatches `pubsub.subscribe`/`pubsub.publish` — those ops now hit
+# its `_ => "unknown e2e op"` arm, so re-adding the old block would record a
+# guaranteed `fail`, not a real check.
+#
+# End-to-end pubsub *delivery* through the Communitas typed x0x client is now
+# covered — more strongly — by the typed-client contract test
+# `communitas-x0x-client/tests/live_mutation_contract.rs` (subscribe → publish →
+# receive frame → assert topic + decoded-payload-bytes equality, over BOTH SSE
+# and WS). That test runs in this same proof set and asserts payload equality,
+# vs. the old block's bare `.delivered == true`.
+#
+# FOLLOW-UP (tracked, communitas repo): to restore delivery coverage at the
+# Dioxus *app-hook* layer specifically, add a `messaging.pubsub_roundtrip` op to
+# e2e_test_mode.rs that drives X0xClient::{subscribe,publish} and confirms
+# delivery, then add that op to the loop above. Not a merge blocker — the
+# typed-client layer below the app already proves delivery.
+
 kill "$APP_PID" 2>/dev/null || true
