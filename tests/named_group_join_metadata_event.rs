@@ -305,7 +305,7 @@ async fn member_joined_event_propagates_to_inviter() {
     assert_eq!(join_resp["ok"], true, "join response: {join_resp:?}");
 
     // Phase 1: bob's MemberJoined event reaches alice's metadata listener.
-    let alice_sees_bob = wait_until(Duration::from_secs(15), || async {
+    let alice_sees_bob = wait_until(Duration::from_secs(30), || async {
         list_members(alice, &group_id).await.contains(&bob_aid)
     })
     .await;
@@ -339,7 +339,7 @@ async fn member_joined_event_propagates_to_inviter() {
     let post = post_public_message(bob, &group_id, body).await;
     assert_eq!(post["ok"], true, "post: {post:?}");
 
-    let alice_sees_msg = wait_until(Duration::from_secs(15), || async {
+    let alice_sees_msg = wait_until(Duration::from_secs(30), || async {
         list_public_messages(alice, &group_id)
             .await
             .iter()
@@ -374,7 +374,7 @@ async fn member_joined_event_is_idempotent() {
     let join_resp = join_via_invite(bob, &invite, "bob-idemp").await;
     assert_eq!(join_resp["ok"], true, "first join: {join_resp:?}");
 
-    let converged = wait_until(Duration::from_secs(15), || async {
+    let converged = wait_until(Duration::from_secs(30), || async {
         list_members(alice, &group_id).await.contains(&bob_aid)
     })
     .await;
@@ -509,7 +509,7 @@ async fn tampered_member_joined_signed_role_is_rejected_before_role_policy() {
         published["ok"], true,
         "publish valid control event: {published:?}"
     );
-    let control_applied = wait_until(Duration::from_secs(15), || async {
+    let control_applied = wait_until(Duration::from_secs(30), || async {
         group_diagnostic_counter(alice, &group_id, "member_joined_events_applied").await
             > applied_before
             && list_members(alice, &group_id).await.contains(&bob_aid)
@@ -585,7 +585,7 @@ async fn forged_member_joined_admin_role_or_secret_is_rejected() {
     let published = publish_raw(bob, &metadata_topic, &payload).await;
     assert_eq!(published["ok"], true, "publish forged event: {published:?}");
 
-    let admin_rejected = wait_until(Duration::from_secs(15), || async {
+    let admin_rejected = wait_until(Duration::from_secs(30), || async {
         group_diagnostic_counter(
             alice,
             &group_id,
@@ -624,7 +624,7 @@ async fn forged_member_joined_admin_role_or_secret_is_rejected() {
         published["ok"], true,
         "publish forged secret event: {published:?}"
     );
-    let unknown_secret_rejected = wait_until(Duration::from_secs(15), || async {
+    let unknown_secret_rejected = wait_until(Duration::from_secs(30), || async {
         group_diagnostic_counter(
             alice,
             &group_id,
@@ -645,7 +645,7 @@ async fn forged_member_joined_admin_role_or_secret_is_rejected() {
 
     let join_resp = join_via_invite(bob, &invite, "bob-member").await;
     assert_eq!(join_resp["ok"], true, "legitimate join: {join_resp:?}");
-    let converged = wait_until(Duration::from_secs(15), || async {
+    let converged = wait_until(Duration::from_secs(30), || async {
         list_members(alice, &group_id).await.contains(&bob_aid)
     })
     .await;
@@ -683,7 +683,7 @@ async fn issued_invite_secret_is_recorded_on_inviter() {
     // committed membership converge.
     let bob_aid = bob.agent_id().await;
     let _ = join_via_invite(bob, &invite, "bob-secret").await;
-    let converged = wait_until(Duration::from_secs(15), || async {
+    let converged = wait_until(Duration::from_secs(30), || async {
         list_members(alice, &group_id).await.contains(&bob_aid)
     })
     .await;

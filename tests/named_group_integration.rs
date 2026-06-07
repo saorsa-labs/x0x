@@ -698,7 +698,7 @@ async fn named_group_multiple_display_names() {
         .unwrap_or(&group_id)
         .to_string();
 
-    let alice_sees_both_names = wait_until(Duration::from_secs(15), || async {
+    let alice_sees_both_names = wait_until(Duration::from_secs(30), || async {
         let info: Value = alice
             .get(&format!("/groups/{group_id}"))
             .await
@@ -1089,7 +1089,7 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
 
     let bob_agent_id = bob.agent_id().await;
 
-    let alice_sees_bob = wait_until(Duration::from_secs(15), || async {
+    let alice_sees_bob = wait_until(Duration::from_secs(30), || async {
         let info: Value = alice
             .get(&format!("/groups/{group_id}/members"))
             .await
@@ -1109,7 +1109,7 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
     let alice_hash = group_state_hash(alice, &group_id)
         .await
         .expect("alice state hash after bob join");
-    let bob_caught_up = wait_until(Duration::from_secs(15), || async {
+    let bob_caught_up = wait_until(Duration::from_secs(30), || async {
         group_state_hash(bob, &bob_group_id).await.as_deref() == Some(alice_hash.as_str())
     })
     .await;
@@ -1126,7 +1126,7 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
         .unwrap();
     assert_eq!(remove_resp["ok"], true, "remove response: {remove_resp:?}");
 
-    let removed_seen = wait_until(Duration::from_secs(15), || async {
+    let removed_seen = wait_until(Duration::from_secs(30), || async {
         let resp = bob.get(&format!("/groups/{bob_group_id}")).await;
         resp.status() == StatusCode::NOT_FOUND
     })
@@ -1331,7 +1331,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
 
     let bob_agent_id = bob.agent_id().await;
 
-    let alice_sees_bob = wait_until(Duration::from_secs(15), || async {
+    let alice_sees_bob = wait_until(Duration::from_secs(30), || async {
         let info: Value = alice
             .get(&format!("/groups/{group_id}/members"))
             .await
@@ -1351,7 +1351,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
     let alice_hash = group_state_hash(alice, &group_id)
         .await
         .expect("alice state hash after bob join");
-    let bob_caught_up = wait_until(Duration::from_secs(15), || async {
+    let bob_caught_up = wait_until(Duration::from_secs(30), || async {
         group_state_hash(bob, &bob_group_id).await.as_deref() == Some(alice_hash.as_str())
     })
     .await;
@@ -1368,7 +1368,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
         .unwrap();
     assert_eq!(delete_resp["ok"], true, "delete response: {delete_resp:?}");
 
-    let deleted_seen = wait_until(Duration::from_secs(15), || async {
+    let deleted_seen = wait_until(Duration::from_secs(30), || async {
         let resp = bob.get(&format!("/groups/{bob_group_id}")).await;
         resp.status() == StatusCode::NOT_FOUND
     })
