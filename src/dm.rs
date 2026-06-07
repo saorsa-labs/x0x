@@ -384,6 +384,10 @@ pub struct DmSendConfig {
     /// present. Use this for higher-volume protocols (for example file
     /// transfer) whose own back-pressure/ACK logic is tuned for raw QUIC.
     pub stop_fallback_on_raw_error: bool,
+    /// If true, gossip-inbox sends wait for the recipient's application-layer
+    /// ACK before returning success. If false, a successful gossip publish is
+    /// reported as accepted-for-delivery and any later ACK is ignored.
+    pub require_gossip_ack: bool,
     /// X0X-0041: bounded grace window (ms) the DM path holds when ant-quic has
     /// just observed a `Replaced` event but the new `Established` has not yet
     /// fired. Mirrors iroh-gossip #43 "always prefer newest connection" — when
@@ -409,6 +413,7 @@ impl Default for DmSendConfig {
             prefer_raw_quic_if_connected: false,
             raw_quic_receive_ack_timeout: None,
             stop_fallback_on_raw_error: false,
+            require_gossip_ack: true,
             // X0X-0041: 250ms is the soak-tested grace from iroh-gossip #43.
             prefer_newest_grace_ms: DEFAULT_PREFER_NEWEST_GRACE_MS,
         }

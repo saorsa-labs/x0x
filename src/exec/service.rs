@@ -1188,11 +1188,7 @@ impl ExecService {
     async fn send_frame(&self, to: &AgentId, frame: &ExecFrame) -> Result<(), ExecServiceError> {
         let payload =
             encode_frame_payload(frame).map_err(|e| ExecServiceError::Protocol(e.to_string()))?;
-        let config = DmSendConfig {
-            require_gossip: true,
-            prefer_raw_quic_if_connected: false,
-            ..DmSendConfig::default()
-        };
+        let config = exec_frame_send_config(frame);
         self.agent
             .send_direct_with_config(to, payload, config)
             .await
@@ -1248,6 +1244,16 @@ impl Drop for ClientCancelGuard {
 
 fn map_dm_error(error: DmError) -> ExecServiceError {
     ExecServiceError::Transport(error.to_string())
+}
+
+fn exec_frame_send_config(_frame: &ExecFrame) -> DmSendConfig {
+    DmSendConfig {
+        timeout_per_attempt: Duration::from_secs(8),
+        require_gossip: true,
+        prefer_raw_quic_if_connected: false,
+        require_gossip_ack: false,
+        ..DmSendConfig::default()
+    }
 }
 
 fn argv_summary(argv: &[String]) -> String {
@@ -1784,6 +1790,59 @@ mod tests {
     #[test]
     fn status_signal_none_returns_none() {
         assert_eq!(status_signal(None), None);
+    }
+
+    #[test]
+    fn exec_frames_use_verified_gossip_publish_only_delivery() {
+        let request_id = ExecRequestId([53; 16]);
+        let frames = [
+            ExecFrame::Request {
+                request_id,
+                argv: vec!["/bin/echo".to_string(), "ok".to_string()],
+                stdin: None,
+                timeout_ms: 1_000,
+                cwd: None,
+            },
+            ExecFrame::Started {
+                request_id,
+                pid: 123,
+            },
+            ExecFrame::Stdout {
+                request_id,
+                seq: 0,
+                data: b"out".to_vec(),
+            },
+            ExecFrame::Stderr {
+                request_id,
+                seq: 1,
+                data: b"err".to_vec(),
+            },
+            ExecFrame::Warning {
+                request_id,
+                kind: WarningKind::StdoutCapHit,
+                message: "cap hit".to_string(),
+            },
+            ExecFrame::LeaseRenew { request_id },
+            ExecFrame::Cancel { request_id },
+            ExecFrame::Exit {
+                request_id,
+                code: Some(0),
+                signal: None,
+                duration_ms: 1,
+                stdout_bytes_total: 0,
+                stderr_bytes_total: 0,
+                truncated: false,
+                denial_reason: None,
+            },
+        ];
+
+        for frame in frames {
+            let config = exec_frame_send_config(&frame);
+            assert!(config.require_gossip);
+            assert!(!config.prefer_raw_quic_if_connected);
+            assert!(!config.require_gossip_ack);
+            assert_eq!(config.timeout_per_attempt, Duration::from_secs(8));
+        }
     }
 
     fn denied(result: Result<CheckedRequest, DenialReason>) -> DenialReason {

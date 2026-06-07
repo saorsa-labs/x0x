@@ -32,6 +32,7 @@ pub struct DmLifecycleHint {
 }
 
 pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
+const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::from_millis(250);
 
 #[allow(clippy::too_many_arguments)]
 pub async fn send_via_gossip(
@@ -151,14 +152,18 @@ pub async fn send_via_gossip(
                 .await
                 .map_err(|e| DmError::LocalGossipUnavailable(e.to_string()))?;
 
-            (&mut rx).await.map_err(|_| {
+            if !config.require_gossip_ack {
+                return Ok(None);
+            }
+
+            (&mut rx).await.map(Some).map_err(|_| {
                 DmError::PublishFailed("in-flight ACK registry replaced our waiter".to_string())
             })
         })
         .await;
 
         match attempt_result {
-            Ok(Ok(outcome)) => {
+            Ok(Ok(Some(outcome))) => {
                 tracing::debug!(
                     target: "dm.trace",
                     stage = "outbound_send_returned_ok",
@@ -168,6 +173,29 @@ pub async fn send_via_gossip(
                 );
                 guard.mark_resolved();
                 return ack_outcome_to_receipt(outcome, request_id, attempt);
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(
+                    target: "dm.trace",
+                    stage = "outbound_send_publish_only_attempt",
+                    request_id = %hex::encode(request_id),
+                    recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                    attempt,
+                    ack_required = false,
+                );
+                if attempt < config.max_retries {
+                    tokio::time::sleep(PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY).await;
+                    continue;
+                }
+                tracing::debug!(
+                    target: "dm.trace",
+                    stage = "outbound_send_returned_ok",
+                    request_id = %hex::encode(request_id),
+                    recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                    retries_used = attempt,
+                    ack_required = false,
+                );
+                return Ok(gossip_publish_receipt(request_id, attempt));
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -373,6 +401,15 @@ fn ack_outcome_to_receipt(
             path: DmPath::GossipInbox,
         }),
         DmAckOutcome::RejectedByPolicy { reason } => Err(DmError::RecipientRejected { reason }),
+    }
+}
+
+fn gossip_publish_receipt(request_id: [u8; 16], retries_used: u8) -> DmReceipt {
+    DmReceipt {
+        request_id,
+        accepted_at: Instant::now(),
+        retries_used,
+        path: DmPath::GossipInbox,
     }
 }
 
@@ -711,6 +748,15 @@ mod tests {
     }
 
     #[test]
+    fn gossip_publish_receipt_uses_gossip_path() {
+        let request_id = [3u8; 16];
+        let receipt = gossip_publish_receipt(request_id, 1);
+        assert_eq!(receipt.request_id, request_id);
+        assert_eq!(receipt.retries_used, 1);
+        assert_eq!(receipt.path, DmPath::GossipInbox);
+    }
+
+    #[test]
     fn ack_outcome_to_receipt_rejected_returns_error() {
         let outcome = DmAckOutcome::RejectedByPolicy {
             reason: "not trusted".to_string(),
@@ -754,5 +800,10 @@ mod tests {
         // Verify DmLifecycleHint can be sent between threads
         fn assert_send<T: Send>() {}
         assert_send::<DmLifecycleHint>();
+    }
+
+    #[test]
+    fn default_send_config_requires_gossip_ack() {
+        assert!(DmSendConfig::default().require_gossip_ack);
     }
 }

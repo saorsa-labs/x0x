@@ -190,6 +190,13 @@ pub struct Contact {
     /// Known machines for this contact.
     #[serde(default)]
     pub machines: Vec<MachineRecord>,
+    /// Last imported direct-message capability for this contact.
+    ///
+    /// Mesh capability adverts are transient. Persisting card-imported
+    /// capabilities lets senders keep using a verified out-of-band card when
+    /// the advert cache misses after restart or under gossip pressure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dm_capabilities: Option<crate::dm::DmCapabilities>,
 }
 
 /// A record of a key revocation event.
@@ -300,6 +307,7 @@ impl ContactStore {
             last_seen: None,
             identity_type: IdentityType::default(),
             machines: Vec::new(),
+            dm_capabilities: None,
         });
         entry.trust_level = effective_trust;
         // When elevating trust to Known or Trusted, auto-upgrade identity_type
@@ -420,6 +428,7 @@ impl ContactStore {
             last_seen: None,
             identity_type: IdentityType::default(),
             machines: Vec::new(),
+            dm_capabilities: None,
         });
 
         if let Some(existing) = contact
@@ -533,6 +542,7 @@ impl ContactStore {
             last_seen: None,
             identity_type: IdentityType::default(),
             machines: Vec::new(),
+            dm_capabilities: None,
         });
         contact.identity_type = identity_type;
         let _ = self.save();
@@ -655,6 +665,7 @@ mod tests {
             last_seen: None,
             identity_type: IdentityType::default(),
             machines: Vec::new(),
+            dm_capabilities: None,
         });
 
         assert!(store.get(&id).is_some());
@@ -716,6 +727,7 @@ mod tests {
                 last_seen: None,
                 identity_type: IdentityType::default(),
                 machines: Vec::new(),
+                dm_capabilities: None,
             });
         }
 
@@ -890,6 +902,7 @@ mod tests {
                 last_seen: None,
                 identity_type: IdentityType::Anonymous,
                 machines: Vec::new(),
+                dm_capabilities: None,
             });
         }
 
@@ -989,6 +1002,7 @@ mod tests {
             last_seen: None,
             identity_type: IdentityType::default(),
             machines: Vec::new(),
+            dm_capabilities: None,
         });
 
         assert!(store.is_revoked(&id));

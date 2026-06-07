@@ -237,9 +237,9 @@ check_json "bob agent" "$RB" "agent_id"
 check_eq "distinct agent IDs" "$([ "$AID" != "$BID" ] && echo yes || echo no)" "yes"
 
 # Agent cards
-R=$(A /agent/card); check_json "alice card" "$R" "link"
+R=$(A /agent/card?include_local_addresses=true); check_json "alice card" "$R" "link"
 ALICE_LINK=$(jq_field "$R" "link")
-R=$(B /agent/card); check_json "bob card" "$R" "link"
+R=$(B /agent/card?include_local_addresses=true); check_json "bob card" "$R" "link"
 BOB_LINK=$(jq_field "$R" "link")
 
 # Decode and validate card identity (Ben bug regression)

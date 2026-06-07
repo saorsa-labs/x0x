@@ -3071,11 +3071,45 @@ impl Agent {
             return Ok(receipt);
         }
 
-        let cap = self.capability_store.lookup(to);
+        let advert_cap = self.capability_store.lookup(to);
+        let advert_gossip_ready = advert_cap
+            .as_ref()
+            .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
+        let (cap, cap_source) = if advert_gossip_ready {
+            (advert_cap, "advert_cache")
+        } else {
+            let contact_cap = {
+                let contacts = self.contact_store.read().await;
+                contacts.get(to).and_then(|contact| {
+                    contact
+                        .dm_capabilities
+                        .as_ref()
+                        .filter(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty())
+                        .cloned()
+                })
+            };
+            match contact_cap {
+                Some(cap) if advert_cap.is_some() => {
+                    (Some(cap), "contact_card_after_unusable_advert")
+                }
+                Some(cap) => (Some(cap), "contact_card"),
+                None if advert_cap.is_some() => (advert_cap, "advert_cache_unusable"),
+                None => (None, "none"),
+            }
+        };
         let gossip_ok = cap
             .as_ref()
             .map(|c| c.gossip_inbox && !c.kem_public_key.is_empty())
             .unwrap_or(false);
+        tracing::debug!(
+            target: "dm.trace",
+            stage = "capability_lookup",
+            recipient = %hex::encode(to.as_bytes()),
+            hit = cap.is_some(),
+            gossip_ok,
+            source = cap_source,
+            capability_store_entries = self.capability_store.len(),
+        );
 
         let rtt_hint_ms = self.dm_peer_rtt_ms(to).await;
         let mut config = config;
@@ -5477,34 +5511,8 @@ impl Agent {
             });
         }
 
-        // Start the capability advert service. Until start_dm_inbox runs,
-        // the advert declares gossip_inbox=false — senders fall back to
-        // raw-QUIC. Once upgraded, peers learn about gossip DM support.
-        if let Some(ref runtime) = self.gossip_runtime {
-            let signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(
-                self.identity.agent_keypair(),
-            ));
-            let caps_rx = self.dm_capabilities_tx.subscribe();
-            match dm_capability_service::CapabilityAdvertService::spawn_default(
-                std::sync::Arc::clone(runtime.pubsub()),
-                signing,
-                self.identity.agent_id(),
-                self.identity.machine_id(),
-                caps_rx,
-                std::sync::Arc::clone(&self.capability_store),
-            )
-            .await
-            {
-                Ok(service) => {
-                    let mut guard = self.capability_advert_service.lock().await;
-                    if let Some(prev) = guard.take() {
-                        prev.abort();
-                    }
-                    *guard = Some(service);
-                    tracing::info!("Capability advert service started");
-                }
-                Err(e) => tracing::warn!("failed to start capability advert service: {e}"),
-            }
+        if let Err(e) = self.start_capability_advert_service().await {
+            tracing::warn!("failed to start capability advert service: {e}");
         }
 
         Ok(())
@@ -5514,6 +5522,52 @@ impl Agent {
     #[must_use]
     pub fn capability_store(&self) -> std::sync::Arc<dm_capability::CapabilityStore> {
         std::sync::Arc::clone(&self.capability_store)
+    }
+
+    /// Start or restart the mesh-wide DM capability advert service.
+    ///
+    /// The service publishes this agent's current DM capability and subscribes
+    /// to peer adverts. It is idempotent: a fresh service replaces any previous
+    /// one. Daemons call this independently of `join_network()` completion so
+    /// a slow bootstrap pass cannot leave DM capability discovery disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no gossip runtime is configured yet or the advert
+    /// service cannot subscribe/publish on its topic.
+    pub async fn start_capability_advert_service(&self) -> error::Result<()> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "cannot start capability advert service: no gossip runtime configured",
+            ))
+        })?;
+
+        let signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(
+            self.identity.agent_keypair(),
+        ));
+        let caps_rx = self.dm_capabilities_tx.subscribe();
+        let service = dm_capability_service::CapabilityAdvertService::spawn_default(
+            std::sync::Arc::clone(runtime.pubsub()),
+            signing,
+            self.identity.agent_id(),
+            self.identity.machine_id(),
+            caps_rx,
+            std::sync::Arc::clone(&self.capability_store),
+        )
+        .await
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "capability advert service spawn failed: {e}"
+            )))
+        })?;
+
+        let mut guard = self.capability_advert_service.lock().await;
+        if let Some(prev) = guard.take() {
+            prev.abort();
+        }
+        *guard = Some(service);
+        tracing::info!("Capability advert service started");
+        Ok(())
     }
 
     /// Clone the shared DM in-flight ACK registry.
@@ -8189,6 +8243,51 @@ mod tests {
     fn raw_quic_payload_errors_still_stop_fallback() {
         let err = error::NetworkError::PayloadTooLarge { size: 2, max: 1 };
         assert!(Agent::raw_quic_error_should_stop_fallback(&err, true));
+    }
+
+    #[tokio::test]
+    async fn unusable_capability_advert_falls_back_to_contact_card() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let target = identity::AgentId([7_u8; 32]);
+        let target_machine = identity::MachineId([9_u8; 32]);
+
+        agent
+            .capability_store()
+            .insert(target, target_machine, dm::DmCapabilities::pending());
+        agent.contacts().write().await.add(contacts::Contact {
+            agent_id: target,
+            trust_level: contacts::TrustLevel::Trusted,
+            label: None,
+            added_at: 0,
+            last_seen: None,
+            identity_type: contacts::IdentityType::Known,
+            machines: Vec::new(),
+            dm_capabilities: Some(dm::DmCapabilities::v1_gossip_ready(vec![42_u8; 1184])),
+        });
+
+        let err = agent
+            .send_direct_with_config(
+                &target,
+                b"contact-card-capability".to_vec(),
+                dm::DmSendConfig {
+                    require_gossip: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await
+            .expect_err("contact-card capability should be used before gossip runtime fails");
+
+        assert!(
+            matches!(err, dm::DmError::LocalGossipUnavailable(_)),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]

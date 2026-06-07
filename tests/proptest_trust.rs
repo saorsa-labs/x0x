@@ -22,6 +22,7 @@ fn make_contact(agent: AgentId, trust: TrustLevel, id_type: IdentityType) -> Con
         last_seen: None,
         identity_type: id_type,
         machines: vec![],
+        dm_capabilities: None,
     }
 }
 

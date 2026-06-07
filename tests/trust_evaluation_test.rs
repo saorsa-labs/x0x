@@ -38,6 +38,7 @@ fn store_with(dir: &TempDir, trust: TrustLevel, id_type: IdentityType) -> (Conta
         last_seen: None,
         identity_type: id_type,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     (store, aid)
 }
@@ -125,6 +126,7 @@ fn pinned_agent_correct_machine_yields_accept() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, Some("laptop".into())));
     store.pin_machine(&aid, &mid);
@@ -157,6 +159,7 @@ fn pinned_agent_wrong_machine_yields_reject_mismatch() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, None));
     store.pin_machine(&aid, &mid);
@@ -189,6 +192,7 @@ fn blocked_takes_priority_over_machine_mismatch() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, None));
     store.pin_machine(&aid, &mid);
@@ -224,6 +228,7 @@ fn unpin_machine_removes_constraint() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, None));
     store.pin_machine(&aid, &mid);
@@ -265,6 +270,7 @@ fn multiple_machines_only_one_pinned() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid1, Some("desktop".into())));
     store.add_machine(&aid, MachineRecord::new(mid2, Some("laptop".into())));
@@ -312,6 +318,7 @@ fn set_trust_updates_existing_contact() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
 
     {
@@ -374,6 +381,7 @@ fn machines_accessor_returns_correct_records() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid1, None));
     store.add_machine(&aid, MachineRecord::new(mid2, Some("server".into())));
@@ -404,6 +412,7 @@ fn remove_machine_removes_correct_record() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid1, None));
     store.add_machine(&aid, MachineRecord::new(mid2, None));
@@ -433,6 +442,7 @@ fn remove_only_pinned_machine_removes_constraint() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, None));
     store.pin_machine(&aid, &mid);
@@ -474,6 +484,7 @@ fn remove_one_pinned_machine_keeps_remaining_pin() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid1, Some("desktop".into())));
     store.add_machine(&aid, MachineRecord::new(mid2, Some("laptop".into())));
@@ -529,6 +540,7 @@ fn contact_store_in_memory_state_round_trip() {
         last_seen: Some(2_000),
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, Some("workstation".into())));
     store.pin_machine(&aid, &mid);

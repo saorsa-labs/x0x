@@ -1,8 +1,5 @@
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>x0x communitas</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;600;700&family=Outfit:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 /* ═══════════════════════════════════════════════════════════════════
    SECTION 1: RESET & CUSTOM PROPERTIES
@@ -21,9 +18,9 @@
   --pk:#ec4899;--pk-dim:rgba(236,72,153,.12);
   --sk:#38bdf8;--og:#f97316;
   --glass:rgba(12,14,24,.88);--glass-bd:rgba(255,255,255,.06);--glass-blur:16px;
-  --sans:'Outfit',system-ui,-apple-system,sans-serif;
-  --display:'Bricolage Grotesque','Outfit',system-ui,sans-serif;
-  --mono:'JetBrains Mono',ui-monospace,'SF Mono','Cascadia Code',monospace;
+  --sans:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --display:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --mono:ui-monospace,'SF Mono','Cascadia Code','Menlo','Consolas',monospace;
   --sp1:4px;--sp2:8px;--sp3:12px;--sp4:16px;--sp5:20px;--sp6:24px;--sp8:32px;
   --r-sm:6px;--r-md:10px;--r-lg:14px;--r-full:9999px;
   --t-fast:.15s ease;--t-norm:.2s ease;--t-slow:.35s ease-out;
@@ -2664,6 +2661,37 @@ function renderNetwork(){
     </div>
     <div id="g-note" style="margin-top:var(--sp2);color:var(--tx2);font-size:11px"></div>
   </div>
+  <h3>Subsystem Diagnostics</h3>
+  <div class="grid g2 mb2" style="gap:var(--sp3)">
+    <div class="card">
+      <div class="row mb" style="justify-content:space-between">
+        <strong>ACK</strong>
+        <button onclick="refreshDiagAck()">Refresh</button>
+      </div>
+      <pre id="diag-ack-out" style="font-size:11px;color:var(--tx3);white-space:pre-wrap;max-height:150px;overflow:auto">—</pre>
+    </div>
+    <div class="card">
+      <div class="row mb" style="justify-content:space-between">
+        <strong>Direct Messages</strong>
+        <button onclick="refreshDiagDm()">Refresh</button>
+      </div>
+      <pre id="diag-dm-out" style="font-size:11px;color:var(--tx3);white-space:pre-wrap;max-height:150px;overflow:auto">—</pre>
+    </div>
+    <div class="card">
+      <div class="row mb" style="justify-content:space-between">
+        <strong>Groups</strong>
+        <button onclick="refreshDiagGroups()">Refresh</button>
+      </div>
+      <pre id="diag-groups-out" style="font-size:11px;color:var(--tx3);white-space:pre-wrap;max-height:150px;overflow:auto">—</pre>
+    </div>
+    <div class="card">
+      <div class="row mb" style="justify-content:space-between">
+        <strong>Exec</strong>
+        <button onclick="refreshDiagExec()">Refresh</button>
+      </div>
+      <pre id="diag-exec-out" style="font-size:11px;color:var(--tx3);white-space:pre-wrap;max-height:150px;overflow:auto">—</pre>
+    </div>
+  </div>
   <h3>Peers</h3>
   <div class="card mb">
     <div class="row mb" style="justify-content:flex-end">
@@ -2778,6 +2806,28 @@ async function fetchUserMachines(){
   if(r&&r.machines)renderMachineList(r.machines);
 }
 
+function diagOut(id,obj){
+  const el=document.getElementById(id);
+  if(el)el.textContent=obj?JSON.stringify(obj,null,2):'No response';
+}
+
+async function refreshDiagAck(){
+  const r=await api('/diagnostics/ack');
+  diagOut('diag-ack-out',r);
+}
+async function refreshDiagDm(){
+  const r=await api('/diagnostics/dm');
+  diagOut('diag-dm-out',r);
+}
+async function refreshDiagGroups(){
+  const r=await api('/diagnostics/groups');
+  diagOut('diag-groups-out',r);
+}
+async function refreshDiagExec(){
+  const r=await api('/diagnostics/exec');
+  diagOut('diag-exec-out',r);
+}
+
 function togglePeerEvents(on){
   if(peerEventsSse){peerEventsSse.close();peerEventsSse=null}
   const out=document.getElementById('n-peer-events');
@@ -2866,6 +2916,12 @@ async function pollNetworkView(){
         : '<span class="trust trust-trusted" style="font-size:10px">clean</span> all gossip stages balanced, zero drops since startup';
     }
   }
+  await Promise.allSettled([
+    refreshDiagAck(),
+    refreshDiagDm(),
+    refreshDiagGroups(),
+    refreshDiagExec(),
+  ]);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -3175,6 +3231,8 @@ function renderAdmin(){
         <button onclick="adminFetchUserId()">Fetch my user-id</button>
         <button onclick="adminFetchIntroduction()">Fetch introduction card</button>
       </div>
+      <textarea id="admin-sign-payload" placeholder="Payload to sign" rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
+      <button onclick="adminSignPayload()">Sign payload</button>
       <div id="admin-identity-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
     </div>
     <div class="card">
@@ -3248,6 +3306,23 @@ function renderAdmin(){
         <button onclick="adminGroupCancelRequest()">Cancel join request</button>
       </div>
       <div id="admin-gm-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Remote Exec</h3>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-exec-agent" placeholder="Target agent ID" style="flex:1">
+        <input id="admin-exec-timeout" type="number" placeholder="Timeout ms" style="width:120px">
+      </div>
+      <textarea id="admin-exec-argv" placeholder='["/bin/echo","hello"]' rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
+      <div class="row mb" style="gap:var(--sp2)">
+        <button onclick="adminExecRun()">Run</button>
+        <button onclick="adminExecSessions()">Sessions</button>
+      </div>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-exec-request" placeholder="Request ID to cancel" style="flex:1">
+        <button class="danger" onclick="adminExecCancel()">Cancel</button>
+      </div>
+      <div id="admin-exec-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2);white-space:pre-wrap;max-height:240px;overflow:auto"></div>
     </div>
     <div class="card">
       <h3 style="margin-top:0">Add Contact (raw)</h3>
@@ -3331,6 +3406,12 @@ async function adminFetchUserId(){
 }
 async function adminFetchIntroduction(){
   const r=await api('/introduction');
+  adminOut('admin-identity-out',r);
+}
+async function adminSignPayload(){
+  const payload=document.getElementById('admin-sign-payload').value||'';
+  if(!payload){adminOut('admin-identity-out',null,'Enter a payload to sign');return}
+  const r=await api('/agent/sign',{method:'POST',body:JSON.stringify({payload_b64:u8encode(payload)})});
   adminOut('admin-identity-out',r);
 }
 
@@ -3444,6 +3525,40 @@ async function adminGroupCancelRequest(){
   if(!gid||!rid){adminOut('admin-gm-out',null,'Need group and request IDs');return}
   const r=await api('/groups/'+encodeURIComponent(gid)+'/requests/'+encodeURIComponent(rid),{method:'DELETE'});
   adminOut('admin-gm-out',r);
+}
+
+function parseExecArgv(){
+  const raw=(document.getElementById('admin-exec-argv').value||'').trim();
+  if(!raw)return [];
+  try{
+    const parsed=JSON.parse(raw);
+    if(Array.isArray(parsed))return parsed.map(String);
+  }catch(e){}
+  return raw.split(/\s+/).filter(Boolean);
+}
+
+async function adminExecRun(){
+  const agent_id=(document.getElementById('admin-exec-agent').value||'').trim();
+  const argv=parseExecArgv();
+  const timeout=parseInt(document.getElementById('admin-exec-timeout').value||'',10);
+  if(!agent_id||!argv.length){adminOut('admin-exec-out',null,'Need target agent ID and argv');return}
+  const body={agent_id,argv};
+  if(Number.isFinite(timeout)&&timeout>0)body.timeout_ms=timeout;
+  const r=await api('/exec/run',{method:'POST',body:JSON.stringify(body)});
+  adminOut('admin-exec-out',r);
+}
+async function adminExecCancel(){
+  const request_id=(document.getElementById('admin-exec-request').value||'').trim();
+  const agent_id=(document.getElementById('admin-exec-agent').value||'').trim();
+  if(!request_id){adminOut('admin-exec-out',null,'Need request ID');return}
+  const body={request_id};
+  if(agent_id)body.agent_id=agent_id;
+  const r=await api('/exec/cancel',{method:'POST',body:JSON.stringify(body)});
+  adminOut('admin-exec-out',r);
+}
+async function adminExecSessions(){
+  const r=await api('/exec/sessions');
+  adminOut('admin-exec-out',r);
 }
 
 async function adminAddContact(){

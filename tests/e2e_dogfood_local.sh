@@ -11,6 +11,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 X0XD="${X0XD:-$ROOT/target/release/x0xd}"
+PYTHON="${PYTHON:-/usr/bin/python3}"
 RUNNER="$ROOT/tests/runners/x0x_test_runner.py"
 ORCHESTRATOR="$ROOT/tests/e2e_dogfood_local.py"
 BUDGET_SECS="${PHASE_D_BUDGET_SECS:-60}"
@@ -22,6 +23,7 @@ fi
 
 NODES=(alice bob)
 declare -A API_PORTS=([alice]=25700 [bob]=25701)
+declare -A DATA_DIRS CONFIGS
 declare -a DAEMON_PIDS=()
 declare -a RUNNER_PIDS=()
 
@@ -43,16 +45,24 @@ cleanup() {
 trap cleanup EXIT
 
 token_path() {
-    echo "$HOME/Library/Application Support/x0x-$1/api-token"
+    echo "${DATA_DIRS[$1]}/api-token"
 }
 
 t0=$(date +%s)
 
 # 1. Boot daemons.
 for node in "${NODES[@]}"; do
+    DATA_DIRS[$node]="$WORK_DIR/$node"
+    CONFIGS[$node]="$WORK_DIR/$node.toml"
+    mkdir -p "${DATA_DIRS[$node]}"
+    cat > "${CONFIGS[$node]}" <<TOML
+instance_name = "$node"
+data_dir = "${DATA_DIRS[$node]}"
+api_address = "127.0.0.1:${API_PORTS[$node]}"
+log_level = "warn"
+TOML
     "$X0XD" \
-        --name "$node" \
-        --api-port "${API_PORTS[$node]}" \
+        --config "${CONFIGS[$node]}" \
         --no-hard-coded-bootstrap \
         > "$WORK_DIR/$node.x0xd.log" 2>&1 &
     DAEMON_PIDS+=("$!")
@@ -76,7 +86,7 @@ for node in "${NODES[@]}"; do
     port="${API_PORTS[$node]}"
     AIDS[$node]="$(curl -sf -H "Authorization: Bearer ${TOKENS[$node]}" \
         "http://127.0.0.1:$port/agent" \
-        | python3 -c "import sys,json;print(json.load(sys.stdin)['agent_id'])")"
+        | "$PYTHON" -c "import sys,json;print(json.load(sys.stdin)['agent_id'])")"
     CARDS[$node]="$(curl -sf -H "Authorization: Bearer ${TOKENS[$node]}" \
         "http://127.0.0.1:$port/agent/card")"
 done
@@ -105,14 +115,14 @@ sleep 1
 NODE_NAME=bob \
 X0X_API_BASE="http://127.0.0.1:${API_PORTS[bob]}" \
 X0X_API_TOKEN="${TOKENS[bob]}" \
-    python3 "$RUNNER" > "$WORK_DIR/bob.runner.log" 2>&1 &
+    "$PYTHON" "$RUNNER" > "$WORK_DIR/bob.runner.log" 2>&1 &
 RUNNER_PIDS+=("$!")
 
 sleep 2
 echo "ready in $(($(date +%s) - t0))s — invoking orchestrator"
 
 # 4. Drive every assertion via DMs.
-python3 "$ORCHESTRATOR" \
+"$PYTHON" "$ORCHESTRATOR" \
     --api-base "http://127.0.0.1:${API_PORTS[alice]}" \
     --api-token "${TOKENS[alice]}" \
     --anchor alice \
