@@ -1337,8 +1337,13 @@ fn prioritize_discovery_addresses(addresses: &mut [std::net::SocketAddr]) {
 ///   machine_id or empty key never clobbers a known value.
 /// - **user_id** is never erased: a fresher *anonymous* announcement keeps a
 ///   previously-disclosed user_id.
-/// - **last_seen** is monotonic (`max`) so cache eviction by receive time keeps
-///   working regardless of announcement arrival order.
+/// - **last_seen** reflects the most recent receive: it is set from the
+///   incoming record (matching the pre-merge replace semantics). In production
+///   `incoming.last_seen` is the current receive time, so it only moves forward;
+///   it is NOT clamped with `max`, because the TTL/presence filter must be able
+///   to observe an entry that has genuinely aged past its window (a `max` clamp
+///   would let a once-fresh entry mask a later stale observation and never
+///   expire — see `test_ttl_expiry_removes_from_presence`).
 async fn upsert_discovered_agent(
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
@@ -1379,7 +1384,7 @@ async fn upsert_discovered_agent(
                 existing.reachable_via = incoming.reachable_via;
                 existing.relay_candidates = incoming.relay_candidates;
             }
-            existing.last_seen = existing.last_seen.max(incoming.last_seen);
+            existing.last_seen = incoming.last_seen;
         }
         None => {
             cache.insert(incoming.agent_id, incoming);
