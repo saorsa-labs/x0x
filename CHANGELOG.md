@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.21.4] - 2026-06-10
+
 ### Fixed
 
 - **Fresh-boot DM delivery black hole (dogfood `group_join` / hop-DM 25s timeouts).** Local 3-daemon soaks failed 10-17% of iterations with `group_join timed out` / `hop DM never echoed back`; a trace-instrumented capture run pinned a chain of three compounding faults, each masked by the previous one:

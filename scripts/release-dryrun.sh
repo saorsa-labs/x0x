@@ -64,6 +64,13 @@ for archive in \
     x0x-macos-arm64.tar.gz \
     x0x-windows-x64.zip; do
     dd if=/dev/urandom of="$ASSETS/${archive}" bs=1024 count=8 status=none
+    # release.yml signs every archive before manifest generation and
+    # x0x-keygen `manifest` requires the sibling .sig — mirror that here.
+    "$KEYGEN" sign \
+        --key "$WORK/test.secret" \
+        --input "$ASSETS/${archive}" \
+        --output "$ASSETS/${archive}.sig" \
+        --context "x0x-release-v1" >/dev/null
 done
 
 # Minimal SKILL.md for hashing.
