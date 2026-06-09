@@ -5,12 +5,12 @@
 use crate::contacts::ContactStore;
 use crate::direct::DirectMessaging;
 use crate::dm::{
-    decrypt_payload, now_unix_ms, validate_timestamp_window, DmAckOutcome, DmBody, DmEnvelope,
-    DmPayload, EnvelopeBuilder, InFlightAcks, RecentDeliveryCache, DM_PROTOCOL_VERSION,
+    decrypt_payload, dm_inbox_topic, now_unix_ms, validate_timestamp_window, DmAckOutcome, DmBody,
+    DmEnvelope, DmPayload, EnvelopeBuilder, InFlightAcks, RecentDeliveryCache, DM_PROTOCOL_VERSION,
     MAX_ENVELOPE_BYTES,
 };
 use crate::error::{NetworkError, NetworkResult};
-use crate::gossip::{PubSubManager, PubSubMessage, SigningContext};
+use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
 use crate::groups::kem_envelope::AgentKemKeypair;
 use crate::identity::{AgentId, MachineId};
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
@@ -74,28 +74,24 @@ pub struct DmTypedPayload {
 }
 
 pub struct DmInboxService {
-    handle: JoinHandle<()>,
+    handles: Vec<JoinHandle<()>>,
     topic: String,
 }
 
-/// Shared DM transport topic. Every gossip-DM-capable agent subscribes
-/// here. Recipients filter by `envelope.recipient_agent_id`; non-
-/// recipients observe only encrypted metadata/payload and do not process it.
-///
-/// The shared bus keeps topic membership simple, but application-level
-/// re-broadcast is intentionally avoided: `PubSubManager::publish()` signs
-/// each hop with the local agent id, while the DM envelope signature is bound
-/// to the origin agent id. Re-publishing an origin envelope from a relay would
-/// make the outer PubSub sender differ from `envelope.sender_agent_id`, so
-/// downstream receivers would reject it and the fleet would only gain load.
+/// Legacy shared DM transport topic. New sends use per-recipient inbox
+/// topics; this listener remains so rolling upgrades can still receive
+/// envelopes from older daemons.
 pub const DM_BUS_TOPIC: &str = "x0x/dm/v1/bus";
+const DM_INBOX_TOPIC_NAME_PREFIX: &str = "x0x/dm/v1/inbox/";
 
 impl DmInboxService {
-    /// Topic every DM envelope is published on. Uniform across agents so
-    /// all subscribers can relay via epidemic broadcast.
+    /// Human-readable name for the agent's raw derived DM inbox topic.
     #[must_use]
-    pub fn inbox_topic_name(_agent_id: &AgentId) -> String {
-        DM_BUS_TOPIC.to_string()
+    pub fn inbox_topic_name(agent_id: &AgentId) -> String {
+        format!(
+            "{DM_INBOX_TOPIC_NAME_PREFIX}{}",
+            hex::encode(dm_inbox_topic(agent_id).to_bytes())
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -112,7 +108,10 @@ impl DmInboxService {
         config: DmInboxConfig,
     ) -> NetworkResult<Self> {
         let topic = Self::inbox_topic_name(&self_agent_id);
-        let mut subscription = pubsub.subscribe(topic.clone()).await;
+        let subscription = pubsub
+            .subscribe_topic_id(topic.clone(), dm_inbox_topic(&self_agent_id))
+            .await;
+        let legacy_subscription = pubsub.subscribe(DM_BUS_TOPIC.to_string()).await;
 
         let pipeline = InboxPipeline {
             pubsub: Arc::clone(&pubsub),
@@ -128,16 +127,19 @@ impl DmInboxService {
             typed_payload_routes: config.typed_payload_routes,
         };
 
-        let topic_for_task = topic.clone();
-        let handle = tokio::spawn(async move {
-            tracing::info!(topic = %topic_for_task, "DM inbox service subscribed");
-            while let Some(message) = subscription.recv().await {
-                pipeline.handle_incoming(message).await;
-            }
-            tracing::debug!(topic = %topic_for_task, "DM inbox subscription closed");
-        });
+        let primary_handle =
+            spawn_subscription_loop(topic.clone(), false, subscription, pipeline.clone());
+        let legacy_handle = spawn_subscription_loop(
+            DM_BUS_TOPIC.to_string(),
+            true,
+            legacy_subscription,
+            pipeline,
+        );
 
-        Ok(Self { handle, topic })
+        Ok(Self {
+            handles: vec![primary_handle, legacy_handle],
+            topic,
+        })
     }
 
     #[must_use]
@@ -146,7 +148,9 @@ impl DmInboxService {
     }
 
     pub fn abort(&self) {
-        self.handle.abort();
+        for handle in &self.handles {
+            handle.abort();
+        }
     }
 }
 
@@ -156,6 +160,22 @@ impl Drop for DmInboxService {
     }
 }
 
+fn spawn_subscription_loop(
+    topic_for_task: String,
+    ack_legacy_bus: bool,
+    mut subscription: Subscription,
+    pipeline: InboxPipeline,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        tracing::info!(topic = %topic_for_task, "DM inbox service subscribed");
+        while let Some(message) = subscription.recv().await {
+            pipeline.handle_incoming(message, ack_legacy_bus).await;
+        }
+        tracing::debug!(topic = %topic_for_task, "DM inbox subscription closed");
+    })
+}
+
+#[derive(Clone)]
 struct InboxPipeline {
     pubsub: Arc<PubSubManager>,
     signing: Arc<SigningContext>,
@@ -171,7 +191,7 @@ struct InboxPipeline {
 }
 
 impl InboxPipeline {
-    async fn handle_incoming(&self, msg: PubSubMessage) {
+    async fn handle_incoming(&self, msg: PubSubMessage, ack_legacy_bus: bool) {
         let (pubsub_sender, sender_pubkey) = match (msg.sender, msg.sender_public_key.as_deref()) {
             (Some(s), Some(pk)) if msg.verified => (s, pk.to_vec()),
             _ => return,
@@ -225,6 +245,7 @@ impl InboxPipeline {
                         AgentId(envelope.sender_agent_id),
                         envelope.request_id,
                         cached.outcome,
+                        ack_legacy_bus,
                     )
                     .await;
             }
@@ -264,12 +285,12 @@ impl InboxPipeline {
                 );
             }
             DmBody::Payload(payload) => {
-                self.handle_payload(envelope, payload).await;
+                self.handle_payload(envelope, payload, ack_legacy_bus).await;
             }
         }
     }
 
-    async fn handle_payload(&self, envelope: DmEnvelope, payload: DmPayload) {
+    async fn handle_payload(&self, envelope: DmEnvelope, payload: DmPayload, ack_legacy_bus: bool) {
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let sender_machine_id = MachineId(envelope.sender_machine_id);
 
@@ -298,7 +319,12 @@ impl InboxPipeline {
                 self.cache.insert(envelope.dedupe_key(), outcome.clone());
                 if !self.silent_reject {
                     let _ = self
-                        .publish_ack(sender_agent_id, envelope.request_id, outcome)
+                        .publish_ack(
+                            sender_agent_id,
+                            envelope.request_id,
+                            outcome,
+                            ack_legacy_bus,
+                        )
                         .await;
                 }
                 return;
@@ -351,7 +377,12 @@ impl InboxPipeline {
             .insert(envelope.dedupe_key(), DmAckOutcome::Accepted);
 
         let _ = self
-            .publish_ack(sender_agent_id, envelope.request_id, DmAckOutcome::Accepted)
+            .publish_ack(
+                sender_agent_id,
+                envelope.request_id,
+                DmAckOutcome::Accepted,
+                ack_legacy_bus,
+            )
             .await;
     }
 
@@ -391,6 +422,7 @@ impl InboxPipeline {
         to: AgentId,
         acks_request_id: [u8; 16],
         outcome: DmAckOutcome,
+        ack_legacy_bus: bool,
     ) -> NetworkResult<()> {
         let body = EnvelopeBuilder::build_ack_body(acks_request_id, outcome);
         let created = now_unix_ms();
@@ -418,7 +450,18 @@ impl InboxPipeline {
             .to_wire_bytes()
             .map_err(|e| NetworkError::SerializationError(format!("ack encode: {e}")))?;
         let topic = DmInboxService::inbox_topic_name(&to);
-        self.pubsub.publish(topic, Bytes::from(encoded)).await
+        let primary = self
+            .pubsub
+            .publish_topic_id(topic, dm_inbox_topic(&to), Bytes::from(encoded.clone()))
+            .await;
+        let legacy = if ack_legacy_bus {
+            self.pubsub
+                .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded))
+                .await
+        } else {
+            Ok(())
+        };
+        primary.and(legacy)
     }
 }
 
@@ -686,18 +729,24 @@ mod tests {
     // ── Inbox topic name consistency ──────────────────────────────────
 
     #[test]
-    fn inbox_topic_is_constant_for_all_agents() {
+    fn inbox_topic_is_agent_specific_and_matches_raw_topic_id() {
         let id1: [u8; 32] = [1u8; 32];
         let id2: [u8; 32] = [2u8; 32];
         let agent1 = AgentId(id1);
         let agent2 = AgentId(id2);
 
-        // DM_BUS_TOPIC is shared — all agents subscribe to the same topic
+        let topic1 = DmInboxService::inbox_topic_name(&agent1);
+        let topic2 = DmInboxService::inbox_topic_name(&agent2);
+
+        assert_ne!(topic1, topic2);
+        assert!(topic1.starts_with(DM_INBOX_TOPIC_NAME_PREFIX));
         assert_eq!(
-            DmInboxService::inbox_topic_name(&agent1),
-            DmInboxService::inbox_topic_name(&agent2)
+            topic1,
+            format!(
+                "{DM_INBOX_TOPIC_NAME_PREFIX}{}",
+                hex::encode(dm_inbox_topic(&agent1).to_bytes())
+            )
         );
-        assert_eq!(DmInboxService::inbox_topic_name(&agent1), DM_BUS_TOPIC);
     }
 
     // ── Typed payload route matching ──────────────────────────────────

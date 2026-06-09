@@ -1318,6 +1318,58 @@ fn push_unique<T: Copy + PartialEq>(items: &mut Vec<T>, item: T) {
     }
 }
 
+fn prioritize_discovery_addresses(addresses: &mut [std::net::SocketAddr]) {
+    addresses.sort_by_key(|addr| is_publicly_advertisable(*addr));
+}
+
+async fn upsert_discovered_agent(
+    cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    mut incoming: DiscoveredAgent,
+) {
+    prioritize_discovery_addresses(&mut incoming.addresses);
+    let mut cache = cache.write().await;
+    match cache.get_mut(&incoming.agent_id) {
+        Some(existing) => {
+            for addr in incoming.addresses {
+                push_unique(&mut existing.addresses, addr);
+            }
+            prioritize_discovery_addresses(&mut existing.addresses);
+            if incoming.announced_at >= existing.announced_at {
+                existing.announced_at = incoming.announced_at;
+                if incoming.machine_id.0 != [0u8; 32] {
+                    existing.machine_id = incoming.machine_id;
+                }
+                if incoming.user_id.is_some() || existing.user_id.is_none() {
+                    existing.user_id = incoming.user_id;
+                }
+                if !incoming.machine_public_key.is_empty() {
+                    existing.machine_public_key = incoming.machine_public_key;
+                }
+                if incoming.nat_type.is_some() {
+                    existing.nat_type = incoming.nat_type;
+                }
+                if incoming.can_receive_direct.is_some() {
+                    existing.can_receive_direct = incoming.can_receive_direct;
+                }
+                if incoming.is_relay.is_some() {
+                    existing.is_relay = incoming.is_relay;
+                }
+                if incoming.is_coordinator.is_some() {
+                    existing.is_coordinator = incoming.is_coordinator;
+                }
+                existing.reachable_via = incoming.reachable_via;
+                existing.relay_candidates = incoming.relay_candidates;
+            }
+            existing.last_seen = existing.last_seen.max(incoming.last_seen);
+        }
+        None => {
+            cache.insert(incoming.agent_id, incoming);
+        }
+    }
+}
+
 fn sort_discovered_machine(machine: &mut DiscoveredMachine) {
     machine.addresses.sort_by_key(|addr| addr.to_string());
     machine.agent_ids.sort_by_key(|id| id.0);
@@ -1895,10 +1947,7 @@ impl HeartbeatContext {
             relay_candidates: announcement.relay_candidates.clone(),
         };
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
-        self.cache
-            .write()
-            .await
-            .insert(discovered_agent.agent_id, discovered_agent);
+        upsert_discovered_agent(&self.cache, discovered_agent).await;
         Ok(())
     }
 }
@@ -2437,6 +2486,7 @@ impl Agent {
         }
 
         let dial_timeout = std::time::Duration::from_secs(8);
+        let local_probe_timeout = std::time::Duration::from_secs(3);
         let direct_probe_addrs = local_direct_probe_addrs(&info.addresses);
 
         // Agent cards minted for a local dogfood run often contain both
@@ -2444,55 +2494,191 @@ impl Agent {
         // that may be stale or firewalled. Probe local IPv4 first so a bad
         // multi-address peer dial cannot consume the full API timeout before
         // the reachable LAN path is attempted.
+        let peer_id_hint =
+            (agent.machine_id.0 != [0u8; 32]).then_some(ant_quic::PeerId(agent.machine_id.0));
         for addr in &direct_probe_addrs {
-            match tokio::time::timeout(dial_timeout, network.connect_addr(*addr)).await {
-                Ok(Ok(connected_peer_id)) => {
-                    let real_machine_id = identity::MachineId(connected_peer_id.0);
-                    if let Some(ref bc) = self.bootstrap_cache {
-                        bc.add_from_connection(connected_peer_id, vec![*addr], None)
-                            .await;
-                    }
+            if let Some(peer_id_hint) = peer_id_hint {
+                match tokio::time::timeout(
+                    local_probe_timeout,
+                    network.connect_peer_with_addrs(peer_id_hint, vec![*addr]),
+                )
+                .await
+                {
+                    Ok(Ok((selected_addr, connected_peer_id)))
+                        if connected_peer_id == peer_id_hint =>
                     {
-                        let mut cache = self.identity_discovery_cache.write().await;
-                        if let Some(entry) = cache.get_mut(agent_id) {
-                            entry.machine_id = real_machine_id;
+                        let real_machine_id = identity::MachineId(connected_peer_id.0);
+                        if let Some(ref bc) = self.bootstrap_cache {
+                            bc.add_from_connection(connected_peer_id, vec![selected_addr], None)
+                                .await;
                         }
+                        {
+                            let mut cache = self.identity_discovery_cache.write().await;
+                            if let Some(entry) = cache.get_mut(agent_id) {
+                                entry.machine_id = real_machine_id;
+                            }
+                        }
+                        self.direct_messaging
+                            .mark_connected(agent.agent_id, real_machine_id)
+                            .await;
+                        tracing::info!(
+                            target: "x0x::connect",
+                            stage = "connect_to_agent",
+                            %agent_prefix,
+                            strategy = "local_direct_first",
+                            outcome = "direct",
+                            selected_addr = %selected_addr,
+                            family = "v4",
+                            dur_ms = call_start.elapsed().as_millis() as u64,
+                            "local peer-authenticated dial succeeded"
+                        );
+                        return Ok(connectivity::ConnectOutcome::Direct(selected_addr));
                     }
-                    self.direct_messaging
-                        .mark_connected(agent.agent_id, real_machine_id)
-                        .await;
-                    tracing::info!(
-                        target: "x0x::connect",
-                        stage = "connect_to_agent",
-                        %agent_prefix,
-                        strategy = "local_direct_first",
-                        outcome = "direct",
-                        selected_addr = %addr,
-                        family = "v4",
-                        dur_ms = call_start.elapsed().as_millis() as u64,
-                        "local direct dial succeeded"
-                    );
-                    return Ok(connectivity::ConnectOutcome::Direct(*addr));
+                    Ok(Ok((selected_addr, connected_peer_id))) => {
+                        tracing::warn!(
+                            target: "x0x::connect",
+                            stage = "connect_to_agent",
+                            %agent_prefix,
+                            strategy = "local_direct_first",
+                            requested_addr = %addr,
+                            selected_addr = %selected_addr,
+                            connected_machine_prefix = %network::hex_prefix(&connected_peer_id.0, 4),
+                            "local peer-authenticated dial reached unexpected peer"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            %agent_prefix,
+                            strategy = "local_direct_first",
+                            %addr,
+                            error = %e,
+                            "local peer-authenticated dial failed; trying verified raw-address fallback"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            %agent_prefix,
+                            strategy = "local_direct_first",
+                            %addr,
+                            timeout_s = local_probe_timeout.as_secs(),
+                            "local peer-authenticated dial timed out; trying verified raw-address fallback"
+                        );
+                    }
                 }
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        target: "x0x::connect",
-                        %agent_prefix,
-                        strategy = "local_direct_first",
-                        %addr,
-                        error = %e,
-                        "local direct dial failed"
-                    );
+
+                match tokio::time::timeout(local_probe_timeout, network.connect_addr(*addr)).await {
+                    Ok(Ok(connected_peer_id)) if connected_peer_id == peer_id_hint => {
+                        let real_machine_id = identity::MachineId(connected_peer_id.0);
+                        if let Some(ref bc) = self.bootstrap_cache {
+                            bc.add_from_connection(connected_peer_id, vec![*addr], None)
+                                .await;
+                        }
+                        {
+                            let mut cache = self.identity_discovery_cache.write().await;
+                            if let Some(entry) = cache.get_mut(agent_id) {
+                                entry.machine_id = real_machine_id;
+                            }
+                        }
+                        self.direct_messaging
+                            .mark_connected(agent.agent_id, real_machine_id)
+                            .await;
+                        tracing::info!(
+                            target: "x0x::connect",
+                            stage = "connect_to_agent",
+                            %agent_prefix,
+                            strategy = "local_direct_raw_fallback",
+                            outcome = "direct",
+                            selected_addr = %addr,
+                            family = "v4",
+                            dur_ms = call_start.elapsed().as_millis() as u64,
+                            "verified local raw-address fallback succeeded"
+                        );
+                        return Ok(connectivity::ConnectOutcome::Direct(*addr));
+                    }
+                    Ok(Ok(connected_peer_id)) => {
+                        tracing::warn!(
+                            target: "x0x::connect",
+                            stage = "connect_to_agent",
+                            %agent_prefix,
+                            strategy = "local_direct_raw_fallback",
+                            %addr,
+                            connected_machine_prefix = %network::hex_prefix(&connected_peer_id.0, 4),
+                            "verified local raw-address fallback reached unexpected peer"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            %agent_prefix,
+                            strategy = "local_direct_raw_fallback",
+                            %addr,
+                            error = %e,
+                            "verified local raw-address fallback failed"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            %agent_prefix,
+                            strategy = "local_direct_raw_fallback",
+                            %addr,
+                            timeout_s = local_probe_timeout.as_secs(),
+                            "verified local raw-address fallback timed out"
+                        );
+                    }
                 }
-                Err(_) => {
-                    tracing::debug!(
-                        target: "x0x::connect",
-                        %agent_prefix,
-                        strategy = "local_direct_first",
-                        %addr,
-                        timeout_s = dial_timeout.as_secs(),
-                        "local direct dial timed out"
-                    );
+            } else {
+                match tokio::time::timeout(local_probe_timeout, network.connect_addr(*addr)).await {
+                    Ok(Ok(connected_peer_id)) => {
+                        let real_machine_id = identity::MachineId(connected_peer_id.0);
+                        if let Some(ref bc) = self.bootstrap_cache {
+                            bc.add_from_connection(connected_peer_id, vec![*addr], None)
+                                .await;
+                        }
+                        {
+                            let mut cache = self.identity_discovery_cache.write().await;
+                            if let Some(entry) = cache.get_mut(agent_id) {
+                                entry.machine_id = real_machine_id;
+                            }
+                        }
+                        self.direct_messaging
+                            .mark_connected(agent.agent_id, real_machine_id)
+                            .await;
+                        tracing::info!(
+                            target: "x0x::connect",
+                            stage = "connect_to_agent",
+                            %agent_prefix,
+                            strategy = "local_direct_first",
+                            outcome = "direct",
+                            selected_addr = %addr,
+                            family = "v4",
+                            dur_ms = call_start.elapsed().as_millis() as u64,
+                            "local direct dial succeeded"
+                        );
+                        return Ok(connectivity::ConnectOutcome::Direct(*addr));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            %agent_prefix,
+                            strategy = "local_direct_first",
+                            %addr,
+                            error = %e,
+                            "local direct dial failed"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            %agent_prefix,
+                            strategy = "local_direct_first",
+                            %addr,
+                            timeout_s = local_probe_timeout.as_secs(),
+                            "local direct dial timed out"
+                        );
+                    }
                 }
             }
         }
@@ -2856,6 +3042,133 @@ impl Agent {
             return Ok(connectivity::ConnectOutcome::Unreachable);
         }
 
+        let dial_timeout = std::time::Duration::from_secs(8);
+        let local_probe_timeout = std::time::Duration::from_secs(3);
+        let direct_probe_addrs = local_direct_probe_addrs(&info.addresses);
+
+        for addr in &direct_probe_addrs {
+            match tokio::time::timeout(
+                local_probe_timeout,
+                network.connect_peer_with_addrs(peer_id, vec![*addr]),
+            )
+            .await
+            {
+                Ok(Ok((selected_addr, connected_peer_id))) if connected_peer_id == peer_id => {
+                    if let Some(ref bc) = self.bootstrap_cache {
+                        bc.add_from_connection(connected_peer_id, vec![selected_addr], None)
+                            .await;
+                    }
+                    for agent_id in &machine.agent_ids {
+                        self.direct_messaging
+                            .mark_connected(*agent_id, machine.machine_id)
+                            .await;
+                    }
+                    tracing::info!(
+                        target: "x0x::connect",
+                        stage = "connect_to_machine",
+                        %machine_prefix,
+                        strategy = "local_direct_first",
+                        outcome = "direct",
+                        selected_addr = %selected_addr,
+                        dur_ms = call_start.elapsed().as_millis() as u64,
+                        "machine local direct dial succeeded"
+                    );
+                    return Ok(connectivity::ConnectOutcome::Direct(selected_addr));
+                }
+                Ok(Ok((selected_addr, connected_peer_id))) => {
+                    tracing::warn!(
+                        target: "x0x::connect",
+                        stage = "connect_to_machine",
+                        %machine_prefix,
+                        requested_addr = %addr,
+                        selected_addr = %selected_addr,
+                        connected_machine_prefix = %network::hex_prefix(&connected_peer_id.0, 4),
+                        "machine local direct dial reached unexpected peer"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        stage = "connect_to_machine",
+                        %machine_prefix,
+                        strategy = "local_direct_first",
+                        %addr,
+                        error = %e,
+                        "machine local direct dial failed"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        stage = "connect_to_machine",
+                        %machine_prefix,
+                        strategy = "local_direct_first",
+                        %addr,
+                        timeout_s = local_probe_timeout.as_secs(),
+                        "machine local direct dial timed out"
+                    );
+                }
+            }
+
+            match tokio::time::timeout(local_probe_timeout, network.connect_addr(*addr)).await {
+                Ok(Ok(connected_peer_id)) if connected_peer_id == peer_id => {
+                    if let Some(ref bc) = self.bootstrap_cache {
+                        bc.add_from_connection(connected_peer_id, vec![*addr], None)
+                            .await;
+                    }
+                    for agent_id in &machine.agent_ids {
+                        self.direct_messaging
+                            .mark_connected(*agent_id, machine.machine_id)
+                            .await;
+                    }
+                    tracing::info!(
+                        target: "x0x::connect",
+                        stage = "connect_to_machine",
+                        %machine_prefix,
+                        strategy = "local_direct_raw_fallback",
+                        outcome = "direct",
+                        selected_addr = %addr,
+                        dur_ms = call_start.elapsed().as_millis() as u64,
+                        "verified machine local raw-address fallback succeeded"
+                    );
+                    return Ok(connectivity::ConnectOutcome::Direct(*addr));
+                }
+                Ok(Ok(connected_peer_id)) => {
+                    tracing::warn!(
+                        target: "x0x::connect",
+                        stage = "connect_to_machine",
+                        %machine_prefix,
+                        strategy = "local_direct_raw_fallback",
+                        %addr,
+                        connected_machine_prefix = %network::hex_prefix(&connected_peer_id.0, 4),
+                        "verified machine local raw-address fallback reached unexpected peer"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        stage = "connect_to_machine",
+                        %machine_prefix,
+                        strategy = "local_direct_raw_fallback",
+                        %addr,
+                        error = %e,
+                        "verified machine local raw-address fallback failed"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        stage = "connect_to_machine",
+                        %machine_prefix,
+                        strategy = "local_direct_raw_fallback",
+                        %addr,
+                        timeout_s = local_probe_timeout.as_secs(),
+                        "verified machine local raw-address fallback timed out"
+                    );
+                }
+            }
+        }
+
         network
             .upsert_peer_hints(peer_id, info.addresses.clone(), None)
             .await
@@ -2865,7 +3178,6 @@ impl Agent {
                 )))
             })?;
 
-        let dial_timeout = std::time::Duration::from_secs(8);
         match tokio::time::timeout(
             dial_timeout,
             network.connect_peer_with_addrs(peer_id, info.addresses.clone()),
@@ -2927,6 +3239,9 @@ impl Agent {
 
         if info.should_attempt_direct() {
             for addr in &info.addresses {
+                if direct_probe_addrs.contains(addr) {
+                    continue;
+                }
                 match tokio::time::timeout(dial_timeout, network.connect_addr(*addr)).await {
                     Ok(Ok(connected_peer_id)) if connected_peer_id == peer_id => {
                         if let Some(ref bc) = self.bootstrap_cache {
@@ -4428,10 +4743,7 @@ impl Agent {
         };
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &discovered_agent)
             .await;
-        self.identity_discovery_cache
-            .write()
-            .await
-            .insert(discovered_agent.agent_id, discovered_agent);
+        upsert_discovered_agent(&self.identity_discovery_cache, discovered_agent).await;
 
         // Record consent AFTER successful publish so heartbeats don't start
         // including user identity if this announcement never actually propagated.
@@ -5187,10 +5499,7 @@ impl Agent {
                     relay_candidates: announcement.relay_candidates.clone(),
                 };
                 upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
-                cache
-                    .write()
-                    .await
-                    .insert(discovered_agent.agent_id, discovered_agent);
+                upsert_discovered_agent(&cache, discovered_agent).await;
                 tracing::debug!(
                     target: "x0x::discovery",
                     announcement_kind = "received",
@@ -6286,10 +6595,7 @@ impl Agent {
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
-                            cache
-                                .write()
-                                .await
-                                .insert(discovered_agent.agent_id, discovered_agent);
+                            upsert_discovered_agent(&cache, discovered_agent).await;
                             return Ok(Some(addrs));
                         }
                     }
@@ -6304,11 +6610,9 @@ impl Agent {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            cache
-                .write()
-                .await
-                .entry(agent_id)
-                .or_insert_with(|| DiscoveredAgent {
+            upsert_discovered_agent(
+                &cache,
+                DiscoveredAgent {
                     agent_id,
                     machine_id: identity::MachineId([0u8; 32]),
                     user_id: None,
@@ -6322,7 +6626,9 @@ impl Agent {
                     is_coordinator: None,
                     reachable_via: Vec::new(),
                     relay_candidates: Vec::new(),
-                });
+                },
+            )
+            .await;
             return Ok(Some(addrs));
         }
 
@@ -7010,10 +7316,7 @@ impl Agent {
         let agent_id = agent.agent_id;
         let machine_id = agent.machine_id;
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
-        self.identity_discovery_cache
-            .write()
-            .await
-            .insert(agent_id, agent);
+        upsert_discovered_agent(&self.identity_discovery_cache, agent).await;
 
         if machine_id.0 != [0u8; 32] {
             self.direct_messaging
@@ -8060,6 +8363,12 @@ impl std::fmt::Debug for KvStoreHandle {
 }
 
 impl KvStoreHandle {
+    /// Return this handle's gossip peer id.
+    #[must_use]
+    pub fn peer_id(&self) -> saorsa_gossip_types::PeerId {
+        self.peer_id
+    }
+
     /// Put a key-value pair into the store.
     ///
     /// If the key already exists, the value is updated. Changes are
@@ -8074,6 +8383,24 @@ impl KvStoreHandle {
         value: Vec<u8>,
         content_type: String,
     ) -> error::Result<()> {
+        let _ = self.put_with_delta(key, value, content_type).await?;
+        Ok(())
+    }
+
+    /// Put a key-value pair and return the CRDT delta that was published.
+    ///
+    /// This is used by API-layer delivery fallbacks that need to carry the
+    /// exact same mutation over a side channel when pub/sub is congested.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value exceeds the maximum inline size (64 KB).
+    pub async fn put_with_delta(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        content_type: String,
+    ) -> error::Result<kv::KvStoreDelta> {
         let delta = {
             let mut store = self.sync.write().await;
             store
@@ -8094,13 +8421,17 @@ impl KvStoreHandle {
                 Some(e) => {
                     kv::KvStoreDelta::for_put(key, e, (self.peer_id, store.next_seq()), version)
                 }
-                None => return Ok(()), // shouldn't happen after successful put
+                None => {
+                    return Err(error::IdentityError::Storage(std::io::Error::other(
+                        "kv put succeeded but entry was not readable",
+                    )));
+                }
             }
         };
-        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv put delta: {e}");
         }
-        Ok(())
+        Ok(delta)
     }
 
     /// Get a value by key.
@@ -8129,6 +8460,16 @@ impl KvStoreHandle {
     ///
     /// Returns an error if the key does not exist.
     pub async fn remove(&self, key: &str) -> error::Result<()> {
+        let _ = self.remove_with_delta(key).await?;
+        Ok(())
+    }
+
+    /// Remove a key and return the CRDT delta that was published.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key does not exist.
+    pub async fn remove_with_delta(&self, key: &str) -> error::Result<kv::KvStoreDelta> {
         let delta = {
             let mut store = self.sync.write().await;
             store.remove(key).map_err(|e| {
@@ -8141,10 +8482,31 @@ impl KvStoreHandle {
                 .insert(key.to_string(), std::collections::HashSet::new());
             d
         };
-        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv remove delta: {e}");
         }
-        Ok(())
+        Ok(delta)
+    }
+
+    /// Apply a verified remote delta received through a non-pubsub channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delta fails to merge into the local store.
+    pub async fn apply_remote_delta(
+        &self,
+        peer_id: saorsa_gossip_types::PeerId,
+        delta: &kv::KvStoreDelta,
+        writer: Option<identity::AgentId>,
+    ) -> error::Result<()> {
+        let mut store = self.sync.write().await;
+        store
+            .merge_delta(delta, peer_id, writer.as_ref())
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "kv direct delta merge failed: {e}",
+                )))
+            })
     }
 
     /// List all active keys in the store.

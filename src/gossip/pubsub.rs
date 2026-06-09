@@ -362,6 +362,16 @@ impl PubSubManager {
     /// `Subscription` is dropped.
     pub async fn subscribe(&self, topic: String) -> Subscription {
         let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.subscribe_topic_id(topic, topic_id).await
+    }
+
+    /// Subscribe to a topic with an explicit transport `TopicId`.
+    ///
+    /// Most callers use [`Self::subscribe`], which derives the transport id
+    /// from the topic string. DM inbox topics are specified as raw
+    /// domain-separated `TopicId`s, while still carrying a stable string topic
+    /// name inside the signed x0x payload.
+    pub async fn subscribe_topic_id(&self, topic: String, topic_id: TopicId) -> Subscription {
         self.register_dynamic_topic_priority(&topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
 
@@ -448,6 +458,20 @@ impl PubSubManager {
     ///
     /// Returns an error if encoding or signing fails.
     pub async fn publish(&self, topic: String, payload: Bytes) -> NetworkResult<()> {
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.publish_topic_id(topic, topic_id, payload).await
+    }
+
+    /// Publish to a topic with an explicit transport `TopicId`.
+    ///
+    /// The signed x0x payload still embeds `topic`; only the underlying
+    /// PlumTree topic id is supplied by the caller.
+    pub async fn publish_topic_id(
+        &self,
+        topic: String,
+        topic_id: TopicId,
+        payload: Bytes,
+    ) -> NetworkResult<()> {
         let encoded_result = if let Some(ref ctx) = self.signing {
             let signing_payload =
                 build_signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload);
@@ -472,7 +496,6 @@ impl PubSubManager {
             }
         };
 
-        let topic_id = TopicId::from_entity(topic.as_bytes());
         self.register_dynamic_topic_priority(&topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
 

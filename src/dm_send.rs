@@ -1,10 +1,10 @@
 //! Sender-side gossip DM path (phase 4 of `docs/design/dm-over-gossip.md`).
 
 use crate::dm::{
-    now_unix_ms, DmAckOutcome, DmEnvelope, DmError, DmPath, DmReceipt, DmSendConfig,
-    EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_VERSION, MAX_PAYLOAD_BYTES,
+    dm_inbox_topic, now_unix_ms, DmAckOutcome, DmEnvelope, DmError, DmPath, DmReceipt,
+    DmSendConfig, EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_VERSION, MAX_PAYLOAD_BYTES,
 };
-use crate::dm_inbox::DmInboxService;
+use crate::dm_inbox::{DmInboxService, DM_BUS_TOPIC};
 use crate::error::IdentityError;
 use crate::gossip::{PubSubManager, SigningContext};
 use crate::identity::{AgentId, MachineId};
@@ -33,6 +33,7 @@ pub struct DmLifecycleHint {
 
 pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
 const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::from_millis(250);
+const ACK_LEGACY_BUS_FALLBACK_DELAY: Duration = Duration::from_millis(250);
 
 #[allow(clippy::too_many_arguments)]
 pub async fn send_via_gossip(
@@ -91,6 +92,7 @@ pub async fn send_via_gossip(
         .map_err(|e| DmError::EnvelopeConstruction(format!("sign: {e}")))?;
     let wire = envelope.to_wire_bytes().map_err(map_identity_err)?;
     let topic = DmInboxService::inbox_topic_name(&recipient_agent_id);
+    let topic_id = dm_inbox_topic(&recipient_agent_id);
 
     tracing::debug!(
         target: "dm.trace",
@@ -147,13 +149,66 @@ pub async fn send_via_gossip(
         // their curl/user-visible deadline without returning a structured
         // `DmError::Timeout`.
         let attempt_result = tokio::time::timeout(config.timeout_per_attempt, async {
-            pubsub
-                .publish(topic.clone(), Bytes::from(wire.clone()))
-                .await
-                .map_err(|e| DmError::LocalGossipUnavailable(e.to_string()))?;
+            let primary_publish = pubsub
+                .publish_topic_id(topic.clone(), topic_id, Bytes::from(wire.clone()))
+                .await;
+            let primary_publish_ok = match primary_publish {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "dm.trace",
+                        stage = "primary_inbox_publish_failed",
+                        request_id = %hex::encode(request_id),
+                        recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                        attempt,
+                        error = %e,
+                    );
+                    false
+                }
+            };
 
             if !config.require_gossip_ack {
+                if !primary_publish_ok {
+                    return Err(DmError::LocalGossipUnavailable(
+                        "primary inbox publish failed".to_string(),
+                    ));
+                }
                 return Ok(None);
+            }
+
+            if primary_publish_ok {
+                if let Some(outcome) =
+                    wait_for_ack_or_backoff(&mut rx, ACK_LEGACY_BUS_FALLBACK_DELAY).await?
+                {
+                    return Ok(Some(outcome));
+                }
+            }
+
+            tracing::debug!(
+                target: "dm.trace",
+                stage = "legacy_bus_fallback_publish",
+                request_id = %hex::encode(request_id),
+                recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                attempt,
+                primary_publish_ok,
+                bus_topic = DM_BUS_TOPIC,
+            );
+            if let Err(e) = pubsub
+                .publish(DM_BUS_TOPIC.to_string(), Bytes::from(wire.clone()))
+                .await
+            {
+                if primary_publish_ok {
+                    tracing::warn!(
+                        target: "dm.trace",
+                        stage = "legacy_bus_fallback_publish_failed",
+                        request_id = %hex::encode(request_id),
+                        recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                        attempt,
+                        error = %e,
+                    );
+                } else {
+                    return Err(DmError::LocalGossipUnavailable(e.to_string()));
+                }
             }
 
             (&mut rx).await.map(Some).map_err(|_| {

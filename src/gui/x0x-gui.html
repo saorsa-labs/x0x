@@ -655,6 +655,8 @@ const LS={
 if(LS.get('sidebar_collapsed',false)){S.set('sidebarCollapsed',true);document.getElementById('app').classList.add('collapsed')}
 const savedName=LS.get('display_name','');
 const savedCard=LS.get('card_link','');
+const UPGRADE_CHECK_COOLDOWN_MS=6*60*60*1000;
+let upgradeCheckInFlight=false;
 
 /* ═══════════════════════════════════════════════════════════════════
    JS SECTION 2: API & WEBSOCKET
@@ -684,14 +686,43 @@ async function api(path,opt){
     const hdrs={'Content-Type':'application/json',...(opt||{}).headers};
     if(API_TOKEN)hdrs['Authorization']='Bearer '+API_TOKEN;
     const r=await fetch(BASE+path,{...opt,headers:hdrs});
-    return r.json();
+    const data=await r.json().catch(()=>({ok:false,error:r.statusText||'request failed'}));
+    if(data&&typeof data==='object'){
+      data._http_ok=r.ok;
+      data._http_status=r.status;
+      if(!r.ok&&!data.error)data.error=r.statusText||('HTTP '+r.status);
+    }
+    return data;
   }catch(e){return null}
+}
+
+async function refreshAgentIdentity(){
+  const a=await api('/agent');
+  if(a&&a.ok){
+    const prevAgent=LS.get('last_agent_id','');
+    const curAgent=a.agent_id||'';
+    if(prevAgent&&curAgent&&prevAgent!==curAgent){
+      // Identity changed (e.g. after purge+reinstall) — clear stale prefs.
+      LS.del('display_name');LS.del('card_link');LS.del('sidebar_collapsed');
+    }
+    if(curAgent)LS.set('last_agent_id',curAgent);
+    if(curAgent)S.set('agentId',curAgent);
+    S.set('machineId',a.machine_id||'');
+    S.set('userId',a.user_id||'');
+    renderIdentityChain();
+    renderSidebar();
+  }
+  return a;
 }
 
 function wsConnect(){
   if(ws&&ws.readyState<2)return;
   try{ws=new WebSocket(WS_URL)}catch(e){setTimeout(wsConnect,3000);return}
-  ws.onopen=()=>{S.set('connected',true);wsSubs.forEach(t=>wsSend({type:'subscribe',topics:[t]}))};
+  ws.onopen=async()=>{
+    await refreshAgentIdentity();
+    S.set('connected',true);
+    wsSubs.forEach(t=>wsSend({type:'subscribe',topics:[t]}));
+  };
   ws.onclose=()=>{S.set('connected',false);setTimeout(wsConnect,3000)};
   ws.onerror=()=>{};
   ws.onmessage=e=>{try{handleWsMsg(JSON.parse(e.data))}catch(e){}};
@@ -746,6 +777,14 @@ function trustClass(t){return'trust trust-'+(t||'unknown').toLowerCase()}
 function trustHtml(t){const sym={Trusted:'&#10003;&#10003;',Known:'&#10003;',Unknown:'?',Blocked:'&#10007;'};return '<span class="'+trustClass(t)+'">'+(sym[t]||'?')+' '+(t||'Unknown')+'</span>'}
 function policyHtml(p){if(!p)return'';const t=typeof p==='string'?p:p.type||'Signed';const c=t.toLowerCase();return '<span class="policy policy-'+c+'">'+(c==='encrypted'?'&#128274; ':'')+t+'</span>'}
 function presenceHtml(online){return '<span class="presence '+(online?'online':'offline')+'"></span>'}
+function apiError(r){return r?(r.error||r.message||r.reason||('HTTP '+(r._http_status||'?'))):'network error'}
+function agentCardPath(displayName,includeGroups){
+  const params=new URLSearchParams();
+  if(displayName)params.set('display_name',displayName);
+  if(includeGroups)params.set('include_groups','true');
+  params.set('include_local_addresses','true');
+  return '/agent/card?'+params.toString();
+}
 
 function toast(msg,type){
   const el=document.createElement('div');
@@ -1578,6 +1617,43 @@ function mountHome(){
   pollDash();
 }
 
+function renderUpgradeBanner(upg){
+  const banner=document.getElementById('h-upgrade-banner');
+  if(!banner)return;
+  if(upg&&upg.update_available){
+    banner.style.display='block';
+    banner.innerHTML=`<div class="card" id="upg-banner" style="border-color:var(--gn);background:var(--gn-dim);display:flex;align-items:center;justify-content:space-between;gap:var(--sp2)">
+      <div><strong style="color:var(--gn)">Update available:</strong> v${esc(upg.version||upg.latest_version||'?')} (you have v${esc(upg.current_version||'?')})</div>
+      <div style="display:flex;gap:var(--sp2);align-items:center">
+        <button class="pri" id="upg-apply-btn" onclick="applyUpgrade()">Apply update</button>
+        <span style="font-size:11px;color:var(--tx2)">or <code style="color:var(--cy)">curl -sfL https://x0x.md | sh</code></span>
+      </div>
+    </div>`;
+  }else{
+    banner.style.display='none';
+    banner.innerHTML='';
+  }
+}
+
+async function refreshUpgradeBanner(force=false){
+  const cached=LS.get('upgrade_status',null);
+  if(cached)renderUpgradeBanner(cached);
+  const last=LS.get('upgrade_checked_at',0);
+  if(!force&&Date.now()-last<UPGRADE_CHECK_COOLDOWN_MS)return;
+  if(upgradeCheckInFlight)return;
+  upgradeCheckInFlight=true;
+  try{
+    const upg=await api('/upgrade');
+    LS.set('upgrade_checked_at',Date.now());
+    if(upg&&upg.ok!==false){
+      LS.set('upgrade_status',upg);
+      renderUpgradeBanner(upg);
+    }
+  }finally{
+    upgradeCheckInFlight=false;
+  }
+}
+
 async function pollDash(){
   const h=await api('/health');
   if(h&&h.ok){
@@ -1589,33 +1665,8 @@ async function pollDash(){
     document.getElementById('st-peers').textContent=(h.peers||0)+' peers';
     document.getElementById('st-ver').textContent='x0x communitas '+(h.version||'');
   }
-  const a=await api('/agent');
-  if(a&&a.ok){
-    const prevAgent=LS.get('last_agent_id','');
-    const curAgent=a.agent_id||'';
-    if(prevAgent&&curAgent&&prevAgent!==curAgent){
-      // Identity changed (e.g. after purge+reinstall) — clear stale prefs
-      LS.del('display_name');LS.del('card_link');LS.del('sidebar_collapsed');
-    }
-    if(curAgent)LS.set('last_agent_id',curAgent);
-    if(!S.get('agentId'))S.set('agentId',curAgent);
-    S.set('machineId',a.machine_id||'');
-    S.set('userId',a.user_id||'');
-    renderIdentityChain();
-  }
-  // Check for updates
-  const upg=await api('/upgrade');
-  const banner=document.getElementById('h-upgrade-banner');
-  if(banner&&upg&&upg.update_available){
-    banner.style.display='block';
-    banner.innerHTML=`<div class="card" id="upg-banner" style="border-color:var(--gn);background:var(--gn-dim);display:flex;align-items:center;justify-content:space-between;gap:var(--sp2)">
-      <div><strong style="color:var(--gn)">Update available:</strong> v${esc(upg.version||upg.latest_version||'?')} (you have v${esc(upg.current_version||'?')})</div>
-      <div style="display:flex;gap:var(--sp2);align-items:center">
-        <button class="pri" id="upg-apply-btn" onclick="applyUpgrade()">Apply update</button>
-        <span style="font-size:11px;color:var(--tx2)">or <code style="color:var(--cy)">curl -sfL https://x0x.md | sh</code></span>
-      </div>
-    </div>`;
-  }else if(banner){banner.style.display='none'}
+  await refreshAgentIdentity();
+  await refreshUpgradeBanner();
 
   const d=await api('/agents/discovered');
   if(d&&d.agents){
@@ -1672,7 +1723,7 @@ function renderIdentityChain(){
 // Share your identity card — generates link and copies to clipboard
 async function shareIdentity(){
   const name=LS.get('display_name','')||'Agent';
-  const r=await api('/agent/card?display_name='+encodeURIComponent(name)+'&include_groups=true');
+  const r=await api(agentCardPath(name,true));
   if(r&&r.link){
     myCardLink=r.link;LS.set('card_link',r.link);
     copyText(r.link);
@@ -1698,6 +1749,7 @@ async function addContactFromLink(){
     document.querySelector('.modal-overlay').remove();
     toast('Contact added: '+(r.display_name||'agent'),'success');
     pollContacts();renderSidebar();
+    if(r.agent_id)api('/agents/connect',{method:'POST',body:JSON.stringify({agent_id:r.agent_id})});
   }else{toast('Invalid link: '+(r&&r.error||'check the link and try again'),'error')}
 }
 
@@ -2156,7 +2208,12 @@ async function boardAction(tid,action){
 
 // --- Space: Files ---
 function renderSpaceFiles(el){
-  el.innerHTML=`<div class="drop-zone" id="file-drop" onclick="document.getElementById('file-input').click()">
+  el.innerHTML=`<div class="row mb">
+    <label for="file-recipient" style="align-self:center;color:var(--tx2);font-size:12px">Send to</label>
+    <select id="file-recipient" style="flex:1" onchange="renderFileSendState()"></select>
+    <button class="ghost" onclick="pollContacts().then(renderFileRecipientOptions)">Refresh</button>
+  </div>
+  <div class="drop-zone" id="file-drop" onclick="chooseFileForSend()">
     Drop files here or click to select
     <input type="file" id="file-input" style="display:none" onchange="handleFileDrop(this.files[0])">
   </div>
@@ -2170,7 +2227,51 @@ function renderSpaceFiles(el){
     dz.addEventListener('dragleave',()=>dz.classList.remove('over'));
     dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('over');if(e.dataTransfer.files.length)handleFileDrop(e.dataTransfer.files[0])});
   }
+  renderFileRecipientOptions();
+  pollContacts().then(renderFileRecipientOptions);
   pollTransfers();
+}
+
+function fileRecipients(){
+  return (S.get('contacts')||[]).filter(c=>c.agent_id&&c.trust_level!=='Blocked');
+}
+
+function fileRecipientLabel(c){
+  const name=c.label||short(c.agent_id,12);
+  const trust=c.trust_level||'Unknown';
+  return name+' · '+short(c.agent_id,12)+' · '+trust;
+}
+
+function renderFileRecipientOptions(){
+  const sel=document.getElementById('file-recipient');
+  if(!sel)return;
+  const previous=sel.value;
+  const recipients=fileRecipients();
+  sel.innerHTML='<option value="">Select a recipient…</option>'+recipients.map(c=>`<option value="${esc(c.agent_id)}">${esc(fileRecipientLabel(c))}</option>`).join('');
+  if(previous&&recipients.some(c=>c.agent_id===previous))sel.value=previous;
+  renderFileSendState();
+}
+
+function renderFileSendState(){
+  const target=selectedFileRecipient();
+  const input=document.getElementById('file-input');
+  const drop=document.getElementById('file-drop');
+  if(input)input.disabled=!target;
+  if(drop){
+    drop.style.opacity=target?'1':'.55';
+    drop.title=target?'Drop files here or click to select':'Select a recipient before sending files';
+  }
+}
+
+function selectedFileRecipient(){
+  const sel=document.getElementById('file-recipient');
+  return sel?sel.value:'';
+}
+
+function chooseFileForSend(){
+  const target=selectedFileRecipient();
+  if(!target){toast('Select a recipient before sending files','warning');return}
+  document.getElementById('file-input').click();
 }
 
 async function handleFileDrop(file){
@@ -2179,10 +2280,14 @@ async function handleFileDrop(file){
   const hash=await crypto.subtle.digest('SHA-256',buf);
   const hex=[...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,'0')).join('');
   document.getElementById('file-hash').textContent=file.name+' · '+(file.size/1024).toFixed(1)+'KB · SHA-256: '+hex;
-  const contacts=S.get('contacts')||[];
-  if(!contacts.length){toast('Add a contact first to send files','warning');return}
-  const target=contacts[0].agent_id;
-  await api('/files/send',{method:'POST',body:JSON.stringify({agent_id:target,filename:file.name,size:file.size,sha256:hex})});
+  const target=selectedFileRecipient();
+  if(!target){toast('Select a recipient before sending files','warning');return}
+  const resp=await api('/files/send',{method:'POST',body:JSON.stringify({agent_id:target,filename:file.name,size:file.size,sha256:hex})});
+  if(!resp||resp._http_ok===false||resp.ok===false){
+    toast('File send failed: '+apiError(resp),'error');
+    return;
+  }
+  toast('File offered to '+short(target,12),'success');
   pollTransfers();
 }
 
@@ -2473,8 +2578,13 @@ async function sendDm(){
   const payload=u8encode(JSON.stringify({text:t,sender_name:name,ts:Date.now()}));
   const ackBox=document.getElementById('dm-require-ack');
   const body={agent_id:target,payload};
-  if(ackBox&&ackBox.checked)body.require_ack_ms=5000;
+  if(ackBox&&ackBox.checked){body.require_ack_ms=5000;body.require_gossip_ack=true}
   const resp=await api('/direct/send',{method:'POST',body:JSON.stringify(body)});
+  if(!resp||resp._http_ok===false||resp.ok===false){
+    toast('Send failed: '+apiError(resp),'error');
+    inp.focus();
+    return;
+  }
   const msg={text:t,sender_name:name,sender_id:S.get('agentId'),timestamp:Date.now(),own:true};
   addDmMsg(target,msg);
   inp.value='';inp.focus();
@@ -3691,7 +3801,7 @@ function saveName(){
 let myCardLink=savedCard||'';
 async function generateCard(){
   const name=LS.get('display_name','')||'Agent';
-  const r=await api('/agent/card?display_name='+encodeURIComponent(name)+'&include_groups=true');
+  const r=await api(agentCardPath(name,true));
   if(r&&r.link){
     myCardLink=r.link;
     LS.set('card_link',r.link);
@@ -4728,7 +4838,7 @@ async function genCardModal(){
   const name=document.getElementById('modal-card-name').value.trim()||'Agent';
   LS.set('display_name',name);
   renderSidebar();
-  const r=await api('/agent/card?display_name='+encodeURIComponent(name)+'&include_groups=true');
+  const r=await api(agentCardPath(name,true));
   if(r&&r.link){
     myCardLink=r.link;LS.set('card_link',r.link);
     copyText(r.link);
@@ -4754,6 +4864,7 @@ async function importCardModal(){
     document.querySelector('.modal-overlay').remove();
     toast('Imported: '+(r.display_name||'agent'),'success');
     pollContacts();renderSidebar();
+    if(r.agent_id)api('/agents/connect',{method:'POST',body:JSON.stringify({agent_id:r.agent_id})});
   }else{toast('Import failed: '+(r&&r.error||'unknown'),'error')}
 }
 
