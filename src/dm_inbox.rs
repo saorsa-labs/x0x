@@ -345,6 +345,31 @@ impl InboxPipeline {
             return;
         }
 
+        // Atomic dedupe claim BEFORE delivery. The same envelope can arrive
+        // twice — once on the primary per-recipient inbox and once on the
+        // legacy bus (during a rolling upgrade), driven by two independent
+        // subscription loops. The earlier `cache.lookup` in `handle_incoming`
+        // is not sufficient: both tasks can miss it before either delivers.
+        // Claiming the dedupe slot here (insert returns `true` only for the
+        // task that inserted it) ensures exactly one task delivers to the
+        // application; the loser re-ACKs the accepted outcome and returns.
+        // The claim happens only after a successful decrypt, so a decrypt
+        // failure above still leaves the slot unclaimed for a genuine retry.
+        if !self
+            .cache
+            .insert(envelope.dedupe_key(), DmAckOutcome::Accepted)
+        {
+            let _ = self
+                .publish_ack(
+                    sender_agent_id,
+                    envelope.request_id,
+                    DmAckOutcome::Accepted,
+                    ack_legacy_bus,
+                )
+                .await;
+            return;
+        }
+
         let is_typed_payload = self
             .route_typed_payload(
                 sender_agent_id,
@@ -372,9 +397,6 @@ impl InboxPipeline {
                 sender = %hex::encode(sender_agent_id.as_bytes()),
             );
         }
-
-        self.cache
-            .insert(envelope.dedupe_key(), DmAckOutcome::Accepted);
 
         let _ = self
             .publish_ack(
@@ -408,11 +430,30 @@ impl InboxPipeline {
             trust_decision,
             received_at_unix_ms: now_unix_ms(),
         };
-        if route.sender.send(typed).await.is_err() {
-            tracing::warn!(
-                sender = %hex::encode(sender_agent_id.as_bytes()),
-                "typed DM payload route receiver is closed; dropping payload"
-            );
+        // Best-effort, NON-BLOCKING hand-off. These typed routes (the
+        // group-public-message and KvStore-delta gossip-DM fallbacks) are
+        // redundant delivery paths — primary fan-out is per-group/store pubsub.
+        // We must not `send().await`: this runs inline in the single DM-inbox
+        // subscription loop that also publishes ACKs, so a slow or
+        // lock-contended route consumer filling the bounded channel would block
+        // ACK delivery for unrelated senders (surfacing as 504s now that
+        // `require_gossip_ack` defaults true). Drop on a full channel and count
+        // it rather than stalling the pipeline.
+        match route.sender.try_send(typed) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dm.record_incoming_typed_route_dropped();
+                tracing::warn!(
+                    sender = %hex::encode(sender_agent_id.as_bytes()),
+                    "typed DM payload route channel full; dropping redundant fallback payload"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!(
+                    sender = %hex::encode(sender_agent_id.as_bytes()),
+                    "typed DM payload route receiver is closed; dropping payload"
+                );
+            }
         }
         true
     }
