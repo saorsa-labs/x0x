@@ -47,6 +47,31 @@ fn gui_dm_composer_exposes_require_ack_toggle() {
     );
 }
 
+/// Verify the embedded Files app requires an explicit recipient selection.
+///
+/// This prevents a privacy/safety regression where file sends silently target
+/// the first contact in the address book.
+#[test]
+fn gui_files_requires_explicit_recipient_selection() {
+    let html = include_str!("../src/gui/x0x-gui.html");
+    assert!(
+        html.contains(r#"id="file-recipient""#),
+        "Files app should expose an explicit recipient select"
+    );
+    assert!(
+        html.contains("selectedFileRecipient()"),
+        "Files send path should read the selected recipient"
+    );
+    assert!(
+        html.contains("Select a recipient before sending files"),
+        "Files app should warn before sending without a recipient"
+    );
+    assert!(
+        !html.contains("contacts[0].agent_id"),
+        "Files app must not auto-send to the first contact"
+    );
+}
+
 /// Verify that API paths called from the GUI exist in ENDPOINTS.
 ///
 /// Extracts `api("/path"...)` calls from the JavaScript and checks each

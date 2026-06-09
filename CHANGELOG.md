@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Fresh-boot DM delivery black hole (dogfood `group_join` / hop-DM 25s timeouts).** Local 3-daemon soaks failed 10-17% of iterations with `group_join timed out` / `hop DM never echoed back`; a trace-instrumented capture run pinned a chain of three compounding faults, each masked by the previous one:
+  1. **Capability-advert poisoning**: `CapabilityAdvertService` broadcast the startup `pending()` advert (no gossip inbox / KEM key), and `CapabilityStore::insert` was unconditional last-writer-wins — epidemic broadcast delivers out of order, so a stale pending advert could clobber the gossip-ready one and leave senders on `advert_cache_unusable`. The store now orders adverts by their signed `created_at_unix_ms` (stale ignored; a genuinely fresher downgrade still wins), and the publisher never broadcasts a not-yet-usable advert (absence already means "use the raw fallback").
+  2. **Fire-and-forget raw-QUIC loss**: the daemon's generic DM config sent raw-path messages without ant-quic's receive-pipeline ACK — a send into a connection being superseded during boot churn returned `Ok` (dur_ms=0) while the bytes were lost, so the retry machinery never fired and the recipient's app never saw the message. `direct_message_send_config()` now sets `raw_quic_receive_ack_timeout = 8s` (matching the named-group config), so loss fails the attempt and the existing retry re-sends.
+  3. **Zombie-connection retry pinning**: with loss now detected, retries still resolved `cached_connected` onto the same dead connection (`is_connected` stays true for a zombie whose remote endpoint vanished without a lifecycle event) and burned ~14s per attempt until the caller's deadline. An ACKed-path send failure on a still-connected peer now tears the connection down so the next attempt takes the X0X-0031/0033 send-readiness repair (fresh dial).
+
+  Validated: the capture harness went from failing within 12-27 iterations to 40/40 clean; `tests/pr99_local_soak.sh` restored to baseline (see soak artefacts under `proofs/x0x-gui-full-dogfood/`).
+
 ### Added
 
 - **`welcome.trace` diagnostics for the TreeKEM Welcome-blob transfer.** Trace-only (no behavior change): `target=welcome.trace` debug stages on both sides of the chunked Welcome pull — anchor `offer_sent` / `chunk_sent` / `chunk_ack_recv` / `final_ack_{ok,failed}`; receiver `chunk_recv` / `chunk_recv_no_pending` / `chunk_ack_sent`. Enable with `RUST_LOG=warn,welcome.trace=debug` to locate exactly where a Welcome transfer stalls under churn.

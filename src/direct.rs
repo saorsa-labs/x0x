@@ -456,6 +456,7 @@ struct DirectDiagnosticsCounters {
     incoming_decode_failed: AtomicU64,
     incoming_signature_failed: AtomicU64,
     incoming_trust_rejected: AtomicU64,
+    incoming_typed_route_dropped: AtomicU64,
     incoming_delivered_to_subscribe: AtomicU64,
     subscriber_channel_lagged: AtomicU64,
     subscriber_events_evicted: AtomicU64,
@@ -499,6 +500,11 @@ pub struct DmDiagnosticsStats {
     pub incoming_decode_failed: u64,
     pub incoming_signature_failed: u64,
     pub incoming_trust_rejected: u64,
+    /// Redundant typed-route gossip-DM fallback hand-offs dropped on a full
+    /// route channel (non-zero ⇒ a route consumer is lagging). Safe drops —
+    /// the primary per-group/store pubsub path still delivers.
+    #[serde(default)]
+    pub incoming_typed_route_dropped: u64,
     pub incoming_delivered_to_subscribe: u64,
     /// Number of oldest buffered events evicted from slow subscriber queues.
     pub subscriber_events_evicted: u64,
@@ -875,6 +881,17 @@ impl DirectMessaging {
         self.with_peer_diagnostics(agent_id, |_| {});
     }
 
+    /// Record a typed-payload route hand-off dropped because the (bounded)
+    /// route channel was full. These are best-effort, redundant gossip-DM
+    /// fallback deliveries (group-public / KvStore-delta); dropping one is
+    /// safe because the primary per-group/store pubsub path still delivers.
+    /// A non-zero value here means a route consumer is lagging.
+    pub(crate) fn record_incoming_typed_route_dropped(&self) {
+        self.diagnostics
+            .incoming_typed_route_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot direct-message diagnostics for API surfaces.
     #[must_use]
     pub fn diagnostics_snapshot(&self) -> DmDiagnosticsSnapshot {
@@ -915,6 +932,10 @@ impl DirectMessaging {
             incoming_trust_rejected: self
                 .diagnostics
                 .incoming_trust_rejected
+                .load(Ordering::Relaxed),
+            incoming_typed_route_dropped: self
+                .diagnostics
+                .incoming_typed_route_dropped
                 .load(Ordering::Relaxed),
             incoming_delivered_to_subscribe: self
                 .diagnostics

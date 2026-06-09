@@ -81,12 +81,16 @@ where
 }
 
 async fn group_state_hash(d: &AgentInstance, group_id: &str) -> Option<String> {
+    let body = group_state(d, group_id).await?;
+    body["state_hash"].as_str().map(ToString::to_string)
+}
+
+async fn group_state(d: &AgentInstance, group_id: &str) -> Option<Value> {
     let resp = d.get(&format!("/groups/{group_id}/state")).await;
     if !resp.status().is_success() {
         return None;
     }
-    let body: Value = resp.json().await.unwrap_or_default();
-    body["state_hash"].as_str().map(ToString::to_string)
+    Some(resp.json().await.unwrap_or_default())
 }
 
 // ===========================================================================
@@ -1305,6 +1309,20 @@ async fn named_group_creator_delete_propagates_to_peer() {
         .unwrap();
     assert_eq!(alice_create["ok"], true);
     let group_id = alice_create["group_id"].as_str().unwrap().to_string();
+    let alice_state = group_state(alice, &group_id).await;
+    assert!(
+        alice_state.is_some(),
+        "alice state missing after default private_secure create"
+    );
+    let Some(alice_state) = alice_state else {
+        return;
+    };
+    assert!(
+        alice_state["security_binding"]
+            .as_str()
+            .is_some_and(|binding| binding.starts_with("treekem:")),
+        "creator-delete regression must exercise a private_secure TreeKEM group: {alice_state:?}"
+    );
 
     let invite: Value = alice
         .post(&format!("/groups/{group_id}/invite"), serde_json::json!({}))

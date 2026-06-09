@@ -101,6 +101,7 @@ struct CachedAdvert {
     capabilities: DmCapabilities,
     _machine_id: [u8; 32],
     seen_at: Instant,
+    created_at_unix_ms: u64,
 }
 
 impl Default for CapabilityStore {
@@ -143,16 +144,38 @@ impl CapabilityStore {
     }
 
     /// Insert / refresh a cache entry.
-    pub fn insert(&self, agent_id: AgentId, machine_id: MachineId, capabilities: DmCapabilities) {
+    ///
+    /// `created_at_unix_ms` is the advert's signed sender-side timestamp and
+    /// orders adverts from the same sender: an advert strictly older than the
+    /// cached one is ignored. Gossip (epidemic broadcast) does not guarantee
+    /// in-order delivery, so without this a daemon's startup `pending`
+    /// (gossip_inbox=false) advert can arrive *after* its upgraded
+    /// gossip-ready advert and clobber it — leaving every sender on the
+    /// silent raw-QUIC fallback (`advert_cache_unusable`) until the next
+    /// republish window. An equal timestamp refreshes the TTL (duplicate
+    /// delivery of the same advert).
+    pub fn insert(
+        &self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        capabilities: DmCapabilities,
+        created_at_unix_ms: u64,
+    ) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
+        if let Some(existing) = inner.get(agent_id.as_bytes()) {
+            if created_at_unix_ms < existing.created_at_unix_ms {
+                return;
+            }
+        }
         inner.insert(
             *agent_id.as_bytes(),
             CachedAdvert {
                 capabilities,
                 _machine_id: *machine_id.as_bytes(),
                 seen_at: Instant::now(),
+                created_at_unix_ms,
             },
         );
     }
@@ -189,10 +212,44 @@ mod tests {
         let machine_id = MachineId([2u8; 32]);
         let caps = DmCapabilities::v1_gossip_ready(vec![0u8; 1184]);
         assert!(store.lookup(&agent_id).is_none());
-        store.insert(agent_id, machine_id, caps.clone());
+        store.insert(agent_id, machine_id, caps.clone(), 1_000);
         let got = store.lookup(&agent_id).expect("hit");
         assert_eq!(got.max_protocol_version, caps.max_protocol_version);
         assert_eq!(got.gossip_inbox, caps.gossip_inbox);
+    }
+
+    /// Gossip delivers adverts out of order. A daemon publishes a `pending`
+    /// (no gossip inbox) advert at startup and an upgraded gossip-ready one
+    /// once its KEM key is wired; if the stale pending advert arrives last it
+    /// must NOT clobber the ready one — that routes every DM to the silent
+    /// raw-QUIC fallback and the recipient's app never sees them (the
+    /// PR #100 dogfood group_join black-hole).
+    #[test]
+    fn capability_store_ignores_stale_out_of_order_advert() {
+        let store = CapabilityStore::new();
+        let agent_id = AgentId([5u8; 32]);
+        let machine_id = MachineId([6u8; 32]);
+        store.insert(
+            agent_id,
+            machine_id,
+            DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
+            2_000,
+        );
+        // Older pending advert delivered late: ignored.
+        store.insert(agent_id, machine_id, DmCapabilities::pending(), 1_000);
+        let got = store.lookup(&agent_id).expect("hit");
+        assert!(
+            got.gossip_inbox && !got.kem_public_key.is_empty(),
+            "stale pending advert must not downgrade a usable cached advert"
+        );
+        // A genuinely fresher downgrade (e.g. daemon restarted pre-KEM) still
+        // applies — ordering, not blanket downgrade protection.
+        store.insert(agent_id, machine_id, DmCapabilities::pending(), 3_000);
+        let got = store.lookup(&agent_id).expect("hit");
+        assert!(
+            !got.gossip_inbox,
+            "fresher advert must win regardless of content"
+        );
     }
 
     #[test]
@@ -204,6 +261,7 @@ mod tests {
             agent_id,
             machine_id,
             DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
+            1_000,
         );
         assert!(store.lookup(&agent_id).is_some());
         std::thread::sleep(Duration::from_millis(100));

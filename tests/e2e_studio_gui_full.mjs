@@ -178,6 +178,45 @@ async function proveGuiRecovery(page) {
     record("embedded-gui.websocket-offline-recovered", "pass");
 }
 
+async function proveEmbeddedGuiFilesRecipient(page, label, groupId, recipientAgentId) {
+    await page.evaluate(({ groupId }) => navigateSpace(groupId, "files"), { groupId });
+    await page.waitForSelector("#file-recipient", { state: "visible", timeout: 15000 });
+    await page.evaluate(() => pollContacts().then(renderFileRecipientOptions));
+    await page.waitForFunction(
+        target => Array.from(document.querySelectorAll("#file-recipient option")).some(option => option.value === target),
+        recipientAgentId,
+        { timeout: 15000 },
+    );
+
+    const initial = await page.locator("#file-recipient").inputValue();
+    failFast(initial === "", `${label} Files should require explicit recipient selection`);
+
+    await page.selectOption("#file-recipient", recipientAgentId);
+    const disabled = await page.locator("#file-input").evaluate(el => el.disabled);
+    failFast(!disabled, `${label} Files input should enable after selecting a recipient`);
+
+    const captured = await page.evaluate(async () => {
+        const originalApi = window.api;
+        let sentBody = null;
+        window.api = async (path, opt) => {
+            if (path === "/files/send") {
+                sentBody = JSON.parse(opt.body);
+                return { ok: true, _http_ok: true };
+            }
+            return originalApi(path, opt);
+        };
+        try {
+            const file = new File(["embedded gui file selector proof"], "embedded-selector-proof.txt", { type: "text/plain" });
+            await handleFileDrop(file);
+            return sentBody;
+        } finally {
+            window.api = originalApi;
+        }
+    });
+    failFast(captured?.agent_id === recipientAgentId, `${label} Files sent to ${captured?.agent_id}, expected ${recipientAgentId}`);
+    record(`${label}.embedded-gui.files-recipient-selector`, "pass", { recipient: recipientAgentId });
+}
+
 async function startExampleServer() {
     const root = resolve("examples/apps");
     const server = createServer((req, res) => {
@@ -285,8 +324,15 @@ async function proveDrop(context, exampleBase, local, studio) {
     await lp.setInputFiles("#fileIn", upload);
     await lp.waitForSelector("#send-btn", { state: "visible", timeout: 10000 });
     await lp.click("#send-btn");
-    await sp.waitForSelector("#xfer-list button", { timeout: 20000 });
-    await sp.click("#xfer-list button:has-text('Accept')");
+    await sp.waitForFunction(() => {
+        const list = document.querySelector("#xfer-list");
+        if (!list) return false;
+        return list.textContent.includes("Complete") || !!list.querySelector("button");
+    }, null, { timeout: 20000 });
+    const accept = sp.locator("#xfer-list button:has-text('Accept')");
+    if (await accept.count()) {
+        await accept.first().click();
+    }
     await waitForText(sp, "#xfer-list", "Complete", 30000);
     record("example-app.drop-cross-machine", "pass");
     await lp.close();
@@ -309,6 +355,8 @@ async function main() {
         const studioGui = await openGui(context, studio, "studio");
         await proveGuiViews(localGui.page, "macbook", space.localGroupId);
         await proveGuiViews(studioGui.page, "studio", space.studioGroupId);
+        await proveEmbeddedGuiFilesRecipient(localGui.page, "macbook", space.localGroupId, studio.agent.agent_id);
+        await proveEmbeddedGuiFilesRecipient(studioGui.page, "studio", space.studioGroupId, local.agent.agent_id);
         await proveGuiDm(localGui.page, studioGui.page, local, studio);
         await proveGuiRecovery(localGui.page);
 

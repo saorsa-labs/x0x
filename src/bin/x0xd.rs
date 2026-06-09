@@ -28,7 +28,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use base64::Engine;
@@ -522,6 +522,8 @@ struct AppState {
     shutdown_notify: watch::Sender<bool>,
     /// Update configuration honored by manual API-triggered update checks.
     update_config: DaemonUpdateConfig,
+    /// Cached `/upgrade` response so polling clients cannot hammer GitHub.
+    upgrade_check_cache: Mutex<Option<CachedUpgradeCheck>>,
     /// Serializes all destructive binary replacement attempts.
     upgrade_apply_lock: Arc<Mutex<()>>,
     /// API bearer token for authenticating local clients.
@@ -536,6 +538,17 @@ struct AppState {
 /// is populated from untrusted discovery surfaces, so it must not grow without
 /// bound even if every incoming card is syntactically valid.
 const GROUP_CARD_CACHE_CAP: usize = 8_192;
+
+const UPGRADE_CHECK_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const UPGRADE_CHECK_ERROR_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Clone)]
+struct CachedUpgradeCheck {
+    checked_at: Instant,
+    status: StatusCode,
+    body: serde_json::Value,
+    ttl: Duration,
+}
 
 fn group_card_expiry_millis(card: &x0x::groups::GroupCard) -> u64 {
     if card.expires_at > card.issued_at {
@@ -983,6 +996,11 @@ struct DirectSendRequest {
     /// gossip DM capability.
     #[serde(default)]
     require_gossip: bool,
+    /// If set, override whether gossip-inbox sends wait for the recipient's
+    /// inbox ACK before returning success. When omitted, the daemon default is
+    /// used.
+    #[serde(default)]
+    require_gossip_ack: Option<bool>,
     /// Optional opt-in: after the DM path accepts the message, probe the
     /// recipient's ant-quic receive pipeline for liveness with this timeout.
     /// This does not force the message itself onto raw-QUIC receive-ACK.
@@ -1161,6 +1179,7 @@ async fn main() -> Result<()> {
         println!("    --name <NAME>                   Instance name for multi-instance support");
         println!("    --api-port <PORT>               Override API server port");
         println!("    --no-hard-coded-bootstrap       Skip configured bootstrap peers");
+        println!("    --disable-peer-cache            Do not load or save cached peers");
         println!("    --exec-acl <PATH>               Override default exec ACL path");
         println!("    --check                         Check configuration and exit");
         println!("    --check-updates       Check for updates and exit");
@@ -1212,6 +1231,7 @@ async fn main() -> Result<()> {
     // where operator policy forbids unsolicited router port mappings. This
     // overrides the daemon config's `port_mapping_enabled` field.
     let cli_no_port_mapping = args.contains(&"--no-port-mapping".to_string());
+    let cli_disable_peer_cache = args.contains(&"--disable-peer-cache".to_string());
 
     // Parse --api-port for overriding the API server port
     let api_port_override = if let Some(idx) = args.iter().position(|a| a == "--api-port") {
@@ -1426,7 +1446,7 @@ async fn main() -> Result<()> {
         max_connections: 50,
         connection_timeout: std::time::Duration::from_secs(30),
         stats_interval: std::time::Duration::from_secs(60),
-        peer_cache_path: Some(cache_dir.join("peers.cache")),
+        peer_cache_path: (!cli_disable_peer_cache).then(|| cache_dir.join("peers.cache")),
         pinned_bootstrap_peers: std::collections::HashSet::new(),
         inbound_allowlist: std::collections::HashSet::new(),
         max_peers_per_ip: 3,
@@ -1452,6 +1472,10 @@ async fn main() -> Result<()> {
     }
     if let Some(secs) = config.presence_offline_timeout_secs {
         builder = builder.with_presence_offline_timeout(secs);
+    }
+    if cli_disable_peer_cache {
+        tracing::info!("Peer cache disabled by --disable-peer-cache");
+        builder = builder.with_peer_cache_disabled();
     }
 
     // NOTE: --no-hard-coded-bootstrap only clears configured seed peers.
@@ -1538,6 +1562,10 @@ async fn main() -> Result<()> {
     let (shutdown_notify, _) = watch::channel(false);
     let agent = Arc::new(agent);
     let (exec_dm_tx, exec_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
+    let (group_public_dm_tx, mut group_public_dm_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
+    let (kv_store_delta_dm_tx, mut kv_store_delta_dm_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
     // ADR-0012 Phase 4: restore live TreeKEM groups from on-disk snapshots.
@@ -1595,6 +1623,7 @@ async fn main() -> Result<()> {
         shutdown_tx,
         shutdown_notify,
         update_config: config.update.clone(),
+        upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         api_token,
         exec_service: Arc::clone(&exec_service),
@@ -1680,10 +1709,14 @@ async fn main() -> Result<()> {
     let dm_inbox_agent = Arc::clone(&agent);
     let dm_inbox_kem = Arc::clone(&agent_kem_keypair);
     let dm_inbox_exec_route_tx = exec_dm_tx.clone();
+    let dm_inbox_group_public_route_tx = group_public_dm_tx.clone();
+    let dm_inbox_kv_store_delta_route_tx = kv_store_delta_dm_tx.clone();
     tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
         dm_inbox_exec_route_tx,
+        dm_inbox_group_public_route_tx,
+        dm_inbox_kv_store_delta_route_tx,
     ));
 
     tokio::spawn(async move {
@@ -1979,6 +2012,66 @@ async fn main() -> Result<()> {
                 );
                 apply_named_group_metadata_event(&meta_state, event, msg.sender, msg.verified)
                     .await;
+            }
+        });
+    }
+
+    // Background signed public-message listener for typed gossip-DM fallback
+    // delivery. Per-group pubsub is still the primary fan-out path; this route
+    // handles the same signed message when the sender additionally direct-
+    // delivers it to active members.
+    {
+        let public_dm_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Some(typed) = group_public_dm_rx.recv().await {
+                if !typed.verified {
+                    continue;
+                }
+                let Some(payload) = typed.payload.strip_prefix(GROUP_PUBLIC_MESSAGE_DM_PREFIX)
+                else {
+                    continue;
+                };
+                let Ok(msg) = serde_json::from_slice::<x0x::groups::GroupPublicMessage>(payload)
+                else {
+                    tracing::debug!(
+                        sender = %hex::encode(typed.sender.as_bytes()),
+                        "typed group-public DM payload was not a GroupPublicMessage"
+                    );
+                    continue;
+                };
+                let group_id = msg.group_id.clone();
+                tracing::debug!(
+                    group_id = %group_id,
+                    sender = %hex::encode(typed.sender.as_bytes()),
+                    "direct-delivered public group message received"
+                );
+                ingest_public_message(&public_dm_state, msg, &group_id).await;
+            }
+        });
+    }
+
+    // Background KvStore delta listener for typed gossip-DM fallback delivery.
+    // Store pub/sub remains the primary path; this side channel gives joined
+    // peers a reliable replay of the same CRDT delta when the topic mesh is
+    // late or congested. Peers that have not joined the store simply ignore it.
+    {
+        let kv_delta_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Some(typed) = kv_store_delta_dm_rx.recv().await {
+                if !typed.verified {
+                    continue;
+                }
+                let Some(payload) = typed.payload.strip_prefix(KV_STORE_DELTA_DM_PREFIX) else {
+                    continue;
+                };
+                let Ok(delta_msg) = serde_json::from_slice::<KvStoreDirectDelta>(payload) else {
+                    tracing::debug!(
+                        sender = %hex::encode(typed.sender.as_bytes()),
+                        "typed kv-store DM payload was not a KvStoreDirectDelta"
+                    );
+                    continue;
+                };
+                apply_direct_kv_store_delta(&kv_delta_state, typed.sender, delta_msg).await;
             }
         });
     }
@@ -2518,16 +2611,20 @@ fn file_transfer_now() -> (u64, u64) {
 }
 
 fn direct_message_send_config() -> x0x::dm::DmSendConfig {
-    // Generic daemon/UI DMs use the capability-aware gossip-inbox path when the
-    // recipient advertises it, but the REST API reports success after the local
-    // gossip publish. Live meshes can deliver the payload while dropping the
-    // reverse ACK; surfacing that as 504 makes users resend messages that the
-    // recipient already displayed. The attempt budget must also cover
-    // saorsa-gossip's Critical fan-out gate plus per-peer send budget under
-    // load; the 4s library default is too short for the live daemon mesh.
+    // Generic daemon/UI DMs should only return success after the inbox path
+    // observes the recipient ACK. Callers that intentionally want
+    // fire-and-forget gossip can pass `require_gossip_ack: false`.
+    //
+    // The raw-QUIC fallback (taken whenever the recipient's gossip-inbox
+    // capability advert has not converged yet — always the case in the first
+    // seconds after boot) must use ant-quic's receive-pipeline ACK. A
+    // fire-and-forget raw send into a connection that is being superseded
+    // reports Ok while the bytes are lost, the retry machinery never fires,
+    // and the recipient's app never sees the message (the dogfood
+    // group_join / hop-DM 25s-timeout black hole).
     x0x::dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(8),
-        require_gossip_ack: false,
+        raw_quic_receive_ack_timeout: Some(Duration::from_secs(8)),
         ..x0x::dm::DmSendConfig::default()
     }
 }
@@ -2537,18 +2634,32 @@ fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
     // The gossip-inbox DM path verifies the signed DM envelope and marks the
     // bridged direct message verified. Raw QUIC can only mark messages
     // verified when the receiver already has a fresh AgentId -> MachineId
-    // binding, so it must remain a fallback rather than preempting gossip.
-    direct_message_send_config()
+    // binding, so keep it as the fallback for peers whose gossip-inbox
+    // capability advert has not converged yet. Terminal signed commits (for
+    // example creator delete) are self-authenticating and explicitly re-check
+    // authority on apply, so dropping the raw fallback can strand members after
+    // their metadata listener exits.
+    let mut config = direct_message_send_config();
+    config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
+    config.require_gossip_ack = true;
+    config
 }
 
 async fn start_dm_inbox_when_gossip_ready(
     agent: Arc<x0x::Agent>,
     kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
     exec_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    group_public_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
-            .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, exec_route_tx.clone());
+            .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, exec_route_tx.clone())
+            .with_typed_payload_route(
+                GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+                group_public_route_tx.clone(),
+            )
+            .with_typed_payload_route(KV_STORE_DELTA_DM_PREFIX, kv_store_delta_route_tx.clone());
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
             .await
@@ -2584,16 +2695,17 @@ async fn start_dm_inbox_when_gossip_ready(
 fn file_transfer_send_config() -> x0x::dm::DmSendConfig {
     let mut config = x0x::dm::DmSendConfig {
         prefer_raw_quic_if_connected: true,
-        stop_fallback_on_raw_error: true,
+        stop_fallback_on_raw_error: false,
         ..x0x::dm::DmSendConfig::default()
     };
-    // File transfer already has a stronger application-level ChunkAck after
-    // the receiver persists each chunk. Avoid layering the raw receive-ACK on
-    // every chunk, which adds an unnecessary second wait in the hot path.
-    // Also keep raw failures terminal: silently falling back to gossip would
-    // push 32 KiB chunks through signed/encrypted pubsub fanout and break the
-    // throughput/back-pressure assumptions of the file chunk window.
-    config.raw_quic_receive_ack_timeout = None;
+    // File transfer has a stronger application-level ChunkAck after the
+    // receiver persists each chunk, but the raw receive-ACK still matters for
+    // stale raw connections: without it, ant-quic can report local send
+    // success while the receiver never drains the chunk, leaving the sender to
+    // fail only after the 60s application ack timeout. Keep the raw fast path,
+    // but allow capability-aware gossip fallback when that raw receive-ACK
+    // fails. DEFAULT_CHUNK_SIZE is sized to fit the DM envelope cap.
+    config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
     config
 }
 
@@ -4244,6 +4356,14 @@ fn discover_local_card_addresses(port: u16, addresses: &mut Vec<String>, include
     }
 }
 
+fn prioritize_local_card_addresses(addresses: &mut [String]) {
+    addresses.sort_by_key(|addr| {
+        addr.parse::<std::net::SocketAddr>()
+            .map(x0x::is_publicly_advertisable)
+            .unwrap_or(true)
+    });
+}
+
 /// GET /agent/card — generate a shareable identity card.
 async fn get_agent_card(
     State(state): State<Arc<AppState>>,
@@ -4278,6 +4398,9 @@ async fn get_agent_card(
                 &mut card.addresses,
                 query.include_local_addresses,
             );
+            if query.include_local_addresses {
+                prioritize_local_card_addresses(&mut card.addresses);
+            }
         }
     }
 
@@ -4396,7 +4519,12 @@ async fn import_agent_card(
     if machine_id_bytes != [0u8; 32] {
         if let Some(caps) = card.dm_capabilities.clone() {
             if caps.gossip_inbox && !caps.kem_public_key.is_empty() {
-                capability_store.insert(agent_id, x0x::identity::MachineId(machine_id_bytes), caps);
+                capability_store.insert(
+                    agent_id,
+                    x0x::identity::MachineId(machine_id_bytes),
+                    caps,
+                    x0x::dm_capability::now_unix_ms(),
+                );
                 inserted_dm_capability = true;
             }
         }
@@ -9972,6 +10100,15 @@ const PUBLIC_MESSAGE_HISTORY_CAP: usize = 512;
 /// fallback path while receivers still validate/cache only messages for groups
 /// they know locally.
 const GLOBAL_PUBLIC_MESSAGE_TOPIC: &str = "x0x.groups.public.v1";
+const GROUP_PUBLIC_MESSAGE_DM_PREFIX: &[u8] = b"X0X-GROUP-PUBLIC-V1\n";
+const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KvStoreDirectDelta {
+    store_id: String,
+    peer_id: saorsa_gossip_types::PeerId,
+    delta: x0x::kv::KvStoreDelta,
+}
 
 /// Request body for `POST /groups/:id/send`.
 #[derive(Debug, Deserialize)]
@@ -10031,7 +10168,7 @@ async fn send_group_public_message(
 
     // Build + endpoint-side authz + sign under the write lock so
     // concurrent role changes can't race the check.
-    let msg = {
+    let (msg, direct_recipients) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return (
@@ -10085,6 +10222,11 @@ async fn send_group_public_message(
                 }
             }
         }
+        let direct_recipients = info
+            .active_members()
+            .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_hex))
+            .map(|member| member.agent_id.clone())
+            .collect::<Vec<_>>();
 
         match x0x::groups::GroupPublicMessage::sign(
             info.stable_group_id().to_string(),
@@ -10096,7 +10238,7 @@ async fn send_group_public_message(
             req.body,
             now_ms,
         ) {
-            Ok(m) => m,
+            Ok(m) => (m, direct_recipients),
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -10151,6 +10293,7 @@ async fn send_group_public_message(
     // Publish succeeded, so cache locally. The listener was started before the
     // publish above to avoid first-message topic races.
     cache_public_message(&state, msg.clone()).await;
+    spawn_group_public_message_delivery_to_active_members(&state, direct_recipients, &msg);
 
     (
         StatusCode::OK,
@@ -10249,6 +10392,86 @@ async fn cache_public_message(state: &AppState, msg: x0x::groups::GroupPublicMes
         while slot.len() > PUBLIC_MESSAGE_HISTORY_CAP {
             slot.remove(0);
         }
+    }
+}
+
+fn encode_group_public_message_direct_payload(
+    msg: &x0x::groups::GroupPublicMessage,
+) -> serde_json::Result<Vec<u8>> {
+    let json = serde_json::to_vec(msg)?;
+    let mut payload = Vec::with_capacity(GROUP_PUBLIC_MESSAGE_DM_PREFIX.len() + json.len());
+    payload.extend_from_slice(GROUP_PUBLIC_MESSAGE_DM_PREFIX);
+    payload.extend_from_slice(&json);
+    Ok(payload)
+}
+
+fn group_public_message_direct_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.require_gossip = true;
+    config.require_gossip_ack = true;
+    config
+}
+
+fn spawn_group_public_message_delivery(
+    state: &AppState,
+    recipient_hex: &str,
+    msg: &x0x::groups::GroupPublicMessage,
+    delay: Option<Duration>,
+) {
+    let recipient = match parse_agent_id_hex(recipient_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                recipient = %recipient_hex,
+                "cannot direct-deliver public group message: invalid recipient id: {e}"
+            );
+            return;
+        }
+    };
+    let payload = match encode_group_public_message_direct_payload(msg) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!("failed to serialize public group message for direct delivery: {e}");
+            return;
+        }
+    };
+    let agent = Arc::clone(&state.agent);
+    let recipient_label = recipient_hex.to_string();
+    let group_id = msg.group_id.clone();
+    tokio::spawn(async move {
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Err(e) = agent
+            .send_direct_with_config(
+                &recipient,
+                payload,
+                group_public_message_direct_delivery_config(),
+            )
+            .await
+        {
+            tracing::warn!(
+                group_id = %group_id,
+                recipient = %recipient_label,
+                "failed to direct-deliver public group message: {e}"
+            );
+        }
+    });
+}
+
+fn spawn_group_public_message_delivery_to_active_members(
+    state: &AppState,
+    recipients: Vec<String>,
+    msg: &x0x::groups::GroupPublicMessage,
+) {
+    for recipient in recipients {
+        spawn_group_public_message_delivery(state, &recipient, msg, None);
+        spawn_group_public_message_delivery(
+            state,
+            &recipient,
+            msg,
+            Some(GROUP_BACKGROUND_PUBLISH_DELAY),
+        );
     }
 }
 
@@ -14562,6 +14785,147 @@ fn render_gui_html() -> String {
 // KvStore handlers
 // ---------------------------------------------------------------------------
 
+fn encode_kv_store_delta_direct_payload(
+    store_id: &str,
+    peer_id: saorsa_gossip_types::PeerId,
+    delta: &x0x::kv::KvStoreDelta,
+) -> serde_json::Result<Vec<u8>> {
+    let msg = KvStoreDirectDelta {
+        store_id: store_id.to_string(),
+        peer_id,
+        delta: delta.clone(),
+    };
+    let json = serde_json::to_vec(&msg)?;
+    let mut payload = Vec::with_capacity(KV_STORE_DELTA_DM_PREFIX.len() + json.len());
+    payload.extend_from_slice(KV_STORE_DELTA_DM_PREFIX);
+    payload.extend_from_slice(&json);
+    Ok(payload)
+}
+
+fn kv_store_delta_direct_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = direct_message_send_config();
+    config.require_gossip = true;
+    config.require_gossip_ack = true;
+    config
+}
+
+async fn kv_store_delta_direct_recipients(state: &AppState) -> Vec<String> {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let contacts = state.contacts.read().await;
+    contacts
+        .list()
+        .into_iter()
+        .filter_map(|contact| {
+            let recipient = hex::encode(contact.agent_id.as_bytes());
+            if recipient == local_agent_hex || contact.trust_level == TrustLevel::Blocked {
+                return None;
+            }
+            let caps = contact.dm_capabilities.as_ref()?;
+            if !caps.gossip_inbox || caps.kem_public_key.is_empty() {
+                return None;
+            }
+            Some(recipient)
+        })
+        .collect()
+}
+
+fn spawn_kv_store_delta_delivery_one(
+    state: &AppState,
+    recipient_hex: &str,
+    store_id: &str,
+    peer_id: saorsa_gossip_types::PeerId,
+    delta: &x0x::kv::KvStoreDelta,
+    delay: Option<Duration>,
+) {
+    let recipient = match parse_agent_id_hex(recipient_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                recipient = %recipient_hex,
+                "cannot direct-deliver kv-store delta: invalid recipient id: {e}"
+            );
+            return;
+        }
+    };
+    let payload = match encode_kv_store_delta_direct_payload(store_id, peer_id, delta) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(
+                store_id,
+                "failed to serialize kv-store delta for direct delivery: {e}"
+            );
+            return;
+        }
+    };
+    let agent = Arc::clone(&state.agent);
+    let recipient_label = recipient_hex.to_string();
+    let store_label = store_id.to_string();
+    tokio::spawn(async move {
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Err(e) = agent
+            .send_direct_with_config(&recipient, payload, kv_store_delta_direct_delivery_config())
+            .await
+        {
+            tracing::warn!(
+                store_id = %store_label,
+                recipient = %recipient_label,
+                "failed to direct-deliver kv-store delta: {e}"
+            );
+        }
+    });
+}
+
+fn spawn_kv_store_delta_delivery(
+    state: &AppState,
+    recipients: Vec<String>,
+    store_id: &str,
+    peer_id: saorsa_gossip_types::PeerId,
+    delta: &x0x::kv::KvStoreDelta,
+) {
+    for recipient in recipients {
+        spawn_kv_store_delta_delivery_one(state, &recipient, store_id, peer_id, delta, None);
+        spawn_kv_store_delta_delivery_one(
+            state,
+            &recipient,
+            store_id,
+            peer_id,
+            delta,
+            Some(GROUP_BACKGROUND_PUBLISH_DELAY),
+        );
+    }
+}
+
+async fn apply_direct_kv_store_delta(
+    state: &AppState,
+    sender: x0x::identity::AgentId,
+    delta_msg: KvStoreDirectDelta,
+) {
+    let store_id = delta_msg.store_id.clone();
+    let handle = {
+        let stores = state.kv_stores.read().await;
+        stores.get(&store_id).cloned()
+    };
+    let Some(handle) = handle else {
+        tracing::debug!(
+            store_id = %store_id,
+            sender = %hex::encode(sender.as_bytes()),
+            "ignoring direct kv-store delta for unjoined store"
+        );
+        return;
+    };
+    if let Err(e) = handle
+        .apply_remote_delta(delta_msg.peer_id, &delta_msg.delta, Some(sender))
+        .await
+    {
+        tracing::warn!(
+            store_id = %store_id,
+            "failed to apply direct kv-store delta: {e}"
+        );
+    }
+}
+
 /// Request body for POST /stores.
 #[derive(Debug, Deserialize)]
 struct CreateStoreRequest {
@@ -14682,12 +15046,15 @@ async fn put_kv_value(
     Path((id, key)): Path<(String, String)>,
     Json(req): Json<PutValueRequest>,
 ) -> impl IntoResponse {
-    let stores = state.kv_stores.read().await;
-    let Some(handle) = stores.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "store not found" })),
-        );
+    let handle = {
+        let stores = state.kv_stores.read().await;
+        let Some(handle) = stores.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "store not found" })),
+            );
+        };
+        handle.clone()
     };
 
     use base64::Engine;
@@ -14705,8 +15072,12 @@ async fn put_kv_value(
         .content_type
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    match handle.put(key, value, content_type).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+    match handle.put_with_delta(key, value, content_type).await {
+        Ok(delta) => {
+            let recipients = kv_store_delta_direct_recipients(&state).await;
+            spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
         Err(e) => {
             let status = if format!("{e}").contains("value too large") {
                 StatusCode::PAYLOAD_TOO_LARGE
@@ -14768,16 +15139,23 @@ async fn delete_kv_value(
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let stores = state.kv_stores.read().await;
-    let Some(handle) = stores.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "store not found" })),
-        );
+    let handle = {
+        let stores = state.kv_stores.read().await;
+        let Some(handle) = stores.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "store not found" })),
+            );
+        };
+        handle.clone()
     };
 
-    match handle.remove(&key).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+    match handle.remove_with_delta(&key).await {
+        Ok(delta) => {
+            let recipients = kv_store_delta_direct_recipients(&state).await;
+            spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
@@ -15090,6 +15468,9 @@ async fn direct_send(
     send_config.prefer_raw_quic_if_connected = req.prefer_raw_quic_if_connected;
     send_config.stop_fallback_on_raw_error = req.stop_fallback_on_raw_error;
     send_config.require_gossip = req.require_gossip;
+    if let Some(require_gossip_ack) = req.require_gossip_ack {
+        send_config.require_gossip_ack = require_gossip_ack;
+    }
     if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
         send_config.raw_quic_receive_ack_timeout = Some(std::time::Duration::from_millis(
             raw_ack_ms.clamp(100, 30_000),
@@ -15934,17 +16315,21 @@ async fn get_constitution_json() -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 /// GET /upgrade — check for available updates.
-async fn check_upgrade(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn check_upgrade(State(state): State<Arc<AppState>>) -> Response {
     if !state.update_config.enabled {
-        return (
+        return upgrade_response(
             StatusCode::OK,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "ok": true,
                 "update_available": false,
                 "current_version": env!("CARGO_PKG_VERSION"),
                 "reason": "updates disabled"
-            })),
+            }),
         );
+    }
+
+    if let Some(response) = cached_upgrade_response(state.as_ref()).await {
+        return response;
     }
 
     let monitor =
@@ -15952,39 +16337,91 @@ async fn check_upgrade(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             Ok(m) => m.with_include_prereleases(state.update_config.include_prereleases),
             Err(e) => {
                 tracing::error!("upgrade monitor creation failed: {e}");
-                return (
+                return store_upgrade_response(
+                    state.as_ref(),
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": "upgrade check unavailable" })),
-                );
+                    serde_json::json!({ "ok": false, "error": "upgrade check unavailable" }),
+                    UPGRADE_CHECK_ERROR_CACHE_TTL,
+                )
+                .await;
             }
         };
 
     match monitor.check_for_updates().await {
-        Ok(Some(release)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(Some(release)) => {
+            store_upgrade_response(
+                state.as_ref(),
+                StatusCode::OK,
+                serde_json::json!({
                 "ok": true,
                 "update_available": true,
                 "version": release.manifest.version,
                 "current_version": env!("CARGO_PKG_VERSION")
-            })),
-        ),
-        Ok(None) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+                }),
+                UPGRADE_CHECK_CACHE_TTL,
+            )
+            .await
+        }
+        Ok(None) => {
+            store_upgrade_response(
+                state.as_ref(),
+                StatusCode::OK,
+                serde_json::json!({
                 "ok": true,
                 "update_available": false,
                 "current_version": env!("CARGO_PKG_VERSION")
-            })),
-        ),
+                }),
+                UPGRADE_CHECK_CACHE_TTL,
+            )
+            .await
+        }
         Err(e) => {
             tracing::error!("upgrade check failed: {e}");
-            (
+            store_upgrade_response(
+                state.as_ref(),
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "upgrade check failed" })),
+                serde_json::json!({ "ok": false, "error": "upgrade check failed" }),
+                UPGRADE_CHECK_ERROR_CACHE_TTL,
             )
+            .await
         }
     }
+}
+
+fn upgrade_response(status: StatusCode, body: serde_json::Value) -> Response {
+    (status, Json(body)).into_response()
+}
+
+async fn cached_upgrade_response(state: &AppState) -> Option<Response> {
+    let cached = {
+        let cache = state.upgrade_check_cache.lock().await;
+        cache
+            .as_ref()
+            .filter(|cached| cached.checked_at.elapsed() < cached.ttl)
+            .cloned()
+    };
+
+    cached.map(|cached| upgrade_response(cached.status, cached.body))
+}
+
+async fn store_upgrade_response(
+    state: &AppState,
+    status: StatusCode,
+    body: serde_json::Value,
+    ttl: Duration,
+) -> Response {
+    let cached = CachedUpgradeCheck {
+        checked_at: Instant::now(),
+        status,
+        body: body.clone(),
+        ttl,
+    };
+    {
+        let mut cache = state.upgrade_check_cache.lock().await;
+        *cache = Some(cached);
+    }
+
+    upgrade_response(status, body)
 }
 
 /// POST /upgrade/apply — fetch the latest signed manifest and apply it.
@@ -19540,6 +19977,19 @@ mod tests {
     }
 
     #[test]
+    fn direct_message_send_config_requires_gossip_ack_by_default() {
+        let config = direct_message_send_config();
+        assert!(config.require_gossip_ack);
+        // Raw-QUIC fallback must be loss-detecting (receive-pipeline ACK), or
+        // a send into a superseded connection reports Ok, the retry never
+        // fires, and the recipient's app never sees the message.
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
+    }
+
+    #[test]
     fn group_card_cache_prunes_expired_cards() {
         let mut cache = HashMap::new();
         cache.insert(
@@ -20186,8 +20636,11 @@ mod tests {
 
         let chunk = file_transfer_send_config();
         assert!(chunk.prefer_raw_quic_if_connected);
-        assert!(chunk.stop_fallback_on_raw_error);
-        assert_eq!(chunk.raw_quic_receive_ack_timeout, None);
+        assert!(!chunk.stop_fallback_on_raw_error);
+        assert_eq!(
+            chunk.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
     }
 
     #[test]
@@ -20197,6 +20650,10 @@ mod tests {
         assert!(!config.prefer_raw_quic_if_connected);
         assert!(!config.require_gossip);
         assert!(!config.stop_fallback_on_raw_error);
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
     }
 
     #[test]
@@ -20747,5 +21204,47 @@ mod tests {
             .expect("waiter must release before the test timeout")
             .expect("waiter task did not panic");
         res.expect("must succeed once ack >= last_seq arrives");
+    }
+
+    #[test]
+    fn group_public_message_direct_payload_is_prefixed_json() {
+        let msg = x0x::groups::GroupPublicMessage {
+            group_id: "group-1".to_string(),
+            state_hash_at_send: "state".to_string(),
+            revision_at_send: 7,
+            author_agent_id: "aa".repeat(32),
+            author_public_key: "bb".repeat(64),
+            author_user_id: None,
+            kind: x0x::groups::GroupPublicMessageKind::Chat,
+            body: "hello".to_string(),
+            timestamp: 123,
+            signature: "cc".repeat(64),
+        };
+
+        let payload =
+            encode_group_public_message_direct_payload(&msg).expect("payload should encode");
+        assert!(payload.starts_with(GROUP_PUBLIC_MESSAGE_DM_PREFIX));
+
+        let decoded: x0x::groups::GroupPublicMessage =
+            serde_json::from_slice(&payload[GROUP_PUBLIC_MESSAGE_DM_PREFIX.len()..])
+                .expect("payload JSON should decode");
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn kv_store_delta_direct_payload_is_prefixed_json() {
+        let peer_id = saorsa_gossip_types::PeerId::new([9; 32]);
+        let delta = x0x::kv::KvStoreDelta::new(42);
+
+        let payload = encode_kv_store_delta_direct_payload("store-1", peer_id, &delta)
+            .expect("payload should encode");
+        assert!(payload.starts_with(KV_STORE_DELTA_DM_PREFIX));
+
+        let decoded: KvStoreDirectDelta =
+            serde_json::from_slice(&payload[KV_STORE_DELTA_DM_PREFIX.len()..])
+                .expect("payload JSON should decode");
+        assert_eq!(decoded.store_id, "store-1");
+        assert_eq!(decoded.peer_id, peer_id);
+        assert_eq!(decoded.delta.version, delta.version);
     }
 }

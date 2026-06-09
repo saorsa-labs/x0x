@@ -69,6 +69,7 @@ impl CapabilityAdvertService {
                     AgentId(advert.agent_id),
                     MachineId(advert.machine_id),
                     advert.capabilities,
+                    advert.created_at_unix_ms,
                 );
                 tracing::debug!(
                     "cached capability advert from {}",
@@ -86,6 +87,24 @@ impl CapabilityAdvertService {
             let mut burst_idx: usize = 0;
             loop {
                 let caps_snapshot = publisher_caps_rx.borrow().clone();
+                // Never broadcast a not-yet-usable (pending) advert: absence
+                // already tells senders to use the raw fallback, while a
+                // pending advert on the wire can race ahead of (or arrive
+                // after) the upgraded one and poison receiver caches. The
+                // `changed()` arm below restarts the burst as soon as the
+                // caps watch upgrades, so readiness still propagates fast.
+                if !advert_is_publishable(&caps_snapshot) {
+                    tracing::debug!("capability advert pending (no inbox/KEM yet); not publishing");
+                    tokio::select! {
+                        _ = tokio::time::sleep(publish_interval) => {}
+                        res = publisher_caps_rx.changed() => {
+                            if res.is_ok() {
+                                burst_idx = 0;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 match build_signed_advert(
                     &publisher_signing,
                     self_agent_id,
@@ -161,6 +180,15 @@ impl Drop for CapabilityAdvertService {
     }
 }
 
+/// True when the capabilities are worth broadcasting: the gossip inbox is
+/// live and the KEM key is present. Anything less is indistinguishable from
+/// "no advert" to senders, so publishing it only risks clobbering a usable
+/// cached advert at receivers.
+#[must_use]
+pub fn advert_is_publishable(caps: &DmCapabilities) -> bool {
+    caps.gossip_inbox && !caps.kem_public_key.is_empty()
+}
+
 pub fn build_signed_advert(
     signing: &SigningContext,
     self_agent_id: AgentId,
@@ -230,6 +258,17 @@ mod tests {
         .expect("build");
         let advert: CapabilityAdvert = postcard::from_bytes(&encoded).expect("decode");
         assert!(verify_advert_signature(&advert, &signing.public_key_bytes));
+    }
+
+    /// A pending advert must never reach the wire — receivers cache adverts
+    /// last-writer-wins per timestamp, so broadcasting "I can't receive"
+    /// degrades DM routing for every sender that hears it.
+    #[test]
+    fn pending_capabilities_are_not_publishable() {
+        assert!(!advert_is_publishable(&DmCapabilities::pending()));
+        assert!(advert_is_publishable(&DmCapabilities::v1_gossip_ready(
+            vec![0u8; 1184]
+        )));
     }
 
     #[test]
