@@ -1322,6 +1322,23 @@ fn prioritize_discovery_addresses(addresses: &mut [std::net::SocketAddr]) {
     addresses.sort_by_key(|addr| is_publicly_advertisable(*addr));
 }
 
+/// Merge a freshly-discovered agent announcement into the cache.
+///
+/// Per-field precedence is keyed on `announced_at` (the signed announcement's
+/// own monotonic timestamp), not local receive time:
+/// - **addresses** reflect the agent's *current* advertised set. A fresher (or
+///   equal) announcement REPLACES the cached list; a stale announcement leaves
+///   it untouched. Announcements carry the agent's full address set, so
+///   replacing — not unioning — keeps the list bounded: a roaming agent
+///   (Wi-Fi → cellular → VPN) does not accumulate dead endpoints, each of which
+///   would otherwise cost a dial timeout in `connect_to_*` / `direct_probe`.
+/// - **machine_id / public key / nat / capability / relay hints** update only
+///   from a fresher-or-equal announcement, and only when present — a zeroed
+///   machine_id or empty key never clobbers a known value.
+/// - **user_id** is never erased: a fresher *anonymous* announcement keeps a
+///   previously-disclosed user_id.
+/// - **last_seen** is monotonic (`max`) so cache eviction by receive time keeps
+///   working regardless of announcement arrival order.
 async fn upsert_discovered_agent(
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
@@ -1332,12 +1349,12 @@ async fn upsert_discovered_agent(
     let mut cache = cache.write().await;
     match cache.get_mut(&incoming.agent_id) {
         Some(existing) => {
-            for addr in incoming.addresses {
-                push_unique(&mut existing.addresses, addr);
-            }
-            prioritize_discovery_addresses(&mut existing.addresses);
             if incoming.announced_at >= existing.announced_at {
                 existing.announced_at = incoming.announced_at;
+                // Replace, don't union: the announcement carries the agent's
+                // full current address set, so the cached list stays bounded.
+                existing.addresses = incoming.addresses;
+                prioritize_discovery_addresses(&mut existing.addresses);
                 if incoming.machine_id.0 != [0u8; 32] {
                     existing.machine_id = incoming.machine_id;
                 }
@@ -9692,6 +9709,119 @@ fn push_unique_works_with_empty() {
     let mut items: Vec<i32> = vec![];
     push_unique(&mut items, 42);
     assert_eq!(items, vec![42]);
+}
+
+#[cfg(test)]
+fn discovered_agent_fixture(
+    tag: u8,
+    announced_at: u64,
+    addrs: &[&str],
+    user_id: Option<identity::UserId>,
+) -> DiscoveredAgent {
+    DiscoveredAgent {
+        agent_id: identity::AgentId([tag; 32]),
+        machine_id: identity::MachineId([tag; 32]),
+        user_id,
+        addresses: addrs
+            .iter()
+            .map(|a| a.parse().expect("valid socket addr"))
+            .collect(),
+        announced_at,
+        last_seen: announced_at,
+        machine_public_key: vec![tag],
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn upsert_discovered_agent_replaces_addresses_on_fresher_announcement() {
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let id = identity::AgentId([7; 32]);
+
+    upsert_discovered_agent(
+        &cache,
+        discovered_agent_fixture(7, 100, &["10.0.0.1:5483", "8.8.8.8:5483"], None),
+    )
+    .await;
+    // A fresher announcement advertising a NEW address set must REPLACE, not
+    // accumulate — otherwise a roaming agent grows an unbounded list of dead
+    // endpoints that each cost a dial timeout.
+    upsert_discovered_agent(
+        &cache,
+        discovered_agent_fixture(7, 200, &["1.2.3.4:5483"], None),
+    )
+    .await;
+
+    let guard = cache.read().await;
+    let entry = guard.get(&id).expect("entry present");
+    assert_eq!(
+        entry.addresses,
+        vec!["1.2.3.4:5483".parse().expect("addr")],
+        "fresher announcement must replace the address set, not union it"
+    );
+}
+
+#[tokio::test]
+async fn upsert_discovered_agent_ignores_stale_announcement_addresses() {
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let id = identity::AgentId([8; 32]);
+
+    upsert_discovered_agent(
+        &cache,
+        discovered_agent_fixture(8, 200, &["1.2.3.4:5483"], None),
+    )
+    .await;
+    // A stale (lower announced_at) announcement must not inject its old
+    // addresses into the fresher cached record.
+    upsert_discovered_agent(
+        &cache,
+        discovered_agent_fixture(8, 100, &["10.0.0.9:5483"], None),
+    )
+    .await;
+
+    let guard = cache.read().await;
+    let entry = guard.get(&id).expect("entry present");
+    assert_eq!(
+        entry.addresses,
+        vec!["1.2.3.4:5483".parse().expect("addr")],
+        "stale announcement must not add addresses"
+    );
+    assert_eq!(
+        entry.announced_at, 200,
+        "stale announcement must not regress announced_at"
+    );
+}
+
+#[tokio::test]
+async fn upsert_discovered_agent_preserves_known_user_id() {
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let id = identity::AgentId([9; 32]);
+    let user = identity::UserId([9; 32]);
+
+    upsert_discovered_agent(
+        &cache,
+        discovered_agent_fixture(9, 100, &["1.2.3.4:5483"], Some(user)),
+    )
+    .await;
+    // A fresher but anonymous announcement must not erase a known user_id.
+    upsert_discovered_agent(
+        &cache,
+        discovered_agent_fixture(9, 200, &["1.2.3.4:5483"], None),
+    )
+    .await;
+
+    let guard = cache.read().await;
+    let entry = guard.get(&id).expect("entry present");
+    assert_eq!(
+        entry.user_id,
+        Some(user),
+        "a fresher anonymous announcement must not erase a disclosed user_id"
+    );
 }
 
 #[test]
