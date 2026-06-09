@@ -2625,9 +2625,13 @@ fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
     // The gossip-inbox DM path verifies the signed DM envelope and marks the
     // bridged direct message verified. Raw QUIC can only mark messages
     // verified when the receiver already has a fresh AgentId -> MachineId
-    // binding, so it must remain a fallback rather than preempting gossip.
+    // binding, so keep it as the fallback for peers whose gossip-inbox
+    // capability advert has not converged yet. Terminal signed commits (for
+    // example creator delete) are self-authenticating and explicitly re-check
+    // authority on apply, so dropping the raw fallback can strand members after
+    // their metadata listener exits.
     let mut config = direct_message_send_config();
-    config.require_gossip = true;
+    config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
     config.require_gossip_ack = true;
     config
 }
@@ -20624,6 +20628,10 @@ mod tests {
         assert!(!config.prefer_raw_quic_if_connected);
         assert!(!config.require_gossip);
         assert!(!config.stop_fallback_on_raw_error);
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
     }
 
     #[test]
