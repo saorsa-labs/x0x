@@ -2614,8 +2614,17 @@ fn direct_message_send_config() -> x0x::dm::DmSendConfig {
     // Generic daemon/UI DMs should only return success after the inbox path
     // observes the recipient ACK. Callers that intentionally want
     // fire-and-forget gossip can pass `require_gossip_ack: false`.
+    //
+    // The raw-QUIC fallback (taken whenever the recipient's gossip-inbox
+    // capability advert has not converged yet — always the case in the first
+    // seconds after boot) must use ant-quic's receive-pipeline ACK. A
+    // fire-and-forget raw send into a connection that is being superseded
+    // reports Ok while the bytes are lost, the retry machinery never fires,
+    // and the recipient's app never sees the message (the dogfood
+    // group_join / hop-DM 25s-timeout black hole).
     x0x::dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(8),
+        raw_quic_receive_ack_timeout: Some(Duration::from_secs(8)),
         ..x0x::dm::DmSendConfig::default()
     }
 }
@@ -4510,7 +4519,12 @@ async fn import_agent_card(
     if machine_id_bytes != [0u8; 32] {
         if let Some(caps) = card.dm_capabilities.clone() {
             if caps.gossip_inbox && !caps.kem_public_key.is_empty() {
-                capability_store.insert(agent_id, x0x::identity::MachineId(machine_id_bytes), caps);
+                capability_store.insert(
+                    agent_id,
+                    x0x::identity::MachineId(machine_id_bytes),
+                    caps,
+                    x0x::dm_capability::now_unix_ms(),
+                );
                 inserted_dm_capability = true;
             }
         }
@@ -19964,7 +19978,15 @@ mod tests {
 
     #[test]
     fn direct_message_send_config_requires_gossip_ack_by_default() {
-        assert!(direct_message_send_config().require_gossip_ack);
+        let config = direct_message_send_config();
+        assert!(config.require_gossip_ack);
+        // Raw-QUIC fallback must be loss-detecting (receive-pipeline ACK), or
+        // a send into a superseded connection reports Ok, the retry never
+        // fires, and the recipient's app never sees the message.
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
     }
 
     #[test]

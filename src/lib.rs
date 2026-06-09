@@ -4081,6 +4081,33 @@ impl Agent {
                     error = %e,
                     "transport send_direct failed"
                 );
+                // A receive-ACK-path failure on a connection that still reads
+                // as connected means the connection is a zombie: the remote
+                // endpoint is gone (supersede/NAT loss without a lifecycle
+                // event) yet `is_connected` keeps steering every retry back
+                // onto it via `cached_connected`. Tear it down so the next
+                // attempt fails the fast path and takes the X0X-0031/0033
+                // send-readiness repair (fresh dial) instead of re-sending
+                // into the same dead connection until the caller's deadline.
+                if receive_ack_timeout.is_some() && network.is_connected(&ant_peer_id).await {
+                    match network.disconnect(&ant_peer_id).await {
+                        Ok(()) => tracing::info!(
+                            target: "x0x::direct",
+                            stage = "send",
+                            to = %agent_prefix,
+                            %machine_prefix,
+                            "tore down zombie connection after acked send failure; retry will redial"
+                        ),
+                        Err(de) => tracing::debug!(
+                            target: "x0x::direct",
+                            stage = "send",
+                            to = %agent_prefix,
+                            %machine_prefix,
+                            error = %de,
+                            "failed to tear down zombie connection after acked send failure"
+                        ),
+                    }
+                }
                 Err(e)
             }
         }
@@ -8947,9 +8974,12 @@ mod tests {
         let target = identity::AgentId([7_u8; 32]);
         let target_machine = identity::MachineId([9_u8; 32]);
 
-        agent
-            .capability_store()
-            .insert(target, target_machine, dm::DmCapabilities::pending());
+        agent.capability_store().insert(
+            target,
+            target_machine,
+            dm::DmCapabilities::pending(),
+            dm_capability::now_unix_ms(),
+        );
         agent.contacts().write().await.add(contacts::Contact {
             agent_id: target,
             trust_level: contacts::TrustLevel::Trusted,
