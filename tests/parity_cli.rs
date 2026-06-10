@@ -99,6 +99,46 @@ fn group_update_rejects_empty_patch_before_daemon_check() {
     );
 }
 
+/// `x0x exec` exposes `sessions` and `cancel` as real, discoverable
+/// subcommands (not magic first-positional sentinels), while the
+/// `x0x exec <agent> -- <argv>` run form still parses. These assert the
+/// documented invocation shapes keep working after the clap restructure.
+#[test]
+fn exec_sub_actions_are_discoverable_subcommands() {
+    let help = run_cli(&["exec", "--help"]).expect("spawn x0x exec --help");
+    assert!(help.status.success(), "exec --help should succeed");
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        text.contains("sessions") && text.contains("cancel"),
+        "exec --help must list the sessions/cancel subcommands:\n{text}"
+    );
+
+    // `sessions` and `cancel <id>` must parse (they fail later only because no
+    // daemon is running, never with a clap usage error).
+    for args in [vec!["exec", "sessions"], vec!["exec", "cancel", "req-1"]] {
+        let out = run_cli(&args).expect("spawn x0x exec sub-action");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Usage:") && !stderr.contains("unexpected argument"),
+            "`x0x {}` should parse as a subcommand, got clap error:\n{stderr}",
+            args.join(" ")
+        );
+    }
+}
+
+#[test]
+fn exec_run_form_still_parses_with_flags() {
+    let agent = "a".repeat(64);
+    // run form with `--` argv and a typed `--timeout` flag must parse.
+    let out = run_cli(&["exec", &agent, "--timeout", "5", "--", "echo", "hi"])
+        .expect("spawn x0x exec run form");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Usage:") && !stderr.contains("unexpected argument"),
+        "exec run form with --timeout should parse, got clap error:\n{stderr}"
+    );
+}
+
 #[test]
 fn group_policy_rejects_empty_patch_before_daemon_check() {
     let output = run_cli(&["group", "policy", "deadbeef"]).expect("spawn x0x group policy");

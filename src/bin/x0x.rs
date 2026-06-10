@@ -173,8 +173,16 @@ enum Commands {
     /// Stream all gossip events to stdout.
     Events,
     /// Remote non-interactive exec over the x0x mesh.
+    ///
+    /// Run a command:   `x0x exec <agent_id> -- <argv...>`
+    /// List sessions:   `x0x exec sessions`
+    /// Cancel a request: `x0x exec cancel <request_id>` (or `--cancel <id>`)
+    ///
+    /// Note: `sessions` and `cancel` are reserved sub-actions. They never
+    /// collide with a real target because agent IDs are 64-char hex strings.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Exec {
-        /// Target agent ID, or the literal `sessions` to list sessions.
+        /// Target agent ID (64-char hex).
         agent_id: Option<String>,
         /// Remote timeout in seconds (remote ACL caps apply).
         #[arg(long)]
@@ -188,6 +196,9 @@ enum Commands {
         /// Command argv. Use `--` before argv to preserve flags.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
+        /// `sessions` / `cancel` sub-actions.
+        #[command(subcommand)]
+        sub: Option<ExecSub>,
     },
     /// Direct messaging.
     Direct {
@@ -399,6 +410,21 @@ enum DiagnosticsSub {
     Groups,
     /// Print remote exec counters, warnings, and ACL summary.
     Exec,
+}
+
+/// Remote exec sub-actions (`x0x exec sessions`, `x0x exec cancel <id>`).
+#[derive(Subcommand)]
+enum ExecSub {
+    /// List exec sessions originated by this local daemon.
+    Sessions,
+    /// Cancel an in-flight exec request by id.
+    Cancel {
+        /// Request id to cancel.
+        request_id: String,
+        /// Optional target agent id the request was sent to.
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
 }
 
 /// Presence subcommands.
@@ -1363,23 +1389,25 @@ async fn run(
             stdin_file,
             cancel,
             argv,
-        } => {
-            if agent_id.as_deref() == Some("sessions") && cancel.is_none() && argv.is_empty() {
-                commands::exec::sessions(&client).await
-            } else if agent_id.as_deref() == Some("cancel") && cancel.is_none() {
-                let Some(request_id) = argv.first() else {
-                    anyhow::bail!("usage: x0x exec cancel <request_id>");
-                };
-                commands::exec::cancel(&client, request_id, None).await
-            } else if let Some(request_id) = cancel {
-                commands::exec::cancel(&client, &request_id, agent_id.as_deref()).await
-            } else {
-                let Some(agent_id) = agent_id else {
-                    anyhow::bail!("usage: x0x exec <agent_id> [--timeout <secs>] [--stdin-file <path>] -- <argv...>");
-                };
-                commands::exec::run(&client, &agent_id, &argv, timeout, stdin_file.as_deref()).await
+            sub,
+        } => match sub {
+            Some(ExecSub::Sessions) => commands::exec::sessions(&client).await,
+            Some(ExecSub::Cancel {
+                request_id,
+                agent_id,
+            }) => commands::exec::cancel(&client, &request_id, agent_id.as_deref()).await,
+            None => {
+                if let Some(request_id) = cancel {
+                    commands::exec::cancel(&client, &request_id, agent_id.as_deref()).await
+                } else {
+                    let Some(agent_id) = agent_id else {
+                        anyhow::bail!("usage: x0x exec <agent_id> [--timeout <secs>] [--stdin-file <path>] -- <argv...>");
+                    };
+                    commands::exec::run(&client, &agent_id, &argv, timeout, stdin_file.as_deref())
+                        .await
+                }
             }
-        }
+        },
         Commands::Direct { sub } => match sub {
             DirectSub::Connect { agent_id } => commands::direct::connect(&client, &agent_id).await,
             DirectSub::Send {

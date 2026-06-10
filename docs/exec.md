@@ -92,8 +92,9 @@ x0x exec <agent_id> --timeout 30 -- journalctl -u x0xd -n 100
 # Send stdin from a local file.
 x0x exec <agent_id> --stdin-file payload.bin -- some-tool --consume-stdin
 
-# Cancel a local in-flight request.
+# Cancel a local in-flight request (flag form, or the `cancel` subcommand).
 x0x exec <agent_id> --cancel <request_id>
+x0x exec cancel <request_id>
 
 # List local pending and remote active sessions.
 x0x exec sessions
@@ -101,6 +102,11 @@ x0x exec sessions
 # Local exec diagnostics.
 x0x diagnostics exec
 ```
+
+`sessions` and `cancel` are real `exec` subcommands (see `x0x exec --help`),
+not positional sentinels. They never shadow a real target: agent IDs are
+64-char hex strings, so the bare words `sessions`/`cancel` can never be a valid
+`<agent_id>`.
 
 For binary output, use `--json` and decode `stdout_b64` / `stderr_b64`.
 

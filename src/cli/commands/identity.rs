@@ -50,10 +50,7 @@ pub async fn agent(client: &DaemonClient) -> Result<()> {
 
 /// `x0x agent user-id` — GET /agent/user-id
 pub async fn user_id(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/agent/user-id").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/agent/user-id").await
 }
 
 /// `x0x announce` — POST /announce
@@ -75,19 +72,16 @@ pub async fn card(
     include_groups: bool,
 ) -> Result<()> {
     client.ensure_running().await?;
-    let mut params = Vec::new();
+    // Build the query with reqwest's encoder so a `display_name` containing
+    // spaces, `&`, or `=` is percent-encoded rather than corrupting the query.
+    let mut query: Vec<(&str, &str)> = Vec::new();
     if let Some(name) = display_name {
-        params.push(format!("display_name={name}"));
+        query.push(("display_name", name));
     }
     if include_groups {
-        params.push("include_groups=true".to_string());
+        query.push(("include_groups", "true"));
     }
-    let query = if params.is_empty() {
-        String::new()
-    } else {
-        format!("?{}", params.join("&"))
-    };
-    let resp = client.get(&format!("/agent/card{query}")).await?;
+    let resp = client.get_query("/agent/card", &query).await?;
 
     // Print the link prominently
     if let Some(link) = resp.get("link").and_then(|v| v.as_str()) {
@@ -102,10 +96,7 @@ pub async fn card(
 
 /// `x0x agent introduction` — GET /introduction
 pub async fn introduction(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/introduction").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/introduction").await
 }
 
 /// `x0x agent import` — POST /agent/card/import
@@ -173,41 +164,7 @@ mod tests {
     use super::*;
     use crate::cli::{DaemonClient, OutputFormat};
 
-    async fn start_mock_server(
-        response_json: serde_json::Value,
-    ) -> (String, tokio::sync::oneshot::Sender<()>) {
-        use std::sync::Arc;
-
-        let json = Arc::new(response_json);
-        let app = axum::Router::new().fallback(move |_req: axum::extract::Request| {
-            let json = Arc::clone(&json);
-            async move {
-                let body = serde_json::to_vec(&*json).unwrap();
-                axum::response::Response::builder()
-                    .status(200)
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(body))
-                    .unwrap()
-            }
-        });
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(async {
-                    rx.await.ok();
-                })
-                .await
-                .ok();
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        (format!("http://{}", addr), tx)
-    }
-
+    use crate::cli::commands::test_support::start_mock_server;
     #[test]
     fn identity_words_encodes_known_hex() {
         let encoder = IdentityEncoder::new();
@@ -381,5 +338,63 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("pass either --file <PATH>"));
+    }
+
+    /// Regression: `card` must percent-encode `display_name`, so a name with
+    /// spaces and `&` cannot corrupt the query string. Captures the raw
+    /// request URI on a mock server and asserts the value round-trips.
+    #[tokio::test]
+    async fn card_url_encodes_display_name() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_for_handler = Arc::clone(&captured);
+
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let captured = Arc::clone(&captured_for_handler);
+            async move {
+                *captured.lock().await = Some(req.uri().to_string());
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{\"ok\":true}"))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let url = format!("http://{addr}");
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+        let result = card(&client, Some("Alice & Bob"), false).await;
+        assert!(result.is_ok(), "card should succeed: {result:?}");
+
+        let uri = captured.lock().await.clone().expect("request captured");
+        // The literal "Alice & Bob" must be encoded, never appearing raw with
+        // a bare `&` that would split into a second query parameter.
+        assert!(
+            uri.contains("display_name=Alice"),
+            "expected encoded display_name in {uri}"
+        );
+        assert!(
+            !uri.contains("display_name=Alice & Bob"),
+            "raw space/ampersand leaked into query: {uri}"
+        );
+        assert!(
+            uri.contains("%26") || uri.contains("Alice%20%26%20Bob") || uri.contains("Alice+%26"),
+            "ampersand was not percent-encoded: {uri}"
+        );
+        drop(tx);
     }
 }

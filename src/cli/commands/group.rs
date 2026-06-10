@@ -13,10 +13,7 @@ use serde_json::{json, Value};
 
 /// `x0x group list` — GET /groups.
 pub async fn list(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/groups").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/groups").await
 }
 
 /// `x0x group create` — POST /groups.
@@ -45,10 +42,7 @@ pub async fn create(
 
 /// `x0x group info` — GET /groups/:id.
 pub async fn info(client: &DaemonClient, group_id: &str) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get(&format!("/groups/{group_id}")).await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get(&format!("/groups/{group_id}")).await
 }
 
 /// `x0x group update` — PATCH /groups/:id.
@@ -77,10 +71,7 @@ pub async fn update(
 
 /// `x0x group members` — GET /groups/:id/members.
 pub async fn members(client: &DaemonClient, group_id: &str) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get(&format!("/groups/{group_id}/members")).await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get(&format!("/groups/{group_id}/members")).await
 }
 
 /// `x0x group add-member` — POST /groups/:id/members.
@@ -152,10 +143,7 @@ pub async fn set_name(client: &DaemonClient, group_id: &str, name: &str) -> Resu
 
 /// `x0x group leave` — DELETE /groups/:id.
 pub async fn leave(client: &DaemonClient, group_id: &str) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.delete(&format!("/groups/{group_id}")).await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_delete(&format!("/groups/{group_id}")).await
 }
 
 // ── Policy / roles / bans ───────────────────────────────────────────────
@@ -256,10 +244,9 @@ pub async fn unban(client: &DaemonClient, group_id: &str, agent_id: &str) -> Res
 
 /// `x0x group requests` — GET /groups/:id/requests.
 pub async fn requests(client: &DaemonClient, group_id: &str) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get(&format!("/groups/{group_id}/requests")).await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client
+        .run_get(&format!("/groups/{group_id}/requests"))
+        .await
 }
 
 /// `x0x group request-access` — POST /groups/:id/requests.
@@ -329,18 +316,12 @@ pub async fn discover(client: &DaemonClient, query: Option<&str>) -> Result<()> 
 
 /// `x0x group discover-nearby` — GET /groups/discover/nearby.
 pub async fn discover_nearby(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/groups/discover/nearby").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/groups/discover/nearby").await
 }
 
 /// `x0x group discover-subscriptions` — GET /groups/discover/subscriptions.
 pub async fn discover_subscriptions(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/groups/discover/subscriptions").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/groups/discover/subscriptions").await
 }
 
 /// `x0x group discover-subscribe` — POST /groups/discover/subscribe.
@@ -375,10 +356,7 @@ pub async fn discover_unsubscribe(client: &DaemonClient, kind: &str, shard: u32)
 
 /// `x0x group card` — GET /groups/cards/:id.
 pub async fn card(client: &DaemonClient, group_id: &str) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get(&format!("/groups/cards/{group_id}")).await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get(&format!("/groups/cards/{group_id}")).await
 }
 
 /// `x0x group card-import` — POST /groups/cards/import.
@@ -426,20 +404,16 @@ pub async fn send(
 
 /// `x0x group messages` — GET /groups/:id/messages.
 pub async fn messages(client: &DaemonClient, group_id: &str) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get(&format!("/groups/{group_id}/messages")).await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client
+        .run_get(&format!("/groups/{group_id}/messages"))
+        .await
 }
 
 // ── State-commit chain (Phase D.3) ──────────────────────────────────────
 
 /// `x0x group state` — GET /groups/:id/state.
 pub async fn state(client: &DaemonClient, group_id: &str) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get(&format!("/groups/{group_id}/state")).await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get(&format!("/groups/{group_id}/state")).await
 }
 
 /// `x0x group state-seal` — POST /groups/:id/state/seal.
@@ -542,44 +516,7 @@ mod tests {
     use super::*;
     use crate::cli::DaemonClient;
 
-    /// Start a mock axum server that returns the given JSON for any request.
-    #[allow(dead_code)]
-    async fn start_mock_server(
-        response_json: serde_json::Value,
-    ) -> (String, tokio::sync::oneshot::Sender<()>) {
-        use std::sync::Arc;
-
-        let json = Arc::new(response_json);
-        let app = axum::Router::new().fallback(move |_req: axum::extract::Request| {
-            let json = Arc::clone(&json);
-            async move {
-                let body = serde_json::to_vec(&*json).unwrap();
-                axum::response::Response::builder()
-                    .status(200)
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(body))
-                    .unwrap()
-            }
-        });
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(async {
-                    rx.await.ok();
-                })
-                .await
-                .ok();
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        (format!("http://{}", addr), tx)
-    }
-
+    use crate::cli::commands::test_support::start_mock_server;
     #[tokio::test]
     async fn list_returns_mock_response() {
         let mock_resp = serde_json::json!({"status": "ok"});

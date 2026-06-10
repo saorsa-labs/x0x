@@ -243,11 +243,7 @@ impl DaemonClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            let msg = body
-                .get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("unknown error");
-            anyhow::bail!("{} (HTTP {})", msg, status.as_u16());
+            return Err(error_from_body(status, &body));
         }
         Ok(resp)
     }
@@ -262,14 +258,69 @@ impl DaemonClient {
         };
 
         if !status.is_success() {
-            let msg = body
-                .get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("unknown error");
-            anyhow::bail!("{} (HTTP {})", msg, status.as_u16());
+            return Err(error_from_body(status, &body));
         }
 
         Ok(body)
+    }
+
+    /// Ensure the daemon is running, send a GET, and print the response.
+    ///
+    /// Collapses the `ensure_running -> get -> print_value` shape shared by the
+    /// trivial read-only commands into a single call.
+    pub async fn run_get(&self, path: &str) -> Result<()> {
+        self.ensure_running().await?;
+        let resp = self.get(path).await?;
+        print_value(self.format, &resp);
+        Ok(())
+    }
+
+    /// Ensure the daemon is running, send a GET with query params, and print.
+    pub async fn run_get_query(&self, path: &str, query: &[(&str, &str)]) -> Result<()> {
+        self.ensure_running().await?;
+        let resp = self.get_query(path, query).await?;
+        print_value(self.format, &resp);
+        Ok(())
+    }
+
+    /// Ensure the daemon is running, send a POST with a JSON body, and print.
+    pub async fn run_post<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<()> {
+        self.ensure_running().await?;
+        let resp = self.post(path, body).await?;
+        print_value(self.format, &resp);
+        Ok(())
+    }
+
+    /// Ensure the daemon is running, send a POST with no body, and print.
+    pub async fn run_post_empty(&self, path: &str) -> Result<()> {
+        self.ensure_running().await?;
+        let resp = self.post_empty(path).await?;
+        print_value(self.format, &resp);
+        Ok(())
+    }
+
+    /// Ensure the daemon is running, send a PATCH with a JSON body, and print.
+    pub async fn run_patch<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<()> {
+        self.ensure_running().await?;
+        let resp = self.patch(path, body).await?;
+        print_value(self.format, &resp);
+        Ok(())
+    }
+
+    /// Ensure the daemon is running, send a PUT with a JSON body, and print.
+    pub async fn run_put<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<()> {
+        self.ensure_running().await?;
+        let resp = self.put(path, body).await?;
+        print_value(self.format, &resp);
+        Ok(())
+    }
+
+    /// Ensure the daemon is running, send a DELETE, and print the response.
+    pub async fn run_delete(&self, path: &str) -> Result<()> {
+        self.ensure_running().await?;
+        let resp = self.delete(path).await?;
+        print_value(self.format, &resp);
+        Ok(())
     }
 
     /// Get the output format.
@@ -286,6 +337,18 @@ impl DaemonClient {
     pub fn api_token(&self) -> Option<&str> {
         self.api_token.as_deref()
     }
+}
+
+/// Build an `anyhow::Error` from a non-success HTTP status and its JSON body.
+///
+/// Reads the `error` field from the body when present, falling back to
+/// `"unknown error"`, and appends the numeric status code.
+fn error_from_body(status: reqwest::StatusCode, body: &serde_json::Value) -> anyhow::Error {
+    let msg = body
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("unknown error");
+    anyhow::anyhow!("{} (HTTP {})", msg, status.as_u16())
 }
 
 /// Print a JSON value according to the output format.

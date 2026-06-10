@@ -23,34 +23,44 @@ pub mod upgrade;
 pub mod user_id;
 pub mod ws;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use crate::api;
+use serde::Serialize;
+
+/// JSON shape of one endpoint in `routes --json`.
+///
+/// Field order/names are the public contract consumed by `just routes-json`
+/// and other tooling: `method`, `path`, `cli_name`, `description`, `category`.
+#[derive(Serialize)]
+struct RouteEntry<'a> {
+    method: String,
+    path: &'a str,
+    cli_name: &'a str,
+    description: &'a str,
+    category: &'a str,
+}
 
 /// Print the full API route table.
 ///
 /// When `json` is true, emits a JSON array — one object per endpoint with
 /// `method`, `path`, `cli_name`, `description`, `category` fields. Used by
-/// `just gui-coverage` and other downstream tooling to treat the registry as
+/// `just routes-json` and other downstream tooling to treat the registry as
 /// the source of truth.
 pub fn routes(json: bool) -> anyhow::Result<()> {
     if json {
-        let mut out = String::from("[\n");
-        let total = api::ENDPOINTS.len();
-        for (i, ep) in api::ENDPOINTS.iter().enumerate() {
-            out.push_str(&format!(
-                "  {{\"method\":\"{}\",\"path\":{},\"cli_name\":{},\"description\":{},\"category\":{}}}",
-                ep.method,
-                json_escape(ep.path),
-                json_escape(ep.cli_name),
-                json_escape(ep.description),
-                json_escape(ep.category),
-            ));
-            if i + 1 < total {
-                out.push(',');
-            }
-            out.push('\n');
-        }
-        out.push(']');
-        println!("{out}");
+        let entries: Vec<RouteEntry<'_>> = api::ENDPOINTS
+            .iter()
+            .map(|ep| RouteEntry {
+                method: ep.method.to_string(),
+                path: ep.path,
+                cli_name: ep.cli_name,
+                description: ep.description,
+                category: ep.category,
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&entries)?);
         return Ok(());
     }
 
@@ -78,57 +88,58 @@ pub fn routes(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::cli::OutputFormat;
 
+    /// The `routes --json` payload is a public contract: tooling parses it and
+    /// keys off `method`/`path`/`cli_name`/`description`/`category`. Pin the
+    /// serialized shape so a serializer change cannot silently break it.
     #[test]
-    fn json_escape_simple_string() {
-        assert_eq!(json_escape("hello"), r#""hello""#);
+    fn routes_json_contract_is_stable() {
+        let entries: Vec<RouteEntry<'_>> = api::ENDPOINTS
+            .iter()
+            .map(|ep| RouteEntry {
+                method: ep.method.to_string(),
+                path: ep.path,
+                cli_name: ep.cli_name,
+                description: ep.description,
+                category: ep.category,
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&entries).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().expect("routes json is an array");
+        assert_eq!(arr.len(), api::ENDPOINTS.len());
+        for (entry, ep) in arr.iter().zip(api::ENDPOINTS.iter()) {
+            let obj = entry.as_object().expect("each entry is an object");
+            for field in ["method", "path", "cli_name", "description", "category"] {
+                assert!(obj.contains_key(field), "missing field {field}");
+            }
+            assert_eq!(obj["method"], serde_json::json!(ep.method.to_string()));
+            assert_eq!(obj["path"], serde_json::json!(ep.path));
+            assert_eq!(obj["cli_name"], serde_json::json!(ep.cli_name));
+        }
     }
 
+    /// Special characters must survive serialization — this is what the old
+    /// hand-rolled escaper guarded. A `"`/newline/tab in a description must
+    /// round-trip without producing invalid JSON.
     #[test]
-    fn json_escape_escapes_quotes() {
-        assert_eq!(json_escape("say \"hi\""), r#""say \"hi\"""#);
-    }
-
-    #[test]
-    fn json_escape_escapes_backslash() {
-        assert_eq!(json_escape("a\\b"), r#""a\\b""#);
-    }
-
-    #[test]
-    fn json_escape_escapes_newline() {
-        assert_eq!(json_escape("a\nb"), r#""a\nb""#);
-    }
-
-    #[test]
-    fn json_escape_escapes_tab() {
-        assert_eq!(json_escape("a\tb"), r#""a\tb""#);
-    }
-
-    #[test]
-    fn json_escape_escapes_control_chars() {
-        assert_eq!(json_escape("a\x00b"), r#""a\u0000b""#);
+    fn routes_json_escapes_special_characters() {
+        let entries = vec![RouteEntry {
+            method: "GET".to_string(),
+            path: "/x",
+            cli_name: "x",
+            description: "say \"hi\"\nand\ttab",
+            category: "test",
+        }];
+        let json = serde_json::to_string(&entries).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed[0]["description"], "say \"hi\"\nand\ttab");
     }
 
     #[test]
