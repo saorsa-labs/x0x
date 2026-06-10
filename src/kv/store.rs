@@ -9,8 +9,9 @@
 //!   from non-owners are rejected. Use for app stores, agent skill registries.
 //! - **Allowlisted**: Only explicitly allowed writers can write. The owner
 //!   manages the allowlist. Use for team workspaces, private swarms.
-//! - **Encrypted**: Only MLS group members can read or write. Deltas are
-//!   encrypted with the group key. Use for private data sharing.
+//! - **Encrypted**: Reserved for group-scoped encrypted stores. The current
+//!   KvStore sync path does not encrypt deltas; do not rely on this policy for
+//!   confidentiality until encrypted sync is wired.
 
 use crate::identity::AgentId;
 use crate::kv::{KvEntry, KvError, KvStoreDelta, Result};
@@ -32,8 +33,11 @@ pub enum AccessPolicy {
     /// The owner manages the allowlist.
     Allowlisted,
 
-    /// Only MLS group members can read or write.
-    /// Deltas are encrypted with the group key before gossip.
+    /// Reserved for group-scoped encrypted stores.
+    ///
+    /// The current KvStore sync path still publishes plaintext deltas and does
+    /// not enforce group membership by itself. Do not rely on this variant for
+    /// confidentiality until encrypted sync is wired.
     Encrypted {
         /// MLS group ID for this store.
         group_id: Vec<u8>,
@@ -221,8 +225,9 @@ impl KvStore {
                     || self.allowed_writers.contains(agent_id)
             }
             AccessPolicy::Encrypted { .. } => {
-                // Authorization is handled by MLS group membership;
-                // if you can decrypt, you're authorized.
+                // Reserved for encrypted sync. The store layer currently treats
+                // this as permissive; group membership enforcement belongs in
+                // the secure sync path once wired.
                 true
             }
         }
@@ -366,8 +371,9 @@ impl KvStore {
                 return Ok(()); // Silent rejection — don't propagate errors for spam
             }
         } else {
-            // No writer identity — only allowed for Encrypted stores
-            // (where MLS group membership is the authorization)
+            // No writer identity is only tolerated for the reserved Encrypted
+            // policy. KvStoreSync does not decrypt or verify group membership
+            // here today.
             match &self.policy {
                 AccessPolicy::Encrypted { .. } => {} // OK
                 _ => {

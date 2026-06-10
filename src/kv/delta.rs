@@ -89,11 +89,10 @@ impl DeltaCrdt for KvStore {
 
     fn merge(&mut self, delta: &Self::Delta) -> anyhow::Result<()> {
         let peer_id = PeerId::new([0u8; 32]);
-        // Anti-entropy merges don't carry writer identity — for Encrypted
-        // stores this is fine (MLS group membership is the auth). For
-        // Signed/Allowlisted stores, the main sync path in KvStoreSync
-        // provides the writer identity; this trait-level merge is only
-        // used by the anti-entropy background task.
+        // Anti-entropy merges don't carry writer identity. Signed/Allowlisted
+        // stores rely on the main sync path in KvStoreSync to provide the
+        // writer identity; Encrypted is currently a reserved policy shape, not
+        // transport confidentiality for KvStore deltas.
         self.merge_delta(delta, peer_id, None)
             .map_err(|e| anyhow::anyhow!("KvStore delta merge failed: {e}"))
     }
