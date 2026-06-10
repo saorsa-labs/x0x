@@ -36,10 +36,7 @@ pub async fn general(client: &DaemonClient) -> Result<()> {
 
 /// `x0x ws sessions` — GET /ws/sessions
 pub async fn sessions(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/ws/sessions").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/ws/sessions").await
 }
 
 /// `x0x ws direct` — GET /ws/direct (diagnostic: prints the WebSocket URL).
@@ -81,44 +78,7 @@ mod tests {
     use super::*;
     use crate::cli::DaemonClient;
 
-    /// Start a mock axum server that returns the given JSON for any request.
-    #[allow(dead_code)]
-    async fn start_mock_server(
-        response_json: serde_json::Value,
-    ) -> (String, tokio::sync::oneshot::Sender<()>) {
-        use std::sync::Arc;
-
-        let json = Arc::new(response_json);
-        let app = axum::Router::new().fallback(move |_req: axum::extract::Request| {
-            let json = Arc::clone(&json);
-            async move {
-                let body = serde_json::to_vec(&*json).unwrap();
-                axum::response::Response::builder()
-                    .status(200)
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(body))
-                    .unwrap()
-            }
-        });
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(async {
-                    rx.await.ok();
-                })
-                .await
-                .ok();
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        (format!("http://{}", addr), tx)
-    }
-
+    use crate::cli::commands::test_support::start_mock_server;
     #[tokio::test]
     async fn sessions_returns_mock_response() {
         let mock_resp = serde_json::json!({"sessions": [{"id": "session-1"}]});

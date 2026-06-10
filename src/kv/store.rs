@@ -181,6 +181,16 @@ impl KvStore {
         self.name.get()
     }
 
+    /// The name register, including its vector clock.
+    ///
+    /// Deltas carry this whole register (not just the value) so receivers can
+    /// resolve a remote name change by causality rather than adopting it
+    /// unconditionally.
+    #[must_use]
+    pub fn name_register(&self) -> &LwwRegister<String> {
+        &self.name
+    }
+
     /// Get the access policy.
     #[must_use]
     pub fn policy(&self) -> &AccessPolicy {
@@ -302,10 +312,16 @@ impl KvStore {
     }
 
     /// Get an entry by key.
+    ///
+    /// Gated on active-key membership so a tombstoned key never reads back.
+    /// `entries` is not a reliable proxy for the active set: `merge` applies a
+    /// remote OR-Set tombstone via `merge_state` without pruning `entries`, so
+    /// a key can linger in `entries` after it leaves the active set. We query
+    /// the OR-Set directly (an O(1) membership check) rather than materializing
+    /// and linearly scanning `elements()` as the previous implementation did.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&KvEntry> {
-        let key_string = key.to_string();
-        if self.keys.elements().contains(&&key_string) {
+        if self.keys.contains(&key.to_string()) {
             self.entries.get(key)
         } else {
             None
@@ -433,9 +449,10 @@ impl KvStore {
             }
         }
 
-        // Apply name update
-        if let Some(ref new_name) = delta.name_update {
-            self.name.set(new_name.clone(), peer_id);
+        // Apply name update via LWW (vector-clock) merge so a stale delta
+        // cannot overwrite a newer local name; mirrors the full-state merge.
+        if let Some(ref name_register) = delta.name_update {
+            self.name.merge(name_register);
         }
 
         self.version += 1;
@@ -474,16 +491,17 @@ impl KvStore {
     #[must_use]
     pub fn full_delta(&self) -> KvStoreDelta {
         let mut delta = KvStoreDelta::new(self.version);
-        let active: HashSet<String> = self.keys.elements().into_iter().cloned().collect();
 
-        for (key, entry) in &self.entries {
-            if active.contains(key) {
+        // Walk the active-key OR-Set directly and look entries up, rather than
+        // cloning the whole key set into an intermediate HashSet first.
+        for key in self.keys.elements() {
+            if let Some(entry) = self.entries.get(key) {
                 let tag = (PeerId::new([0u8; 32]), 0);
                 delta.added.insert(key.clone(), (entry.clone(), tag));
             }
         }
 
-        delta.name_update = Some(self.name().to_string());
+        delta.name_update = Some(self.name.clone());
 
         // Include allowlist in full delta
         if !self.allowed_writers.is_empty() {

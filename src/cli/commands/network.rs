@@ -41,10 +41,7 @@ fn inject_location_words(value: &mut serde_json::Value) {
 
 /// `x0x health` — GET /health
 pub async fn health(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/health").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/health").await
 }
 
 /// `x0x status` — GET /status
@@ -60,34 +57,22 @@ pub async fn status(client: &DaemonClient) -> Result<()> {
 
 /// `x0x peers` — GET /peers
 pub async fn peers(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/peers").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/peers").await
 }
 
 /// `x0x presence` — GET /presence
 pub async fn presence(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/presence").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/presence").await
 }
 
 /// `x0x network status` — GET /network/status
 pub async fn network_status(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/network/status").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/network/status").await
 }
 
 /// `x0x network cache` — GET /network/bootstrap-cache
 pub async fn bootstrap_cache(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/network/bootstrap-cache").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/network/bootstrap-cache").await
 }
 
 /// `x0x diagnostics connectivity` — GET /diagnostics/connectivity
@@ -97,10 +82,7 @@ pub async fn bootstrap_cache(client: &DaemonClient) -> Result<()> {
 /// hole-punch success rate, and advertised external addresses. Primary tool
 /// for answering "is ant-quic's 100%-connectivity promise holding?".
 pub async fn diagnostics_connectivity(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/diagnostics/connectivity").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/diagnostics/connectivity").await
 }
 
 /// `x0x diagnostics ack` — GET /diagnostics/ack
@@ -109,10 +91,7 @@ pub async fn diagnostics_connectivity(client: &DaemonClient) -> Result<()> {
 /// the old opaque "ACK timeout" class into sender open/write/finish/read and
 /// receiver demux/admission/response-write stages.
 pub async fn diagnostics_ack(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/diagnostics/ack").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/diagnostics/ack").await
 }
 
 /// `x0x diagnostics gossip` — GET /diagnostics/gossip
@@ -122,10 +101,7 @@ pub async fn diagnostics_ack(client: &DaemonClient) -> Result<()> {
 /// subscriber channel (buffer full or dropped subscription). Primary tool
 /// for the 100%-delivery proof under stress.
 pub async fn diagnostics_gossip(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/diagnostics/gossip").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/diagnostics/gossip").await
 }
 
 /// `x0x diagnostics dm` — GET /diagnostics/dm
@@ -133,10 +109,7 @@ pub async fn diagnostics_gossip(client: &DaemonClient) -> Result<()> {
 /// Prints direct-message send/receive counters, subscriber fan-out health, and
 /// per-peer timing/path state.
 pub async fn diagnostics_dm(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/diagnostics/dm").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/diagnostics/dm").await
 }
 
 /// `x0x diagnostics groups` — GET /diagnostics/groups
@@ -150,10 +123,7 @@ pub async fn diagnostics_dm(client: &DaemonClient) -> Result<()> {
 /// joiners' messages reached the listener but the owner's `members_v2`
 /// view is missing them.
 pub async fn diagnostics_groups(client: &DaemonClient) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get("/diagnostics/groups").await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get("/diagnostics/groups").await
 }
 
 /// `x0x peers probe <peer_id>` — POST /peers/:peer_id/probe
@@ -183,10 +153,7 @@ pub async fn peers_probe(
 /// lifecycle state, generation, directional activity timestamps, and the
 /// most-recent close reason.
 pub async fn peers_health(client: &DaemonClient, peer_id: &str) -> Result<()> {
-    client.ensure_running().await?;
-    let resp = client.get(&format!("/peers/{peer_id}/health")).await?;
-    print_value(client.format(), &resp);
-    Ok(())
+    client.run_get(&format!("/peers/{peer_id}/health")).await
 }
 
 /// `x0x peers events` — GET /peers/events (SSE).
@@ -244,44 +211,8 @@ mod tests {
     }
 }
 
-/// Start a mock axum server that returns the given JSON for any request.
-/// Returns the base URL and a shutdown sender.
-#[allow(dead_code)]
-async fn start_mock_server(
-    response_json: serde_json::Value,
-) -> (String, tokio::sync::oneshot::Sender<()>) {
-    use std::sync::Arc;
-
-    let json = Arc::new(response_json);
-    let app = axum::Router::new().fallback(move |_req: axum::extract::Request| {
-        let json = Arc::clone(&json);
-        async move {
-            let body = serde_json::to_vec(&*json).unwrap();
-            axum::response::Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body))
-                .unwrap()
-        }
-    });
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-
-    tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service())
-            .with_graceful_shutdown(async {
-                rx.await.ok();
-            })
-            .await
-            .ok();
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    (format!("http://{}", addr), tx)
-}
+#[cfg(test)]
+use crate::cli::commands::test_support::start_mock_server;
 
 #[tokio::test]
 async fn health_returns_mock_response() {

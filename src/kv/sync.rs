@@ -3,9 +3,9 @@
 //! Wraps a KvStore in `Arc<RwLock<>>` for concurrent access and
 //! synchronizes it via gossip pub/sub delta propagation.
 
+use crate::gossip::wire::{decode_delta, encode_delta};
 use crate::gossip::PubSubManager;
 use crate::kv::{KvStore, KvStoreDelta, Result};
-use saorsa_gossip_crdt_sync::AntiEntropyManager;
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -39,10 +39,6 @@ pub struct KvStoreSync {
     /// The store being synchronized.
     store: Arc<RwLock<KvStore>>,
 
-    /// Anti-entropy manager for periodic sync.
-    #[allow(dead_code)]
-    anti_entropy: AntiEntropyManager<KvStore>,
-
     /// Pub/sub manager for topic-based messaging.
     pubsub: Arc<PubSubManager>,
 
@@ -62,21 +58,17 @@ impl KvStoreSync {
     /// * `store` - The KvStore to synchronize.
     /// * `pubsub` - Pub/sub manager for gossip messaging.
     /// * `topic` - Topic name for pub/sub.
-    /// * `sync_interval_secs` - How often to run anti-entropy.
     /// * `local_peer_id` - This node's gossip peer id.
     pub fn new(
         store: KvStore,
         pubsub: Arc<PubSubManager>,
         topic: String,
-        sync_interval_secs: u64,
         local_peer_id: PeerId,
     ) -> Result<Self> {
         let store = Arc::new(RwLock::new(store));
-        let anti_entropy = AntiEntropyManager::new(Arc::clone(&store), sync_interval_secs);
 
         Ok(Self {
             store,
-            anti_entropy,
             pubsub,
             topic,
             local_peer_id,
@@ -102,14 +94,7 @@ impl KvStoreSync {
 
         tokio::spawn(async move {
             while let Some(msg) = sub.recv().await {
-                let decoded = {
-                    use bincode::Options;
-                    bincode::options()
-                        .with_fixint_encoding()
-                        .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-                        .allow_trailing_bytes()
-                        .deserialize::<(PeerId, KvStoreDelta)>(&msg.payload)
-                };
+                let decoded = decode_delta::<KvStoreDelta>(&msg.payload);
                 match decoded {
                     Ok((peer_id, delta)) => {
                         let mut s = store.write().await;
@@ -154,7 +139,7 @@ impl KvStoreSync {
                     }
                     s.full_delta()
                 };
-                let Ok(serialized) = bincode::serialize(&(local_peer_id, full)) else {
+                let Ok(serialized) = encode_delta(local_peer_id, &full) else {
                     continue;
                 };
                 if let Err(e) = responder_pubsub
@@ -211,7 +196,7 @@ impl KvStoreSync {
 
     /// Publish a local delta to the gossip network.
     pub async fn publish_delta(&self, local_peer_id: PeerId, delta: KvStoreDelta) -> Result<()> {
-        let serialized = bincode::serialize(&(local_peer_id, delta))
+        let serialized = encode_delta(local_peer_id, &delta)
             .map_err(|e| crate::kv::KvError::Gossip(format!("serialize delta failed: {e}")))?;
 
         self.pubsub

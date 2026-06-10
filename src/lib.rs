@@ -3727,15 +3727,17 @@ impl Agent {
                     // the full backoff window.
                     let lifecycle_hint = self.dm_lifecycle_hint(to).await;
                     dm_send::send_via_gossip(
-                        std::sync::Arc::clone(runtime.pubsub()),
-                        &signing,
-                        self.identity.agent_id(),
-                        self.identity.machine_id(),
+                        dm_send::DmSendContext {
+                            pubsub: std::sync::Arc::clone(runtime.pubsub()),
+                            signing: &signing,
+                            self_agent_id: self.identity.agent_id(),
+                            self_machine_id: self.identity.machine_id(),
+                            inflight: std::sync::Arc::clone(&self.dm_inflight_acks),
+                        },
                         *to,
                         &kem_pub,
                         payload,
                         &config,
-                        std::sync::Arc::clone(&self.dm_inflight_acks),
                         lifecycle_hint,
                     )
                     .await
@@ -7426,7 +7428,7 @@ impl Agent {
             task_list,
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
-            30,
+            peer_id,
         )
         .map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -7488,7 +7490,7 @@ impl Agent {
             task_list,
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
-            30,
+            peer_id,
         )
         .map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -8277,7 +8279,12 @@ impl TaskListHandle {
                     e
                 )))
             })?;
-            crdt::TaskListDelta::for_reorder(task_ids, list.current_version())
+            // Carry the post-reorder ordering register (value + clock) so the
+            // change merges by causality on receivers.
+            crdt::TaskListDelta::for_reorder(
+                list.ordering_register().clone(),
+                list.current_version(),
+            )
         };
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish reorder delta: {}", e);
@@ -8319,7 +8326,6 @@ impl Agent {
             store,
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
-            30,
             peer_id,
         )
         .map_err(|e| {
@@ -8375,7 +8381,6 @@ impl Agent {
             store,
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
-            30,
             peer_id,
         )
         .map_err(|e| {

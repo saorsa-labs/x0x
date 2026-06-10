@@ -13,7 +13,7 @@
 //! This significantly reduces bandwidth usage in collaborative scenarios.
 
 use crate::crdt::{Result, TaskId, TaskItem, TaskList};
-use saorsa_gossip_crdt_sync::DeltaCrdt;
+use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -39,15 +39,14 @@ pub struct TaskListDelta {
     /// A future optimization could implement TaskItemDelta for finer-grained updates.
     pub task_updates: HashMap<TaskId, TaskItem>,
 
-    /// Update to task ordering (new_order, timestamp)
-    ///
-    /// If Some, the ordering changed. The receiver should merge this using LWW semantics.
-    pub ordering_update: Option<Vec<TaskId>>,
+    /// Update to task ordering, carried as the full LWW register (value +
+    /// vector clock) so the receiver resolves it by causality rather than
+    /// adopting it unconditionally.
+    pub ordering_update: Option<LwwRegister<Vec<TaskId>>>,
 
-    /// Update to list name (new_name)
-    ///
-    /// If Some, the name changed. The receiver should merge this using LWW semantics.
-    pub name_update: Option<String>,
+    /// Update to list name, carried as the full LWW register (value + vector
+    /// clock) so the receiver resolves it by causality.
+    pub name_update: Option<LwwRegister<String>>,
 
     /// Version number of this delta
     pub version: u64,
@@ -87,10 +86,13 @@ impl TaskListDelta {
     }
 
     /// Create a delta for a reorder operation.
+    ///
+    /// Takes the post-reorder ordering register (with its vector clock) so the
+    /// change merges by causality on the receiver.
     #[must_use]
-    pub fn for_reorder(new_order: Vec<TaskId>, version: u64) -> Self {
+    pub fn for_reorder(order_register: LwwRegister<Vec<TaskId>>, version: u64) -> Self {
         let mut delta = Self::new(version);
-        delta.ordering_update = Some(new_order);
+        delta.ordering_update = Some(order_register);
         delta
     }
 
@@ -122,48 +124,32 @@ impl TaskList {
         self.current_version()
     }
 
-    /// Generate a delta containing changes since a given version.
+    /// Generate a delta containing the task list's entire current state.
     ///
-    /// Returns None if no changes have occurred since the specified version.
-    ///
-    /// # Arguments
-    ///
-    /// * `since_version` - The version to generate delta from
-    ///
-    /// # Returns
-    ///
-    /// Some(delta) if there are changes, None otherwise.
-    ///
-    /// Note: This is a simplified implementation. A production version would
-    /// maintain a changelog to generate accurate deltas.
+    /// Mirrors `KvStore::full_delta`: every active task is emitted as an
+    /// "added" entry plus the current ordering and name. Receivers apply it
+    /// with `merge_delta`, whose upsert/LWW semantics make a full snapshot a
+    /// safe superset of any incremental change — this is the producer used to
+    /// answer cold-start state requests (see `TaskListSync`). The OR-Set tags
+    /// are synthetic because the receiver re-derives membership on merge.
     #[must_use]
-    pub fn delta(&self, since_version: u64) -> Option<TaskListDelta> {
-        let current_version = self.version();
+    pub fn full_delta(&self) -> TaskListDelta {
+        let mut delta = TaskListDelta::new(self.version());
 
-        // If versions match, no changes
-        if since_version >= current_version {
-            return None;
-        }
-
-        // For simplicity, we generate a full-state delta
-        // A production implementation would track actual changes
-        let mut delta = TaskListDelta::new(current_version);
-
-        // Add all current tasks as "added"
-        // In a real implementation, we'd only include tasks added since the version
-        for task in self.tasks_ordered() {
+        let ordered = self.tasks_ordered();
+        for task in &ordered {
             let task_id = *task.id();
-            let tag = (PeerId::new([0u8; 32]), 0); // Placeholder tag
-            delta.added_tasks.insert(task_id, (task.clone(), tag));
+            let tag = (PeerId::new([0u8; 32]), 0);
+            delta.added_tasks.insert(task_id, ((*task).clone(), tag));
         }
 
-        // Include current ordering
-        delta.ordering_update = Some(self.tasks_ordered().iter().map(|t| *t.id()).collect());
+        // Carry the registers themselves (value + clock) so a cold-start
+        // snapshot merges by causality and cannot clobber a newer local
+        // ordering/name on an already-populated peer.
+        delta.ordering_update = Some(self.ordering_register().clone());
+        delta.name_update = Some(self.name_register().clone());
 
-        // Include current name
-        delta.name_update = Some(self.name().to_string());
-
-        Some(delta)
+        delta
     }
 
     /// Merge a delta into this TaskList.
@@ -223,23 +209,16 @@ impl TaskList {
             }
         }
 
-        // Apply ordering update (LWW semantics via merge)
-        if let Some(ref new_order) = delta.ordering_update {
-            // Validate all task IDs exist before reordering
-            let valid_order: Vec<TaskId> = new_order
-                .iter()
-                .filter(|id| self.get_task(id).is_some())
-                .copied()
-                .collect();
-
-            if !valid_order.is_empty() {
-                let _ = self.reorder(valid_order, peer_id);
-            }
+        // Apply ordering update via LWW (vector-clock) merge. The merged
+        // ordering may reference task IDs not yet present (out-of-order
+        // delivery); tasks_ordered filters those at read time.
+        if let Some(ref order_register) = delta.ordering_update {
+            self.merge_ordering(order_register);
         }
 
-        // Apply name update (LWW semantics via merge)
-        if let Some(ref new_name) = delta.name_update {
-            self.update_name(new_name.clone(), peer_id);
+        // Apply name update via LWW (vector-clock) merge.
+        if let Some(ref name_register) = delta.name_update {
+            self.merge_name(name_register);
         }
 
         Ok(())
@@ -262,7 +241,14 @@ impl DeltaCrdt for TaskList {
     }
 
     fn delta(&self, since_version: u64) -> Option<Self::Delta> {
-        self.delta(since_version)
+        // A full-state delta is a sound conservative answer to "changes since
+        // version N": merge_delta is idempotent and LWW/upsert-based, so the
+        // receiver converges regardless of how much extra state we include.
+        if since_version >= self.version() {
+            None
+        } else {
+            Some(self.full_delta())
+        }
     }
 
     fn version(&self) -> u64 {
@@ -348,11 +334,8 @@ mod tests {
         let task = make_task(1, peer);
         list.add_task(task, peer, 1).ok().unwrap();
 
-        // Generate delta from version 0
-        let delta = list.delta(0);
-        assert!(delta.is_some());
-
-        let delta = delta.unwrap();
+        // A full-state delta carries every active task.
+        let delta = list.full_delta();
         assert!(!delta.is_empty());
         assert!(!delta.added_tasks.is_empty());
     }
@@ -365,8 +348,9 @@ mod tests {
 
         let current_version = list.version();
 
-        // Delta from current version should be None
-        let delta = list.delta(current_version);
+        // Asking the DeltaCrdt trait for changes since the current version
+        // yields nothing.
+        let delta = DeltaCrdt::delta(&list, current_version);
         assert!(delta.is_none());
     }
 
@@ -383,8 +367,8 @@ mod tests {
         let task = make_task(1, peer2);
         list2.add_task(task, peer2, 1).ok().unwrap();
 
-        // Generate delta from list2
-        let delta = list2.delta(0).unwrap();
+        // Generate a full-state delta from list2
+        let delta = list2.full_delta();
 
         // Merge delta into list1
         let result = list1.merge_delta(&delta, peer1);
@@ -392,6 +376,42 @@ mod tests {
 
         // list1 should now have the task
         assert_eq!(list1.task_count(), 1);
+    }
+
+    #[test]
+    fn full_delta_lets_a_late_joiner_converge() {
+        // WHY: a peer that subscribes after tasks were already added has no
+        // organic deltas to replay. The cold-start path (TaskListSync's
+        // StateRequest) answers with `full_delta()`; merging it must reproduce
+        // the holder's complete state — every task, the ordering, and the name
+        // — or a late joiner would converge to a partial list.
+        let holder_peer = peer(1);
+        let joiner_peer = peer(2);
+        let id = list_id(1);
+
+        let mut holder = TaskList::new(id, "Sprint".to_string(), holder_peer);
+        let t1 = make_task(1, holder_peer);
+        let t2 = make_task(2, holder_peer);
+        let t3 = make_task(3, holder_peer);
+        let (id1, id2, id3) = (*t1.id(), *t2.id(), *t3.id());
+        holder.add_task(t1, holder_peer, 1).expect("add t1");
+        holder.add_task(t2, holder_peer, 2).expect("add t2");
+        holder.add_task(t3, holder_peer, 3).expect("add t3");
+        holder
+            .reorder(vec![id3, id1, id2], holder_peer)
+            .expect("reorder");
+        holder.update_name("Sprint Backlog".to_string(), holder_peer);
+
+        // Fresh joiner with an empty list applies only the cold-start snapshot.
+        let mut joiner = TaskList::new(id, String::new(), joiner_peer);
+        let snapshot = holder.full_delta();
+        joiner.merge_delta(&snapshot, holder_peer).expect("merge");
+
+        assert_eq!(joiner.task_count(), 3, "all tasks transferred");
+        assert_eq!(joiner.name(), "Sprint Backlog", "name transferred");
+        let joiner_order: Vec<_> = joiner.tasks_ordered().iter().map(|t| *t.id()).collect();
+        let holder_order: Vec<_> = holder.tasks_ordered().iter().map(|t| *t.id()).collect();
+        assert_eq!(joiner_order, holder_order, "ordering converged");
     }
 
     #[test]
@@ -446,9 +466,13 @@ mod tests {
         list.add_task(task1, peer, 1).ok().unwrap();
         list.add_task(task2, peer, 2).ok().unwrap();
 
-        // Create delta with ordering update
+        // Build an ordering register that causally dominates the local one
+        // (a peer that reversed the order on top of the shared history), so
+        // the LWW merge adopts it.
+        let mut order_register = list.ordering_register().clone();
+        order_register.set(vec![id2, id1], peer); // Reversed order, newer clock
         let mut delta = TaskListDelta::new(10);
-        delta.ordering_update = Some(vec![id2, id1]); // Reversed order
+        delta.ordering_update = Some(order_register);
 
         // Merge delta
         list.merge_delta(&delta, peer).ok().unwrap();
@@ -460,14 +484,43 @@ mod tests {
     }
 
     #[test]
+    fn stale_name_delta_does_not_clobber_newer_local_name() {
+        // WHY: a cold-start responder broadcasts its full state on the main
+        // topic, reaching established peers. A peer that renamed the list more
+        // recently must not have its name reverted by an older holder's
+        // snapshot — the register's vector clock decides the winner.
+        let local = peer(1);
+        let remote = peer(2);
+        let id = list_id(1);
+        let mut list = TaskList::new(id, "Original".to_string(), local);
+
+        // `remote` renames the list; capture that register as the "stale" one.
+        list.update_name("FromRemote".to_string(), remote);
+        let stale = list.name_register().clone();
+
+        // `local` then renames on top — causally newer (its clock includes the
+        // remote rename), so a later redelivery of the stale register loses.
+        list.update_name("Newest".to_string(), local);
+
+        let mut delta = TaskListDelta::new(7);
+        delta.name_update = Some(stale);
+        list.merge_delta(&delta, remote).ok().unwrap();
+
+        assert_eq!(list.name(), "Newest", "stale name must not clobber newer");
+    }
+
+    #[test]
     fn test_merge_delta_with_name_update() {
         let peer = peer(1);
         let id = list_id(1);
         let mut list = TaskList::new(id, "Original".to_string(), peer);
 
-        // Create delta with name update
+        // A peer renames on top of the shared initial state; its register
+        // causally dominates ours, so the LWW merge adopts it.
+        let mut other = TaskList::new(id, "Original".to_string(), peer);
+        other.update_name("Updated".to_string(), peer);
         let mut delta = TaskListDelta::new(5);
-        delta.name_update = Some("Updated".to_string());
+        delta.name_update = Some(other.name_register().clone());
 
         // Merge delta
         list.merge_delta(&delta, peer).ok().unwrap();

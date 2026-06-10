@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.23.0] - 2026-06-10
+
+### Fixed
+
+- **CRDT delta apply bypassed the LWW vector clock** (PR #108). `merge_delta` applied list name (kv + task lists) and task ordering via `LwwRegister::set()`, which bumps the local clock and adopts the value *unconditionally* — while the full-state merge path already resolved by causality. A redelivered or stale full-state snapshot could therefore overwrite a newer local name/ordering. Deltas now carry the whole `LwwRegister` (value + vector clock) and receivers resolve the winner via `LwwRegister::merge()`.
+- **`KvStore::get` could resurrect a deleted key.** A simplification assumed `entries` and the active-key OR-Set stay in lockstep, but `KvStore::merge` applies a remote tombstone without pruning `entries`. `get` now re-checks active-key membership (O(1) via `OrSet::contains`).
+- **`x0x contacts card` did not URL-encode `display_name`** — a name with spaces or `&` corrupted the query.
+
+### Added
+
+- **Task lists get cold-start bootstrap.** A first-time joiner of a task-list topic now requests state on a 1/5/15/30s schedule and holders republish full state (mirrors the kv-store side channel from #96), so tasks added before the join arrive instead of being lost. Daemon-backed e2e test included.
+
+### Changed
+
+- **Wire-format change (minor bump):** `TaskListDelta.{name_update,ordering_update}` and `KvStoreDelta.name_update` now carry an `LwwRegister<value>` instead of a bare value on the CRDT sync topics. Deltas are transient (not persisted), but mixed-version daemons cannot exchange task-list/kv deltas during rollout — coordinate the upgrade for apps using these features. The gossip relay layer is unaffected.
+- **Codebase simplification (PR #108, ~−1,300 lines):** consolidated daemon error-response and base64 boilerplate, CLI command wrappers and a `routes --json`/`exec` cleanup, a shared gossip delta codec, and dead-code removal. No REST/WebSocket API changes.
+
 ## [v0.22.1] - 2026-06-10
 
 ### Fixed

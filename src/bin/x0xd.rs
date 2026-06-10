@@ -31,6 +31,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -87,23 +88,12 @@ fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
         .unwrap_or(false);
     if !is_json {
         // Non-JSON content type with a body — reject
-        return Err((
+        return Err(api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "Content-Type must be application/json"
-            })),
+            "Content-Type must be application/json",
         ));
     }
-    serde_json::from_slice(body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("invalid JSON: {e}")
-            })),
-        )
-    })
+    serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2879,10 +2869,7 @@ async fn file_send_handler(
         .to_string();
 
     if agent_id_hex.is_empty() || sha256.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok": false, "error": "agent_id and sha256 are required"})),
-        );
+        return bad_request("agent_id and sha256 are required");
     }
 
     let agent_id = match parse_agent_id_hex(agent_id_hex) {
@@ -2904,54 +2891,30 @@ async fn file_send_handler(
             .or_else(|| body.get("data_base64"))
             .and_then(|v| v.as_str())
         {
-            let data = match base64::engine::general_purpose::STANDARD.decode(data_b64) {
+            let data = match BASE64.decode(data_b64) {
                 Ok(data) => data,
                 Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "ok": false,
-                            "error": format!("invalid data_b64: {e}")
-                        })),
-                    );
+                    return bad_request(format!("invalid data_b64: {e}"));
                 }
             };
             if data.len() as u64 != size {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "data_b64 length does not match size"
-                    })),
-                );
+                return bad_request("data_b64 length does not match size");
             }
             let actual_sha = hex::encode(Sha256::digest(&data));
             if !sha256.eq_ignore_ascii_case(&actual_sha) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "data_b64 sha256 mismatch"
-                    })),
-                );
+                return bad_request("data_b64 sha256 mismatch");
             }
             if let Err(e) = tokio::fs::create_dir_all(&state.transfers_dir).await {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": format!("failed to create transfer spool: {e}")
-                    })),
+                    format!("failed to create transfer spool: {e}"),
                 );
             }
             let spool_path = state.transfers_dir.join(format!("{transfer_id}.send"));
             if let Err(e) = tokio::fs::write(&spool_path, data).await {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": format!("failed to spool upload: {e}")
-                    })),
+                    format!("failed to spool upload: {e}"),
                 );
             }
             source_path = spool_path.to_string_lossy().into_owned();
@@ -3016,9 +2979,9 @@ async fn file_send_handler(
                 t.error = Some(format!("Failed to send offer: {e}"));
                 t.completed_at_unix_ms = Some(file_transfer_now().1);
             }
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok": false, "error": format!("send offer failed: {e}")})),
+                format!("send offer failed: {e}"),
             )
         }
     }
@@ -3045,10 +3008,7 @@ async fn file_transfer_status_handler(
             StatusCode::OK,
             Json(serde_json::json!({"ok": true, "transfer": t})),
         ),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"ok": false, "error": "transfer not found"})),
-        ),
+        None => not_found("transfer not found"),
     }
 }
 
@@ -3069,18 +3029,10 @@ async fn file_accept_handler(
                 remote_agent_hex = t.remote_agent_id.clone();
             }
             Some(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(
-                        serde_json::json!({"ok": false, "error": "transfer is not a pending receive"}),
-                    ),
-                );
+                return bad_request("transfer is not a pending receive");
             }
             None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"ok": false, "error": "transfer not found"})),
-                );
+                return not_found("transfer not found");
             }
         }
     }
@@ -3116,11 +3068,9 @@ async fn file_accept_handler(
         if let Some(t) = transfers.get_mut(&id) {
             t.status = x0x::files::TransferStatus::Pending;
         }
-        (
+        api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::json!({"ok": false, "error": "accepted but failed to notify sender — reverted to pending"}),
-            ),
+            "accepted but failed to notify sender — reverted to pending",
         )
     } else {
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
@@ -3151,16 +3101,10 @@ async fn file_reject_handler(
                 remote_agent_hex = t.remote_agent_id.clone();
             }
             Some(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"ok": false, "error": "transfer is not pending"})),
-                );
+                return bad_request("transfer is not pending");
             }
             None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"ok": false, "error": "transfer not found"})),
-                );
+                return not_found("transfer not found");
             }
         }
     }
@@ -4002,17 +3946,11 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<StatusDa
 /// GET /network/status — NAT traversal diagnostics and connection stats.
 async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(network) = state.agent.network() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
-        );
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized");
     };
 
     let Some(status) = network.node_status().await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "node not available" })),
-        );
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "node not available");
     };
 
     let nat_type_str = format!("{:?}", status.nat_type);
@@ -4103,8 +4041,7 @@ async fn agent_info(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Agen
             agent_id: hex::encode(state.agent.agent_id().as_bytes()),
             machine_id: hex::encode(state.agent.machine_id().as_bytes()),
             user_id: state.agent.user_id().map(|u| hex::encode(u.as_bytes())),
-            kem_public_key_b64: base64::engine::general_purpose::STANDARD
-                .encode(&state.agent_kem_keypair.public_bytes),
+            kem_public_key_b64: BASE64.encode(&state.agent_kem_keypair.public_bytes),
         },
     })
 }
@@ -4309,11 +4246,7 @@ async fn announce_identity(
             })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        )
-            .into_response(),
+        Err(e) => bad_request(format!("{e}")).into_response(),
     }
 }
 
@@ -4458,10 +4391,7 @@ async fn import_agent_card(
     let card = match x0x::groups::card::AgentCard::from_link(&req.card) {
         Ok(c) => c,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": format!("invalid card: {e}") })),
-            );
+            return bad_request(format!("invalid card: {e}"));
         }
     };
 
@@ -4485,10 +4415,7 @@ async fn import_agent_card(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid agent_id in card" })),
-            );
+            return bad_request("invalid agent_id in card");
         }
     };
     let agent_id = x0x::identity::AgentId(agent_id_bytes);
@@ -4632,39 +4559,24 @@ async fn agent_sign(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AgentSignRequest>,
 ) -> impl IntoResponse {
-    let payload = match base64::engine::general_purpose::STANDARD.decode(&req.payload_b64) {
+    let payload = match BASE64.decode(&req.payload_b64) {
         Ok(bytes) => bytes,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("invalid base64 payload: {e}"),
-                })),
-            );
+            return bad_request(format!("invalid base64 payload: {e}"));
         }
     };
 
     if payload.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "payload must be non-empty",
-            })),
-        );
+        return bad_request("payload must be non-empty");
     }
 
     if payload.len() > AGENT_SIGN_MAX_PAYLOAD_BYTES {
-        return (
+        return api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!(
-                    "payload exceeds maximum signable size of {} bytes",
-                    AGENT_SIGN_MAX_PAYLOAD_BYTES
-                ),
-            })),
+            format!(
+                "payload exceeds maximum signable size of {} bytes",
+                AGENT_SIGN_MAX_PAYLOAD_BYTES
+            ),
         );
     }
 
@@ -4675,34 +4587,16 @@ async fn agent_sign(
     let canonical = match req.domain.as_deref() {
         Some(domain) => {
             if domain.is_empty() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "domain must be non-empty when provided",
-                    })),
-                );
+                return bad_request("domain must be non-empty when provided");
             }
             if domain.as_bytes().contains(&0u8) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "domain must not contain NUL bytes",
-                    })),
-                );
+                return bad_request("domain must not contain NUL bytes");
             }
             if domain.len() > AGENT_SIGN_MAX_DOMAIN_BYTES {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": format!(
-                            "domain exceeds maximum length of {} bytes",
-                            AGENT_SIGN_MAX_DOMAIN_BYTES
-                        ),
-                    })),
-                );
+                return bad_request(format!(
+                    "domain exceeds maximum length of {} bytes",
+                    AGENT_SIGN_MAX_DOMAIN_BYTES
+                ));
             }
             let mut buf = Vec::with_capacity(domain.len() + 1 + payload.len());
             buf.extend_from_slice(domain.as_bytes());
@@ -4722,19 +4616,15 @@ async fn agent_sign(
     ) {
         Ok(sig) => sig,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("signing failed: {e:?}"),
-                })),
+                format!("signing failed: {e:?}"),
             );
         }
     };
 
-    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.as_bytes());
-    let public_key_b64 =
-        base64::engine::general_purpose::STANDARD.encode(keypair.public_key().as_bytes());
+    let signature_b64 = BASE64.encode(signature.as_bytes());
+    let public_key_b64 = BASE64.encode(keypair.public_key().as_bytes());
     let agent_id_hex = hex::encode(state.agent.agent_id().as_bytes());
 
     let mut resp = serde_json::json!({
@@ -4768,10 +4658,7 @@ async fn peers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 Json(serde_json::json!({ "ok": true, "peers": entries })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -4782,36 +4669,24 @@ async fn publish(
 ) -> impl IntoResponse {
     // Reject empty topic
     if req.topic.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "topic must not be empty" })),
-        );
+        return bad_request("topic must not be empty");
     }
 
     // Decode base64 payload
-    let payload = match base64::engine::general_purpose::STANDARD.decode(&req.payload) {
+    let payload = match BASE64.decode(&req.payload) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!(
-                        "invalid base64 in payload field: {e}. \
+            return bad_request(format!(
+                "invalid base64 in payload field: {e}. \
                          The payload must be base64-encoded \
                          (e.g., use `echo -n \"hello\" | base64`)"
-                    )
-                })),
-            );
+            ));
         }
     };
 
     match state.agent.publish(&req.topic, payload).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -4841,7 +4716,7 @@ async fn subscribe(
                         data: serde_json::json!({
                             "subscription_id": sub_id,
                             "topic": topic,
-                            "payload": base64::engine::general_purpose::STANDARD.encode(&msg.payload),
+                            "payload": BASE64.encode(&msg.payload),
                             "sender": msg.sender.map(|s| hex::encode(s.0)),
                             "verified": msg.verified,
                             "trust_level": msg.trust_level.map(|t| t.to_string()),
@@ -4878,10 +4753,7 @@ async fn subscribe(
                 Json(serde_json::json!({ "ok": true, "subscription_id": id })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -4902,10 +4774,7 @@ async fn unsubscribe(
         );
         (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "subscription not found" })),
-        )
+        not_found("subscription not found")
     }
 }
 
@@ -4955,10 +4824,7 @@ async fn presence(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 Json(serde_json::json!({ "ok": true, "agents": entries })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5000,10 +4866,7 @@ async fn presence_online(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 Json(serde_json::json!({ "ok": true, "agents": entries })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5032,10 +4895,7 @@ async fn presence_foaf(
                 Json(serde_json::json!({ "ok": true, "agents": entries })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5054,12 +4914,7 @@ async fn presence_find(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({ "ok": false, "error": "invalid agent id (expected 64 hex chars)" }),
-                ),
-            );
+            return bad_request("invalid agent id (expected 64 hex chars)");
         }
     };
     let agent_id = x0x::identity::AgentId(bytes);
@@ -5076,10 +4931,7 @@ async fn presence_find(
             StatusCode::OK,
             Json(serde_json::json!({ "ok": true, "agent": null })),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5097,12 +4949,7 @@ async fn presence_status(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({ "ok": false, "error": "invalid agent id (expected 64 hex chars)" }),
-                ),
-            );
+            return bad_request("invalid agent id (expected 64 hex chars)");
         }
     };
     let agent_id = x0x::identity::AgentId(bytes);
@@ -5248,10 +5095,7 @@ async fn discovered_agents(
                 Json(serde_json::json!({ "ok": true, "agents": entries })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5308,18 +5152,10 @@ async fn discovered_agent(
                 };
             }
             Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(
-                        serde_json::json!({ "ok": false, "error": "agent not found within timeout" }),
-                    ),
-                );
+                return not_found("agent not found within timeout");
             }
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-                );
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"));
             }
         }
     }
@@ -5332,14 +5168,8 @@ async fn discovered_agent(
                 "agent": discovered_agent_entry(agent),
             })),
         ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "agent not found" })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Ok(None) => not_found("agent not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5362,10 +5192,7 @@ async fn discovered_machines(
                 Json(serde_json::json!({ "ok": true, "machines": entries })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5397,19 +5224,10 @@ async fn discovered_machine(
                 );
             }
             Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "machine not found within timeout"
-                    })),
-                );
+                return not_found("machine not found within timeout");
             }
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-                );
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"));
             }
         }
     }
@@ -5422,14 +5240,8 @@ async fn discovered_machine(
                 "machine": discovered_machine_entry(machine),
             })),
         ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "machine not found" })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Ok(None) => not_found("machine not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5457,14 +5269,8 @@ async fn machine_for_agent_handler(
                 "machine": discovered_machine_entry(machine),
             })),
         ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "agent machine not found" })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Ok(None) => not_found("agent machine not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5480,13 +5286,7 @@ async fn agents_by_user_handler(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "invalid user_id: expected 64 hex characters"
-                })),
-            );
+            return bad_request("invalid user_id: expected 64 hex characters");
         }
     };
     let user_id = x0x::identity::UserId(user_id_bytes);
@@ -5503,10 +5303,7 @@ async fn agents_by_user_handler(
                 })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5522,13 +5319,7 @@ async fn machines_by_user_handler(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "invalid user_id: expected 64 hex characters"
-                })),
-            );
+            return bad_request("invalid user_id: expected 64 hex characters");
         }
     };
     let user_id = x0x::identity::UserId(user_id_bytes);
@@ -5545,10 +5336,7 @@ async fn machines_by_user_handler(
                 })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -5766,14 +5554,7 @@ async fn add_machine(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "machine_id must be a 64-character hex string"
-                })),
-            )
-                .into_response();
+            return bad_request("machine_id must be a 64-character hex string").into_response();
         }
     };
     let machine_id = MachineId(machine_bytes);
@@ -5839,14 +5620,7 @@ async fn delete_machine(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "machine_id must be a 64-character hex string"
-                })),
-            )
-                .into_response();
+            return bad_request("machine_id must be a 64-character hex string").into_response();
         }
     };
     let machine_id = MachineId(machine_bytes);
@@ -5859,11 +5633,7 @@ async fn delete_machine(
     if removed {
         (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response()
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "machine not found" })),
-        )
-            .into_response()
+        not_found("machine not found").into_response()
     }
 }
 
@@ -5886,10 +5656,7 @@ async fn delete_contact(
     if removed.is_some() {
         (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "contact not found" })),
-        )
+        not_found("contact not found")
     }
 }
 
@@ -6385,17 +6152,16 @@ async fn publish_secure_share(
     secret_epoch: u64,
 ) -> bool {
     use base64::Engine as _;
-    let recipient_kem_public =
-        match base64::engine::general_purpose::STANDARD.decode(recipient_kem_public_b64) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    recipient = %LogHexId::agent(&recipient_hex),
-                    "publish_secure_share: recipient KEM public key not valid base64: {e}"
-                );
-                return false;
-            }
-        };
+    let recipient_kem_public = match BASE64.decode(recipient_kem_public_b64) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                recipient = %LogHexId::agent(&recipient_hex),
+                "publish_secure_share: recipient KEM public key not valid base64: {e}"
+            );
+            return false;
+        }
+    };
     let aad = secure_share_aad(group_id, recipient_hex, secret_epoch);
     let (kem_ct, aead_nonce, aead_ct) =
         match x0x::groups::kem_envelope::seal_group_secret_to_recipient(
@@ -6413,9 +6179,9 @@ async fn publish_secure_share(
         group_id: group_id.to_string(),
         recipient: recipient_hex.to_string(),
         secret_epoch,
-        kem_ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(&kem_ct),
-        aead_nonce_b64: base64::engine::general_purpose::STANDARD.encode(aead_nonce),
-        aead_ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(&aead_ct),
+        kem_ciphertext_b64: BASE64.encode(&kem_ct),
+        aead_nonce_b64: BASE64.encode(aead_nonce),
+        aead_ciphertext_b64: BASE64.encode(&aead_ct),
         actor: actor_hex.to_string(),
     };
     publish_named_group_metadata_event(state, metadata_topic, &event).await;
@@ -8329,14 +8095,13 @@ async fn apply_named_group_metadata_event_inner(
             };
             if let Some((commit_b64, welcome_b64, welcome_ref, epoch)) = treekem_payload {
                 use base64::Engine as _;
-                let commit_bytes =
-                    match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
-                        Ok(bytes) => bytes,
-                        Err(_) => return false,
-                    };
+                let commit_bytes = match BASE64.decode(commit_b64) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return false,
+                };
                 if agent_id == local_agent_hex {
                     let welcome_bytes = if let Some(welcome_b64) = welcome_b64 {
-                        match base64::engine::general_purpose::STANDARD.decode(welcome_b64) {
+                        match BASE64.decode(welcome_b64) {
                             Ok(bytes) => bytes,
                             Err(_) => return false,
                         }
@@ -8562,11 +8327,10 @@ async fn apply_named_group_metadata_event_inner(
             }
             if let Some((commit_b64, _epoch)) = treekem_payload {
                 use base64::Engine as _;
-                let commit_bytes =
-                    match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
-                        Ok(bytes) => bytes,
-                        Err(_) => return false,
-                    };
+                let commit_bytes = match BASE64.decode(commit_b64) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return false,
+                };
                 let group = {
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
@@ -8828,11 +8592,10 @@ async fn apply_named_group_metadata_event_inner(
                 }
             } else if let Some((commit_b64, epoch)) = treekem_payload {
                 use base64::Engine as _;
-                let commit_bytes =
-                    match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
-                        Ok(bytes) => bytes,
-                        Err(_) => return false,
-                    };
+                let commit_bytes = match BASE64.decode(commit_b64) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return false,
+                };
                 let group = {
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
@@ -9079,14 +8842,13 @@ async fn apply_named_group_metadata_event_inner(
             };
             if let Some((commit_b64, welcome_b64, welcome_ref, _epoch)) = treekem_payload {
                 use base64::Engine as _;
-                let commit_bytes =
-                    match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
-                        Ok(bytes) => bytes,
-                        Err(_) => return false,
-                    };
+                let commit_bytes = match BASE64.decode(commit_b64) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return false,
+                };
                 if requester_agent_id == local_agent_hex {
                     let welcome_bytes = if let Some(welcome_b64) = welcome_b64 {
-                        match base64::engine::general_purpose::STANDARD.decode(welcome_b64) {
+                        match BASE64.decode(welcome_b64) {
                             Ok(bytes) => bytes,
                             Err(_) => return false,
                         }
@@ -9362,13 +9124,11 @@ async fn apply_named_group_metadata_event_inner(
                 return false;
             }
             use base64::Engine as _;
-            let kem_ct = match base64::engine::general_purpose::STANDARD.decode(&kem_ciphertext_b64)
-            {
+            let kem_ct = match BASE64.decode(&kem_ciphertext_b64) {
                 Ok(b) => b,
                 Err(_) => return false,
             };
-            let aead_nonce = match base64::engine::general_purpose::STANDARD.decode(&aead_nonce_b64)
-            {
+            let aead_nonce = match BASE64.decode(&aead_nonce_b64) {
                 Ok(b) => b,
                 Err(_) => return false,
             };
@@ -9377,11 +9137,10 @@ async fn apply_named_group_metadata_event_inner(
             }
             let mut nonce_bytes = [0u8; 12];
             nonce_bytes.copy_from_slice(&aead_nonce);
-            let aead_ct =
-                match base64::engine::general_purpose::STANDARD.decode(&aead_ciphertext_b64) {
-                    Ok(b) => b,
-                    Err(_) => return false,
-                };
+            let aead_ct = match BASE64.decode(&aead_ciphertext_b64) {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
             let aad = secure_share_aad(ev_group_id, &recipient, secret_epoch);
             let opened = x0x::groups::kem_envelope::open_group_secret(
                 &state.agent_kem_keypair,
@@ -9442,17 +9201,16 @@ async fn apply_named_group_metadata_event_inner(
 
             // 2. Decode the joiner's published public key + signature.
             use base64::Engine as _;
-            let pubkey_bytes =
-                match base64::engine::general_purpose::STANDARD.decode(&member_public_key_b64) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::debug!(
-                            group_id = %resolved_group_key,
-                            "MemberJoined: bad public key base64: {e}"
-                        );
-                        return false;
-                    }
-                };
+            let pubkey_bytes = match BASE64.decode(&member_public_key_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(
+                        group_id = %resolved_group_key,
+                        "MemberJoined: bad public key base64: {e}"
+                    );
+                    return false;
+                }
+            };
             let pubkey = match ant_quic::MlDsaPublicKey::from_bytes(&pubkey_bytes) {
                 Ok(p) => p,
                 Err(e) => {
@@ -9463,7 +9221,7 @@ async fn apply_named_group_metadata_event_inner(
                     return false;
                 }
             };
-            let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(&signature_b64) {
+            let sig_bytes = match BASE64.decode(&signature_b64) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::debug!(
@@ -9601,7 +9359,7 @@ async fn apply_named_group_metadata_event_inner(
                     let Some(kp_b64) = treekem_key_package_b64.clone() else {
                         return false;
                     };
-                    match base64::engine::general_purpose::STANDARD.decode(kp_b64) {
+                    match BASE64.decode(kp_b64) {
                         Ok(bytes) => Some(bytes),
                         Err(_) => return false,
                     }
@@ -9728,8 +9486,7 @@ async fn apply_named_group_metadata_event_inner(
                 actor: inviter_agent_id.clone(),
                 agent_id: member_agent_id.clone(),
                 display_name: display_name.clone(),
-                treekem_commit_b64: treekem_commit
-                    .map(|c| base64::engine::general_purpose::STANDARD.encode(c)),
+                treekem_commit_b64: treekem_commit.map(|c| BASE64.encode(c)),
                 treekem_welcome_b64: None,
                 welcome_ref,
                 treekem_epoch,
@@ -9860,10 +9617,7 @@ async fn create_named_group(
         Some(name) => match x0x::groups::GroupPolicyPreset::from_name(name) {
             Some(preset) => preset.to_policy(),
             None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "ok": false, "error": "unknown preset" })),
-                );
+                return bad_request("unknown preset");
             }
         },
         None => x0x::groups::GroupPolicy::default(),
@@ -9887,8 +9641,7 @@ async fn create_named_group(
             {
                 use base64::Engine as _;
                 let owner_hex = hex::encode(agent_id.as_bytes());
-                let owner_kem_b64 = base64::engine::general_purpose::STANDARD
-                    .encode(&state.agent_kem_keypair.public_bytes);
+                let owner_kem_b64 = BASE64.encode(&state.agent_kem_keypair.public_bytes);
                 info.set_member_kem_public_key(&owner_hex, owner_kem_b64);
             }
 
@@ -9924,12 +9677,9 @@ async fn create_named_group(
                     Ok(tk) => tk,
                     Err(e) => {
                         tracing::error!(group_id = %group_id_hex, "failed to create TreeKEM group: {e}");
-                        return (
+                        return api_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({
-                                "ok": false,
-                                "error": format!("failed to create secure group: {e}")
-                            })),
+                            format!("failed to create secure group: {e}"),
                         );
                     }
                 };
@@ -9972,12 +9722,9 @@ async fn create_named_group(
                         persist_treekem_and_named_groups_atomic(&state, &group_id_hex, &guard).await
                     {
                         tracing::error!(group_id = %group_id_hex, "failed to atomically persist TreeKEM group create: {e}");
-                        return (
+                        return api_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({
-                                "ok": false,
-                                "error": format!("failed to persist secure group: {e}")
-                            })),
+                            format!("failed to persist secure group: {e}"),
                         );
                     }
                 }
@@ -10070,10 +9817,7 @@ async fn create_named_group(
                 })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -10104,10 +9848,7 @@ async fn get_named_group(
 ) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     let members = named_group_member_values(info);
 
@@ -10139,10 +9880,7 @@ async fn get_named_group_members(
 ) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     let members = named_group_member_values(info);
     (
@@ -10209,23 +9947,16 @@ async fn send_group_public_message(
         "chat" => x0x::groups::GroupPublicMessageKind::Chat,
         "announcement" => x0x::groups::GroupPublicMessageKind::Announcement,
         other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("unknown kind '{other}' (expected 'chat' or 'announcement')")
-                })),
-            );
+            return bad_request(format!(
+                "unknown kind '{other}' (expected 'chat' or 'announcement')"
+            ));
         }
     };
 
     if req.body.len() > x0x::groups::MAX_PUBLIC_MESSAGE_BYTES {
-        return (
+        return api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "body exceeds MAX_PUBLIC_MESSAGE_BYTES"
-            })),
+            "body exceeds MAX_PUBLIC_MESSAGE_BYTES",
         );
     }
 
@@ -10241,25 +9972,13 @@ async fn send_group_public_message(
     let (msg, direct_recipients) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            );
+            return not_found("group not found");
         };
         if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "group is not SignedPublic — use /groups/:id/secure/encrypt"
-                })),
-            );
+            return bad_request("group is not SignedPublic — use /groups/:id/secure/encrypt");
         }
         if info.is_banned(&local_hex) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "ok": false, "error": "you are banned" })),
-            );
+            return forbidden("you are banned");
         }
         // Endpoint-side write-access enforcement. Mirror the ingest
         // validator so we reject locally rather than trust receivers.
@@ -10267,13 +9986,7 @@ async fn send_group_public_message(
         match info.policy.write_access {
             x0x::groups::GroupWriteAccess::MembersOnly => {
                 if caller_role.is_none() {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(serde_json::json!({
-                            "ok": false,
-                            "error": "members-only write policy"
-                        })),
-                    );
+                    return forbidden("members-only write policy");
                 }
             }
             x0x::groups::GroupWriteAccess::ModeratedPublic => { /* any non-banned */ }
@@ -10282,13 +9995,7 @@ async fn send_group_public_message(
                     .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
                     .unwrap_or(false);
                 if !ok {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(serde_json::json!({
-                            "ok": false,
-                            "error": "admin-only write policy"
-                        })),
-                    );
+                    return forbidden("admin-only write policy");
                 }
             }
         }
@@ -10310,12 +10017,9 @@ async fn send_group_public_message(
         ) {
             Ok(m) => (m, direct_recipients),
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": format!("sign failed: {e}")
-                    })),
+                    format!("sign failed: {e}"),
                 );
             }
         }
@@ -10330,23 +10034,17 @@ async fn send_group_public_message(
     let bytes = match serde_json::to_vec(&msg) {
         Ok(b) => b,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("serialize failed: {e}")
-                })),
+                format!("serialize failed: {e}"),
             );
         }
     };
     if let Err(e) = state.agent.publish(&topic, bytes.clone()).await {
         tracing::warn!(topic = %LogHexId::topic(&topic), "E: public-send publish failed: {e}");
-        return (
+        return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("publish failed: {e}")
-            })),
+            format!("publish failed: {e}"),
         );
     }
     if let Err(e) = state
@@ -10414,22 +10112,10 @@ async fn get_group_public_messages(
         }
     };
     if confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "MlsEncrypted groups do not publish a plaintext message history"
-            })),
-        );
+        return bad_request("MlsEncrypted groups do not publish a plaintext message history");
     }
     if read_access == x0x::groups::GroupReadAccess::MembersOnly && !is_member {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "members-only read policy"
-            })),
-        );
+        return forbidden("members-only read policy");
     }
 
     // Ensure the listener is live on the stable-id topic.
@@ -10814,19 +10500,13 @@ async fn join_group_via_invite(
     let invite = match x0x::groups::invite::SignedInvite::from_link(&req.invite) {
         Ok(inv) => inv,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": format!("invalid invite: {e}") })),
-            );
+            return bad_request(format!("invalid invite: {e}"));
         }
     };
 
     // Check expiry
     if invite.is_expired() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "invite has expired" })),
-        );
+        return bad_request("invite has expired");
     }
     let invite_is_treekem = invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
 
@@ -10835,10 +10515,7 @@ async fn join_group_via_invite(
     let creator = match parse_agent_id_hex(&invite.inviter) {
         Ok(id) => id,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": format!("invalid inviter: {e}") })),
-            );
+            return bad_request(format!("invalid inviter: {e}"));
         }
     };
 
@@ -10848,12 +10525,7 @@ async fn join_group_via_invite(
     let group_id_bytes = match hex::decode(&group_id_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({ "ok": false, "error": format!("invalid group_id hex: {e}") }),
-                ),
-            );
+            return bad_request(format!("invalid group_id hex: {e}"));
         }
     };
 
@@ -10863,16 +10535,13 @@ async fn join_group_via_invite(
         let prepared = match x0x::mls::TreeKemMlsGroup::prepare_member(agent_id, &seed) {
             Ok(prepared) => prepared,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": format!("failed to prepare TreeKEM KeyPackage: {e}")
-                    })),
+                    format!("failed to prepare TreeKEM KeyPackage: {e}"),
                 );
             }
         };
-        Some(base64::engine::general_purpose::STANDARD.encode(prepared.key_package_bytes()))
+        Some(BASE64.encode(prepared.key_package_bytes()))
     } else {
         None
     };
@@ -10976,7 +10645,7 @@ async fn join_group_via_invite(
             let now_ms = now_millis_u64();
             let member_pubkey_b64 = {
                 use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD.encode(signing_kp.public_key().as_bytes())
+                BASE64.encode(signing_kp.public_key().as_bytes())
             };
             let stable_id_for_event = info.stable_group_id().to_string();
             let display_name_for_event = req.display_name.clone();
@@ -10998,8 +10667,7 @@ async fn join_group_via_invite(
             ) {
                 Ok(sig) => {
                     use base64::Engine as _;
-                    let signature_b64 =
-                        base64::engine::general_purpose::STANDARD.encode(sig.as_bytes());
+                    let signature_b64 = BASE64.encode(sig.as_bytes());
                     let event = NamedGroupMetadataEvent::MemberJoined {
                         group_id: info.mls_group_id.clone(),
                         stable_group_id: Some(stable_id_for_event),
@@ -11127,10 +10795,7 @@ async fn join_group_via_invite(
                 })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -11142,10 +10807,7 @@ async fn set_group_display_name(
 ) -> impl IntoResponse {
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
 
     let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -11187,18 +10849,10 @@ async fn add_named_group_member(
     let (metadata_topic, event, members, epoch) = {
         let mut named_groups = state.named_groups.write().await;
         let Some(info) = named_groups.get_mut(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            );
+            return not_found("group not found");
         };
         if local_agent != info.creator {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(
-                    serde_json::json!({ "ok": false, "error": "only the creator can add members" }),
-                ),
-            );
+            return forbidden("only the creator can add members");
         }
         if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
             drop(named_groups);
@@ -11207,10 +10861,7 @@ async fn add_named_group_member(
 
         let agent_hex = hex::encode(agent_id.as_bytes());
         if info.has_member(&agent_hex) {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "ok": false, "error": "member already present" })),
-            );
+            return api_error(StatusCode::CONFLICT, "member already present");
         }
         info.roster_revision = info.roster_revision.saturating_add(1);
         let actor_hex = hex::encode(local_agent.as_bytes());
@@ -11227,9 +10878,9 @@ async fn add_named_group_member(
         let commit = match info.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                    format!("seal failed: {e}"),
                 );
             }
         };
@@ -11501,33 +11152,17 @@ async fn remove_named_group_member(
     let (metadata_topic, event, members, epoch) = {
         let mut named_groups = state.named_groups.write().await;
         let Some(info) = named_groups.get_mut(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            );
+            return not_found("group not found");
         };
 
         if agent_id_hex == hex::encode(info.creator.as_bytes()) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({ "ok": false, "error": "cannot remove creator via member API; delete the group instead" }),
-                ),
-            );
+            return bad_request("cannot remove creator via member API; delete the group instead");
         }
         if local_agent != info.creator {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(
-                    serde_json::json!({ "ok": false, "error": "only the creator can remove other members" }),
-                ),
-            );
+            return forbidden("only the creator can remove other members");
         }
         if !info.has_member(&agent_id_hex) {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "member not found" })),
-            );
+            return not_found("member not found");
         }
 
         info.roster_revision = info.roster_revision.saturating_add(1);
@@ -11536,9 +11171,9 @@ async fn remove_named_group_member(
         let commit = match info.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                    format!("seal failed: {e}"),
                 );
             }
         };
@@ -11926,10 +11561,7 @@ async fn get_group_state(
 ) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     let roster_root = x0x::groups::compute_roster_root(&info.members_v2);
     let policy_hash = x0x::groups::compute_policy_hash(&info.policy);
@@ -11966,31 +11598,19 @@ async fn seal_group_state(
     {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            );
+            return not_found("group not found");
         };
         let role = info.caller_role(&local_hex);
         if !role
             .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
             .unwrap_or(false)
         {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "owner or admin required to seal state"
-                })),
-            );
+            return forbidden("owner or admin required to seal state");
         }
     }
     let commit = publish_group_card_with_reseal(&state, &id).await;
     let Some(commit) = commit else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": "seal failed" })),
-        );
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "seal failed");
     };
     (
         StatusCode::OK,
@@ -12021,29 +11641,17 @@ async fn withdraw_group_state(
     let commit = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            );
+            return not_found("group not found");
         };
         if info.caller_role(&local_hex) != Some(x0x::groups::GroupRole::Owner) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "owner required to withdraw"
-                })),
-            );
+            return forbidden("owner required to withdraw");
         }
         match info.seal_withdrawal(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": format!("withdrawal seal failed: {e}")
-                    })),
+                    format!("withdrawal seal failed: {e}"),
                 );
             }
         }
@@ -12082,10 +11690,7 @@ async fn leave_group(
 
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
 
     let is_creator = local_agent == info.creator;
@@ -12101,11 +11706,9 @@ async fn leave_group(
         let commit = match info.seal_withdrawal(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        serde_json::json!({ "ok": false, "error": format!("withdrawal seal failed: {e}") }),
-                    ),
+                    format!("withdrawal seal failed: {e}"),
                 );
             }
         };
@@ -12125,9 +11728,9 @@ async fn leave_group(
         let commit = match info.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                    format!("seal failed: {e}"),
                 );
             }
         };
@@ -12238,10 +11841,7 @@ fn require_admin_or_above(
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     match info.caller_role(caller_hex) {
         Some(role) if role.at_least(x0x::groups::GroupRole::Admin) => Ok(()),
-        _ => Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "admin role required" })),
-        )),
+        _ => Err(forbidden("admin role required")),
     }
 }
 
@@ -12251,10 +11851,7 @@ fn require_owner(
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     match info.caller_role(caller_hex) {
         Some(x0x::groups::GroupRole::Owner) => Ok(()),
-        _ => Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "owner role required" })),
-        )),
+        _ => Err(forbidden("owner role required")),
     }
 }
 
@@ -12273,10 +11870,7 @@ async fn update_named_group(
     let _membership_guard = membership_lock.lock().await;
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
@@ -12295,9 +11889,9 @@ async fn update_named_group(
     let commit = match info.seal_commit(signing_kp, now_ms) {
         Ok(c) => c,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                format!("seal failed: {e}"),
             );
         }
     };
@@ -12343,10 +11937,7 @@ async fn update_group_policy(
     let now_ms = now_millis_u64();
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     if let Err(e) = require_owner(info, &caller_hex) {
         return e;
@@ -12357,10 +11948,7 @@ async fn update_group_policy(
         match x0x::groups::GroupPolicyPreset::from_name(preset_name) {
             Some(preset) => new_policy = preset.to_policy(),
             None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "ok": false, "error": "unknown preset" })),
-                );
+                return bad_request("unknown preset");
             }
         }
     }
@@ -12398,9 +11986,9 @@ async fn update_group_policy(
     let commit = match info.seal_commit(signing_kp, now_ms) {
         Ok(c) => c,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                format!("seal failed: {e}"),
             );
         }
     };
@@ -12549,10 +12137,7 @@ async fn ban_group_member(
     let _membership_guard = membership_lock.lock().await;
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
@@ -12562,10 +12147,7 @@ async fn ban_group_member(
         return ban_treekem_group_member(state, id, agent_id_hex, caller_hex).await;
     }
     if info.caller_role(&agent_id_hex) == Some(x0x::groups::GroupRole::Owner) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "cannot ban owner" })),
-        );
+        return forbidden("cannot ban owner");
     }
     info.ban_member(&agent_id_hex, Some(caller_hex.clone()));
     info.roster_revision = info.roster_revision.saturating_add(1);
@@ -12596,9 +12178,9 @@ async fn ban_group_member(
     let commit = match info.seal_commit(signing_kp, now_ms) {
         Ok(c) => c,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                format!("seal failed: {e}"),
             );
         }
     };
@@ -12850,19 +12432,13 @@ async fn unban_group_member(
     let now_ms = now_millis_u64();
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
     }
     if !info.is_banned(&agent_id_hex) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "member is not banned" })),
-        );
+        return bad_request("member is not banned");
     }
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         if let Some(member) = info.members_v2.get_mut(&agent_id_hex) {
@@ -12878,9 +12454,9 @@ async fn unban_group_member(
     let commit = match info.seal_commit(signing_kp, now_ms) {
         Ok(c) => c,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                format!("seal failed: {e}"),
             );
         }
     };
@@ -12913,10 +12489,7 @@ async fn list_join_requests(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
@@ -12947,40 +12520,23 @@ async fn create_join_request(
     let (metadata_topic, event_group_id, request, creator_hex, commit) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            );
+            return not_found("group not found");
         };
         if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(
-                    serde_json::json!({ "ok": false, "error": "group admission is not request_access" }),
-                ),
-            );
+            return forbidden("group admission is not request_access");
         }
         if info.is_banned(&caller_hex) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "ok": false, "error": "banned" })),
-            );
+            return forbidden("banned");
         }
         if info.has_active_member(&caller_hex) {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "ok": false, "error": "already a member" })),
-            );
+            return api_error(StatusCode::CONFLICT, "already a member");
         }
         if info
             .join_requests
             .values()
             .any(|r| r.requester_agent_id == caller_hex && r.is_pending())
         {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "ok": false, "error": "pending request already exists" })),
-            );
+            return api_error(StatusCode::CONFLICT, "pending request already exists");
         }
 
         let mut request = x0x::groups::JoinRequest::new(
@@ -12994,41 +12550,33 @@ async fn create_join_request(
             let group_id_bytes = match hex::decode(&info.mls_group_id) {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    return (
+                    return api_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(
-                            serde_json::json!({ "ok": false, "error": format!("invalid TreeKEM group id: {e}") }),
-                        ),
+                        format!("invalid TreeKEM group id: {e}"),
                     );
                 }
             };
             let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
-            let prepared = match x0x::mls::TreeKemMlsGroup::prepare_member(
-                state.agent.agent_id(),
-                &seed,
-            ) {
-                Ok(prepared) => prepared,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(
-                            serde_json::json!({ "ok": false, "error": format!("failed to prepare TreeKEM KeyPackage: {e}") }),
-                        ),
-                    );
-                }
-            };
-            request.treekem_key_package_b64 = Some(
-                base64::engine::general_purpose::STANDARD.encode(prepared.key_package_bytes()),
-            );
+            let prepared =
+                match x0x::mls::TreeKemMlsGroup::prepare_member(state.agent.agent_id(), &seed) {
+                    Ok(prepared) => prepared,
+                    Err(e) => {
+                        return api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to prepare TreeKEM KeyPackage: {e}"),
+                        );
+                    }
+                };
+            request.treekem_key_package_b64 = Some(BASE64.encode(prepared.key_package_bytes()));
         }
         info.join_requests
             .insert(request.request_id.clone(), request.clone());
         let commit = match info.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                    format!("seal failed: {e}"),
                 );
             }
         };
@@ -13044,8 +12592,7 @@ async fn create_join_request(
     // Include our ML-KEM-768 public key so the approver can seal the group
     // shared secret directly to us on approval.
     use base64::Engine as _;
-    let requester_kem_b64 =
-        base64::engine::general_purpose::STANDARD.encode(&state.agent_kem_keypair.public_bytes);
+    let requester_kem_b64 = BASE64.encode(&state.agent_kem_keypair.public_bytes);
     let event = NamedGroupMetadataEvent::JoinRequestCreated {
         group_id: event_group_id,
         request_id: request.request_id.clone(),
@@ -13096,10 +12643,7 @@ async fn approve_join_request(
     let (metadata_topic, event_group_id, requester_hex, revision, commit) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            );
+            return not_found("group not found");
         };
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
             return e;
@@ -13108,16 +12652,10 @@ async fn approve_join_request(
             return resp;
         }
         let Some(req) = info.join_requests.get_mut(&request_id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "request not found" })),
-            );
+            return not_found("request not found");
         };
         if !req.is_pending() {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "ok": false, "error": "request is not pending" })),
-            );
+            return api_error(StatusCode::CONFLICT, "request is not pending");
         }
         req.status = x0x::groups::JoinRequestStatus::Approved;
         req.reviewed_by = Some(caller_hex.clone());
@@ -13133,9 +12671,9 @@ async fn approve_join_request(
         let commit = match info.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                    format!("seal failed: {e}"),
                 );
             }
         };
@@ -13277,31 +12815,19 @@ async fn approve_treekem_join_request(
     let (mut next, metadata_topic, event_group_id, requester_hex, requester_id, kp_bytes) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            );
+            return not_found("group not found");
         };
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
             return e;
         }
         let Some(req) = info.join_requests.get(&request_id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "request not found" })),
-            );
+            return not_found("request not found");
         };
         if !req.is_pending() {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "ok": false, "error": "request is not pending" })),
-            );
+            return api_error(StatusCode::CONFLICT, "request is not pending");
         }
         if info.is_banned(&req.requester_agent_id) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "ok": false, "error": "requester is banned" })),
-            );
+            return forbidden("requester is banned");
         }
         let requester_id = match parse_agent_id_hex(&req.requester_agent_id) {
             Ok(id) => id,
@@ -13313,24 +12839,15 @@ async fn approve_treekem_join_request(
             }
         };
         let Some(kp_b64) = req.treekem_key_package_b64.clone() else {
-            return (
+            return api_error(
                 StatusCode::FAILED_DEPENDENCY,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "request is missing TreeKEM KeyPackage"
-                })),
+                "request is missing TreeKEM KeyPackage",
             );
         };
-        let kp_bytes = match base64::engine::general_purpose::STANDARD.decode(kp_b64) {
+        let kp_bytes = match BASE64.decode(kp_b64) {
             Ok(bytes) => bytes,
             Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "request TreeKEM KeyPackage is not valid base64"
-                    })),
-                );
+                return bad_request("request TreeKEM KeyPackage is not valid base64");
             }
         };
         (
@@ -13348,12 +12865,9 @@ async fn approve_treekem_join_request(
         map.get(&id).cloned()
     };
     let Some(group) = group else {
-        return (
+        return api_error(
             StatusCode::FAILED_DEPENDENCY,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "TreeKEM group not loaded — restart or re-share required"
-            })),
+            "TreeKEM group not loaded — restart or re-share required",
         );
     };
     let mut guard = group.lock().await;
@@ -13370,53 +12884,41 @@ async fn approve_treekem_join_request(
         Some(caller_hex.clone()),
         None,
     );
-    next.set_member_treekem_key_package(
-        &requester_hex,
-        base64::engine::general_purpose::STANDARD.encode(&kp_bytes),
-    );
+    next.set_member_treekem_key_package(&requester_hex, BASE64.encode(&kp_bytes));
     next.secret_epoch = treekem_epoch;
     next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
     let revision = next.roster_revision;
     let commit = match next.seal_commit(signing_kp, now_ms) {
         Ok(c) => c,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                format!("seal failed: {e}"),
             );
         }
     };
     let out = match guard.add_member(requester_id, &kp_bytes) {
         Ok(out) => out,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("TreeKEM add_member failed: {e}")
-                })),
+                format!("TreeKEM add_member failed: {e}"),
             );
         }
     };
     if guard.epoch() != treekem_epoch {
-        return (
+        return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "TreeKEM epoch did not advance as expected"
-            })),
+            "TreeKEM epoch did not advance as expected",
         );
     }
     if let Err(e) =
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
     {
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after approval: {e}");
-        return (
+        return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "failed to persist secure group state"
-            })),
+            "failed to persist secure group state",
         );
     }
     let treekem_commit = out.commit;
@@ -13436,7 +12938,7 @@ async fn approve_treekem_join_request(
         revision,
         actor: caller_hex,
         requester_agent_id: requester_hex.clone(),
-        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_commit_b64: Some(BASE64.encode(treekem_commit)),
         treekem_welcome_b64: None,
         welcome_ref: Some(welcome_ref),
         treekem_epoch: Some(treekem_epoch),
@@ -13470,25 +12972,16 @@ async fn reject_join_request(
     let (metadata_topic, event_group_id, requester_hex, commit) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            );
+            return not_found("group not found");
         };
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
             return e;
         }
         let Some(req) = info.join_requests.get_mut(&request_id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "request not found" })),
-            );
+            return not_found("request not found");
         };
         if !req.is_pending() {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "ok": false, "error": "request is not pending" })),
-            );
+            return api_error(StatusCode::CONFLICT, "request is not pending");
         }
         req.status = x0x::groups::JoinRequestStatus::Rejected;
         req.reviewed_by = Some(caller_hex.clone());
@@ -13497,9 +12990,9 @@ async fn reject_join_request(
         let commit = match info.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                    format!("seal failed: {e}"),
                 );
             }
         };
@@ -13537,37 +13030,25 @@ async fn cancel_join_request(
     let (metadata_topic, event_group_id, requester_hex, commit) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            );
+            return not_found("group not found");
         };
         let Some(req) = info.join_requests.get_mut(&request_id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "request not found" })),
-            );
+            return not_found("request not found");
         };
         if req.requester_agent_id != caller_hex {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "ok": false, "error": "not your request" })),
-            );
+            return forbidden("not your request");
         }
         if !req.is_pending() {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "ok": false, "error": "request is not pending" })),
-            );
+            return api_error(StatusCode::CONFLICT, "request is not pending");
         }
         req.status = x0x::groups::JoinRequestStatus::Cancelled;
         let requester_hex = req.requester_agent_id.clone();
         let commit = match info.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                    format!("seal failed: {e}"),
                 );
             }
         };
@@ -13723,13 +13204,7 @@ async fn create_discovery_subscription(
     Json(req): Json<SubscribeDiscoveryRequest>,
 ) -> impl IntoResponse {
     let Some(kind) = x0x::groups::ShardKind::from_str(&req.kind) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "kind must be 'tag', 'name', or 'id'"
-            })),
-        );
+        return bad_request("kind must be 'tag', 'name', or 'id'");
     };
     let (shard, key) = match (req.shard, req.key.as_deref()) {
         (Some(s), k) => (s, k.map(str::to_string)),
@@ -13742,23 +13217,11 @@ async fn create_discovery_subscription(
             (x0x::groups::shard_of(kind, &normalised), Some(normalised))
         }
         (None, None) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "either 'shard' or 'key' is required"
-                })),
-            );
+            return bad_request("either 'shard' or 'key' is required");
         }
     };
     if state.directory_subscriptions.read().await.len() >= x0x::groups::DEFAULT_MAX_SUBSCRIPTIONS {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "subscription limit reached"
-            })),
-        );
+        return api_error(StatusCode::PAYLOAD_TOO_LARGE, "subscription limit reached");
     }
     let rec = x0x::groups::SubscriptionRecord {
         kind,
@@ -13790,13 +13253,7 @@ async fn delete_discovery_subscription(
     Path((kind_str, shard)): Path<(String, u32)>,
 ) -> impl IntoResponse {
     let Some(kind) = x0x::groups::ShardKind::from_str(&kind_str) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "kind must be 'tag', 'name', or 'id'"
-            })),
-        );
+        return bad_request("kind must be 'tag', 'name', or 'id'");
     };
     let existed = state
         .directory_subscriptions
@@ -13834,19 +13291,15 @@ async fn get_group_card(
             }
             Ok(None) => {}
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": format!("card sign failed: {e}") })),
+                    format!("card sign failed: {e}"),
                 )
-                    .into_response();
+                .into_response();
             }
         }
     }
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({ "ok": false, "error": "card not found" })),
-    )
-        .into_response()
+    not_found("card not found").into_response()
 }
 
 /// POST /groups/cards/import — accept a discoverable card into the local cache.
@@ -13861,16 +13314,10 @@ async fn import_group_card(
     Json(card): Json<x0x::groups::GroupCard>,
 ) -> impl IntoResponse {
     if card.policy_summary.discoverability == x0x::groups::GroupDiscoverability::Hidden {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "card is hidden" })),
-        );
+        return bad_request("card is hidden");
     }
     if let Err(e) = card.verify_signature() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": format!("invalid signed card: {e}") })),
-        );
+        return bad_request(format!("invalid signed card: {e}"));
     }
     let group_id = card.group_id.clone();
 
@@ -13899,10 +13346,7 @@ async fn import_group_card(
     let creator = match parse_agent_id_hex(&card.owner_agent_id) {
         Ok(id) => id,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid owner_agent_id" })),
-            );
+            return bad_request("invalid owner_agent_id");
         }
     };
 
@@ -14065,13 +13509,7 @@ fn treekem_membership_unsupported(
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-        Some((
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "TreeKEM secure-group membership flow is not supported by this endpoint; use request-access approval/removal transport"
-            })),
-        ))
+        Some(api_error(StatusCode::NOT_IMPLEMENTED, "TreeKEM secure-group membership flow is not supported by this endpoint; use request-access approval/removal transport"))
     } else {
         None
     }
@@ -14091,13 +13529,10 @@ async fn treekem_group_encrypt(
     payload_b64: &str,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
-    let plaintext = match base64::engine::general_purpose::STANDARD.decode(payload_b64) {
+    let plaintext = match BASE64.decode(payload_b64) {
         Ok(p) => p,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid base64 payload" })),
-            );
+            return bad_request("invalid base64 payload");
         }
     };
     let group = {
@@ -14105,12 +13540,9 @@ async fn treekem_group_encrypt(
         match map.get(group_id_hex) {
             Some(g) => Arc::clone(g),
             None => {
-                return (
+                return api_error(
                     StatusCode::FAILED_DEPENDENCY,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "TreeKEM group not loaded — restart or re-share required"
-                    })),
+                    "TreeKEM group not loaded — restart or re-share required",
                 );
             }
         }
@@ -14119,11 +13551,9 @@ async fn treekem_group_encrypt(
     let ciphertext = match guard.encrypt_message(&plaintext) {
         Ok(c) => c,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({ "ok": false, "error": format!("treekem encrypt failed: {e}") }),
-                ),
+                format!("treekem encrypt failed: {e}"),
             );
         }
     };
@@ -14132,11 +13562,9 @@ async fn treekem_group_encrypt(
     // not, so a persist failure fails the request.
     if let Err(e) = persist_treekem_snapshot_bound(state, group_id_hex, &guard).await {
         tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot after encrypt: {e}");
-        return (
+        return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::json!({ "ok": false, "error": "failed to persist secure group state" }),
-            ),
+            "failed to persist secure group state",
         );
     }
     let epoch = guard.epoch();
@@ -14145,7 +13573,7 @@ async fn treekem_group_encrypt(
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
-            "ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+            "ciphertext_b64": BASE64.encode(&ciphertext),
             "secret_epoch": epoch,
             "secure_plane": "treekem",
         })),
@@ -14162,13 +13590,10 @@ async fn treekem_group_decrypt(
     ciphertext_b64: &str,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
-    let ciphertext = match base64::engine::general_purpose::STANDARD.decode(ciphertext_b64) {
+    let ciphertext = match BASE64.decode(ciphertext_b64) {
         Ok(c) => c,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid base64 ciphertext" })),
-            );
+            return bad_request("invalid base64 ciphertext");
         }
     };
     let group = {
@@ -14176,12 +13601,9 @@ async fn treekem_group_decrypt(
         match map.get(group_id_hex) {
             Some(g) => Arc::clone(g),
             None => {
-                return (
+                return api_error(
                     StatusCode::FAILED_DEPENDENCY,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "TreeKEM group not loaded — restart or re-share required"
-                    })),
+                    "TreeKEM group not loaded — restart or re-share required",
                 );
             }
         }
@@ -14190,12 +13612,7 @@ async fn treekem_group_decrypt(
     let plaintext = match guard.decrypt_message(&ciphertext) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({ "ok": false, "error": format!("treekem decrypt failed: {e}") }),
-                ),
-            );
+            return bad_request(format!("treekem decrypt failed: {e}"));
         }
     };
     // Persisting the receive replay window is best-effort. A failure here may
@@ -14213,7 +13630,7 @@ async fn treekem_group_decrypt(
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
-            "payload_b64": base64::engine::general_purpose::STANDARD.encode(&plaintext),
+            "payload_b64": BASE64.encode(&plaintext),
             "secret_epoch": epoch,
             "secure_plane": "treekem",
         })),
@@ -14228,25 +13645,13 @@ async fn secure_group_encrypt(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     if !info.has_active_member(&caller_hex) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "not a member" })),
-        );
+        return forbidden("not a member");
     }
     if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "group is not MlsEncrypted — use public send instead"
-            })),
-        );
+        return bad_request("group is not MlsEncrypted — use public send instead");
     }
     // ADR-0012: real-TreeKEM groups encrypt via the live group's ratchet, not
     // the GSS shared secret. Dispatch on the group's plane.
@@ -14255,12 +13660,9 @@ async fn secure_group_encrypt(
         return treekem_group_encrypt(state.as_ref(), &id, &req.payload_b64).await;
     }
     let Some(key) = info.secure_message_key() else {
-        return (
+        return api_error(
             StatusCode::FAILED_DEPENDENCY,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "no shared secret available — await welcome or ask admin to re-share"
-            })),
+            "no shared secret available — await welcome or ask admin to re-share",
         );
     };
     let epoch = info.secret_epoch;
@@ -14268,13 +13670,10 @@ async fn secure_group_encrypt(
     drop(groups);
 
     use base64::Engine as _;
-    let plaintext = match base64::engine::general_purpose::STANDARD.decode(&req.payload_b64) {
+    let plaintext = match BASE64.decode(&req.payload_b64) {
         Ok(p) => p,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid base64 payload" })),
-            );
+            return bad_request("invalid base64 payload");
         }
     };
 
@@ -14288,10 +13687,7 @@ async fn secure_group_encrypt(
     let cipher = match chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key) {
         Ok(c) => c,
         Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "cipher init failed" })),
-            );
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "cipher init failed");
         }
     };
     let aad = format!("x0x.group.secure|{}|{}", group_id_clone, epoch);
@@ -14305,9 +13701,9 @@ async fn secure_group_encrypt(
     ) {
         Ok(c) => c,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": format!("encrypt failed: {e}") })),
+                format!("encrypt failed: {e}"),
             );
         }
     };
@@ -14316,8 +13712,8 @@ async fn secure_group_encrypt(
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
-            "ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
-            "nonce_b64": base64::engine::general_purpose::STANDARD.encode(nonce_bytes),
+            "ciphertext_b64": BASE64.encode(&ciphertext),
+            "nonce_b64": BASE64.encode(nonce_bytes),
             "secret_epoch": epoch,
         })),
     )
@@ -14338,17 +13734,11 @@ async fn secure_group_decrypt(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     if !info.has_active_member(&caller_hex) && !info.is_banned(&caller_hex) {
         // Removed/never-member callers can't decrypt.
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "not a member" })),
-        );
+        return forbidden("not a member");
     }
     // ADR-0012: real-TreeKEM groups decrypt via the live group's ratchet. A
     // removed member's leaf is gone from the live group, so decryption of a
@@ -14358,13 +13748,7 @@ async fn secure_group_decrypt(
         return treekem_group_decrypt(state.as_ref(), &id, &req.ciphertext_b64).await;
     }
     let Some(local_secret) = info.shared_secret.clone() else {
-        return (
-            StatusCode::FAILED_DEPENDENCY,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "no shared secret available"
-            })),
-        );
+        return api_error(StatusCode::FAILED_DEPENDENCY, "no shared secret available");
     };
     let local_epoch = info.secret_epoch;
     let group_id_clone = info.stable_group_id().to_string();
@@ -14386,29 +13770,20 @@ async fn secure_group_decrypt(
     }
 
     use base64::Engine as _;
-    let ciphertext = match base64::engine::general_purpose::STANDARD.decode(&req.ciphertext_b64) {
+    let ciphertext = match BASE64.decode(&req.ciphertext_b64) {
         Ok(c) => c,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid base64 ciphertext" })),
-            );
+            return bad_request("invalid base64 ciphertext");
         }
     };
-    let nonce_bytes = match base64::engine::general_purpose::STANDARD.decode(&req.nonce_b64) {
+    let nonce_bytes = match BASE64.decode(&req.nonce_b64) {
         Ok(n) => n,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid base64 nonce" })),
-            );
+            return bad_request("invalid base64 nonce");
         }
     };
     if nonce_bytes.len() != 12 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "nonce must be 12 bytes" })),
-        );
+        return bad_request("nonce must be 12 bytes");
     }
 
     let key = x0x::groups::GroupInfo::derive_message_key(
@@ -14420,10 +13795,7 @@ async fn secure_group_decrypt(
     let cipher = match chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key) {
         Ok(c) => c,
         Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "cipher init failed" })),
-            );
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "cipher init failed");
         }
     };
     let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
@@ -14439,14 +13811,11 @@ async fn secure_group_decrypt(
             StatusCode::OK,
             Json(serde_json::json!({
                 "ok": true,
-                "payload_b64": base64::engine::general_purpose::STANDARD.encode(&plaintext),
+                "payload_b64": BASE64.encode(&plaintext),
                 "secret_epoch": req.secret_epoch,
             })),
         ),
-        Err(_) => (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "decryption failed" })),
-        ),
+        Err(_) => forbidden("decryption failed"),
     }
 }
 
@@ -14492,40 +13861,25 @@ async fn secure_group_reseal(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
     if !info.has_active_member(&caller_hex) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "not a member" })),
-        );
+        return forbidden("not a member");
     }
     // Recipient must be a known member with a KEM pubkey.
     let Some(recipient_member) = info.members_v2.get(&req.recipient) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "recipient is not a member" })),
-        );
+        return not_found("recipient is not a member");
     };
     let Some(recipient_kem_b64) = recipient_member.kem_public_key_b64.clone() else {
-        return (
+        return api_error(
             StatusCode::FAILED_DEPENDENCY,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "recipient has no published KEM public key"
-            })),
+            "recipient has no published KEM public key",
         );
     };
     let Some(secret_vec) = info.shared_secret.clone() else {
-        return (
+        return api_error(
             StatusCode::FAILED_DEPENDENCY,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "no shared secret available on this daemon"
-            })),
+            "no shared secret available on this daemon",
         );
     };
     let epoch = info.secret_epoch;
@@ -14533,31 +13887,21 @@ async fn secure_group_reseal(
     drop(groups);
 
     if secret_vec.len() != 32 {
-        return (
+        return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "shared secret has unexpected length"
-            })),
+            "shared secret has unexpected length",
         );
     }
     let mut secret = [0u8; 32];
     secret.copy_from_slice(&secret_vec);
 
     use base64::Engine as _;
-    let recipient_kem_bytes =
-        match base64::engine::general_purpose::STANDARD.decode(&recipient_kem_b64) {
-            Ok(b) => b,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "recipient KEM public key is not valid base64"
-                    })),
-                );
-            }
-        };
+    let recipient_kem_bytes = match BASE64.decode(&recipient_kem_b64) {
+        Ok(b) => b,
+        Err(_) => {
+            return bad_request("recipient KEM public key is not valid base64");
+        }
+    };
     let aad = secure_share_aad(&group_id_wire, &req.recipient, epoch);
     let (kem_ct, aead_nonce, aead_ct) =
         match x0x::groups::kem_envelope::seal_group_secret_to_recipient(
@@ -14567,12 +13911,9 @@ async fn secure_group_reseal(
         ) {
             Ok(t) => t,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": format!("seal failed: {e}")
-                    })),
+                    format!("seal failed: {e}"),
                 );
             }
         };
@@ -14584,9 +13925,9 @@ async fn secure_group_reseal(
             "group_id": group_id_wire,
             "recipient": req.recipient,
             "secret_epoch": epoch,
-            "kem_ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(&kem_ct),
-            "aead_nonce_b64": base64::engine::general_purpose::STANDARD.encode(aead_nonce),
-            "aead_ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(&aead_ct),
+            "kem_ciphertext_b64": BASE64.encode(&kem_ct),
+            "aead_nonce_b64": BASE64.encode(aead_nonce),
+            "aead_ciphertext_b64": BASE64.encode(&aead_ct),
         })),
     )
 }
@@ -14613,39 +13954,27 @@ async fn secure_open_envelope_adversarial(
     Json(req): Json<OpenEnvelopeRequest>,
 ) -> impl IntoResponse {
     use base64::Engine as _;
-    let kem_ct = match base64::engine::general_purpose::STANDARD.decode(&req.kem_ciphertext_b64) {
+    let kem_ct = match BASE64.decode(&req.kem_ciphertext_b64) {
         Ok(b) => b,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "bad kem_ciphertext_b64" })),
-            );
+            return bad_request("bad kem_ciphertext_b64");
         }
     };
-    let nonce = match base64::engine::general_purpose::STANDARD.decode(&req.aead_nonce_b64) {
+    let nonce = match BASE64.decode(&req.aead_nonce_b64) {
         Ok(b) => b,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "bad aead_nonce_b64" })),
-            );
+            return bad_request("bad aead_nonce_b64");
         }
     };
     if nonce.len() != 12 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "nonce must be 12 bytes" })),
-        );
+        return bad_request("nonce must be 12 bytes");
     }
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes.copy_from_slice(&nonce);
-    let aead_ct = match base64::engine::general_purpose::STANDARD.decode(&req.aead_ciphertext_b64) {
+    let aead_ct = match BASE64.decode(&req.aead_ciphertext_b64) {
         Ok(b) => b,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "bad aead_ciphertext_b64" })),
-            );
+            return bad_request("bad aead_ciphertext_b64");
         }
     };
     let aad = secure_share_aad(&req.group_id, &req.recipient, req.secret_epoch);
@@ -14661,7 +13990,7 @@ async fn secure_open_envelope_adversarial(
             Json(serde_json::json!({
                 "ok": true,
                 "opened": true,
-                "secret_b64": base64::engine::general_purpose::STANDARD.encode(secret),
+                "secret_b64": BASE64.encode(secret),
             })),
         ),
         Err(_) => (
@@ -14706,10 +14035,7 @@ async fn create_task_list(
                 Json(serde_json::json!({ "ok": true, "id": id })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -14720,10 +14046,7 @@ async fn list_tasks(
 ) -> impl IntoResponse {
     let lists = state.task_lists.read().await;
     let Some(handle) = lists.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "task list not found" })),
-        );
+        return not_found("task list not found");
     };
 
     match handle.list_tasks().await {
@@ -14744,10 +14067,7 @@ async fn list_tasks(
                 Json(serde_json::json!({ "ok": true, "tasks": entries })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -14759,10 +14079,7 @@ async fn add_task(
 ) -> impl IntoResponse {
     let lists = state.task_lists.read().await;
     let Some(handle) = lists.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "task list not found" })),
-        );
+        return not_found("task list not found");
     };
 
     match handle
@@ -14773,10 +14090,7 @@ async fn add_task(
             StatusCode::CREATED,
             Json(serde_json::json!({ "ok": true, "task_id": format!("{task_id}") })),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -14788,10 +14102,7 @@ async fn update_task(
 ) -> impl IntoResponse {
     let lists = state.task_lists.read().await;
     let Some(handle) = lists.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "task list not found" })),
-        );
+        return not_found("task list not found");
     };
 
     // Parse task ID from hex
@@ -14802,12 +14113,7 @@ async fn update_task(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({ "ok": false, "error": "invalid task ID (expected 64 hex chars)" }),
-                ),
-            );
+            return bad_request("invalid task ID (expected 64 hex chars)");
         }
     };
     let task_id = x0x::crdt::TaskId::from_bytes(task_id_bytes);
@@ -14816,21 +14122,13 @@ async fn update_task(
         "claim" => handle.claim_task(task_id).await,
         "complete" => handle.complete_task(task_id).await,
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({ "ok": false, "error": "action must be 'claim' or 'complete'" }),
-                ),
-            );
+            return bad_request("action must be 'claim' or 'complete'");
         }
     };
 
     match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -15044,10 +14342,7 @@ async fn create_kv_store(
                 Json(serde_json::json!({ "ok": true, "id": id })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -15064,10 +14359,7 @@ async fn join_kv_store(
                 Json(serde_json::json!({ "ok": true, "id": id })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -15078,10 +14370,7 @@ async fn list_kv_keys(
 ) -> impl IntoResponse {
     let stores = state.kv_stores.read().await;
     let Some(handle) = stores.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "store not found" })),
-        );
+        return not_found("store not found");
     };
 
     match handle.keys().await {
@@ -15103,10 +14392,7 @@ async fn list_kv_keys(
                 Json(serde_json::json!({ "ok": true, "keys": keys })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -15119,22 +14405,16 @@ async fn put_kv_value(
     let handle = {
         let stores = state.kv_stores.read().await;
         let Some(handle) = stores.get(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "store not found" })),
-            );
+            return not_found("store not found");
         };
         handle.clone()
     };
 
     use base64::Engine;
-    let value = match base64::engine::general_purpose::STANDARD.decode(&req.value) {
+    let value = match BASE64.decode(&req.value) {
         Ok(v) => v,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": format!("invalid base64: {e}") })),
-            );
+            return bad_request(format!("invalid base64: {e}"));
         }
     };
 
@@ -15169,16 +14449,13 @@ async fn get_kv_value(
 ) -> impl IntoResponse {
     let stores = state.kv_stores.read().await;
     let Some(handle) = stores.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "store not found" })),
-        );
+        return not_found("store not found");
     };
 
     match handle.get(&key).await {
         Ok(Some(entry)) => {
             use base64::Engine;
-            let value_b64 = base64::engine::general_purpose::STANDARD.encode(&entry.value);
+            let value_b64 = BASE64.encode(&entry.value);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -15193,14 +14470,8 @@ async fn get_kv_value(
                 })),
             )
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "key not found" })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Ok(None) => not_found("key not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -15212,10 +14483,7 @@ async fn delete_kv_value(
     let handle = {
         let stores = state.kv_stores.read().await;
         let Some(handle) = stores.get(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "store not found" })),
-            );
+            return not_found("store not found");
         };
         handle.clone()
     };
@@ -15226,10 +14494,7 @@ async fn delete_kv_value(
             spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
 
@@ -15283,10 +14548,7 @@ async fn connect_agent(
         }
         Ok(Err(e)) => {
             tracing::error!("connect_agent failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "connection failed" })),
-            )
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "connection failed")
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -15348,10 +14610,7 @@ async fn connect_machine(
         }
         Ok(Err(e)) => {
             tracing::error!("connect_machine failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "connection failed" })),
-            )
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "connection failed")
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -15386,21 +14645,13 @@ async fn exec_run(
         }
     };
     if req.argv.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "argv must not be empty" })),
-        )
-            .into_response();
+        return bad_request("argv must not be empty").into_response();
     }
     let stdin = match req.stdin_b64.as_deref() {
-        Some(encoded) => match base64::engine::general_purpose::STANDARD.decode(encoded) {
+        Some(encoded) => match BASE64.decode(encoded) {
             Ok(bytes) => Some(bytes),
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "ok": false, "error": format!("invalid stdin_b64: {e}") })),
-                )
-                    .into_response();
+                return bad_request(format!("invalid stdin_b64: {e}")).into_response();
             }
         },
         None => None,
@@ -15423,8 +14674,8 @@ async fn exec_run(
                     "code": result.code,
                     "signal": result.signal,
                     "duration_ms": result.duration_ms,
-                    "stdout_b64": base64::engine::general_purpose::STANDARD.encode(&result.stdout),
-                    "stderr_b64": base64::engine::general_purpose::STANDARD.encode(&result.stderr),
+                    "stdout_b64": BASE64.encode(&result.stdout),
+                    "stderr_b64": BASE64.encode(&result.stderr),
                     "stdout_bytes_total": result.stdout_bytes_total,
                     "stderr_bytes_total": result.stderr_bytes_total,
                     "truncated": result.truncated,
@@ -15461,11 +14712,7 @@ async fn exec_cancel(
     let request_id = match x0x::exec::ExecRequestId::from_hex(&req.request_id) {
         Ok(id) => id,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
-            )
-                .into_response();
+            return bad_request(e.to_string()).into_response();
         }
     };
     let target = match req.agent_id.as_deref() {
@@ -15483,11 +14730,7 @@ async fn exec_cancel(
     };
     match state.exec_service.cancel_remote(request_id, target).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
 }
 
@@ -15521,10 +14764,7 @@ async fn direct_send(
         let contacts = state.contacts.read().await;
         if let Some(contact) = contacts.get(&agent_id) {
             if contact.trust_level == TrustLevel::Blocked {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({ "ok": false, "error": "agent is blocked" })),
-                );
+                return forbidden("agent is blocked");
             }
         }
     }
@@ -15720,7 +14960,7 @@ async fn direct_events_sse(
                     let data = serde_json::json!({
                         "sender": hex::encode(msg.sender.as_bytes()),
                         "machine_id": hex::encode(msg.machine_id.as_bytes()),
-                        "payload": base64::engine::general_purpose::STANDARD.encode(&msg.payload),
+                        "payload": BASE64.encode(&msg.payload),
                         "received_at": msg.received_at,
                         "verified": msg.verified,
                         "trust_decision": msg.trust_decision.map(|d| d.to_string())
@@ -15761,10 +15001,7 @@ async fn create_mls_group(
         Some(hex_str) => match hex::decode(&hex_str) {
             Ok(bytes) => bytes,
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "ok": false, "error": format!("invalid hex: {e}") })),
-                );
+                return bad_request(format!("invalid hex: {e}"));
             }
         },
         None => {
@@ -15806,10 +15043,7 @@ async fn create_mls_group(
         }
         Err(e) => {
             tracing::error!("operation failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "internal error" })),
-            )
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
 }
@@ -15841,10 +15075,7 @@ async fn get_mls_group(
 ) -> impl IntoResponse {
     let groups = state.mls_groups.read().await;
     let Some(group) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
 
     let members: Vec<String> = group
@@ -15882,10 +15113,7 @@ async fn add_mls_member(
 
     let mut groups = state.mls_groups.write().await;
     let Some(group) = groups.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
 
     // add_member() auto-applies the commit internally (increments epoch).
@@ -15906,10 +15134,7 @@ async fn add_mls_member(
         }
         Err(e) => {
             tracing::error!("add_mls_member failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "operation failed" })),
-            )
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "operation failed")
         }
     }
 }
@@ -15931,10 +15156,7 @@ async fn remove_mls_member(
 
     let mut groups = state.mls_groups.write().await;
     let Some(group) = groups.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
 
     // remove_member() auto-applies the commit internally.
@@ -15954,10 +15176,7 @@ async fn remove_mls_member(
         }
         Err(e) => {
             tracing::error!("remove_mls_member failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "internal error" })),
-            )
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
 }
@@ -15975,10 +15194,7 @@ async fn mls_encrypt(
 
     let groups = state.mls_groups.read().await;
     let Some(group) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
 
     let (cipher, epoch) = match make_mls_cipher(group) {
@@ -15991,16 +15207,13 @@ async fn mls_encrypt(
             StatusCode::OK,
             Json(serde_json::json!({
                 "ok": true,
-                "ciphertext": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+                "ciphertext": BASE64.encode(&ciphertext),
                 "epoch": epoch
             })),
         ),
         Err(e) => {
             tracing::error!("mls_encrypt failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "encryption failed" })),
-            )
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "encryption failed")
         }
     }
 }
@@ -16018,10 +15231,7 @@ async fn mls_decrypt(
 
     let groups = state.mls_groups.read().await;
     let Some(group) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
 
     let (cipher, _epoch) = match make_mls_cipher(group) {
@@ -16034,15 +15244,12 @@ async fn mls_decrypt(
             StatusCode::OK,
             Json(serde_json::json!({
                 "ok": true,
-                "payload": base64::engine::general_purpose::STANDARD.encode(&plaintext)
+                "payload": BASE64.encode(&plaintext)
             })),
         ),
         Err(e) => {
             tracing::error!("mls_decrypt failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "decryption failed" })),
-            )
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "decryption failed")
         }
     }
 }
@@ -16080,10 +15287,7 @@ async fn find_agent(
         ),
         Err(e) => {
             tracing::error!("find_agent failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "search failed" })),
-            )
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "search failed")
         }
     }
 }
@@ -16115,10 +15319,7 @@ async fn agent_reachability(
                 "addresses": info.addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>()
             })),
         ),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "agent not in discovery cache" })),
-        ),
+        None => not_found("agent not in discovery cache"),
     }
 }
 
@@ -16191,10 +15392,7 @@ async fn pin_machine(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid machine_id hex" })),
-            );
+            return bad_request("invalid machine_id hex");
         }
     };
     let machine_id = MachineId(machine_bytes);
@@ -16230,10 +15428,7 @@ async fn unpin_machine(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid machine_id hex" })),
-            );
+            return bad_request("invalid machine_id hex");
         }
     };
     let machine_id = MachineId(machine_bytes);
@@ -16269,10 +15464,7 @@ async fn evaluate_trust(
             arr
         }
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "invalid machine_id hex" })),
-            );
+            return bad_request("invalid machine_id hex");
         }
     };
     let machine_id = MachineId(machine_bytes);
@@ -16318,10 +15510,7 @@ async fn create_mls_welcome(
 
     let groups = state.mls_groups.read().await;
     let Some(group) = groups.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-        );
+        return not_found("group not found");
     };
 
     match x0x::mls::MlsWelcome::create(group, &invitee) {
@@ -16330,10 +15519,7 @@ async fn create_mls_welcome(
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("welcome serialization failed: {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({ "ok": false, "error": "serialization failed" })),
-                    );
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, "serialization failed");
                 }
             };
 
@@ -16341,7 +15527,7 @@ async fn create_mls_welcome(
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "ok": true,
-                    "welcome": base64::engine::general_purpose::STANDARD.encode(&welcome_bytes),
+                    "welcome": BASE64.encode(&welcome_bytes),
                     "group_id": id,
                     "epoch": welcome.epoch()
                 })),
@@ -16349,10 +15535,7 @@ async fn create_mls_welcome(
         }
         Err(e) => {
             tracing::error!("create_mls_welcome failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "welcome creation failed" })),
-            )
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "welcome creation failed")
         }
     }
 }
@@ -16531,11 +15714,9 @@ async fn apply_upgrade(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             Ok(m) => m.with_include_prereleases(state.update_config.include_prereleases),
             Err(e) => {
                 tracing::error!("upgrade monitor creation failed: {e}");
-                return (
+                return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        serde_json::json!({ "ok": false, "error": "upgrade monitor unavailable" }),
-                    ),
+                    "upgrade monitor unavailable",
                 );
             }
         };
@@ -16555,10 +15736,7 @@ async fn apply_upgrade(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         }
         Err(e) => {
             tracing::error!("upgrade check failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "upgrade check failed" })),
-            );
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "upgrade check failed");
         }
     };
 
@@ -16649,10 +15827,7 @@ async fn bootstrap_cache_stats(State(state): State<Arc<AppState>>) -> impl IntoR
                 })),
             )
         }
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
-        ),
+        None => api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized"),
     }
 }
 
@@ -16841,10 +16016,7 @@ where
 /// guarantee ant-quic is responsible for.
 async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(network) = state.agent.network() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
-        );
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized");
     };
 
     match network.node_status().await {
@@ -17032,20 +16204,14 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
             });
             (StatusCode::OK, Json(snapshot))
         }
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "node status unavailable" })),
-        ),
+        None => api_error(StatusCode::SERVICE_UNAVAILABLE, "node status unavailable"),
     }
 }
 
 /// GET /diagnostics/ack — ACK-v2 per-stage latency and outcome diagnostics.
 async fn ack_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(network) = state.agent.network() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
-        );
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized");
     };
 
     match network.ack_diagnostics().await {
@@ -17056,9 +16222,9 @@ async fn ack_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 "ack": snapshot,
             })),
         ),
-        None => (
+        None => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "ACK diagnostics unavailable" })),
+            "ACK diagnostics unavailable",
         ),
     }
 }
@@ -17090,9 +16256,9 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
                 })),
             )
         }
-        None => (
+        None => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "gossip runtime not initialized" })),
+            "gossip runtime not initialized",
         ),
     }
 }
@@ -17163,23 +16329,13 @@ async fn dm_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 /// Parse a hex `peer_id` path segment into an ant-quic `PeerId` (32 bytes).
 fn parse_peer_id(hex_str: &str) -> Result<ant_quic::PeerId, (StatusCode, Json<serde_json::Value>)> {
-    let bytes = hex::decode(hex_str).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("invalid hex peer_id: {e}")
-            })),
-        )
-    })?;
+    let bytes =
+        hex::decode(hex_str).map_err(|e| bad_request(format!("invalid hex peer_id: {e}")))?;
     if bytes.len() != 32 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("peer_id must be 32 bytes, got {}", bytes.len())
-            })),
-        ));
+        return Err(bad_request(format!(
+            "peer_id must be 32 bytes, got {}",
+            bytes.len()
+        )));
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
@@ -17209,10 +16365,7 @@ async fn probe_peer_handler(
         Err(e) => return e.into_response(),
     };
     let Some(network) = state.agent.network() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
-        )
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized")
             .into_response();
     };
     let timeout_ms = q.timeout_ms.unwrap_or(2_000).clamp(100, 30_000);
@@ -17229,19 +16382,14 @@ async fn probe_peer_handler(
             })),
         )
             .into_response(),
-        Some(Err(e)) => (
+        Some(Err(e)) => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("probe failed: {e}"),
-            })),
+            format!("probe failed: {e}"),
         )
-            .into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "network node not running" })),
-        )
-            .into_response(),
+        .into_response(),
+        None => {
+            api_error(StatusCode::SERVICE_UNAVAILABLE, "network node not running").into_response()
+        }
     }
 }
 
@@ -17267,10 +16415,7 @@ async fn peer_health_handler(
         Err(e) => return e.into_response(),
     };
     let Some(network) = state.agent.network() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
-        )
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized")
             .into_response();
     };
     match network.connection_health(peer_id).await {
@@ -17303,11 +16448,9 @@ async fn peer_health_handler(
             )
                 .into_response()
         }
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "network node not running" })),
-        )
-            .into_response(),
+        None => {
+            api_error(StatusCode::SERVICE_UNAVAILABLE, "network node not running").into_response()
+        }
     }
 }
 
@@ -17319,17 +16462,11 @@ async fn peer_health_handler(
 async fn peer_events_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
     let Some(network) = state.agent.network() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
-        )
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized")
             .into_response();
     };
     let Some(mut rx) = network.subscribe_all_peer_events().await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ok": false, "error": "network node not running" })),
-        )
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "network node not running")
             .into_response();
     };
     let mut shutdown_rx = state.shutdown_notify.subscribe();
@@ -17473,7 +16610,7 @@ async fn handle_ws_connection(
                 let out = WsOutbound::DirectMessage {
                     sender: hex::encode(msg.sender.as_bytes()),
                     machine_id: hex::encode(msg.machine_id.as_bytes()),
-                    payload: base64::engine::general_purpose::STANDARD.encode(&msg.payload),
+                    payload: BASE64.encode(&msg.payload),
                     received_at: msg.received_at,
                     verified: msg.verified,
                     trust_decision: msg.trust_decision.map(|d| d.to_string()),
@@ -17628,8 +16765,7 @@ async fn handle_ws_command(
                                     while let Some(msg) = gossip_sub.recv().await {
                                         let out = WsOutbound::Message {
                                             topic: topic_clone.clone(),
-                                            payload: base64::engine::general_purpose::STANDARD
-                                                .encode(&msg.payload),
+                                            payload: BASE64.encode(&msg.payload),
                                             origin: msg.sender.map(|s| hex::encode(s.as_bytes())),
                                         };
                                         let _ = btx.send(out);
@@ -18131,7 +17267,7 @@ async fn load_named_groups(
 async fn save_named_groups(state: &AppState) {
     let json = {
         let groups = state.named_groups.read().await;
-        serde_json::to_string_pretty(&*groups)
+        serde_json::to_string(&*groups)
     };
     match json {
         Ok(json) => {
@@ -18170,16 +17306,35 @@ async fn write_named_groups_json_atomic(path: &FsPath, json: &str) -> std::io::R
     write_result
 }
 
+/// Build a uniform `{ "ok": false, "error": <msg> }` JSON error response paired
+/// with the given status code. Used by handlers in place of hand-rolled literals.
+fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({ "ok": false, "error": msg.into() })),
+    )
+}
+
+/// `400 Bad Request` error response.
+fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    api_error(StatusCode::BAD_REQUEST, msg)
+}
+
+/// `404 Not Found` error response.
+fn not_found(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    api_error(StatusCode::NOT_FOUND, msg)
+}
+
+/// `403 Forbidden` error response.
+fn forbidden(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    api_error(StatusCode::FORBIDDEN, msg)
+}
+
 /// Decode a base64-encoded payload from a request field.
 fn decode_base64_payload(encoded: &str) -> Result<Vec<u8>, (StatusCode, Json<serde_json::Value>)> {
-    base64::engine::general_purpose::STANDARD
+    BASE64
         .decode(encoded)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": format!("invalid base64: {e}") })),
-            )
-        })
+        .map_err(|e| bad_request(format!("invalid base64: {e}")))
 }
 
 /// Derive an MLS cipher from a group's current key schedule.
@@ -18188,10 +17343,7 @@ fn make_mls_cipher(
 ) -> Result<(x0x::mls::MlsCipher, u64), (StatusCode, Json<serde_json::Value>)> {
     let key_schedule = x0x::mls::MlsKeySchedule::from_group(group).map_err(|e| {
         tracing::error!("MLS key derivation failed: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": "key derivation failed" })),
-        )
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "key derivation failed")
     })?;
     let cipher = x0x::mls::MlsCipher::new(
         key_schedule.encryption_key().to_vec(),
@@ -18996,7 +18148,7 @@ async fn stream_welcome_blob(
         let msg = WelcomeBlobMessage::Chunk {
             welcome_id: welcome_id.to_string(),
             sequence,
-            data: base64::engine::general_purpose::STANDARD.encode(chunk),
+            data: BASE64.encode(chunk),
         };
         if let Err(e) = send_welcome_blob_message(state, recipient, &msg).await {
             tracing::warn!(
@@ -19037,7 +18189,7 @@ async fn handle_welcome_blob_chunk(
     data: String,
 ) {
     let sender_hex = hex::encode(sender.as_bytes());
-    let decoded = match base64::engine::general_purpose::STANDARD.decode(data) {
+    let decoded = match BASE64.decode(data) {
         Ok(bytes) => bytes,
         Err(e) => {
             notify_welcome_waiters(
@@ -19419,7 +18571,7 @@ async fn stream_file_chunks(
             return;
         }
 
-        let chunk_data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+        let chunk_data = BASE64.encode(&buf[..n]);
         let chunk_msg = x0x::files::FileMessage::Chunk(x0x::files::FileChunk {
             transfer_id: transfer_id.to_string(),
             sequence,
@@ -19602,7 +18754,7 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
         }
     };
 
-    let data = match base64::engine::general_purpose::STANDARD.decode(&chunk.data) {
+    let data = match BASE64.decode(&chunk.data) {
         Ok(d) => d,
         Err(e) => {
             tracing::error!("Chunk decode error for {}: {e}", chunk.transfer_id);

@@ -1,6 +1,6 @@
 [package]
 name = "x0x"
-version = "0.22.1"
+version = "0.23.0"
 edition = "2021"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"

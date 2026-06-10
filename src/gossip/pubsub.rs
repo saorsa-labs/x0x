@@ -516,39 +516,7 @@ impl PubSubManager {
         // `local:` topics fan out to same-daemon subscribers only — the
         // payload never reaches PlumTree or any remote peer (issue #89).
         if is_local_topic(&topic) {
-            let message = PubSubMessage {
-                topic: topic.clone(),
-                payload,
-                sender: self.signing.as_ref().map(|ctx| ctx.agent_id),
-                sender_public_key: self
-                    .signing
-                    .as_ref()
-                    .map(|ctx| ctx.public_key_bytes.clone()),
-                // Local publishes come from a bearer-token-authenticated
-                // API caller on this daemon — trusted by construction.
-                verified: true,
-                trust_level: None,
-            };
-            let mut topics = self.local_topics.write().await;
-            if let Some(senders) = topics.get_mut(&topic) {
-                senders.retain(|tx| match tx.try_send(message.clone()) {
-                    Ok(()) => {
-                        self.stats
-                            .delivered_to_subscriber
-                            .fetch_add(1, Ordering::Relaxed);
-                        true
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        self.stats
-                            .slow_subscriber_dropped
-                            .fetch_add(1, Ordering::Relaxed);
-                        true
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => false,
-                });
-            }
-            self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return self.publish_local(topic, payload).await;
         }
 
         let encoded_result = if let Some(ref ctx) = self.signing {
@@ -590,6 +558,48 @@ impl PubSubManager {
                 )))
             }
         }
+    }
+
+    /// Fan out a `local:` publish to same-daemon subscribers only.
+    ///
+    /// The payload never reaches PlumTree or any remote peer (issue #89). The
+    /// `Full` vs `Closed` arms encode the slow-subscriber-drop behaviour:
+    /// `Full` keeps the subscriber (the message is dropped, not the queue),
+    /// `Closed` evicts it.
+    async fn publish_local(&self, topic: String, payload: Bytes) -> NetworkResult<()> {
+        let message = PubSubMessage {
+            topic: topic.clone(),
+            payload,
+            sender: self.signing.as_ref().map(|ctx| ctx.agent_id),
+            sender_public_key: self
+                .signing
+                .as_ref()
+                .map(|ctx| ctx.public_key_bytes.clone()),
+            // Local publishes come from a bearer-token-authenticated
+            // API caller on this daemon — trusted by construction.
+            verified: true,
+            trust_level: None,
+        };
+        let mut topics = self.local_topics.write().await;
+        if let Some(senders) = topics.get_mut(&topic) {
+            senders.retain(|tx| match tx.try_send(message.clone()) {
+                Ok(()) => {
+                    self.stats
+                        .delivered_to_subscriber
+                        .fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.stats
+                        .slow_subscriber_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            });
+        }
+        self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Handle an incoming message from a peer.
@@ -970,6 +980,32 @@ fn encode_v2(
     Ok(Bytes::from(buf))
 }
 
+/// Read a `u16_be` length-prefixed field at `*pos`, advancing the cursor past
+/// both the prefix and the field.
+///
+/// Returns a borrowed slice of the field bytes. `what` names the field so the
+/// per-field error diagnostics (`"Truncated <what> length"` / `"Truncated
+/// <what>"`) match the original hand-written checks. Performs the two bounds
+/// checks the v2 decoder relies on: that the length prefix is present, and
+/// that the buffer holds the full claimed field.
+fn take_lp<'a>(data: &'a [u8], pos: &mut usize, what: &str) -> NetworkResult<&'a [u8]> {
+    if data.len() < *pos + 2 {
+        return Err(NetworkError::SerializationError(format!(
+            "Truncated {what} length"
+        )));
+    }
+    let len = u16::from_be_bytes([data[*pos], data[*pos + 1]]) as usize;
+    *pos += 2;
+    if data.len() < *pos + len {
+        return Err(NetworkError::SerializationError(format!(
+            "Truncated {what}"
+        )));
+    }
+    let field = &data[*pos..*pos + len];
+    *pos += len;
+    Ok(field)
+}
+
 /// Decode a v2 (signed) message, verifying the ML-DSA-65 signature.
 fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
     // Minimum: 1 (version) + 32 (agent_id) + 2 (pk_len) + 2 (sig_len) + 2 (topic_len)
@@ -987,54 +1023,19 @@ fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
     let agent_id = AgentId(agent_id_bytes);
     pos += 32;
 
-    // Public key
-    if data.len() < pos + 2 {
-        return Err(NetworkError::SerializationError(
-            "Truncated pubkey length".to_string(),
-        ));
-    }
-    let pk_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-    pos += 2;
-    if data.len() < pos + pk_len {
-        return Err(NetworkError::SerializationError(
-            "Truncated public key".to_string(),
-        ));
-    }
-    let public_key_bytes = data[pos..pos + pk_len].to_vec();
-    pos += pk_len;
+    let public_key_bytes = take_lp(data, &mut pos, "public key").map_err(|e| match e {
+        NetworkError::SerializationError(msg) if msg == "Truncated public key length" => {
+            NetworkError::SerializationError("Truncated pubkey length".to_string())
+        }
+        other => other,
+    })?;
+    let public_key_bytes = public_key_bytes.to_vec();
 
-    // Signature
-    if data.len() < pos + 2 {
-        return Err(NetworkError::SerializationError(
-            "Truncated signature length".to_string(),
-        ));
-    }
-    let sig_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-    pos += 2;
-    if data.len() < pos + sig_len {
-        return Err(NetworkError::SerializationError(
-            "Truncated signature".to_string(),
-        ));
-    }
-    let signature_bytes = &data[pos..pos + sig_len];
-    pos += sig_len;
+    let signature_bytes = take_lp(data, &mut pos, "signature")?;
 
-    // Topic
-    if data.len() < pos + 2 {
-        return Err(NetworkError::SerializationError(
-            "Truncated topic length".to_string(),
-        ));
-    }
-    let topic_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-    pos += 2;
-    if data.len() < pos + topic_len {
-        return Err(NetworkError::SerializationError(
-            "Truncated topic".to_string(),
-        ));
-    }
-    let topic = String::from_utf8(data[pos..pos + topic_len].to_vec())
+    let topic_bytes = take_lp(data, &mut pos, "topic")?;
+    let topic = String::from_utf8(topic_bytes.to_vec())
         .map_err(|e| NetworkError::SerializationError(format!("Invalid UTF-8: {}", e)))?;
-    pos += topic_len;
 
     // Payload (remaining bytes)
     let payload = Bytes::copy_from_slice(&data[pos..]);
@@ -1454,6 +1455,120 @@ mod tests {
     fn test_v2_truncated_data() {
         // Just version byte + a few bytes — should fail
         assert!(decode_v2(&[VERSION_V2, 0, 0, 0]).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // V2 decode bounds-check tests (pin the `take_lp` extraction in finding #2)
+    // -----------------------------------------------------------------------
+
+    /// Produce a known-good encoded v2 buffer for slicing in the bounds tests.
+    fn valid_v2_buffer() -> Bytes {
+        let kp = AgentKeypair::generate().expect("keygen");
+        let ctx = SigningContext::from_keypair(&kp);
+        let topic = "bounds-check";
+        let payload = Bytes::from("payload bytes");
+        let signing_payload =
+            build_signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload);
+        let signature = ctx.sign(&signing_payload).expect("sign");
+        encode_v2(
+            &ctx.agent_id,
+            &ctx.public_key_bytes,
+            &signature,
+            topic,
+            &payload,
+        )
+        .expect("encode")
+    }
+
+    #[test]
+    fn test_v2_full_buffer_decodes_and_verifies() {
+        // Baseline: the unmodified buffer round-trips and verifies. This pins
+        // the happy path so the bounds tests below isolate truncation.
+        let buf = valid_v2_buffer();
+        let msg = decode_v2(&buf).expect("decode");
+        assert_eq!(msg.topic, "bounds-check");
+        assert_eq!(msg.payload, Bytes::from("payload bytes"));
+        assert!(msg.verified);
+    }
+
+    /// Byte offset where the trailing payload (the "remaining bytes" field)
+    /// begins in a v2 buffer. Truncations before this offset hit a length-
+    /// prefix bounds check; truncations at/after it just shorten the payload
+    /// and remain valid.
+    fn v2_payload_start(buf: &[u8]) -> usize {
+        let pk_len = u16::from_be_bytes([buf[33], buf[34]]) as usize;
+        let sig_len_pos = 35 + pk_len;
+        let sig_len = u16::from_be_bytes([buf[sig_len_pos], buf[sig_len_pos + 1]]) as usize;
+        let topic_len_pos = sig_len_pos + 2 + sig_len;
+        let topic_len = u16::from_be_bytes([buf[topic_len_pos], buf[topic_len_pos + 1]]) as usize;
+        topic_len_pos + 2 + topic_len
+    }
+
+    #[test]
+    fn test_v2_truncated_in_header_region_is_err() {
+        // Truncating anywhere inside the framed header (version → end of topic)
+        // must be rejected, never panic. This walks every length-prefix bounds
+        // check in decode_v2.
+        let buf = valid_v2_buffer();
+        let payload_start = v2_payload_start(&buf);
+        for cut in 1..payload_start {
+            assert!(
+                decode_v2(&buf[..cut]).is_err(),
+                "truncating to {cut} of {} bytes (payload_start={payload_start}) must be an error",
+                buf.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_v2_truncation_into_payload_region_still_decodes() {
+        // The payload is the trailing "remaining bytes" field with no length
+        // prefix, so cutting into it yields a shorter (still valid) payload.
+        // This pins the boundary that test_v2_truncated_in_header_region_is_err
+        // stops at.
+        let buf = valid_v2_buffer();
+        let payload_start = v2_payload_start(&buf);
+        for cut in payload_start..=buf.len() {
+            assert!(
+                decode_v2(&buf[..cut]).is_ok(),
+                "truncating to {cut} (>= payload_start {payload_start}) must still decode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v2_oversized_pubkey_len_is_err() {
+        // Overwrite the pubkey length prefix (bytes 33..35) with 0xFFFF so the
+        // claimed field overruns the buffer — must be a clean error.
+        let mut buf = valid_v2_buffer().to_vec();
+        buf[33] = 0xFF;
+        buf[34] = 0xFF;
+        assert!(decode_v2(&buf).is_err());
+    }
+
+    #[test]
+    fn test_v2_oversized_sig_len_is_err() {
+        // The signature length prefix sits right after the public key. Decode
+        // the real pubkey length to locate it, then poison it.
+        let mut buf = valid_v2_buffer().to_vec();
+        let pk_len = u16::from_be_bytes([buf[33], buf[34]]) as usize;
+        let sig_len_pos = 35 + pk_len;
+        buf[sig_len_pos] = 0xFF;
+        buf[sig_len_pos + 1] = 0xFF;
+        assert!(decode_v2(&buf).is_err());
+    }
+
+    #[test]
+    fn test_v2_oversized_topic_len_is_err() {
+        // The topic length prefix sits after pubkey and signature.
+        let mut buf = valid_v2_buffer().to_vec();
+        let pk_len = u16::from_be_bytes([buf[33], buf[34]]) as usize;
+        let sig_len_pos = 35 + pk_len;
+        let sig_len = u16::from_be_bytes([buf[sig_len_pos], buf[sig_len_pos + 1]]) as usize;
+        let topic_len_pos = sig_len_pos + 2 + sig_len;
+        buf[topic_len_pos] = 0xFF;
+        buf[topic_len_pos + 1] = 0xFF;
+        assert!(decode_v2(&buf).is_err());
     }
 
     // -----------------------------------------------------------------------
