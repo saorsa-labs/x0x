@@ -251,7 +251,11 @@ async fn upgrade_binary_manual(
 
 /// Discover the daemon API address from the port file, if running.
 fn discover_daemon_api() -> Option<String> {
-    let data_dir = dirs::data_dir()?;
+    discover_daemon_api_in(&dirs::data_dir()?)
+}
+
+/// Discover the daemon API address from `<data_dir>/x0x/api.port`.
+fn discover_daemon_api_in(data_dir: &std::path::Path) -> Option<String> {
     let port_file = data_dir.join("x0x").join("api.port");
     std::fs::read_to_string(port_file)
         .ok()
@@ -261,7 +265,15 @@ fn discover_daemon_api() -> Option<String> {
 
 /// Stop the daemon if it's running. Returns true if it was running.
 async fn stop_daemon_if_running() -> bool {
-    let addr = match discover_daemon_api() {
+    match dirs::data_dir() {
+        Some(data_dir) => stop_daemon_if_running_in(&data_dir).await,
+        None => false,
+    }
+}
+
+/// Stop the daemon whose port file lives under `data_dir`, if it's running.
+async fn stop_daemon_if_running_in(data_dir: &std::path::Path) -> bool {
+    let addr = match discover_daemon_api_in(data_dir) {
         Some(a) => a,
         None => return false,
     };
@@ -281,7 +293,7 @@ async fn stop_daemon_if_running() -> bool {
     }
 
     // Read the API token for authenticated shutdown
-    let token = read_api_token();
+    let token = read_api_token_in(data_dir);
 
     // Send shutdown
     let shutdown_url = format!("http://{addr}/shutdown");
@@ -302,9 +314,8 @@ async fn stop_daemon_if_running() -> bool {
     true
 }
 
-/// Read the API token from the daemon's token file.
-fn read_api_token() -> Option<String> {
-    let data_dir = dirs::data_dir()?;
+/// Read the API token from `<data_dir>/x0x/api.token`.
+fn read_api_token_in(data_dir: &std::path::Path) -> Option<String> {
     let token_file = data_dir.join("x0x").join("api.token");
     std::fs::read_to_string(token_file)
         .ok()
@@ -484,9 +495,10 @@ mod tests {
     }
 
     #[test]
-    fn discover_daemon_api_returns_none_in_test_env() {
-        // In a test environment without a running daemon, this should return None
-        let result = discover_daemon_api();
+    fn discover_daemon_api_returns_none_without_port_file() {
+        // An isolated data dir with no port file means no daemon to talk to
+        let dir = tempfile::tempdir().expect("temp dir");
+        let result = discover_daemon_api_in(dir.path());
         assert!(
             result.is_none(),
             "should return None without a running daemon"
@@ -494,13 +506,36 @@ mod tests {
     }
 
     #[test]
-    fn read_api_token_returns_none_in_test_env() {
-        // In a test environment without a configured token, this should return None
-        let result = read_api_token();
+    fn discover_daemon_api_reads_trimmed_port_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let x0x_dir = dir.path().join("x0x");
+        std::fs::create_dir_all(&x0x_dir).expect("create x0x dir");
+        std::fs::write(x0x_dir.join("api.port"), "127.0.0.1:12700\n").expect("write port file");
+
+        let result = discover_daemon_api_in(dir.path());
+        assert_eq!(result.as_deref(), Some("127.0.0.1:12700"));
+    }
+
+    #[test]
+    fn read_api_token_returns_none_without_token_file() {
+        // An isolated data dir with no token file means no configured token
+        let dir = tempfile::tempdir().expect("temp dir");
+        let result = read_api_token_in(dir.path());
         assert!(
             result.is_none(),
             "should return None without a configured token"
         );
+    }
+
+    #[test]
+    fn read_api_token_ignores_empty_token_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let x0x_dir = dir.path().join("x0x");
+        std::fs::create_dir_all(&x0x_dir).expect("create x0x dir");
+        std::fs::write(x0x_dir.join("api.token"), "  \n").expect("write token file");
+
+        let result = read_api_token_in(dir.path());
+        assert!(result.is_none(), "whitespace-only token must be ignored");
     }
 
     #[tokio::test]
@@ -534,6 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_daemon_if_running_returns_false_without_port_file() {
-        assert!(!stop_daemon_if_running().await);
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(!stop_daemon_if_running_in(dir.path()).await);
     }
 }
