@@ -265,7 +265,10 @@ fn shared_cache_dir() -> PathBuf {
 }
 
 fn default_log_level() -> String {
-    "info".to_string()
+    // Privacy by default for operators outside our fleet (issue #85): without
+    // an explicit RUST_LOG or config log_level override, x0xd logs warn/error
+    // only. Opt in to verbose logging with RUST_LOG=info.
+    "warn".to_string()
 }
 
 fn default_log_format() -> String {
@@ -788,6 +791,12 @@ struct AgentSignRequest {
     /// bytes verbatim — the caller is responsible for choosing a canonical
     /// serialization for any structured payload.
     payload_b64: String,
+    /// Optional domain-separation string. When present, the signature is
+    /// computed over `domain || 0x00 || payload` instead of the raw payload,
+    /// preventing cross-protocol signature replay (issue #90). Must not
+    /// contain NUL bytes.
+    #[serde(default)]
+    domain: Option<String>,
 }
 
 /// POST /announce request body.
@@ -4578,6 +4587,12 @@ async fn import_agent_card(
 /// envelope (≤1 KiB in practice) while still bounding worst-case work.
 const AGENT_SIGN_MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 
+/// Maximum length of the optional `domain` separation string, in bytes.
+/// Domain strings are protocol identifiers (`x0x.<purpose>.<version>`
+/// convention) — far shorter in practice; the cap keeps the canonical
+/// bytes bounded by AGENT_SIGN_MAX_PAYLOAD_BYTES + 1 KiB + 1.
+const AGENT_SIGN_MAX_DOMAIN_BYTES: usize = 1024;
+
 /// Stable scheme identifier returned by `POST /agent/sign`.
 const AGENT_SIGN_SCHEME_ID: &str = "x0x.agent-sign.v1.ml-dsa-65";
 
@@ -4599,9 +4614,14 @@ const AGENT_SIGN_SCHEME_ID: &str = "x0x.agent-sign.v1.ml-dsa-65";
 /// Payload. `payload_b64` is base64-decoded and signed verbatim. The
 /// caller is responsible for choosing a canonical serialization of any
 /// structured payload (e.g. `serde_canonical_json`, `postcard`, or an
-/// explicit field-order convention). Callers should also domain-separate
-/// payloads (for example, with an application/type/version prefix) so a
-/// signature produced for one protocol cannot be replayed as another.
+/// explicit field-order convention).
+///
+/// Domain separation. The optional `domain` field, when present, changes
+/// the signed bytes to `domain || 0x00 || payload` and is echoed back in
+/// the response, so a signature produced for one protocol cannot be
+/// replayed as another (`x0x.<purpose>.<version>` is the conventional
+/// shape for x0x's own protocols). When omitted, the raw payload is
+/// signed — unchanged pre-#90 behavior.
 ///
 /// Response. Returns the agent_id (hex, 32 bytes), the agent's public
 /// key (base64), the signature (base64), and the stable signing scheme
@@ -4647,12 +4667,57 @@ async fn agent_sign(
         );
     }
 
+    // Optional domain separation (issue #90): sign `domain || 0x00 || payload`
+    // so a signature issued for one protocol context cannot be replayed in
+    // another. The NUL separator is rejected inside the domain itself so the
+    // framing stays unambiguous.
+    let canonical = match req.domain.as_deref() {
+        Some(domain) => {
+            if domain.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "domain must be non-empty when provided",
+                    })),
+                );
+            }
+            if domain.as_bytes().contains(&0u8) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "domain must not contain NUL bytes",
+                    })),
+                );
+            }
+            if domain.len() > AGENT_SIGN_MAX_DOMAIN_BYTES {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!(
+                            "domain exceeds maximum length of {} bytes",
+                            AGENT_SIGN_MAX_DOMAIN_BYTES
+                        ),
+                    })),
+                );
+            }
+            let mut buf = Vec::with_capacity(domain.len() + 1 + payload.len());
+            buf.extend_from_slice(domain.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(&payload);
+            buf
+        }
+        None => payload,
+    };
+
     let identity = state.agent.identity();
     let keypair = identity.agent_keypair();
 
     let signature = match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
         keypair.secret_key(),
-        &payload,
+        &canonical,
     ) {
         Ok(sig) => sig,
         Err(e) => {
@@ -4671,16 +4736,20 @@ async fn agent_sign(
         base64::engine::general_purpose::STANDARD.encode(keypair.public_key().as_bytes());
     let agent_id_hex = hex::encode(state.agent.agent_id().as_bytes());
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "agent_id": agent_id_hex,
-            "public_key_b64": public_key_b64,
-            "signature_b64": signature_b64,
-            "algorithm": AGENT_SIGN_SCHEME_ID,
-        })),
-    )
+    let mut resp = serde_json::json!({
+        "ok": true,
+        "agent_id": agent_id_hex,
+        "public_key_b64": public_key_b64,
+        "signature_b64": signature_b64,
+        "algorithm": AGENT_SIGN_SCHEME_ID,
+    });
+    // Echo the domain back so a verifier knows the canonical-bytes shape
+    // (domain || 0x00 || payload) without out-of-band context.
+    if let Some(domain) = req.domain {
+        resp["domain"] = serde_json::Value::String(domain);
+    }
+
+    (StatusCode::OK, Json(resp))
 }
 
 /// GET /peers
@@ -18156,7 +18225,8 @@ fn init_logging(level: &str, format: &str) -> Result<()> {
     let fallback = level.to_lowercase();
     let fallback_directive = match fallback.as_str() {
         "trace" | "debug" | "info" | "warn" | "error" => fallback.as_str(),
-        _ => "info",
+        // Unknown values fall back to the privacy-preserving default (#85).
+        _ => "warn",
     };
 
     let (filter, source) = match std::env::var("RUST_LOG") {

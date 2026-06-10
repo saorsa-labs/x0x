@@ -129,12 +129,14 @@ pub async fn import_card(
 /// Reads bytes from `--file <PATH>` (or stdin when path is `-`) OR uses
 /// `--payload-b64 <BASE64>` directly, base64-encodes the bytes, and asks
 /// the daemon to produce a detached ML-DSA-65 signature. The daemon signs
-/// exact bytes; callers should canonicalize structured payloads and
-/// domain-separate them before signing.
+/// exact bytes; callers should canonicalize structured payloads. Pass
+/// `--domain <STRING>` to sign `domain || 0x00 || payload` for
+/// cross-protocol replay protection (issue #90).
 pub async fn sign(
     client: &DaemonClient,
     file: Option<&str>,
     payload_b64: Option<&str>,
+    domain: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
 
@@ -156,7 +158,10 @@ pub async fn sign(
         (None, None) => bail!("pass either --file <PATH> or --payload-b64 <BASE64>"),
     };
 
-    let body = serde_json::json!({ "payload_b64": payload_b64 });
+    let mut body = serde_json::json!({ "payload_b64": payload_b64 });
+    if let Some(domain) = domain {
+        body["domain"] = serde_json::Value::String(domain.to_string());
+    }
     let resp = client.post("/agent/sign", &body).await?;
     print_value(client.format(), &resp);
     Ok(())
@@ -344,7 +349,7 @@ mod tests {
         let mock_resp = serde_json::json!({"signature_b64": "c2ln"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
-        let result = sign(&client, None, Some("aGVsbG8=")).await;
+        let result = sign(&client, None, Some("aGVsbG8="), None).await;
         assert!(result.is_ok(), "sign should succeed: {:?}", result);
     }
 
@@ -356,7 +361,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("payload.txt");
         std::fs::write(&path, b"hello").unwrap();
-        let result = sign(&client, path.to_str(), None).await;
+        let result = sign(&client, path.to_str(), None, None).await;
         assert!(result.is_ok(), "sign file should succeed: {:?}", result);
     }
 
@@ -366,11 +371,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
 
-        let both = sign(&client, Some("-"), Some("aGVsbG8=")).await;
+        let both = sign(&client, Some("-"), Some("aGVsbG8="), None).await;
         assert!(both.is_err());
         assert!(both.unwrap_err().to_string().contains("pass either --file"));
 
-        let neither = sign(&client, None, None).await;
+        let neither = sign(&client, None, None, None).await;
         assert!(neither.is_err());
         assert!(neither
             .unwrap_err()

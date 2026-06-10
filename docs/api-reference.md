@@ -68,6 +68,7 @@ curl http://127.0.0.1:12700/status
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
 | GET | `/agent/card` | `x0x agent card` | Generate a shareable identity card |
 | POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts |
+| POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 
 ### Announce request body
 
@@ -85,6 +86,26 @@ Notes:
 ### Agent card query params
 
 `GET /agent/card?display_name=Alice&include_groups=true`
+
+### Sign request body
+
+```json
+{
+  "payload_b64": "<base64 bytes to sign>",
+  "domain": "my-protocol.v1.register"
+}
+```
+
+Notes:
+- `payload_b64` is decoded and signed verbatim (max 256 KiB). Callers
+  canonicalize structured payloads themselves.
+- `domain` is optional. When present, the daemon signs
+  `domain || 0x00 || payload` and echoes `domain` in the response, so a
+  signature for one protocol context cannot be replayed in another.
+  Domains must be non-empty, NUL-free, and at most 1024 bytes.
+  `x0x.<purpose>.<version>` is the conventional shape for x0x protocols.
+- Response: `ok`, `agent_id` (hex), `public_key_b64`, `signature_b64`,
+  `algorithm` (`x0x.agent-sign.v1.ml-dsa-65`), and `domain` when supplied.
 
 ## Network
 
