@@ -3727,15 +3727,17 @@ impl Agent {
                     // the full backoff window.
                     let lifecycle_hint = self.dm_lifecycle_hint(to).await;
                     dm_send::send_via_gossip(
-                        std::sync::Arc::clone(runtime.pubsub()),
-                        &signing,
-                        self.identity.agent_id(),
-                        self.identity.machine_id(),
+                        dm_send::DmSendContext {
+                            pubsub: std::sync::Arc::clone(runtime.pubsub()),
+                            signing: &signing,
+                            self_agent_id: self.identity.agent_id(),
+                            self_machine_id: self.identity.machine_id(),
+                            inflight: std::sync::Arc::clone(&self.dm_inflight_acks),
+                        },
                         *to,
                         &kem_pub,
                         payload,
                         &config,
-                        std::sync::Arc::clone(&self.dm_inflight_acks),
                         lifecycle_hint,
                     )
                     .await

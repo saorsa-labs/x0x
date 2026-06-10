@@ -64,7 +64,6 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 
 /// Stream type byte for direct messages (distinct from gossip: 0, 1, 2).
@@ -215,10 +214,7 @@ impl DirectMessage {
         verified: bool,
         trust_decision: Option<TrustDecision>,
     ) -> Self {
-        let received_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let received_at = crate::dm::now_unix_ms();
 
         Self {
             sender,
@@ -237,12 +233,7 @@ impl DirectMessage {
     }
 }
 
-fn now_unix_ms_lossy() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use crate::dm::now_unix_ms as now_unix_ms_lossy;
 
 fn direct_diagnostics_retain_limit(connected_len: usize) -> usize {
     DIRECT_DIAGNOSTICS_MIN_RETAIN.max(connected_len.saturating_mul(2))

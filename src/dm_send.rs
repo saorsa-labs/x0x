@@ -35,19 +35,40 @@ pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
 const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::from_millis(250);
 const ACK_LEGACY_BUS_FALLBACK_DELAY: Duration = Duration::from_millis(250);
 
-#[allow(clippy::too_many_arguments)]
+/// Stable per-sender context for [`send_via_gossip`].
+///
+/// Groups the identity/runtime handles that are constant for a given sending
+/// agent, separating them from the per-call message parameters. This keeps the
+/// two adjacent `AgentId`/`MachineId` self-identity fields off the call site's
+/// positional argument list, where they were easy to transpose.
+pub struct DmSendContext<'a> {
+    /// PlumTree pub/sub manager used to publish the envelope.
+    pub pubsub: Arc<PubSubManager>,
+    /// Sender signing context (ML-DSA-65).
+    pub signing: &'a SigningContext,
+    /// This agent's `AgentId`.
+    pub self_agent_id: AgentId,
+    /// This agent's `MachineId`.
+    pub self_machine_id: MachineId,
+    /// Shared in-flight ACK registry.
+    pub inflight: Arc<InFlightAcks>,
+}
+
 pub async fn send_via_gossip(
-    pubsub: Arc<PubSubManager>,
-    signing: &SigningContext,
-    self_agent_id: AgentId,
-    self_machine_id: MachineId,
+    ctx: DmSendContext<'_>,
     recipient_agent_id: AgentId,
     recipient_kem_public_key: &[u8],
     payload: Vec<u8>,
     config: &DmSendConfig,
-    inflight: Arc<InFlightAcks>,
     lifecycle_hint: Option<DmLifecycleHint>,
 ) -> Result<DmReceipt, DmError> {
+    let DmSendContext {
+        pubsub,
+        signing,
+        self_agent_id,
+        self_machine_id,
+        inflight,
+    } = ctx;
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(DmError::EnvelopeConstruction(format!(
             "payload exceeds MAX_PAYLOAD_BYTES ({} > {})",
