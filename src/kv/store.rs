@@ -303,13 +303,19 @@ impl KvStore {
 
     /// Get an entry by key.
     ///
-    /// `entries` and the active-key OR-Set are kept in lockstep by `put`,
-    /// `remove`, `merge`, and `merge_delta` (a tombstoned key is removed from
-    /// both), so a direct `entries` lookup already excludes inactive keys
-    /// without materializing and scanning the OR-Set on every read.
+    /// Gated on active-key membership so a tombstoned key never reads back.
+    /// `entries` is not a reliable proxy for the active set: `merge` applies a
+    /// remote OR-Set tombstone via `merge_state` without pruning `entries`, so
+    /// a key can linger in `entries` after it leaves the active set. We query
+    /// the OR-Set directly (an O(1) membership check) rather than materializing
+    /// and linearly scanning `elements()` as the previous implementation did.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&KvEntry> {
-        self.entries.get(key)
+        if self.keys.contains(&key.to_string()) {
+            self.entries.get(key)
+        } else {
+            None
+        }
     }
 
     /// Remove a key from the store.

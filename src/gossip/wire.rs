@@ -5,33 +5,39 @@
 //! options in one place means the on-wire format cannot silently fork between
 //! the two stacks.
 
+use bincode::Options;
 use saorsa_gossip_types::PeerId;
 use serde::{de::DeserializeOwned, Serialize};
 
+/// The single source of truth for the encoding of the `(PeerId, Delta)`
+/// envelope: fixint, trailing-byte tolerant. Both the encode and decode paths
+/// derive from this so the format cannot fork between them — the decode side
+/// additionally bounds the input size (see [`decode_delta`]). Fixint matches
+/// the legacy inline `bincode::serialize`, so existing peers and persisted
+/// payloads stay compatible.
+fn envelope_opts() -> impl Options {
+    bincode::options()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+}
+
 /// Serialize a `(sender, delta)` pair for publication on a CRDT sync topic.
-///
-/// Uses `bincode::serialize` (fixint encoding), matching the decode side in
-/// [`decode_delta`].
 pub(crate) fn encode_delta<D: Serialize>(
     sender: PeerId,
     delta: &D,
 ) -> Result<Vec<u8>, bincode::Error> {
-    bincode::serialize(&(sender, delta))
+    envelope_opts().serialize(&(sender, delta))
 }
 
 /// Decode a `(sender, delta)` pair received on a CRDT sync topic.
 ///
-/// Fixint encoding with a hard size limit, tolerating trailing bytes — the
-/// single definition of the inbound delta envelope shared by every CRDT sync
-/// loop.
+/// Adds a hard size limit on top of [`envelope_opts`] so an oversized inbound
+/// payload is rejected rather than allocated.
 pub(crate) fn decode_delta<D: DeserializeOwned>(
     payload: &[u8],
 ) -> Result<(PeerId, D), bincode::Error> {
-    use bincode::Options;
-    bincode::options()
-        .with_fixint_encoding()
+    envelope_opts()
         .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-        .allow_trailing_bytes()
         .deserialize::<(PeerId, D)>(payload)
 }
 

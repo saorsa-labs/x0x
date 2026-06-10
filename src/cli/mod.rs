@@ -283,38 +283,6 @@ impl DaemonClient {
         Ok(())
     }
 
-    /// Ensure the daemon is running, send a POST with a JSON body, and print.
-    pub async fn run_post<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<()> {
-        self.ensure_running().await?;
-        let resp = self.post(path, body).await?;
-        print_value(self.format, &resp);
-        Ok(())
-    }
-
-    /// Ensure the daemon is running, send a POST with no body, and print.
-    pub async fn run_post_empty(&self, path: &str) -> Result<()> {
-        self.ensure_running().await?;
-        let resp = self.post_empty(path).await?;
-        print_value(self.format, &resp);
-        Ok(())
-    }
-
-    /// Ensure the daemon is running, send a PATCH with a JSON body, and print.
-    pub async fn run_patch<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<()> {
-        self.ensure_running().await?;
-        let resp = self.patch(path, body).await?;
-        print_value(self.format, &resp);
-        Ok(())
-    }
-
-    /// Ensure the daemon is running, send a PUT with a JSON body, and print.
-    pub async fn run_put<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<()> {
-        self.ensure_running().await?;
-        let resp = self.put(path, body).await?;
-        print_value(self.format, &resp);
-        Ok(())
-    }
-
     /// Ensure the daemon is running, send a DELETE, and print the response.
     pub async fn run_delete(&self, path: &str) -> Result<()> {
         self.ensure_running().await?;
