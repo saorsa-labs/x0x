@@ -281,6 +281,11 @@ impl DaemonClient {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    /// Get the API bearer token, when one was discovered.
+    pub fn api_token(&self) -> Option<&str> {
+        self.api_token.as_deref()
+    }
 }
 
 /// Print a JSON value according to the output format.

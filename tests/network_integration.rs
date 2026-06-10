@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Integration tests for x0x agent network lifecycle.
 //!
 //! These tests verify the complete workflow of creating agents,

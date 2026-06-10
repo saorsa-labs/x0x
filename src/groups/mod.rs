@@ -22,6 +22,7 @@ pub mod request;
 pub mod state_commit;
 
 use crate::identity::{AgentId, AgentKeypair};
+use crate::mls::SecureGroupPlane;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -144,6 +145,14 @@ pub struct GroupInfo {
     /// Monotonic epoch for the shared secret. Incremented on rekey (ban/remove).
     #[serde(default)]
     pub secret_epoch: u64,
+    /// Which secure-group crypto plane this group runs on (ADR-0012).
+    /// Defaults to [`SecureGroupPlane::Gss`] when absent so every
+    /// already-persisted group — all created before TreeKEM existed — is
+    /// correctly grandfathered onto the legacy GSS plane. New `MlsEncrypted`
+    /// groups are created on [`SecureGroupPlane::TreeKem`] (set explicitly at
+    /// creation time, not by this default).
+    #[serde(default = "secure_plane_legacy_default")]
+    pub secure_plane: SecureGroupPlane,
 
     // ── Phase D.3: Stable identity + evolving validity ──────────────────
     /// Stable genesis record — establishes the group's permanent `group_id`.
@@ -199,6 +208,15 @@ pub struct GroupInfo {
     /// they wait for the inviter's authority-signed `MemberAdded` commit.
     #[serde(default)]
     pub issued_invites: HashMap<String, IssuedInviteRecord>,
+}
+
+/// Serde default for [`GroupInfo::secure_plane`]: groups persisted before the
+/// field existed were all created on the legacy GSS plane, so a missing field
+/// must deserialize to [`SecureGroupPlane::Gss`] (NOT the enum's own
+/// `TreeKem` default) to avoid silently relabelling a grandfathered group as
+/// FS/PCS-capable when it has no TreeKEM state.
+fn secure_plane_legacy_default() -> SecureGroupPlane {
+    SecureGroupPlane::Gss
 }
 
 impl GroupInfo {
@@ -294,6 +312,12 @@ impl GroupInfo {
             discovery_card_topic,
             shared_secret,
             secret_epoch: 0,
+            // Generic constructor stays on the legacy GSS plane (matching the
+            // shared_secret generated above). The secure-by-default TreeKEM
+            // routing is applied explicitly in the daemon's create-group path
+            // (ADR-0012 Phase 2), not here, so card-import stubs and other
+            // constructors are not silently relabelled.
+            secure_plane: SecureGroupPlane::Gss,
 
             genesis: Some(genesis),
             state_revision: 0,
@@ -699,6 +723,7 @@ impl GroupInfo {
                 added_by,
                 removed_by: None,
                 kem_public_key_b64,
+                treekem_key_package_b64: None,
             });
     }
 
@@ -708,6 +733,20 @@ impl GroupInfo {
     pub fn set_member_kem_public_key(&mut self, agent_id_hex: &str, kem_public_key_b64: String) {
         if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
             m.kem_public_key_b64 = Some(kem_public_key_b64);
+            m.updated_at = now_millis();
+        }
+    }
+
+    /// Record the TreeKEM KeyPackage that binds a roster member to a ratchet
+    /// tree leaf. Receivers use this before removal to avoid trusting a stale
+    /// best-effort `AgentId -> leaf` map.
+    pub fn set_member_treekem_key_package(
+        &mut self,
+        agent_id_hex: &str,
+        treekem_key_package_b64: String,
+    ) {
+        if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
+            m.treekem_key_package_b64 = Some(treekem_key_package_b64);
             m.updated_at = now_millis();
         }
     }
@@ -742,6 +781,7 @@ impl GroupInfo {
                 added_by: None,
                 removed_by: banned_by,
                 kem_public_key_b64: None,
+                treekem_key_package_b64: None,
             });
     }
 
@@ -1030,6 +1070,49 @@ mod tests {
         let count = info.members_v2.len();
         info.migrate_from_v1();
         assert_eq!(info.members_v2.len(), count);
+    }
+
+    #[test]
+    fn legacy_group_without_plane_field_grandfathers_to_gss() {
+        // ADR-0012: every group persisted before `secure_plane` existed was
+        // created on the GSS plane. A blob missing the field MUST load as Gss,
+        // never the enum's own TreeKem default — relabelling a grandfathered
+        // group as FS/PCS-capable when it has no TreeKEM state would be a lie.
+        let json = serde_json::json!({
+            "name": "Old",
+            "description": "",
+            "creator": vec![1u8; 32],
+            "created_at": 1000,
+            "mls_group_id": "aa".repeat(16),
+            "metadata_topic": "x0x.group.aa.meta",
+            "chat_topic_prefix": "x0x.group.aa.chat",
+            "shared_secret": vec![7u8; 32],
+            "secret_epoch": 3,
+        });
+        let info: GroupInfo = serde_json::from_value(json).expect("deserialize legacy blob");
+        assert_eq!(
+            info.secure_plane,
+            SecureGroupPlane::Gss,
+            "a group blob without secure_plane must grandfather to GSS"
+        );
+    }
+
+    #[test]
+    fn with_policy_constructor_stays_on_gss_plane() {
+        // The generic constructor must not flip groups to TreeKem — that
+        // decision is made explicitly in the daemon's create path so stubs and
+        // other callers are not silently relabelled (ADR-0012 Phase 2).
+        let info = GroupInfo::new("T".into(), "".into(), agent(1), "aa".repeat(16));
+        assert_eq!(info.secure_plane, SecureGroupPlane::Gss);
+    }
+
+    #[test]
+    fn secure_plane_survives_json_roundtrip() {
+        let mut info = GroupInfo::new("T".into(), "".into(), agent(1), "aa".repeat(16));
+        info.secure_plane = SecureGroupPlane::TreeKem;
+        let json = serde_json::to_string(&info).expect("serialize");
+        let restored: GroupInfo = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.secure_plane, SecureGroupPlane::TreeKem);
     }
 
     #[test]

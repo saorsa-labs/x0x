@@ -8,8 +8,11 @@
 //! metadata and is not currently enforced on the wire.
 
 use crate::groups::policy::GroupPolicy;
+use crate::groups::GroupMember;
 use crate::identity::AgentId;
+use crate::mls::SecureGroupPlane;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default invite expiry: 7 days in seconds.
@@ -42,6 +45,32 @@ pub struct SignedInvite {
     /// `GroupGenesis` payload, not just the same stable group id.
     #[serde(default)]
     pub genesis_creation_nonce: Option<String>,
+    /// Authority state revision at invite creation time. TreeKEM joiners seed
+    /// their stub from this so later signed membership commits validate against
+    /// the authority's actual state-chain frontier.
+    #[serde(default)]
+    pub base_state_revision: Option<u64>,
+    /// Authority state hash at invite creation time.
+    #[serde(default)]
+    pub base_state_hash: Option<String>,
+    /// Authority active roster snapshot at invite creation time. Needed because
+    /// state-hash validation commits to the roster root; a joiner stub with
+    /// only the owner cannot validate later membership commits.
+    #[serde(default)]
+    pub base_members_v2: Option<BTreeMap<String, GroupMember>>,
+    /// Authority previous state hash at invite creation time.
+    #[serde(default)]
+    pub base_prev_state_hash: Option<String>,
+    /// Secure-group crypto plane at invite creation time. Missing means legacy
+    /// pre-ADR-0012 invite; treat as GSS-compatible for backwards compatibility.
+    #[serde(default)]
+    pub secure_plane: Option<SecureGroupPlane>,
+    /// Authority's base secret epoch at invite creation time.
+    #[serde(default)]
+    pub base_secret_epoch: Option<u64>,
+    /// Authority's base security binding at invite creation time.
+    #[serde(default)]
+    pub base_security_binding: Option<String>,
     /// Agent ID of the inviter (hex-encoded).
     pub inviter: String,
     /// One-time invite secret (32 bytes, hex-encoded).
@@ -92,6 +121,13 @@ impl SignedInvite {
             group_description: None,
             policy: None,
             genesis_creation_nonce: None,
+            base_state_revision: None,
+            base_state_hash: None,
+            base_members_v2: None,
+            base_prev_state_hash: None,
+            secure_plane: None,
+            base_secret_epoch: None,
+            base_security_binding: None,
             inviter: hex::encode(inviter.as_bytes()),
             invite_secret: hex::encode(secret_bytes),
             created_at: now,
@@ -115,6 +151,27 @@ impl SignedInvite {
         data.extend_from_slice(&policy_json);
         data.extend_from_slice(
             self.genesis_creation_nonce
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        data.extend_from_slice(&self.base_state_revision.unwrap_or_default().to_le_bytes());
+        data.extend_from_slice(self.base_state_hash.as_deref().unwrap_or("").as_bytes());
+        let members_json = serde_json::to_vec(&self.base_members_v2).unwrap_or_default();
+        data.extend_from_slice(&members_json);
+        data.extend_from_slice(
+            self.base_prev_state_hash
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        if let Some(secure_plane) = self.secure_plane {
+            let secure_plane_json = serde_json::to_vec(&secure_plane).unwrap_or_default();
+            data.extend_from_slice(&secure_plane_json);
+        }
+        data.extend_from_slice(&self.base_secret_epoch.unwrap_or_default().to_le_bytes());
+        data.extend_from_slice(
+            self.base_security_binding
                 .as_deref()
                 .unwrap_or("")
                 .as_bytes(),
@@ -286,6 +343,11 @@ mod tests {
         invite.group_description = Some("desc".to_string());
         invite.policy = Some(GroupPolicy::default());
         invite.genesis_creation_nonce = Some("cc".repeat(32));
+        invite.base_state_revision = Some(7);
+        invite.base_state_hash = Some("state-7".to_string());
+        invite.base_members_v2 = Some(BTreeMap::new());
+        invite.base_prev_state_hash = Some("state-6".to_string());
+        invite.secure_plane = Some(SecureGroupPlane::TreeKem);
 
         let json = serde_json::to_string(&invite).expect("serialize metadata invite");
         let restored: SignedInvite =
@@ -298,5 +360,27 @@ mod tests {
             invite.genesis_creation_nonce,
             restored.genesis_creation_nonce
         );
+        assert_eq!(invite.base_state_revision, restored.base_state_revision);
+        assert_eq!(invite.base_state_hash, restored.base_state_hash);
+        assert_eq!(invite.base_members_v2, restored.base_members_v2);
+        assert_eq!(invite.base_prev_state_hash, restored.base_prev_state_hash);
+        assert_eq!(invite.secure_plane, restored.secure_plane);
+    }
+
+    #[test]
+    fn test_legacy_invite_missing_secure_plane_defaults_none() {
+        let json = serde_json::json!({
+            "group_id": "aabb".repeat(8),
+            "group_name": "Legacy",
+            "inviter": hex::encode(agent(1).as_bytes()),
+            "invite_secret": "11".repeat(32),
+            "created_at": 1,
+            "expires_at": 0,
+            "signature": ""
+        });
+        let restored: SignedInvite =
+            serde_json::from_value(json).expect("deserialize legacy invite");
+        assert_eq!(restored.secure_plane, None);
+        assert_ne!(restored.secure_plane, Some(SecureGroupPlane::TreeKem));
     }
 }

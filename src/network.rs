@@ -14,13 +14,13 @@
 //! Agents automatically connect to these bootstrap nodes
 //! unless overridden with `AgentBuilder::with_network_config`.
 //!
-//! Default bootstrap nodes:
-//! - `142.93.199.50:5483` - NYC, US (DigitalOcean)
-//! - `147.182.234.192:5483` - SFO, US (DigitalOcean)
-//! - `65.21.157.229:5483` - Helsinki, FI (Hetzner)
-//! - `116.203.101.172:5483` - Nuremberg, DE (Hetzner)
-//! - `152.42.210.67:5483` - Singapore, SG (DigitalOcean)
-//! - `170.64.176.102:5483` - Sydney, AU (DigitalOcean)
+//! Default bootstrap nodes (each reachable on UDP/443 *and* UDP/5483 — ADR-0011):
+//! - `142.93.199.50` - NYC, US (DigitalOcean)
+//! - `147.182.234.192` - SFO, US (DigitalOcean)
+//! - `65.21.157.229` - Helsinki, FI (Hetzner)
+//! - `116.203.101.172` - Nuremberg, DE (Hetzner)
+//! - `152.42.210.67` - Singapore, SG (DigitalOcean)
+//! - `170.64.176.102` - Sydney, AU (DigitalOcean)
 
 use crate::error::{NetworkError, NetworkResult};
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
@@ -114,7 +114,8 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// roles. They form a globally distributed mesh providing bootstrap, NAT traversal,
 /// and rendezvous services.
 ///
-/// All nodes bind to `[::]:5483` (dual-stack: accepts both IPv4 and IPv6).
+/// Each node runs two listeners (ADR-0011): a root instance on `[::]:443` and
+/// the original on `[::]:5483` (both dual-stack: accept IPv4 and IPv6).
 /// IPv6 addresses are included for nodes that have global IPv6 connectivity.
 ///
 /// Locations:
@@ -135,7 +136,42 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// shipped in ant-quic; rewiring `Endpoint::connect` is intentionally out of
 /// scope for X0X-0038 (per the SOTA-Borrow plan: "Don't yet rip out direct
 /// mDNS / bootstrap-cache callers in p2p_endpoint.rs").
+///
+/// ## Dual port: UDP/443 and UDP/5483 (ADR-0011)
+///
+/// Each bootstrap VPS runs **two** `x0xd` listeners: a dedicated root-run
+/// instance bound to UDP/443 *and* the original instance on UDP/5483. The
+/// `:443` entries are listed first because that destination port traverses
+/// full-tunnel VPNs (Cloudflare WARP), corporate/hotel/CGNAT, and mobile
+/// carrier networks that carry mainstream HTTP/3 (UDP/443) cleanly but
+/// throttle or drop arbitrary high UDP ports like 5483. Dialing a low
+/// *destination* port is unprivileged (ephemeral high source port), so
+/// clients never need elevation. Both ports are dialed in parallel
+/// (`BootstrapConnector::connect_multiple`); the `:5483` entries are retained
+/// for backward compatibility with pre-ADR-0011 clients and unrestricted
+/// networks. Identity is key-based, so the two listeners on a host are simply
+/// distinct seed hints (see [[0001-bootstrap-peers-are-seed-hints-only]]).
+///
+/// MTU caveat: UDP/443 mitigates port throttling/DPI but does not raise a
+/// path's MTU. A path that cannot carry QUIC's 1200-byte Initial cannot run
+/// QUIC on any port.
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
+    // ── UDP/443 (preferred; traverses WARP / full-tunnel VPN / CGNAT / DPI) ──
+    // IPv4
+    "142.93.199.50:443",   // NYC
+    "147.182.234.192:443", // SFO
+    "65.21.157.229:443",   // Helsinki
+    "116.203.101.172:443", // Nuremberg
+    "152.42.210.67:443",   // Singapore
+    "170.64.176.102:443",  // Sydney
+    // IPv6
+    "[2604:a880:400:d1:0:3:7db3:f001]:443", // NYC
+    "[2604:a880:4:1d0:0:1:6ba1:f000]:443",  // SFO
+    "[2a01:4f9:c012:684b::1]:443",          // Helsinki
+    "[2a01:4f8:1c1a:31e6::1]:443",          // Nuremberg
+    "[2400:6180:0:d2:0:2:d30b:d000]:443",   // Singapore
+    "[2400:6180:10:200::ba69:b000]:443",    // Sydney
+    // ── UDP/5483 (original; backward-compatible with pre-ADR-0011 clients) ──
     // IPv4
     "142.93.199.50:5483",   // NYC
     "147.182.234.192:5483", // SFO
@@ -451,6 +487,11 @@ pub struct RecvPumpStreamSnapshot {
     pub dequeued_total: u64,
     /// Frames dropped because the bounded receive queue was full.
     pub dropped_full: u64,
+    /// Recoverable control frames (IHAVE/IWANT/AntiEntropy) proactively shed
+    /// while the queue was near-full, to preserve data (EAGER) delivery
+    /// (ADR 0010). Distinct from `dropped_full`: an intentional, recoverable
+    /// shed, not a hard data loss.
+    pub shed_priority: u64,
     /// Frames dropped because the receive queue was closed.
     pub dropped_closed: u64,
     /// Most recently sampled queue depth.
@@ -497,6 +538,7 @@ struct RecvPumpStreamDiagnostics {
     enqueued_total: std::sync::atomic::AtomicU64,
     dequeued_total: std::sync::atomic::AtomicU64,
     dropped_full: std::sync::atomic::AtomicU64,
+    shed_priority: std::sync::atomic::AtomicU64,
     dropped_closed: std::sync::atomic::AtomicU64,
     latest_depth: std::sync::atomic::AtomicU64,
     max_depth: std::sync::atomic::AtomicU64,
@@ -520,6 +562,12 @@ impl RecvPumpStreamDiagnostics {
 
     fn record_dropped_full(&self, depth: usize, capacity: usize) {
         self.dropped_full
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.record_depth(depth, capacity);
+    }
+
+    fn record_shed_priority(&self, depth: usize, capacity: usize) {
+        self.shed_priority
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.record_depth(depth, capacity);
     }
@@ -577,6 +625,9 @@ impl RecvPumpStreamDiagnostics {
             enqueued_total,
             dequeued_total,
             dropped_full: self.dropped_full.load(std::sync::atomic::Ordering::Relaxed),
+            shed_priority: self
+                .shed_priority
+                .load(std::sync::atomic::Ordering::Relaxed),
             dropped_closed: self
                 .dropped_closed
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -693,6 +744,11 @@ impl RecvPumpDiagnostics {
         self.stream(stream_type)
             .record_dropped_full(depth, capacity);
         self.with_peer(peer_id, |peer| peer.dropped_full(stream_type));
+    }
+
+    fn record_shed_priority(&self, stream_type: GossipStreamType, depth: usize, capacity: usize) {
+        self.stream(stream_type)
+            .record_shed_priority(depth, capacity);
     }
 
     fn record_dropped_closed(&self, stream_type: GossipStreamType, depth: usize, capacity: usize) {
@@ -849,6 +905,29 @@ fn channel_pressure_exceeds_warn_threshold(available: usize, max: usize) -> bool
     available.saturating_mul(5) < max
 }
 
+/// True when the PubSub forward channel is more than 90% full, i.e.
+/// `available < max/10` (on the production 10k channel that is >9000 used; on
+/// small channels integer rounding makes it slightly stricter). Above this the
+/// recv pump proactively sheds recoverable control frames (IHAVE/IWANT/AntiEntropy)
+/// before they consume the last slots, preserving data (EAGER) delivery
+/// (ADR 0010). Refines ADR 0009's flat PubSub try_send/drop policy into a
+/// priority-aware shed; the kind-peek is gated on this threshold so the
+/// steady-state hot path pays no decode cost.
+fn channel_pressure_exceeds_shed_threshold(available: usize, max: usize) -> bool {
+    available.saturating_mul(10) < max
+}
+
+/// ADR 0010: PubSub frame kinds that are safe to shed under near-overload
+/// because they are recoverable by PlumTree's lazy-push recovery. EAGER (data)
+/// and tree-maintenance frames (Prune/Graft) are never shed here.
+fn is_pubsub_shed_eligible(kind: saorsa_gossip_types::MessageKind) -> bool {
+    use saorsa_gossip_types::MessageKind;
+    matches!(
+        kind,
+        MessageKind::IHave | MessageKind::IWant | MessageKind::AntiEntropy
+    )
+}
+
 fn channel_depth<T>(tx: &mpsc::Sender<T>) -> usize {
     tx.max_capacity().saturating_sub(tx.capacity())
 }
@@ -897,7 +976,7 @@ fn warn_forward_channel_pressure<T>(
             used,
             max,
             used_pct,
-            peer = ?peer_id,
+            peer = %crate::logging::LogTransportPeerId::from(&peer_id),
             stream = ?stream_type,
             channel = channel_name,
             "[1/6 network] receive forward channel >80% full — back-pressure active before ant-quic recv drain (rate-limited; see recv_pump.<stream>.{{producer_per_sec, consumer_per_sec, max_depth, dropped_full}} for steady-state)"
@@ -909,6 +988,10 @@ fn warn_forward_channel_pressure<T>(
 enum ForwardGossipOutcome {
     Enqueued,
     DroppedFull,
+    /// A recoverable PubSub control frame was proactively shed under
+    /// near-overload to preserve EAGER delivery (ADR 0010). Like
+    /// `DroppedFull`, the recv pump skips it; counted in `shed_priority`.
+    Shed,
 }
 
 async fn forward_gossip_payload(
@@ -929,6 +1012,33 @@ async fn forward_gossip_payload(
     };
 
     if stream_type == GossipStreamType::PubSub {
+        // ADR 0010: under near-overload (>90% full, available < max/10), proactively shed
+        // recoverable control frames (IHAVE/IWANT/AntiEntropy) so the last
+        // slots stay available for data (EAGER). The kind-peek is gated on the
+        // shed threshold, so the steady-state path keeps ADR 0009's flat
+        // try_send behavior with no decode cost.
+        if channel_pressure_exceeds_shed_threshold(tx.capacity(), max)
+            && saorsa_gossip_pubsub::peek_message_kind(&message.data)
+                .is_some_and(is_pubsub_shed_eligible)
+        {
+            let depth = channel_depth(tx);
+            diagnostics.record_shed_priority(stream_type, depth, max);
+            if channel_drop_warn_limiter().should_emit(
+                channel_pressure_key(channel_name, Some(stream_type)),
+                Instant::now(),
+                CHANNEL_PRESSURE_INFO_INTERVAL,
+            ) {
+                warn!(
+                    peer = %crate::logging::LogTransportPeerId::from(&peer_id),
+                    stream = ?stream_type,
+                    channel = channel_name,
+                    depth,
+                    max,
+                    "[1/6 network] shedding recoverable PubSub control frame (channel >90% full) to preserve EAGER delivery (ADR 0010; rate-limited; see recv_pump.pubsub.shed_priority)"
+                );
+            }
+            return Ok(ForwardGossipOutcome::Shed);
+        }
         return match tx.try_send(message) {
             Ok(()) => {
                 diagnostics.record_enqueued(stream_type, channel_depth(tx), max);
@@ -947,7 +1057,7 @@ async fn forward_gossip_payload(
                         .dropped_full
                         .load(std::sync::atomic::Ordering::Relaxed);
                     warn!(
-                        peer = ?peer_id,
+                        peer = %crate::logging::LogTransportPeerId::from(&peer_id),
                         stream = ?stream_type,
                         channel = channel_name,
                         depth,
@@ -1457,8 +1567,9 @@ impl NetworkNode {
     ) -> NetworkResult<()> {
         tracing::warn!(
             target: "x0x::connect",
-            peer_id_prefix = %hex_prefix(&peer_id.0, 4),
-            ?fallback_addr,
+            peer_id_prefix = %crate::logging::LogTransportPeerId::from(peer_id),
+            fallback_addr = ?fallback_addr
+                .map(|a| crate::logging::LogHexId::addr(&a.to_string()).to_string()),
             reason,
             "refreshing peer connection before send"
         );
@@ -1952,7 +2063,7 @@ impl NetworkNode {
                 tracing::warn!(
                     target: "x0x::connect",
                     strategy = "peer_with_addrs",
-                    peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                    peer_id_prefix = %crate::logging::LogTransportPeerId::from(&peer_id),
                     dur_ms,
                     "connected but transport type unsupported"
                 );
@@ -2162,7 +2273,7 @@ impl NetworkNode {
             .map_err(|e| NetworkError::ConnectionFailed(format!("send failed: {}", e)))?;
         self.note_connection_pool_activity(*peer_id).await;
 
-        info!(
+        debug!(
             "[1/6 network] send_direct: {} bytes to peer {:?}",
             payload.len(),
             peer_id
@@ -2295,7 +2406,7 @@ impl NetworkNode {
                                 continue;
                             }
 
-                            info!(
+                            debug!(
                                 "[1/6 network] recv direct: {} bytes from peer {:?}",
                                 payload.len(),
                                 peer_id
@@ -2320,7 +2431,7 @@ impl NetworkNode {
                         // Extract payload (everything after the type byte)
                         let payload = Bytes::copy_from_slice(&data[1..]);
 
-                        info!(
+                        debug!(
                             "[1/6 network] recv: {} bytes ({:?}) from peer {:?}",
                             data.len() - 1,
                             stream_type,
@@ -2365,7 +2476,9 @@ impl NetworkNode {
 
                         match forward_result {
                             Ok(ForwardGossipOutcome::Enqueued) => {}
-                            Ok(ForwardGossipOutcome::DroppedFull) => continue,
+                            Ok(ForwardGossipOutcome::DroppedFull | ForwardGossipOutcome::Shed) => {
+                                continue
+                            }
                             Err(e) => {
                                 error!("Failed to forward gossip message: {}", e);
                                 break;
@@ -2637,7 +2750,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         drop(node_guard);
         self.note_connection_pool_activity(ant_peer).await;
 
-        info!(
+        debug!(
             "[1/6 network] send: {} bytes ({:?}) to peer {:?}",
             buf.len(),
             stream_type,
@@ -2645,6 +2758,14 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         );
 
         Ok(())
+    }
+
+    async fn connected_peer_ids(&self) -> Vec<GossipPeerId> {
+        self.connected_peers()
+            .await
+            .into_iter()
+            .map(|peer| ant_to_gossip_peer_id(&peer))
+            .collect()
     }
 
     async fn receive_message(
@@ -2769,11 +2890,13 @@ mod tests {
 
         assert!(config.bind_addr.is_none());
 
-        // Verify default bootstrap nodes are included
+        // Verify default bootstrap nodes are included. ADR-0011: each of the 6
+        // VPS is seeded on both UDP/443 and UDP/5483, in IPv4 and IPv6 →
+        // 6 nodes × 2 ports × 2 families = 24 entries when IPv6 is available.
         assert_eq!(
             config.bootstrap_nodes.len(),
-            12,
-            "Should have 12 default bootstrap nodes (6 IPv4 + 6 IPv6)"
+            24,
+            "Should have 24 default bootstrap nodes (6 nodes × {{443,5483}} × {{IPv4,IPv6}})"
         );
 
         // Verify specific bootstrap addresses
@@ -3536,6 +3659,112 @@ mod pressure_tests {
         rx.recv().await.expect("first message");
         let snapshot = diagnostics.snapshot();
         assert_eq!(snapshot.bulk.dropped_full, 0);
+    }
+
+    #[tokio::test]
+    async fn recv_pump_pubsub_sheds_control_under_near_full_but_preserves_eager() {
+        // ADR 0010: when the PubSub channel is near-full (>90%, available < max/10), recoverable
+        // control frames (IHAVE/IWANT/AntiEntropy) are shed so the last slots
+        // stay available for data (EAGER). EAGER is never silently shed — when
+        // the channel is truly full it hard-drops (dropped_full) as ADR 0009
+        // already specified. WHY it matters: preserving EAGER under bursts
+        // keeps payload delivery flowing while sacrificing only frames that
+        // PlumTree can recover via IHAVE/IWANT.
+        use saorsa_gossip_pubsub::GossipMessage;
+        use saorsa_gossip_types::{MessageHeader, MessageKind, TopicId};
+
+        fn frame(kind: MessageKind) -> Bytes {
+            let msg = GossipMessage {
+                header: MessageHeader {
+                    version: 1,
+                    topic: TopicId::new([0u8; 32]),
+                    msg_id: [0u8; 32],
+                    kind,
+                    hop: 0,
+                    ttl: 10,
+                },
+                payload: None,
+                signature: Vec::new(),
+                public_key: Vec::new(),
+            };
+            postcard::to_stdvec(&msg).expect("frame serializes").into()
+        }
+
+        // Capacity 20: the shed threshold (available*10 < max) activates at
+        // available <= 1, so 19/20 full still leaves one slot to prove the
+        // control frame is shed while EAGER claims that slot.
+        let (tx, _rx) = mpsc::channel::<GossipPayload>(20);
+        let diagnostics = RecvPumpDiagnostics::new();
+        let peer = ant_quic::PeerId([11; 32]);
+
+        for _ in 0..19 {
+            tx.try_send(GossipPayload {
+                peer_id: peer,
+                data: Bytes::from_static(b"x"),
+                enqueued_at: Instant::now(),
+            })
+            .expect("prefill should fit");
+        }
+        assert_eq!(tx.capacity(), 1, "channel should have one free slot");
+
+        // IHAVE (recoverable control) is shed; the free slot is preserved.
+        let ihave = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            frame(MessageKind::IHave),
+            "recv_pubsub_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ihave, ForwardGossipOutcome::Shed);
+        assert_eq!(
+            tx.capacity(),
+            1,
+            "shedding a control frame must not consume the preserved slot"
+        );
+
+        // EAGER (data) is NOT shed: it claims the preserved slot.
+        let eager = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            frame(MessageKind::Eager),
+            "recv_pubsub_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(eager, ForwardGossipOutcome::Enqueued);
+        assert_eq!(tx.capacity(), 0, "EAGER must claim the preserved slot");
+
+        // Channel now full: EAGER hard-drops (dropped_full), never silently shed.
+        let eager_full = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            frame(MessageKind::Eager),
+            "recv_pubsub_tx",
+            &diagnostics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(eager_full, ForwardGossipOutcome::DroppedFull);
+
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(
+            snapshot.pubsub.shed_priority, 1,
+            "exactly one recoverable control frame shed"
+        );
+        assert_eq!(
+            snapshot.pubsub.dropped_full, 1,
+            "EAGER hard-dropped exactly once when the channel was full"
+        );
+        assert_eq!(
+            snapshot.pubsub.enqueued_total, 1,
+            "exactly one EAGER enqueued into the preserved slot"
+        );
     }
 
     #[tokio::test]

@@ -16,9 +16,9 @@
 //! x0xd --list                           # list running instances
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,9 +26,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use base64::Engine;
@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tokio::signal;
-use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 #[cfg(feature = "profile-heap")]
 #[global_allocator]
@@ -59,6 +59,7 @@ pub static MALLOC_CONF: &[u8] =
 use x0x::contacts::{ContactStore, IdentityType, MachineRecord, TrustLevel};
 use x0x::identity::AgentId;
 use x0x::identity::MachineId;
+use x0x::logging::LogHexId;
 use x0x::network::NetworkConfig;
 use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
@@ -213,6 +214,17 @@ struct DaemonConfig {
 pub const DEFAULT_QUIC_PORT: u16 = 5483;
 
 const GROUP_BACKGROUND_PUBLISH_DELAY: Duration = Duration::from_secs(8);
+const NAMED_GROUP_METADATA_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+const TREEKEM_PENDING_EVENTS_PER_GROUP_CAP: usize = 64;
+const TREEKEM_EVENT_LOG_PER_GROUP_CAP: usize = 128;
+// TreeKEM MemberAdded events carry signed state commits plus commit/welcome
+// references and are ~35-40 KiB each on the wire. Two events in one catch-up
+// response exceed the direct-message payload cap, so paginate one event at a
+// time and rely on the existing `truncated` next-page loop.
+const TREEKEM_CATCHUP_RESPONSE_EVENT_CAP: usize = 1;
+const TREEKEM_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
+const DM_INBOX_START_MAX_ATTEMPTS: u32 = 120;
+const DM_INBOX_START_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 fn default_bootstrap_peers() -> Vec<SocketAddr> {
     x0x::network::DEFAULT_BOOTSTRAP_PEERS
@@ -254,7 +266,10 @@ fn shared_cache_dir() -> PathBuf {
 }
 
 fn default_log_level() -> String {
-    "info".to_string()
+    // Privacy by default for operators outside our fleet (issue #85): without
+    // an explicit RUST_LOG or config log_level override, x0xd logs warn/error
+    // only. Opt in to verbose logging with RUST_LOG=info.
+    "warn".to_string()
 }
 
 fn default_log_format() -> String {
@@ -391,10 +406,23 @@ struct SseEvent {
     data: serde_json::Value,
 }
 
+type WelcomeFetchWaiter = oneshot::Sender<std::result::Result<Vec<u8>, String>>;
+
+/// A live REST `/subscribe` stream tracked so `DELETE /subscribe/:id` can stop it.
+struct RestSubscription {
+    /// Topic the subscription is for (retained for diagnostics/logging).
+    topic: String,
+    /// Forwarder task draining the gossip subscription into the SSE broadcast.
+    /// Aborting it drops the underlying `Subscription`, which releases the
+    /// gossip topic ref-count and ends delivery — without this, an
+    /// unsubscribed stream would keep forwarding messages to SSE forever.
+    forwarder: tokio::task::JoinHandle<()>,
+}
+
 /// Shared state accessible from all route handlers.
 struct AppState {
     agent: Arc<Agent>,
-    subscriptions: RwLock<HashMap<String, String>>,
+    subscriptions: RwLock<HashMap<String, RestSubscription>>,
     task_lists: RwLock<HashMap<String, TaskListHandle>>,
     kv_stores: RwLock<HashMap<String, KvStoreHandle>>,
     named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
@@ -431,6 +459,45 @@ struct AppState {
     mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
     #[allow(dead_code)]
     mls_groups_path: PathBuf,
+    /// Authority-signed MemberAdded results staged by an anchor for joiner polling.
+    pending_join_results: RwLock<HashMap<String, PendingJoinResult>>,
+    /// TreeKEM Welcome blobs staged by an anchor for pull-based delivery.
+    pending_welcomes: RwLock<HashMap<String, PendingWelcome>>,
+    /// In-progress pulled TreeKEM Welcome blob receives, keyed by blake3 id.
+    pending_welcome_receives: RwLock<HashMap<String, PendingWelcomeReceive>>,
+    /// Waiters blocked on a Welcome blob receive completing.
+    pending_welcome_waiters: RwLock<HashMap<String, Vec<WelcomeFetchWaiter>>>,
+    /// Per-active Welcome blob transfer ack slots.
+    pending_welcome_acks: RwLock<HashMap<String, Arc<FileChunkAckSlot>>>,
+    /// Bounded per-group queue for verified TreeKEM membership events that
+    /// arrived before local TreeKEM readiness or ahead of our state frontier.
+    treekem_pending_events: RwLock<HashMap<String, VecDeque<PendingTreeKemMetadataEvent>>>,
+    /// Bounded per-group log of locally authored/applied TreeKEM membership
+    /// events used to satisfy explicit catch-up requests.
+    treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,
+    /// Anti-spam throttle for outbound catch-up requests.
+    treekem_catchup_throttle: RwLock<HashMap<String, Instant>>,
+    /// Per-group serialization for authoritative membership mutations. The
+    /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
+    /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates
+    /// the live MLS tree, then commits the roster — across several locks, not
+    /// one. The gossip metadata listener and the direct-channel listener call
+    /// `apply_named_group_metadata_event` for the same group concurrently, so
+    /// without serialization two stale clones can both pass the
+    /// `has_active_member` check, both consume the bearer invite, and double-add
+    /// to the MLS tree (the second add fails "already a member") while the
+    /// roster is clobbered or never committed — leaving tree and roster
+    /// permanently diverged. This per-group mutex serializes those applies so
+    /// the second observes the committed add and cleanly no-ops.
+    group_membership_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    /// Live real-TreeKEM groups (ADR-0012), keyed by group-id hex. Each is
+    /// wrapped in its own async mutex so a group's encrypt/decrypt/commit op
+    /// and the snapshot-persist that follows it are serialized per group
+    /// without blocking other groups (and without holding the map lock across
+    /// disk IO). Snapshots persist under [`Self::treekem_dir`].
+    treekem_groups: RwLock<HashMap<String, Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>>>,
+    /// Directory holding `<group_id>.snap` TreeKEM snapshots (mode 0600).
+    treekem_dir: PathBuf,
     /// Active WebSocket sessions.
     ws_sessions: RwLock<HashMap<String, WsSession>>,
     /// Shared WS topic state (single lock for channel + subscribers + forwarder per topic).
@@ -459,6 +526,8 @@ struct AppState {
     shutdown_notify: watch::Sender<bool>,
     /// Update configuration honored by manual API-triggered update checks.
     update_config: DaemonUpdateConfig,
+    /// Cached `/upgrade` response so polling clients cannot hammer GitHub.
+    upgrade_check_cache: Mutex<Option<CachedUpgradeCheck>>,
     /// Serializes all destructive binary replacement attempts.
     upgrade_apply_lock: Arc<Mutex<()>>,
     /// API bearer token for authenticating local clients.
@@ -473,6 +542,17 @@ struct AppState {
 /// is populated from untrusted discovery surfaces, so it must not grow without
 /// bound even if every incoming card is syntactically valid.
 const GROUP_CARD_CACHE_CAP: usize = 8_192;
+
+const UPGRADE_CHECK_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const UPGRADE_CHECK_ERROR_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Clone)]
+struct CachedUpgradeCheck {
+    checked_at: Instant,
+    status: StatusCode,
+    body: serde_json::Value,
+    ttl: Duration,
+}
 
 fn group_card_expiry_millis(card: &x0x::groups::GroupCard) -> u64 {
     if card.expires_at > card.issued_at {
@@ -622,8 +702,8 @@ struct WsSession {
     subscribed_topics: HashSet<String>,
     /// Whether this session receives direct messages.
     receives_direct: bool,
-    /// Handles for spawned per-session forwarder tasks (aborted on cleanup).
-    forwarder_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Per-topic forwarder tasks for this session (aborted on unsubscribe/cleanup).
+    topic_forwarders: HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 /// Shared state for a single gossip topic subscription shared across WS sessions.
@@ -712,6 +792,12 @@ struct AgentSignRequest {
     /// bytes verbatim — the caller is responsible for choosing a canonical
     /// serialization for any structured payload.
     payload_b64: String,
+    /// Optional domain-separation string. When present, the signature is
+    /// computed over `domain || 0x00 || payload` instead of the raw payload,
+    /// preventing cross-protocol signature replay (issue #90). Must not
+    /// contain NUL bytes.
+    #[serde(default)]
+    domain: Option<String>,
 }
 
 /// POST /announce request body.
@@ -920,6 +1006,11 @@ struct DirectSendRequest {
     /// gossip DM capability.
     #[serde(default)]
     require_gossip: bool,
+    /// If set, override whether gossip-inbox sends wait for the recipient's
+    /// inbox ACK before returning success. When omitted, the daemon default is
+    /// used.
+    #[serde(default)]
+    require_gossip_ack: Option<bool>,
     /// Optional opt-in: after the DM path accepts the message, probe the
     /// recipient's ant-quic receive pipeline for liveness with this timeout.
     /// This does not force the message itself onto raw-QUIC receive-ACK.
@@ -1098,6 +1189,7 @@ async fn main() -> Result<()> {
         println!("    --name <NAME>                   Instance name for multi-instance support");
         println!("    --api-port <PORT>               Override API server port");
         println!("    --no-hard-coded-bootstrap       Skip configured bootstrap peers");
+        println!("    --disable-peer-cache            Do not load or save cached peers");
         println!("    --exec-acl <PATH>               Override default exec ACL path");
         println!("    --check                         Check configuration and exit");
         println!("    --check-updates       Check for updates and exit");
@@ -1149,6 +1241,7 @@ async fn main() -> Result<()> {
     // where operator policy forbids unsolicited router port mappings. This
     // overrides the daemon config's `port_mapping_enabled` field.
     let cli_no_port_mapping = args.contains(&"--no-port-mapping".to_string());
+    let cli_disable_peer_cache = args.contains(&"--disable-peer-cache".to_string());
 
     // Parse --api-port for overriding the API server port
     let api_port_override = if let Some(idx) = args.iter().position(|a| a == "--api-port") {
@@ -1363,7 +1456,7 @@ async fn main() -> Result<()> {
         max_connections: 50,
         connection_timeout: std::time::Duration::from_secs(30),
         stats_interval: std::time::Duration::from_secs(60),
-        peer_cache_path: Some(cache_dir.join("peers.cache")),
+        peer_cache_path: (!cli_disable_peer_cache).then(|| cache_dir.join("peers.cache")),
         pinned_bootstrap_peers: std::collections::HashSet::new(),
         inbound_allowlist: std::collections::HashSet::new(),
         max_peers_per_ip: 3,
@@ -1389,6 +1482,10 @@ async fn main() -> Result<()> {
     }
     if let Some(secs) = config.presence_offline_timeout_secs {
         builder = builder.with_presence_offline_timeout(secs);
+    }
+    if cli_disable_peer_cache {
+        tracing::info!("Peer cache disabled by --disable-peer-cache");
+        builder = builder.with_peer_cache_disabled();
     }
 
     // NOTE: --no-hard-coded-bootstrap only clears configured seed peers.
@@ -1430,29 +1527,17 @@ async fn main() -> Result<()> {
 
     // Load named groups from disk (if any)
     let named_groups_path = config.data_dir.join("named_groups.json");
-    let named_groups = match tokio::fs::read_to_string(&named_groups_path).await {
-        Ok(json) => match serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&json) {
-            Ok(mut groups) => {
-                for info in groups.values_mut() {
-                    info.migrate_from_v1();
-                }
-                tracing::info!(
-                    "Loaded {} named groups from {}",
-                    groups.len(),
-                    named_groups_path.display()
-                );
-                groups
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse named groups file, starting fresh: {e}");
-                HashMap::new()
-            }
-        },
-        Err(_) => {
-            tracing::info!("No named groups file found, starting fresh");
-            HashMap::new()
-        }
-    };
+    let treekem_dir = config.data_dir.join("treekem");
+    if let Err(e) = tokio::fs::create_dir_all(&treekem_dir).await {
+        tracing::warn!(
+            "failed to create TreeKEM snapshot dir {}: {e}",
+            treekem_dir.display()
+        );
+    }
+    recover_treekem_named_journals(&named_groups_path, &treekem_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to recover TreeKEM persistence journal: {e}"))?;
+    let named_groups = load_named_groups(&named_groups_path).await?;
 
     // Load or generate API bearer token for local authentication.
     let api_token = load_or_generate_api_token(&config.data_dir).await?;
@@ -1487,7 +1572,18 @@ async fn main() -> Result<()> {
     let (shutdown_notify, _) = watch::channel(false);
     let agent = Arc::new(agent);
     let (exec_dm_tx, exec_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
+    let (group_public_dm_tx, mut group_public_dm_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
+    let (kv_store_delta_dm_tx, mut kv_store_delta_dm_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
+
+    // ADR-0012 Phase 4: restore live TreeKEM groups from on-disk snapshots.
+    // Must happen before the AppState is built so secure endpoints see the
+    // groups immediately. Done with `named_groups` still owned (it is moved
+    // into the RwLock below).
+    let treekem_groups = restore_treekem_groups(&named_groups, agent.as_ref(), &treekem_dir).await;
+
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
         subscriptions: RwLock::new(HashMap::new()),
@@ -1513,6 +1609,17 @@ async fn main() -> Result<()> {
         contacts,
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
+        pending_join_results: RwLock::new(HashMap::new()),
+        pending_welcomes: RwLock::new(HashMap::new()),
+        pending_welcome_receives: RwLock::new(HashMap::new()),
+        pending_welcome_waiters: RwLock::new(HashMap::new()),
+        pending_welcome_acks: RwLock::new(HashMap::new()),
+        treekem_pending_events: RwLock::new(HashMap::new()),
+        treekem_event_log: RwLock::new(HashMap::new()),
+        treekem_catchup_throttle: RwLock::new(HashMap::new()),
+        group_membership_locks: RwLock::new(HashMap::new()),
+        treekem_groups: RwLock::new(treekem_groups),
+        treekem_dir,
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         api_address: actual_api_addr,
@@ -1526,6 +1633,7 @@ async fn main() -> Result<()> {
         shutdown_tx,
         shutdown_notify,
         update_config: config.update.clone(),
+        upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         api_token,
         exec_service: Arc::clone(&exec_service),
@@ -1601,22 +1709,30 @@ async fn main() -> Result<()> {
 
     // Join network in background — API is available immediately
     let join_agent = Arc::clone(&agent);
-    let join_kem = Arc::clone(&agent_kem_keypair);
-    let join_exec_route_tx = exec_dm_tx.clone();
     let rendezvous_enabled = config.rendezvous_enabled;
     let rendezvous_validity_ms = config.rendezvous_validity_ms;
+
+    // Start the DM inbox as soon as join_network has created the gossip
+    // runtime. join_network may keep working through slow bootstrap/cache
+    // peers for a long time; the daemon must still be able to receive gossip
+    // DMs once `/agent/card` advertises a KEM key.
+    let dm_inbox_agent = Arc::clone(&agent);
+    let dm_inbox_kem = Arc::clone(&agent_kem_keypair);
+    let dm_inbox_exec_route_tx = exec_dm_tx.clone();
+    let dm_inbox_group_public_route_tx = group_public_dm_tx.clone();
+    let dm_inbox_kv_store_delta_route_tx = kv_store_delta_dm_tx.clone();
+    tokio::spawn(start_dm_inbox_when_gossip_ready(
+        dm_inbox_agent,
+        dm_inbox_kem,
+        dm_inbox_exec_route_tx,
+        dm_inbox_group_public_route_tx,
+        dm_inbox_kv_store_delta_route_tx,
+    ));
+
     tokio::spawn(async move {
         match join_agent.join_network().await {
             Ok(()) => {
                 tracing::info!("Network joined");
-                // Start the DM inbox service now that the KEM keypair is
-                // loaded. This upgrades the capability advert so peers
-                // learn about gossip DM support within seconds.
-                let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
-                    .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, join_exec_route_tx);
-                if let Err(e) = join_agent.start_dm_inbox(join_kem, dm_inbox_config).await {
-                    tracing::warn!("Failed to start DM inbox service: {e}");
-                }
                 if rendezvous_enabled {
                     if let Err(e) = join_agent.advertise_identity(rendezvous_validity_ms).await {
                         tracing::warn!("Initial rendezvous advertisement failed: {e}");
@@ -1633,6 +1749,28 @@ async fn main() -> Result<()> {
 
     let self_published_release_manifests =
         Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+
+    // Reclaim upgrade debris left by previous failed/interrupted attempts:
+    // orphaned `.x0x-upgrade-*` temp dirs and `*.x0xold-*` sidelined binaries.
+    // Runs unconditionally (cheap one-shot dir scan) so a machine that hit the
+    // old disk-fill loop is cleaned up even if updates are now disabled.
+    tokio::spawn(async {
+        let removed = tokio::task::spawn_blocking(|| {
+            let exe = x0x::upgrade::apply::current_binary_path().ok()?;
+            let dir = exe.parent()?.to_path_buf();
+            Some(x0x::upgrade::sweep_stale_upgrade_artifacts(
+                &dir,
+                Duration::from_secs(3600),
+            ))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        if removed > 0 {
+            tracing::info!(removed, "Reclaimed stale upgrade artifacts at startup");
+        }
+    });
 
     // Gossip-based release subscription (primary update mechanism)
     if config.update.enabled && config.update.gossip_updates {
@@ -1768,6 +1906,182 @@ async fn main() -> Result<()> {
                     continue; // not a file message
                 };
                 handle_file_message(&file_state, &msg.sender, file_msg).await;
+            }
+        });
+    }
+
+    // Background join-result listener — joiner-initiated recovery path for
+    // fresh TreeKEM members that miss the anchor's opportunistic MemberAdded push.
+    {
+        let join_result_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut rx = join_result_state.agent.subscribe_direct();
+            loop {
+                let Some(msg) = rx.recv().await else { break };
+                let Ok(join_msg) = serde_json::from_slice::<JoinResultMessage>(&msg.payload) else {
+                    continue;
+                };
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "direct_classified_join_result",
+                    sender = %hex::encode(msg.sender.as_bytes()),
+                    len = msg.payload.len(),
+                    verified = msg.verified,
+                );
+                handle_join_result_message(&join_result_state, &msg.sender, join_msg).await;
+            }
+        });
+    }
+
+    // Background TreeKEM Welcome blob listener — pull-based bulk delivery for
+    // oversized Welcome payloads referenced by named-group metadata events.
+    {
+        let welcome_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut rx = welcome_state.agent.subscribe_direct();
+            loop {
+                let Some(msg) = rx.recv().await else { break };
+                let Ok(welcome_msg) = serde_json::from_slice::<WelcomeBlobMessage>(&msg.payload)
+                else {
+                    continue;
+                };
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "direct_classified_welcome_blob",
+                    sender = %hex::encode(msg.sender.as_bytes()),
+                    len = msg.payload.len(),
+                    verified = msg.verified,
+                );
+                handle_welcome_blob_message(&welcome_state, &msg.sender, welcome_msg).await;
+            }
+        });
+    }
+
+    // Background TreeKEM catch-up listener — explicit anti-entropy for
+    // order-sensitive membership events that arrive before local readiness or
+    // ahead of the local epoch/state frontier.
+    {
+        let catchup_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut rx = catchup_state.agent.subscribe_direct();
+            loop {
+                let Some(msg) = rx.recv().await else { break };
+                if let Ok(request) = serde_json::from_slice::<TreeKemCatchupRequest>(&msg.payload) {
+                    if request.message_type == "treekem_catchup_request" {
+                        handle_treekem_catchup_request(
+                            &catchup_state,
+                            &msg.sender,
+                            msg.verified,
+                            request,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
+                {
+                    if response.message_type == "treekem_catchup_response" {
+                        handle_treekem_catchup_response(
+                            &catchup_state,
+                            &msg.sender,
+                            msg.verified,
+                            response,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
+    // Background named-group metadata listener on the direct channel — applies
+    // authority-authored review commits (approve / reject) that are
+    // direct-delivered to a requester before they are grafted into the
+    // metadata topic's gossip mesh (see `spawn_named_group_event_delivery`).
+    // This mirrors the per-group metadata topic-subscription apply loop; the
+    // shared apply handler re-validates the signed commit, enforces the same
+    // authorization checks, and is idempotent, so applying via both the direct
+    // and gossip channels is safe.
+    {
+        let meta_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut rx = meta_state.agent.subscribe_direct();
+            loop {
+                let Some(msg) = rx.recv().await else { break };
+                let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
+                else {
+                    continue; // not a named-group metadata event
+                };
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "direct_classified_metadata_event",
+                    sender = %hex::encode(msg.sender.as_bytes()),
+                    len = msg.payload.len(),
+                    verified = msg.verified,
+                    event = named_group_metadata_event_kind(&event),
+                );
+                apply_named_group_metadata_event(&meta_state, event, msg.sender, msg.verified)
+                    .await;
+            }
+        });
+    }
+
+    // Background signed public-message listener for typed gossip-DM fallback
+    // delivery. Per-group pubsub is still the primary fan-out path; this route
+    // handles the same signed message when the sender additionally direct-
+    // delivers it to active members.
+    {
+        let public_dm_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Some(typed) = group_public_dm_rx.recv().await {
+                if !typed.verified {
+                    continue;
+                }
+                let Some(payload) = typed.payload.strip_prefix(GROUP_PUBLIC_MESSAGE_DM_PREFIX)
+                else {
+                    continue;
+                };
+                let Ok(msg) = serde_json::from_slice::<x0x::groups::GroupPublicMessage>(payload)
+                else {
+                    tracing::debug!(
+                        sender = %hex::encode(typed.sender.as_bytes()),
+                        "typed group-public DM payload was not a GroupPublicMessage"
+                    );
+                    continue;
+                };
+                let group_id = msg.group_id.clone();
+                tracing::debug!(
+                    group_id = %group_id,
+                    sender = %hex::encode(typed.sender.as_bytes()),
+                    "direct-delivered public group message received"
+                );
+                ingest_public_message(&public_dm_state, msg, &group_id).await;
+            }
+        });
+    }
+
+    // Background KvStore delta listener for typed gossip-DM fallback delivery.
+    // Store pub/sub remains the primary path; this side channel gives joined
+    // peers a reliable replay of the same CRDT delta when the topic mesh is
+    // late or congested. Peers that have not joined the store simply ignore it.
+    {
+        let kv_delta_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Some(typed) = kv_store_delta_dm_rx.recv().await {
+                if !typed.verified {
+                    continue;
+                }
+                let Some(payload) = typed.payload.strip_prefix(KV_STORE_DELTA_DM_PREFIX) else {
+                    continue;
+                };
+                let Ok(delta_msg) = serde_json::from_slice::<KvStoreDirectDelta>(payload) else {
+                    tracing::debug!(
+                        sender = %hex::encode(typed.sender.as_bytes()),
+                        "typed kv-store DM payload was not a KvStoreDirectDelta"
+                    );
+                    continue;
+                };
+                apply_direct_kv_store_delta(&kv_delta_state, typed.sender, delta_msg).await;
             }
         });
     }
@@ -1965,20 +2279,17 @@ async fn main() -> Result<()> {
         .route("/gui/", get(serve_gui))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer({
-            // Restrict CORS to localhost origins only.
+            // Restrict CORS to exact loopback origins only.
             // The daemon API is a local control plane — external origins must not access it.
             use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin};
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(|origin, _| {
-                    let o = origin.as_bytes();
-                    o.starts_with(b"http://127.0.0.1")
-                        || o.starts_with(b"http://localhost")
-                        || o.starts_with(b"http://[::1]")
+                    is_allowed_loopback_origin(origin)
                 }))
                 .allow_methods(AllowMethods::any())
                 .allow_headers(AllowHeaders::any())
         })
-        // Bearer-token authentication: all endpoints except /health and /gui
+        // Bearer-token authentication: all control-plane endpoints.
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -2037,11 +2348,13 @@ async fn main() -> Result<()> {
 ///
 /// Exempts:
 /// - `OPTIONS` (CORS preflight — browsers send these without auth headers)
-/// - `/health`, `/gui`, `/gui/` (must be accessible without a token)
+/// - `/health`
+/// - `/constitution` resources
 ///
 /// Accepts `?token=` query parameter on endpoints that browsers cannot send
-/// headers on: WebSocket (`/ws`, `/ws/direct`) and SSE (`/events`,
-/// `/direct/events`).
+/// headers on: the GUI bootstrap (`/gui`, `/gui/`), WebSocket (`/ws`,
+/// `/ws/direct`), and SSE (`/events`, `/direct/events`,
+/// `/peers/events`, `/presence/events`).
 ///
 /// All other endpoints require `Authorization: Bearer <token>`.
 async fn auth_middleware(
@@ -2056,8 +2369,8 @@ async fn auth_middleware(
 
     let path = req.uri().path();
 
-    // Exempt: health check, GUI serving, and constitution
-    if path == "/health" || path == "/gui" || path == "/gui/" || path.starts_with("/constitution") {
+    // Exempt: health check and public constitution resources.
+    if is_auth_exempt_path(path) {
         return next.run(req).await;
     }
 
@@ -2074,8 +2387,7 @@ async fn auth_middleware(
 
     // Endpoints where browsers cannot set headers: accept ?token= query param.
     // WebSocket upgrades and SSE (EventSource API has no header support).
-    let accepts_query_token = matches!(path, "/ws" | "/ws/direct" | "/events" | "/direct/events");
-    if accepts_query_token {
+    if accepts_query_token(path) {
         if let Some(query) = req.uri().query() {
             for pair in query.split('&') {
                 if let Some(token) = pair.strip_prefix("token=") {
@@ -2092,6 +2404,77 @@ async fn auth_middleware(
         axum::Json(serde_json::json!({"error": "missing or invalid Authorization: Bearer token"})),
     )
         .into_response()
+}
+
+fn is_auth_exempt_path(path: &str) -> bool {
+    path == "/health" || path.starts_with("/constitution")
+}
+
+fn accepts_query_token(path: &str) -> bool {
+    matches!(
+        path,
+        "/gui"
+            | "/gui/"
+            | "/ws"
+            | "/ws/direct"
+            | "/events"
+            | "/direct/events"
+            | "/peers/events"
+            | "/presence/events"
+    )
+}
+
+fn is_allowed_loopback_origin(origin: &HeaderValue) -> bool {
+    origin
+        .to_str()
+        .ok()
+        .is_some_and(is_allowed_loopback_origin_str)
+}
+
+fn is_allowed_loopback_origin_str(origin: &str) -> bool {
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains('/') || authority.contains('@') {
+        return false;
+    }
+
+    let Some(host) = origin_host_without_port(authority) else {
+        return false;
+    };
+    // Literal loopback IPs only. The `localhost` hostname is intentionally rejected:
+    // its resolution can be redirected (/etc/hosts, split-horizon DNS, OSes that map it
+    // off-loopback), so it is not a trustworthy origin for the local control plane.
+    matches!(host, "127.0.0.1" | "::1")
+}
+
+fn origin_host_without_port(authority: &str) -> Option<&str> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, port) = rest.split_once(']')?;
+        if port.is_empty() || valid_origin_port(port.strip_prefix(':')?) {
+            Some(host)
+        } else {
+            None
+        }
+    } else {
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            Some(_) => return None,
+            None => (authority, None),
+        };
+        if port.is_none_or(valid_origin_port) {
+            Some(host)
+        } else {
+            None
+        }
+    }
+}
+
+fn valid_origin_port(port: &str) -> bool {
+    !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
 /// Load or generate an API bearer token.
@@ -2238,25 +2621,111 @@ fn file_transfer_now() -> (u64, u64) {
 }
 
 fn direct_message_send_config() -> x0x::dm::DmSendConfig {
-    // Generic daemon DMs use the capability-aware gossip-inbox path when the
-    // recipient advertises it. That path has an authenticated application-level
-    // ACK, which is the delivery semantic users and the mesh harness need.
-    x0x::dm::DmSendConfig::default()
+    // Generic daemon/UI DMs should only return success after the inbox path
+    // observes the recipient ACK. Callers that intentionally want
+    // fire-and-forget gossip can pass `require_gossip_ack: false`.
+    //
+    // The raw-QUIC fallback (taken whenever the recipient's gossip-inbox
+    // capability advert has not converged yet — always the case in the first
+    // seconds after boot) must use ant-quic's receive-pipeline ACK. A
+    // fire-and-forget raw send into a connection that is being superseded
+    // reports Ok while the bytes are lost, the retry machinery never fires,
+    // and the recipient's app never sees the message (the dogfood
+    // group_join / hop-DM 25s-timeout black hole).
+    x0x::dm::DmSendConfig {
+        timeout_per_attempt: Duration::from_secs(8),
+        raw_quic_receive_ack_timeout: Some(Duration::from_secs(8)),
+        ..x0x::dm::DmSendConfig::default()
+    }
+}
+
+fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
+    // Named-group metadata applies require `DirectMessage::verified == true`.
+    // The gossip-inbox DM path verifies the signed DM envelope and marks the
+    // bridged direct message verified. Raw QUIC can only mark messages
+    // verified when the receiver already has a fresh AgentId -> MachineId
+    // binding, so keep it as the fallback for peers whose gossip-inbox
+    // capability advert has not converged yet. Terminal signed commits (for
+    // example creator delete) are self-authenticating and explicitly re-check
+    // authority on apply, so dropping the raw fallback can strand members after
+    // their metadata listener exits.
+    let mut config = direct_message_send_config();
+    config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
+    config.require_gossip_ack = true;
+    config
+}
+
+async fn start_dm_inbox_when_gossip_ready(
+    agent: Arc<x0x::Agent>,
+    kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
+    exec_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    group_public_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+) {
+    for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
+        let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
+            .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, exec_route_tx.clone())
+            .with_typed_payload_route(
+                GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+                group_public_route_tx.clone(),
+            )
+            .with_typed_payload_route(KV_STORE_DELTA_DM_PREFIX, kv_store_delta_route_tx.clone());
+        match agent
+            .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
+            .await
+        {
+            Ok(()) => {
+                if let Err(e) = agent.start_capability_advert_service().await {
+                    tracing::warn!(
+                        attempt,
+                        "Capability advert service not ready after DM inbox start: {e}"
+                    );
+                }
+                tracing::info!(
+                    attempt,
+                    "DM inbox service started independently of network join completion"
+                );
+                return;
+            }
+            Err(e) if attempt < DM_INBOX_START_MAX_ATTEMPTS => {
+                tracing::debug!(attempt, "DM inbox not ready yet: {e}");
+                tokio::time::sleep(DM_INBOX_START_RETRY_DELAY).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attempts = DM_INBOX_START_MAX_ATTEMPTS,
+                    "Failed to start DM inbox service: {e}"
+                );
+                return;
+            }
+        }
+    }
 }
 
 fn file_transfer_send_config() -> x0x::dm::DmSendConfig {
     let mut config = x0x::dm::DmSendConfig {
         prefer_raw_quic_if_connected: true,
-        stop_fallback_on_raw_error: true,
+        stop_fallback_on_raw_error: false,
         ..x0x::dm::DmSendConfig::default()
     };
-    // File transfer already has a stronger application-level ChunkAck after
-    // the receiver persists each chunk. Avoid layering the raw receive-ACK on
-    // every chunk, which adds an unnecessary second wait in the hot path.
-    // Also keep raw failures terminal: silently falling back to gossip would
-    // push 32 KiB chunks through signed/encrypted pubsub fanout and break the
-    // throughput/back-pressure assumptions of the file chunk window.
-    config.raw_quic_receive_ack_timeout = None;
+    // File transfer has a stronger application-level ChunkAck after the
+    // receiver persists each chunk, but the raw receive-ACK still matters for
+    // stale raw connections: without it, ant-quic can report local send
+    // success while the receiver never drains the chunk, leaving the sender to
+    // fail only after the 60s application ack timeout. Keep the raw fast path,
+    // but allow capability-aware gossip fallback when that raw receive-ACK
+    // fails. DEFAULT_CHUNK_SIZE is sized to fit the DM envelope cap.
+    config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
+    config
+}
+
+fn file_transfer_control_send_config() -> x0x::dm::DmSendConfig {
+    let mut config = file_transfer_send_config();
+    // Offer/accept/reject/complete are low-volume control messages. They must
+    // not be fire-and-forget: a stale raw connection can otherwise report local
+    // send success while the peer never updates transfer state.
+    config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
+    config.stop_fallback_on_raw_error = false;
     config
 }
 
@@ -2317,6 +2786,17 @@ impl FileChunkAckSlot {
         }
         self.notify.notify_waiters();
     }
+
+    /// Highest contiguous sequence acked, or `-1` if none acked yet (the
+    /// `u64::MAX` sentinel). For `welcome.trace` diagnostics.
+    fn highest_acked(&self) -> i64 {
+        let v = self.last_acked.load(Ordering::SeqCst);
+        if v == u64::MAX {
+            -1
+        } else {
+            v as i64
+        }
+    }
 }
 
 /// Block until `last_acked >= n.saturating_sub(FILE_CHUNK_WINDOW)`, i.e.
@@ -2362,7 +2842,7 @@ async fn send_file_message(
     let payload = serde_json::to_vec(msg).map_err(|e| format!("serialization failed: {e}"))?;
     state
         .agent
-        .send_direct_with_config(agent_id, payload, file_transfer_send_config())
+        .send_direct_with_config(agent_id, payload, file_transfer_control_send_config())
         .await
         .map_err(|e| e.to_string())
 }
@@ -2392,7 +2872,11 @@ async fn file_send_handler(
         .unwrap_or("unnamed");
     let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
     let sha256 = body.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
-    let source_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let mut source_path = body
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     if agent_id_hex.is_empty() || sha256.is_empty() {
         return (
@@ -2414,12 +2898,68 @@ async fn file_send_handler(
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let (now_secs, now_ms) = file_transfer_now();
 
+    if source_path.is_empty() {
+        if let Some(data_b64) = body
+            .get("data_b64")
+            .or_else(|| body.get("data_base64"))
+            .and_then(|v| v.as_str())
+        {
+            let data = match base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                Ok(data) => data,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "error": format!("invalid data_b64: {e}")
+                        })),
+                    );
+                }
+            };
+            if data.len() as u64 != size {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "data_b64 length does not match size"
+                    })),
+                );
+            }
+            let actual_sha = hex::encode(Sha256::digest(&data));
+            if !sha256.eq_ignore_ascii_case(&actual_sha) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "data_b64 sha256 mismatch"
+                    })),
+                );
+            }
+            if let Err(e) = tokio::fs::create_dir_all(&state.transfers_dir).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("failed to create transfer spool: {e}")
+                    })),
+                );
+            }
+            let spool_path = state.transfers_dir.join(format!("{transfer_id}.send"));
+            if let Err(e) = tokio::fs::write(&spool_path, data).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("failed to spool upload: {e}")
+                    })),
+                );
+            }
+            source_path = spool_path.to_string_lossy().into_owned();
+        }
+    }
+
     let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
-    let total_chunks = if size == 0 {
-        0
-    } else {
-        size.div_ceil(chunk_size as u64)
-    };
+    let total_chunks = x0x::files::total_chunks_for_size(size, chunk_size);
 
     let transfer = x0x::files::TransferState {
         transfer_id: transfer_id.clone(),
@@ -2437,7 +2977,7 @@ async fn file_send_handler(
         source_path: if source_path.is_empty() {
             None
         } else {
-            Some(source_path.to_string())
+            Some(source_path)
         },
         output_path: None,
         chunk_size,
@@ -2747,6 +3287,36 @@ async fn run_doctor(config: &DaemonConfig) -> Result<()> {
                 }
             }
         }
+
+        // ADR-0011 §4: full-tunnel-VPN / constrained-MTU environment check.
+        if let Ok(resp) = client
+            .get(format!("{base}/diagnostics/connectivity"))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    match body.get("transport_environment") {
+                        Some(env)
+                            if env.get("degraded").and_then(|v| v.as_bool()) == Some(true) =>
+                        {
+                            let guidance = env
+                                .get("guidance")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("transport path is degraded");
+                            print_warn(&format!("transport environment degraded: {guidance}"));
+                            if let Some(reasons) = env.get("reasons").and_then(|v| v.as_array()) {
+                                for reason in reasons.iter().filter_map(|r| r.as_str()) {
+                                    println!("        • {reason}");
+                                }
+                            }
+                        }
+                        Some(_) => print_pass("transport environment: healthy"),
+                        None => {}
+                    }
+                }
+            }
+        }
     } else {
         // Check if port is free (daemon not running) or blocked (conflict)
         match tokio::net::TcpListener::bind(config.api_address).await {
@@ -2984,8 +3554,19 @@ async fn run_gossip_update_listener(
     // message ID each time — so PlumTree's transport-layer dedup cannot suppress re-sends.
     let mut rebroadcasted_versions: HashMap<String, Instant> = HashMap::new();
 
+    // Track versions that failed to *apply* so a release that can never succeed
+    // in this environment (e.g. a locked binary that won't replace) is not
+    // re-downloaded and re-extracted on every gossip receipt. Without this the
+    // gossip path retried indefinitely — the cause of the Windows disk-fill
+    // loop. Mirrors the backoff in run_fallback_github_poll.
+    let mut failed_apply_versions: HashMap<String, Instant> = HashMap::new();
+    const APPLY_RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
+
     while let Some(msg) = release_sub.recv().await {
         tracing::info!("Received release manifest via gossip");
+
+        // Drop expired backoff entries so the map stays bounded.
+        failed_apply_versions.retain(|_, failed_at| failed_at.elapsed() < APPLY_RETRY_AFTER);
 
         // Decode wire format: length-prefixed manifest JSON + signature
         let (manifest_json, sig) = match decode_signed_manifest(&msg.payload) {
@@ -3101,6 +3682,20 @@ async fn run_gossip_update_listener(
         // Update SKILL.md if changed (independent of binary update)
         update_skill_if_changed(&manifest, &data_dir).await;
 
+        // Skip versions that recently failed to apply. A release that can never
+        // succeed here would otherwise re-download and re-extract on every
+        // gossip receipt; the backoff caps that to one attempt per 30 minutes.
+        if let Some(failed_at) = failed_apply_versions.get(&manifest.version) {
+            if failed_at.elapsed() < APPLY_RETRY_AFTER {
+                tracing::debug!(
+                    version = %manifest.version,
+                    "Skipping recently failed upgrade v{} (apply backoff active)",
+                    manifest.version
+                );
+                continue;
+            }
+        }
+
         tracing::info!(
             version = %manifest.version,
             "Applying upgrade immediately"
@@ -3115,9 +3710,11 @@ async fn run_gossip_update_listener(
             }
             Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
                 tracing::warn!(%reason, "Upgrade rolled back");
+                failed_apply_versions.insert(manifest.version.clone(), Instant::now());
             }
             Err(e) => {
                 tracing::error!(error = %e, "Upgrade failed: {e}");
+                failed_apply_versions.insert(manifest.version.clone(), Instant::now());
             }
             _ => {}
         }
@@ -3743,6 +4340,12 @@ struct CardQuery {
     /// Whether to include group invites.
     #[serde(default)]
     include_groups: Option<bool>,
+    /// Include loopback/private interface addresses for local testnet cards.
+    ///
+    /// The default remains false so copy-pasteable cards do not leak
+    /// unroutable RFC1918/loopback addresses to remote recipients.
+    #[serde(default)]
+    include_local_addresses: bool,
 }
 
 /// Populate `addresses` with locally-discovered globally-routable interfaces.
@@ -3751,9 +4354,9 @@ struct CardQuery {
 /// be shared anywhere. They must only carry globally-advertisable addresses —
 /// a card minted inside a Vultr VPC must not embed `10.200.0.1:5483` or
 /// recipients in London will spend ~50s dialing a black hole.
-fn discover_local_card_addresses(port: u16, addresses: &mut Vec<String>) {
+fn discover_local_card_addresses(port: u16, addresses: &mut Vec<String>, include_local: bool) {
     for addr in x0x::collect_local_interface_addrs(port) {
-        if !x0x::is_publicly_advertisable(addr) {
+        if !include_local && !x0x::is_publicly_advertisable(addr) {
             continue;
         }
         let s = addr.to_string();
@@ -3761,6 +4364,14 @@ fn discover_local_card_addresses(port: u16, addresses: &mut Vec<String>) {
             addresses.push(s);
         }
     }
+}
+
+fn prioritize_local_card_addresses(addresses: &mut [String]) {
+    addresses.sort_by_key(|addr| {
+        addr.parse::<std::net::SocketAddr>()
+            .map(x0x::is_publicly_advertisable)
+            .unwrap_or(true)
+    });
 }
 
 /// GET /agent/card — generate a shareable identity card.
@@ -3789,10 +4400,17 @@ async fn get_agent_card(
             card.addresses = ns
                 .external_addrs
                 .iter()
-                .filter(|a| x0x::is_publicly_advertisable(**a))
+                .filter(|a| query.include_local_addresses || x0x::is_publicly_advertisable(**a))
                 .map(|a| a.to_string())
                 .collect();
-            discover_local_card_addresses(ns.local_addr.port(), &mut card.addresses);
+            discover_local_card_addresses(
+                ns.local_addr.port(),
+                &mut card.addresses,
+                query.include_local_addresses,
+            );
+            if query.include_local_addresses {
+                prioritize_local_card_addresses(&mut card.addresses);
+            }
         }
     }
 
@@ -3889,6 +4507,7 @@ async fn import_agent_card(
         last_seen: None,
         identity_type: x0x::contacts::IdentityType::default(),
         machines: Vec::new(),
+        dm_capabilities: card.dm_capabilities.clone(),
     };
 
     state.contacts.write().await.add(contact);
@@ -3905,17 +4524,30 @@ async fn import_agent_card(
         .filter_map(|a| a.parse().ok())
         .collect();
 
+    let capability_store = state.agent.capability_store();
+    let mut inserted_dm_capability = false;
     if machine_id_bytes != [0u8; 32] {
         if let Some(caps) = card.dm_capabilities.clone() {
             if caps.gossip_inbox && !caps.kem_public_key.is_empty() {
-                state.agent.capability_store().insert(
+                capability_store.insert(
                     agent_id,
                     x0x::identity::MachineId(machine_id_bytes),
                     caps,
+                    x0x::dm_capability::now_unix_ms(),
                 );
+                inserted_dm_capability = true;
             }
         }
     }
+    tracing::debug!(
+        target: "dm.trace",
+        stage = "agent_card_import_capability",
+        agent_id = %hex::encode(agent_id.as_bytes()),
+        machine_id = %hex::encode(machine_id_bytes),
+        card_has_capability = card.dm_capabilities.is_some(),
+        inserted = inserted_dm_capability,
+        capability_store_entries = capability_store.len(),
+    );
 
     if machine_id_bytes != [0u8; 32] || !addresses.is_empty() {
         state
@@ -3956,6 +4588,12 @@ async fn import_agent_card(
 /// envelope (≤1 KiB in practice) while still bounding worst-case work.
 const AGENT_SIGN_MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 
+/// Maximum length of the optional `domain` separation string, in bytes.
+/// Domain strings are protocol identifiers (`x0x.<purpose>.<version>`
+/// convention) — far shorter in practice; the cap keeps the canonical
+/// bytes bounded by AGENT_SIGN_MAX_PAYLOAD_BYTES + 1 KiB + 1.
+const AGENT_SIGN_MAX_DOMAIN_BYTES: usize = 1024;
+
 /// Stable scheme identifier returned by `POST /agent/sign`.
 const AGENT_SIGN_SCHEME_ID: &str = "x0x.agent-sign.v1.ml-dsa-65";
 
@@ -3977,9 +4615,14 @@ const AGENT_SIGN_SCHEME_ID: &str = "x0x.agent-sign.v1.ml-dsa-65";
 /// Payload. `payload_b64` is base64-decoded and signed verbatim. The
 /// caller is responsible for choosing a canonical serialization of any
 /// structured payload (e.g. `serde_canonical_json`, `postcard`, or an
-/// explicit field-order convention). Callers should also domain-separate
-/// payloads (for example, with an application/type/version prefix) so a
-/// signature produced for one protocol cannot be replayed as another.
+/// explicit field-order convention).
+///
+/// Domain separation. The optional `domain` field, when present, changes
+/// the signed bytes to `domain || 0x00 || payload` and is echoed back in
+/// the response, so a signature produced for one protocol cannot be
+/// replayed as another (`x0x.<purpose>.<version>` is the conventional
+/// shape for x0x's own protocols). When omitted, the raw payload is
+/// signed — unchanged pre-#90 behavior.
 ///
 /// Response. Returns the agent_id (hex, 32 bytes), the agent's public
 /// key (base64), the signature (base64), and the stable signing scheme
@@ -4025,12 +4668,57 @@ async fn agent_sign(
         );
     }
 
+    // Optional domain separation (issue #90): sign `domain || 0x00 || payload`
+    // so a signature issued for one protocol context cannot be replayed in
+    // another. The NUL separator is rejected inside the domain itself so the
+    // framing stays unambiguous.
+    let canonical = match req.domain.as_deref() {
+        Some(domain) => {
+            if domain.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "domain must be non-empty when provided",
+                    })),
+                );
+            }
+            if domain.as_bytes().contains(&0u8) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "domain must not contain NUL bytes",
+                    })),
+                );
+            }
+            if domain.len() > AGENT_SIGN_MAX_DOMAIN_BYTES {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!(
+                            "domain exceeds maximum length of {} bytes",
+                            AGENT_SIGN_MAX_DOMAIN_BYTES
+                        ),
+                    })),
+                );
+            }
+            let mut buf = Vec::with_capacity(domain.len() + 1 + payload.len());
+            buf.extend_from_slice(domain.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(&payload);
+            buf
+        }
+        None => payload,
+    };
+
     let identity = state.agent.identity();
     let keypair = identity.agent_keypair();
 
     let signature = match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
         keypair.secret_key(),
-        &payload,
+        &canonical,
     ) {
         Ok(sig) => sig,
         Err(e) => {
@@ -4049,16 +4737,20 @@ async fn agent_sign(
         base64::engine::general_purpose::STANDARD.encode(keypair.public_key().as_bytes());
     let agent_id_hex = hex::encode(state.agent.agent_id().as_bytes());
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "agent_id": agent_id_hex,
-            "public_key_b64": public_key_b64,
-            "signature_b64": signature_b64,
-            "algorithm": AGENT_SIGN_SCHEME_ID,
-        })),
-    )
+    let mut resp = serde_json::json!({
+        "ok": true,
+        "agent_id": agent_id_hex,
+        "public_key_b64": public_key_b64,
+        "signature_b64": signature_b64,
+        "algorithm": AGENT_SIGN_SCHEME_ID,
+    });
+    // Echo the domain back so a verifier knows the canonical-bytes shape
+    // (domain || 0x00 || payload) without out-of-band context.
+    if let Some(domain) = req.domain {
+        resp["domain"] = serde_json::Value::String(domain);
+    }
+
+    (StatusCode::OK, Json(resp))
 }
 
 /// GET /peers
@@ -4136,7 +4828,7 @@ async fn subscribe(
             let topic = req.topic.clone();
             let mut recv_sub = sub;
             let sub_id = id.clone();
-            tokio::spawn(async move {
+            let forwarder = tokio::spawn(async move {
                 while let Some(msg) = recv_sub.recv().await {
                     tracing::info!(
                         topic = %topic,
@@ -4162,18 +4854,24 @@ async fn subscribe(
                             "[5/6 x0xd] broadcast sent to {n} SSE receivers"
                         ),
                         Err(_) => tracing::warn!(
-                            topic = %topic,
+                            topic = %LogHexId::topic(&topic),
                             "[5/6 x0xd] broadcast send failed (no SSE receivers)"
                         ),
                     }
                 }
             });
 
-            // Track the subscription ID and topic for unsubscribe.
-            // We don't create a second subscription — just record the
-            // topic so the DELETE handler can call unsubscribe().
+            // Track the forwarder task so the DELETE handler can abort it.
+            // Aborting drops the underlying `Subscription`, releasing the
+            // gossip topic ref-count and stopping SSE delivery.
             let mut subs = state.subscriptions.write().await;
-            subs.insert(id.clone(), req.topic.clone());
+            subs.insert(
+                id.clone(),
+                RestSubscription {
+                    topic: req.topic.clone(),
+                    forwarder,
+                },
+            );
 
             (
                 StatusCode::OK,
@@ -4193,7 +4891,15 @@ async fn unsubscribe(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let mut subs = state.subscriptions.write().await;
-    if subs.remove(&id).is_some() {
+    if let Some(sub) = subs.remove(&id) {
+        // Stop the forwarder task. Dropping its `Subscription` releases the
+        // gossip topic ref-count and ends message delivery for this stream.
+        sub.forwarder.abort();
+        tracing::info!(
+            sub_id = %id,
+            topic = %sub.topic,
+            "unsubscribed: forwarder aborted, gossip subscription released"
+        );
         (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     } else {
         (
@@ -4942,6 +5648,7 @@ async fn add_contact(
         last_seen: None,
         identity_type: x0x::contacts::IdentityType::default(),
         machines: Vec::new(),
+        dm_capabilities: None,
     };
 
     state.contacts.write().await.add(contact);
@@ -5281,6 +5988,128 @@ struct AddNamedGroupMemberRequest {
     agent_id: String,
     #[serde(default)]
     display_name: Option<String>,
+    /// Base64 postcard-encoded TreeKEM KeyPackage supplied by the target.
+    /// Required when directly adding to a TreeKEM group.
+    #[serde(default)]
+    treekem_key_package_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WelcomeRef {
+    welcome_id: String,
+    byte_len: u64,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingJoinResult {
+    event: NamedGroupMetadataEvent,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingWelcome {
+    group_id: String,
+    joiner_agent: String,
+    bytes: Vec<u8>,
+    created_at: Instant,
+}
+
+struct PendingWelcomeReceive {
+    group_id: String,
+    source: String,
+    byte_len: u64,
+    total_chunks: u64,
+    chunks: BTreeMap<u64, Vec<u8>>,
+    received_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTreeKemMetadataEvent {
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    queued_at: Instant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TreeKemCatchupRequest {
+    message_type: String,
+    group_id: String,
+    requester_agent_id: String,
+    from_revision: u64,
+    from_treekem_epoch: u64,
+    current_state_hash: String,
+    missing_prev_state_hash: Option<String>,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TreeKemCatchupResponse {
+    message_type: String,
+    group_id: String,
+    events: Vec<NamedGroupMetadataEvent>,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum JoinResultMessage {
+    FetchRequest {
+        group_id: String,
+        member_agent_id: String,
+    },
+    Result {
+        event: Box<NamedGroupMetadataEvent>,
+    },
+}
+
+fn named_group_metadata_event_kind(event: &NamedGroupMetadataEvent) -> &'static str {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded { .. } => "member_added",
+        NamedGroupMetadataEvent::MemberRemoved { .. } => "member_removed",
+        NamedGroupMetadataEvent::GroupDeleted { .. } => "group_deleted",
+        NamedGroupMetadataEvent::PolicyUpdated { .. } => "policy_updated",
+        NamedGroupMetadataEvent::MemberRoleUpdated { .. } => "member_role_updated",
+        NamedGroupMetadataEvent::MemberBanned { .. } => "member_banned",
+        NamedGroupMetadataEvent::MemberUnbanned { .. } => "member_unbanned",
+        NamedGroupMetadataEvent::JoinRequestCreated { .. } => "join_request_created",
+        NamedGroupMetadataEvent::JoinRequestApproved { .. } => "join_request_approved",
+        NamedGroupMetadataEvent::JoinRequestRejected { .. } => "join_request_rejected",
+        NamedGroupMetadataEvent::JoinRequestCancelled { .. } => "join_request_cancelled",
+        NamedGroupMetadataEvent::GroupCardPublished { .. } => "group_card_published",
+        NamedGroupMetadataEvent::GroupMetadataUpdated { .. } => "group_metadata_updated",
+        NamedGroupMetadataEvent::MemberJoined { .. } => "member_joined",
+        NamedGroupMetadataEvent::SecureShareDelivered { .. } => "secure_share_delivered",
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WelcomeBlobMessage {
+    FetchRequest {
+        group_id: String,
+        welcome_id: String,
+    },
+    Offer {
+        group_id: String,
+        welcome_id: String,
+        byte_len: u64,
+        chunk_size: usize,
+        total_chunks: u64,
+        blake3_hex: String,
+    },
+    Chunk {
+        welcome_id: String,
+        sequence: u64,
+        data: String,
+    },
+    ChunkAck {
+        welcome_id: String,
+        sequence: u64,
+    },
+    Complete {
+        welcome_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5297,6 +6126,19 @@ enum NamedGroupMetadataEvent {
         actor: String,
         agent_id: String,
         display_name: Option<String>,
+        /// Base64 postcard-encoded TreeKEM Commit for existing members.
+        #[serde(default)]
+        treekem_commit_b64: Option<String>,
+        /// Base64 postcard-encoded TreeKEM Welcome for the added member.
+        /// Legacy fallback; new events carry `welcome_ref` instead.
+        #[serde(default)]
+        treekem_welcome_b64: Option<String>,
+        /// Content-addressed pull reference for the added member's TreeKEM Welcome.
+        #[serde(default)]
+        welcome_ref: Option<WelcomeRef>,
+        /// TreeKEM epoch after applying `treekem_commit_b64`.
+        #[serde(default)]
+        treekem_epoch: Option<u64>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -5305,6 +6147,12 @@ enum NamedGroupMetadataEvent {
         revision: u64,
         actor: String,
         agent_id: String,
+        /// Base64 postcard-encoded TreeKEM Commit for remaining members.
+        #[serde(default)]
+        treekem_commit_b64: Option<String>,
+        /// TreeKEM epoch after applying `treekem_commit_b64`.
+        #[serde(default)]
+        treekem_epoch: Option<u64>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -5343,6 +6191,12 @@ enum NamedGroupMetadataEvent {
         /// `SecureShareDelivered` arrival order.
         #[serde(default)]
         secret_epoch: Option<u64>,
+        /// Base64 postcard-encoded TreeKEM Commit for remaining members.
+        #[serde(default)]
+        treekem_commit_b64: Option<String>,
+        /// TreeKEM epoch after applying `treekem_commit_b64`.
+        #[serde(default)]
+        treekem_epoch: Option<u64>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -5365,6 +6219,12 @@ enum NamedGroupMetadataEvent {
         /// Required for MlsEncrypted groups; optional for others.
         #[serde(default)]
         requester_kem_public_key_b64: Option<String>,
+        /// Base64 postcard-encoded TreeKEM KeyPackage for ADR-0012 Phase 3
+        /// joins. Present for TreeKEM groups so an approver can produce the
+        /// real Commit/Welcome pair; absent for legacy GSS groups and old
+        /// requests.
+        #[serde(default)]
+        treekem_key_package_b64: Option<String>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -5374,6 +6234,19 @@ enum NamedGroupMetadataEvent {
         revision: u64,
         actor: String,
         requester_agent_id: String,
+        /// Base64 postcard-encoded TreeKEM Commit for existing members.
+        #[serde(default)]
+        treekem_commit_b64: Option<String>,
+        /// Base64 postcard-encoded TreeKEM Welcome for the requester.
+        /// Legacy fallback; new events carry `welcome_ref` instead.
+        #[serde(default)]
+        treekem_welcome_b64: Option<String>,
+        /// Content-addressed pull reference for the requester's TreeKEM Welcome.
+        #[serde(default)]
+        welcome_ref: Option<WelcomeRef>,
+        /// TreeKEM epoch after applying `treekem_commit_b64`.
+        #[serde(default)]
+        treekem_epoch: Option<u64>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -5445,6 +6318,9 @@ enum NamedGroupMetadataEvent {
         invite_secret: String,
         /// Unix-millis timestamp at the joiner.
         ts_ms: u64,
+        /// Base64 postcard-encoded TreeKEM KeyPackage for invite joins.
+        #[serde(default)]
+        treekem_key_package_b64: Option<String>,
         /// Base64 ML-DSA-65 signature over `canonical_member_joined_bytes`.
         signature_b64: String,
     },
@@ -5514,7 +6390,7 @@ async fn publish_secure_share(
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
-                    recipient = %recipient_hex,
+                    recipient = %LogHexId::agent(&recipient_hex),
                     "publish_secure_share: recipient KEM public key not valid base64: {e}"
                 );
                 return false;
@@ -5529,7 +6405,7 @@ async fn publish_secure_share(
         ) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(recipient = %recipient_hex, "KEM seal failed: {e}");
+                tracing::warn!(recipient = %LogHexId::agent(&recipient_hex), "KEM seal failed: {e}");
                 return false;
             }
         };
@@ -5543,6 +6419,13 @@ async fn publish_secure_share(
         actor: actor_hex.to_string(),
     };
     publish_named_group_metadata_event(state, metadata_topic, &event).await;
+    spawn_named_group_event_delivery(state, recipient_hex, &event);
+    spawn_named_group_event_delivery_after(
+        state,
+        recipient_hex,
+        &event,
+        GROUP_BACKGROUND_PUBLISH_DELAY,
+    );
     true
 }
 
@@ -5732,7 +6615,7 @@ async fn publish_group_card_to_discovery_inner(
                 "C.2: published signed card to shard"
             ),
             Err(e) => tracing::warn!(
-                topic = %topic,
+                topic = %LogHexId::topic(&topic),
                 "C.2: shard publish failed: {e}"
             ),
         }
@@ -5920,7 +6803,7 @@ async fn subscribe_shard(state: Arc<AppState>, kind: x0x::groups::ShardKind, sha
     let mut sub = match state.agent.subscribe(&topic).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(topic = %topic, "C.2: failed to subscribe to shard: {e}");
+            tracing::warn!(topic = %LogHexId::topic(&topic), "C.2: failed to subscribe to shard: {e}");
             return;
         }
     };
@@ -6309,7 +7192,7 @@ async fn spawn_listed_to_contacts_listener(state: Arc<AppState>) {
 ///
 /// Bumping this string is a protocol break — receivers verify against the
 /// exact byte sequence below.
-const MEMBER_JOINED_DOMAIN: &[u8] = b"x0x.named_group.member_joined.v1";
+const MEMBER_JOINED_DOMAIN: &[u8] = b"x0x.named_group.member_joined.v2";
 
 /// Build the canonical bytes signed by the joiner for a `MemberJoined`
 /// metadata event.
@@ -6328,6 +7211,7 @@ const MEMBER_JOINED_DOMAIN: &[u8] = b"x0x.named_group.member_joined.v1";
 /// u32 len + inviter_agent_id
 /// u32 len + invite_secret
 /// u64 BE  ts_ms
+/// u32 len + treekem_key_package_b64 (empty string if None)
 /// ```
 #[allow(clippy::too_many_arguments)]
 fn canonical_member_joined_bytes(
@@ -6340,6 +7224,7 @@ fn canonical_member_joined_bytes(
     inviter_agent_id: &str,
     invite_secret: &str,
     ts_ms: u64,
+    treekem_key_package_b64: Option<&str>,
 ) -> Vec<u8> {
     fn push_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
         buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -6356,6 +7241,7 @@ fn canonical_member_joined_bytes(
     push_lp(&mut buf, inviter_agent_id.as_bytes());
     push_lp(&mut buf, invite_secret.as_bytes());
     buf.extend_from_slice(&ts_ms.to_be_bytes());
+    push_lp(&mut buf, treekem_key_package_b64.unwrap_or("").as_bytes());
     buf
 }
 
@@ -6366,11 +7252,151 @@ async fn publish_named_group_metadata_event(
 ) {
     match serde_json::to_vec(event) {
         Ok(bytes) => {
-            if let Err(e) = state.agent.publish(metadata_topic, bytes).await {
-                tracing::warn!(topic = %metadata_topic, "failed to publish named-group metadata event: {e}");
+            match tokio::time::timeout(
+                NAMED_GROUP_METADATA_PUBLISH_TIMEOUT,
+                state.agent.publish(metadata_topic, bytes),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(topic = %LogHexId::topic(&metadata_topic), "failed to publish named-group metadata event: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        topic = %LogHexId::topic(&metadata_topic),
+                        timeout_ms = NAMED_GROUP_METADATA_PUBLISH_TIMEOUT.as_millis() as u64,
+                        "timed out publishing named-group metadata event"
+                    );
+                }
             }
         }
         Err(e) => tracing::warn!("failed to serialize named-group metadata event: {e}"),
+    }
+}
+
+/// Schedule best-effort delivery of a named-group metadata event directly to a
+/// single recipient over the authenticated direct-message channel, in addition
+/// to the metadata-topic gossip publish.
+///
+/// Review decisions (approve / reject) target a requester who has only just
+/// imported the group card and is not yet grafted into the authority's
+/// PlumTree eager-push mesh for the metadata topic. Gossip cannot backfill a
+/// message published before the receiver is in the eager set, so the
+/// authority-authored, chain-linked commit can fail to reach the one peer that
+/// must converge. The direct path closes that gap. The receiver applies the
+/// event through the same [`apply_named_group_metadata_event`] path used for
+/// gossip, which re-validates the signed commit, enforces the same
+/// authorization, and is idempotent — so this is an additive delivery channel
+/// that neither weakens authorization nor risks a double apply.
+///
+/// Direct delivery is intentionally spawned in the background: failures are
+/// logged by the task and must not block metadata application, follow-up
+/// side-effects, or HTTP responses.
+fn spawn_named_group_event_delivery(
+    state: &AppState,
+    recipient_hex: &str,
+    event: &NamedGroupMetadataEvent,
+) {
+    let recipient = match parse_agent_id_hex(recipient_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                requester = %LogHexId::agent(&recipient_hex),
+                "cannot direct-deliver named-group event: invalid requester id: {e}"
+            );
+            return;
+        }
+    };
+    let payload = match serde_json::to_vec(event) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!("failed to serialize named-group event for direct delivery: {e}");
+            return;
+        }
+    };
+    let agent = Arc::clone(&state.agent);
+    let requester = recipient_hex.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = agent
+            .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
+            .await
+        {
+            tracing::warn!(
+                requester = %LogHexId::agent(&requester),
+                "failed to direct-deliver named-group review event: {e}"
+            );
+        }
+    });
+}
+
+fn spawn_named_group_event_delivery_after(
+    state: &AppState,
+    recipient_hex: &str,
+    event: &NamedGroupMetadataEvent,
+    delay: Duration,
+) {
+    let recipient = match parse_agent_id_hex(recipient_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                requester = %LogHexId::agent(&recipient_hex),
+                "cannot delayed-direct-deliver named-group event: invalid requester id: {e}"
+            );
+            return;
+        }
+    };
+    let payload = match serde_json::to_vec(event) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                "failed to serialize named-group event for delayed direct delivery: {e}"
+            );
+            return;
+        }
+    };
+    let agent = Arc::clone(&state.agent);
+    let requester = recipient_hex.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if let Err(e) = agent
+            .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
+            .await
+        {
+            tracing::warn!(
+                requester = %LogHexId::agent(&requester),
+                "failed to delayed-direct-deliver named-group event: {e}"
+            );
+        }
+    });
+}
+
+fn spawn_named_group_event_delivery_to_active_members(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    extra_recipients: &[String],
+) {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut recipients = HashSet::new();
+    for member in info.active_members() {
+        if !member.agent_id.eq_ignore_ascii_case(&local_agent_hex) {
+            recipients.insert(member.agent_id.clone());
+        }
+    }
+    for recipient in extra_recipients {
+        if !recipient.eq_ignore_ascii_case(&local_agent_hex) {
+            recipients.insert(recipient.clone());
+        }
+    }
+    for recipient in recipients {
+        spawn_named_group_event_delivery(state, &recipient, event);
+        spawn_named_group_event_delivery_after(
+            state,
+            &recipient,
+            event,
+            GROUP_BACKGROUND_PUBLISH_DELAY,
+        );
     }
 }
 
@@ -6431,6 +7457,19 @@ async fn refresh_group_card_cache_from_info(
     }
 }
 
+async fn store_named_group_info(
+    state: &AppState,
+    group_id: &str,
+    info: x0x::groups::GroupInfo,
+) -> bool {
+    let mut groups = state.named_groups.write().await;
+    let Some(slot) = groups.get_mut(group_id) else {
+        return false;
+    };
+    *slot = info;
+    true
+}
+
 async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id: &str) {
     let info = {
         let groups = state.named_groups.read().await;
@@ -6455,13 +7494,656 @@ async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id:
     }
 }
 
+struct TreeKemMembershipFrontier<'a> {
+    group_id: &'a str,
+    revision: u64,
+    epoch: Option<u64>,
+    commit: &'a x0x::groups::GroupStateCommit,
+    actor: &'a str,
+    target: &'a str,
+}
+
+fn treekem_membership_event_frontier(
+    event: &NamedGroupMetadataEvent,
+) -> Option<TreeKemMembershipFrontier<'_>> {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded {
+            group_id,
+            revision,
+            actor,
+            agent_id,
+            treekem_epoch,
+            commit: Some(commit),
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberRemoved {
+            group_id,
+            revision,
+            actor,
+            agent_id,
+            treekem_epoch,
+            commit: Some(commit),
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberBanned {
+            group_id,
+            revision,
+            actor,
+            agent_id,
+            treekem_epoch,
+            commit: Some(commit),
+            ..
+        } => Some(TreeKemMembershipFrontier {
+            group_id,
+            revision: *revision,
+            epoch: *treekem_epoch,
+            commit,
+            actor,
+            target: agent_id,
+        }),
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id,
+            revision,
+            actor,
+            requester_agent_id,
+            treekem_epoch,
+            commit: Some(commit),
+            ..
+        } => Some(TreeKemMembershipFrontier {
+            group_id,
+            revision: *revision,
+            epoch: *treekem_epoch,
+            commit,
+            actor,
+            target: requester_agent_id,
+        }),
+        _ => None,
+    }
+}
+
+fn treekem_membership_event_key(event: &NamedGroupMetadataEvent) -> Option<String> {
+    let frontier = treekem_membership_event_frontier(event)?;
+    let kind = match event {
+        NamedGroupMetadataEvent::MemberAdded { .. } => "add",
+        NamedGroupMetadataEvent::MemberRemoved { .. } => "remove",
+        NamedGroupMetadataEvent::MemberBanned { .. } => "ban",
+        NamedGroupMetadataEvent::JoinRequestApproved { .. } => "approve",
+        _ => return None,
+    };
+    Some(format!(
+        "{}:{kind}:{}:{}:{}:{}",
+        frontier.group_id,
+        frontier.revision,
+        frontier.epoch.unwrap_or_default(),
+        frontier.actor,
+        frontier.target
+    ))
+}
+
+fn treekem_membership_event_sort_key(event: &NamedGroupMetadataEvent) -> (u64, u64) {
+    treekem_membership_event_frontier(event)
+        .map(|frontier| (frontier.revision, frontier.epoch.unwrap_or_default()))
+        .unwrap_or_default()
+}
+
+fn treekem_event_is_local_welcome(event: &NamedGroupMetadataEvent, local_agent_hex: &str) -> bool {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => agent_id == local_agent_hex,
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            requester_agent_id, ..
+        } => requester_agent_id == local_agent_hex,
+        _ => false,
+    }
+}
+
+async fn current_treekem_epoch(state: &AppState, group_id: &str) -> Option<u64> {
+    let group = state.treekem_groups.read().await.get(group_id).cloned();
+    let group = group?;
+    let epoch = group.lock().await.epoch();
+    Some(epoch)
+}
+
+fn authorized_treekem_membership_event_for_queue(
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    sender_hex: &str,
+    creator_hex: &str,
+) -> bool {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded {
+            actor,
+            commit: Some(_),
+            treekem_commit_b64: Some(_),
+            treekem_epoch: Some(_),
+            ..
+        } => sender_hex == creator_hex && actor == sender_hex,
+        NamedGroupMetadataEvent::MemberRemoved {
+            actor,
+            agent_id,
+            commit: Some(_),
+            treekem_commit_b64,
+            treekem_epoch,
+            ..
+        } => {
+            let creator_remove = sender_hex == creator_hex
+                && actor == sender_hex
+                && treekem_commit_b64.is_some()
+                && treekem_epoch.is_some();
+            let self_leave = sender_hex == agent_id
+                && actor == sender_hex
+                && treekem_commit_b64.is_none()
+                && treekem_epoch.is_none();
+            creator_remove || self_leave
+        }
+        NamedGroupMetadataEvent::MemberBanned {
+            actor,
+            agent_id,
+            commit: Some(_),
+            treekem_commit_b64: Some(_),
+            treekem_epoch: Some(_),
+            ..
+        } => {
+            actor == sender_hex
+                && info
+                    .caller_role(actor)
+                    .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
+                && info.caller_role(agent_id) != Some(x0x::groups::GroupRole::Owner)
+        }
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            actor,
+            requester_agent_id,
+            request_id,
+            commit: Some(_),
+            treekem_commit_b64: Some(_),
+            treekem_epoch: Some(_),
+            ..
+        } => {
+            actor == sender_hex
+                && info
+                    .caller_role(actor)
+                    .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
+                && info.join_requests.get(request_id).is_some_and(|req| {
+                    req.is_pending() && req.requester_agent_id == *requester_agent_id
+                })
+        }
+        _ => false,
+    }
+}
+
+fn treekem_state_frontier_gap_reason(
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    local_agent_hex: &str,
+    local_epoch: Option<u64>,
+) -> Option<String> {
+    if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+        return None;
+    }
+    let frontier = treekem_membership_event_frontier(event)?;
+    let is_local_welcome = treekem_event_is_local_welcome(event, local_agent_hex);
+    if frontier.commit.revision <= info.state_revision || frontier.revision <= info.roster_revision
+    {
+        return None;
+    }
+    if frontier.commit.revision > info.state_revision.saturating_add(1)
+        || frontier.revision > info.roster_revision.saturating_add(1)
+    {
+        return Some("revision_gap".to_string());
+    }
+    if frontier.commit.prev_state_hash.as_deref() != Some(info.state_hash.as_str()) {
+        return Some("state_hash_gap".to_string());
+    }
+    if let Some(epoch) = frontier.epoch {
+        match local_epoch {
+            Some(local_epoch) if !is_local_welcome && epoch > local_epoch.saturating_add(1) => {
+                return Some("treekem_epoch_gap".to_string());
+            }
+            None if !is_local_welcome => return Some("treekem_not_ready".to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+async fn should_queue_treekem_membership_event(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    local_agent_hex: &str,
+) -> Option<String> {
+    let local_epoch = current_treekem_epoch(state, group_id).await;
+    treekem_state_frontier_gap_reason(info, event, local_agent_hex, local_epoch)
+}
+
+async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupMetadataEvent) {
+    let Some(frontier) = treekem_membership_event_frontier(event) else {
+        return;
+    };
+    let mut logs = state.treekem_event_log.write().await;
+    let log = logs.entry(frontier.group_id.to_string()).or_default();
+    if let Some(key) = treekem_membership_event_key(event) {
+        if log
+            .iter()
+            .filter_map(treekem_membership_event_key)
+            .any(|existing| existing == key)
+        {
+            return;
+        }
+    }
+    log.push_back(event.clone());
+    while log.len() > TREEKEM_EVENT_LOG_PER_GROUP_CAP {
+        log.pop_front();
+    }
+}
+
+async fn queue_treekem_membership_event(
+    state: &Arc<AppState>,
+    group_id: &str,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    reason: &str,
+) {
+    let queued = PendingTreeKemMetadataEvent {
+        event: event.clone(),
+        sender,
+        queued_at: Instant::now(),
+    };
+    let key = treekem_membership_event_key(&event);
+    {
+        let mut pending = state.treekem_pending_events.write().await;
+        let queue = pending.entry(group_id.to_string()).or_default();
+        if let Some(key) = key.as_deref() {
+            if queue
+                .iter()
+                .filter_map(|pending| treekem_membership_event_key(&pending.event))
+                .any(|existing| existing == key)
+            {
+                return;
+            }
+        }
+        queue.push_back(queued);
+        queue
+            .make_contiguous()
+            .sort_by_key(|pending| treekem_membership_event_sort_key(&pending.event));
+        while queue.len() > TREEKEM_PENDING_EVENTS_PER_GROUP_CAP {
+            queue.pop_front();
+        }
+    }
+    tracing::warn!(group_id = %LogHexId::group(&group_id), reason, "queued TreeKEM membership event pending catch-up/replay");
+    request_treekem_catchup_for_gap(state, group_id, &event, sender).await;
+}
+
+async fn request_treekem_catchup_for_gap(
+    state: &Arc<AppState>,
+    group_id: &str,
+    event: &NamedGroupMetadataEvent,
+    sender: AgentId,
+) {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let Some(frontier) = treekem_membership_event_frontier(event) else {
+        return;
+    };
+    let (from_revision, from_epoch, current_state_hash) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id) else {
+            return;
+        };
+        (
+            info.state_revision,
+            info.secret_epoch,
+            info.state_hash.clone(),
+        )
+    };
+    let mut peers = Vec::new();
+    if !frontier.actor.eq_ignore_ascii_case(&local_agent_hex) {
+        if let Ok(peer) = parse_agent_id_hex(frontier.actor) {
+            peers.push(peer);
+        }
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    if sender_hex != local_agent_hex && !peers.contains(&sender) {
+        peers.push(sender);
+    }
+    for peer in peers {
+        let peer_hex = hex::encode(peer.as_bytes());
+        let throttle_key = format!("{group_id}:{peer_hex}:{from_revision}:{from_epoch}");
+        {
+            let mut throttle = state.treekem_catchup_throttle.write().await;
+            if throttle
+                .get(&throttle_key)
+                .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+            {
+                continue;
+            }
+            throttle.insert(throttle_key, Instant::now());
+        }
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: group_id.to_string(),
+            requester_agent_id: local_agent_hex.clone(),
+            from_revision,
+            from_treekem_epoch: from_epoch,
+            current_state_hash: current_state_hash.clone(),
+            missing_prev_state_hash: frontier.commit.prev_state_hash.clone(),
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        let payload = match serde_json::to_vec(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize TreeKEM catch-up request: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = state
+            .agent
+            .send_direct_with_config(&peer, payload, direct_message_send_config())
+            .await
+        {
+            tracing::debug!(group_id = %group_id, peer = %peer_hex, "TreeKEM catch-up request failed: {e}");
+        }
+    }
+}
+
+async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
+    let entries = {
+        let mut pending = state.treekem_pending_events.write().await;
+        let Some(queue) = pending.get_mut(group_id) else {
+            return;
+        };
+        let mut entries: Vec<_> = queue.drain(..).collect();
+        entries.retain(|pending| pending.queued_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+        entries.sort_by_key(|pending| treekem_membership_event_sort_key(&pending.event));
+        entries
+    };
+    let mut still_pending = VecDeque::new();
+    for pending in entries {
+        let applied = apply_named_group_metadata_event_inner(
+            state,
+            pending.event.clone(),
+            pending.sender,
+            true,
+            false,
+        )
+        .await;
+        if !applied && treekem_membership_event_frontier(&pending.event).is_some() {
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let info = {
+                let groups = state.named_groups.read().await;
+                groups.get(group_id).cloned()
+            };
+            if let Some(info) = info {
+                if should_queue_treekem_membership_event(
+                    state,
+                    group_id,
+                    &info,
+                    &pending.event,
+                    &local_agent_hex,
+                )
+                .await
+                .is_some()
+                {
+                    still_pending.push_back(pending);
+                }
+            }
+        }
+    }
+    if !still_pending.is_empty() {
+        let mut pending = state.treekem_pending_events.write().await;
+        let queue = pending.entry(group_id.to_string()).or_default();
+        for item in still_pending {
+            queue.push_back(item);
+        }
+        while queue.len() > TREEKEM_PENDING_EVENTS_PER_GROUP_CAP {
+            queue.pop_front();
+        }
+    }
+}
+
+async fn handle_treekem_catchup_request(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    request: TreeKemCatchupRequest,
+) {
+    if !verified || request.message_type != "treekem_catchup_request" {
+        return;
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    if sender_hex != request.requester_agent_id {
+        return;
+    }
+    let (authorized, log_keys) = {
+        let groups = state.named_groups.read().await;
+        if let Some((key, info)) = groups.get_key_value(&request.group_id).or_else(|| {
+            groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == request.group_id)
+        }) {
+            let mut keys = vec![
+                request.group_id.clone(),
+                key.clone(),
+                info.stable_group_id().to_string(),
+            ];
+            keys.sort();
+            keys.dedup();
+            (info.has_active_member(&sender_hex), keys)
+        } else {
+            (false, vec![request.group_id.clone()])
+        }
+    };
+    let target_of_cached_add = {
+        let logs = state.treekem_event_log.read().await;
+        log_keys.iter().any(|key| {
+            logs.get(key).is_some_and(|events| {
+                events.iter().any(|event| match event {
+                    NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => {
+                        agent_id == &sender_hex
+                    }
+                    NamedGroupMetadataEvent::JoinRequestApproved {
+                        requester_agent_id, ..
+                    } => requester_agent_id == &sender_hex,
+                    _ => false,
+                })
+            })
+        })
+    };
+    if !authorized && !target_of_cached_add {
+        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
+        return;
+    }
+    let mut events = {
+        let logs = state.treekem_event_log.read().await;
+        let mut events = Vec::new();
+        for key in &log_keys {
+            if let Some(logged) = logs.get(key) {
+                events.extend(logged.iter().cloned());
+            }
+        }
+        events
+            .into_iter()
+            .filter(|event| {
+                treekem_membership_event_frontier(event).is_some_and(|frontier| {
+                    frontier.revision > request.from_revision
+                        || frontier.epoch.unwrap_or_default() > request.from_treekem_epoch
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    events.sort_by_key(treekem_membership_event_sort_key);
+    let truncated = events.len() > request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP);
+    events.truncate(request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP));
+    let response = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: request.group_id.clone(),
+        events,
+        truncated,
+    };
+    let payload = match serde_json::to_vec(&response) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to serialize TreeKEM catch-up response: {e}");
+            return;
+        }
+    };
+    if let Err(e) = state
+        .agent
+        .send_direct_with_config(sender, payload, direct_message_send_config())
+        .await
+    {
+        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
+    }
+}
+
+async fn handle_treekem_catchup_response(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    response: TreeKemCatchupResponse,
+) {
+    if !verified || response.message_type != "treekem_catchup_response" {
+        return;
+    }
+    let was_truncated = response.truncated;
+    let mut events = response.events;
+    events.sort_by_key(treekem_membership_event_sort_key);
+    for event in events {
+        apply_named_group_metadata_event(state, event, *sender, true).await;
+    }
+    replay_pending_treekem_events(state, &response.group_id).await;
+    if was_truncated {
+        tracing::debug!(
+            target: "treekem.trace",
+            group_id = %response.group_id,
+            sender = %hex::encode(sender.as_bytes()),
+            "TreeKEM catch-up response was truncated; requesting next page"
+        );
+        request_treekem_catchup_page(state, &response.group_id, sender).await;
+    }
+}
+
+async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, peer: &AgentId) {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (from_revision, from_epoch, current_state_hash) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_id)
+        }) else {
+            return;
+        };
+        (
+            info.state_revision,
+            info.secret_epoch,
+            info.state_hash.clone(),
+        )
+    };
+    let request = TreeKemCatchupRequest {
+        message_type: "treekem_catchup_request".to_string(),
+        group_id: group_id.to_string(),
+        requester_agent_id: local_agent_hex,
+        from_revision,
+        from_treekem_epoch: from_epoch,
+        current_state_hash,
+        missing_prev_state_hash: None,
+        limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+    };
+    let payload = match serde_json::to_vec(&request) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize paged TreeKEM catch-up request: {e}");
+            return;
+        }
+    };
+    if let Err(e) = state
+        .agent
+        .send_direct_with_config(peer, payload, direct_message_send_config())
+        .await
+    {
+        tracing::debug!(group_id = %group_id, peer = %hex::encode(peer.as_bytes()), "paged TreeKEM catch-up request failed: {e}");
+    }
+}
+
+/// Get-or-create the per-group membership serialization mutex. See
+/// [`AppState::group_membership_locks`] for why membership applies must be
+/// serialized per group.
+async fn group_membership_lock(state: &AppState, group_key: &str) -> Arc<Mutex<()>> {
+    {
+        let locks = state.group_membership_locks.read().await;
+        if let Some(lock) = locks.get(group_key) {
+            return Arc::clone(lock);
+        }
+    }
+    let mut locks = state.group_membership_locks.write().await;
+    Arc::clone(
+        locks
+            .entry(group_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
 async fn apply_named_group_metadata_event(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
     sender: AgentId,
     verified: bool,
 ) -> bool {
-    if !verified {
+    apply_named_group_metadata_event_inner(state, event, sender, verified, true).await
+}
+
+async fn apply_named_group_metadata_event_inner(
+    state: &Arc<AppState>,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    verified: bool,
+    allow_queue: bool,
+) -> bool {
+    let event_kind = named_group_metadata_event_kind(&event);
+    let sender_hex = hex::encode(sender.as_bytes());
+    tracing::debug!(
+        target: "treekem.trace",
+        stage = "apply_metadata_event_entry",
+        event = event_kind,
+        sender = %sender_hex,
+        verified,
+        allow_queue,
+    );
+    // The transport `verified` flag asserts the sender's AgentId→MachineId
+    // binding is in our identity-discovery cache — a best-effort annotation
+    // populated asynchronously from gossip announcements. Both a terminal
+    // `GroupDeleted` and a `MemberRemoved` carry a self-authenticating
+    // ML-DSA-signed state commit (`validate_apply` → `verify_structure` proves
+    // the signer authored it), so their authority does not depend on that
+    // cache. Both are also delivery-critical to a peer that is not (or no
+    // longer) in the metadata-topic eager mesh and cannot be backfilled by the
+    // single gossip broadcast: the deleted group's members, and — for removal —
+    // the *removed member itself*, which is direct-delivered the commit so it
+    // learns it was cut from the roster. A transient unverified drop of either
+    // is unrecoverable, so let them through; the apply arms below re-check
+    // authority from the signed commit (GroupDeleted: OwnerOnly via
+    // `commit.committed_by`; MemberRemoved: creator/self auth + signed-commit
+    // validation). The authenticated DM `sender_hex` is reliable regardless of
+    // the cache, so bypassing `verified` does not weaken membership
+    // authorization — only the racy cache annotation is skipped.
+    let bypass_verified = matches!(
+        event,
+        NamedGroupMetadataEvent::GroupDeleted {
+            commit: Some(_),
+            ..
+        } | NamedGroupMetadataEvent::MemberRemoved {
+            commit: Some(_),
+            ..
+        }
+    );
+    if !verified && !bypass_verified {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "apply_metadata_event_reject",
+            reason = "unverified",
+            event = event_kind,
+            sender = %sender_hex,
+        );
         return false;
     }
 
@@ -6483,23 +8165,92 @@ async fn apply_named_group_metadata_event(
         | NamedGroupMetadataEvent::SecureShareDelivered { group_id, .. } => group_id.clone(),
     };
 
-    let sender_hex = hex::encode(sender.as_bytes());
-    let mut groups = state.named_groups.write().await;
-    let resolved_group_key = if groups.contains_key(&group_id) {
-        group_id.clone()
-    } else if let Some((key, _)) = groups
-        .iter()
-        .find(|(_, info)| info.stable_group_id() == group_id)
-    {
-        key.clone()
-    } else {
-        return false;
+    let resolved_group_key = {
+        let groups = state.named_groups.read().await;
+        if groups.contains_key(&group_id) {
+            group_id.clone()
+        } else if let Some((key, _)) = groups
+            .iter()
+            .find(|(_, info)| info.stable_group_id() == group_id)
+        {
+            key.clone()
+        } else {
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "apply_metadata_event_reject",
+                reason = "unknown_group",
+                event = event_kind,
+                group_id = %group_id,
+                sender = %sender_hex,
+            );
+            return false;
+        }
     };
-    let Some(info) = groups.get_mut(&resolved_group_key) else {
-        return false;
+    // Serialize every membership apply for this group across the concurrent
+    // gossip metadata listener and direct-channel listener. Held for the rest
+    // of the apply so the load-mutate-commit sequence below cannot interleave
+    // with a duplicate of the same event arriving on the other transport. The
+    // direct-DM delivery added for reliability means the owner now receives the
+    // same `MemberJoined` on two independent tasks at once; without this guard
+    // they double-add to the MLS tree and clobber the roster. `info` is loaded
+    // *under* the guard so no stale clone from a racing apply is in flight.
+    let membership_lock = group_membership_lock(state, &resolved_group_key).await;
+    let _membership_guard = membership_lock.lock().await;
+    let info = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&resolved_group_key).cloned() else {
+            return false;
+        };
+        info
     };
     let creator_hex = hex::encode(info.creator.as_bytes());
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        && treekem_metadata_event_requires_phase3(&event)
+    {
+        tracing::warn!(
+            group_id = %LogHexId::group(&resolved_group_key),
+            "ignoring TreeKEM metadata membership event without Phase 3 Commit/Welcome transport"
+        );
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "apply_metadata_event_reject",
+            reason = "missing_phase3_transport",
+            event = event_kind,
+            group_id = %resolved_group_key,
+            sender = %sender_hex,
+        );
+        return false;
+    }
+
+    if allow_queue
+        && treekem_membership_event_frontier(&event).is_some()
+        && authorized_treekem_membership_event_for_queue(&info, &event, &sender_hex, &creator_hex)
+    {
+        if let Some(reason) = should_queue_treekem_membership_event(
+            state,
+            &resolved_group_key,
+            &info,
+            &event,
+            &local_agent_hex,
+        )
+        .await
+        {
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "apply_metadata_event_queued",
+                reason = %reason,
+                event = event_kind,
+                group_id = %resolved_group_key,
+                sender = %sender_hex,
+            );
+            queue_treekem_membership_event(state, &resolved_group_key, event, sender, &reason)
+                .await;
+            return false;
+        }
+    }
+
+    let event_for_log = event.clone();
 
     match event {
         NamedGroupMetadataEvent::MemberAdded {
@@ -6507,6 +8258,10 @@ async fn apply_named_group_metadata_event(
             actor,
             agent_id,
             display_name,
+            treekem_commit_b64,
+            treekem_welcome_b64,
+            welcome_ref,
+            treekem_epoch,
             commit,
             ..
         } => {
@@ -6516,8 +8271,22 @@ async fn apply_named_group_metadata_event(
             if sender_hex != creator_hex || actor != sender_hex {
                 return false;
             }
+            let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                let Some(commit_b64) = treekem_commit_b64 else {
+                    return false;
+                };
+                if treekem_welcome_b64.is_none() && welcome_ref.is_none() {
+                    return false;
+                }
+                let Some(epoch) = treekem_epoch else {
+                    return false;
+                };
+                Some((commit_b64, treekem_welcome_b64, welcome_ref, epoch))
+            } else {
+                None
+            };
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let next = match apply_stateful_event_to_group(
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -6532,31 +8301,183 @@ async fn apply_named_group_metadata_event(
                     if let Some(name) = display_name.clone() {
                         next.set_display_name(&agent_id, name);
                     }
+                    if let Some((_, _, _, epoch)) = treekem_payload.as_ref() {
+                        next.secret_epoch = *epoch;
+                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                    }
                 },
-            ) else {
-                return false;
+            ) {
+                Ok(next) => next,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "apply_metadata_event_reject",
+                        reason = "member_added_state_commit_apply_failed",
+                        group_id = %resolved_group_key,
+                        member = %agent_id,
+                        sender = %sender_hex,
+                        revision,
+                        commit_revision = commit.revision,
+                        local_state_revision = current.state_revision,
+                        local_roster_revision = current.roster_revision,
+                        local_state_hash = %current.state_hash,
+                        commit_prev_state_hash = ?commit.prev_state_hash,
+                        error = %e,
+                    );
+                    return false;
+                }
             };
-            *info = next;
-            let mut mls_groups = state.mls_groups.write().await;
-            if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
-                if let Ok(member_id) = parse_agent_id_hex(&agent_id) {
-                    if !group.is_member(&member_id) {
-                        let _ = group.add_member(member_id).await;
+            if let Some((commit_b64, welcome_b64, welcome_ref, epoch)) = treekem_payload {
+                use base64::Engine as _;
+                let commit_bytes =
+                    match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return false,
+                    };
+                if agent_id == local_agent_hex {
+                    let welcome_bytes = if let Some(welcome_b64) = welcome_b64 {
+                        match base64::engine::general_purpose::STANDARD.decode(welcome_b64) {
+                            Ok(bytes) => bytes,
+                            Err(_) => return false,
+                        }
+                    } else if let Some(welcome_ref) = welcome_ref {
+                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
+                            .await
+                        {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                                return false;
+                            }
+                        }
+                    } else {
+                        return false;
+                    };
+                    let group_id_bytes = match hex::decode(&next.mls_group_id) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return false,
+                    };
+                    let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+                    let prepared = match x0x::mls::TreeKemMlsGroup::prepare_member(
+                        state.agent.agent_id(),
+                        &seed,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(e) => {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to prepare local TreeKEM identity for MemberAdded Welcome: {e}");
+                            return false;
+                        }
+                    };
+                    let tk = match x0x::mls::TreeKemMlsGroup::join_from_welcome(
+                        prepared,
+                        &welcome_bytes,
+                    ) {
+                        Ok(group) => group,
+                        Err(e) => {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to join TreeKEM group from MemberAdded Welcome: {e}");
+                            return false;
+                        }
+                    };
+                    if tk.epoch() != epoch {
+                        return false;
+                    }
+                    if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                        state,
+                        &resolved_group_key,
+                        next.clone(),
+                        &tk,
+                    )
+                    .await
+                    {
+                        tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after MemberAdded Welcome: {e}");
+                        return false;
+                    }
+                    state.treekem_groups.write().await.insert(
+                        resolved_group_key.clone(),
+                        Arc::new(tokio::sync::Mutex::new(tk)),
+                    );
+                } else {
+                    let group = {
+                        let map = state.treekem_groups.read().await;
+                        map.get(&resolved_group_key).cloned()
+                    };
+                    if let Some(group) = group {
+                        let mut guard = group.lock().await;
+                        if let Err(e) = guard.process_commit(&commit_bytes) {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM MemberAdded commit: {e}");
+                            return false;
+                        }
+                        if guard.epoch() != epoch {
+                            return false;
+                        }
+                        if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                            state,
+                            &resolved_group_key,
+                            next.clone(),
+                            &guard,
+                        )
+                        .await
+                        {
+                            tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after MemberAdded commit: {e}");
+                            return false;
+                        }
+                    } else if !info.has_active_member(&local_agent_hex) {
+                        // This daemon is a pre-Welcome joiner catching up on
+                        // authority-signed state commits for members who joined
+                        // before it. It has no TreeKEM ratchet yet, so it
+                        // cannot process their TreeKEM commits. Applying the
+                        // signed metadata commit advances the roster/state hash
+                        // so the joiner's own later MemberAdded Welcome can
+                        // validate against the correct frontier.
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "member_added_pre_welcome_state_only_apply",
+                            group_id = %resolved_group_key,
+                            member = %agent_id,
+                            local = %local_agent_hex,
+                            revision,
+                            epoch,
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "apply_metadata_event_reject",
+                            reason = "member_added_missing_local_treekem_group",
+                            group_id = %resolved_group_key,
+                            member = %agent_id,
+                            local = %local_agent_hex,
+                            revision,
+                            epoch,
+                        );
+                        return false;
                     }
                 }
+            } else {
+                let mut mls_groups = state.mls_groups.write().await;
+                if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
+                    if let Ok(member_id) = parse_agent_id_hex(&agent_id) {
+                        if !group.is_member(&member_id) {
+                            let _ = group.add_member(member_id).await;
+                        }
+                    }
+                }
+                drop(mls_groups);
             }
-            drop(mls_groups);
-            let updated = info.clone();
-            drop(groups);
-            refresh_group_card_cache_from_info(state, &resolved_group_key, &updated).await;
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             save_mls_groups(state).await;
-            false
+            remember_treekem_membership_event(state, &event_for_log).await;
+            true
         }
         NamedGroupMetadataEvent::MemberRemoved {
             revision,
             actor,
             agent_id,
+            treekem_commit_b64,
+            treekem_epoch,
             commit,
             ..
         } => {
@@ -6573,29 +8494,50 @@ async fn apply_named_group_metadata_event(
             } else {
                 x0x::groups::ActionKind::AdminOrHigher
             };
+            let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                if self_leave_auth {
+                    if treekem_commit_b64.is_some() || treekem_epoch.is_some() {
+                        return false;
+                    }
+                    None
+                } else {
+                    let Some(commit_b64) = treekem_commit_b64 else {
+                        return false;
+                    };
+                    let Some(epoch) = treekem_epoch else {
+                        return false;
+                    };
+                    Some((commit_b64, epoch))
+                }
+            } else {
+                None
+            };
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(&current, &commit, action_kind, |next| {
                 next.roster_revision = revision.max(next.roster_revision);
                 next.remove_member(&agent_id, Some(actor.clone()));
+                if let Some((_, epoch)) = treekem_payload.as_ref() {
+                    next.secret_epoch = *epoch;
+                    next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                }
             }) else {
                 return false;
             };
             let removed_self = agent_id == local_agent_hex;
             if removed_self {
-                groups.remove(&resolved_group_key);
-            } else {
-                *info = next.clone();
+                state.named_groups.write().await.remove(&resolved_group_key);
             }
-            let mut mls_groups = state.mls_groups.write().await;
-            if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
-                if let Ok(member_id) = parse_agent_id_hex(&agent_id) {
-                    if group.is_member(&member_id) {
-                        let _ = group.remove_member(member_id).await;
+            if treekem_payload.is_none() {
+                let mut mls_groups = state.mls_groups.write().await;
+                if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
+                    if let Ok(member_id) = parse_agent_id_hex(&agent_id) {
+                        if group.is_member(&member_id) {
+                            let _ = group.remove_member(member_id).await;
+                        }
                     }
                 }
+                drop(mls_groups);
             }
-            drop(mls_groups);
-            drop(groups);
             if removed_self {
                 state
                     .group_card_cache
@@ -6603,14 +8545,64 @@ async fn apply_named_group_metadata_event(
                     .await
                     .remove(&resolved_group_key);
                 state.mls_groups.write().await.remove(&resolved_group_key);
+                state
+                    .treekem_groups
+                    .write()
+                    .await
+                    .remove(&resolved_group_key);
+                let treekem_snapshot = state.treekem_dir.join(format!("{resolved_group_key}.snap"));
+                if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to remove TreeKEM snapshot after self removal: {e}");
+                    }
+                }
                 save_named_groups(state).await;
                 save_mls_groups(state).await;
                 return true;
             }
+            if let Some((commit_b64, _epoch)) = treekem_payload {
+                use base64::Engine as _;
+                let commit_bytes =
+                    match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return false,
+                    };
+                let group = {
+                    let map = state.treekem_groups.read().await;
+                    map.get(&resolved_group_key).cloned()
+                };
+                let Some(group) = group else {
+                    return false;
+                };
+                let mut guard = group.lock().await;
+                if let Err(e) = guard.process_commit(&commit_bytes) {
+                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM remove commit: {e}");
+                    return false;
+                }
+                if guard.epoch() != _epoch {
+                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM remove commit advanced to unexpected epoch");
+                    return false;
+                }
+                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    state,
+                    &resolved_group_key,
+                    next.clone(),
+                    &guard,
+                )
+                .await
+                {
+                    tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after remove commit: {e}");
+                    return false;
+                }
+            }
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             save_mls_groups(state).await;
-            false
+            remember_treekem_membership_event(state, &event_for_log).await;
+            true
         }
         NamedGroupMetadataEvent::GroupDeleted {
             revision,
@@ -6621,11 +8613,22 @@ async fn apply_named_group_metadata_event(
             let Some(commit) = commit else {
                 return false;
             };
-            if sender_hex != creator_hex || actor != sender_hex {
+            // Authority comes from the signed commit, not the transport
+            // sender. `validate_apply` (below) verifies the ML-DSA signature
+            // and that the signer (`commit.committed_by`) holds the Owner role
+            // — `OwnerOnly`. The `actor` field is advisory metadata, so we only
+            // require it to name the cryptographically-verified signer; we do
+            // *not* gate on `sender_hex`, which is the relaying/transport peer
+            // (wrong for gossip-relayed copies) and unreliable for an
+            // unverified direct delete. The signer must be this group's
+            // creator, preserving the original creator-only delete semantics.
+            // This lets a creator's terminal delete apply on a joiner whose
+            // identity-discovery cache hasn't yet bound the creator's AgentId.
+            if actor != commit.committed_by || commit.committed_by != creator_hex {
                 return false;
             }
             let current = info.clone();
-            if apply_stateful_event_to_group(
+            if let Err(e) = apply_stateful_event_to_group(
                 &current,
                 &commit,
                 x0x::groups::ActionKind::OwnerOnly,
@@ -6633,13 +8636,19 @@ async fn apply_named_group_metadata_event(
                     next.roster_revision = revision.max(next.roster_revision);
                     next.updated_at = commit.committed_at;
                 },
-            )
-            .is_err()
-            {
+            ) {
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "apply_metadata_event_reject",
+                    reason = "group_deleted_state_commit_apply_failed",
+                    error = %e,
+                    event = event_kind,
+                    group_id = %resolved_group_key,
+                    sender = %sender_hex,
+                );
                 return false;
             }
-            groups.remove(&resolved_group_key);
-            drop(groups);
+            state.named_groups.write().await.remove(&resolved_group_key);
             state
                 .group_card_cache
                 .write()
@@ -6685,8 +8694,9 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next.clone();
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
@@ -6740,8 +8750,9 @@ async fn apply_named_group_metadata_event(
             }) else {
                 return false;
             };
-            *info = next.clone();
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
@@ -6751,6 +8762,8 @@ async fn apply_named_group_metadata_event(
             actor,
             agent_id,
             secret_epoch,
+            treekem_commit_b64,
+            treekem_epoch,
             commit,
             ..
         } => {
@@ -6766,6 +8779,17 @@ async fn apply_named_group_metadata_event(
             if info.caller_role(&agent_id) == Some(x0x::groups::GroupRole::Owner) {
                 return false;
             }
+            let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                let Some(commit_b64) = treekem_commit_b64 else {
+                    return false;
+                };
+                let Some(epoch) = treekem_epoch else {
+                    return false;
+                };
+                Some((commit_b64, epoch))
+            } else {
+                None
+            };
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
                 &current,
@@ -6774,7 +8798,10 @@ async fn apply_named_group_metadata_event(
                 |next| {
                     next.roster_revision = revision.max(next.roster_revision);
                     next.ban_member(&agent_id, Some(actor.clone()));
-                    if let Some(secret_epoch) = secret_epoch {
+                    if let Some((_, epoch)) = treekem_payload.as_ref() {
+                        next.secret_epoch = *epoch;
+                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                    } else if let Some(secret_epoch) = secret_epoch {
                         let old_epoch = next.secret_epoch;
                         next.secret_epoch = secret_epoch;
                         next.security_binding = Some(format!("gss:epoch={secret_epoch}"));
@@ -6786,11 +8813,60 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next.clone();
-            drop(groups);
+            let banned_self = agent_id == local_agent_hex;
+            if banned_self {
+                state
+                    .treekem_groups
+                    .write()
+                    .await
+                    .remove(&resolved_group_key);
+                let treekem_snapshot = state.treekem_dir.join(format!("{resolved_group_key}.snap"));
+                if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to remove TreeKEM snapshot after ban: {e}");
+                    }
+                }
+            } else if let Some((commit_b64, epoch)) = treekem_payload {
+                use base64::Engine as _;
+                let commit_bytes =
+                    match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return false,
+                    };
+                let group = {
+                    let map = state.treekem_groups.read().await;
+                    map.get(&resolved_group_key).cloned()
+                };
+                let Some(group) = group else {
+                    return false;
+                };
+                let mut guard = group.lock().await;
+                if let Err(e) = guard.process_commit(&commit_bytes) {
+                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM ban commit: {e}");
+                    return false;
+                }
+                if guard.epoch() != epoch {
+                    return false;
+                }
+                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    state,
+                    &resolved_group_key,
+                    next.clone(),
+                    &guard,
+                )
+                .await
+                {
+                    tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after ban commit: {e}");
+                    return false;
+                }
+            }
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
-            false
+            remember_treekem_membership_event(state, &event_for_log).await;
+            true
         }
         NamedGroupMetadataEvent::MemberUnbanned {
             revision,
@@ -6815,13 +8891,22 @@ async fn apply_named_group_metadata_event(
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = revision.max(next.roster_revision);
-                    next.unban_member(&agent_id);
+                    if next.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                        if let Some(member) = next.members_v2.get_mut(&agent_id) {
+                            member.state = x0x::groups::GroupMemberState::Removed;
+                            member.updated_at = commit.committed_at;
+                            member.removed_by = None;
+                        }
+                    } else {
+                        next.unban_member(&agent_id);
+                    }
                 },
             ) else {
                 return false;
             };
-            *info = next.clone();
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
@@ -6832,6 +8917,7 @@ async fn apply_named_group_metadata_event(
             message,
             ts,
             requester_kem_public_key_b64,
+            treekem_key_package_b64,
             commit,
             ..
         } => {
@@ -6873,6 +8959,7 @@ async fn apply_named_group_metadata_event(
                         requester_user_id: None,
                         requested_role: x0x::groups::GroupRole::Member,
                         message: message.clone(),
+                        treekem_key_package_b64: treekem_key_package_b64.clone(),
                         created_at: ts,
                         reviewed_at: None,
                         reviewed_by: None,
@@ -6896,14 +8983,19 @@ async fn apply_named_group_metadata_event(
                                 added_by: None,
                                 removed_by: None,
                                 kem_public_key_b64: Some(kem_b64),
+                                treekem_key_package_b64: treekem_key_package_b64.clone(),
                             });
+                    }
+                    if let Some(kp_b64) = treekem_key_package_b64.clone() {
+                        next.set_member_treekem_key_package(&requester_agent_id, kp_b64);
                     }
                 },
             ) else {
                 return false;
             };
-            *info = next;
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             save_named_groups(state).await;
             false
         }
@@ -6912,6 +9004,10 @@ async fn apply_named_group_metadata_event(
             revision,
             actor,
             requester_agent_id,
+            treekem_commit_b64,
+            treekem_welcome_b64,
+            welcome_ref,
+            treekem_epoch,
             commit,
             ..
         } => {
@@ -6936,6 +9032,21 @@ async fn apply_named_group_metadata_event(
             if info.is_banned(&requester_agent_id) {
                 return false;
             }
+            let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                let Some(commit_b64) = treekem_commit_b64 else {
+                    return false;
+                };
+                if treekem_welcome_b64.is_none() && welcome_ref.is_none() {
+                    return false;
+                }
+                let Some(epoch) = treekem_epoch else {
+                    return false;
+                };
+                Some((commit_b64, treekem_welcome_b64, welcome_ref, epoch))
+            } else {
+                None
+            };
+            let request_key_package_b64 = req_snapshot.treekem_key_package_b64.clone();
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
                 &current,
@@ -6955,15 +9066,126 @@ async fn apply_named_group_metadata_event(
                         Some(actor.clone()),
                         None,
                     );
+                    if let Some(kp_b64) = request_key_package_b64.clone() {
+                        next.set_member_treekem_key_package(&requester_agent_id, kp_b64);
+                    }
+                    if let Some((_, _, _, epoch)) = treekem_payload.as_ref() {
+                        next.secret_epoch = *epoch;
+                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                    }
                 },
             ) else {
                 return false;
             };
-            *info = next.clone();
-            drop(groups);
+            if let Some((commit_b64, welcome_b64, welcome_ref, _epoch)) = treekem_payload {
+                use base64::Engine as _;
+                let commit_bytes =
+                    match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return false,
+                    };
+                if requester_agent_id == local_agent_hex {
+                    let welcome_bytes = if let Some(welcome_b64) = welcome_b64 {
+                        match base64::engine::general_purpose::STANDARD.decode(welcome_b64) {
+                            Ok(bytes) => bytes,
+                            Err(_) => return false,
+                        }
+                    } else if let Some(welcome_ref) = welcome_ref {
+                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
+                            .await
+                        {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                                return false;
+                            }
+                        }
+                    } else {
+                        return false;
+                    };
+                    let group_id_bytes = match hex::decode(&next.mls_group_id) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return false,
+                    };
+                    let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+                    let prepared = match x0x::mls::TreeKemMlsGroup::prepare_member(
+                        state.agent.agent_id(),
+                        &seed,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(e) => {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to prepare local TreeKEM identity for welcome: {e}");
+                            return false;
+                        }
+                    };
+                    let tk = match x0x::mls::TreeKemMlsGroup::join_from_welcome(
+                        prepared,
+                        &welcome_bytes,
+                    ) {
+                        Ok(group) => group,
+                        Err(e) => {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to join TreeKEM group from Welcome: {e}");
+                            return false;
+                        }
+                    };
+                    if tk.epoch() != _epoch {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), expected_epoch = _epoch, actual_epoch = tk.epoch(), "TreeKEM Welcome joined at unexpected epoch");
+                        return false;
+                    }
+                    if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                        state,
+                        &resolved_group_key,
+                        next.clone(),
+                        &tk,
+                    )
+                    .await
+                    {
+                        tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist joined TreeKEM snapshot: {e}");
+                        return false;
+                    }
+                    state.treekem_groups.write().await.insert(
+                        resolved_group_key.clone(),
+                        Arc::new(tokio::sync::Mutex::new(tk)),
+                    );
+                } else {
+                    let group = {
+                        let map = state.treekem_groups.read().await;
+                        map.get(&resolved_group_key).cloned()
+                    };
+                    let Some(group) = group else {
+                        return false;
+                    };
+                    {
+                        let mut guard = group.lock().await;
+                        if let Err(e) = guard.process_commit(&commit_bytes) {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM add commit: {e}");
+                            return false;
+                        }
+                        if guard.epoch() != _epoch {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM add commit advanced to unexpected epoch");
+                            return false;
+                        }
+                        if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                            state,
+                            &resolved_group_key,
+                            next.clone(),
+                            &guard,
+                        )
+                        .await
+                        {
+                            tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after add commit: {e}");
+                            return false;
+                        }
+                    }
+                }
+            }
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
-            false
+            remember_treekem_membership_event(state, &event_for_log).await;
+            true
         }
         NamedGroupMetadataEvent::JoinRequestRejected {
             request_id,
@@ -7001,8 +9223,9 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next;
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             save_named_groups(state).await;
             false
         }
@@ -7037,8 +9260,9 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next;
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             save_named_groups(state).await;
             false
         }
@@ -7096,8 +9320,9 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next.clone();
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
@@ -7175,10 +9400,13 @@ async fn apply_named_group_metadata_event(
                     return false;
                 }
             };
-            info.shared_secret = Some(secret.to_vec());
-            info.secret_epoch = secret_epoch;
-            info.security_binding = Some(format!("gss:epoch={secret_epoch}"));
-            drop(groups);
+            let mut next = info.clone();
+            next.shared_secret = Some(secret.to_vec());
+            next.secret_epoch = secret_epoch;
+            next.security_binding = Some(format!("gss:epoch={secret_epoch}"));
+            if !store_named_group_info(state, &resolved_group_key, next).await {
+                return false;
+            }
             save_named_groups(state).await;
             tracing::info!(
                 group_id = %ev_group_id,
@@ -7196,6 +9424,7 @@ async fn apply_named_group_metadata_event(
             inviter_agent_id,
             invite_secret,
             ts_ms,
+            treekem_key_package_b64,
             signature_b64,
             ..
         } => {
@@ -7271,6 +9500,7 @@ async fn apply_named_group_metadata_event(
                 &inviter_agent_id,
                 &invite_secret,
                 ts_ms,
+                treekem_key_package_b64.as_deref(),
             );
             if let Err(e) = ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
                 &pubkey, &canonical, &sig,
@@ -7304,6 +9534,9 @@ async fn apply_named_group_metadata_event(
                     role = ?role,
                     "MemberJoined: rejecting non-member role"
                 );
+                state
+                    .groups_diagnostics
+                    .record_member_joined_rejected_non_member_role(&resolved_group_key);
                 return false;
             }
 
@@ -7350,6 +9583,11 @@ async fn apply_named_group_metadata_event(
             if let Err(reason) =
                 next.consume_issued_invite(&invite_secret, &member_agent_id, role, ts_ms, now_ms)
             {
+                if reason == "invite_secret_unknown" {
+                    state
+                        .groups_diagnostics
+                        .record_member_joined_rejected_invite_secret_unknown(&resolved_group_key);
+                }
                 tracing::debug!(
                     group_id = %resolved_group_key,
                     inviter = %inviter_agent_id,
@@ -7358,6 +9596,21 @@ async fn apply_named_group_metadata_event(
                 );
                 return false;
             }
+            let treekem_key_package_bytes =
+                if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                    let Some(kp_b64) = treekem_key_package_b64.clone() else {
+                        return false;
+                    };
+                    match base64::engine::general_purpose::STANDARD.decode(kp_b64) {
+                        Ok(bytes) => Some(bytes),
+                        Err(_) => return false,
+                    }
+                } else {
+                    None
+                };
+            let mut treekem_epoch = None;
+            let mut treekem_commit = None;
+            let mut treekem_welcome = None;
             next.roster_revision = next.roster_revision.saturating_add(1);
             next.add_member_with_kem(
                 member_agent_id.clone(),
@@ -7369,22 +9622,80 @@ async fn apply_named_group_metadata_event(
             if let Some(ref dn) = display_name {
                 next.set_display_name(&member_agent_id, dn.clone());
             }
+            if let Some(kp_b64) = treekem_key_package_b64.clone() {
+                next.set_member_treekem_key_package(&member_agent_id, kp_b64);
+            }
             let revision = next.roster_revision;
-            let commit = match next.seal_commit(signing_kp, now_ms) {
-                Ok(commit) => commit,
-                Err(e) => {
-                    tracing::warn!(
-                        group_id = %resolved_group_key,
-                        member = %member_agent_id,
-                        "MemberJoined: failed to seal authoritative add: {e}"
-                    );
+            let commit = if let Some(kp_bytes) = treekem_key_package_bytes.as_ref() {
+                let member_id = match parse_agent_id_hex(&member_agent_id) {
+                    Ok(id) => id,
+                    Err(_) => return false,
+                };
+                let group = {
+                    let map = state.treekem_groups.read().await;
+                    map.get(&resolved_group_key).cloned()
+                };
+                let Some(group) = group else {
                     return false;
+                };
+                let mut guard = group.lock().await;
+                let expected_epoch = guard.epoch().saturating_add(1);
+                next.secret_epoch = expected_epoch;
+                next.security_binding = Some(format!("treekem:epoch={expected_epoch}"));
+                let commit = match next.seal_commit(signing_kp, now_ms) {
+                    Ok(commit) => commit,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined: failed to seal authoritative add: {e}"
+                        );
+                        return false;
+                    }
+                };
+                let out = match guard.add_member(member_id, kp_bytes) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), member = %LogHexId::agent(&member_agent_id), "MemberJoined: TreeKEM add_member failed: {e}");
+                        return false;
+                    }
+                };
+                if guard.epoch() != expected_epoch {
+                    return false;
+                }
+                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    state,
+                    &resolved_group_key,
+                    next.clone(),
+                    &guard,
+                )
+                .await
+                {
+                    tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after invite add: {e}");
+                    return false;
+                }
+                treekem_epoch = Some(expected_epoch);
+                treekem_commit = Some(out.commit);
+                treekem_welcome = Some(out.welcome);
+                commit
+            } else {
+                match next.seal_commit(signing_kp, now_ms) {
+                    Ok(commit) => commit,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined: failed to seal authoritative add: {e}"
+                        );
+                        return false;
+                    }
                 }
             };
             let metadata_topic = next.metadata_topic.clone();
             let event_group_id = next.stable_group_id().to_string();
-            *info = next;
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
 
             // Persist and expose the committed roster before any slower MLS or
             // discovery-card side effects. Tests and operators poll
@@ -7395,24 +9706,44 @@ async fn apply_named_group_metadata_event(
                 .groups_diagnostics
                 .record_member_joined(&resolved_group_key);
 
-            if let Ok(member_id) = parse_agent_id_hex(&member_agent_id) {
-                let mut mls_groups = state.mls_groups.write().await;
-                if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
-                    if !group.is_member(&member_id) {
-                        let _ = group.add_member(member_id).await;
+            if treekem_epoch.is_none() {
+                if let Ok(member_id) = parse_agent_id_hex(&member_agent_id) {
+                    let mut mls_groups = state.mls_groups.write().await;
+                    if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
+                        if !group.is_member(&member_id) {
+                            let _ = group.add_member(member_id).await;
+                        }
                     }
                 }
+                save_mls_groups(state).await;
             }
-            save_mls_groups(state).await;
+            let welcome_ref = if let Some(welcome) = treekem_welcome.take() {
+                Some(stage_treekem_welcome(state, &event_group_id, &member_agent_id, welcome).await)
+            } else {
+                None
+            };
             let event = NamedGroupMetadataEvent::MemberAdded {
-                group_id: event_group_id,
+                group_id: event_group_id.clone(),
                 revision,
                 actor: inviter_agent_id.clone(),
                 agent_id: member_agent_id.clone(),
                 display_name: display_name.clone(),
+                treekem_commit_b64: treekem_commit
+                    .map(|c| base64::engine::general_purpose::STANDARD.encode(c)),
+                treekem_welcome_b64: None,
+                welcome_ref,
+                treekem_epoch,
                 commit: Some(commit),
             };
+            stage_join_result(state, &event_group_id, &member_agent_id, event.clone()).await;
             publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+            remember_treekem_membership_event(state, &event).await;
+            spawn_named_group_event_delivery_to_active_members(
+                state,
+                &next,
+                &event,
+                std::slice::from_ref(&member_agent_id),
+            );
             maybe_publish_group_card_after_state_change(state, &resolved_group_key).await;
             tracing::info!(
                 group_id = %resolved_group_key,
@@ -7445,7 +9776,7 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
     let mut sub = match state.agent.subscribe(&metadata_topic).await {
         Ok(sub) => sub,
         Err(e) => {
-            tracing::warn!(group_id = %group_id, topic = %metadata_topic, "failed to subscribe to named-group metadata topic: {e}");
+            tracing::warn!(group_id = %LogHexId::group(&group_id), topic = %LogHexId::topic(&metadata_topic), "failed to subscribe to named-group metadata topic: {e}");
             return;
         }
     };
@@ -7538,8 +9869,10 @@ async fn create_named_group(
         None => x0x::groups::GroupPolicy::default(),
     };
 
-    // Create MLS group
-    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id).await {
+    // Create the legacy demo MLS group object (kept for the `/mls/groups/:id`
+    // surface). `.clone()` because the real-TreeKEM routing below also needs
+    // the raw group-id bytes.
+    match x0x::mls::MlsGroup::new(group_id_bytes.clone(), agent_id).await {
         Ok(group) => {
             // Create group metadata with explicit policy.
             let mut info = x0x::groups::GroupInfo::with_policy(
@@ -7564,6 +9897,54 @@ async fn create_named_group(
                 info.set_display_name(&hex::encode(agent_id.as_bytes()), dn);
             }
 
+            // ADR-0012 Phase 2: new PRIVATE (Hidden) MlsEncrypted groups are
+            // secure-by-default real TreeKEM (FS/PCS), NOT the legacy GSS
+            // shared-secret plane. Public encrypted presets (e.g.
+            // `public_request_secure`, PublicDirectory) deliberately stay on the
+            // GSS plane — their cross-daemon join-request review converges via
+            // the D4 signed-commit path, which the single-committer TreeKEM
+            // transport does not provide. This matches ADR-0012's scope ("all
+            // new private groups secure-by-default TreeKEM"); gating on
+            // MlsEncrypted alone was too broad and swept in public request-secure
+            // groups, breaking their join-request convergence.
+            // Build the live TreeKEM group (creator = sole leaf 0), persist its
+            // snapshot at rest, then relabel `info` so no surface claims GSS for
+            // it (drop the GSS shared secret, bind the TreeKEM epoch into the
+            // signed state hash). If TreeKEM setup or persistence fails we fail
+            // the request rather than store a group mislabelled as secure.
+            if info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
+                && info.policy.discoverability == x0x::groups::GroupDiscoverability::Hidden
+            {
+                let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+                let tk = match x0x::mls::TreeKemMlsGroup::create(
+                    group_id_bytes.clone(),
+                    agent_id,
+                    &seed,
+                ) {
+                    Ok(tk) => tk,
+                    Err(e) => {
+                        tracing::error!(group_id = %group_id_hex, "failed to create TreeKEM group: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": format!("failed to create secure group: {e}")
+                            })),
+                        );
+                    }
+                };
+                info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+                info.shared_secret = None;
+                info.secret_epoch = tk.epoch();
+                info.security_binding = Some(format!("treekem:epoch={}", tk.epoch()));
+                info.recompute_state_hash();
+                state
+                    .treekem_groups
+                    .write()
+                    .await
+                    .insert(group_id_hex.clone(), Arc::new(tokio::sync::Mutex::new(tk)));
+            }
+
             // Store MLS group
             state
                 .mls_groups
@@ -7580,7 +9961,29 @@ async fn create_named_group(
                 .write()
                 .await
                 .insert(group_id_hex.clone(), info.clone());
-            save_named_groups(&state).await;
+            if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                let group = {
+                    let map = state.treekem_groups.read().await;
+                    map.get(&group_id_hex).cloned()
+                };
+                if let Some(group) = group {
+                    let guard = group.lock().await;
+                    if let Err(e) =
+                        persist_treekem_and_named_groups_atomic(&state, &group_id_hex, &guard).await
+                    {
+                        tracing::error!(group_id = %group_id_hex, "failed to atomically persist TreeKEM group create: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": format!("failed to persist secure group: {e}")
+                            })),
+                        );
+                    }
+                }
+            } else {
+                save_named_groups(&state).await;
+            }
             ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
 
             // P0-1: If the group is discoverable, publish its card to the global
@@ -7767,6 +10170,15 @@ const PUBLIC_MESSAGE_HISTORY_CAP: usize = 512;
 /// fallback path while receivers still validate/cache only messages for groups
 /// they know locally.
 const GLOBAL_PUBLIC_MESSAGE_TOPIC: &str = "x0x.groups.public.v1";
+const GROUP_PUBLIC_MESSAGE_DM_PREFIX: &[u8] = b"X0X-GROUP-PUBLIC-V1\n";
+const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KvStoreDirectDelta {
+    store_id: String,
+    peer_id: saorsa_gossip_types::PeerId,
+    delta: x0x::kv::KvStoreDelta,
+}
 
 /// Request body for `POST /groups/:id/send`.
 #[derive(Debug, Deserialize)]
@@ -7826,7 +10238,7 @@ async fn send_group_public_message(
 
     // Build + endpoint-side authz + sign under the write lock so
     // concurrent role changes can't race the check.
-    let msg = {
+    let (msg, direct_recipients) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return (
@@ -7880,6 +10292,11 @@ async fn send_group_public_message(
                 }
             }
         }
+        let direct_recipients = info
+            .active_members()
+            .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_hex))
+            .map(|member| member.agent_id.clone())
+            .collect::<Vec<_>>();
 
         match x0x::groups::GroupPublicMessage::sign(
             info.stable_group_id().to_string(),
@@ -7891,7 +10308,7 @@ async fn send_group_public_message(
             req.body,
             now_ms,
         ) {
-            Ok(m) => m,
+            Ok(m) => (m, direct_recipients),
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -7923,7 +10340,7 @@ async fn send_group_public_message(
         }
     };
     if let Err(e) = state.agent.publish(&topic, bytes.clone()).await {
-        tracing::warn!(topic = %topic, "E: public-send publish failed: {e}");
+        tracing::warn!(topic = %LogHexId::topic(&topic), "E: public-send publish failed: {e}");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -7946,6 +10363,7 @@ async fn send_group_public_message(
     // Publish succeeded, so cache locally. The listener was started before the
     // publish above to avoid first-message topic races.
     cache_public_message(&state, msg.clone()).await;
+    spawn_group_public_message_delivery_to_active_members(&state, direct_recipients, &msg);
 
     (
         StatusCode::OK,
@@ -8044,6 +10462,86 @@ async fn cache_public_message(state: &AppState, msg: x0x::groups::GroupPublicMes
         while slot.len() > PUBLIC_MESSAGE_HISTORY_CAP {
             slot.remove(0);
         }
+    }
+}
+
+fn encode_group_public_message_direct_payload(
+    msg: &x0x::groups::GroupPublicMessage,
+) -> serde_json::Result<Vec<u8>> {
+    let json = serde_json::to_vec(msg)?;
+    let mut payload = Vec::with_capacity(GROUP_PUBLIC_MESSAGE_DM_PREFIX.len() + json.len());
+    payload.extend_from_slice(GROUP_PUBLIC_MESSAGE_DM_PREFIX);
+    payload.extend_from_slice(&json);
+    Ok(payload)
+}
+
+fn group_public_message_direct_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.require_gossip = true;
+    config.require_gossip_ack = true;
+    config
+}
+
+fn spawn_group_public_message_delivery(
+    state: &AppState,
+    recipient_hex: &str,
+    msg: &x0x::groups::GroupPublicMessage,
+    delay: Option<Duration>,
+) {
+    let recipient = match parse_agent_id_hex(recipient_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                recipient = %LogHexId::agent(&recipient_hex),
+                "cannot direct-deliver public group message: invalid recipient id: {e}"
+            );
+            return;
+        }
+    };
+    let payload = match encode_group_public_message_direct_payload(msg) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!("failed to serialize public group message for direct delivery: {e}");
+            return;
+        }
+    };
+    let agent = Arc::clone(&state.agent);
+    let recipient_label = recipient_hex.to_string();
+    let group_id = msg.group_id.clone();
+    tokio::spawn(async move {
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Err(e) = agent
+            .send_direct_with_config(
+                &recipient,
+                payload,
+                group_public_message_direct_delivery_config(),
+            )
+            .await
+        {
+            tracing::warn!(
+                group_id = %LogHexId::group(&group_id),
+                recipient = %LogHexId::agent(&recipient_label),
+                "failed to direct-deliver public group message: {e}"
+            );
+        }
+    });
+}
+
+fn spawn_group_public_message_delivery_to_active_members(
+    state: &AppState,
+    recipients: Vec<String>,
+    msg: &x0x::groups::GroupPublicMessage,
+) {
+    for recipient in recipients {
+        spawn_group_public_message_delivery(state, &recipient, msg, None);
+        spawn_group_public_message_delivery(
+            state,
+            &recipient,
+            msg,
+            Some(GROUP_BACKGROUND_PUBLISH_DELAY),
+        );
     }
 }
 
@@ -8179,7 +10677,7 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     let mut sub = match state.agent.subscribe(&topic).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(topic = %topic, "E: failed to subscribe to public chat: {e}");
+            tracing::warn!(topic = %LogHexId::topic(&topic), "E: failed to subscribe to public chat: {e}");
             return;
         }
     };
@@ -8232,6 +10730,12 @@ async fn create_group_invite(
         Ok(r) => r,
         Err(resp) => return resp.into_response(),
     };
+    // Serialize this group-state mutation against concurrent membership applies
+    // and the other API mutators (see `AppState::group_membership_locks`): every
+    // read-modify-write of one group's `GroupInfo` must hold this lock, or a
+    // stale-clone apply storing afterward overwrites the invite we record here.
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
     let (link, mls_group_id, group_name, expires_at) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
@@ -8261,6 +10765,13 @@ async fn create_group_invite(
         invite.group_description = Some(info.description.clone());
         invite.policy = Some(info.policy.clone());
         invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
+        invite.base_state_revision = Some(info.state_revision);
+        invite.base_state_hash = Some(info.state_hash.clone());
+        invite.base_members_v2 = Some(info.members_v2.clone());
+        invite.base_prev_state_hash = info.prev_state_hash.clone();
+        invite.secure_plane = Some(info.secure_plane);
+        invite.base_secret_epoch = Some(info.secret_epoch);
+        invite.base_security_binding = info.security_binding.clone();
 
         // Track this one-time secret on the inviter so a future
         // MemberJoined request carrying it can be authenticated, role-capped,
@@ -8317,6 +10828,7 @@ async fn join_group_via_invite(
             Json(serde_json::json!({ "ok": false, "error": "invite has expired" })),
         );
     }
+    let invite_is_treekem = invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
 
     let agent_id = state.agent.agent_id();
     let group_id_hex = invite.group_id.clone();
@@ -8345,15 +10857,38 @@ async fn join_group_via_invite(
         }
     };
 
+    let treekem_key_package_b64 = if invite_is_treekem {
+        use base64::Engine as _;
+        let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let prepared = match x0x::mls::TreeKemMlsGroup::prepare_member(agent_id, &seed) {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("failed to prepare TreeKEM KeyPackage: {e}")
+                    })),
+                );
+            }
+        };
+        Some(base64::engine::general_purpose::STANDARD.encode(prepared.key_package_bytes()))
+    } else {
+        None
+    };
+
     match x0x::mls::MlsGroup::new(group_id_bytes, agent_id).await {
         Ok(group) => {
-            // Store MLS group
-            state
-                .mls_groups
-                .write()
-                .await
-                .insert(group_id_hex.clone(), group);
-            save_mls_groups(&state).await;
+            if !invite_is_treekem {
+                // Store legacy demo MLS group. Real TreeKEM groups are stored
+                // only after the authority's Welcome is accepted.
+                state
+                    .mls_groups
+                    .write()
+                    .await
+                    .insert(group_id_hex.clone(), group);
+                save_mls_groups(&state).await;
+            }
 
             // Create group info from invite. D.4 requires the joiner to seed
             // the same stable group identity + policy snapshot as the authority
@@ -8378,18 +10913,43 @@ async fn join_group_via_invite(
                     }),
                 ));
             }
-            info.recompute_state_hash();
-
             let joiner_hex = hex::encode(agent_id.as_bytes());
-            info.add_member(
-                joiner_hex.clone(),
-                x0x::groups::GroupRole::Member,
-                Some(invite.inviter.clone()),
-                req.display_name.clone(),
-            );
-            // Set joiner's display name if provided
-            if let Some(ref dn) = req.display_name {
-                info.set_display_name(&joiner_hex, dn.clone());
+            if invite_is_treekem {
+                info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+                info.shared_secret = None;
+                info.secret_epoch = invite.base_secret_epoch.unwrap_or_default();
+                info.security_binding = invite
+                    .base_security_binding
+                    .clone()
+                    .or_else(|| Some(format!("treekem:epoch={}", info.secret_epoch)));
+                if let Some(base_revision) = invite.base_state_revision {
+                    info.state_revision = base_revision;
+                    info.roster_revision = info.roster_revision.max(base_revision);
+                }
+                if let Some(base_members) = invite.base_members_v2.clone() {
+                    info.members_v2 = base_members;
+                }
+                if let Some(base_state_hash) = invite.base_state_hash.clone() {
+                    info.state_hash = base_state_hash;
+                    info.prev_state_hash = invite.base_prev_state_hash.clone();
+                }
+            } else {
+                info.add_member(
+                    joiner_hex.clone(),
+                    x0x::groups::GroupRole::Member,
+                    Some(invite.inviter.clone()),
+                    req.display_name.clone(),
+                );
+                // Set joiner's display name if provided
+                if let Some(ref dn) = req.display_name {
+                    info.set_display_name(&joiner_hex, dn.clone());
+                }
+                if let Some(kp_b64) = treekem_key_package_b64.clone() {
+                    info.set_member_treekem_key_package(&joiner_hex, kp_b64);
+                }
+            }
+            if !invite_is_treekem || invite.base_state_hash.is_none() {
+                info.recompute_state_hash();
             }
 
             let chat_topic = info.general_chat_topic();
@@ -8430,6 +10990,7 @@ async fn join_group_via_invite(
                 &invite.inviter,
                 &invite.invite_secret,
                 now_ms,
+                treekem_key_package_b64.as_deref(),
             );
             match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
                 signing_kp.secret_key(),
@@ -8449,6 +11010,7 @@ async fn join_group_via_invite(
                         inviter_agent_id: invite.inviter.clone(),
                         invite_secret: invite.invite_secret.clone(),
                         ts_ms: now_ms,
+                        treekem_key_package_b64: treekem_key_package_b64.clone(),
                         signature_b64,
                     };
                     tracing::info!(
@@ -8466,8 +11028,19 @@ async fn join_group_via_invite(
                     // event for an already-active member is a no-op), so
                     // double-publish is safe.
                     publish_named_group_metadata_event(&state, &info.metadata_topic, &event).await;
+                    // TreeKEM membership is order-sensitive: gossip remains the
+                    // broadcast path, but the join trigger must reach the inviter
+                    // reliably so they can produce the authoritative add commit.
+                    spawn_named_group_event_delivery(&state, &invite.inviter, &event);
+                    spawn_named_group_event_delivery_after(
+                        &state,
+                        &invite.inviter,
+                        &event,
+                        GROUP_BACKGROUND_PUBLISH_DELAY,
+                    );
                     let state_for_replay = Arc::clone(&state);
                     let topic_for_replay = info.metadata_topic.clone();
+                    let inviter_for_replay = invite.inviter.clone();
                     let event_for_replay = event;
                     tokio::spawn(async move {
                         tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
@@ -8477,6 +11050,11 @@ async fn join_group_via_invite(
                             &event_for_replay,
                         )
                         .await;
+                        spawn_named_group_event_delivery(
+                            &state_for_replay,
+                            &inviter_for_replay,
+                            &event_for_replay,
+                        );
                     });
                 }
                 Err(e) => {
@@ -8485,6 +11063,22 @@ async fn join_group_via_invite(
                         "MemberJoined: failed to sign join announcement: {e:?}"
                     );
                 }
+            }
+            if invite_is_treekem {
+                let state_for_poll = Arc::clone(&state);
+                let group_id_for_poll = group_id_hex.clone();
+                let event_group_id_for_poll = info.stable_group_id().to_string();
+                let member_for_poll = joiner_hex.clone();
+                tokio::spawn(async move {
+                    poll_join_result_until_treekem_ready(
+                        state_for_poll,
+                        group_id_for_poll,
+                        event_group_id_for_poll,
+                        creator,
+                        member_for_poll,
+                    )
+                    .await;
+                });
             }
 
             // Announce join on the chat topic so the creator sees us —
@@ -8584,6 +11178,12 @@ async fn add_named_group_member(
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`). Held across the delegation to the
+    // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
+
     let (metadata_topic, event, members, epoch) = {
         let mut named_groups = state.named_groups.write().await;
         let Some(info) = named_groups.get_mut(&id) else {
@@ -8599,6 +11199,10 @@ async fn add_named_group_member(
                     serde_json::json!({ "ok": false, "error": "only the creator can add members" }),
                 ),
             );
+        }
+        if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+            drop(named_groups);
+            return add_treekem_named_group_member(state, id, agent_id, req).await;
         }
 
         let agent_hex = hex::encode(agent_id.as_bytes());
@@ -8657,6 +11261,10 @@ async fn add_named_group_member(
             actor: actor_hex,
             agent_id: agent_hex,
             display_name: req.display_name,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
             commit: Some(commit),
         };
         (metadata_topic, event, members, epoch)
@@ -8670,6 +11278,180 @@ async fn add_named_group_member(
             "ok": true,
             "group_id": id,
             "epoch": epoch,
+            "member_count": members.len(),
+            "members": members,
+        })),
+    )
+}
+
+async fn add_treekem_named_group_member(
+    state: Arc<AppState>,
+    id: String,
+    agent_id: AgentId,
+    req: AddNamedGroupMemberRequest,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+
+    let local_agent = state.agent.agent_id();
+    let actor_hex = hex::encode(local_agent.as_bytes());
+    let agent_hex = hex::encode(agent_id.as_bytes());
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
+    let Some(kp_b64) = req.treekem_key_package_b64.clone() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM direct add requires treekem_key_package_b64 from the target"
+            })),
+        );
+    };
+    let kp_bytes = match base64::engine::general_purpose::STANDARD.decode(&kp_b64) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "treekem_key_package_b64 is not valid base64"
+                })),
+            );
+        }
+    };
+
+    let (mut next, metadata_topic, event_group_id) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if local_agent != info.creator {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    serde_json::json!({ "ok": false, "error": "only the creator can add members" }),
+                ),
+            );
+        }
+        if info.has_member(&agent_hex) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "ok": false, "error": "member already present" })),
+            );
+        }
+        (
+            info.clone(),
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+        )
+    };
+
+    let group = {
+        let map = state.treekem_groups.read().await;
+        map.get(&id).cloned()
+    };
+    let Some(group) = group else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(
+                serde_json::json!({ "ok": false, "error": "TreeKEM group not loaded — restart or re-share required" }),
+            ),
+        );
+    };
+    let mut guard = group.lock().await;
+    let treekem_epoch = guard.epoch().saturating_add(1);
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.add_member(
+        agent_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(actor_hex.clone()),
+        req.display_name.clone(),
+    );
+    if let Some(display_name) = req.display_name.clone() {
+        next.set_display_name(&agent_hex, display_name);
+    }
+    next.set_member_treekem_key_package(&agent_hex, kp_b64);
+    next.secret_epoch = treekem_epoch;
+    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    let commit = match next.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
+    let out = match guard.add_member(agent_id, &kp_bytes) {
+        Ok(out) => out,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("TreeKEM add_member failed: {e}") }),
+                ),
+            );
+        }
+    };
+    if guard.epoch() != treekem_epoch {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({ "ok": false, "error": "TreeKEM epoch did not advance as expected" }),
+            ),
+        );
+    }
+    if let Err(e) =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
+    {
+        tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after direct add: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({ "ok": false, "error": "failed to persist secure group state" }),
+            ),
+        );
+    }
+    drop(guard);
+
+    let mut groups = state.named_groups.write().await;
+    groups.insert(id.clone(), next.clone());
+    drop(groups);
+    save_named_groups(&state).await;
+
+    let welcome_ref = stage_treekem_welcome(&state, &event_group_id, &agent_hex, out.welcome).await;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: event_group_id,
+        revision,
+        actor: actor_hex,
+        agent_id: agent_hex.clone(),
+        display_name: req.display_name,
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(out.commit)),
+        treekem_welcome_b64: None,
+        welcome_ref: Some(welcome_ref),
+        treekem_epoch: Some(treekem_epoch),
+        commit: Some(commit),
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_treekem_membership_event(&state, &event).await;
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &next,
+        &event,
+        std::slice::from_ref(&agent_hex),
+    );
+    maybe_publish_group_card_after_state_change(&state, &id).await;
+
+    let members = named_group_member_values(&next);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": id,
+            "epoch": treekem_epoch,
             "member_count": members.len(),
             "members": members,
         })),
@@ -8692,6 +11474,27 @@ async fn remove_named_group_member(
     };
     let local_agent = state.agent.agent_id();
     let local_agent_hex = hex::encode(local_agent.as_bytes());
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`). Held across the delegation to the
+    // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
+    {
+        let groups = state.named_groups.read().await;
+        if let Some(info) = groups.get(&id) {
+            if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                drop(groups);
+                return remove_treekem_named_group_member(
+                    state,
+                    id,
+                    agent_id_hex,
+                    local_agent,
+                    local_agent_hex,
+                )
+                .await;
+            }
+        }
+    }
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
@@ -8764,6 +11567,8 @@ async fn remove_named_group_member(
             revision,
             actor: local_agent_hex,
             agent_id: agent_id_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
             commit: Some(commit),
         };
         (metadata_topic, event, members, epoch)
@@ -8784,12 +11589,337 @@ async fn remove_named_group_member(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeKemLeaveDisposition {
+    ActiveMember,
+    LocalOnlyDrop,
+    CreatorMustDelete,
+}
+
+fn treekem_leave_disposition(
+    info: &x0x::groups::GroupInfo,
+    local_agent: AgentId,
+    local_agent_hex: &str,
+) -> TreeKemLeaveDisposition {
+    if local_agent == info.creator {
+        TreeKemLeaveDisposition::CreatorMustDelete
+    } else if info.has_active_member(local_agent_hex) {
+        TreeKemLeaveDisposition::ActiveMember
+    } else {
+        TreeKemLeaveDisposition::LocalOnlyDrop
+    }
+}
+
+async fn drop_local_named_group_state(state: &AppState, id: &str, reason: &str) {
+    state.named_groups.write().await.remove(id);
+    state.group_card_cache.write().await.remove(id);
+    state.mls_groups.write().await.remove(id);
+    state.treekem_groups.write().await.remove(id);
+    let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
+    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(group_id = %LogHexId::group(&id), reason = %reason, "failed to remove TreeKEM snapshot while dropping local group state: {e}");
+        }
+    }
+    save_named_groups(state).await;
+    save_mls_groups(state).await;
+}
+
+async fn leave_treekem_group(
+    state: Arc<AppState>,
+    id: String,
+    local_agent: AgentId,
+    local_agent_hex: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
+    let (mut next, metadata_topic, event_group_id, name, disposition) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        let disposition = treekem_leave_disposition(info, local_agent, &local_agent_hex);
+        (
+            info.clone(),
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            info.name.clone(),
+            disposition,
+        )
+    };
+    match disposition {
+        TreeKemLeaveDisposition::CreatorMustDelete => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "creator must delete the group" })),
+            );
+        }
+        TreeKemLeaveDisposition::LocalOnlyDrop => {
+            drop_local_named_group_state(&state, &id, "treekem_non_active_leave").await;
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "left": name, "local_only": true })),
+            );
+        }
+        TreeKemLeaveDisposition::ActiveMember => {}
+    }
+
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
+    let commit = match next.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
+
+    let mut groups = state.named_groups.write().await;
+    groups.remove(&id);
+    drop(groups);
+    state.group_card_cache.write().await.remove(&id);
+    state.mls_groups.write().await.remove(&id);
+    state.treekem_groups.write().await.remove(&id);
+    let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
+    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(group_id = %LogHexId::group(&id), "failed to remove TreeKEM snapshot after leave: {e}");
+        }
+    }
+    save_named_groups(&state).await;
+    save_mls_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: event_group_id,
+        revision,
+        actor: local_agent_hex.clone(),
+        agent_id: local_agent_hex,
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        commit: Some(commit),
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_treekem_membership_event(&state, &event).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "left": name })),
+    )
+}
+
+async fn remove_treekem_named_group_member(
+    state: Arc<AppState>,
+    id: String,
+    agent_id_hex: String,
+    local_agent: AgentId,
+    local_agent_hex: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
+    let target_agent = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+
+    let (mut next, metadata_topic, event_group_id, target_kp_bytes) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if agent_id_hex == hex::encode(info.creator.as_bytes()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "cannot remove creator via member API; delete the group instead"
+                })),
+            );
+        }
+        if local_agent != info.creator {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "only the creator can remove other members"
+                })),
+            );
+        }
+        if !info.has_member(&agent_id_hex) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "member not found" })),
+            );
+        }
+        let Some(kp_b64) = info
+            .members_v2
+            .get(&agent_id_hex)
+            .and_then(|m| m.treekem_key_package_b64.clone())
+        else {
+            return (
+                StatusCode::FAILED_DEPENDENCY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "member is missing TreeKEM KeyPackage"
+                })),
+            );
+        };
+        let target_kp_bytes = match base64::engine::general_purpose::STANDARD.decode(kp_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "member TreeKEM KeyPackage is not valid base64"
+                    })),
+                );
+            }
+        };
+        (
+            info.clone(),
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            target_kp_bytes,
+        )
+    };
+
+    let group = {
+        let map = state.treekem_groups.read().await;
+        map.get(&id).cloned()
+    };
+    let Some(group) = group else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM group not loaded — restart or re-share required"
+            })),
+        );
+    };
+    let mut guard = group.lock().await;
+    let treekem_epoch = guard.epoch().saturating_add(1);
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
+    next.secret_epoch = treekem_epoch;
+    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    let commit = match next.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
+    let treekem_commit = match guard.remove_member_verified(target_agent, &target_kp_bytes) {
+        Ok(commit) => commit,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("TreeKEM remove_member failed: {e}")
+                })),
+            );
+        }
+    };
+    if guard.epoch() != treekem_epoch {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM epoch did not advance as expected"
+            })),
+        );
+    }
+    if let Err(e) =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
+    {
+        tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after removal: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "failed to persist secure group state"
+            })),
+        );
+    }
+    drop(guard);
+
+    let mut groups = state.named_groups.write().await;
+    groups.insert(id.clone(), next.clone());
+    drop(groups);
+    save_named_groups(&state).await;
+    save_mls_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: event_group_id,
+        revision,
+        actor: local_agent_hex,
+        agent_id: agent_id_hex.clone(),
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_epoch: Some(treekem_epoch),
+        commit: Some(commit),
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_treekem_membership_event(&state, &event).await;
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &next,
+        &event,
+        std::slice::from_ref(&agent_id_hex),
+    );
+    maybe_publish_group_card_after_state_change(&state, &id).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": id,
+            "removed_member": agent_id_hex,
+            "epoch": treekem_epoch,
+            "member_count": named_group_member_values(&next).len(),
+            "members": named_group_member_values(&next),
+        })),
+    )
+}
+
 /// GET /groups/:id/state — Phase D.3: inspect the stable-identity +
 /// state-commit chain view of a group.
 ///
 /// Returns `{ group_id, genesis, state_revision, state_hash,
 /// prev_state_hash, security_binding, withdrawn, roster_root,
-/// policy_hash, public_meta_hash }`. Available to any active member.
+/// policy_hash, public_meta_hash }`.
+///
+/// Available to anyone holding the group stub — active members and
+/// non-member card importers alike. Every field returned here is part of
+/// the group's **public projection**: it is exactly the data already
+/// published in the signed `GroupCard` (state_hash, revision,
+/// prev_state_hash) plus derived commitments (roster_root, policy_hash,
+/// public_meta_hash) that are hashes, never member content. The named-groups
+/// model (`docs/design/named-groups-full-model.md`) requires non-members to
+/// be able to view the public card and converge on the authoritative public
+/// state of a discoverable group; private member content (chat, files, KV,
+/// secure presence) is never exposed here. Non-discoverable groups cannot be
+/// stubbed by a non-member (no card to import), so they 404 above for
+/// outsiders rather than relying on this gate.
 async fn get_group_state(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -8801,13 +11931,6 @@ async fn get_group_state(
             Json(serde_json::json!({ "ok": false, "error": "group not found" })),
         );
     };
-    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    if !info.has_active_member(&local_hex) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "not a member" })),
-        );
-    }
     let roster_root = x0x::groups::compute_roster_root(&info.members_v2);
     let policy_hash = x0x::groups::compute_policy_hash(&info.policy);
     let public_meta_hash = x0x::groups::compute_public_meta_hash(&info.public_meta());
@@ -8951,6 +12074,12 @@ async fn leave_group(
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`). Held across the delegation to the
+    // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
+
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return (
@@ -8960,6 +12089,10 @@ async fn leave_group(
     };
 
     let is_creator = local_agent == info.creator;
+    if !is_creator && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        drop(groups);
+        return leave_treekem_group(state, id, local_agent, local_agent_hex).await;
+    }
     let name = info.name.clone();
     let metadata_topic = info.metadata_topic.clone();
     let event_group_id = info.stable_group_id().to_string();
@@ -8983,6 +12116,9 @@ async fn leave_group(
             commit: Some(commit),
         }
     } else {
+        if let Some(resp) = treekem_membership_unsupported(info) {
+            return resp;
+        }
         info.roster_revision = info.roster_revision.saturating_add(1);
         let revision = info.roster_revision;
         info.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
@@ -9000,13 +12136,36 @@ async fn leave_group(
             revision,
             actor: local_agent_hex.clone(),
             agent_id: local_agent_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
             commit: Some(commit),
         }
+    };
+    // Creator-delete: capture the roster before teardown so we can direct-
+    // deliver the GroupDeleted commit. The gossip publish below is a single
+    // eager broadcast, and we stop the metadata listener immediately after —
+    // leaving no anti-entropy source — so a member not currently grafted into
+    // the eager mesh would otherwise never learn of the deletion.
+    let delete_recipients: Vec<String> = if is_creator {
+        info.members_v2
+            .keys()
+            .filter(|member| member.as_str() != local_agent_hex)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
     };
     drop(groups);
 
     save_named_groups(&state).await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // Mirror the join/approve/reject path: also push the chain-linked
+    // GroupDeleted commit over the authenticated direct channel to each known
+    // member, since gossip cannot backfill it after teardown. Idempotent and
+    // re-validated on apply, so this is purely additive.
+    for recipient_hex in &delete_recipients {
+        spawn_named_group_event_delivery(&state, recipient_hex, &event);
+    }
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     state.named_groups.write().await.remove(&id);
@@ -9014,6 +12173,17 @@ async fn leave_group(
     prune_expired_group_cards(&mut cache, now_millis_u64());
     cache.remove(&id);
     state.mls_groups.write().await.remove(&id);
+    // ADR-0012: drop the live TreeKEM group and wipe its at-rest snapshot
+    // (which contains private key material) so a deleted secure group leaves
+    // nothing behind. No-op for GSS groups: no in-memory entry, and the
+    // snapshot file does not exist (NotFound is ignored).
+    state.treekem_groups.write().await.remove(&id);
+    let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
+    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(group_id = %LogHexId::group(&id), "failed to remove TreeKEM snapshot on delete: {e}");
+        }
+    }
     save_named_groups(&state).await;
     save_mls_groups(&state).await;
     stop_named_group_metadata_listener(&state, &id).await;
@@ -9097,6 +12267,10 @@ async fn update_named_group(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return (
@@ -9131,6 +12305,7 @@ async fn update_named_group(
     let updated_desc = info.description.clone();
     let metadata_topic = info.metadata_topic.clone();
     let event_group_id = info.stable_group_id().to_string();
+    let delivery_roster = info.clone();
     drop(groups);
     save_named_groups(&state).await;
 
@@ -9143,6 +12318,7 @@ async fn update_named_group(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -9231,6 +12407,7 @@ async fn update_group_policy(
     let metadata_topic = info.metadata_topic.clone();
     let event_group_id = info.stable_group_id().to_string();
     let policy_clone = info.policy.clone();
+    let delivery_roster = info.clone();
     drop(groups);
     save_named_groups(&state).await;
 
@@ -9242,6 +12419,7 @@ async fn update_group_policy(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -9317,6 +12495,9 @@ async fn update_member_role(
         );
     }
 
+    // Role changes are metadata-only: they do not add/remove TreeKEM leaves or
+    // require Commit/Welcome transport, so TreeKEM groups may apply them before
+    // Phase 3 membership transport lands.
     info.set_member_role(&agent_id_hex, new_role);
     info.roster_revision = info.roster_revision.saturating_add(1);
     let revision = info.roster_revision;
@@ -9331,6 +12512,7 @@ async fn update_member_role(
     };
     let metadata_topic = info.metadata_topic.clone();
     let event_group_id = info.stable_group_id().to_string();
+    let delivery_roster = info.clone();
     drop(groups);
     save_named_groups(&state).await;
 
@@ -9343,6 +12525,7 @@ async fn update_member_role(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -9359,6 +12542,11 @@ async fn ban_group_member(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`). Held across the delegation to the
+    // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return (
@@ -9368,6 +12556,10 @@ async fn ban_group_member(
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
+    }
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        drop(groups);
+        return ban_treekem_group_member(state, id, agent_id_hex, caller_hex).await;
     }
     if info.caller_role(&agent_id_hex) == Some(x0x::groups::GroupRole::Owner) {
         return (
@@ -9425,7 +12617,7 @@ async fn ban_group_member(
             }
             let Some(kem_b64) = recipient_kem_b64 else {
                 tracing::warn!(
-                    recipient = %recipient,
+                    recipient = %LogHexId::agent(&recipient),
                     "rekey: no KEM pubkey on record for remaining member; cannot seal"
                 );
                 continue;
@@ -9477,9 +12669,169 @@ async fn ban_group_member(
         actor: caller_hex,
         agent_id: agent_id_hex,
         secret_epoch: if is_encrypted { Some(new_epoch) } else { None },
+        treekem_commit_b64: None,
+        treekem_epoch: None,
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    maybe_publish_group_card_after_state_change(&state, &id).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "revision": revision })),
+    )
+}
+
+async fn ban_treekem_group_member(
+    state: Arc<AppState>,
+    id: String,
+    agent_id_hex: String,
+    caller_hex: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
+    let target_agent = match parse_agent_id_hex(&agent_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            );
+        }
+    };
+    let (mut next, metadata_topic, event_group_id, target_kp_bytes) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+            return e;
+        }
+        if info.caller_role(&agent_id_hex) == Some(x0x::groups::GroupRole::Owner) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "ok": false, "error": "cannot ban owner" })),
+            );
+        }
+        let Some(kp_b64) = info
+            .members_v2
+            .get(&agent_id_hex)
+            .and_then(|m| m.treekem_key_package_b64.clone())
+        else {
+            return (
+                StatusCode::FAILED_DEPENDENCY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "member is missing TreeKEM KeyPackage"
+                })),
+            );
+        };
+        let target_kp_bytes = match base64::engine::general_purpose::STANDARD.decode(kp_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "member TreeKEM KeyPackage is not valid base64"
+                    })),
+                );
+            }
+        };
+        (
+            info.clone(),
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            target_kp_bytes,
+        )
+    };
+    let group = {
+        let map = state.treekem_groups.read().await;
+        map.get(&id).cloned()
+    };
+    let Some(group) = group else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(
+                serde_json::json!({ "ok": false, "error": "TreeKEM group not loaded — restart or re-share required" }),
+            ),
+        );
+    };
+    let mut guard = group.lock().await;
+    let treekem_epoch = guard.epoch().saturating_add(1);
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.ban_member(&agent_id_hex, Some(caller_hex.clone()));
+    next.secret_epoch = treekem_epoch;
+    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    let commit = match next.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
+    let treekem_commit = match guard.remove_member_verified(target_agent, &target_kp_bytes) {
+        Ok(commit) => commit,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("TreeKEM ban removal failed: {e}") }),
+                ),
+            );
+        }
+    };
+    if guard.epoch() != treekem_epoch {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({ "ok": false, "error": "TreeKEM epoch did not advance as expected" }),
+            ),
+        );
+    }
+    if let Err(e) =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
+    {
+        tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after ban: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({ "ok": false, "error": "failed to persist secure group state" }),
+            ),
+        );
+    }
+    drop(guard);
+    let mut groups = state.named_groups.write().await;
+    groups.insert(id.clone(), next.clone());
+    drop(groups);
+    save_named_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::MemberBanned {
+        group_id: event_group_id,
+        revision,
+        actor: caller_hex,
+        agent_id: agent_id_hex.clone(),
+        secret_epoch: None,
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_epoch: Some(treekem_epoch),
+        commit: Some(commit),
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_treekem_membership_event(&state, &event).await;
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &next,
+        &event,
+        std::slice::from_ref(&agent_id_hex),
+    );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -9512,7 +12864,15 @@ async fn unban_group_member(
             Json(serde_json::json!({ "ok": false, "error": "member is not banned" })),
         );
     }
-    info.unban_member(&agent_id_hex);
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        if let Some(member) = info.members_v2.get_mut(&agent_id_hex) {
+            member.state = x0x::groups::GroupMemberState::Removed;
+            member.updated_at = now_ms;
+            member.removed_by = None;
+        }
+    } else {
+        info.unban_member(&agent_id_hex);
+    }
     info.roster_revision = info.roster_revision.saturating_add(1);
     let revision = info.roster_revision;
     let commit = match info.seal_commit(signing_kp, now_ms) {
@@ -9623,12 +12983,44 @@ async fn create_join_request(
             );
         }
 
-        let request = x0x::groups::JoinRequest::new(
+        let mut request = x0x::groups::JoinRequest::new(
             info.mls_group_id.clone(),
             caller_hex.clone(),
             req_body.message.clone(),
             now_ms,
         );
+        if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+            use base64::Engine as _;
+            let group_id_bytes = match hex::decode(&info.mls_group_id) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            serde_json::json!({ "ok": false, "error": format!("invalid TreeKEM group id: {e}") }),
+                        ),
+                    );
+                }
+            };
+            let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+            let prepared = match x0x::mls::TreeKemMlsGroup::prepare_member(
+                state.agent.agent_id(),
+                &seed,
+            ) {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            serde_json::json!({ "ok": false, "error": format!("failed to prepare TreeKEM KeyPackage: {e}") }),
+                        ),
+                    );
+                }
+            };
+            request.treekem_key_package_b64 = Some(
+                base64::engine::general_purpose::STANDARD.encode(prepared.key_package_bytes()),
+            );
+        }
         info.join_requests
             .insert(request.request_id.clone(), request.clone());
         let commit = match info.seal_commit(signing_kp, now_ms) {
@@ -9641,13 +13033,10 @@ async fn create_join_request(
             }
         };
         let creator_hex = hex::encode(info.creator.as_bytes());
-        (
-            info.metadata_topic.clone(),
-            info.stable_group_id().to_string(),
-            request,
-            creator_hex,
-            commit,
-        )
+        let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        drop(groups);
+        (metadata_topic, event_group_id, request, creator_hex, commit)
     };
 
     save_named_groups(&state).await;
@@ -9664,6 +13053,7 @@ async fn create_join_request(
         message: request.message.clone(),
         ts: request.created_at,
         requester_kem_public_key_b64: Some(requester_kem_b64),
+        treekem_key_package_b64: request.treekem_key_package_b64.clone(),
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -9686,6 +13076,20 @@ async fn approve_join_request(
     Path((id, request_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // Serialize against concurrent membership applies + other API mutators (see
+    // `AppState::group_membership_locks`). Held across the delegation to the
+    // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
+    {
+        let groups = state.named_groups.read().await;
+        if let Some(info) = groups.get(&id) {
+            if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                drop(groups);
+                return approve_treekem_join_request(state, id, request_id, caller_hex).await;
+            }
+        }
+    }
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
@@ -9699,6 +13103,9 @@ async fn approve_join_request(
         };
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
             return e;
+        }
+        if let Some(resp) = treekem_membership_unsupported(info) {
+            return resp;
         }
         let Some(req) = info.join_requests.get_mut(&request_id) else {
             return (
@@ -9732,11 +13139,15 @@ async fn approve_join_request(
                 );
             }
         };
+        let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        let revision = info.roster_revision;
+        drop(groups);
         (
-            info.metadata_topic.clone(),
-            info.stable_group_id().to_string(),
+            metadata_topic,
+            event_group_id,
             requester_hex,
-            info.roster_revision,
+            revision,
             commit,
         )
     };
@@ -9784,14 +13195,14 @@ async fn approve_join_request(
             }
             (None, _) => {
                 tracing::warn!(
-                    group_id = %id,
+                    group_id = %LogHexId::group(&id),
                     "approval: no group shared secret yet; requester will receive via next rekey"
                 );
             }
             (_, None) => {
                 tracing::warn!(
-                    group_id = %id,
-                    requester = %requester_hex,
+                    group_id = %LogHexId::group(&id),
+                    requester = %LogHexId::agent(&requester_hex),
                     "approval: requester KEM pubkey unknown; cannot seal secure share"
                 );
             }
@@ -9835,10 +13246,210 @@ async fn approve_join_request(
         request_id,
         revision,
         actor: caller_hex,
-        requester_agent_id: requester_hex,
+        requester_agent_id: requester_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery(&state, &requester_hex, &event);
+    maybe_publish_group_card_after_state_change(&state, &id).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "revision": revision })),
+    )
+}
+
+async fn approve_treekem_join_request(
+    state: Arc<AppState>,
+    id: String,
+    request_id: String,
+    caller_hex: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
+
+    let (mut next, metadata_topic, event_group_id, requester_hex, requester_id, kp_bytes) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+            return e;
+        }
+        let Some(req) = info.join_requests.get(&request_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "request not found" })),
+            );
+        };
+        if !req.is_pending() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "ok": false, "error": "request is not pending" })),
+            );
+        }
+        if info.is_banned(&req.requester_agent_id) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "ok": false, "error": "requester is banned" })),
+            );
+        }
+        let requester_id = match parse_agent_id_hex(&req.requester_agent_id) {
+            Ok(id) => id,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": e })),
+                );
+            }
+        };
+        let Some(kp_b64) = req.treekem_key_package_b64.clone() else {
+            return (
+                StatusCode::FAILED_DEPENDENCY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "request is missing TreeKEM KeyPackage"
+                })),
+            );
+        };
+        let kp_bytes = match base64::engine::general_purpose::STANDARD.decode(kp_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "request TreeKEM KeyPackage is not valid base64"
+                    })),
+                );
+            }
+        };
+        (
+            info.clone(),
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            req.requester_agent_id.clone(),
+            requester_id,
+            kp_bytes,
+        )
+    };
+
+    let group = {
+        let map = state.treekem_groups.read().await;
+        map.get(&id).cloned()
+    };
+    let Some(group) = group else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM group not loaded — restart or re-share required"
+            })),
+        );
+    };
+    let mut guard = group.lock().await;
+    let treekem_epoch = guard.epoch().saturating_add(1);
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    if let Some(req) = next.join_requests.get_mut(&request_id) {
+        req.status = x0x::groups::JoinRequestStatus::Approved;
+        req.reviewed_by = Some(caller_hex.clone());
+        req.reviewed_at = Some(now_ms);
+    }
+    next.add_member(
+        requester_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(caller_hex.clone()),
+        None,
+    );
+    next.set_member_treekem_key_package(
+        &requester_hex,
+        base64::engine::general_purpose::STANDARD.encode(&kp_bytes),
+    );
+    next.secret_epoch = treekem_epoch;
+    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    let revision = next.roster_revision;
+    let commit = match next.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
+    let out = match guard.add_member(requester_id, &kp_bytes) {
+        Ok(out) => out,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("TreeKEM add_member failed: {e}")
+                })),
+            );
+        }
+    };
+    if guard.epoch() != treekem_epoch {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM epoch did not advance as expected"
+            })),
+        );
+    }
+    if let Err(e) =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
+    {
+        tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after approval: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "failed to persist secure group state"
+            })),
+        );
+    }
+    let treekem_commit = out.commit;
+    let treekem_welcome = out.welcome;
+    drop(guard);
+
+    let mut groups = state.named_groups.write().await;
+    groups.insert(id.clone(), next.clone());
+    drop(groups);
+    save_named_groups(&state).await;
+
+    let welcome_ref =
+        stage_treekem_welcome(&state, &event_group_id, &requester_hex, treekem_welcome).await;
+    let event = NamedGroupMetadataEvent::JoinRequestApproved {
+        group_id: event_group_id,
+        request_id,
+        revision,
+        actor: caller_hex,
+        requester_agent_id: requester_hex.clone(),
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_welcome_b64: None,
+        welcome_ref: Some(welcome_ref),
+        treekem_epoch: Some(treekem_epoch),
+        commit: Some(commit),
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_treekem_membership_event(&state, &event).await;
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &next,
+        &event,
+        std::slice::from_ref(&requester_hex),
+    );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -9892,12 +13503,10 @@ async fn reject_join_request(
                 );
             }
         };
-        (
-            info.metadata_topic.clone(),
-            info.stable_group_id().to_string(),
-            requester_hex,
-            commit,
-        )
+        let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        drop(groups);
+        (metadata_topic, event_group_id, requester_hex, commit)
     };
 
     save_named_groups(&state).await;
@@ -9906,10 +13515,11 @@ async fn reject_join_request(
         group_id: event_group_id,
         request_id,
         actor: caller_hex,
-        requester_agent_id: requester_hex,
+        requester_agent_id: requester_hex.clone(),
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery(&state, &requester_hex, &event);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
@@ -9961,12 +13571,10 @@ async fn cancel_join_request(
                 );
             }
         };
-        (
-            info.metadata_topic.clone(),
-            info.stable_group_id().to_string(),
-            requester_hex,
-            commit,
-        )
+        let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        drop(groups);
+        (metadata_topic, event_group_id, requester_hex, commit)
     };
 
     save_named_groups(&state).await;
@@ -10427,7 +14035,13 @@ struct SecureEncryptRequest {
 #[derive(Debug, Deserialize)]
 struct SecureDecryptRequest {
     ciphertext_b64: String,
+    /// GSS plane only: per-message nonce. Unused for TreeKEM, whose
+    /// `ApplicationCiphertext` carries its own nonce.
+    #[serde(default)]
     nonce_b64: String,
+    /// GSS plane only: ciphertext epoch (checked against the local epoch).
+    /// Unused for TreeKEM, whose epoch is embedded in the ciphertext.
+    #[serde(default)]
     secret_epoch: u64,
 }
 
@@ -10438,6 +14052,174 @@ struct SecureDecryptRequest {
 /// cross-daemon encrypt/decrypt with rekey-on-ban, but does NOT provide the
 /// per-message forward secrecy that full MLS TreeKEM would. Documented as
 /// Phase D.2 scope.
+/// Guard for membership-mutating named-group endpoints that still require a
+/// TreeKEM-specific transport shape (direct invites/adds and ban/unban).
+///
+/// Request-access joins and creator removals use real TreeKEM Commit/Welcome or
+/// Commit transport. The remaining guarded handlers still run the legacy GSS
+/// rekey path (`rotate_shared_secret` + per-recipient reseal), which would
+/// silently re-introduce a shared secret and relabel the plane. Refuse those
+/// endpoints loudly until they provide KeyPackage/Welcome or removal Commit
+/// inputs.
+fn treekem_membership_unsupported(
+    info: &x0x::groups::GroupInfo,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        Some((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM secure-group membership flow is not supported by this endpoint; use request-access approval/removal transport"
+            })),
+        ))
+    } else {
+        None
+    }
+}
+
+fn treekem_metadata_event_requires_phase3(_event: &NamedGroupMetadataEvent) -> bool {
+    false
+}
+
+/// Encrypt `payload_b64` for a real-TreeKEM group (ADR-0012). The live group's
+/// send-ratchet advances, so the snapshot is persisted before returning to
+/// prevent send-generation (nonce) reuse across a restart. Returns the
+/// self-describing `ApplicationCiphertext` as `ciphertext_b64`.
+async fn treekem_group_encrypt(
+    state: &AppState,
+    group_id_hex: &str,
+    payload_b64: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+    let plaintext = match base64::engine::general_purpose::STANDARD.decode(payload_b64) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid base64 payload" })),
+            );
+        }
+    };
+    let group = {
+        let map = state.treekem_groups.read().await;
+        match map.get(group_id_hex) {
+            Some(g) => Arc::clone(g),
+            None => {
+                return (
+                    StatusCode::FAILED_DEPENDENCY,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "TreeKEM group not loaded — restart or re-share required"
+                    })),
+                );
+            }
+        }
+    };
+    let mut guard = group.lock().await;
+    let ciphertext = match guard.encrypt_message(&plaintext) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("treekem encrypt failed: {e}") }),
+                ),
+            );
+        }
+    };
+    // Persist the advanced ratchet state before returning. Skipping a burned
+    // generation on error is harmless (no reuse); a stale on-disk snapshot is
+    // not, so a persist failure fails the request.
+    if let Err(e) = persist_treekem_snapshot_bound(state, group_id_hex, &guard).await {
+        tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot after encrypt: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({ "ok": false, "error": "failed to persist secure group state" }),
+            ),
+        );
+    }
+    let epoch = guard.epoch();
+    drop(guard);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+            "secret_epoch": epoch,
+            "secure_plane": "treekem",
+        })),
+    )
+}
+
+/// Decrypt a real-TreeKEM `ApplicationCiphertext` (ADR-0012). The per-sender
+/// replay window advances, so the snapshot is persisted to keep replay
+/// protection across a restart (best-effort: a persist failure is logged but
+/// does not invalidate the already-recovered plaintext).
+async fn treekem_group_decrypt(
+    state: &AppState,
+    group_id_hex: &str,
+    ciphertext_b64: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+    let ciphertext = match base64::engine::general_purpose::STANDARD.decode(ciphertext_b64) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid base64 ciphertext" })),
+            );
+        }
+    };
+    let group = {
+        let map = state.treekem_groups.read().await;
+        match map.get(group_id_hex) {
+            Some(g) => Arc::clone(g),
+            None => {
+                return (
+                    StatusCode::FAILED_DEPENDENCY,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "TreeKEM group not loaded — restart or re-share required"
+                    })),
+                );
+            }
+        }
+    };
+    let mut guard = group.lock().await;
+    let plaintext = match guard.decrypt_message(&ciphertext) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("treekem decrypt failed: {e}") }),
+                ),
+            );
+        }
+    };
+    // Persisting the receive replay window is best-effort. A failure here may
+    // permit the same ciphertext to be accepted again after restart, but the
+    // plaintext has already been validly recovered and retrying in-process would
+    // hit the replay guard. Unlike send-side snapshot failure, this is not a
+    // nonce-reuse risk, so return the plaintext and surface the persistence
+    // problem in logs.
+    if let Err(e) = persist_treekem_snapshot_bound(state, group_id_hex, &guard).await {
+        tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot after decrypt: {e}");
+    }
+    let epoch = guard.epoch();
+    drop(guard);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "payload_b64": base64::engine::general_purpose::STANDARD.encode(&plaintext),
+            "secret_epoch": epoch,
+            "secure_plane": "treekem",
+        })),
+    )
+}
+
 async fn secure_group_encrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -10465,6 +14247,12 @@ async fn secure_group_encrypt(
                 "error": "group is not MlsEncrypted — use public send instead"
             })),
         );
+    }
+    // ADR-0012: real-TreeKEM groups encrypt via the live group's ratchet, not
+    // the GSS shared secret. Dispatch on the group's plane.
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        drop(groups);
+        return treekem_group_encrypt(state.as_ref(), &id, &req.payload_b64).await;
     }
     let Some(key) = info.secure_message_key() else {
         return (
@@ -10561,6 +14349,13 @@ async fn secure_group_decrypt(
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "ok": false, "error": "not a member" })),
         );
+    }
+    // ADR-0012: real-TreeKEM groups decrypt via the live group's ratchet. A
+    // removed member's leaf is gone from the live group, so decryption of a
+    // post-removal epoch fails there — that is the FS/PCS guarantee.
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        drop(groups);
+        return treekem_group_decrypt(state.as_ref(), &id, &req.ciphertext_b64).await;
     }
     let Some(local_secret) = info.shared_secret.clone() else {
         return (
@@ -11047,20 +14842,159 @@ async fn update_task(
 /// The embedded GUI HTML, compiled into the binary.
 const GUI_HTML: &str = include_str!("../gui/x0x-gui.html");
 
-/// GET /gui — serve the embedded GUI with API token injected.
-///
-/// Injects `const X0X_TOKEN='<token>';` into the HTML so the GUI can
-/// authenticate API calls and WebSocket connections automatically.
-async fn serve_gui(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let injected = format!("<script>const X0X_TOKEN='{}';</script>", state.api_token);
-    // Replace the dedicated marker rather than relying on the first <script> tag.
-    let html = GUI_HTML.replace("<!-- X0X_TOKEN_INJECTION_POINT -->", &injected);
-    axum::response::Html(html)
+/// GET /gui — serve the embedded GUI shell.
+async fn serve_gui() -> impl IntoResponse {
+    axum::response::Html(render_gui_html())
+}
+
+fn render_gui_html() -> String {
+    GUI_HTML.replace("<!-- X0X_TOKEN_INJECTION_POINT -->", "")
 }
 
 // ---------------------------------------------------------------------------
 // KvStore handlers
 // ---------------------------------------------------------------------------
+
+fn encode_kv_store_delta_direct_payload(
+    store_id: &str,
+    peer_id: saorsa_gossip_types::PeerId,
+    delta: &x0x::kv::KvStoreDelta,
+) -> serde_json::Result<Vec<u8>> {
+    let msg = KvStoreDirectDelta {
+        store_id: store_id.to_string(),
+        peer_id,
+        delta: delta.clone(),
+    };
+    let json = serde_json::to_vec(&msg)?;
+    let mut payload = Vec::with_capacity(KV_STORE_DELTA_DM_PREFIX.len() + json.len());
+    payload.extend_from_slice(KV_STORE_DELTA_DM_PREFIX);
+    payload.extend_from_slice(&json);
+    Ok(payload)
+}
+
+fn kv_store_delta_direct_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = direct_message_send_config();
+    config.require_gossip = true;
+    config.require_gossip_ack = true;
+    config
+}
+
+async fn kv_store_delta_direct_recipients(state: &AppState) -> Vec<String> {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let contacts = state.contacts.read().await;
+    contacts
+        .list()
+        .into_iter()
+        .filter_map(|contact| {
+            let recipient = hex::encode(contact.agent_id.as_bytes());
+            if recipient == local_agent_hex || contact.trust_level == TrustLevel::Blocked {
+                return None;
+            }
+            let caps = contact.dm_capabilities.as_ref()?;
+            if !caps.gossip_inbox || caps.kem_public_key.is_empty() {
+                return None;
+            }
+            Some(recipient)
+        })
+        .collect()
+}
+
+fn spawn_kv_store_delta_delivery_one(
+    state: &AppState,
+    recipient_hex: &str,
+    store_id: &str,
+    peer_id: saorsa_gossip_types::PeerId,
+    delta: &x0x::kv::KvStoreDelta,
+    delay: Option<Duration>,
+) {
+    let recipient = match parse_agent_id_hex(recipient_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                recipient = %LogHexId::agent(&recipient_hex),
+                "cannot direct-deliver kv-store delta: invalid recipient id: {e}"
+            );
+            return;
+        }
+    };
+    let payload = match encode_kv_store_delta_direct_payload(store_id, peer_id, delta) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(
+                store_id,
+                "failed to serialize kv-store delta for direct delivery: {e}"
+            );
+            return;
+        }
+    };
+    let agent = Arc::clone(&state.agent);
+    let recipient_label = recipient_hex.to_string();
+    let store_label = store_id.to_string();
+    tokio::spawn(async move {
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Err(e) = agent
+            .send_direct_with_config(&recipient, payload, kv_store_delta_direct_delivery_config())
+            .await
+        {
+            tracing::warn!(
+                store_id = %store_label,
+                recipient = %LogHexId::agent(&recipient_label),
+                "failed to direct-deliver kv-store delta: {e}"
+            );
+        }
+    });
+}
+
+fn spawn_kv_store_delta_delivery(
+    state: &AppState,
+    recipients: Vec<String>,
+    store_id: &str,
+    peer_id: saorsa_gossip_types::PeerId,
+    delta: &x0x::kv::KvStoreDelta,
+) {
+    for recipient in recipients {
+        spawn_kv_store_delta_delivery_one(state, &recipient, store_id, peer_id, delta, None);
+        spawn_kv_store_delta_delivery_one(
+            state,
+            &recipient,
+            store_id,
+            peer_id,
+            delta,
+            Some(GROUP_BACKGROUND_PUBLISH_DELAY),
+        );
+    }
+}
+
+async fn apply_direct_kv_store_delta(
+    state: &AppState,
+    sender: x0x::identity::AgentId,
+    delta_msg: KvStoreDirectDelta,
+) {
+    let store_id = delta_msg.store_id.clone();
+    let handle = {
+        let stores = state.kv_stores.read().await;
+        stores.get(&store_id).cloned()
+    };
+    let Some(handle) = handle else {
+        tracing::debug!(
+            store_id = %store_id,
+            sender = %hex::encode(sender.as_bytes()),
+            "ignoring direct kv-store delta for unjoined store"
+        );
+        return;
+    };
+    if let Err(e) = handle
+        .apply_remote_delta(delta_msg.peer_id, &delta_msg.delta, Some(sender))
+        .await
+    {
+        tracing::warn!(
+            store_id = %store_id,
+            "failed to apply direct kv-store delta: {e}"
+        );
+    }
+}
 
 /// Request body for POST /stores.
 #[derive(Debug, Deserialize)]
@@ -11182,12 +15116,15 @@ async fn put_kv_value(
     Path((id, key)): Path<(String, String)>,
     Json(req): Json<PutValueRequest>,
 ) -> impl IntoResponse {
-    let stores = state.kv_stores.read().await;
-    let Some(handle) = stores.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "store not found" })),
-        );
+    let handle = {
+        let stores = state.kv_stores.read().await;
+        let Some(handle) = stores.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "store not found" })),
+            );
+        };
+        handle.clone()
     };
 
     use base64::Engine;
@@ -11205,8 +15142,12 @@ async fn put_kv_value(
         .content_type
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    match handle.put(key, value, content_type).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+    match handle.put_with_delta(key, value, content_type).await {
+        Ok(delta) => {
+            let recipients = kv_store_delta_direct_recipients(&state).await;
+            spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
         Err(e) => {
             let status = if format!("{e}").contains("value too large") {
                 StatusCode::PAYLOAD_TOO_LARGE
@@ -11268,16 +15209,23 @@ async fn delete_kv_value(
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let stores = state.kv_stores.read().await;
-    let Some(handle) = stores.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "error": "store not found" })),
-        );
+    let handle = {
+        let stores = state.kv_stores.read().await;
+        let Some(handle) = stores.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "store not found" })),
+            );
+        };
+        handle.clone()
     };
 
-    match handle.remove(&key).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+    match handle.remove_with_delta(&key).await {
+        Ok(delta) => {
+            let recipients = kv_store_delta_direct_recipients(&state).await;
+            spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
@@ -11590,6 +15538,9 @@ async fn direct_send(
     send_config.prefer_raw_quic_if_connected = req.prefer_raw_quic_if_connected;
     send_config.stop_fallback_on_raw_error = req.stop_fallback_on_raw_error;
     send_config.require_gossip = req.require_gossip;
+    if let Some(require_gossip_ack) = req.require_gossip_ack {
+        send_config.require_gossip_ack = require_gossip_ack;
+    }
     if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
         send_config.raw_quic_receive_ack_timeout = Some(std::time::Duration::from_millis(
             raw_ack_ms.clamp(100, 30_000),
@@ -11608,7 +15559,7 @@ async fn direct_send(
                 x0x::dm::DmPath::RawQuic => "raw_quic",
                 x0x::dm::DmPath::RawQuicAcked => "raw_quic_acked",
             };
-            tracing::info!(
+            tracing::debug!(
                 target: "dm.trace",
                 stage = "accepted_at_api",
                 request_id = %hex::encode(receipt.request_id),
@@ -11759,7 +15710,7 @@ async fn direct_events_sse(
                     let Some(msg) = maybe_msg else {
                         break;
                     };
-                    tracing::info!(
+                    tracing::debug!(
                         target: "dm.trace",
                         stage = "inbound_sse_yielded",
                         sender = %hex::encode(msg.sender.as_bytes()),
@@ -12434,17 +16385,21 @@ async fn get_constitution_json() -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 /// GET /upgrade — check for available updates.
-async fn check_upgrade(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn check_upgrade(State(state): State<Arc<AppState>>) -> Response {
     if !state.update_config.enabled {
-        return (
+        return upgrade_response(
             StatusCode::OK,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "ok": true,
                 "update_available": false,
                 "current_version": env!("CARGO_PKG_VERSION"),
                 "reason": "updates disabled"
-            })),
+            }),
         );
+    }
+
+    if let Some(response) = cached_upgrade_response(state.as_ref()).await {
+        return response;
     }
 
     let monitor =
@@ -12452,39 +16407,91 @@ async fn check_upgrade(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             Ok(m) => m.with_include_prereleases(state.update_config.include_prereleases),
             Err(e) => {
                 tracing::error!("upgrade monitor creation failed: {e}");
-                return (
+                return store_upgrade_response(
+                    state.as_ref(),
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "ok": false, "error": "upgrade check unavailable" })),
-                );
+                    serde_json::json!({ "ok": false, "error": "upgrade check unavailable" }),
+                    UPGRADE_CHECK_ERROR_CACHE_TTL,
+                )
+                .await;
             }
         };
 
     match monitor.check_for_updates().await {
-        Ok(Some(release)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(Some(release)) => {
+            store_upgrade_response(
+                state.as_ref(),
+                StatusCode::OK,
+                serde_json::json!({
                 "ok": true,
                 "update_available": true,
                 "version": release.manifest.version,
                 "current_version": env!("CARGO_PKG_VERSION")
-            })),
-        ),
-        Ok(None) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+                }),
+                UPGRADE_CHECK_CACHE_TTL,
+            )
+            .await
+        }
+        Ok(None) => {
+            store_upgrade_response(
+                state.as_ref(),
+                StatusCode::OK,
+                serde_json::json!({
                 "ok": true,
                 "update_available": false,
                 "current_version": env!("CARGO_PKG_VERSION")
-            })),
-        ),
+                }),
+                UPGRADE_CHECK_CACHE_TTL,
+            )
+            .await
+        }
         Err(e) => {
             tracing::error!("upgrade check failed: {e}");
-            (
+            store_upgrade_response(
+                state.as_ref(),
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": "upgrade check failed" })),
+                serde_json::json!({ "ok": false, "error": "upgrade check failed" }),
+                UPGRADE_CHECK_ERROR_CACHE_TTL,
             )
+            .await
         }
     }
+}
+
+fn upgrade_response(status: StatusCode, body: serde_json::Value) -> Response {
+    (status, Json(body)).into_response()
+}
+
+async fn cached_upgrade_response(state: &AppState) -> Option<Response> {
+    let cached = {
+        let cache = state.upgrade_check_cache.lock().await;
+        cache
+            .as_ref()
+            .filter(|cached| cached.checked_at.elapsed() < cached.ttl)
+            .cloned()
+    };
+
+    cached.map(|cached| upgrade_response(cached.status, cached.body))
+}
+
+async fn store_upgrade_response(
+    state: &AppState,
+    status: StatusCode,
+    body: serde_json::Value,
+    ttl: Duration,
+) -> Response {
+    let cached = CachedUpgradeCheck {
+        checked_at: Instant::now(),
+        status,
+        body: body.clone(),
+        ttl,
+    };
+    {
+        let mut cache = state.upgrade_check_cache.lock().await;
+        *cache = Some(cached);
+    }
+
+    upgrade_response(status, body)
 }
 
 /// POST /upgrade/apply — fetch the latest signed manifest and apply it.
@@ -12849,6 +16856,12 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
             let connection_pool = network.connection_pool_diagnostics();
             let now = Instant::now();
             let mut per_peer_transport = Vec::new();
+            // ADR-0011 §4: accumulate path-quality signals across peers so the
+            // transport-environment assessment can spot a constrained-MTU /
+            // black-holed path even when only some peers are affected.
+            let mut min_observed_mtu: Option<u16> = None;
+            let mut lost_plpmtud_probes_total: u64 = 0;
+            let mut black_holes_total: u64 = 0;
             for peer_id in network.connected_peers().await {
                 let health = network.connection_health(peer_id).await;
                 let transport_stats = network.connection_transport_stats(peer_id).await;
@@ -12877,7 +16890,13 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                     None => (false, None, None, None, None, None, None),
                 };
                 let row = match transport_stats {
-                    Some(ts) => serde_json::json!({
+                    Some(ts) => {
+                        if let Some(mtu) = ts.current_mtu {
+                            min_observed_mtu = Some(min_observed_mtu.map_or(mtu, |m| m.min(mtu)));
+                        }
+                        lost_plpmtud_probes_total += ts.lost_plpmtud_probes;
+                        black_holes_total += ts.black_holes_detected;
+                        serde_json::json!({
                         "peer_id": hex::encode(peer_id.0),
                         "transport": "quic",
                         "stats_available": true,
@@ -12906,7 +16925,8 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                         "last_received_ago_ms": ts.last_received_ago_ms.or(last_received_ago_ms),
                         "idle_for_ms": ts.idle_for_ms.or(idle_for_ms),
                         "close_reason": close_reason,
-                    }),
+                        })
+                    }
                     None => serde_json::json!({
                         "peer_id": hex::encode(peer_id.0),
                         "transport": "quic",
@@ -12940,6 +16960,17 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                 };
                 per_peer_transport.push(row);
             }
+            // ADR-0011 §4: full-tunnel-VPN / constrained-MTU / CGNAT assessment.
+            let transport_environment = x0x::connectivity::assess_transport_environment(
+                &x0x::connectivity::TransportObservation {
+                    external_addrs: ns.external_addrs.clone(),
+                    can_receive_direct: Some(ns.can_receive_direct),
+                    connected_peers: ns.connected_peers,
+                    min_observed_mtu,
+                    lost_plpmtud_probes: lost_plpmtud_probes_total,
+                    black_holes_detected: black_holes_total,
+                },
+            );
             let snapshot = serde_json::json!({
                 "ok": true,
                 "peer_id": hex::encode(ns.peer_id.0),
@@ -12996,6 +17027,8 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                     "bundle_send_total": gso.as_ref().map(|g| g.bundle_send_total),
                     "bundle_partial_send": gso.as_ref().map(|g| g.bundle_partial_send),
                 },
+                // ADR-0011 §4: structured full-tunnel-VPN / constrained-MTU signal.
+                "transport_environment": transport_environment,
             });
             (StatusCode::OK, Json(snapshot))
         }
@@ -13040,6 +17073,7 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
         Some(snap) => {
             let pubsub_stages =
                 augment_pubsub_stage_diagnostics(state.agent.gossip_pubsub_stage_stats());
+            let (agents, machines, users) = state.agent.discovery_cache_entry_counts().await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -13048,6 +17082,11 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
                 "pubsub_stages": pubsub_stages,
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
+                "discovery_cache_entries": {
+                    "agents": agents,
+                    "machines": machines,
+                    "users": users,
+                },
                 })),
             )
         }
@@ -13117,6 +17156,7 @@ async fn dm_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "per_peer": per_peer,
             "subscriber_count": subscriber_count,
             "subscriber_capacity": subscriber_capacity,
+            "capability_store_entries": state.agent.capability_store().len(),
         })),
     )
 }
@@ -13391,7 +17431,7 @@ async fn handle_ws_connection(
         id: session_id.clone(),
         subscribed_topics: HashSet::new(),
         receives_direct: direct_mode,
-        forwarder_handles: Vec::new(),
+        topic_forwarders: HashMap::new(),
     };
     state
         .ws_sessions
@@ -13486,10 +17526,12 @@ async fn handle_ws_connection(
     // Cleanup: remove session, abort per-session forwarders
     let subscribed_topics =
         if let Some(session) = state.ws_sessions.write().await.remove(&session_id) {
-            for h in session.forwarder_handles {
-                h.abort();
+            let mut subscribed_topics = session.subscribed_topics;
+            for (topic, handle) in session.topic_forwarders {
+                subscribed_topics.insert(topic);
+                handle.abort();
             }
-            session.subscribed_topics
+            subscribed_topics
         } else {
             HashSet::new()
         };
@@ -13553,7 +17595,19 @@ async fn handle_ws_command(
         WsInbound::Subscribe { topics } => {
             // Shared fan-out: one gossip subscription per topic, broadcast to all WS sessions
             let mut handles = Vec::new();
+            let already_subscribed = {
+                let sessions = state.ws_sessions.read().await;
+                let Some(session) = sessions.get(session_id) else {
+                    return;
+                };
+                session.subscribed_topics.clone()
+            };
+            let mut requested_topics = HashSet::new();
             for topic in &topics {
+                if !requested_topics.insert(topic.clone()) || already_subscribed.contains(topic) {
+                    continue;
+                }
+
                 let broadcast_rx = {
                     let mut ws_topics = state.ws_topics.write().await;
                     if let Some(ts) = ws_topics.get_mut(topic) {
@@ -13615,25 +17669,54 @@ async fn handle_ws_command(
                         }
                     }
                 });
-                handles.push(handle);
+                handles.push((topic.clone(), handle));
             }
 
             // Store handles in session for cleanup
-            if let Some(session) = state.ws_sessions.write().await.get_mut(session_id) {
-                session.subscribed_topics.extend(topics.iter().cloned());
-                session.forwarder_handles.extend(handles);
+            let mut orphaned_handles = Vec::new();
+            {
+                let mut sessions = state.ws_sessions.write().await;
+                if let Some(session) = sessions.get_mut(session_id) {
+                    for (topic, handle) in handles {
+                        session.subscribed_topics.insert(topic.clone());
+                        if let Some(previous) = session.topic_forwarders.insert(topic, handle) {
+                            previous.abort();
+                        }
+                    }
+                } else {
+                    orphaned_handles = handles;
+                }
+            }
+            for (topic, handle) in orphaned_handles {
+                handle.abort();
+                cleanup_ws_topic_if_empty(state, &topic, session_id).await;
             }
 
             let _ = tx.send(WsOutbound::Subscribed { topics });
         }
 
         WsInbound::Unsubscribe { topics } => {
+            let mut handles = Vec::new();
+            let mut topics_to_cleanup = Vec::new();
             if let Some(session) = state.ws_sessions.write().await.get_mut(session_id) {
+                let mut requested_topics = HashSet::new();
                 for t in &topics {
-                    session.subscribed_topics.remove(t);
+                    if !requested_topics.insert(t.clone()) {
+                        continue;
+                    }
+                    let removed_subscription = session.subscribed_topics.remove(t);
+                    if let Some(handle) = session.topic_forwarders.remove(t) {
+                        handles.push(handle);
+                        topics_to_cleanup.push(t.clone());
+                    } else if removed_subscription {
+                        topics_to_cleanup.push(t.clone());
+                    }
                 }
             }
-            for topic in &topics {
+            for handle in handles {
+                handle.abort();
+            }
+            for topic in &topics_to_cleanup {
                 cleanup_ws_topic_if_empty(state, topic, session_id).await;
             }
             let _ = tx.send(WsOutbound::Unsubscribed { topics });
@@ -13714,16 +17797,377 @@ async fn save_mls_groups(_state: &AppState) {
     // They are recreated each session.
 }
 
-async fn save_named_groups(state: &AppState) {
-    let groups = state.named_groups.read().await;
-    match serde_json::to_string_pretty(&*groups) {
+/// Derive this agent's per-group TreeKEM identity seed from its long-term
+/// ML-DSA secret key and the group's id bytes (ADR-0012). Centralised so the
+/// create path and the restore path always agree on the seed (and therefore on
+/// the re-derived identity / leaf).
+fn agent_treekem_seed(agent: &Agent, group_id_bytes: &[u8]) -> [u8; 32] {
+    let (_public, secret) = agent.identity().agent_keypair().to_bytes();
+    x0x::mls::treekem::derive_identity_seed(&secret, group_id_bytes)
+}
+
+const TREEKEM_DAEMON_SNAPSHOT_MAGIC: &[u8; 4] = b"XTD1";
+const TREEKEM_DAEMON_SNAPSHOT_VERSION: u8 = 1;
+const TREEKEM_NAMED_JOURNAL_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TreeKemSnapshotEnvelope {
+    version: u8,
+    state_revision: u64,
+    state_hash: String,
+    security_binding: Option<String>,
+    snapshot: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TreeKemNamedPersistJournal {
+    version: u8,
+    group_id_hex: String,
+    named_groups_json: String,
+    snapshot_envelope: Vec<u8>,
+}
+
+fn treekem_snapshot_path(treekem_dir: &FsPath, group_id_hex: &str) -> PathBuf {
+    treekem_dir.join(format!("{group_id_hex}.snap"))
+}
+
+fn treekem_journal_path(treekem_dir: &FsPath, group_id_hex: &str) -> PathBuf {
+    treekem_dir.join(format!("{group_id_hex}.journal"))
+}
+
+fn encode_treekem_snapshot_envelope(
+    info: &x0x::groups::GroupInfo,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> anyhow::Result<Vec<u8>> {
+    let snapshot = group
+        .to_snapshot_bytes()
+        .map_err(|e| anyhow::anyhow!("treekem snapshot encode: {e}"))?;
+    let mut bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
+    let envelope = TreeKemSnapshotEnvelope {
+        version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+        state_revision: info.state_revision,
+        state_hash: info.state_hash.clone(),
+        security_binding: info.security_binding.clone(),
+        snapshot,
+    };
+    bytes.extend(
+        postcard::to_stdvec(&envelope)
+            .map_err(|e| anyhow::anyhow!("treekem snapshot envelope encode: {e}"))?,
+    );
+    Ok(bytes)
+}
+
+fn decode_treekem_snapshot_envelope(
+    bytes: &[u8],
+) -> anyhow::Result<Option<TreeKemSnapshotEnvelope>> {
+    let Some(payload) = bytes.strip_prefix(TREEKEM_DAEMON_SNAPSHOT_MAGIC) else {
+        return Ok(None);
+    };
+    let envelope: TreeKemSnapshotEnvelope = postcard::from_bytes(payload)
+        .map_err(|e| anyhow::anyhow!("treekem snapshot envelope decode: {e}"))?;
+    if envelope.version != TREEKEM_DAEMON_SNAPSHOT_VERSION {
+        anyhow::bail!(
+            "unsupported TreeKEM snapshot envelope version {}",
+            envelope.version
+        );
+    }
+    Ok(Some(envelope))
+}
+
+fn treekem_snapshot_envelope_matches_info(
+    envelope: &TreeKemSnapshotEnvelope,
+    info: &x0x::groups::GroupInfo,
+) -> bool {
+    envelope.state_revision == info.state_revision
+        && envelope.state_hash == info.state_hash
+        && envelope.security_binding == info.security_binding
+}
+
+async fn persist_treekem_snapshot_bytes(
+    treekem_dir: &FsPath,
+    group_id_hex: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<()> {
+    let path = treekem_snapshot_path(treekem_dir, group_id_hex);
+    x0x::storage::write_private_bytes(&path, bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("treekem snapshot write: {e}"))?;
+    Ok(())
+}
+
+/// Persist a TreeKEM snapshot bound to the currently durable named-group state.
+async fn persist_treekem_snapshot_bound(
+    state: &AppState,
+    group_id_hex: &str,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> anyhow::Result<()> {
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id_hex)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("named group missing for TreeKEM snapshot"))?
+    };
+    let bytes = encode_treekem_snapshot_envelope(&info, group)?;
+    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, bytes).await
+}
+
+/// Persist a supplied named-group state and matching TreeKEM snapshot with a
+/// replay journal. The in-memory map is updated only after this returns.
+async fn persist_treekem_and_named_groups_atomic_with_info(
+    state: &AppState,
+    group_id_hex: &str,
+    info: x0x::groups::GroupInfo,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> anyhow::Result<()> {
+    let named_groups_json = {
+        let groups = state.named_groups.read().await;
+        let mut next_groups = groups.clone();
+        next_groups.insert(group_id_hex.to_string(), info.clone());
+        serde_json::to_string_pretty(&next_groups)
+            .map_err(|e| anyhow::anyhow!("named groups encode: {e}"))?
+    };
+    let snapshot_envelope = encode_treekem_snapshot_envelope(&info, group)?;
+    let journal = TreeKemNamedPersistJournal {
+        version: TREEKEM_NAMED_JOURNAL_VERSION,
+        group_id_hex: group_id_hex.to_string(),
+        named_groups_json: named_groups_json.clone(),
+        snapshot_envelope: snapshot_envelope.clone(),
+    };
+    let journal_bytes = postcard::to_stdvec(&journal)
+        .map_err(|e| anyhow::anyhow!("TreeKEM journal encode: {e}"))?;
+    let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
+    x0x::storage::write_private_bytes(&journal_path, journal_bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
+    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, snapshot_envelope).await?;
+    write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
+        .await
+        .map_err(|e| anyhow::anyhow!("named groups write: {e}"))?;
+    if let Err(e) = tokio::fs::remove_file(&journal_path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(anyhow::anyhow!("TreeKEM journal cleanup: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// Persist current named-group JSON and a matching bound TreeKEM snapshot.
+async fn persist_treekem_and_named_groups_atomic(
+    state: &AppState,
+    group_id_hex: &str,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> anyhow::Result<()> {
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id_hex)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("named group missing for TreeKEM atomic persist"))?
+    };
+    persist_treekem_and_named_groups_atomic_with_info(state, group_id_hex, info, group).await
+}
+
+async fn recover_treekem_named_journals(
+    named_groups_path: &FsPath,
+    treekem_dir: &FsPath,
+) -> anyhow::Result<()> {
+    let mut entries = match tokio::fs::read_dir(treekem_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(anyhow::anyhow!("read TreeKEM journal dir: {e}")),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| anyhow::anyhow!("read TreeKEM journal entry: {e}"))?
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("journal") {
+            continue;
+        }
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("read TreeKEM journal {}: {e}", path.display()))?;
+        let journal: TreeKemNamedPersistJournal = postcard::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("decode TreeKEM journal {}: {e}", path.display()))?;
+        if journal.version != TREEKEM_NAMED_JOURNAL_VERSION {
+            tracing::warn!(path = %path.display(), version = journal.version, "ignoring unsupported TreeKEM journal version");
+            continue;
+        }
+        persist_treekem_snapshot_bytes(
+            treekem_dir,
+            &journal.group_id_hex,
+            journal.snapshot_envelope,
+        )
+        .await?;
+        write_named_groups_json_atomic(named_groups_path, &journal.named_groups_json)
+            .await
+            .map_err(|e| anyhow::anyhow!("replay named groups journal: {e}"))?;
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("remove replayed TreeKEM journal: {e}"))?;
+        tracing::warn!(group_id = %journal.group_id_hex, "replayed TreeKEM/named-group persistence journal after prior crash");
+    }
+    Ok(())
+}
+
+/// Rebuild the live TreeKEM group map from on-disk snapshots at startup
+/// (ADR-0012 Phase 4). For every named group tagged
+/// [`x0x::mls::SecureGroupPlane::TreeKem`], restore its snapshot using the
+/// agent's per-group identity seed. A missing or unreadable snapshot is logged
+/// and skipped — the group stays unusable for secure content until re-shared,
+/// never a crash.
+async fn restore_treekem_groups(
+    named_groups: &HashMap<String, x0x::groups::GroupInfo>,
+    agent: &Agent,
+    treekem_dir: &FsPath,
+) -> HashMap<String, Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>> {
+    let mut restored = HashMap::new();
+    let agent_id = agent.agent_id();
+    for (group_id_hex, info) in named_groups {
+        if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+            continue;
+        }
+        let path = treekem_snapshot_path(treekem_dir, group_id_hex);
+        let snapshot_bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    group_id = %group_id_hex,
+                    "TreeKEM group tagged but no snapshot on disk; secure content unavailable until re-shared"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(group_id = %group_id_hex, "failed to read TreeKEM snapshot: {e}");
+                continue;
+            }
+        };
+        let snapshot = match decode_treekem_snapshot_envelope(&snapshot_bytes) {
+            Ok(Some(envelope)) => {
+                if !treekem_snapshot_envelope_matches_info(&envelope, info) {
+                    tracing::warn!(
+                        group_id = %group_id_hex,
+                        snapshot_revision = envelope.state_revision,
+                        named_revision = info.state_revision,
+                        "TreeKEM snapshot/named-group binding mismatch; secure content unavailable until repaired"
+                    );
+                    continue;
+                }
+                envelope.snapshot
+            }
+            Ok(None) => {
+                tracing::warn!(group_id = %group_id_hex, "restoring legacy unbound TreeKEM snapshot; future writes will bind it to named-group state");
+                snapshot_bytes
+            }
+            Err(e) => {
+                tracing::warn!(group_id = %group_id_hex, "failed to decode TreeKEM snapshot envelope: {e}");
+                continue;
+            }
+        };
+        let group_id_bytes = match hex::decode(&info.mls_group_id) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %group_id_hex,
+                    "invalid mls_group_id hex, cannot restore TreeKEM group: {e}"
+                );
+                continue;
+            }
+        };
+        let seed = agent_treekem_seed(agent, &group_id_bytes);
+        match x0x::mls::TreeKemMlsGroup::restore(&snapshot, agent_id, &seed) {
+            Ok(g) => {
+                tracing::info!(group_id = %group_id_hex, "restored TreeKEM group from snapshot");
+                restored.insert(group_id_hex.clone(), Arc::new(tokio::sync::Mutex::new(g)));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %group_id_hex,
+                    "failed to restore TreeKEM group (wrong identity or corrupt snapshot?): {e}"
+                );
+            }
+        }
+    }
+    restored
+}
+
+async fn load_named_groups(
+    named_groups_path: &FsPath,
+) -> Result<HashMap<String, x0x::groups::GroupInfo>> {
+    match tokio::fs::read_to_string(named_groups_path).await {
         Ok(json) => {
-            if let Err(e) = tokio::fs::write(&state.named_groups_path, json).await {
+            let mut groups = serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&json)
+                .with_context(|| {
+                    format!(
+                        "failed to parse named groups file {}",
+                        named_groups_path.display()
+                    )
+                })?;
+            for info in groups.values_mut() {
+                info.migrate_from_v1();
+            }
+            tracing::info!(
+                "Loaded {} named groups from {}",
+                groups.len(),
+                named_groups_path.display()
+            );
+            Ok(groups)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!("No named groups file found, starting fresh");
+            Ok(HashMap::new())
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to read named groups file {}",
+                named_groups_path.display()
+            )
+        }),
+    }
+}
+
+async fn save_named_groups(state: &AppState) {
+    let json = {
+        let groups = state.named_groups.read().await;
+        serde_json::to_string_pretty(&*groups)
+    };
+    match json {
+        Ok(json) => {
+            if let Err(e) = write_named_groups_json_atomic(&state.named_groups_path, &json).await {
                 tracing::error!("Failed to save named groups: {e}");
             }
         }
         Err(e) => tracing::error!("Failed to serialize named groups: {e}"),
     }
+}
+
+async fn write_named_groups_json_atomic(path: &FsPath, json: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut temp_os = path.as_os_str().to_owned();
+    temp_os.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let temp_path = PathBuf::from(temp_os);
+
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await?;
+        file.write_all(json.as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temp_path, path).await
+    }
+    .await;
+
+    if write_result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+
+    write_result
 }
 
 /// Decode a base64-encoded payload from a request field.
@@ -13782,7 +18226,8 @@ fn init_logging(level: &str, format: &str) -> Result<()> {
     let fallback = level.to_lowercase();
     let fallback_directive = match fallback.as_str() {
         "trace" | "debug" | "info" | "warn" | "error" => fallback.as_str(),
-        _ => "info",
+        // Unknown values fall back to the privacy-preserving default (#85).
+        _ => "warn",
     };
 
     let (filter, source) = match std::env::var("RUST_LOG") {
@@ -13902,6 +18347,807 @@ fn init_logging(level: &str, format: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// TreeKEM join-result and Welcome blob pull handling
+// ---------------------------------------------------------------------------
+
+const PENDING_JOIN_RESULT_TTL: Duration = Duration::from_secs(10 * 60);
+const JOIN_RESULT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
+const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
+const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
+    Duration::ZERO,
+    Duration::from_secs(5),
+    Duration::from_secs(20),
+    Duration::from_secs(60),
+];
+
+fn welcome_id_for_bytes(bytes: &[u8]) -> String {
+    hex::encode(blake3::hash(bytes).as_bytes())
+}
+
+fn join_result_key(group_id: &str, member_agent_id: &str) -> String {
+    format!("{group_id}:{member_agent_id}")
+}
+
+async fn stage_join_result(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    event: NamedGroupMetadataEvent,
+) {
+    let key = join_result_key(group_id, member_agent_id);
+    let event_kind = named_group_metadata_event_kind(&event);
+    let (has_commit, has_commit_b64, has_inline_welcome, welcome_ref_id, treekem_epoch) =
+        match &event {
+            NamedGroupMetadataEvent::MemberAdded {
+                commit,
+                treekem_commit_b64,
+                treekem_welcome_b64,
+                welcome_ref,
+                treekem_epoch,
+                ..
+            } => (
+                commit.is_some(),
+                treekem_commit_b64.is_some(),
+                treekem_welcome_b64.is_some(),
+                welcome_ref.as_ref().map(|w| w.welcome_id.clone()),
+                *treekem_epoch,
+            ),
+            _ => (false, false, false, None, None),
+        };
+    let mut results = state.pending_join_results.write().await;
+    results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    results.insert(
+        key.clone(),
+        PendingJoinResult {
+            event,
+            created_at: Instant::now(),
+        },
+    );
+    tracing::debug!(
+        target: "treekem.trace",
+        stage = "stage_join_result",
+        key = %key,
+        group_id = %group_id,
+        member = %member_agent_id,
+        event = event_kind,
+        has_commit,
+        has_commit_b64,
+        has_inline_welcome,
+        welcome_ref = ?welcome_ref_id,
+        treekem_epoch = ?treekem_epoch,
+        pending_count = results.len(),
+    );
+}
+
+async fn handle_join_result_message(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    msg: JoinResultMessage,
+) {
+    match msg {
+        JoinResultMessage::FetchRequest {
+            group_id,
+            member_agent_id,
+        } => {
+            let sender_hex = hex::encode(sender.as_bytes());
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "fetch_request_received",
+                group_id = %group_id,
+                member = %member_agent_id,
+                sender = %sender_hex,
+            );
+            if sender_hex != member_agent_id {
+                tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), member = %LogHexId::agent(&member_agent_id), "ignoring unauthorized join-result fetch");
+                return;
+            }
+            let key = join_result_key(&group_id, &member_agent_id);
+            let (event, pending_count) = {
+                let mut results = state.pending_join_results.write().await;
+                results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+                (
+                    results.get(&key).map(|pending| pending.event.clone()),
+                    results.len(),
+                )
+            };
+            let Some(event) = event else {
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "fetch_request_lookup_miss",
+                    key = %key,
+                    group_id = %group_id,
+                    member = %member_agent_id,
+                    pending_count,
+                );
+                tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
+                return;
+            };
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "fetch_request_lookup_hit",
+                key = %key,
+                group_id = %group_id,
+                member = %member_agent_id,
+                event = named_group_metadata_event_kind(&event),
+                pending_count,
+            );
+            let response = JoinResultMessage::Result {
+                event: Box::new(event),
+            };
+            let payload = match serde_json::to_vec(&response) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize join-result event: {e}");
+                    return;
+                }
+            };
+            let payload_len = payload.len();
+            let payload_hash = hex::encode(blake3::hash(&payload).as_bytes());
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "join_result_send_start",
+                group_id = %group_id,
+                member = %member_agent_id,
+                payload_len,
+                payload_hash = %payload_hash,
+            );
+            if let Err(e) = state
+                .agent
+                .send_direct_with_config(sender, payload, direct_message_send_config())
+                .await
+            {
+                tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "failed to send join-result response: {e}");
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "join_result_send_err",
+                    group_id = %group_id,
+                    member = %member_agent_id,
+                    payload_len,
+                    payload_hash = %payload_hash,
+                    error = %e,
+                );
+            } else {
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "join_result_send_ok",
+                    group_id = %group_id,
+                    member = %member_agent_id,
+                    payload_len,
+                    payload_hash = %payload_hash,
+                );
+            }
+        }
+        JoinResultMessage::Result { event } => {
+            let event = *event;
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "join_result_received",
+                event = named_group_metadata_event_kind(&event),
+                sender = %hex::encode(sender.as_bytes()),
+            );
+            let (group_id, member_agent_id) = match &event {
+                NamedGroupMetadataEvent::MemberAdded {
+                    group_id, agent_id, ..
+                } => (group_id.clone(), agent_id.clone()),
+                _ => {
+                    tracing::warn!("ignoring non-MemberAdded join-result response");
+                    return;
+                }
+            };
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            if member_agent_id != local_agent_hex {
+                tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), local = %LogHexId::agent(&local_agent_hex), "ignoring join-result for different member");
+                return;
+            }
+            let sender_hex = hex::encode(sender.as_bytes());
+            let creator_hex = {
+                let groups = state.named_groups.read().await;
+                groups
+                    .get(&group_id)
+                    .or_else(|| {
+                        groups
+                            .values()
+                            .find(|info| info.stable_group_id() == group_id)
+                    })
+                    .map(|info| hex::encode(info.creator.as_bytes()))
+            };
+            let Some(creator_hex) = creator_hex else {
+                tracing::warn!(group_id = %LogHexId::group(&group_id), "ignoring join-result for unknown local group");
+                return;
+            };
+            if sender_hex != creator_hex {
+                tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), creator = %LogHexId::agent(&creator_hex), "ignoring join-result from non-creator");
+                return;
+            }
+            apply_named_group_metadata_event(state, event, *sender, true).await;
+        }
+    }
+}
+
+async fn poll_join_result_until_treekem_ready(
+    state: Arc<AppState>,
+    group_id: String,
+    event_group_id: String,
+    inviter: AgentId,
+    member_agent_id: String,
+) {
+    let deadline = tokio::time::Instant::now() + JOIN_RESULT_POLL_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if state.treekem_groups.read().await.contains_key(&group_id) {
+            return;
+        }
+        let request = JoinResultMessage::FetchRequest {
+            group_id: event_group_id.clone(),
+            member_agent_id: member_agent_id.clone(),
+        };
+        let payload = match serde_json::to_vec(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize join-result fetch request: {e}");
+                return;
+            }
+        };
+        let payload_len = payload.len();
+        let payload_hash = hex::encode(blake3::hash(&payload).as_bytes());
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "fetch_request_send_start",
+            group_id = %group_id,
+            event_group_id = %event_group_id,
+            member = %member_agent_id,
+            payload_len,
+            payload_hash = %payload_hash,
+        );
+        if let Err(e) = state
+            .agent
+            .send_direct_with_config(&inviter, payload, direct_message_send_config())
+            .await
+        {
+            tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "fetch_request_send_err",
+                group_id = %group_id,
+                event_group_id = %event_group_id,
+                member = %member_agent_id,
+                payload_len,
+                payload_hash = %payload_hash,
+                error = %e,
+            );
+        } else {
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "fetch_request_send_ok",
+                group_id = %group_id,
+                event_group_id = %event_group_id,
+                member = %member_agent_id,
+                payload_len,
+                payload_hash = %payload_hash,
+            );
+        }
+        tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
+    }
+    tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "timed out polling anchor for TreeKEM join result");
+}
+
+async fn stage_treekem_welcome(
+    state: &AppState,
+    group_id: &str,
+    joiner_agent: &str,
+    bytes: Vec<u8>,
+) -> WelcomeRef {
+    let welcome_id = welcome_id_for_bytes(&bytes);
+    let byte_len = bytes.len() as u64;
+    let source = hex::encode(state.agent.agent_id().as_bytes());
+    let pending = PendingWelcome {
+        group_id: group_id.to_string(),
+        joiner_agent: joiner_agent.to_string(),
+        bytes,
+        created_at: Instant::now(),
+    };
+    let mut welcomes = state.pending_welcomes.write().await;
+    welcomes.retain(|_, pending| pending.created_at.elapsed() < PENDING_WELCOME_TTL);
+    welcomes.insert(welcome_id.clone(), pending);
+    WelcomeRef {
+        welcome_id,
+        byte_len,
+        source,
+    }
+}
+
+fn welcome_blob_send_config(msg: &WelcomeBlobMessage) -> x0x::dm::DmSendConfig {
+    match msg {
+        WelcomeBlobMessage::Chunk { .. } => file_transfer_send_config(),
+        WelcomeBlobMessage::FetchRequest { .. }
+        | WelcomeBlobMessage::Offer { .. }
+        | WelcomeBlobMessage::ChunkAck { .. }
+        | WelcomeBlobMessage::Complete { .. } => direct_message_send_config(),
+    }
+}
+
+async fn send_welcome_blob_message(
+    state: &Arc<AppState>,
+    agent_id: &AgentId,
+    msg: &WelcomeBlobMessage,
+) -> std::result::Result<x0x::dm::DmReceipt, String> {
+    let payload = serde_json::to_vec(msg).map_err(|e| format!("serialization failed: {e}"))?;
+    if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "welcome blob message exceeds MAX_PAYLOAD_BYTES ({} > {})",
+            payload.len(),
+            x0x::dm::MAX_PAYLOAD_BYTES
+        ));
+    }
+    state
+        .agent
+        .send_direct_with_config(agent_id, payload, welcome_blob_send_config(msg))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn notify_welcome_waiters(
+    state: &Arc<AppState>,
+    welcome_id: &str,
+    result: std::result::Result<Vec<u8>, String>,
+) {
+    let waiters = state
+        .pending_welcome_waiters
+        .write()
+        .await
+        .remove(welcome_id);
+    if let Some(waiters) = waiters {
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+}
+
+async fn cleanup_welcome_fetch_state(state: &Arc<AppState>, welcome_id: &str) {
+    state
+        .pending_welcome_receives
+        .write()
+        .await
+        .remove(welcome_id);
+    state
+        .pending_welcome_waiters
+        .write()
+        .await
+        .remove(welcome_id);
+}
+
+async fn fetch_treekem_welcome_with_retries(
+    state: &Arc<AppState>,
+    group_id: &str,
+    welcome_ref: &WelcomeRef,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut last_error = None;
+    for (attempt, delay) in WELCOME_FETCH_RETRY_DELAYS.iter().enumerate() {
+        if !delay.is_zero() {
+            tokio::time::sleep(*delay).await;
+        }
+        match fetch_treekem_welcome(state, group_id, welcome_ref).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                tracing::warn!(
+                    target: "welcome.trace",
+                    stage = "fetch_retry_failed",
+                    group_id,
+                    welcome_id = %welcome_ref.welcome_id,
+                    attempt,
+                    next_delay_ms = ?WELCOME_FETCH_RETRY_DELAYS
+                        .get(attempt + 1)
+                        .map(|d| d.as_millis() as u64),
+                    error = %e,
+                );
+                last_error = Some(e);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "TreeKEM Welcome fetch did not run".to_string()))
+}
+
+async fn fetch_treekem_welcome(
+    state: &Arc<AppState>,
+    group_id: &str,
+    welcome_ref: &WelcomeRef,
+) -> std::result::Result<Vec<u8>, String> {
+    if welcome_ref.byte_len > x0x::files::MAX_TRANSFER_SIZE {
+        return Err("TreeKEM Welcome blob exceeds maximum transfer size".to_string());
+    }
+    let source = parse_agent_id_hex(&welcome_ref.source)?;
+    let total_chunks =
+        x0x::files::total_chunks_for_size(welcome_ref.byte_len, x0x::files::DEFAULT_CHUNK_SIZE);
+    let (tx, rx) = oneshot::channel();
+    let should_send_fetch = {
+        let mut receives = state.pending_welcome_receives.write().await;
+        let should_send_fetch = match receives.get(&welcome_ref.welcome_id) {
+            Some(existing)
+                if existing.group_id == group_id
+                    && existing.source == welcome_ref.source
+                    && existing.byte_len == welcome_ref.byte_len
+                    && existing.total_chunks == total_chunks =>
+            {
+                tracing::debug!(
+                    target: "welcome.trace",
+                    stage = "fetch_join_inflight",
+                    group_id,
+                    welcome_id = %welcome_ref.welcome_id,
+                );
+                false
+            }
+            Some(_) => {
+                return Err("conflicting in-flight TreeKEM Welcome fetch".to_string());
+            }
+            None => {
+                receives.insert(
+                    welcome_ref.welcome_id.clone(),
+                    PendingWelcomeReceive {
+                        group_id: group_id.to_string(),
+                        source: welcome_ref.source.clone(),
+                        byte_len: welcome_ref.byte_len,
+                        total_chunks,
+                        chunks: BTreeMap::new(),
+                        received_bytes: 0,
+                    },
+                );
+                true
+            }
+        };
+        state
+            .pending_welcome_waiters
+            .write()
+            .await
+            .entry(welcome_ref.welcome_id.clone())
+            .or_default()
+            .push(tx);
+        should_send_fetch
+    };
+
+    if should_send_fetch {
+        let request = WelcomeBlobMessage::FetchRequest {
+            group_id: group_id.to_string(),
+            welcome_id: welcome_ref.welcome_id.clone(),
+        };
+        if let Err(e) = send_welcome_blob_message(state, &source, &request).await {
+            cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+            return Err(e);
+        }
+    }
+
+    let received = match tokio::time::timeout(WELCOME_FETCH_TIMEOUT, rx).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(_)) => return Err("TreeKEM Welcome waiter dropped".to_string()),
+        Err(_) => {
+            cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+            return Err("timed out waiting for TreeKEM Welcome blob".to_string());
+        }
+    };
+    if received.len() as u64 != welcome_ref.byte_len {
+        return Err(format!(
+            "TreeKEM Welcome length mismatch: got {}, expected {}",
+            received.len(),
+            welcome_ref.byte_len
+        ));
+    }
+    let actual = welcome_id_for_bytes(&received);
+    if actual != welcome_ref.welcome_id {
+        return Err("TreeKEM Welcome blake3 mismatch".to_string());
+    }
+    Ok(received)
+}
+
+async fn handle_welcome_blob_message(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    msg: WelcomeBlobMessage,
+) {
+    match msg {
+        WelcomeBlobMessage::FetchRequest {
+            group_id,
+            welcome_id,
+        } => handle_welcome_fetch_request(state, sender, group_id, welcome_id).await,
+        WelcomeBlobMessage::Offer {
+            group_id,
+            welcome_id,
+            byte_len,
+            chunk_size,
+            total_chunks,
+            blake3_hex,
+        } => {
+            let source = hex::encode(sender.as_bytes());
+            let mismatch = {
+                let receives = state.pending_welcome_receives.read().await;
+                let Some(receive) = receives.get(&welcome_id) else {
+                    tracing::debug!(welcome_id, "ignoring unsolicited Welcome blob offer");
+                    return;
+                };
+                if receive.source != source {
+                    tracing::debug!(welcome_id, sender = %source, "ignoring Welcome blob offer from unexpected source");
+                    return;
+                }
+                receive.group_id != group_id
+                    || receive.byte_len != byte_len
+                    || receive.total_chunks != total_chunks
+                    || chunk_size != x0x::files::DEFAULT_CHUNK_SIZE
+                    || blake3_hex != welcome_id
+            };
+            if mismatch {
+                state
+                    .pending_welcome_receives
+                    .write()
+                    .await
+                    .remove(&welcome_id);
+                notify_welcome_waiters(
+                    state,
+                    &welcome_id,
+                    Err("welcome offer did not match requested reference".to_string()),
+                )
+                .await;
+            }
+        }
+        WelcomeBlobMessage::Chunk {
+            welcome_id,
+            sequence,
+            data,
+        } => handle_welcome_blob_chunk(state, sender, welcome_id, sequence, data).await,
+        WelcomeBlobMessage::ChunkAck {
+            welcome_id,
+            sequence,
+        } => {
+            let matched_pending =
+                if let Some(slot) = state.pending_welcome_acks.read().await.get(&welcome_id) {
+                    slot.record_ack(sequence);
+                    true
+                } else {
+                    false
+                };
+            tracing::debug!(target: "welcome.trace", stage = "chunk_ack_recv", welcome_id = %welcome_id, seq = sequence, matched_pending);
+        }
+        WelcomeBlobMessage::Complete { welcome_id } => {
+            handle_welcome_blob_complete(state, sender, &welcome_id).await;
+        }
+    }
+}
+
+async fn handle_welcome_fetch_request(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    group_id: String,
+    welcome_id: String,
+) {
+    let sender_hex = hex::encode(sender.as_bytes());
+    let pending = {
+        let welcomes = state.pending_welcomes.read().await;
+        welcomes.get(&welcome_id).cloned()
+    };
+    let Some(pending) = pending else {
+        tracing::warn!(welcome_id, "Welcome fetch for unknown blob");
+        return;
+    };
+    if pending.created_at.elapsed() >= PENDING_WELCOME_TTL {
+        state.pending_welcomes.write().await.remove(&welcome_id);
+        return;
+    }
+    if pending.group_id != group_id || pending.joiner_agent != sender_hex {
+        tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sender = %LogHexId::agent(&sender_hex), "unauthorized Welcome fetch request");
+        return;
+    }
+    let state = Arc::clone(state);
+    let recipient = *sender;
+    tokio::spawn(async move {
+        stream_welcome_blob(&state, &recipient, &welcome_id, pending).await;
+    });
+}
+
+async fn stream_welcome_blob(
+    state: &Arc<AppState>,
+    recipient: &AgentId,
+    welcome_id: &str,
+    pending: PendingWelcome,
+) {
+    let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
+    let total_chunks = x0x::files::total_chunks_for_size(pending.bytes.len() as u64, chunk_size);
+    let ack_slot = Arc::new(FileChunkAckSlot::new());
+    {
+        let mut acks = state.pending_welcome_acks.write().await;
+        if acks.contains_key(welcome_id) {
+            tracing::debug!(
+                target: "welcome.trace",
+                stage = "stream_duplicate_ignored",
+                welcome_id,
+                recipient = %hex::encode(recipient.as_bytes()),
+            );
+            return;
+        }
+        acks.insert(welcome_id.to_string(), Arc::clone(&ack_slot));
+    }
+
+    let offer = WelcomeBlobMessage::Offer {
+        group_id: pending.group_id.clone(),
+        welcome_id: welcome_id.to_string(),
+        byte_len: pending.bytes.len() as u64,
+        chunk_size,
+        total_chunks,
+        blake3_hex: welcome_id.to_string(),
+    };
+    if let Err(e) = send_welcome_blob_message(state, recipient, &offer).await {
+        tracing::warn!(welcome_id, "failed to send Welcome blob offer: {e}");
+        state.pending_welcome_acks.write().await.remove(welcome_id);
+        return;
+    }
+    tracing::debug!(
+        target: "welcome.trace",
+        stage = "offer_sent",
+        welcome_id,
+        recipient = %hex::encode(recipient.as_bytes()),
+        total_chunks,
+        byte_len = pending.bytes.len() as u64,
+    );
+
+    for (sequence, chunk) in pending.bytes.chunks(chunk_size).enumerate() {
+        let sequence = sequence as u64;
+        if let Err(e) = wait_for_chunk_window(&ack_slot, sequence).await {
+            tracing::warn!(welcome_id, "Welcome blob chunk window failed: {e}");
+            state.pending_welcome_acks.write().await.remove(welcome_id);
+            return;
+        }
+        let msg = WelcomeBlobMessage::Chunk {
+            welcome_id: welcome_id.to_string(),
+            sequence,
+            data: base64::engine::general_purpose::STANDARD.encode(chunk),
+        };
+        if let Err(e) = send_welcome_blob_message(state, recipient, &msg).await {
+            tracing::warn!(
+                welcome_id,
+                sequence,
+                "failed to send Welcome blob chunk: {e}"
+            );
+            state.pending_welcome_acks.write().await.remove(welcome_id);
+            return;
+        }
+        tracing::debug!(target: "welcome.trace", stage = "chunk_sent", welcome_id, seq = sequence);
+    }
+
+    if total_chunks > 0 {
+        let last_seq = total_chunks - 1;
+        if let Err(e) = wait_for_final_acks(&ack_slot, last_seq).await {
+            tracing::warn!(welcome_id, "Welcome blob final ack wait failed: {e}");
+            tracing::debug!(target: "welcome.trace", stage = "final_ack_failed", welcome_id, total_chunks, last_acked = ack_slot.highest_acked(), "{e}");
+            state.pending_welcome_acks.write().await.remove(welcome_id);
+            return;
+        }
+        tracing::debug!(target: "welcome.trace", stage = "final_ack_ok", welcome_id, total_chunks);
+    }
+    let complete = WelcomeBlobMessage::Complete {
+        welcome_id: welcome_id.to_string(),
+    };
+    if let Err(e) = send_welcome_blob_message(state, recipient, &complete).await {
+        tracing::warn!(welcome_id, "failed to send Welcome blob complete: {e}");
+    }
+    state.pending_welcome_acks.write().await.remove(welcome_id);
+}
+
+async fn handle_welcome_blob_chunk(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    welcome_id: String,
+    sequence: u64,
+    data: String,
+) {
+    let sender_hex = hex::encode(sender.as_bytes());
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(data) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            notify_welcome_waiters(
+                state,
+                &welcome_id,
+                Err(format!("Welcome chunk decode failed: {e}")),
+            )
+            .await;
+            return;
+        }
+    };
+    let mut receives = state.pending_welcome_receives.write().await;
+    let Some(receive) = receives.get_mut(&welcome_id) else {
+        tracing::debug!(target: "welcome.trace", stage = "chunk_recv_no_pending", welcome_id = %welcome_id, seq = sequence);
+        return;
+    };
+    if receive.source != sender_hex {
+        tracing::debug!(target: "welcome.trace", stage = "chunk_recv_wrong_source", welcome_id = %welcome_id, seq = sequence);
+        return;
+    }
+    if sequence >= receive.total_chunks {
+        return;
+    }
+    if !receive.chunks.contains_key(&sequence) {
+        receive.received_bytes = receive.received_bytes.saturating_add(decoded.len() as u64);
+        receive.chunks.insert(sequence, decoded);
+    }
+    drop(receives);
+    tracing::debug!(target: "welcome.trace", stage = "chunk_recv", welcome_id = %welcome_id, seq = sequence);
+
+    let ack = WelcomeBlobMessage::ChunkAck {
+        welcome_id: welcome_id.clone(),
+        sequence,
+    };
+    match send_welcome_blob_message(state, sender, &ack).await {
+        Ok(_) => {
+            tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence);
+        }
+        Err(e) => {
+            tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sequence, "failed to ack Welcome blob chunk: {e}");
+        }
+    }
+}
+
+async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, welcome_id: &str) {
+    let sender_hex = hex::encode(sender.as_bytes());
+    {
+        let receives = state.pending_welcome_receives.read().await;
+        let Some(receive) = receives.get(welcome_id) else {
+            return;
+        };
+        if receive.source != sender_hex {
+            return;
+        }
+    }
+    let receive = state
+        .pending_welcome_receives
+        .write()
+        .await
+        .remove(welcome_id);
+    let Some(receive) = receive else {
+        return;
+    };
+    if receive.received_bytes != receive.byte_len
+        || receive.chunks.len() as u64 != receive.total_chunks
+    {
+        notify_welcome_waiters(
+            state,
+            welcome_id,
+            Err("incomplete Welcome blob transfer".to_string()),
+        )
+        .await;
+        return;
+    }
+    let mut bytes = Vec::with_capacity(receive.byte_len as usize);
+    for sequence in 0..receive.total_chunks {
+        let Some(chunk) = receive.chunks.get(&sequence) else {
+            notify_welcome_waiters(
+                state,
+                welcome_id,
+                Err("missing Welcome blob chunk".to_string()),
+            )
+            .await;
+            return;
+        };
+        bytes.extend_from_slice(chunk);
+    }
+    if receive.group_id.is_empty() {
+        notify_welcome_waiters(
+            state,
+            welcome_id,
+            Err("Welcome blob missing group id".to_string()),
+        )
+        .await;
+        return;
+    }
+    let actual = welcome_id_for_bytes(&bytes);
+    if actual != welcome_id {
+        notify_welcome_waiters(
+            state,
+            welcome_id,
+            Err("Welcome blob blake3 mismatch".to_string()),
+        )
+        .await;
+        return;
+    }
+    notify_welcome_waiters(state, welcome_id, Ok(bytes)).await;
+}
+
+// ---------------------------------------------------------------------------
 // File transfer message handling
 // ---------------------------------------------------------------------------
 
@@ -13958,6 +19204,14 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
         }
     }
 
+    if !is_safe_file_transfer_id(&offer.transfer_id) {
+        tracing::warn!(
+            "Rejected file offer from {sender_hex}: invalid transfer id {}",
+            offer.transfer_id
+        );
+        return;
+    }
+
     // Size limit check
     if offer.size > x0x::files::MAX_TRANSFER_SIZE {
         tracing::warn!(
@@ -14012,6 +19266,23 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
             "sender": sender_hex,
         }),
     });
+}
+
+fn is_safe_file_transfer_id(transfer_id: &str) -> bool {
+    match uuid::Uuid::parse_str(transfer_id) {
+        Ok(uuid) => transfer_id == uuid.hyphenated().to_string(),
+        Err(_) => false,
+    }
+}
+
+fn safe_file_transfer_part_path(
+    transfers_dir: &FsPath,
+    transfer_id: &str,
+) -> std::result::Result<PathBuf, String> {
+    if !is_safe_file_transfer_id(transfer_id) {
+        return Err(format!("invalid file transfer id: {transfer_id}"));
+    }
+    Ok(transfers_dir.join(format!("{transfer_id}.part")))
 }
 
 /// Handle an incoming accept — start streaming chunks to the receiver.
@@ -14282,8 +19553,14 @@ async fn handle_file_reject(
 /// Clean up partial file and hasher state for a failed transfer.
 async fn cleanup_failed_transfer(state: &Arc<AppState>, transfer_id: &str) {
     // Remove .part file
-    let part_path = state.transfers_dir.join(format!("{transfer_id}.part"));
-    let _ = tokio::fs::remove_file(&part_path).await;
+    match safe_file_transfer_part_path(&state.transfers_dir, transfer_id) {
+        Ok(part_path) => {
+            let _ = tokio::fs::remove_file(&part_path).await;
+        }
+        Err(e) => {
+            tracing::warn!("Skipping partial file cleanup: {e}");
+        }
+    }
 
     // Remove hasher + any buffered out-of-order chunks
     state.receive_hashers.write().await.remove(transfer_id);
@@ -14298,11 +19575,9 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
     let expected_sequence = {
         let transfers = state.file_transfers.read().await;
         match transfers.get(&chunk.transfer_id) {
-            Some(t)
-                if t.direction == x0x::files::TransferDirection::Receiving
-                    && t.status == x0x::files::TransferStatus::InProgress =>
-            {
-                if t.remote_agent_id != sender_hex {
+            Some(t) => match x0x::files::receive_chunk_expected_sequence(t, &sender_hex) {
+                Ok(sequence) => sequence,
+                Err(x0x::files::FileChunkValidationError::WrongSender) => {
                     tracing::warn!(
                         "Chunk from wrong agent for {}: expected {} got {sender_hex}",
                         chunk.transfer_id,
@@ -14310,21 +19585,16 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
                     );
                     return;
                 }
-                if t.chunk_size > 0 {
-                    t.bytes_transferred / t.chunk_size as u64
-                } else {
-                    0
+                Err(_) => {
+                    tracing::warn!(
+                        "Ignoring chunk for transfer {} (dir={:?} status={:?})",
+                        chunk.transfer_id,
+                        t.direction,
+                        t.status
+                    );
+                    return;
                 }
-            }
-            Some(t) => {
-                tracing::warn!(
-                    "Ignoring chunk for transfer {} (dir={:?} status={:?})",
-                    chunk.transfer_id,
-                    t.direction,
-                    t.status
-                );
-                return;
-            }
+            },
             None => {
                 tracing::warn!("Ignoring chunk for unknown transfer {}", chunk.transfer_id);
                 return;
@@ -14422,7 +19692,7 @@ async fn apply_ready_file_chunks(
 ) -> std::result::Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let part_path = state.transfers_dir.join(format!("{transfer_id}.part"));
+    let part_path = safe_file_transfer_part_path(&state.transfers_dir, transfer_id)?;
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -14527,7 +19797,19 @@ async fn finalize_received_transfer(
     transfer_id: &str,
     expected_sha256: &str,
 ) {
-    let part_path = state.transfers_dir.join(format!("{transfer_id}.part"));
+    let part_path = match safe_file_transfer_part_path(&state.transfers_dir, transfer_id) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::error!("Cannot finalize received transfer: {e}");
+            let mut transfers = state.file_transfers.write().await;
+            if let Some(t) = transfers.get_mut(transfer_id) {
+                t.status = x0x::files::TransferStatus::Failed;
+                t.error = Some(e);
+                t.completed_at_unix_ms = Some(file_transfer_now().1);
+            }
+            return;
+        }
+    };
 
     let computed_hash = {
         let mut hashers = state.receive_hashers.write().await;
@@ -14572,16 +19854,7 @@ async fn finalize_received_transfer(
             .map(|t| t.filename.clone())
             .unwrap_or_else(|| transfer_id.to_string())
     };
-    let base_name = std::path::Path::new(&raw_filename)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| transfer_id.to_string());
-    let id_prefix = if transfer_id.len() >= 8 {
-        &transfer_id[..8]
-    } else {
-        transfer_id
-    };
-    let filename = format!("{id_prefix}_{base_name}");
+    let filename = x0x::files::received_file_output_name(transfer_id, &raw_filename);
 
     let final_path = state.transfers_dir.join(&filename);
     if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
@@ -14712,6 +19985,28 @@ mod tests {
         x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, b"test-signature")
     }
 
+    fn fake_group_state_commit(
+        group_id: &str,
+        revision: u64,
+        committed_by: &str,
+    ) -> x0x::groups::GroupStateCommit {
+        x0x::groups::GroupStateCommit {
+            group_id: group_id.to_string(),
+            revision,
+            prev_state_hash: Some(format!("state-{}", revision.saturating_sub(1))),
+            roster_root: "roster".to_string(),
+            policy_hash: "policy".to_string(),
+            public_meta_hash: "meta".to_string(),
+            security_binding: Some("treekem:epoch=1".to_string()),
+            state_hash: format!("state-{revision}"),
+            withdrawn: false,
+            committed_by: committed_by.to_string(),
+            committed_at: revision,
+            signer_public_key: "pub".to_string(),
+            signature: "sig".to_string(),
+        }
+    }
+
     fn sample_group_card(group_id: &str, revision: u64, issued_at: u64) -> x0x::groups::GroupCard {
         x0x::groups::GroupCard {
             group_id: group_id.to_string(),
@@ -14753,6 +20048,19 @@ mod tests {
     }
 
     #[test]
+    fn direct_message_send_config_requires_gossip_ack_by_default() {
+        let config = direct_message_send_config();
+        assert!(config.require_gossip_ack);
+        // Raw-QUIC fallback must be loss-detecting (receive-pipeline ACK), or
+        // a send into a superseded connection reports Ok, the retry never
+        // fires, and the recipient's app never sees the message.
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
+    }
+
+    #[test]
     fn group_card_cache_prunes_expired_cards() {
         let mut cache = HashMap::new();
         cache.insert(
@@ -14765,6 +20073,60 @@ mod tests {
 
         assert!(!cache.contains_key("expired"));
         assert!(cache.contains_key("fresh"));
+    }
+
+    #[test]
+    fn cors_origin_allows_only_literal_loopback_ips() {
+        for origin in [
+            "http://127.0.0.1",
+            "http://127.0.0.1:12700",
+            "http://[::1]",
+            "http://[::1]:12700",
+        ] {
+            assert!(
+                is_allowed_loopback_origin_str(origin),
+                "expected literal loopback IP origin to be allowed: {origin}"
+            );
+        }
+
+        for origin in [
+            // `localhost` hostname is rejected — resolution can be redirected.
+            "http://localhost",
+            "http://localhost:12700",
+            "https://localhost",
+            // spoofed / non-loopback
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://[::1].evil.example",
+            "http://evil.localhost",
+            "http://localhost@evil.example",
+            "http://localhost:bad",
+            "ftp://localhost",
+            "null",
+        ] {
+            assert!(
+                !is_allowed_loopback_origin_str(origin),
+                "expected non-IP-loopback origin to be rejected: {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_requires_auth_but_accepts_query_token_bootstrap() {
+        assert!(!is_auth_exempt_path("/gui"));
+        assert!(!is_auth_exempt_path("/gui/"));
+        assert!(accepts_query_token("/gui"));
+        assert!(accepts_query_token("/gui/"));
+        assert!(accepts_query_token("/peers/events"));
+        assert!(accepts_query_token("/presence/events"));
+    }
+
+    #[test]
+    fn rendered_gui_does_not_disclose_api_token() {
+        let html = render_gui_html();
+
+        assert!(!html.contains("super-secret-api-token"));
+        assert!(!html.contains("X0X_TOKEN"));
     }
 
     #[test]
@@ -14864,6 +20226,894 @@ mod tests {
         assert_eq!(newer_info.state_revision, 3);
     }
 
+    #[tokio::test]
+    async fn malformed_named_groups_file_is_rejected_without_replacing_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("named_groups.json");
+        let malformed_json = "{\"group\":";
+        tokio::fs::write(&path, malformed_json).await?;
+
+        let result = load_named_groups(&path).await;
+
+        assert!(result.is_err());
+        assert_eq!(tokio::fs::read_to_string(&path).await?, malformed_json);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_groups_json_write_replaces_file_without_temp_leftover() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("named_groups.json");
+
+        write_named_groups_json_atomic(&path, "{\"old\":true}").await?;
+        write_named_groups_json_atomic(&path, "{\"new\":true}").await?;
+
+        assert_eq!(tokio::fs::read_to_string(&path).await?, "{\"new\":true}");
+
+        let mut entries = tokio::fs::read_dir(dir.path()).await?;
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            names.push(entry.file_name());
+        }
+        assert_eq!(names, vec![std::ffi::OsString::from("named_groups.json")]);
+        Ok(())
+    }
+
+    #[test]
+    fn treekem_snapshot_envelope_binding_detects_mismatch() {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            AgentId([9; 32]),
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.state_revision = 7;
+        info.state_hash = "hash-a".to_string();
+        info.security_binding = Some("treekem:epoch=3".to_string());
+        let envelope = TreeKemSnapshotEnvelope {
+            version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+            state_revision: info.state_revision,
+            state_hash: info.state_hash.clone(),
+            security_binding: info.security_binding.clone(),
+            snapshot: b"snapshot".to_vec(),
+        };
+        assert!(treekem_snapshot_envelope_matches_info(&envelope, &info));
+
+        info.state_hash = "hash-b".to_string();
+        assert!(!treekem_snapshot_envelope_matches_info(&envelope, &info));
+    }
+
+    #[tokio::test]
+    async fn treekem_journal_replay_writes_snapshot_and_named_groups() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let treekem_dir = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem_dir).await?;
+        let named_path = dir.path().join("named_groups.json");
+        let snapshot_envelope = {
+            let mut bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
+            bytes.extend(postcard::to_stdvec(&TreeKemSnapshotEnvelope {
+                version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+                state_revision: 1,
+                state_hash: "state".to_string(),
+                security_binding: Some("treekem:epoch=1".to_string()),
+                snapshot: b"snapshot".to_vec(),
+            })?);
+            bytes
+        };
+        let journal = TreeKemNamedPersistJournal {
+            version: TREEKEM_NAMED_JOURNAL_VERSION,
+            group_id_hex: "ab".repeat(16),
+            named_groups_json: "{\"group\":true}".to_string(),
+            snapshot_envelope: snapshot_envelope.clone(),
+        };
+        let journal_path = treekem_journal_path(&treekem_dir, &journal.group_id_hex);
+        x0x::storage::write_private_bytes(&journal_path, postcard::to_stdvec(&journal)?).await?;
+
+        recover_treekem_named_journals(&named_path, &treekem_dir).await?;
+
+        assert_eq!(
+            tokio::fs::read_to_string(&named_path).await?,
+            "{\"group\":true}"
+        );
+        assert_eq!(
+            tokio::fs::read(treekem_snapshot_path(&treekem_dir, &journal.group_id_hex)).await?,
+            snapshot_envelope
+        );
+        assert!(!journal_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn treekem_metadata_event_phase3_classifier_allows_owner_delete() {
+        let event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: "aa".repeat(16),
+            revision: 1,
+            actor: "11".repeat(32),
+            agent_id: "22".repeat(32),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&event));
+
+        let event = NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: "aa".repeat(16),
+            request_id: "req".to_string(),
+            requester_agent_id: "22".repeat(32),
+            message: None,
+            ts: 1,
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: Some("a2V5".to_string()),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&event));
+
+        let event = NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id: "aa".repeat(16),
+            request_id: "req".to_string(),
+            revision: 2,
+            actor: "11".repeat(32),
+            requester_agent_id: "22".repeat(32),
+            treekem_commit_b64: Some("Y29tbWl0".to_string()),
+            treekem_welcome_b64: Some("d2VsY29tZQ==".to_string()),
+            welcome_ref: None,
+            treekem_epoch: Some(1),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&event));
+
+        let event = NamedGroupMetadataEvent::GroupDeleted {
+            group_id: "aa".repeat(16),
+            revision: 1,
+            actor: "11".repeat(32),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&event));
+
+        let event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: "aa".repeat(16),
+            revision: 1,
+            actor: "11".repeat(32),
+            agent_id: "22".repeat(32),
+            role: x0x::groups::GroupRole::Admin,
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&event));
+
+        let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: "aa".repeat(16),
+            revision: 1,
+            actor: "11".repeat(32),
+            name: Some("name".to_string()),
+            description: Some(String::new()),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&event));
+    }
+
+    #[test]
+    fn treekem_self_leave_metadata_is_authorized_without_transport_commit() {
+        let creator = AgentId([0x11; 32]);
+        let creator_hex = hex::encode(creator.as_bytes());
+        let member_hex = "22".repeat(32);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            creator,
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        let group_id = info.stable_group_id().to_string();
+
+        let self_leave = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision: 2,
+            actor: member_hex.clone(),
+            agent_id: member_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit: Some(fake_group_state_commit(&group_id, 2, &member_hex)),
+        };
+
+        assert!(authorized_treekem_membership_event_for_queue(
+            &info,
+            &self_leave,
+            &member_hex,
+            &creator_hex
+        ));
+        assert!(!authorized_treekem_membership_event_for_queue(
+            &info,
+            &self_leave,
+            &creator_hex,
+            &creator_hex
+        ));
+
+        let admin_remove_without_treekem = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision: 3,
+            actor: creator_hex.clone(),
+            agent_id: member_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit: Some(fake_group_state_commit(&group_id, 3, &creator_hex)),
+        };
+        assert!(!authorized_treekem_membership_event_for_queue(
+            &info,
+            &admin_remove_without_treekem,
+            &creator_hex,
+            &creator_hex
+        ));
+
+        let admin_remove_with_treekem = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision: 4,
+            actor: creator_hex.clone(),
+            agent_id: member_hex,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_epoch: Some(2),
+            commit: Some(fake_group_state_commit(&group_id, 4, &creator_hex)),
+        };
+        assert!(authorized_treekem_membership_event_for_queue(
+            &info,
+            &admin_remove_with_treekem,
+            &creator_hex,
+            &creator_hex
+        ));
+    }
+
+    #[test]
+    fn treekem_leave_disposition_allows_local_pending_stub_cleanup() {
+        let creator = AgentId([0x11; 32]);
+        let member = AgentId([0x22; 32]);
+        let creator_hex = hex::encode(creator.as_bytes());
+        let member_hex = hex::encode(member.as_bytes());
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            creator,
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+
+        assert_eq!(
+            treekem_leave_disposition(&info, creator, &creator_hex),
+            TreeKemLeaveDisposition::CreatorMustDelete
+        );
+        assert_eq!(
+            treekem_leave_disposition(&info, member, &member_hex),
+            TreeKemLeaveDisposition::LocalOnlyDrop
+        );
+
+        info.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(creator_hex.clone()),
+            None,
+        );
+        assert_eq!(
+            treekem_leave_disposition(&info, member, &member_hex),
+            TreeKemLeaveDisposition::ActiveMember
+        );
+
+        info.remove_member(&member_hex, Some(creator_hex));
+        assert_eq!(
+            treekem_leave_disposition(&info, member, &member_hex),
+            TreeKemLeaveDisposition::LocalOnlyDrop
+        );
+    }
+
+    #[test]
+    fn treekem_invite_stub_matches_authority_base_hash() {
+        let creator = AgentId([7; 32]);
+        let group_id = "ab".repeat(32);
+        let policy = x0x::groups::GroupPolicy::default();
+        let mut authority = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            "desc".to_string(),
+            creator,
+            group_id.clone(),
+            policy.clone(),
+        );
+        authority.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        authority.shared_secret = None;
+        authority.secret_epoch = 1;
+        authority.security_binding = Some("treekem:epoch=1".to_string());
+        authority.recompute_state_hash();
+
+        let mut invite = x0x::groups::invite::SignedInvite::new(
+            authority.mls_group_id.clone(),
+            authority.name.clone(),
+            &creator,
+            0,
+        );
+        invite.stable_group_id = Some(authority.stable_group_id().to_string());
+        invite.group_created_at = Some(authority.created_at);
+        invite.group_description = Some(authority.description.clone());
+        invite.policy = Some(authority.policy.clone());
+        invite.genesis_creation_nonce =
+            authority.genesis.as_ref().map(|g| g.creation_nonce.clone());
+        invite.base_state_revision = Some(authority.state_revision);
+        invite.base_state_hash = Some(authority.state_hash.clone());
+        invite.base_members_v2 = Some(authority.members_v2.clone());
+        invite.base_prev_state_hash = authority.prev_state_hash.clone();
+        invite.secure_plane = Some(authority.secure_plane);
+        invite.base_secret_epoch = Some(authority.secret_epoch);
+        invite.base_security_binding = authority.security_binding.clone();
+
+        let mut stub = x0x::groups::GroupInfo::with_policy(
+            invite.group_name.clone(),
+            invite.group_description.clone().unwrap_or_default(),
+            creator,
+            invite.group_id.clone(),
+            invite.policy.clone().unwrap_or_default(),
+        );
+        if let Some(group_created_at) = invite.group_created_at {
+            stub.created_at = group_created_at;
+        }
+        if let Some(stable_group_id) = invite.stable_group_id.clone() {
+            stub.genesis = Some(x0x::groups::GroupGenesis::with_existing_id(
+                stable_group_id,
+                invite.inviter.clone(),
+                stub.created_at,
+                invite.genesis_creation_nonce.clone().unwrap_or_default(),
+            ));
+        }
+        stub.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        stub.shared_secret = None;
+        stub.secret_epoch = invite.base_secret_epoch.unwrap_or_default();
+        stub.security_binding = invite.base_security_binding.clone();
+        stub.state_revision = invite.base_state_revision.unwrap_or_default();
+        stub.roster_revision = stub.roster_revision.max(stub.state_revision);
+        if let Some(base_members) = invite.base_members_v2.clone() {
+            stub.members_v2 = base_members;
+        }
+        if let Some(base_state_hash) = invite.base_state_hash.clone() {
+            stub.state_hash = base_state_hash;
+            stub.prev_state_hash = invite.base_prev_state_hash.clone();
+        } else {
+            stub.recompute_state_hash();
+        }
+
+        assert_eq!(stub.state_hash, authority.state_hash);
+        assert_eq!(stub.state_revision, authority.state_revision);
+    }
+
+    #[test]
+    fn local_treekem_welcome_with_state_gap_is_queued() {
+        let local_agent_hex = "22".repeat(32);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            AgentId([1; 32]),
+            "aa".repeat(32),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.state_revision = 1;
+        info.roster_revision = 1;
+        info.state_hash = "rev1".to_string();
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: info.stable_group_id().to_string(),
+            revision: 3,
+            actor: "11".repeat(32),
+            agent_id: local_agent_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: None,
+            welcome_ref: Some(WelcomeRef {
+                welcome_id: "welcome".to_string(),
+                byte_len: 1,
+                source: "11".repeat(32),
+            }),
+            treekem_epoch: Some(3),
+            commit: Some(x0x::groups::GroupStateCommit {
+                group_id: info.stable_group_id().to_string(),
+                revision: 3,
+                prev_state_hash: Some("rev2".to_string()),
+                roster_root: String::new(),
+                policy_hash: String::new(),
+                public_meta_hash: String::new(),
+                security_binding: Some("treekem:epoch=3".to_string()),
+                state_hash: "rev3".to_string(),
+                withdrawn: false,
+                committed_by: "11".repeat(32),
+                committed_at: 1,
+                signer_public_key: String::new(),
+                signature: String::new(),
+            }),
+        };
+
+        assert_eq!(
+            treekem_state_frontier_gap_reason(&info, &event, &local_agent_hex, None),
+            Some("revision_gap".to_string())
+        );
+    }
+
+    #[test]
+    fn join_result_fetch_request_is_small_and_stable() {
+        let request = JoinResultMessage::FetchRequest {
+            group_id: "aa".repeat(32),
+            member_agent_id: "bb".repeat(32),
+        };
+        let payload = serde_json::to_vec(&request);
+        assert!(payload.is_ok(), "join-result fetch request serializes");
+        let Ok(payload) = payload else {
+            return;
+        };
+        assert!(payload.len() < x0x::dm::MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            join_result_key(&"aa".repeat(32), &"bb".repeat(32)),
+            format!("{}:{}", "aa".repeat(32), "bb".repeat(32))
+        );
+
+        let result = JoinResultMessage::Result {
+            event: Box::new(NamedGroupMetadataEvent::MemberAdded {
+                group_id: "aa".repeat(32),
+                revision: 1,
+                actor: "11".repeat(32),
+                agent_id: "bb".repeat(32),
+                display_name: None,
+                treekem_commit_b64: Some("Yw==".to_string()),
+                treekem_welcome_b64: None,
+                welcome_ref: None,
+                treekem_epoch: Some(1),
+                commit: None,
+            }),
+        };
+        let result_payload = serde_json::to_vec(&result);
+        assert!(result_payload.is_ok(), "join-result response serializes");
+        let Ok(result_payload) = result_payload else {
+            return;
+        };
+        assert!(result_payload.len() < x0x::dm::MAX_PAYLOAD_BYTES);
+        let parsed = serde_json::from_slice::<JoinResultMessage>(&result_payload);
+        assert!(parsed.is_ok(), "join-result response deserializes");
+        assert!(matches!(parsed, Ok(JoinResultMessage::Result { .. })));
+    }
+
+    #[test]
+    fn welcome_blob_control_messages_keep_gossip_fallback() {
+        let fetch = WelcomeBlobMessage::FetchRequest {
+            group_id: "aa".repeat(32),
+            welcome_id: "bb".repeat(32),
+        };
+        let fetch_config = welcome_blob_send_config(&fetch);
+        assert!(!fetch_config.prefer_raw_quic_if_connected);
+        assert!(!fetch_config.stop_fallback_on_raw_error);
+
+        let chunk = WelcomeBlobMessage::Chunk {
+            welcome_id: "bb".repeat(32),
+            sequence: 0,
+            data: "Yw==".to_string(),
+        };
+        let chunk_config = welcome_blob_send_config(&chunk);
+        assert!(chunk_config.prefer_raw_quic_if_connected);
+        assert!(chunk_config.stop_fallback_on_raw_error);
+    }
+
+    #[test]
+    fn file_transfer_control_messages_are_acked_but_chunks_are_windowed() {
+        let control = file_transfer_control_send_config();
+        assert!(control.prefer_raw_quic_if_connected);
+        assert!(!control.stop_fallback_on_raw_error);
+        assert_eq!(
+            control.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
+
+        let chunk = file_transfer_send_config();
+        assert!(chunk.prefer_raw_quic_if_connected);
+        assert!(!chunk.stop_fallback_on_raw_error);
+        assert_eq!(
+            chunk.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
+    }
+
+    #[test]
+    fn named_group_metadata_delivery_prefers_verified_gossip_inbox() {
+        let config = named_group_direct_delivery_config();
+
+        assert!(!config.prefer_raw_quic_if_connected);
+        assert!(!config.require_gossip);
+        assert!(!config.stop_fallback_on_raw_error);
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
+    }
+
+    #[test]
+    fn treekem_welcome_ref_is_content_addressed_and_serialized() {
+        let bytes = b"large treekem welcome blob";
+        let welcome_id = welcome_id_for_bytes(bytes);
+        assert_eq!(welcome_id, hex::encode(blake3::hash(bytes).as_bytes()));
+
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: "aa".to_string(),
+            revision: 1,
+            actor: "11".to_string(),
+            agent_id: "22".to_string(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: None,
+            welcome_ref: Some(WelcomeRef {
+                welcome_id: welcome_id.clone(),
+                byte_len: bytes.len() as u64,
+                source: "11".repeat(32),
+            }),
+            treekem_epoch: Some(1),
+            commit: None,
+        };
+        let json = serde_json::to_value(event);
+        assert!(json.is_ok(), "welcome ref event serializes");
+        let Ok(json) = json else {
+            return;
+        };
+        assert_eq!(json["welcome_ref"]["welcome_id"], welcome_id);
+        assert_eq!(json["treekem_welcome_b64"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn treekem_join_request_events_accept_legacy_json_defaults() {
+        let created: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "join_request_created",
+            "group_id": "aa",
+            "request_id": "req",
+            "requester_agent_id": "22",
+            "message": null,
+            "ts": 1
+        }))
+        .expect("legacy created event should deserialize");
+        match created {
+            NamedGroupMetadataEvent::JoinRequestCreated {
+                treekem_key_package_b64,
+                ..
+            } => assert_eq!(treekem_key_package_b64, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let approved: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "join_request_approved",
+            "group_id": "aa",
+            "request_id": "req",
+            "revision": 2,
+            "actor": "11",
+            "requester_agent_id": "22"
+        }))
+        .expect("legacy approved event should deserialize");
+        match approved {
+            NamedGroupMetadataEvent::JoinRequestApproved {
+                treekem_commit_b64,
+                treekem_welcome_b64,
+                treekem_epoch,
+                ..
+            } => {
+                assert_eq!(treekem_commit_b64, None);
+                assert_eq!(treekem_welcome_b64, None);
+                assert_eq!(treekem_epoch, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_joined_canonical_binds_treekem_keypackage() {
+        let base = canonical_member_joined_bytes(
+            "group",
+            Some("stable"),
+            &"22".repeat(32),
+            "pubkey",
+            x0x::groups::GroupRole::Member,
+            Some("Alice"),
+            &"11".repeat(32),
+            "invite-secret",
+            42,
+            Some("key-package-a"),
+        );
+        let changed = canonical_member_joined_bytes(
+            "group",
+            Some("stable"),
+            &"22".repeat(32),
+            "pubkey",
+            x0x::groups::GroupRole::Member,
+            Some("Alice"),
+            &"11".repeat(32),
+            "invite-secret",
+            42,
+            Some("key-package-b"),
+        );
+        let legacy = canonical_member_joined_bytes(
+            "group",
+            Some("stable"),
+            &"22".repeat(32),
+            "pubkey",
+            x0x::groups::GroupRole::Member,
+            Some("Alice"),
+            &"11".repeat(32),
+            "invite-secret",
+            42,
+            None,
+        );
+
+        assert_ne!(base, changed);
+        assert_ne!(base, legacy);
+    }
+
+    #[test]
+    fn direct_add_request_defaults_without_treekem_keypackage() {
+        let req: AddNamedGroupMemberRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "22",
+            "display_name": "Bob"
+        }))
+        .expect("request should deserialize");
+        assert_eq!(req.agent_id, "22");
+        assert_eq!(req.display_name.as_deref(), Some("Bob"));
+        assert_eq!(req.treekem_key_package_b64, None);
+    }
+
+    #[test]
+    fn phase3_metadata_events_accept_legacy_json_defaults() {
+        let joined: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "member_joined",
+            "group_id": "aa",
+            "member_agent_id": "22",
+            "member_public_key_b64": "cHVi",
+            "role": "member",
+            "inviter_agent_id": "11",
+            "invite_secret": "secret",
+            "ts_ms": 1,
+            "signature_b64": "c2ln"
+        }))
+        .expect("legacy member_joined should deserialize");
+        match joined {
+            NamedGroupMetadataEvent::MemberJoined {
+                treekem_key_package_b64,
+                ..
+            } => assert_eq!(treekem_key_package_b64, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let added: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "member_added",
+            "group_id": "aa",
+            "revision": 1,
+            "actor": "11",
+            "agent_id": "22",
+            "display_name": null
+        }))
+        .expect("legacy member_added should deserialize");
+        match added {
+            NamedGroupMetadataEvent::MemberAdded {
+                treekem_commit_b64,
+                treekem_welcome_b64,
+                treekem_epoch,
+                ..
+            } => {
+                assert_eq!(treekem_commit_b64, None);
+                assert_eq!(treekem_welcome_b64, None);
+                assert_eq!(treekem_epoch, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let banned: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "member_banned",
+            "group_id": "aa",
+            "revision": 1,
+            "actor": "11",
+            "agent_id": "22"
+        }))
+        .expect("legacy member_banned should deserialize");
+        match banned {
+            NamedGroupMetadataEvent::MemberBanned {
+                treekem_commit_b64,
+                treekem_epoch,
+                ..
+            } => {
+                assert_eq!(treekem_commit_b64, None);
+                assert_eq!(treekem_epoch, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase3_metadata_classifier_allows_completed_membership_events() {
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            group_id: "aa".to_string(),
+            revision: 1,
+            actor: "11".to_string(),
+            agent_id: "22".to_string(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: Some("dw==".to_string()),
+            welcome_ref: None,
+            treekem_epoch: Some(1),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&member_added));
+
+        let member_banned = NamedGroupMetadataEvent::MemberBanned {
+            group_id: "aa".to_string(),
+            revision: 1,
+            actor: "11".to_string(),
+            agent_id: "22".to_string(),
+            secret_epoch: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_epoch: Some(1),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&member_banned));
+
+        let member_unbanned = NamedGroupMetadataEvent::MemberUnbanned {
+            group_id: "aa".to_string(),
+            revision: 1,
+            actor: "11".to_string(),
+            agent_id: "22".to_string(),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&member_unbanned));
+    }
+
+    #[test]
+    fn treekem_pending_event_helpers_dedupe_and_sort_by_frontier() {
+        fn fake_commit(revision: u64, prev: &str) -> x0x::groups::GroupStateCommit {
+            x0x::groups::GroupStateCommit {
+                group_id: "aa".to_string(),
+                revision,
+                prev_state_hash: Some(prev.to_string()),
+                roster_root: "roster".to_string(),
+                policy_hash: "policy".to_string(),
+                public_meta_hash: "meta".to_string(),
+                security_binding: Some(format!("treekem:epoch={revision}")),
+                state_hash: format!("state-{revision}"),
+                withdrawn: false,
+                committed_by: "11".to_string(),
+                committed_at: revision,
+                signer_public_key: "pub".to_string(),
+                signature: "sig".to_string(),
+            }
+        }
+
+        let add_epoch_2 = NamedGroupMetadataEvent::MemberAdded {
+            group_id: "aa".to_string(),
+            revision: 2,
+            actor: "11".to_string(),
+            agent_id: "22".to_string(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: Some("dw==".to_string()),
+            welcome_ref: None,
+            treekem_epoch: Some(2),
+            commit: Some(fake_commit(2, "state-1")),
+        };
+        let ban_epoch_3 = NamedGroupMetadataEvent::MemberBanned {
+            group_id: "aa".to_string(),
+            revision: 3,
+            actor: "11".to_string(),
+            agent_id: "33".to_string(),
+            secret_epoch: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_epoch: Some(3),
+            commit: Some(fake_commit(3, "state-2")),
+        };
+
+        assert_eq!(treekem_membership_event_sort_key(&ban_epoch_3), (3, 3));
+        assert_eq!(treekem_membership_event_sort_key(&add_epoch_2), (2, 2));
+        assert_ne!(
+            treekem_membership_event_key(&add_epoch_2),
+            treekem_membership_event_key(&ban_epoch_3)
+        );
+        assert_eq!(
+            treekem_membership_event_key(&add_epoch_2),
+            treekem_membership_event_key(&add_epoch_2.clone())
+        );
+    }
+
+    #[test]
+    fn treekem_local_welcome_queues_on_authority_state_gap() {
+        let local_agent_hex = "22".repeat(32);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            AgentId([9; 32]),
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.state_revision = 0;
+        info.roster_revision = 0;
+        info.state_hash = "joiner-stub-hash".to_string();
+        let commit = x0x::groups::GroupStateCommit {
+            group_id: "aa".to_string(),
+            revision: 10,
+            prev_state_hash: Some("authority-prev-hash".to_string()),
+            roster_root: "roster".to_string(),
+            policy_hash: "policy".to_string(),
+            public_meta_hash: "meta".to_string(),
+            security_binding: Some("treekem:epoch=10".to_string()),
+            state_hash: "authority-state-10".to_string(),
+            withdrawn: false,
+            committed_by: "11".to_string(),
+            committed_at: 10,
+            signer_public_key: "pub".to_string(),
+            signature: "sig".to_string(),
+        };
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: "aa".to_string(),
+            revision: 10,
+            actor: "11".to_string(),
+            agent_id: local_agent_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: Some("dw==".to_string()),
+            welcome_ref: None,
+            treekem_epoch: Some(10),
+            commit: Some(commit),
+        };
+
+        assert_eq!(
+            treekem_state_frontier_gap_reason(&info, &event, &local_agent_hex, None),
+            Some("revision_gap".to_string())
+        );
+    }
+
+    #[test]
+    fn treekem_catchup_messages_use_explicit_type_tags() {
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: "aa".to_string(),
+            requester_agent_id: "22".to_string(),
+            from_revision: 1,
+            from_treekem_epoch: 1,
+            current_state_hash: "state-1".to_string(),
+            missing_prev_state_hash: Some("state-2".to_string()),
+            limit: 8,
+        };
+        let encoded = serde_json::to_value(&request).expect("catch-up request serializes");
+        assert_eq!(encoded["message_type"], "treekem_catchup_request");
+
+        let response = TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: "aa".to_string(),
+            events: Vec::new(),
+            truncated: false,
+        };
+        let encoded = serde_json::to_value(&response).expect("catch-up response serializes");
+        assert_eq!(encoded["message_type"], "treekem_catchup_response");
+    }
+
+    #[test]
+    fn treekem_membership_guard_returns_501_without_mutating() {
+        let creator = AgentId([7; 32]);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            creator,
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        let before_revision = info.roster_revision;
+        let before_members = info.members_v2.clone();
+
+        let response = treekem_membership_unsupported(&info);
+        assert!(
+            response.is_some(),
+            "legacy-only TreeKEM endpoints must fail loud instead of running GSS rekey logic"
+        );
+        let status = response.map(|(status, _body)| status);
+
+        assert_eq!(status, Some(StatusCode::NOT_IMPLEMENTED));
+        assert_eq!(info.roster_revision, before_revision);
+        assert_eq!(info.members_v2, before_members);
+    }
+
     #[test]
     fn release_manifest_rebroadcast_only_newer_versions() {
         let older_manifest = manifest_with_version("0.0.1");
@@ -14929,6 +21179,43 @@ mod tests {
     }
 
     #[test]
+    fn safe_file_transfer_id_accepts_canonical_uuid() {
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        assert!(is_safe_file_transfer_id(&transfer_id));
+
+        let transfers_dir = PathBuf::from("/tmp/x0x-transfers");
+        let part_path = safe_file_transfer_part_path(&transfers_dir, &transfer_id);
+        assert_eq!(
+            part_path,
+            Ok(transfers_dir.join(format!("{transfer_id}.part")))
+        );
+    }
+
+    #[test]
+    fn safe_file_transfer_id_rejects_path_traversal_and_noncanonical_ids() {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let invalid_ids = vec![
+            "../../escape".to_string(),
+            "../escape".to_string(),
+            "subdir/file".to_string(),
+            r"subdir\file".to_string(),
+            "..".to_string(),
+            String::new(),
+            uuid.to_uppercase(),
+            format!("urn:uuid:{uuid}"),
+            format!("{{{uuid}}}"),
+        ];
+
+        for transfer_id in invalid_ids {
+            assert!(!is_safe_file_transfer_id(&transfer_id));
+            assert!(
+                safe_file_transfer_part_path(FsPath::new("/tmp/x0x-transfers"), &transfer_id)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn file_chunk_ack_slot_records_max() {
         let slot = FileChunkAckSlot::new();
         assert_eq!(slot.last_acked.load(Ordering::SeqCst), u64::MAX);
@@ -14988,5 +21275,47 @@ mod tests {
             .expect("waiter must release before the test timeout")
             .expect("waiter task did not panic");
         res.expect("must succeed once ack >= last_seq arrives");
+    }
+
+    #[test]
+    fn group_public_message_direct_payload_is_prefixed_json() {
+        let msg = x0x::groups::GroupPublicMessage {
+            group_id: "group-1".to_string(),
+            state_hash_at_send: "state".to_string(),
+            revision_at_send: 7,
+            author_agent_id: "aa".repeat(32),
+            author_public_key: "bb".repeat(64),
+            author_user_id: None,
+            kind: x0x::groups::GroupPublicMessageKind::Chat,
+            body: "hello".to_string(),
+            timestamp: 123,
+            signature: "cc".repeat(64),
+        };
+
+        let payload =
+            encode_group_public_message_direct_payload(&msg).expect("payload should encode");
+        assert!(payload.starts_with(GROUP_PUBLIC_MESSAGE_DM_PREFIX));
+
+        let decoded: x0x::groups::GroupPublicMessage =
+            serde_json::from_slice(&payload[GROUP_PUBLIC_MESSAGE_DM_PREFIX.len()..])
+                .expect("payload JSON should decode");
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn kv_store_delta_direct_payload_is_prefixed_json() {
+        let peer_id = saorsa_gossip_types::PeerId::new([9; 32]);
+        let delta = x0x::kv::KvStoreDelta::new(42);
+
+        let payload = encode_kv_store_delta_direct_payload("store-1", peer_id, &delta)
+            .expect("payload should encode");
+        assert!(payload.starts_with(KV_STORE_DELTA_DM_PREFIX));
+
+        let decoded: KvStoreDirectDelta =
+            serde_json::from_slice(&payload[KV_STORE_DELTA_DM_PREFIX.len()..])
+                .expect("payload JSON should decode");
+        assert_eq!(decoded.store_id, "store-1");
+        assert_eq!(decoded.peer_id, peer_id);
+        assert_eq!(decoded.delta.version, delta.version);
     }
 }

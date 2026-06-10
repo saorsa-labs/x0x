@@ -270,7 +270,11 @@ def main() -> int:
         paths = list(module["paths"])
         matches = matching_records(records, paths)
         if not matches:
-            warn(f"{module['name']}: no LCOV records matched {paths}")
+            message = f"{module['name']}: no LCOV records matched {paths}"
+            if args.enforce_modules or module["mode"] == "required":
+                failures.append(message)
+            else:
+                warn(message)
             continue
 
         module_percent, module_hit, module_found = coverage_percent(matches)

@@ -1,7 +1,9 @@
-//! Shared x0xd launcher for ignored integration tests.
+//! Shared x0xd launcher for daemon integration tests.
 //!
 //! Starts a fresh daemon per test with an isolated temp data dir, a unique
 //! instance-scoped identity dir, and update checks disabled for determinism.
+
+#![allow(clippy::expect_used, clippy::panic)]
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use std::path::{Path, PathBuf};
@@ -29,10 +31,7 @@ impl DaemonFixture {
     pub async fn start_with_config(prefix: &str, extra_config: &str) -> Self {
         let name = format!("{prefix}-{}", rand::random::<u32>());
         let binary = find_x0xd_binary();
-        assert!(
-            binary.exists(),
-            "Build x0xd first: cargo build --release --bin x0xd"
-        );
+        assert!(binary.exists(), "Build x0xd first: cargo build --bin x0xd");
 
         let tempdir = TempDir::new().expect("temp dir");
         let config_path = tempdir.path().join("config.toml");
@@ -216,13 +215,21 @@ impl Drop for DaemonFixture {
 
 fn find_x0xd_binary() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidates = [
+    let cargo_test_binary = option_env!("CARGO_BIN_EXE_x0xd").map(PathBuf::from);
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    let mut candidates = Vec::new();
+    if let Some(path) = cargo_test_binary {
+        candidates.push(path);
+    }
+    candidates.extend([
         manifest_dir.join("target/release/x0xd"),
         manifest_dir.join("../../target/release/x0xd"),
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("target/release/x0xd"),
-    ];
+        current_dir.join("target/release/x0xd"),
+        manifest_dir.join("target/debug/x0xd"),
+        manifest_dir.join("../../target/debug/x0xd"),
+        current_dir.join("target/debug/x0xd"),
+    ]);
 
     for candidate in candidates {
         if candidate.exists() {

@@ -170,6 +170,7 @@ mod tests {
             last_seen: None,
             identity_type: id_type,
             machines: Vec::new(),
+            dm_capabilities: None,
         });
         (store, aid)
     }
@@ -255,6 +256,7 @@ mod tests {
             last_seen: None,
             identity_type: IdentityType::Anonymous,
             machines: Vec::new(),
+            dm_capabilities: None,
         });
         store.add_machine(&aid, MachineRecord::new(mid, None));
         store.pin_machine(&aid, &mid);
@@ -283,6 +285,7 @@ mod tests {
             last_seen: None,
             identity_type: IdentityType::Anonymous,
             machines: Vec::new(),
+            dm_capabilities: None,
         });
         store.add_machine(&aid, MachineRecord::new(mid, None));
         store.pin_machine(&aid, &mid);
@@ -312,6 +315,7 @@ mod tests {
             last_seen: None,
             identity_type: IdentityType::Anonymous,
             machines: Vec::new(),
+            dm_capabilities: None,
         });
         store.add_machine(&aid, MachineRecord::new(mid, None));
         store.pin_machine(&aid, &mid);

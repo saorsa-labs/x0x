@@ -40,6 +40,10 @@ AgentCertificate = sign(UserKeypair, context || user_public_key || agent_public_
 
 Never auto-generated. Opt-in only (`with_user_key()` or `with_user_key_path()`). When included in an announcement, both the certificate and user ID are present or neither is. Announcement APIs also require explicit human consent before disclosing `user_id`.
 
+Create a user identity explicitly with `x0x user-id create [PATH]`. Without `PATH`, the command writes `~/.x0x/user.key`; with `PATH`, it writes there instead. Restart `x0xd`, or set `user_key_path` in `config.toml`, for the daemon to load it. The command overwrites an existing file at the target path, so back up an existing `user.key` first if you want to keep that identity.
+
+The standalone `x0x-user-keygen` binary remains buildable from source as a deprecated compatibility shim, but the canonical user-facing path is `x0x user-id create`.
+
 **Purpose**: Optional human accountability layer.
 
 ## Identity Unification

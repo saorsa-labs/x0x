@@ -4,9 +4,123 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.22.0] - 2026-06-10
+
+### Fixed
+
+- **Cross-NAT DM capability black hole at startup** (#101, PR #102). `start_dm_inbox` published the DM capability upgrade with `watch::Sender::send`, which drops the value when no receiver is subscribed — and x0xd starts the inbox before the capability advert service subscribes. Peers cached `gossip_inbox=false` for the process lifetime and fell back to the raw-QUIC path that fails across NAT. Now `send_replace`; a regression test locks in late-subscriber visibility (verified to fail on the pre-fix code). Thanks @josh-clsn for the precise diagnosis.
+- **KvStore first-time late join never bootstrapped pre-existing keys** (#96, PR #103). The gossip message cache replays ~60s and its lazy pruning loses older deltas on busy topics, so a first-time joiner could never receive keys written before it subscribed. New `<topic>/state-sync` side channel: empty-store joiners request state on a 1/5/15/30s schedule and holders republish their full state as a regular CRDT delta (idempotent, multi-holder safe, fully backward compatible). Proven by a cold-join daemon test that fails against the pre-fix binary. Thanks @JimCollinson for the decisive repro matrix.
+
 ### Added
 
+- **`local:` topic prefix — same-daemon pub/sub IPC** (#89, PR #103). Topics starting with `local:` are delivered only to subscribers on the same x0xd instance and never reach PlumTree (no EAGER, no IHAVE); `/publish`, `/subscribe`, `/events`, WebSocket subscribe and bearer auth work unchanged. The local-IPC substrate for multi-process apps sharing one daemon. Proposed by @nkoteskey.
+- **Domain separation on `POST /agent/sign`** (#90, PR #102). Optional `domain` field signs `domain || 0x00 || payload` and echoes the domain in the response, preventing cross-protocol signature replay. NUL/empty/oversize domains rejected with 400. CLI: `x0x agent sign --domain`. Proposed by @nkoteskey.
+- **`x0x user-id inspect [PATH]`** (#93, PR #102). Daemonless validation of a user identity file: prints `user_id` and the four-word form, `--json` mode, non-zero exit naming the file on failure. The symmetric sibling of `user-id create`. Proposed by @JimCollinson.
+- **`x0x user-id create --from-seed <hex>`** (#95, PR #103). Deterministic UserKeypair derivation via FIPS 204 seeded KeyGen (the ξ input, `fips204::ml_dsa_65::KG::keygen_from_seed`) — same 32-byte seed, same keypair, any machine. Foundation for mnemonic-based identity portability; mnemonic encoding stays in consumer applications. Proposed by @JimCollinson.
+
+### Changed
+
+- **x0xd is quiet by default** (#85, PR #102). Without `RUST_LOG` or a config `log_level`, only warn/error lines are emitted (privacy by default for operators outside the fleet). `RUST_LOG=info` restores verbosity; documented in the README. Operator visibility via `/health` and `/diagnostics/*` is unaffected.
+- **Privacy Layer 2: salted-hash identifiers in warn!/error! logs** (#83, PR #104). All production warn/error sites that interpolated stable identifiers (peer/agent/machine/user ids, group ids, topics, addresses) now emit salted-BLAKE3 8-hex tokens via the new `x0x::logging` wrappers — correlatable within one daemon run, unlinkable across restarts and daemons. `info!`/`debug!` diagnostic channels (`treekem.trace`, `dm.trace`) intentionally keep real ids.
+
+### Test infrastructure
+
+- Daemon-backed regression suites for #96 and #89 wired into CI; `solo()`/`join_peer()` staggered-start harness helpers; `X0XD_TEST_BINARY` runtime override for pre-fix/post-fix proof runs; daemon health gate 30s→90s.
+
+## [v0.21.4] - 2026-06-10
+
+### Fixed
+
+- **Fresh-boot DM delivery black hole (dogfood `group_join` / hop-DM 25s timeouts).** Local 3-daemon soaks failed 10-17% of iterations with `group_join timed out` / `hop DM never echoed back`; a trace-instrumented capture run pinned a chain of three compounding faults, each masked by the previous one:
+  1. **Capability-advert poisoning**: `CapabilityAdvertService` broadcast the startup `pending()` advert (no gossip inbox / KEM key), and `CapabilityStore::insert` was unconditional last-writer-wins — epidemic broadcast delivers out of order, so a stale pending advert could clobber the gossip-ready one and leave senders on `advert_cache_unusable`. The store now orders adverts by their signed `created_at_unix_ms` (stale ignored; a genuinely fresher downgrade still wins), and the publisher never broadcasts a not-yet-usable advert (absence already means "use the raw fallback").
+  2. **Fire-and-forget raw-QUIC loss**: the daemon's generic DM config sent raw-path messages without ant-quic's receive-pipeline ACK — a send into a connection being superseded during boot churn returned `Ok` (dur_ms=0) while the bytes were lost, so the retry machinery never fired and the recipient's app never saw the message. `direct_message_send_config()` now sets `raw_quic_receive_ack_timeout = 8s` (matching the named-group config), so loss fails the attempt and the existing retry re-sends.
+  3. **Zombie-connection retry pinning**: with loss now detected, retries still resolved `cached_connected` onto the same dead connection (`is_connected` stays true for a zombie whose remote endpoint vanished without a lifecycle event) and burned ~14s per attempt until the caller's deadline. An ACKed-path send failure on a still-connected peer now tears the connection down so the next attempt takes the X0X-0031/0033 send-readiness repair (fresh dial).
+
+  Validated: the capture harness went from failing within 12-27 iterations to 40/40 clean; `tests/pr99_local_soak.sh` restored to baseline (see soak artefacts under `proofs/x0x-gui-full-dogfood/`).
+
+### Added
+
+- **`welcome.trace` diagnostics for the TreeKEM Welcome-blob transfer.** Trace-only (no behavior change): `target=welcome.trace` debug stages on both sides of the chunked Welcome pull — anchor `offer_sent` / `chunk_sent` / `chunk_ack_recv` / `final_ack_{ok,failed}`; receiver `chunk_recv` / `chunk_recv_no_pending` / `chunk_ack_sent`. Enable with `RUST_LOG=warn,welcome.trace=debug` to locate exactly where a Welcome transfer stalls under churn.
+
+### Notes
+
+- **Refined understanding of the v0.21.1 high-churn convergence "known limitation".** A controlled same-day A/B and an instrumented 110-iteration diagnostic soak found that **multi-member TreeKEM converges ~100% under normal conditions** (110/110, `welcome.trace` shows 0 Welcome-transfer failures). The earlier low numbers (47% overnight, 78% daytime) are a **degraded-network tail**, not a persistent x0x logic bug: they correlate with sustained/overnight cross-region degradation (connection eviction → `ant_quic` `Peer not found`), and — importantly — the bulk `Peer not found` events are **background gossip/transport noise** that do **not** drive Welcome-transfer failure (2207 in a 2h window with 100% convergence). Three candidate x0x-side fixes (inline-Welcome, FetchRequest retry, redial-on-`Peer not found`) were tried and all proved to target that background noise rather than the actual transfer; none improved convergence and they are **not** merged. The residual tail is treated as a connection-resilience / infra concern; the `welcome.trace` instrumentation above is left in to capture a real failure when conditions next degrade. See `handoff/` writeups and saorsa-gossip#24.
+
+## [v0.21.1] - 2026-06-04
+
+### Fixed
+
+- **Multi-member TreeKEM convergence (2nd+ member never entered the tree).** A second (or later) member reached the owner's roster but its `MemberAdded` / `Welcome` was received and then **silently rejected** — it never entered the TreeKEM tree and could not encrypt/decrypt (the v0.21.0 "known limitation"). Root cause: TreeKEM `MemberAdded` events carry signed state commits whose state-hash validation commits to the roster root, but the invite *joiner stub* did not carry the authority's current state-chain frontier or roster, so the joiner failed signed state-chain validation **before** applying the Welcome (no error logged — needed new `treekem.trace`). Fixed by seeding invites with the authority's base state (`base_state_revision` / `base_state_hash` / `base_prev_state_hash` / `base_members_v2`); local Welcome events with state gaps now queue/catch-up instead of silently failing; TreeKEM catch-up responses paginate one event at a time to stay under the DM payload cap. Cross-region testnet e2e (`tests/e2e_treekem_membership.py --member2`) now passes (m1 + m2 converge, 3-way secure round-trips, ban + forward-secrecy).
+- **`X0X-0074d` Critical-gate overflow flood under sustained load** (via saorsa-gossip 0.5.62). 0.5.59 pruned ghost/disconnected eager peers, but Critical sends could still queue behind a slow peer with no queue-wait bound — a full 64-deep Critical FIFO took ~64×send-timeout to drain, producing runaway `X0X-0074d` WARN bursts. 0.5.62 rechecks connectivity at claim time, bounds the Critical-gate wait, and treats a full Critical gate as threshold pressure that immediately cools the peer/topic instead of spamming overflow WARNs. Validated: a 3.5h testnet churn soak held `X0X-0074d=0` and `invalid epoch=0` on all 6 nodes (was thousands of overflows per ~6 min before).
+
+### Changed
+
+- Bumped saorsa-gossip **0.5.58 → 0.5.62** across all 10 crates; consume the bounded Critical-gate + saturation-cooling surfaces and the transport-connectivity hook.
+
+### Known limitations
+
+- **High-churn multi-member TreeKEM convergence is not yet fully reliable.** A 3.5h testnet soak (150 rapid create→2-member-join→ban→delete cycles on 3 fixed cross-region nodes) passed 117/150 (78%); failures are `Welcome not processed`, clustered in degradation windows. They are driven by send-timeout / Critical-gate-saturation cooling accumulating under sustained load and starving the chunked Welcome-blob fetch (`failed to fetch TreeKEM Welcome`) — **not** a TreeKEM/state bug (`invalid epoch=0`, `X0X-0074d=0` throughout). Single-member and low-churn multi-member groups converge reliably. The cooling-vs-Welcome-fetch interaction is a tracked follow-up (see `handoff/cooling-vs-welcome-fetch-2026-06-04.md`).
+
+## [v0.21.0] - 2026-06-03
+
+### Fixed
+
+- **Owner-side multi-member roster convergence**: adding a *second* (or later) member to a private secure (TreeKEM) group left that member permanently absent from the **owner's roster** — the roster stayed empty or the new joiner's invite was silently dropped (`invite_secret_unknown`), so the joiner polled forever. Root cause: every group-state mutation did a `clone → mutate → store_named_group_info(clone)` **blind last-writer-wins overwrite** of the whole `GroupInfo`, with no per-group serialization. The owner now receives the same `MemberJoined` concurrently over gossip **and** direct delivery, so two stale-clone applies would each pass the `has_active_member` check, each consume the bearer invite, and double-add to the MLS tree (`already a member`) while clobbering the roster / a freshly-issued invite. Fixed with a per-group `group_membership_lock` that serializes **all** read-modify-write of a single group's `GroupInfo` — the owner-side apply path (gossip + direct listeners) and every API mutator (`create_invite`, add, remove, ban, approve, leave, update). Single-level locking (inner TreeKEM helpers stay unlocked) keeps it deadlock-free. Verified: the 3-daemon roster-convergence/ban test passes 41/41 under soak, and the full workspace suite (1662 tests) stays green. **Scope:** this fixes the *owner-side roster*; the joiner's cryptographic tree-join is tracked as a known limitation below.
+
+### Known limitations
+
+- **Multi-member secure messaging is not yet functional end-to-end.** A cross-region testnet e2e (`tests/e2e_treekem_membership.py --member2`) confirmed that while a 2nd member now reliably reaches the owner's roster (Active), its **join result (`MemberAdded` + `Welcome`) is never delivered to it** — the joiner polls the anchor for the result and times out (`timed out polling anchor for TreeKEM join result`), so it never processes the Welcome, never enters the TreeKEM tree, and cannot encrypt/decrypt. The local `d4_mls_ban` test only asserts roster *state*, which is why it passed. **Single-member** TreeKEM groups are fully functional end-to-end (invite → join → bidirectional secure → ban → forward secrecy, verified on testnet). Multi-member (2+ members) secure participation is a tracked follow-up.
+
+### Added
+
+- **Order-sensitive TreeKEM membership reliability**: authoritative membership events are no longer gossip-only. The joiner direct-DMs `MemberJoined` to the inviter (immediately and again after the background-publish delay), and authoritative TreeKEM commits (`MemberAdded` / remove / ban / join-request approval) are direct-delivered to the new joiner plus all active members, with gossip retained as broadcast backup.
+- **Bounded TreeKEM pending/replay + explicit catch-up anti-entropy**: verified membership events that arrive before local TreeKEM readiness or ahead of the local scalar frontier (`prev_state_hash` / `state_revision` / `roster_revision` / `treekem_epoch`) are queued (bounded per group) and trigger explicit, throttled `TreeKemCatchupRequest` / `TreeKemCatchupResponse` direct messages. Responses are authorization-gated and always re-processed through the regular signed-metadata apply path.
+
+### Changed
+
+- **`AGENTS.md` clippy-gate guidance corrected**: the pre-submit clippy command is now the standard `cargo clippy --all-features --all-targets -- -D warnings` that CI actually gates on; the extra `-D clippy::panic` / `-D clippy::unwrap_used` / `-D clippy::expect_used` denies are removed because they trip on existing test code and are stricter than CI.
+- **`d4_mls_ban` strengthened to a real 3-daemon convergence test**: owner + non-banned observer + a real invite-joined ban target; it now verifies the banned member converges to `banned` in *both* the owner's and the non-banned observer's rosters, and that the owner's TreeKEM epoch advances. Uses a fresh, **owned** trio (not the process-global `cluster()` singleton, whose daemons are never dropped and lingered on the loopback interface, intermittently stalling `d4_stateful`'s gossip convergence).
+
+## [v0.20.2] - 2026-06-02
+
+### Fixed
+
+- **Scope secure-by-default TreeKEM to private groups (ADR-0012)**: group creation now flips to the real TreeKEM plane only for **private** (`Hidden` discoverability) MlsEncrypted groups, not every MlsEncrypted preset. Gating on `confidentiality == MlsEncrypted` alone was too broad — it swept in the *public* `public_request_secure` preset, whose cross-daemon join-request review converges via the D4 signed-commit (GSS) path that the single-committer TreeKEM transport does not provide, breaking request-to-join convergence. `public_request_secure` (and any public encrypted policy) now stays on the GSS plane; `private_secure` remains secure-by-default TreeKEM. Matches ADR-0012's stated scope ("all new private groups secure-by-default TreeKEM").
+
+## [v0.20.1] - 2026-06-02
+
+### Changed
+
+- **SKILL.md install guidance hardened**: the install section no longer pipes a remote script straight into a shell (`curl … | sh`) or recommends one-line variants that immediately start/persist the daemon. Option B is now download → review → run (`curl -sfLO …/install.sh`, `less install.sh`, `sh install.sh`); starting the daemon is a separate explicit `x0x start`, and `--start` / `--autostart` remain as opt-in flags on the already-downloaded, reviewed script. Clears the ClawScan "suspicious" verdict (SkillSpector + VirusTotal flagged the previous remote-installer docs; static scan was already clean).
+
+### Fixed
+
+- **Release pipeline no longer false-fails on the ClawHub scan clock**: the "Publish SKILL.md to ClawHub" job previously hard-failed after a fixed 5-minute wait for ClawHub's asynchronous security scan, reddening otherwise-successful releases (crate, binaries, and GitHub release all publish independently). The verification step is now status-aware — it keys off the `SecuritySnapshot.status` enum (`clean` → success, `malicious` → fail, `suspicious` → warn-and-succeed, `pending`/`error` → tolerate and finalize asynchronously) — so a slow scan never blocks a release while a genuine malicious verdict still does.
+- **Documentation build (rustdoc `-D warnings`)**: fixed broken/private intra-doc links in the `mls` module docs introduced with the TreeKEM plane (`[group]`, `[treekem]`, and links to the private `member_id_from_seed` / `agent_id_to_member_id` items) — now plain code spans, so `cargo doc` is clean again.
+- **`named_group_add_remove_member_local` integration test**: updated to create a `public_open` (GSS) group. The default `private_secure` preset is now secure-by-default TreeKEM (ADR-0012), where a direct roster add correctly requires the target's KeyPackage; this local-roster-semantics test now exercises the non-secure plane where add-by-`agent_id` is the valid operation.
+
+## [v0.20.0] - 2026-06-02
+
+### Added
+
+- **TreeKEM secure-group membership (ADR-0012)**: private secure groups now run real RFC-9420-subset **TreeKEM** group key agreement (via `saorsa-mls` `TreeKemGroup`), providing forward secrecy and post-compromise security. The full membership lifecycle works end-to-end — invite → join → `Welcome` processing → bidirectional secure-plane encrypt/decrypt → ban (epoch advance) → forward secrecy. On a TreeKEM join the joiner reconstructs the **owner-only authority base** from the invite (new `base_secret_epoch` / `base_security_binding` fields, folded into the signed invite bytes) so its `state_hash` matches the authority `MemberAdded` commit's `prev_hash` (previously the joiner pre-added itself, causing a `PrevHashMismatch` that blocked every join). Oversized `Welcome` payloads are delivered out-of-band via a content-addressed fetch-by-reference (`WelcomeRef`, blake3 + byte-length verified); a joiner-initiated poll recovers the authoritative `MemberAdded` if the gossip push is missed; per-group unlinkable `MemberId`s. Validated by the full test suite (1662 tests) plus a local multi-iteration soak and a 6-hour cross-region testnet membership-churn soak.
+
 - **`POST /agent/sign`**: detached ML-DSA-65 signature over a caller-supplied payload using the running agent's signing key. Bearer-token authenticated; payloads are capped at 256 KiB. Response includes the agent_id (hex), the agent's public key (base64), the signature (base64), and the stable signing scheme identifier (`"x0x.agent-sign.v1.ml-dsa-65"`). Intended for applications that persist signed records to disk or distributed storage (audit logs, governance votes, content metadata) where transport-layer gossip signing doesn't survive a database read. Callers sign exact bytes, so applications must canonicalize structured payloads and should domain-separate them with an application/type/version prefix before signing. Matching CLI: `x0x agent sign --file <PATH>` (or `--payload-b64 <BASE64>`). Coverage: `daemon_api_agent_sign_*` integration tests + `api_coverage` registry entry.
+- **Bootstrap UDP/443 reachability (ADR-0011)**: `DEFAULT_BOOTSTRAP_PEERS` now seeds each of the 6 VPS on **both UDP/443 and UDP/5483** (IPv4 + IPv6), with the `:443` entries listed first. UDP/443 traverses full-tunnel VPNs (Cloudflare WARP), corporate/hotel/CGNAT, and carrier networks that carry mainstream HTTP/3 cleanly but throttle/drop high UDP ports like 5483. Dialing a low *destination* port is unprivileged (ephemeral high source port), so **clients still never bind a privileged port or need root** — only the operator-run bootstrap VPS bind 443. Each bootstrap host runs a dedicated root `x0xd` on `:443` alongside its existing `:5483` listener; no ant-quic change (each listener binds one port). `:5483` is retained for backward compatibility — no flag day. MTU caveat: 443 mitigates port throttling/DPI but cannot raise a path's MTU; a path that can't carry QUIC's 1200-byte Initial can't run QUIC on any port.
+- **`transport_environment` diagnostics (ADR-0011 §4)**: `GET /diagnostics/connectivity` now carries a structured `transport_environment` assessment, and `x0xd --doctor` prints actionable guidance when the local path is degraded. Detects full-tunnel-VPN egress (Cloudflare WARP address ranges), constrained/critical path MTU (lost PLPMTUD probes, black-hole detection, sub-1400/sub-1252 MTU), and CGNAT (RFC 6598) — turning a previously silent "can't connect behind my VPN" failure into self-service guidance (split-tunnel / DNS-only mode). Pure, unit-tested heuristics in `connectivity::assess_transport_environment`.
+
+## [v0.19.52] - 2026-05-29
+
+### Changed
+
+- Bump `ant-quic` 0.27.24 → 0.27.25 and `saorsa-gossip` 0.5.57 → 0.5.58.
+  ant-quic 0.27.25 fixes an intermittent direct-message failure
+  (`invalid ACK-v2 response envelope: len=0`): a transient mid-exchange
+  ACK-v2 response-stream drop is now retried duplicate-safely (same request
+  id, receiver replays the cached outcome) instead of surfacing as a hard
+  `ConnectionFailed`. No x0x code changes — the fix flows through the
+  `send_with_receive_ack` DM path transparently. Validated by a local
+  2-node DM soak: 4,912/4,912 ACKed DMs, 0 errors, 0 `len=0` occurrences.
 
 ## [v0.19.45] - 2026-05-13
 

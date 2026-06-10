@@ -52,7 +52,11 @@ impl AgentInstance {
 
     async fn refresh_runtime_state(&mut self) {
         let api_addr = self.api_addr.clone();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        // 90s, not 30s: debug-build daemons doing ML-DSA keygen plus
+        // hard-coded internet bootstrap rounds come healthy anywhere from
+        // ~15s to >30s depending on machine load — the old deadline was a
+        // flakiness knife-edge for the first daemon of a run.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
         let client = reqwest::Client::new();
         loop {
             if let Ok(resp) = client.get(format!("http://{api_addr}/health")).send().await {
@@ -61,7 +65,7 @@ impl AgentInstance {
                 }
             }
             if tokio::time::Instant::now() > deadline {
-                panic!("x0xd {} did not become healthy within 30s", self.name);
+                panic!("x0xd {} did not become healthy within 90s", self.name);
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -221,6 +225,41 @@ pub async fn pair() -> AgentPair {
     pair_with_extra_config("").await
 }
 
+/// Start a single daemon with no bootstrap peers. Returns the instance
+/// and its UDP bind port so a later daemon can bootstrap to it — the
+/// staggered-start primitive for cold-late-join tests (issue #96), where
+/// state must exist before the second daemon's process does.
+pub async fn solo() -> (AgentInstance, u16) {
+    let binary = find_x0xd_binary();
+    let suffix = rand::random::<u16>();
+    let api = allocate_unused_tcp_port();
+    let bind = allocate_unused_udp_port();
+    let instance = start_instance(&binary, &format!("solo-{suffix}"), api, bind, "", "").await;
+    (instance, bind)
+}
+
+/// Start a daemon that bootstraps to an already-running instance's UDP
+/// bind port (as returned by [`solo`]). Waits for the mesh to settle and
+/// asserts the two nodes actually peered, mirroring [`pair`]'s guarantees.
+pub async fn join_peer(anchor: &AgentInstance, anchor_bind: u16) -> AgentInstance {
+    let binary = find_x0xd_binary();
+    let suffix = rand::random::<u16>();
+    let api = allocate_unused_tcp_port();
+    let bind = allocate_unused_udp_port();
+    let instance = start_instance(
+        &binary,
+        &format!("late-{suffix}"),
+        api,
+        bind,
+        &format!("bootstrap_peers = [\"127.0.0.1:{anchor_bind}\"]"),
+        "",
+    )
+    .await;
+    tokio::time::sleep(MESH_SETTLE_TIME).await;
+    assert_nodes_connected(&[anchor, &instance]).await;
+    instance
+}
+
 pub async fn trio_with_extra_config(extra_config: &str) -> AgentCluster {
     create_cluster_with_extra_config(extra_config).await
 }
@@ -244,7 +283,10 @@ pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
         extra_config,
     )
     .await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Rolling start: use the same empirically-required delay as the trio so
+    // bob has a stable alice to bootstrap against. The previous 5s was too
+    // short and let propagation-dependent tests race mesh formation.
+    tokio::time::sleep(ROLLING_START_DELAY).await;
     let bob = start_instance(
         &binary,
         &format!("pair-bob-{suffix}"),
@@ -254,7 +296,13 @@ pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
         extra_config,
     )
     .await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(MESH_SETTLE_TIME).await;
+
+    // Enforce peering before returning. Without this, propagation-dependent
+    // assertions (member convergence, delete propagation) flake when alice and
+    // bob have not yet connected — exactly the failure mode the trio path
+    // already guards against via assert_mesh_connected.
+    assert_nodes_connected(&[&alice, &bob]).await;
 
     AgentPair { alice, bob }
 }
@@ -357,7 +405,16 @@ async fn assert_mesh_connected(
     bob: &AgentInstance,
     charlie: &AgentInstance,
 ) {
-    for node in [alice, bob, charlie] {
+    assert_nodes_connected(&[alice, bob, charlie]).await;
+    eprintln!("[cluster] mesh verified — all 3 nodes connected");
+}
+
+/// Poll `/peers` on each node until it reports at least one peer. Panics if any
+/// node still has zero peers after 30s. A disconnected mesh produces flaky
+/// propagation results, so we fail loudly here rather than let the test proceed
+/// and time out on a downstream convergence assertion.
+async fn assert_nodes_connected(nodes: &[&AgentInstance]) {
+    for node in nodes {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let resp: serde_json::Value = node.get("/peers").await.json().await.unwrap_or_default();
@@ -380,10 +437,22 @@ async fn assert_mesh_connected(
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
-    eprintln!("[cluster] mesh verified — all 3 nodes connected");
 }
 
 fn find_x0xd_binary() -> PathBuf {
+    // Runtime override — lets a test run pin the daemon build (e.g. to
+    // prove a regression test fails against a pre-fix binary while the
+    // test code itself compiles from the current tree).
+    if let Ok(path) = std::env::var("X0XD_TEST_BINARY") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return path;
+        }
+        panic!(
+            "X0XD_TEST_BINARY set but does not exist: {}",
+            path.display()
+        );
+    }
     if let Some(path) = option_env!("CARGO_BIN_EXE_x0xd") {
         let path = PathBuf::from(path);
         if path.exists() {

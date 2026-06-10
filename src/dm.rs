@@ -384,6 +384,10 @@ pub struct DmSendConfig {
     /// present. Use this for higher-volume protocols (for example file
     /// transfer) whose own back-pressure/ACK logic is tuned for raw QUIC.
     pub stop_fallback_on_raw_error: bool,
+    /// If true, gossip-inbox sends wait for the recipient's application-layer
+    /// ACK before returning success. If false, a successful gossip publish is
+    /// reported as accepted-for-delivery and any later ACK is ignored.
+    pub require_gossip_ack: bool,
     /// X0X-0041: bounded grace window (ms) the DM path holds when ant-quic has
     /// just observed a `Replaced` event but the new `Established` has not yet
     /// fired. Mirrors iroh-gossip #43 "always prefer newest connection" — when
@@ -409,6 +413,7 @@ impl Default for DmSendConfig {
             prefer_raw_quic_if_connected: false,
             raw_quic_receive_ack_timeout: None,
             stop_fallback_on_raw_error: false,
+            require_gossip_ack: true,
             // X0X-0041: 250ms is the soak-tested grace from iroh-gossip #43.
             prefer_newest_grace_ms: DEFAULT_PREFER_NEWEST_GRACE_MS,
         }
@@ -543,14 +548,24 @@ impl RecentDeliveryCache {
         Some(entry)
     }
 
-    /// Insert an outcome. If the key is already present, the existing
-    /// `first_seen` is preserved (so TTL doesn't restart on re-delivery).
-    pub fn insert(&self, key: DedupeKey, outcome: DmAckOutcome) {
+    /// Insert an outcome, returning `true` iff this call was the one that
+    /// inserted the key (i.e. it *claimed* the dedupe slot). If the key is
+    /// already present, the existing `first_seen` is preserved (so TTL doesn't
+    /// restart on re-delivery) and `false` is returned.
+    ///
+    /// The boolean makes this usable as an atomic claim: a caller can insert a
+    /// placeholder outcome and only proceed with delivery when it observes the
+    /// `true` return, so two tasks racing the same envelope (e.g. the primary
+    /// per-recipient inbox and the legacy bus delivering the same DM) cannot
+    /// both deliver it to the application. On lock poisoning we return `true`
+    /// (proceed) so a poisoned cache degrades to possible double-delivery
+    /// rather than silent message loss.
+    pub fn insert(&self, key: DedupeKey, outcome: DmAckOutcome) -> bool {
         let Ok(mut inner) = self.inner.lock() else {
-            return;
+            return true;
         };
         if inner.entries.contains_key(&key) {
-            return;
+            return false;
         }
         inner.entries.insert(
             key,
@@ -568,6 +583,7 @@ impl RecentDeliveryCache {
             };
             inner.entries.remove(&oldest);
         }
+        true
     }
 
     /// Current cache size (diagnostic).
@@ -1009,6 +1025,27 @@ mod tests {
         cache.insert(k, DmAckOutcome::Accepted);
         let hit = cache.lookup(&k).expect("cache hit");
         assert_eq!(hit.outcome, DmAckOutcome::Accepted);
+    }
+
+    #[test]
+    fn dedupe_cache_insert_claims_slot_exactly_once() {
+        // The atomic-claim contract that prevents dual-path (primary inbox +
+        // legacy bus) double-delivery: the first insert claims the slot
+        // (returns true); any later insert of the same key returns false so the
+        // racing task skips delivery and only re-ACKs.
+        let cache = RecentDeliveryCache::with_defaults();
+        let k = DedupeKey::new(dummy_agent_id(1), [9; 16]);
+        assert!(
+            cache.insert(k, DmAckOutcome::Accepted),
+            "first insert must claim the slot"
+        );
+        assert!(
+            !cache.insert(k, DmAckOutcome::Accepted),
+            "second insert of the same key must not re-claim"
+        );
+        // A different key is independently claimable.
+        let k2 = DedupeKey::new(dummy_agent_id(2), [9; 16]);
+        assert!(cache.insert(k2, DmAckOutcome::Accepted));
     }
 
     #[test]

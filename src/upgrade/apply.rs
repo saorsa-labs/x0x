@@ -12,6 +12,31 @@ use super::manifest::{current_platform_target, ReleaseManifest};
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
 use super::{UpgradeError, UpgradeResult, Upgrader};
 
+/// Removes an upgrade temp dir when dropped, so it is never leaked on an
+/// early-return error path (e.g. a failed binary replace on Windows, which
+/// otherwise left a ~50 MB archive + extracted binary behind on every attempt).
+///
+/// The success path explicitly removes the temp dir *before* triggering the
+/// restart, because the restart `exec()`s (Unix) or `exit()`s without unwinding,
+/// so this guard would not otherwise run there.
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => debug!(
+                path = %self.path.display(),
+                error = %e,
+                "Failed to remove upgrade temp dir on cleanup"
+            ),
+        }
+    }
+}
+
 /// Auto-apply upgrader that handles the full download → verify → extract → replace → restart flow.
 pub struct AutoApplyUpgrader {
     /// Which binary to extract from the archive (e.g. "x0xd", "x0x").
@@ -92,6 +117,10 @@ impl AutoApplyUpgrader {
         let target_path = current_binary_path()?;
         let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
         let temp_dir = upgrader.create_temp_dir()?;
+        // Guarantees temp-dir removal on every early-return error path below.
+        let _temp_guard = TempDirGuard {
+            path: temp_dir.clone(),
+        };
 
         let archive_path = temp_dir.join("archive");
         let sig_path = temp_dir.join("archive.sig");
@@ -653,5 +682,63 @@ mod tests {
             err.contains("NoPlatformAsset"),
             "error should mention NoPlatformAsset: {err}"
         );
+    }
+
+    async fn serve_once(response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}/archive")
+    }
+
+    #[tokio::test]
+    async fn download_to_file_writes_successful_response_body() {
+        let dir = TempDir::new().unwrap();
+        let destination = dir.path().join("downloaded.bin");
+        let body = "download bytes";
+        let url = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        ))
+        .await;
+
+        download_to_file(&url, &destination).await.unwrap();
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn download_to_file_rejects_http_error_status() {
+        let dir = TempDir::new().unwrap();
+        let destination = dir.path().join("downloaded.bin");
+        let url =
+            serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found".to_string())
+                .await;
+
+        let result = download_to_file(&url, &destination).await;
+        assert!(matches!(result, Err(UpgradeError::DownloadError(_))));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn download_to_file_rejects_oversized_content_length() {
+        let dir = TempDir::new().unwrap();
+        let destination = dir.path().join("downloaded.bin");
+        let too_large = super::super::MAX_BINARY_SIZE_BYTES + 1;
+        let url = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {too_large}\r\n\r\n"
+        ))
+        .await;
+
+        let result = download_to_file(&url, &destination).await;
+        assert!(matches!(result, Err(UpgradeError::BinaryTooLarge { .. })));
+        assert!(!destination.exists());
     }
 }

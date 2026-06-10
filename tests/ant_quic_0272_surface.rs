@@ -104,11 +104,25 @@ async fn connection_health_after_connect_is_observable() {
         .expect("connect_addr");
     sleep(Duration::from_millis(200)).await;
 
-    // `ConnectionHealth` is opaque but `Debug` renders the lifecycle state +
-    // timestamps. A probe after inspecting health proves the call doesn't
-    // invalidate the connection.
-    let health = sender.connection_health(&receiver_id).await;
-    let _ = format!("{health:?}");
+    let health = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let health = sender.connection_health(&receiver_id).await;
+            if health.connected
+                && health.generation.is_some()
+                && health.reader_task_active == Some(true)
+            {
+                break health;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "connection_health never reported a live receiver snapshot: {health:?}"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    };
+    assert_eq!(health.close_reason, None);
+
     sender
         .probe_peer(&receiver_id, Duration::from_secs(10))
         .await
@@ -128,6 +142,7 @@ async fn send_with_receive_ack_round_trips_on_localhost() {
     let r_accept = spawn_accept_loop(Arc::clone(&receiver));
 
     let sender = make_endpoint(vec![receiver_addr]).await;
+    let sender_id = sender.peer_id();
     let s_accept = spawn_accept_loop(Arc::clone(&sender));
 
     sender
@@ -136,10 +151,15 @@ async fn send_with_receive_ack_round_trips_on_localhost() {
         .expect("connect_addr");
     sleep(Duration::from_millis(150)).await;
 
-    // Drain receiver recv() so the ACK isn't starved.
+    // Receive the application payload while send_with_receive_ack waits for ACK.
     let recv_task = {
         let r = Arc::clone(&receiver);
-        tokio::spawn(async move { while r.recv().await.is_ok() {} })
+        tokio::spawn(async move {
+            timeout(Duration::from_secs(10), r.recv())
+                .await
+                .expect("receiver recv timeout")
+                .expect("receiver recv")
+        })
     };
 
     sender
@@ -147,7 +167,10 @@ async fn send_with_receive_ack_round_trips_on_localhost() {
         .await
         .expect("send_with_receive_ack on healthy link");
 
-    recv_task.abort();
+    let (peer_id, payload) = recv_task.await.expect("recv task panicked");
+    assert_eq!(peer_id, sender_id);
+    assert_eq!(payload, b"x0x-ack-roundtrip");
+
     sender.shutdown().await;
     receiver.shutdown().await;
     r_accept.abort();

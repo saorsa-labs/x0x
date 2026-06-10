@@ -188,7 +188,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Get,
         path: "/diagnostics/connectivity",
         cli_name: "diagnostics connectivity",
-        description: "Ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS)",
+        description: "Connectivity snapshot (NodeStatus + transport_environment VPN/MTU assessment)",
         category: "network",
     },
     EndpointDef {

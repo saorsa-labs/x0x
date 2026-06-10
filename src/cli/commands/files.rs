@@ -173,6 +173,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_file_posts_metadata_for_existing_file() {
+        let mock_resp = serde_json::json!({"transfer_id": "tx-1", "status": "queued"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("hello.txt");
+        std::fs::write(&file_path, b"hello world").unwrap();
+
+        let result = send_file(&client, &"aa".repeat(32), &file_path).await;
+        assert!(result.is_ok(), "send_file should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn send_file_rejects_missing_file() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.bin");
+
+        let result = send_file(&client, &"aa".repeat(32), &missing).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("File not found"));
+    }
+
+    #[tokio::test]
+    async fn receive_file_handles_no_pending_transfers() {
+        let mock_resp = serde_json::json!({"transfers": []});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = receive_file(&client, None, None).await;
+        assert!(result.is_ok(), "receive_file should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn receive_file_filters_pending_incoming_transfers() {
+        let mock_resp = serde_json::json!({
+            "transfers": [
+                {"transfer_id": "recv-1", "filename": "in.txt", "total_size": 42, "direction": "Receiving", "status": "Pending"},
+                {"transfer_id": "send-1", "filename": "out.txt", "total_size": 7, "direction": "Sending", "status": "Pending"},
+                {"transfer_id": "done-1", "filename": "done.txt", "total_size": 9, "direction": "Receiving", "status": "Completed"}
+            ]
+        });
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let result = receive_file(&client, Some(&"aa".repeat(32)), Some(Path::new("/tmp"))).await;
+        assert!(result.is_ok(), "receive_file should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
     async fn transfers_returns_mock_response() {
         let mock_resp = serde_json::json!({"status": "ok"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;

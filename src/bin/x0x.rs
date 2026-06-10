@@ -16,7 +16,7 @@
 //! ```
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use x0x::cli::commands;
@@ -27,8 +27,15 @@ use x0x::cli::{DaemonClient, OutputFormat};
 #[command(name = "x0x", version = x0x::VERSION, about = "x0x agent network — control a running x0xd daemon")]
 struct Cli {
     /// Named instance to target (reads port from data dir). [dev]
-    #[arg(long, global = true, hide = true)]
-    name: Option<String>,
+    //
+    // The clap field id MUST stay distinct from any subcommand's `name`
+    // argument: a shared id collides under `global = true` and the
+    // last-parsed value wins, so a positional like `group create <NAME>`
+    // would otherwise bleed into this instance selector and route the
+    // command at a non-existent daemon instance. Keep the `--name` long flag
+    // (established dev/multi-instance API) but bind it to `instance`.
+    #[arg(long = "name", global = true, hide = true)]
+    instance: Option<String>,
 
     /// Daemon API address override (default: auto-detect). [dev]
     #[arg(long, global = true, hide = true, alias = "api-url")]
@@ -80,6 +87,11 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<AgentSub>,
     },
+    /// Manage user identity.
+    UserId {
+        #[command(subcommand)]
+        sub: UserIdSub,
+    },
     /// Announce identity to network.
     Announce {
         /// Include user identity in announcement.
@@ -94,7 +106,7 @@ enum Commands {
     /// Presence and agent discovery operations.
     Presence {
         #[command(subcommand)]
-        sub: PresenceSub,
+        sub: Option<PresenceSub>,
     },
     /// Network diagnostics.
     Network {
@@ -221,7 +233,7 @@ enum Commands {
     #[command(hide = true)]
     Ws {
         #[command(subcommand)]
-        sub: WsSub,
+        sub: Option<WsSub>,
     },
     /// Open the x0x GUI in your browser.
     Gui,
@@ -319,6 +331,29 @@ enum AgentSub {
         /// Base64-encoded bytes to sign.
         #[arg(long)]
         payload_b64: Option<String>,
+        /// Optional domain-separation string; signs `domain || 0x00 || payload`.
+        #[arg(long)]
+        domain: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserIdSub {
+    /// Create a new user identity keypair (ML-DSA-65). Defaults to ~/.x0x/user.key.
+    /// Overwrites any existing file at the target path without prompting.
+    Create {
+        /// Output path. Existing file at this path is overwritten.
+        path: Option<PathBuf>,
+        /// Derive the keypair deterministically from a 32-byte hex seed
+        /// (64 hex chars) via FIPS 204 seeded KeyGen. Same seed, same keypair.
+        #[arg(long, value_name = "HEX")]
+        from_seed: Option<String>,
+    },
+    /// Read and validate a user identity file (no daemon needed).
+    /// Defaults to ~/.x0x/user.key.
+    Inspect {
+        /// Path of the key file to inspect.
+        path: Option<PathBuf>,
     },
 }
 
@@ -722,9 +757,10 @@ enum GroupSub {
     Update {
         /// Group ID.
         group_id: String,
-        /// New name.
-        #[arg(long)]
-        name: Option<String>,
+        /// New name. (`--new-name`, not `--name`: the global `--name` instance
+        /// selector reserves that long flag.)
+        #[arg(long = "new-name")]
+        new_name: Option<String>,
         /// New description.
         #[arg(long)]
         description: Option<String>,
@@ -1020,7 +1056,13 @@ async fn main() -> ExitCode {
         OutputFormat::Text
     };
 
-    let result = run(cli.command, cli.name.as_deref(), cli.api.as_deref(), format).await;
+    let result = run(
+        cli.command,
+        cli.instance.as_deref(),
+        cli.api.as_deref(),
+        format,
+    )
+    .await;
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1070,6 +1112,38 @@ async fn run(
                 commands::daemon::autostart(name).await
             };
         }
+        Commands::UserId { sub } => match sub {
+            UserIdSub::Create { path, from_seed } => {
+                let resolved =
+                    commands::user_id::create(path.clone(), from_seed.as_deref()).await?;
+                match format {
+                    OutputFormat::Json => x0x::cli::print_value(
+                        format,
+                        &serde_json::json!({ "path": resolved.to_string_lossy() }),
+                    ),
+                    OutputFormat::Text => {
+                        println!("Created user identity keypair at {}", resolved.display());
+                    }
+                }
+                return Ok(());
+            }
+            UserIdSub::Inspect { path } => {
+                let report = commands::user_id::inspect(path.clone()).await?;
+                match format {
+                    OutputFormat::Json => {
+                        x0x::cli::print_value(format, &serde_json::to_value(&report)?)
+                    }
+                    OutputFormat::Text => {
+                        println!("User identity at {}:", report.path);
+                        println!("user_id:    {}", report.user_id);
+                        if let Some(words) = &report.user_words {
+                            println!("user_words: {words}");
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        },
         _ => {}
     }
 
@@ -1080,8 +1154,11 @@ async fn run(
         Commands::Gui => {
             // Ensure daemon is running and open GUI in browser
             client.ensure_running().await?;
-            let url = format!("{}/gui", client.base_url());
-            eprintln!("x0x GUI: {url}");
+            let Some(token) = client.api_token() else {
+                anyhow::bail!("API token not found; set X0X_API_TOKEN or restart x0xd");
+            };
+            let url = format!("{}/gui?token={token}", client.base_url());
+            eprintln!("x0x GUI: {}/gui", client.base_url());
 
             let opened = {
                 #[cfg(target_os = "macos")]
@@ -1109,7 +1186,7 @@ async fn run(
             };
 
             if !opened {
-                eprintln!("Could not open browser. Open the URL above manually.");
+                eprintln!("Could not open browser. Open this URL manually: {url}");
             }
             Ok(())
         }
@@ -1126,8 +1203,18 @@ async fn run(
             Some(AgentSub::Import { card, trust }) => {
                 commands::identity::import_card(&client, &card, Some(trust.as_str())).await
             }
-            Some(AgentSub::Sign { file, payload_b64 }) => {
-                commands::identity::sign(&client, file.as_deref(), payload_b64.as_deref()).await
+            Some(AgentSub::Sign {
+                file,
+                payload_b64,
+                domain,
+            }) => {
+                commands::identity::sign(
+                    &client,
+                    file.as_deref(),
+                    payload_b64.as_deref(),
+                    domain.as_deref(),
+                )
+                .await
             }
         },
         Commands::Announce {
@@ -1136,17 +1223,18 @@ async fn run(
         } => commands::identity::announce(&client, include_user, consent).await,
         Commands::Peers => commands::network::peers(&client).await,
         Commands::Presence { sub } => match sub {
-            PresenceSub::Online => commands::presence::online(&client).await,
-            PresenceSub::Foaf { ttl, timeout_ms } => {
+            None => commands::network::presence(&client).await,
+            Some(PresenceSub::Online) => commands::presence::online(&client).await,
+            Some(PresenceSub::Foaf { ttl, timeout_ms }) => {
                 commands::presence::foaf(&client, ttl, timeout_ms).await
             }
-            PresenceSub::Find {
+            Some(PresenceSub::Find {
                 id,
                 ttl,
                 timeout_ms,
-            } => commands::presence::find(&client, &id, ttl, timeout_ms).await,
-            PresenceSub::Status { id } => commands::presence::status(&client, &id).await,
-            PresenceSub::Events => commands::presence::events(&client).await,
+            }) => commands::presence::find(&client, &id, ttl, timeout_ms).await,
+            Some(PresenceSub::Status { id }) => commands::presence::status(&client, &id).await,
+            Some(PresenceSub::Events) => commands::presence::events(&client).await,
         },
         Commands::Network { sub } => match sub {
             NetworkSub::Status => commands::network::network_status(&client).await,
@@ -1373,11 +1461,16 @@ async fn run(
             Some(GroupSub::Leave { group_id }) => commands::group::leave(&client, &group_id).await,
             Some(GroupSub::Update {
                 group_id,
-                name,
+                new_name,
                 description,
             }) => {
-                commands::group::update(&client, &group_id, name.as_deref(), description.as_deref())
-                    .await
+                commands::group::update(
+                    &client,
+                    &group_id,
+                    new_name.as_deref(),
+                    description.as_deref(),
+                )
+                .await
             }
             Some(GroupSub::Policy {
                 group_id,
@@ -1538,8 +1631,9 @@ async fn run(
         },
         Commands::Upgrade { .. } => unreachable!(),
         Commands::Ws { sub } => match sub {
-            WsSub::Sessions => commands::ws::sessions(&client).await,
-            WsSub::Direct => commands::ws::direct(&client).await,
+            None => commands::ws::general(&client).await,
+            Some(WsSub::Sessions) => commands::ws::sessions(&client).await,
+            Some(WsSub::Direct) => commands::ws::direct(&client).await,
         },
         Commands::Stop => commands::daemon::stop(&client).await,
         Commands::Doctor => commands::daemon::doctor(&client).await,
@@ -1569,6 +1663,7 @@ async fn run(
         | Commands::Uninstall
         | Commands::Purge
         | Commands::Constitution { .. }
+        | Commands::UserId { .. }
         | Commands::Start { .. }
         | Commands::Instances
         | Commands::Autostart { .. } => unreachable!(),
@@ -1593,6 +1688,8 @@ x0x (v{VERSION})
 |   |   +-- user-id        Show user ID
 |   |   +-- card           Generate shareable identity card
 |   |   +-- import         Import an agent card to contacts
+|   +-- user-id create     Create user identity keypair
+|   +-- user-id inspect    Validate a user identity file (daemonless)
 |   +-- announce           Announce identity to network
 |
 +-- Network
@@ -1706,6 +1803,30 @@ x0x (v{VERSION})
     Ok(())
 }
 
+fn remove_binary_file(path: &Path, output_prefix: &str) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            eprintln!("{output_prefix}Removed {}", path.display());
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "{output_prefix}Failed to remove {}: {error}",
+                path.display()
+            );
+            Err(format!("{}: {error}", path.display()))
+        }
+    }
+}
+
+fn report_binary_removal_failures(failures: &[String]) -> anyhow::Result<()> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to remove binaries: {}", failures.join("; "))
+    }
+}
+
 // ── Uninstall ──────────────────────────────────────────────────────────────
 
 async fn uninstall() -> anyhow::Result<()> {
@@ -1762,15 +1883,19 @@ async fn uninstall() -> anyhow::Result<()> {
         .await;
 
     // Remove binaries
+    let mut removal_failures = Vec::new();
     if let Some(ref d) = x0xd_path {
         if d.exists() {
-            std::fs::remove_file(d).ok();
-            eprintln!("Removed {}", d.display());
+            if let Err(error) = remove_binary_file(d, "") {
+                removal_failures.push(error);
+            }
         }
     }
     // Remove self last
-    std::fs::remove_file(&x0x_path).ok();
-    eprintln!("Removed {}", x0x_path.display());
+    if let Err(error) = remove_binary_file(&x0x_path, "") {
+        removal_failures.push(error);
+    }
+    report_binary_removal_failures(&removal_failures)?;
 
     eprintln!();
     eprintln!("x0x uninstalled. Your data and keys are preserved.");
@@ -1788,36 +1913,25 @@ async fn purge() -> anyhow::Result<()> {
     eprintln!("This will permanently delete:");
     eprintln!();
 
-    let mut paths_to_remove: Vec<std::path::PathBuf> = Vec::new();
-
-    // Data directory
-    if let Some(data_dir) = dirs::data_dir().map(|d| d.join("x0x")) {
-        if data_dir.exists() {
-            eprintln!(
+    let data_dir = dirs::data_dir();
+    let home_dir = dirs::home_dir();
+    let paths_to_remove =
+        commands::purge::collect_purge_paths(data_dir.as_deref(), home_dir.as_deref());
+    for purge_path in &paths_to_remove {
+        match purge_path.kind {
+            commands::purge::PurgePathKind::Data => eprintln!(
                 "  Data:    {} (contacts, groups, stores, transfers)",
-                data_dir.display()
-            );
-            paths_to_remove.push(data_dir);
-        }
-    }
-    // Keys directory
-    if let Some(home) = dirs::home_dir().map(|h| h.join(".x0x")) {
-        if home.exists() {
-            eprintln!(
+                purge_path.path.display()
+            ),
+            commands::purge::PurgePathKind::InstanceData => {
+                eprintln!("  Instance: {} (data)", purge_path.path.display());
+            }
+            commands::purge::PurgePathKind::Keys => eprintln!(
                 "  Keys:    {} (machine.key, agent.key, agent.cert)",
-                home.display()
-            );
-            paths_to_remove.push(home);
-        }
-    }
-    // Named instances
-    if let Some(home) = dirs::home_dir() {
-        for entry in std::fs::read_dir(&home).into_iter().flatten().flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with(".x0x-") && entry.path().is_dir() {
-                eprintln!("  Instance: {}", entry.path().display());
-                paths_to_remove.push(entry.path());
+                purge_path.path.display()
+            ),
+            commands::purge::PurgePathKind::LegacyInstanceKeys => {
+                eprintln!("  Instance: {} (legacy keys)", purge_path.path.display());
             }
         }
     }
@@ -1864,22 +1978,13 @@ async fn purge() -> anyhow::Result<()> {
     input.clear();
     eprintln!();
     eprintln!("\x1b[33mStep 3/3: Verify your agent ID.\x1b[0m");
-    // Try to read agent ID from key file
-    let agent_id_hint = if let Some(home) = dirs::home_dir() {
-        let key_path = home.join(".x0x/agent.key");
-        if key_path.exists() {
-            match std::fs::read(&key_path) {
-                Ok(data) => match x0x::storage::deserialize_agent_keypair(&data) {
-                    Ok(kp) => hex::encode(&kp.agent_id().as_bytes()[..4]),
-                    Err(_) => "unknown".to_string(),
-                },
-                Err(_) => "unknown".to_string(),
-            }
-        } else {
-            "unknown".to_string()
+    let agent_id_hint = match commands::purge::agent_id_confirmation_hint(home_dir.as_deref()) {
+        Ok(hint) => hint,
+        Err(error) => {
+            eprintln!("Cannot verify your agent ID: {error:#}");
+            eprintln!("Cancelled without removing data.");
+            return Ok(());
         }
-    } else {
-        "unknown".to_string()
     };
     eprintln!("Your agent ID starts with: {agent_id_hint}...");
     eprint!("Type the first 8 characters of your agent ID to confirm: ");
@@ -1903,27 +2008,124 @@ async fn purge() -> anyhow::Result<()> {
         .output()
         .await;
 
-    for path in &paths_to_remove {
-        if path.is_dir() {
-            match std::fs::remove_dir_all(path) {
-                Ok(()) => eprintln!("  Removed {}", path.display()),
-                Err(e) => eprintln!("  Failed to remove {}: {}", path.display(), e),
+    for purge_path in &paths_to_remove {
+        if purge_path.path.is_dir() {
+            match std::fs::remove_dir_all(&purge_path.path) {
+                Ok(()) => eprintln!("  Removed {}", purge_path.path.display()),
+                Err(e) => eprintln!("  Failed to remove {}: {}", purge_path.path.display(), e),
             }
         }
     }
 
     // Remove binaries
+    let mut removal_failures = Vec::new();
     if let Some(ref d) = x0xd_path {
         if d.exists() {
-            std::fs::remove_file(d).ok();
-            eprintln!("  Removed {}", d.display());
+            if let Err(error) = remove_binary_file(d, "  ") {
+                removal_failures.push(error);
+            }
         }
     }
-    std::fs::remove_file(&x0x_path).ok();
-    eprintln!("  Removed {}", x0x_path.display());
+    if let Err(error) = remove_binary_file(&x0x_path, "  ") {
+        removal_failures.push(error);
+    }
+    report_binary_removal_failures(&removal_failures)?;
 
     eprintln!();
     eprintln!("x0x has been completely removed.");
     eprintln!("To reinstall: curl -sfL https://x0x.md | sh");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_presence_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "presence"])?;
+        match cli.command {
+            Commands::Presence { sub: None } => Ok(()),
+            _ => anyhow::bail!("expected bare presence to parse without nested subcommand"),
+        }
+    }
+
+    #[test]
+    fn bare_ws_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "ws"])?;
+        match cli.command {
+            Commands::Ws { sub: None } => Ok(()),
+            _ => anyhow::bail!("expected bare ws to parse without nested subcommand"),
+        }
+    }
+
+    // Regression: the global `--name` instance selector and a subcommand's
+    // positional `name` once shared the clap arg id `name`, so under
+    // `global = true` the positional value bled into the instance selector and
+    // every `* create <NAME>` (group/store/task-list) routed at a non-existent
+    // daemon instance instead of the default daemon. The global is now bound to
+    // `instance`; these tests pin that a positional name never sets it.
+    #[test]
+    fn group_create_positional_name_does_not_set_instance() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "group", "create", "demo"])?;
+        assert!(
+            cli.instance.is_none(),
+            "group name must not populate the --name instance selector"
+        );
+        match cli.command {
+            Commands::Group {
+                sub: Some(GroupSub::Create { name, .. }),
+            } => {
+                assert_eq!(name, "demo");
+                Ok(())
+            }
+            _ => anyhow::bail!("expected group create to parse with the positional name"),
+        }
+    }
+
+    #[test]
+    fn store_create_positional_name_does_not_set_instance() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "store", "create", "mystore", "mytopic"])?;
+        assert!(
+            cli.instance.is_none(),
+            "store name must not populate the --name instance selector"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_instance_flag_still_targets_named_instance() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "--name", "alice", "group", "create", "demo"])?;
+        assert_eq!(
+            cli.instance.as_deref(),
+            Some("alice"),
+            "explicit --name must still select the daemon instance"
+        );
+        match cli.command {
+            Commands::Group {
+                sub: Some(GroupSub::Create { name, .. }),
+            } => {
+                assert_eq!(name, "demo", "group name and instance must not conflate");
+                Ok(())
+            }
+            _ => anyhow::bail!("expected group create under an explicit instance"),
+        }
+    }
+
+    #[test]
+    fn group_update_uses_new_name_flag_not_name() -> anyhow::Result<()> {
+        // `--name` would be the global instance selector; renaming a group uses
+        // `--new-name`.
+        let cli = Cli::try_parse_from(["x0x", "group", "update", "gid", "--new-name", "Renamed"])?;
+        assert!(cli.instance.is_none());
+        match cli.command {
+            Commands::Group {
+                sub: Some(GroupSub::Update { new_name, .. }),
+            } => {
+                assert_eq!(new_name.as_deref(), Some("Renamed"));
+                Ok(())
+            }
+            _ => anyhow::bail!("expected group update with --new-name"),
+        }
+    }
 }

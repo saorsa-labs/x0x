@@ -256,6 +256,25 @@ pub struct PubSubManager {
     contacts: std::sync::OnceLock<Arc<tokio::sync::RwLock<ContactStore>>>,
     /// Drop-detection counters exposed at `GET /diagnostics/gossip`.
     stats: Arc<PubSubStats>,
+    /// Subscriber channels for `local:` topics (issue #89). These topics
+    /// are same-daemon IPC: delivered only to local subscribers, never
+    /// handed to PlumTree, never gossipped to remote peers.
+    local_topics: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubMessage>>>>>,
+}
+
+/// Topic-name prefix marking a topic as local-only (issue #89).
+///
+/// Topics starting with this prefix are delivered exclusively to
+/// subscribers on the same daemon — they never enter the PlumTree EAGER
+/// set, IHAVE digests, or any other remote relay path. Because such
+/// topics are never registered with PlumTree, an inbound gossip frame
+/// referencing one has no subscription to deliver into and is dropped.
+pub const LOCAL_TOPIC_PREFIX: &str = "local:";
+
+/// True when `topic` is a same-daemon-only topic (issue #89).
+#[must_use]
+pub fn is_local_topic(topic: &str) -> bool {
+    topic.starts_with(LOCAL_TOPIC_PREFIX)
 }
 
 impl std::fmt::Debug for PubSubManager {
@@ -324,6 +343,7 @@ impl PubSubManager {
             signing,
             contacts: std::sync::OnceLock::new(),
             stats: Arc::new(PubSubStats::default()),
+            local_topics: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -362,6 +382,37 @@ impl PubSubManager {
     /// `Subscription` is dropped.
     pub async fn subscribe(&self, topic: String) -> Subscription {
         let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.subscribe_topic_id(topic, topic_id).await
+    }
+
+    /// Subscribe to a topic with an explicit transport `TopicId`.
+    ///
+    /// Most callers use [`Self::subscribe`], which derives the transport id
+    /// from the topic string. DM inbox topics are specified as raw
+    /// domain-separated `TopicId`s, while still carrying a stable string topic
+    /// name inside the signed x0x payload.
+    pub async fn subscribe_topic_id(&self, topic: String, topic_id: TopicId) -> Subscription {
+        // `local:` topics never touch PlumTree — same-daemon delivery only
+        // (issue #89).
+        if is_local_topic(&topic) {
+            let (tx, rx) = mpsc::channel(10_000);
+            self.local_topics
+                .write()
+                .await
+                .entry(topic.clone())
+                .or_default()
+                .push(tx);
+            {
+                let mut counts = self.topic_ref_counts.write().await;
+                *counts.entry(topic.clone()).or_insert(0) += 1;
+            }
+            return Subscription {
+                topic,
+                receiver: rx,
+                topic_ref_counts: Arc::clone(&self.topic_ref_counts),
+            };
+        }
+
         self.register_dynamic_topic_priority(&topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
 
@@ -382,7 +433,7 @@ impl PubSubManager {
         tokio::spawn(async move {
             while let Some((_peer, encoded_payload)) = plumtree_rx.recv().await {
                 stats.incoming_total.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
+                tracing::debug!(
                     topic = %sub_topic,
                     payload_len = encoded_payload.len(),
                     "[4/6 pubsub] received from PlumTree, decoding"
@@ -397,7 +448,7 @@ impl PubSubManager {
                     continue;
                 };
                 stats.incoming_decoded.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
+                tracing::debug!(
                     topic = %sub_topic,
                     msg_topic = %message.topic,
                     "[4/6 pubsub] decoded, forwarding to subscriber channel"
@@ -448,6 +499,58 @@ impl PubSubManager {
     ///
     /// Returns an error if encoding or signing fails.
     pub async fn publish(&self, topic: String, payload: Bytes) -> NetworkResult<()> {
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.publish_topic_id(topic, topic_id, payload).await
+    }
+
+    /// Publish to a topic with an explicit transport `TopicId`.
+    ///
+    /// The signed x0x payload still embeds `topic`; only the underlying
+    /// PlumTree topic id is supplied by the caller.
+    pub async fn publish_topic_id(
+        &self,
+        topic: String,
+        topic_id: TopicId,
+        payload: Bytes,
+    ) -> NetworkResult<()> {
+        // `local:` topics fan out to same-daemon subscribers only — the
+        // payload never reaches PlumTree or any remote peer (issue #89).
+        if is_local_topic(&topic) {
+            let message = PubSubMessage {
+                topic: topic.clone(),
+                payload,
+                sender: self.signing.as_ref().map(|ctx| ctx.agent_id),
+                sender_public_key: self
+                    .signing
+                    .as_ref()
+                    .map(|ctx| ctx.public_key_bytes.clone()),
+                // Local publishes come from a bearer-token-authenticated
+                // API caller on this daemon — trusted by construction.
+                verified: true,
+                trust_level: None,
+            };
+            let mut topics = self.local_topics.write().await;
+            if let Some(senders) = topics.get_mut(&topic) {
+                senders.retain(|tx| match tx.try_send(message.clone()) {
+                    Ok(()) => {
+                        self.stats
+                            .delivered_to_subscriber
+                            .fetch_add(1, Ordering::Relaxed);
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.stats
+                            .slow_subscriber_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                });
+            }
+            self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+
         let encoded_result = if let Some(ref ctx) = self.signing {
             let signing_payload =
                 build_signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload);
@@ -472,7 +575,6 @@ impl PubSubManager {
             }
         };
 
-        let topic_id = TopicId::from_entity(topic.as_bytes());
         self.register_dynamic_topic_priority(&topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
 
@@ -496,7 +598,10 @@ impl PubSubManager {
     /// processing (EAGER/IHAVE/IWANT/AntiEntropy).
     pub async fn handle_incoming(&self, peer: PeerId, data: Bytes) {
         if let Err(e) = self.plumtree.handle_message(peer, data).await {
-            tracing::warn!("Failed to handle PlumTree pubsub message from {peer}: {e}");
+            tracing::warn!(
+                "Failed to handle PlumTree pubsub message from {}: {e}",
+                crate::logging::LogPeerId::from(peer)
+            );
         }
     }
 
@@ -508,6 +613,10 @@ impl PubSubManager {
     /// Unsubscribe from a topic, removing all subscriptions.
     pub async fn unsubscribe(&self, topic: &str) {
         self.topic_ref_counts.write().await.remove(topic);
+        if is_local_topic(topic) {
+            self.local_topics.write().await.remove(topic);
+            return;
+        }
         let topic_id = TopicId::from_entity(topic.as_bytes());
         if let Err(e) = self.plumtree.unsubscribe(topic_id).await {
             tracing::debug!("PlumTree unsubscribe failed for topic '{topic}': {e}");

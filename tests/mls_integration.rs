@@ -266,37 +266,31 @@ async fn test_welcome_wrong_recipient() {
 
 /// Test encryption authentication prevents tampering.
 #[tokio::test]
-async fn test_encryption_authentication() {
-    let identity = Identity::generate().expect("identity generation failed");
+async fn test_encryption_authentication() -> anyhow::Result<()> {
+    let identity = Identity::generate()?;
     let agent_id = identity.agent_id();
     let group_id = b"test-group".to_vec();
-    let group = MlsGroup::new(group_id, agent_id)
-        .await
-        .expect("group creation failed");
+    let group = MlsGroup::new(group_id, agent_id).await?;
 
     let delta = TaskListDelta::new(1);
-    let encrypted =
-        EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
+    let encrypted = EncryptedTaskListDelta::encrypt_with_group(&delta, &group)?;
 
-    // Tamper with ciphertext
-    let ciphertext = encrypted.ciphertext().to_vec();
-    let mut tampered = ciphertext;
-    tampered[0] ^= 1; // Flip one bit
+    let serialized = bincode::serialize(&encrypted)?;
+    let ciphertext = encrypted.ciphertext();
+    let ciphertext_offset = serialized
+        .windows(ciphertext.len())
+        .position(|window| window == ciphertext)
+        .ok_or_else(|| anyhow::anyhow!("serialized ciphertext missing"))?;
 
-    // Create new encrypted delta with tampered ciphertext (simulate network attack)
-    let _tampered_encrypted =
-        EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
-    // In real scenario, attacker would modify the serialized bytes
+    let mut tampered_serialized = serialized;
+    tampered_serialized[ciphertext_offset] ^= 1;
+    let tampered_encrypted: EncryptedTaskListDelta = bincode::deserialize(&tampered_serialized)?;
 
-    // For this test, just verify that tampering the actual struct's ciphertext field
-    // would cause decryption to fail (we can't easily do this without reflection,
-    // so we rely on the unit tests in encrypted.rs)
+    assert!(tampered_encrypted.decrypt_with_group(&group).is_err());
 
-    // Instead, verify that decryption succeeds with untampered data
-    let decrypted = encrypted
-        .decrypt_with_group(&group)
-        .expect("decryption should succeed");
+    let decrypted = encrypted.decrypt_with_group(&group)?;
     assert_eq!(decrypted.version, delta.version);
+    Ok(())
 }
 
 /// Test group epoch consistency across operations.

@@ -152,6 +152,22 @@ async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// Write arbitrary secret bytes to `path` with the same protection x0x gives
+/// key material: an atomic write (temp file + rename) with Unix mode `0600`.
+///
+/// Used to persist TreeKEM group snapshots at rest (ADR-0012 §6 / Phase 4) —
+/// they contain private key material and are no more sensitive than
+/// `machine.key` / `agent.key` / `agent_kem.key`, which use this same model.
+/// At-rest encryption of the whole identity dir is tracked separately
+/// (ADR-0012 open question #4).
+///
+/// # Errors
+/// Returns an error if the directory cannot be created or the write/rename
+/// fails.
+pub async fn write_private_bytes(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    write_private_file(path, bytes).await
+}
+
 /// Get the x0x configuration directory path.
 ///
 /// # Returns

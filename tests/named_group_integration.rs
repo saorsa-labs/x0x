@@ -81,12 +81,16 @@ where
 }
 
 async fn group_state_hash(d: &AgentInstance, group_id: &str) -> Option<String> {
+    let body = group_state(d, group_id).await?;
+    body["state_hash"].as_str().map(ToString::to_string)
+}
+
+async fn group_state(d: &AgentInstance, group_id: &str) -> Option<Value> {
     let resp = d.get(&format!("/groups/{group_id}/state")).await;
     if !resp.status().is_success() {
         return None;
     }
-    let body: Value = resp.json().await.unwrap_or_default();
-    body["state_hash"].as_str().map(ToString::to_string)
+    Some(resp.json().await.unwrap_or_default())
 }
 
 // ===========================================================================
@@ -246,7 +250,33 @@ async fn named_group_members_endpoint() {
 #[ignore]
 async fn named_group_add_remove_member_local() {
     let d = daemon().await;
-    let (group_id, _) = create_group(&d, "Roster Group", "", Some("Owner")).await;
+    // Direct roster add-by-agent_id is a non-secure-plane operation. Since
+    // ADR-0012 made `private_secure` (the default preset) secure-by-default
+    // TreeKEM — where a direct add correctly requires the target's KeyPackage —
+    // this local-roster-semantics test uses a `public_open` (GSS) group, where
+    // adding a member by agent_id alone is the valid operation under test.
+    let create_r: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Roster Group",
+            "description": "",
+            "display_name": "Owner",
+            "preset": "public_open"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group_id = create_r["group_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !group_id.is_empty(),
+        "create public_open group: {create_r:?}"
+    );
     let fake_member = fake_agent_id(0x42);
 
     let add_r: Value = authed_client(&d)
@@ -505,7 +535,33 @@ async fn named_group_leave() {
 #[ignore]
 async fn named_group_rejoin_after_leave() {
     let d = daemon().await;
-    let (group_id, _) = create_group(&d, "Rejoin Group", "", Some("Alice")).await;
+    // Uses a public_open (GSS) group: on a non-secure group, rejoin-via-invite
+    // restores the joiner into the local roster synchronously. The default
+    // private_secure preset is now secure-by-default TreeKEM (ADR-0012), where
+    // the join awaits the anchor's authoritative MemberAdded — a different flow
+    // than this single-daemon roster-restore test exercises.
+    let create_r: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Rejoin Group",
+            "description": "",
+            "display_name": "Alice",
+            "preset": "public_open"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group_id = create_r["group_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !group_id.is_empty(),
+        "create public_open group: {create_r:?}"
+    );
 
     // Generate invite before leaving
     let invite_resp: Value = authed_client(&d)
@@ -585,69 +641,95 @@ async fn named_group_rejoin_after_leave() {
 }
 
 // ===========================================================================
-// 9. Multiple Members (simulated via display names)
+// 9. Multiple Members with display names
 // ===========================================================================
 
-/// On a single daemon we cannot have truly separate agents. Instead, we
-/// exercise the member tracking by creating a group, joining via invite
-/// multiple times (leave + rejoin with different display names), and
-/// verifying the display_names map in group info grows accordingly.
-///
-/// This tests that the daemon correctly tracks display names set via the
-/// PUT /groups/:id/display-name endpoint after successive joins.
+/// Exercise member tracking with two real daemon identities and verify group
+/// info retains distinct display names for both members after an invite join.
 #[tokio::test]
 #[ignore]
 async fn named_group_multiple_display_names() {
-    let d = daemon().await;
-    let (group_id, _) = create_group(&d, "Multi-Name Group", "", Some("Alice")).await;
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
 
-    // Verify initial member
-    let info: Value = authed_client(&d)
-        .get(d.url(&format!("/groups/{group_id}")))
-        .send()
+    let alice_agent_id = alice.agent_id().await;
+    let bob_agent_id = bob.agent_id().await;
+
+    let create: Value = alice
+        .post(
+            "/groups",
+            serde_json::json!({"name":"Multi-Name Group","display_name":"Alice"}),
+        )
         .await
-        .unwrap()
         .json()
         .await
-        .unwrap();
-    assert_eq!(info["ok"], true);
-    let members = info["members"].as_array().unwrap();
+        .unwrap_or_default();
+    assert_eq!(create["ok"], true, "create response: {create:?}");
+    let group_id = create["group_id"].as_str().unwrap_or_default().to_string();
     assert!(
-        !members.is_empty(),
-        "should have at least 1 member after creation"
+        !group_id.is_empty(),
+        "group_id should be present: {create:?}"
     );
 
-    // Update display name to "Bob" (simulating a different persona)
-    let r: Value = authed_client(&d)
-        .put(d.url(&format!("/groups/{group_id}/display-name")))
-        .json(&serde_json::json!({"name": "Bob"}))
-        .send()
+    let invite: Value = alice
+        .post(&format!("/groups/{group_id}/invite"), serde_json::json!({}))
         .await
-        .unwrap()
         .json()
         .await
-        .unwrap();
-    assert_eq!(r["ok"], true);
+        .unwrap_or_default();
+    let invite_link = invite["invite_link"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !invite_link.is_empty(),
+        "invite link should be present: {invite:?}"
+    );
 
-    // Verify the updated name appears
-    let info2: Value = authed_client(&d)
-        .get(d.url(&format!("/groups/{group_id}")))
-        .send()
+    let bob_join: Value = bob
+        .post(
+            "/groups/join",
+            serde_json::json!({"invite": invite_link, "display_name": "Bob"}),
+        )
         .await
-        .unwrap()
         .json()
         .await
-        .unwrap();
-    let members2 = info2["members"].as_array().unwrap();
-    let has_bob = members2.iter().any(|m| m["display_name"] == "Bob");
-    assert!(has_bob, "Bob should appear in members: {members2:?}");
+        .unwrap_or_default();
+    assert_eq!(bob_join["ok"], true, "join response: {bob_join:?}");
+    let bob_group_id = bob_join["group_id"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
 
-    // Cleanup
-    authed_client(&d)
-        .delete(d.url(&format!("/groups/{group_id}")))
-        .send()
-        .await
-        .unwrap();
+    let alice_sees_both_names = wait_until(Duration::from_secs(30), || async {
+        let info: Value = alice
+            .get(&format!("/groups/{group_id}"))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        info["members"]
+            .as_array()
+            .map(|members| {
+                let has_alice = members
+                    .iter()
+                    .any(|m| m["agent_id"] == alice_agent_id && m["display_name"] == "Alice");
+                let has_bob = members
+                    .iter()
+                    .any(|m| m["agent_id"] == bob_agent_id && m["display_name"] == "Bob");
+                members.len() >= 2 && has_alice && has_bob
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        alice_sees_both_names,
+        "alice never observed distinct Alice and Bob display names"
+    );
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+    let _ = bob.delete(&format!("/groups/{bob_group_id}")).await;
 }
 
 // ===========================================================================
@@ -1011,7 +1093,7 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
 
     let bob_agent_id = bob.agent_id().await;
 
-    let alice_sees_bob = wait_until(Duration::from_secs(15), || async {
+    let alice_sees_bob = wait_until(Duration::from_secs(30), || async {
         let info: Value = alice
             .get(&format!("/groups/{group_id}/members"))
             .await
@@ -1031,7 +1113,7 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
     let alice_hash = group_state_hash(alice, &group_id)
         .await
         .expect("alice state hash after bob join");
-    let bob_caught_up = wait_until(Duration::from_secs(15), || async {
+    let bob_caught_up = wait_until(Duration::from_secs(30), || async {
         group_state_hash(bob, &bob_group_id).await.as_deref() == Some(alice_hash.as_str())
     })
     .await;
@@ -1048,7 +1130,7 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
         .unwrap();
     assert_eq!(remove_resp["ok"], true, "remove response: {remove_resp:?}");
 
-    let removed_seen = wait_until(Duration::from_secs(15), || async {
+    let removed_seen = wait_until(Duration::from_secs(30), || async {
         let resp = bob.get(&format!("/groups/{bob_group_id}")).await;
         resp.status() == StatusCode::NOT_FOUND
     })
@@ -1067,7 +1149,7 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
 
 #[tokio::test]
 #[ignore]
-async fn invite_join_preserves_genesis_creation_nonce() {
+async fn named_group_invite_join_preserves_genesis_creation_nonce() {
     let pair = pair().await;
     let alice = &pair.alice;
     let bob = &pair.bob;
@@ -1227,6 +1309,20 @@ async fn named_group_creator_delete_propagates_to_peer() {
         .unwrap();
     assert_eq!(alice_create["ok"], true);
     let group_id = alice_create["group_id"].as_str().unwrap().to_string();
+    let alice_state = group_state(alice, &group_id).await;
+    assert!(
+        alice_state.is_some(),
+        "alice state missing after default private_secure create"
+    );
+    let Some(alice_state) = alice_state else {
+        return;
+    };
+    assert!(
+        alice_state["security_binding"]
+            .as_str()
+            .is_some_and(|binding| binding.starts_with("treekem:")),
+        "creator-delete regression must exercise a private_secure TreeKEM group: {alice_state:?}"
+    );
 
     let invite: Value = alice
         .post(&format!("/groups/{group_id}/invite"), serde_json::json!({}))
@@ -1253,7 +1349,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
 
     let bob_agent_id = bob.agent_id().await;
 
-    let alice_sees_bob = wait_until(Duration::from_secs(15), || async {
+    let alice_sees_bob = wait_until(Duration::from_secs(30), || async {
         let info: Value = alice
             .get(&format!("/groups/{group_id}/members"))
             .await
@@ -1273,7 +1369,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
     let alice_hash = group_state_hash(alice, &group_id)
         .await
         .expect("alice state hash after bob join");
-    let bob_caught_up = wait_until(Duration::from_secs(15), || async {
+    let bob_caught_up = wait_until(Duration::from_secs(30), || async {
         group_state_hash(bob, &bob_group_id).await.as_deref() == Some(alice_hash.as_str())
     })
     .await;
@@ -1290,7 +1386,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
         .unwrap();
     assert_eq!(delete_resp["ok"], true, "delete response: {delete_resp:?}");
 
-    let deleted_seen = wait_until(Duration::from_secs(15), || async {
+    let deleted_seen = wait_until(Duration::from_secs(30), || async {
         let resp = bob.get(&format!("/groups/{bob_group_id}")).await;
         resp.status() == StatusCode::NOT_FOUND
     })

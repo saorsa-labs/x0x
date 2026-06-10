@@ -30,13 +30,15 @@
 //! `connect_addr`, then:
 //!
 //! 1. Subscribes to bob's incoming-DM channel BEFORE the test send.
-//! 2. Spawns a "kill+restart" task that, ~30 ms after the test issues
-//!    the send, calls `alice_network.disconnect(bob_peer)` and then
-//!    `alice_network.connect_addr(bob_addr)`. The reconnect to the
-//!    same peer triggers ant-quic's `peer_event_generations` table to
-//!    advance — `peer_event_generations` retains the previous
-//!    generation across disconnect (`ant-quic/src/p2p_endpoint.rs:2069-2072`),
-//!    so the first reconnect after a disconnect fires
+//! 2. Installs a test hook on alice's ACKed raw send path, issues the DM,
+//!    waits until `send_ack_racing_replaced` has subscribed to Replaced
+//!    events and started polling the first `send_with_receive_ack` attempt,
+//!    then calls `alice_network.disconnect(bob_peer)` and
+//!    `alice_network.connect_addr(bob_addr)`. The reconnect to the same
+//!    peer triggers ant-quic's `peer_event_generations` table to advance —
+//!    `peer_event_generations` retains the previous generation across
+//!    disconnect (`ant-quic/src/p2p_endpoint.rs:2069-2072`), so the first
+//!    reconnect after a disconnect fires
 //!    `PeerLifecycleEvent::Replaced { old, new }`. The lifecycle watcher
 //!    loop in `src/lib.rs::~5933` consumes the event and calls
 //!    `DirectMessaging::record_lifecycle_replaced` — the production
@@ -70,55 +72,33 @@
 //!    plumbing was actually wired up to ant-quic's event stream.
 //! 2. **The X0X-0053 racing helper subscribes to
 //!    `lifecycle_replaced_rx` BEFORE issuing `send_with_receive_ack`** —
-//!    verified by code structure and the dm.trace `path_chosen` /
-//!    `wire_encoded` / racing-arm-fires log sites. (See production
-//!    helper at `src/lib.rs::send_ack_racing_replaced`.)
+//!    verified by the test hook that only fires after the helper has
+//!    subscribed and started polling the first ACKed raw send attempt, plus
+//!    the required short-circuit signal when the same-peer Replaced wins the
+//!    race. (See production helper at `src/lib.rs::send_ack_racing_replaced`.)
 //! 3. **The ACKed raw path completes successfully under disconnect+
 //!    reconnect churn within the 500 ms acceptance budget** — verified
 //!    by the `Ok(DmPath::RawQuicAcked)` + send_elapsed assertions and
 //!    the bob.recv_direct round-trip. This is the X0X-0053 acceptance
 //!    criterion verbatim.
 //!
-//! ## Negative-control evidence (X0X-0053 acceptance)
+//! ## Deterministic race synchronization
 //!
-//! Replacing the entire body of `send_ack_racing_replaced` in
-//! `src/lib.rs` with a single-shot
-//! `network.send_with_receive_ack(...)` call (no Replaced subscription,
-//! no race, no reissue) and re-running this test produced 13 PASS / 2
-//! FAIL across 15 consecutive runs on the development workstation —
-//! the failing runs panicked at the lifecycle-generation-advancement
-//! assertion (line 406 above) with `got Some(1)`. With the production
-//! race arm restored, 10 PASS / 0 FAIL across 10 consecutive runs.
+//! Loopback delivery is fast enough that a fixed sleep can let the first
+//! `send_with_receive_ack` complete before the disconnect, so the test no
+//! longer relies on wall-clock timing to prove the race. Instead it installs
+//! a narrow test hook that:
 //!
-//! The negative-control failure mode is consistent with the helper's
-//! lost synchronisation contribution: with the race arm in place, the
-//! helper subscribes to `lifecycle_replaced_rx` *before* calling
-//! `send_with_receive_ack`, which gives the lifecycle watcher loop in
-//! `src/lib.rs::~5933` a guaranteed broadcast-side consumer to deliver
-//! the Replaced event to. Without the race arm there is no early
-//! subscriber, so the watcher's processing of the
-//! `PeerLifecycleEvent::Replaced` event races against the test's
-//! `current_generation(&bob.machine_id())` read; on slower iterations
-//! the test reads a stale Some(1) and fails. The failure is
-//! intermittent because both the watcher loop and the test thread
-//! make progress concurrently on the multi-thread runtime — the
-//! probabilistic failure is a real signal that the race arm
-//! materially changes when the lifecycle event is observed by the
-//! send pipeline, not a flake.
+//! - signals only after `send_ack_racing_replaced` has subscribed to
+//!   Replaced events and started polling the first ACKed raw send attempt;
+//! - holds that first-attempt result pending so the helper cannot return
+//!   before the synthetic supersede; and
+//! - requires the helper's same-peer Replaced short-circuit signal before
+//!   accepting the final `Ok(DmPath::RawQuicAcked)`.
 //!
-//! On loopback ant-quic's own `ensure_peer_send_ready` cache-driven
-//! re-dial (`src/network.rs:1319-1403`) re-establishes the connection
-//! within a few milliseconds of the disconnect, so the in-flight
-//! `send_with_receive_ack` call typically completes Ok before the
-//! 6-second `raw_quic_receive_ack_timeout` fires. The race arm's
-//! value on production WAN paths — where `send_with_receive_ack` is
-//! genuinely stuck waiting for an ACK on a superseded connection
-//! (X0X-0034 tail traffic) and the supersede event arrives tens to
-//! hundreds of milliseconds before the in-flight call would self-time
-//! out — is the failure-class this loopback test cannot reproduce
-//! deterministically. Phase A integration on the live VPS mesh
-//! (re-deployed under X0X-0056 once that lands) is the authoritative
-//! acceptance signal for the WAN behaviour.
+//! A single-shot `network.send_with_receive_ack(...)` implementation with no
+//! Replaced subscription/reissue path cannot produce that short-circuit signal,
+//! so the test now fails deterministically when the race arm is removed.
 //!
 //! ## Stop conditions consulted
 //!
@@ -141,6 +121,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use x0x::direct::RawQuicAckRaceTestHook;
 use x0x::dm::{DmPath, DmSendConfig};
 use x0x::network::NetworkConfig;
 use x0x::Agent;
@@ -300,17 +281,20 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
 
     // ---------------------------------------------------------------------
     // 4. Subscribe to bob's incoming-DM channel BEFORE we issue the send so
-    //    we never miss the message.
+    //    we never miss the message. Install the ACK-race hook before the
+    //    send so the test can synchronize on the first attempt being polled.
     // ---------------------------------------------------------------------
     let mut bob_rx = bob.subscribe_direct();
+    let ack_race_hook = Arc::new(RawQuicAckRaceTestHook::new());
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(Some(Arc::clone(&ack_race_hook)));
 
     // ---------------------------------------------------------------------
-    // 5. Spawn the mid-DM kill+restart task. The 30 ms head-start gives
-    //    `send_direct_with_config` time to enter
-    //    `send_ack_racing_replaced`, subscribe to
-    //    `lifecycle_replaced_rx`, and begin polling
-    //    `send_with_receive_ack` against bob's gen-1 connection before
-    //    the supersede fires.
+    // 5. Issue /direct/send under a 500 ms wall clock budget, then wait for
+    //    the hook proving `send_ack_racing_replaced` subscribed to Replaced
+    //    events and started polling the first ACKed raw send attempt. Only
+    //    then do we trigger the kill+restart.
     //
     //    `disconnect(bob_peer)` drops the gen-1 connection.
     //    `connect_addr(bob_addr)` re-establishes via a fresh QUIC
@@ -321,29 +305,6 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
     //    in `src/lib.rs::~5933` consumes the event and calls
     //    `DirectMessaging::record_lifecycle_replaced`, which fires the
     //    broadcast our racing helper is subscribed to.
-    // ---------------------------------------------------------------------
-    let alice_network_for_task = Arc::clone(&alice_network);
-    let kill_restart = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        alice_network_for_task
-            .disconnect(&bob_peer)
-            .await
-            .expect("disconnect should succeed");
-        alice_network_for_task
-            .connect_addr(bob_addr)
-            .await
-            .expect("reconnect alice→bob")
-    });
-
-    // ---------------------------------------------------------------------
-    // 6. Issue /direct/send under a 500 ms wall clock budget. With the
-    //    X0X-0053 race arm in place, the helper subscribes to the
-    //    Replaced broadcast before the in-flight send and either races
-    //    against it directly (when the in-flight send is still pending)
-    //    or drains it from the broadcast queue immediately after
-    //    `send_fut` returns Err on the dying connection — both cases
-    //    abandon the in-flight call and reissue against the new
-    //    generation.
     // ---------------------------------------------------------------------
     let payload: Vec<u8> = b"x0x-0053-mid-send-replaced-race-payload".to_vec();
     let send_cfg = DmSendConfig {
@@ -358,12 +319,53 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
         stop_fallback_on_raw_error: true,
         ..DmSendConfig::default()
     };
+
+    let alice_for_send = Arc::clone(&alice);
+    let bob_agent_id = bob.agent_id();
+    let send_payload = payload.clone();
     let send_start = Instant::now();
-    let send_result = tokio::time::timeout(
-        Duration::from_millis(500),
-        alice.send_direct_with_config(&bob.agent_id(), payload.clone(), send_cfg),
+    let send_task = tokio::spawn(async move {
+        alice_for_send
+            .send_direct_with_config(&bob_agent_id, send_payload, send_cfg)
+            .await
+    });
+
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        ack_race_hook.wait_first_attempt_started(),
     )
-    .await;
+    .await
+    .expect("send_direct must start polling the first ACKed raw send before kill+restart");
+
+    let alice_network_for_task = Arc::clone(&alice_network);
+    let kill_restart = tokio::spawn(async move {
+        alice_network_for_task
+            .disconnect(&bob_peer)
+            .await
+            .expect("disconnect should succeed");
+        alice_network_for_task
+            .connect_addr(bob_addr)
+            .await
+            .expect("reconnect alice→bob")
+    });
+
+    // ---------------------------------------------------------------------
+    // 6. Require the racing helper to observe the same-peer Replaced event
+    //    and take the short-circuit/reissue path. This is the assertion that
+    //    makes the test fail when `send_ack_racing_replaced` is replaced by a
+    //    single-shot `network.send_with_receive_ack(...)`.
+    // ---------------------------------------------------------------------
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        ack_race_hook.wait_replaced_short_circuit(),
+    )
+    .await
+    .expect("send_ack_racing_replaced must short-circuit on the same-peer Replaced event");
+
+    let remaining = Duration::from_millis(500)
+        .checked_sub(send_start.elapsed())
+        .unwrap_or(Duration::ZERO);
+    let send_result = tokio::time::timeout(remaining, send_task).await;
     let send_elapsed = send_start.elapsed();
 
     let _reconnected_peer = kill_restart
@@ -373,7 +375,12 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
     // Hard acceptance: the outer 500 ms budget itself.
     let receipt = send_result
         .expect("send_direct must complete inside the 500ms acceptance budget — no Timeout")
+        .expect("send task should not panic")
         .expect("send_direct must return Ok on the new connection");
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(None);
+    ack_race_hook.release_first_attempt_result();
 
     assert!(
         send_elapsed <= Duration::from_millis(500),
@@ -389,7 +396,7 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
     );
 
     // ---------------------------------------------------------------------
-    // 7. Confirm bob actually received the bytes on the new generation.
+    // 7. Confirm bob actually received the bytes.
     // ---------------------------------------------------------------------
     let recv_deadline = Duration::from_millis(2_000);
     let received = tokio::time::timeout(recv_deadline, bob_rx.recv())

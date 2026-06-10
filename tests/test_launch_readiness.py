@@ -515,6 +515,56 @@ class LaunchReadinessGateTests(unittest.TestCase):
             violations,
         )
 
+    def test_broad_launch_phase_a_sent_only_gap_is_explicitly_handled(self) -> None:
+        deltas = {
+            "nyc": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
+            }
+        }
+        posts = {"nyc": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100}}
+        scenario = self.lr.ScenarioResult(
+            name="baseline",
+            duration_secs=1.0,
+            extra_metrics={"phase_a_received": 30, "phase_a_sent": 29},
+        )
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertFalse(passed)
+        self.assertIn("phase A sent 29 < gate 30", violations)
+        self.assertNotIn("phase A received 30 < gate 30", violations)
+
+    def test_broad_launch_phase_a_received_only_gap_is_explicitly_handled(self) -> None:
+        deltas = {
+            "nyc": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
+            }
+        }
+        posts = {"nyc": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100}}
+        scenario = self.lr.ScenarioResult(
+            name="baseline",
+            duration_secs=1.0,
+            extra_metrics={"phase_a_received": 29, "phase_a_sent": 30},
+        )
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertFalse(passed)
+        self.assertIn("phase A received 29 < gate 30", violations)
+        self.assertNotIn("phase A sent 30 < gate 30", violations)
+
     def test_dispatcher_timeout_exempt_nodes_are_scenario_scoped(self) -> None:
         deltas = {
             "sfo": {

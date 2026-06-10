@@ -2,23 +2,26 @@
 //!
 //! ## Test categories
 //!
-//! - **Local e2e** (no `#[ignore]`): Two agents on loopback, directly
-//!   connected via explicit bootstrap address. Tests the full library stack
-//!   without network access. Suitable for CI.
+//! - **Local loopback e2e** (`#[ignore = "requires real QUIC loopback connections"]`):
+//!   Two agents on loopback, directly connected via explicit bootstrap address.
+//!   Tests the full library stack without VPS access, but is timing-sensitive
+//!   on macOS dual-stack and must be run explicitly.
 //!
 //! - **VPS e2e** (`#[ignore = "requires live VPS bootstrap nodes"]`):
 //!   Same tests but with VPS bootstrap nodes added. Must be run from a
 //!   machine with UDP access to port 5483 on the VPS nodes (not behind
 //!   restrictive NAT). Run from a VPS or with UDP 5483 open.
 //!
-//! Run local tests:
+//! Default cargo/nextest runs skip these ignored e2e tests.
+//!
+//! Run local loopback tests:
 //! ```bash
-//! cargo nextest run --test vps_e2e_integration
+//! cargo nextest run --test vps_e2e_integration --run-ignored only test_local_
 //! ```
 //!
 //! Run VPS tests (from a machine with QUIC/UDP access):
 //! ```bash
-//! cargo nextest run --test vps_e2e_integration --run-ignored only
+//! cargo nextest run --test vps_e2e_integration --run-ignored only test_vps_
 //! ```
 //!
 //! ## Coverage
@@ -86,6 +89,19 @@ fn cfg_b(a_addr: std::net::SocketAddr, vps: bool) -> NetworkConfig {
     NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         bootstrap_nodes: nodes,
+        ..Default::default()
+    }
+}
+
+/// Build a NetworkConfig for Agent B with only live VPS bootstrap nodes.
+fn cfg_b_vps_only() -> NetworkConfig {
+    use x0x::network::DEFAULT_BOOTSTRAP_PEERS;
+    NetworkConfig {
+        bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+        bootstrap_nodes: DEFAULT_BOOTSTRAP_PEERS
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect(),
         ..Default::default()
     }
 }
@@ -402,6 +418,10 @@ async fn test_vps_identity_announcement_and_discovery() {
         .unwrap();
     agent_b.join_network().await.unwrap();
 
+    // B is now directly connected to A; re-announce so the announcement
+    // is delivered while B's PlumTree peer set includes A.
+    agent_a.announce_identity(false, false).await.unwrap();
+
     let found = wait_for_discovery(
         &agent_b,
         agent_a.agent_id(),
@@ -467,9 +487,9 @@ async fn test_vps_late_join_heartbeat_discovery() {
 
 #[ignore = "requires live VPS bootstrap nodes (UDP port 5483 must be accessible)"]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_vps_rendezvous_find_agent() {
-    let dir_a = TempDir::new().unwrap();
-    let dir_b = TempDir::new().unwrap();
+async fn test_vps_rendezvous_find_agent() -> Result<(), Box<dyn std::error::Error>> {
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
 
     let agent_a = Agent::builder()
         .with_machine_key(dir_a.path().join("machine.key"))
@@ -477,37 +497,31 @@ async fn test_vps_rendezvous_find_agent() {
         .with_network_config(cfg_a_vps(12))
         .with_heartbeat_interval(4)
         .build()
-        .await
-        .unwrap();
-    agent_a.join_network().await.unwrap();
-    agent_a
-        .advertise_identity(RENDEZVOUS_VALIDITY_MS)
-        .await
-        .unwrap();
-
-    let a_addr = agent_a
-        .bound_addr()
-        .await
-        .expect("agent A must have a bound address");
+        .await?;
+    agent_a.join_network().await?;
 
     let agent_b = Agent::builder()
         .with_machine_key(dir_b.path().join("machine.key"))
         .with_agent_key_path(dir_b.path().join("agent.key"))
-        .with_network_config(cfg_b(a_addr, true))
+        .with_network_config(cfg_b_vps_only())
         .build()
-        .await
-        .unwrap();
-    agent_b.join_network().await.unwrap();
+        .await?;
+    agent_b.join_network().await?;
 
-    let result = agent_b
-        .find_agent(agent_a.agent_id())
-        .await
-        .expect("find_agent must not error");
+    let target_id = agent_a.agent_id();
+    let lookup = agent_b.find_agent_rendezvous(target_id, 10);
+    let advertise = async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        agent_a.advertise_identity(RENDEZVOUS_VALIDITY_MS).await
+    };
+    let (result, ()) = tokio::try_join!(lookup, advertise)?;
 
     assert!(
         result.is_some(),
-        "find_agent should locate Agent A within 10s"
+        "find_agent_rendezvous should locate Agent A within 10s"
     );
+
+    Ok(())
 }
 
 #[ignore = "requires live VPS bootstrap nodes (UDP port 5483 must be accessible)"]
@@ -543,6 +557,10 @@ async fn test_vps_user_identity_discovery() {
         .await
         .unwrap();
     agent_b.join_network().await.unwrap();
+
+    // Both A and B are now connected. Re-announce with user identity so
+    // B's PlumTree receives the user-bearing announcement.
+    agent_a.announce_identity(true, true).await.unwrap();
 
     let found = wait_for_discovery(
         &agent_b,

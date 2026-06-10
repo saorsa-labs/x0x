@@ -8,6 +8,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 X0XD="${X0XD:-$ROOT/target/release/x0xd}"
+PYTHON="${PYTHON:-/usr/bin/python3}"
 RUNNER="$ROOT/tests/runners/x0x_test_runner.py"
 
 if [ ! -x "$X0XD" ]; then
@@ -17,7 +18,7 @@ fi
 
 NODES=(alice bob charlie)
 declare -A API_PORTS=([alice]=23700 [bob]=23701 [charlie]=23702)
-declare -A DATA_DIRS
+declare -A DATA_DIRS CONFIGS
 declare -a DAEMON_PIDS RUNNER_PIDS
 
 WORK_DIR=$(mktemp -d -t x0x-mesh-local.XXXXXX)
@@ -39,16 +40,22 @@ trap cleanup EXIT
 
 token_path() {
     local node="$1"
-    echo "$HOME/Library/Application Support/x0x-$node/api-token"
+    echo "${DATA_DIRS[$node]}/api-token"
 }
 
 # Boot daemons.
 for node in "${NODES[@]}"; do
     DATA_DIRS[$node]="$WORK_DIR/$node"
+    CONFIGS[$node]="$WORK_DIR/$node.toml"
     mkdir -p "${DATA_DIRS[$node]}"
+    cat > "${CONFIGS[$node]}" <<TOML
+instance_name = "$node"
+data_dir = "${DATA_DIRS[$node]}"
+api_address = "127.0.0.1:${API_PORTS[$node]}"
+log_level = "warn"
+TOML
     "$X0XD" \
-        --name "$node" \
-        --api-port "${API_PORTS[$node]}" \
+        --config "${CONFIGS[$node]}" \
         --no-hard-coded-bootstrap \
         > "$WORK_DIR/$node.x0xd.log" 2>&1 &
     DAEMON_PIDS+=("$!")
@@ -72,7 +79,7 @@ for node in "${NODES[@]}"; do
     port="${API_PORTS[$node]}"
     AIDS[$node]="$(curl -sf -H "Authorization: Bearer ${TOKENS[$node]}" \
         "http://127.0.0.1:$port/agent" \
-        | python3 -c "import sys,json;print(json.load(sys.stdin)['agent_id'])")"
+        | "$PYTHON" -c "import sys,json;print(json.load(sys.stdin)['agent_id'])")"
     CARDS[$node]="$(curl -sf -H "Authorization: Bearer ${TOKENS[$node]}" \
         "http://127.0.0.1:$port/agent/card")"
     echo "$node aid=${AIDS[$node]:0:16}…"
@@ -117,7 +124,7 @@ for node in "${NODES[@]}"; do
     NODE_NAME="$node" \
     X0X_API_BASE="http://127.0.0.1:${API_PORTS[$node]}" \
     X0X_API_TOKEN="${TOKENS[$node]}" \
-        python3 "$RUNNER" \
+        "$PYTHON" "$RUNNER" \
         > "$WORK_DIR/$node.runner.log" 2>&1 &
     RUNNER_PIDS+=("$!")
     echo "started runner $node pid=$!"
@@ -126,7 +133,7 @@ done
 sleep 3
 
 echo "==== running mesh harness ===="
-python3 "$ROOT/tests/e2e_vps_mesh.py" \
+"$PYTHON" "$ROOT/tests/e2e_vps_mesh.py" \
     --no-tunnel \
     --anchor alice \
     --api-base "http://127.0.0.1:${API_PORTS[alice]}" \

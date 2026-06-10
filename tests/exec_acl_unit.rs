@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::panic)]
+
 use std::path::Path;
 
 use x0x::exec::acl::{

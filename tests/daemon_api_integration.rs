@@ -5,6 +5,7 @@
 //!
 //! Before running: cargo build --release --bin x0xd
 
+use anyhow::{ensure, Context, Result};
 use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::Value;
@@ -150,6 +151,99 @@ async fn daemon_api_agent_sign_roundtrip() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_agent_sign_domain_separation_roundtrip() {
+    let d = daemon().await;
+
+    // Domain-separated signing (issue #90): the signature must verify over
+    // domain || 0x00 || payload, NOT over the raw payload — otherwise a
+    // signature issued in one protocol context could be replayed in another.
+    let payload = b"register envelope bytes";
+    let domain = "community.jams.pair.v1.register-pop";
+    let r: Value = ca(&d)
+        .post(d.url("/agent/sign"))
+        .json(&serde_json::json!({ "payload_b64": b64(payload), "domain": domain }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(r["ok"], true);
+    assert_eq!(
+        r["domain"].as_str().unwrap(),
+        domain,
+        "response must echo the domain so verifiers know the canonical-bytes shape"
+    );
+
+    let pk_bytes = base64::engine::general_purpose::STANDARD
+        .decode(r["public_key_b64"].as_str().unwrap())
+        .unwrap();
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(r["signature_b64"].as_str().unwrap())
+        .unwrap();
+    let public_key = ant_quic::MlDsaPublicKey::from_bytes(&pk_bytes).unwrap();
+    let signature =
+        ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes).unwrap();
+
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(domain.as_bytes());
+    canonical.push(0);
+    canonical.extend_from_slice(payload);
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&public_key, &canonical, &signature)
+        .expect("signature verifies over domain || 0x00 || payload");
+
+    assert!(
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            &public_key,
+            payload,
+            &signature
+        )
+        .is_err(),
+        "domain-separated signature must NOT verify over the raw payload"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_sign_without_domain_omits_domain_field() {
+    let d = daemon().await;
+    // Pre-#90 behavior must be unchanged: no domain in, no domain out.
+    let r: Value = ca(&d)
+        .post(d.url("/agent/sign"))
+        .json(&serde_json::json!({ "payload_b64": b64(b"plain payload") }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert!(
+        r.get("domain").is_none(),
+        "response must not contain a domain field when none was supplied"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_sign_rejects_nul_in_domain() {
+    let d = daemon().await;
+    let r = ca(&d)
+        .post(d.url("/agent/sign"))
+        .json(&serde_json::json!({ "payload_b64": b64(b"x"), "domain": "bad\u{0}domain" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::BAD_REQUEST,
+        "NUL bytes in domain would make the separator framing ambiguous"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_agent_sign_rejects_empty_payload() {
     let d = daemon().await;
     let r = ca(&d)
@@ -239,7 +333,9 @@ async fn daemon_api_shutdown_with_sse_client() {
         .unwrap();
     assert_eq!(shutdown_response.status(), StatusCode::OK);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // GHA runners are noticeably slower than local — a 5 s deadline flaked
+    // intermittently. Bumped to 30 s; observed local shutdown is <1 s.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = d.try_wait().unwrap() {
             assert!(status.success(), "daemon exited with {status}");
@@ -347,15 +443,28 @@ async fn daemon_api_publish_bad_base64() {
 
 #[tokio::test]
 #[ignore]
-async fn daemon_api_direct_send_not_found() {
+async fn daemon_api_direct_send_not_found() -> Result<()> {
     let d = daemon().await;
     let r = ca(&d)
         .post(d.url("/direct/send"))
         .json(&serde_json::json!({"agent_id": fake_id(), "payload": b64(b"hi")}))
         .send()
-        .await
-        .unwrap();
-    assert!(r.status().is_server_error() || r.status() == StatusCode::NOT_FOUND);
+        .await?;
+    let status = r.status();
+    let body: Value = r.json().await?;
+    ensure!(
+        status == StatusCode::NOT_FOUND,
+        "unknown direct-send recipient returned {status}: {body:?}"
+    );
+    ensure!(
+        body["ok"].as_bool() == Some(false),
+        "unexpected direct-send error body: {body:?}"
+    );
+    ensure!(
+        body["error"].as_str() == Some("recipient_key_unavailable"),
+        "unexpected direct-send error body: {body:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -555,23 +664,59 @@ async fn daemon_api_add_contact_rejects_unknown_field_alias() {
 /// returns the same FromStr error as POST /contacts.
 #[tokio::test]
 #[ignore]
-async fn daemon_api_import_card_invalid_trust_level_rejected() {
+async fn daemon_api_import_card_invalid_trust_level_rejected() -> Result<()> {
     let d = daemon().await;
-    let r = ca(&d)
+    let client = ca(&d);
+    let card: Value = client
+        .get(d.url("/agent/card"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let card_link = card["link"]
+        .as_str()
+        .context("agent card response missing link")?;
+    let card_agent_id = card["card"]["agent_id"]
+        .as_str()
+        .context("agent card response missing card.agent_id")?;
+
+    let r = client
         .post(d.url("/agent/card/import"))
         .json(&serde_json::json!({
-            "card": "x0x://agent/not-a-real-card",
+            "card": card_link,
             "trust_level": "completely-bogus",
         }))
         .send()
-        .await
-        .unwrap();
-    // The card itself is invalid first, OR we hit the trust-level branch —
-    // either way it is a 400 with a structured error, not a silent default.
-    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-    let body: Value = r.json().await.unwrap();
-    assert_eq!(body["ok"], false);
-    assert!(body["error"].is_string());
+        .await?;
+    ensure!(
+        r.status() == StatusCode::BAD_REQUEST,
+        "expected BAD_REQUEST, got {}",
+        r.status()
+    );
+    let body: Value = r.json().await?;
+    ensure!(
+        body["ok"].as_bool() == Some(false),
+        "unexpected import response: {body:?}"
+    );
+    let error = body["error"]
+        .as_str()
+        .context("import response missing error")?;
+    ensure!(
+        error.contains("invalid trust level: completely-bogus"),
+        "unexpected error: {error}"
+    );
+
+    let contacts: Value = client.get(d.url("/contacts")).send().await?.json().await?;
+    let contact_entries = contacts["contacts"]
+        .as_array()
+        .context("contacts response missing contacts array")?;
+    ensure!(
+        !contact_entries
+            .iter()
+            .any(|contact| contact["agent_id"].as_str() == Some(card_agent_id)),
+        "invalid trust import added contact: {contacts:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -1004,75 +1149,203 @@ async fn daemon_api_group_not_found() {
 // Task Lists (5)
 // ===========================================================================
 
-#[tokio::test]
-#[ignore]
-async fn daemon_api_create_task_list() {
-    let d = daemon().await;
-    let r: Value = ca(&d)
-        .post(d.url("/task-lists"))
-        .json(&serde_json::json!({"name": "test", "topic": "test-tasks"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(r["ok"], true);
-}
+async fn create_task_list_item(d: &DaemonFixture, title: &str) -> Result<(String, String)> {
+    let client = ca(d);
+    let topic = format!("task-lifecycle-{}", rand::random::<u32>());
 
-#[tokio::test]
-#[ignore]
-async fn daemon_api_add_task() {
-    let d = daemon().await;
-    let cr: Value = ca(&d)
+    let create = client
         .post(d.url("/task-lists"))
-        .json(&serde_json::json!({"name": "t", "topic": "t-tasks"}))
+        .json(&serde_json::json!({"name": "task lifecycle", "topic": topic}))
         .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let lid = cr["id"]
+        .await?;
+    ensure!(
+        create.status() == StatusCode::CREATED,
+        "create task list status: {}",
+        create.status()
+    );
+
+    let create_body: Value = create.json().await?;
+    ensure!(
+        create_body["ok"].as_bool() == Some(true),
+        "create task list response: {create_body:?}"
+    );
+    let list_id = create_body["id"]
         .as_str()
-        .unwrap_or(cr["task_list_id"].as_str().unwrap_or(""));
-    if !lid.is_empty() {
-        let r: Value = ca(&d)
-            .post(d.url(&format!("/task-lists/{lid}/tasks")))
-            .json(&serde_json::json!({"title": "Test task"}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(r["ok"], true);
-    }
+        .with_context(|| format!("create task list response missing id: {create_body:?}"))?
+        .to_string();
+    ensure!(!list_id.is_empty(), "create task list id was empty");
+
+    let add = client
+        .post(d.url(&format!("/task-lists/{list_id}/tasks")))
+        .json(&serde_json::json!({"title": title}))
+        .send()
+        .await?;
+    ensure!(
+        add.status() == StatusCode::CREATED,
+        "add task status: {}",
+        add.status()
+    );
+
+    let add_body: Value = add.json().await?;
+    ensure!(
+        add_body["ok"].as_bool() == Some(true),
+        "add task response: {add_body:?}"
+    );
+    let task_id = add_body["task_id"]
+        .as_str()
+        .with_context(|| format!("add task response missing task_id: {add_body:?}"))?
+        .to_string();
+    ensure!(
+        task_id.len() == 64,
+        "add task response missing 64-char task_id: {add_body:?}"
+    );
+
+    Ok((list_id, task_id))
+}
+
+async fn list_task_list_items(d: &DaemonFixture, list_id: &str) -> Result<Value> {
+    let response = ca(d)
+        .get(d.url(&format!("/task-lists/{list_id}/tasks")))
+        .send()
+        .await?;
+    ensure!(
+        response.status() == StatusCode::OK,
+        "list tasks status: {}",
+        response.status()
+    );
+
+    let body: Value = response.json().await?;
+    ensure!(
+        body["ok"].as_bool() == Some(true),
+        "list tasks response: {body:?}"
+    );
+    ensure!(body["tasks"].is_array(), "tasks response: {body:?}");
+    Ok(body)
+}
+
+async fn update_task_item(
+    d: &DaemonFixture,
+    list_id: &str,
+    task_id: &str,
+    action: &str,
+) -> Result<()> {
+    let response = ca(d)
+        .patch(d.url(&format!("/task-lists/{list_id}/tasks/{task_id}")))
+        .json(&serde_json::json!({"action": action}))
+        .send()
+        .await?;
+    ensure!(
+        response.status() == StatusCode::OK,
+        "update task status: {}",
+        response.status()
+    );
+
+    let body: Value = response.json().await?;
+    ensure!(
+        body["ok"].as_bool() == Some(true),
+        "update task response: {body:?}"
+    );
+    Ok(())
+}
+
+fn task_state<'a>(body: &'a Value, task_id: &str) -> Option<&'a str> {
+    body["tasks"]
+        .as_array()
+        .and_then(|tasks| {
+            tasks
+                .iter()
+                .find(|task| task["id"].as_str() == Some(task_id))
+        })
+        .and_then(|task| task["state"].as_str())
 }
 
 #[tokio::test]
 #[ignore]
-async fn daemon_api_list_tasks() {
+async fn daemon_api_create_task_list() -> Result<()> {
     let d = daemon().await;
-    let r = ca(&d).get(d.url("/task-lists")).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    let r = ca(&d)
+        .post(d.url("/task-lists"))
+        .json(&serde_json::json!({
+            "name": "test",
+            "topic": format!("test-tasks-{}", rand::random::<u32>()),
+        }))
+        .send()
+        .await?;
+    ensure!(
+        r.status() == StatusCode::CREATED,
+        "create task list status: {}",
+        r.status()
+    );
+
+    let r: Value = r.json().await?;
+    ensure!(
+        r["ok"].as_bool() == Some(true),
+        "create task list response: {r:?}"
+    );
+    ensure!(r["id"].is_string(), "create task list response: {r:?}");
+    Ok(())
 }
 
 #[tokio::test]
 #[ignore]
-async fn daemon_api_claim_task() {
-    // Tested via the update_task endpoint with action: "claim"
+async fn daemon_api_add_task() -> Result<()> {
     let d = daemon().await;
-    let r = ca(&d).get(d.url("/task-lists")).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    create_task_list_item(&d, "Test task").await?;
+    Ok(())
 }
 
 #[tokio::test]
 #[ignore]
-async fn daemon_api_complete_task() {
+async fn daemon_api_list_tasks() -> Result<()> {
     let d = daemon().await;
-    let r = ca(&d).get(d.url("/task-lists")).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    let (list_id, task_id) = create_task_list_item(&d, "List me").await?;
+
+    let r = ca(&d).get(d.url("/task-lists")).send().await?;
+    ensure!(
+        r.status() == StatusCode::OK,
+        "list task lists status: {}",
+        r.status()
+    );
+
+    let listed = list_task_list_items(&d, &list_id).await?;
+    ensure!(
+        task_state(&listed, &task_id) == Some("empty"),
+        "listed task response: {listed:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_claim_task() -> Result<()> {
+    let d = daemon().await;
+    let (list_id, task_id) = create_task_list_item(&d, "Claim me").await?;
+
+    update_task_item(&d, &list_id, &task_id, "claim").await?;
+
+    let listed = list_task_list_items(&d, &list_id).await?;
+    ensure!(
+        task_state(&listed, &task_id).is_some_and(|state| state.starts_with("claimed:")),
+        "claimed task response: {listed:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_complete_task() -> Result<()> {
+    let d = daemon().await;
+    let (list_id, task_id) = create_task_list_item(&d, "Complete me").await?;
+
+    update_task_item(&d, &list_id, &task_id, "claim").await?;
+    update_task_item(&d, &list_id, &task_id, "complete").await?;
+
+    let listed = list_task_list_items(&d, &list_id).await?;
+    ensure!(
+        task_state(&listed, &task_id).is_some_and(|state| state.starts_with("done:")),
+        "completed task response: {listed:?}"
+    );
+    Ok(())
 }
 
 // ===========================================================================

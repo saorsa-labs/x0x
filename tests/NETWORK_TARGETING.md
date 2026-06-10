@@ -26,6 +26,7 @@ singapore / sydney); only ports + services + data dirs differ:
 | Bootstrap (UDP) | **6483** | **5483** |
 | API (TCP, localhost) | **13600** | **12600** |
 | systemd unit | `x0xd-testnet.service` | `x0xd.service` |
+| Binary path | `/opt/x0x/x0xd-testnet` | `/opt/x0x/x0xd` |
 | Data dir | `/root/.local/share/x0x-testnet/` | `/root/.local/share/x0x/` |
 | Config | `/etc/x0x/config-testnet.toml` | `/etc/x0x/config.toml` |
 | Auto-update | enabled (fast iteration) | disabled (manual control) |

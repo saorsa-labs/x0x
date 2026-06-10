@@ -1,4 +1,5 @@
 //! Property-based tests for groups.
+#![allow(clippy::unwrap_used)]
 
 use proptest::prelude::*;
 use x0x::groups::{card::AgentCard, invite::SignedInvite, GroupInfo};

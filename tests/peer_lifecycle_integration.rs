@@ -11,11 +11,13 @@
 //! verifies the underlying ant-quic primitives. This file proves the daemon
 //! REST handlers actually round-trip with a real second peer attached.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 #[path = "harness/src/daemon.rs"]
@@ -24,6 +26,47 @@ mod daemon;
 use daemon::DaemonFixture;
 
 const STARTUP_SETTLE: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+struct PeerLifecycleLock(std::fs::File);
+
+#[cfg(unix)]
+fn peer_lifecycle_lock() -> PeerLifecycleLock {
+    let lock_path = std::env::temp_dir().join("x0x-peer-lifecycle-integration.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+        .expect("open peer lifecycle lock file");
+
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return PeerLifecycleLock(file);
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            panic!("failed to lock peer lifecycle tests: {err}");
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PeerLifecycleLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(not(unix))]
+struct PeerLifecycleLock;
+
+#[cfg(not(unix))]
+fn peer_lifecycle_lock() -> PeerLifecycleLock {
+    PeerLifecycleLock
+}
 
 /// Boot bob, read his QUIC bind addr from `/status`, then boot alice with
 /// bob as a bootstrap peer. After cross-importing cards as Trusted, both
@@ -162,8 +205,8 @@ async fn wait_for_peer(fixture: &DaemonFixture, peer_machine: &str, deadline: Du
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
 async fn peer_probe_returns_finite_rtt_against_live_peer() {
+    let _guard = peer_lifecycle_lock();
     let (alice, _bob, _alice_machine, bob_machine) = alice_and_bob_connected().await;
     wait_for_peer(&alice, &bob_machine, Duration::from_secs(15)).await;
 
@@ -190,8 +233,8 @@ async fn peer_probe_returns_finite_rtt_against_live_peer() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn peer_probe_returns_400_on_invalid_peer_id() {
+    let _guard = peer_lifecycle_lock();
     let alice = DaemonFixture::start("plc-probe-bad").await;
     let client = alice.authed_client(Duration::from_secs(10));
     // Not 64 hex chars — must be a structured 4xx, not 5xx panic.
@@ -208,8 +251,8 @@ async fn peer_probe_returns_400_on_invalid_peer_id() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
 async fn peer_health_snapshot_observable_for_live_peer() {
+    let _guard = peer_lifecycle_lock();
     let (alice, _bob, _alice_machine, bob_machine) = alice_and_bob_connected().await;
     wait_for_peer(&alice, &bob_machine, Duration::from_secs(15)).await;
 
@@ -254,8 +297,8 @@ async fn peer_health_snapshot_observable_for_live_peer() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
 async fn peer_events_sse_emits_established_on_new_connection() {
+    let _guard = peer_lifecycle_lock();
     // Boot alice first so we can subscribe to her SSE *before* the connection
     // happens. ant-quic's broadcast bus only delivers transitions that occur
     // *after* the receiver subscribes (existing connections are not replayed).
@@ -264,6 +307,7 @@ async fn peer_events_sse_emits_established_on_new_connection() {
     let alice_url = alice.url("/peers/events");
 
     // Open the SSE in a background task; collect raw lines for 12 s.
+    let (sse_ready_tx, sse_ready_rx) = tokio::sync::oneshot::channel();
     let alice_token_clone = alice_token.clone();
     let collector = tokio::spawn(async move {
         let client = reqwest::Client::builder()
@@ -276,6 +320,8 @@ async fn peer_events_sse_emits_established_on_new_connection() {
             .send()
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "SSE subscription failed");
+        let _ = sse_ready_tx.send(());
         let mut acc = String::new();
         let started = tokio::time::Instant::now();
         while started.elapsed() < Duration::from_secs(12) {
@@ -292,8 +338,7 @@ async fn peer_events_sse_emits_established_on_new_connection() {
         acc
     });
 
-    // Give the SSE a moment to connect.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sse_ready_rx.await.unwrap();
 
     // Read alice's QUIC bind, then boot bob pointed at her.
     let alice_client = reqwest::Client::builder()
@@ -376,8 +421,8 @@ async fn peer_events_sse_emits_established_on_new_connection() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
 async fn direct_send_with_require_ack_round_trips_to_live_peer() {
+    let _guard = peer_lifecycle_lock();
     let (alice, bob, _alice_machine, _bob_machine) = alice_and_bob_connected().await;
 
     let bob_agent_id = {
@@ -421,8 +466,8 @@ async fn direct_send_with_require_ack_round_trips_to_live_peer() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn direct_send_without_require_ack_omits_ack_block() {
+    let _guard = peer_lifecycle_lock();
     // Negative coverage: opting out leaves require_ack absent so legacy
     // clients aren't broken by the new field appearing unsolicited.
     let (alice, bob, _alice_machine, _bob_machine) = alice_and_bob_connected().await;

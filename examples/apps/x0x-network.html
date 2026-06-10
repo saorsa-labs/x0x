@@ -107,7 +107,11 @@ tr:hover td { background: rgba(0,212,255,0.03); }
   </div>
 </div>
 <script>
-const API_URL = "http://localhost:12700";
+const CONFIG = new URLSearchParams(location.search);
+const API_URL = (CONFIG.get("api") || localStorage.getItem("x0x.apiBase") || "http://localhost:12700").replace(/\/$/, "");
+const API_TOKEN = CONFIG.get("token") || localStorage.getItem("x0x.apiToken") || "";
+if (CONFIG.get("api")) localStorage.setItem("x0x.apiBase", API_URL);
+if (CONFIG.get("token")) localStorage.setItem("x0x.apiToken", API_TOKEN);
 const POLL_MS = 3000;
 let online = false;
 
@@ -134,7 +138,11 @@ function copyId(el) {
   const t = el.textContent; if (!t || t === "--") return;
   navigator.clipboard.writeText(t).then(() => { $("toast").classList.add("show"); setTimeout(() => $("toast").classList.remove("show"), 1200); });
 }
-async function api(path) { const r = await fetch(API_URL + path, { signal: AbortSignal.timeout(2500) }); return r.json(); }
+async function api(path) {
+  const headers = API_TOKEN ? { Authorization: "Bearer " + API_TOKEN } : {};
+  const r = await fetch(API_URL + path, { headers, signal: AbortSignal.timeout(2500) });
+  return r.json();
+}
 function setOnline(v) { if (v === online) return; online = v; $("offline").style.display = v ? "none" : "flex"; $("app").style.display = v ? "block" : "none"; }
 
 async function poll() {

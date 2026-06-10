@@ -69,8 +69,10 @@ proptest! {
         let json = serde_json::to_string(&offer).unwrap();
         let parsed: FileOffer = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(parsed.transfer_id, offer.transfer_id);
+        prop_assert_eq!(parsed.filename, offer.filename);
         prop_assert_eq!(parsed.size, offer.size);
         prop_assert_eq!(parsed.sha256, offer.sha256);
+        prop_assert_eq!(parsed.chunk_size, offer.chunk_size);
         prop_assert_eq!(parsed.total_chunks, offer.total_chunks);
     }
 
@@ -102,6 +104,38 @@ proptest! {
 #[test]
 fn max_transfer_size_is_at_least_one_chunk() {
     assert!(MAX_TRANSFER_SIZE >= DEFAULT_CHUNK_SIZE as u64);
+}
+
+#[test]
+fn chunk_math_covers_transfer_size_boundary() {
+    let chunk = DEFAULT_CHUNK_SIZE as u64;
+    let cases = [
+        (0, 0, 0),
+        (1, 1, 1),
+        (chunk, 1, DEFAULT_CHUNK_SIZE),
+        (chunk + 1, 2, 1),
+        (
+            MAX_TRANSFER_SIZE - chunk,
+            (MAX_TRANSFER_SIZE - chunk) / chunk,
+            DEFAULT_CHUNK_SIZE,
+        ),
+        (
+            MAX_TRANSFER_SIZE - 1,
+            MAX_TRANSFER_SIZE / chunk,
+            DEFAULT_CHUNK_SIZE - 1,
+        ),
+        (
+            MAX_TRANSFER_SIZE,
+            MAX_TRANSFER_SIZE / chunk,
+            DEFAULT_CHUNK_SIZE,
+        ),
+        (MAX_TRANSFER_SIZE + 1, MAX_TRANSFER_SIZE / chunk + 1, 1),
+    ];
+
+    for (size, expected_chunks, expected_last) in cases {
+        assert_eq!(chunk_count(size, DEFAULT_CHUNK_SIZE), expected_chunks);
+        assert_eq!(last_chunk_size(size, DEFAULT_CHUNK_SIZE), expected_last);
+    }
 }
 
 #[test]

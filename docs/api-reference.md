@@ -68,6 +68,7 @@ curl http://127.0.0.1:12700/status
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
 | GET | `/agent/card` | `x0x agent card` | Generate a shareable identity card |
 | POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts |
+| POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 
 ### Announce request body
 
@@ -85,6 +86,26 @@ Notes:
 ### Agent card query params
 
 `GET /agent/card?display_name=Alice&include_groups=true`
+
+### Sign request body
+
+```json
+{
+  "payload_b64": "<base64 bytes to sign>",
+  "domain": "my-protocol.v1.register"
+}
+```
+
+Notes:
+- `payload_b64` is decoded and signed verbatim (max 256 KiB). Callers
+  canonicalize structured payloads themselves.
+- `domain` is optional. When present, the daemon signs
+  `domain || 0x00 || payload` and echoes `domain` in the response, so a
+  signature for one protocol context cannot be replayed in another.
+  Domains must be non-empty, NUL-free, and at most 1024 bytes.
+  `x0x.<purpose>.<version>` is the conventional shape for x0x protocols.
+- Response: `ok`, `agent_id` (hex), `public_key_b64`, `signature_b64`,
+  `algorithm` (`x0x.agent-sign.v1.ml-dsa-65`), and `domain` when supplied.
 
 ## Network
 
@@ -112,6 +133,16 @@ Notes:
   "payload": "aGVsbG8="
 }
 ```
+
+### `local:` topics (same-daemon IPC)
+
+Topics whose name starts with `local:` (e.g. `local:my-app/events`) are
+never gossipped: messages are delivered only to subscribers attached to
+the same `x0xd` instance — they never enter the PlumTree EAGER set or
+IHAVE digests. All primitives work unchanged (`/publish`, `/subscribe`,
+`/events`, WebSocket subscribe, bearer-token auth). Use them as a local
+pub/sub substrate for multi-process applications sharing one daemon,
+without leaking events to the mesh.
 
 ## Discovery
 
@@ -332,8 +363,14 @@ Cards and commits carry ML-DSA-65 signatures. Peers verify both the
 signature and the chain link (`prev_state_hash`) before accepting; stale
 revisions are silently dropped.
 
-**Honest scope — v1 secure model is GSS, not MLS TreeKEM.** See
-`docs/primers/groups.md` for what GSS provides and does not provide.
+**Secure-group plane (ADR-0012, x0x 0.21.0):** private groups (`private_secure`
+preset — `Hidden` + `MlsEncrypted`) run **real TreeKEM** (forward secrecy +
+post-compromise security). **Single-member** private groups work end-to-end
+(invite → join → bidirectional secure → ban → forward secrecy). **Multi-member
+limitation:** a 2nd+ member converges into the owner's roster but its
+`MemberAdded`+`Welcome` is not yet delivered, so it cannot yet encrypt — tracked
+follow-up. Public encrypted presets (`public_request_secure`) and grandfathered
+groups remain on the legacy **GSS** plane. See `docs/primers/groups.md`.
 
 ## Collaborative task lists
 

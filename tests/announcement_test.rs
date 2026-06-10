@@ -14,14 +14,165 @@ use x0x::{
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn test_peer_cache_dir(dir: &TempDir) -> std::path::PathBuf {
+    dir.path().join("peers")
+}
+
 async fn build_agent(dir: &TempDir) -> Agent {
-    Agent::builder()
+    let peer_cache_dir = test_peer_cache_dir(dir);
+    let agent = Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
+        .with_peer_cache_dir(&peer_cache_dir)
         .with_network_config(NetworkConfig::default())
         .build()
         .await
-        .unwrap()
+        .unwrap();
+
+    assert!(
+        peer_cache_dir.exists(),
+        "networked tests must use the TempDir peer cache"
+    );
+    agent
+}
+
+#[derive(serde::Serialize)]
+struct IdentityAnnouncementUnsignedForTest {
+    agent_id: x0x::identity::AgentId,
+    machine_id: x0x::identity::MachineId,
+    user_id: Option<x0x::identity::UserId>,
+    agent_certificate: Option<x0x::identity::AgentCertificate>,
+    machine_public_key: Vec<u8>,
+    addresses: Vec<std::net::SocketAddr>,
+    announced_at: u64,
+    nat_type: Option<String>,
+    can_receive_direct: Option<bool>,
+    is_relay: Option<bool>,
+    is_coordinator: Option<bool>,
+    reachable_via: Vec<x0x::identity::MachineId>,
+    relay_candidates: Vec<x0x::identity::MachineId>,
+}
+
+#[derive(serde::Serialize)]
+struct MachineAnnouncementUnsignedForTest {
+    machine_id: x0x::identity::MachineId,
+    machine_public_key: Vec<u8>,
+    addresses: Vec<std::net::SocketAddr>,
+    announced_at: u64,
+    nat_type: Option<String>,
+    can_receive_direct: Option<bool>,
+    is_relay: Option<bool>,
+    is_coordinator: Option<bool>,
+    reachable_via: Vec<x0x::identity::MachineId>,
+    relay_candidates: Vec<x0x::identity::MachineId>,
+}
+
+fn machine_signature_for_test(
+    machine_keypair: &x0x::identity::MachineKeypair,
+    unsigned_bytes: &[u8],
+) -> Vec<u8> {
+    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        machine_keypair.secret_key(),
+        unsigned_bytes,
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec()
+}
+
+fn signed_identity_announcement_with_nat_fields() -> IdentityAnnouncement {
+    let machine_keypair = x0x::identity::MachineKeypair::generate().unwrap();
+    let agent_keypair = x0x::identity::AgentKeypair::generate().unwrap();
+    let unsigned = IdentityAnnouncementUnsignedForTest {
+        agent_id: agent_keypair.agent_id(),
+        machine_id: machine_keypair.machine_id(),
+        user_id: None,
+        agent_certificate: None,
+        machine_public_key: machine_keypair.public_key().as_bytes().to_vec(),
+        addresses: Vec::new(),
+        announced_at: 1_000,
+        nat_type: Some(String::from("Symmetric")),
+        can_receive_direct: Some(false),
+        is_relay: Some(false),
+        is_coordinator: Some(true),
+        reachable_via: vec![x0x::identity::MachineId([0xAA; 32])],
+        relay_candidates: vec![x0x::identity::MachineId([0xBB; 32])],
+    };
+    let unsigned_bytes = bincode::serialize(&unsigned).unwrap();
+    let machine_signature = machine_signature_for_test(&machine_keypair, &unsigned_bytes);
+
+    IdentityAnnouncement {
+        agent_id: unsigned.agent_id,
+        machine_id: unsigned.machine_id,
+        user_id: unsigned.user_id,
+        agent_certificate: unsigned.agent_certificate,
+        machine_public_key: unsigned.machine_public_key,
+        machine_signature,
+        addresses: unsigned.addresses,
+        announced_at: unsigned.announced_at,
+        nat_type: unsigned.nat_type,
+        can_receive_direct: unsigned.can_receive_direct,
+        is_relay: unsigned.is_relay,
+        is_coordinator: unsigned.is_coordinator,
+        reachable_via: unsigned.reachable_via,
+        relay_candidates: unsigned.relay_candidates,
+    }
+}
+
+fn signed_machine_announcement_with_nat_fields() -> MachineAnnouncement {
+    let machine_keypair = x0x::identity::MachineKeypair::generate().unwrap();
+    let unsigned = MachineAnnouncementUnsignedForTest {
+        machine_id: machine_keypair.machine_id(),
+        machine_public_key: machine_keypair.public_key().as_bytes().to_vec(),
+        addresses: Vec::new(),
+        announced_at: 1_000,
+        nat_type: Some(String::from("Symmetric")),
+        can_receive_direct: Some(false),
+        is_relay: Some(false),
+        is_coordinator: Some(true),
+        reachable_via: vec![x0x::identity::MachineId([0xAA; 32])],
+        relay_candidates: vec![x0x::identity::MachineId([0xBB; 32])],
+    };
+    let unsigned_bytes = bincode::serialize(&unsigned).unwrap();
+    let machine_signature = machine_signature_for_test(&machine_keypair, &unsigned_bytes);
+
+    MachineAnnouncement {
+        machine_id: unsigned.machine_id,
+        machine_public_key: unsigned.machine_public_key,
+        machine_signature,
+        addresses: unsigned.addresses,
+        announced_at: unsigned.announced_at,
+        nat_type: unsigned.nat_type,
+        can_receive_direct: unsigned.can_receive_direct,
+        is_relay: unsigned.is_relay,
+        is_coordinator: unsigned.is_coordinator,
+        reachable_via: unsigned.reachable_via,
+        relay_candidates: unsigned.relay_candidates,
+    }
+}
+
+fn assert_identity_announcement_rejects_tamper<F>(base: &IdentityAnnouncement, mutate: F)
+where
+    F: FnOnce(&mut IdentityAnnouncement),
+{
+    let mut tampered = base.clone();
+    mutate(&mut tampered);
+    assert!(
+        tampered.verify().is_err(),
+        "tampered identity announcement must fail verification"
+    );
+}
+
+fn assert_machine_announcement_rejects_tamper<F>(base: &MachineAnnouncement, mutate: F)
+where
+    F: FnOnce(&mut MachineAnnouncement),
+{
+    let mut tampered = base.clone();
+    mutate(&mut tampered);
+    assert!(
+        tampered.verify().is_err(),
+        "tampered machine announcement must fail verification"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +215,7 @@ async fn announcement_with_user_identity_round_trip() {
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
         .with_user_key(user_kp)
+        .with_peer_cache_dir(test_peer_cache_dir(&dir))
         .with_network_config(NetworkConfig::default())
         .build()
         .await
@@ -155,6 +307,48 @@ fn announcement_nat_fields_round_trip() {
     assert_eq!(decoded.is_coordinator, Some(true));
     assert_eq!(decoded.reachable_via, vec![coord]);
     assert_eq!(decoded.relay_candidates, vec![coord]);
+}
+
+#[test]
+fn signed_announcement_nat_fields_round_trip_and_reject_tampering() {
+    let ann = signed_identity_announcement_with_nat_fields();
+    let bytes = bincode::serialize(&ann).unwrap();
+    let decoded: IdentityAnnouncement = bincode::deserialize(&bytes).unwrap();
+
+    assert_eq!(decoded.nat_type.as_deref(), Some("Symmetric"));
+    assert_eq!(decoded.can_receive_direct, Some(false));
+    assert_eq!(decoded.is_relay, Some(false));
+    assert_eq!(decoded.is_coordinator, Some(true));
+    assert_eq!(
+        decoded.reachable_via,
+        vec![x0x::identity::MachineId([0xAA; 32])]
+    );
+    assert_eq!(
+        decoded.relay_candidates,
+        vec![x0x::identity::MachineId([0xBB; 32])]
+    );
+    decoded
+        .verify()
+        .expect("signed announcement with NAT fields should verify");
+
+    assert_identity_announcement_rejects_tamper(&decoded, |ann| {
+        ann.nat_type = Some(String::from("FullCone"));
+    });
+    assert_identity_announcement_rejects_tamper(&decoded, |ann| {
+        ann.can_receive_direct = Some(true);
+    });
+    assert_identity_announcement_rejects_tamper(&decoded, |ann| {
+        ann.is_relay = Some(true);
+    });
+    assert_identity_announcement_rejects_tamper(&decoded, |ann| {
+        ann.is_coordinator = Some(false);
+    });
+    assert_identity_announcement_rejects_tamper(&decoded, |ann| {
+        ann.reachable_via[0] = x0x::identity::MachineId([0xCC; 32]);
+    });
+    assert_identity_announcement_rejects_tamper(&decoded, |ann| {
+        ann.relay_candidates[0] = x0x::identity::MachineId([0xDD; 32]);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +507,7 @@ async fn self_announcement_populates_discovery_cache() {
     let agent = Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
+        .with_peer_cache_dir(test_peer_cache_dir(&dir))
         .with_network_config(NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: vec![],
@@ -351,6 +546,48 @@ async fn machine_announcement_round_trip() {
         .expect("decoded machine announcement should verify");
 }
 
+#[test]
+fn signed_machine_announcement_nat_fields_round_trip_and_reject_tampering() {
+    let ann = signed_machine_announcement_with_nat_fields();
+    let bytes = bincode::serialize(&ann).unwrap();
+    let decoded: MachineAnnouncement = bincode::deserialize(&bytes).unwrap();
+
+    assert_eq!(decoded.nat_type.as_deref(), Some("Symmetric"));
+    assert_eq!(decoded.can_receive_direct, Some(false));
+    assert_eq!(decoded.is_relay, Some(false));
+    assert_eq!(decoded.is_coordinator, Some(true));
+    assert_eq!(
+        decoded.reachable_via,
+        vec![x0x::identity::MachineId([0xAA; 32])]
+    );
+    assert_eq!(
+        decoded.relay_candidates,
+        vec![x0x::identity::MachineId([0xBB; 32])]
+    );
+    decoded
+        .verify()
+        .expect("signed machine announcement with NAT fields should verify");
+
+    assert_machine_announcement_rejects_tamper(&decoded, |ann| {
+        ann.nat_type = Some(String::from("FullCone"));
+    });
+    assert_machine_announcement_rejects_tamper(&decoded, |ann| {
+        ann.can_receive_direct = Some(true);
+    });
+    assert_machine_announcement_rejects_tamper(&decoded, |ann| {
+        ann.is_relay = Some(true);
+    });
+    assert_machine_announcement_rejects_tamper(&decoded, |ann| {
+        ann.is_coordinator = Some(false);
+    });
+    assert_machine_announcement_rejects_tamper(&decoded, |ann| {
+        ann.reachable_via[0] = x0x::identity::MachineId([0xCC; 32]);
+    });
+    assert_machine_announcement_rejects_tamper(&decoded, |ann| {
+        ann.relay_candidates[0] = x0x::identity::MachineId([0xDD; 32]);
+    });
+}
+
 #[tokio::test]
 async fn machine_announcement_decode_rejects_trailing_bytes() {
     let dir = TempDir::new().unwrap();
@@ -377,6 +614,7 @@ async fn self_announcement_populates_machine_cache() {
     let agent = Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
+        .with_peer_cache_dir(test_peer_cache_dir(&dir))
         .with_network_config(NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: vec![],
@@ -405,6 +643,7 @@ async fn user_and_agent_link_to_discovered_machine() {
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
         .with_user_key(user_kp)
+        .with_peer_cache_dir(test_peer_cache_dir(&dir))
         .with_network_config(NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: vec![],

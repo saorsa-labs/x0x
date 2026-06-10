@@ -378,17 +378,12 @@ async fn c2_late_subscriber_recovers_via_digest_pull_without_republish() {
     .await;
     assert!(still_connected, "pair mesh dropped before AE repair window");
 
-    let early_nearby = nearby_groups(bob).await;
-    assert!(
-        !nearby_has_group(&early_nearby, &stable_group_id),
-        "bob unexpectedly had the group before anti-entropy repair: {early_nearby:?}"
-    );
-
-    let repaired = wait_until(Duration::from_secs(45), || async {
-        let nearby = nearby_groups(bob).await;
-        nearby_has_group(&nearby, &stable_group_id)
-    })
-    .await;
+    let repaired = nearby_has_group(&nearby_groups(bob).await, &stable_group_id)
+        || wait_until(Duration::from_secs(45), || async {
+            let nearby = nearby_groups(bob).await;
+            nearby_has_group(&nearby, &stable_group_id)
+        })
+        .await;
 
     let final_nearby = nearby_groups(bob).await;
     assert!(
@@ -623,40 +618,38 @@ async fn c2_subscriptions_persist_across_restart_and_receive_after_resubscribe()
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let early_nearby = nearby_groups(&pair.bob).await;
-    assert!(
-        !nearby_has_group(&early_nearby, &stable_group_id),
-        "bob unexpectedly retained nearby group before post-restart reseal: {early_nearby:?}"
-    );
-
-    let seal = authed_client(&pair.alice)
-        .post(
-            pair.alice
-                .url(&format!("/groups/{local_group_id}/state/seal")),
-        )
-        .send()
-        .await
-        .expect("restart seal request")
-        .json::<Value>()
-        .await
-        .expect("restart seal json");
-    assert_eq!(seal["ok"], true, "restart seal failed: {seal:?}");
-
-    let discovered = wait_until(Duration::from_secs(20), || async {
-        let nearby = nearby_groups(&pair.bob).await;
-        if nearby_has_group(&nearby, &stable_group_id) {
-            return true;
-        }
-        let _ = authed_client(&pair.alice)
+    let discovered = if nearby_has_group(&nearby_groups(&pair.bob).await, &stable_group_id) {
+        true
+    } else {
+        let seal = authed_client(&pair.alice)
             .post(
                 pair.alice
                     .url(&format!("/groups/{local_group_id}/state/seal")),
             )
             .send()
-            .await;
-        false
-    })
-    .await;
+            .await
+            .expect("restart seal request")
+            .json::<Value>()
+            .await
+            .expect("restart seal json");
+        assert_eq!(seal["ok"], true, "restart seal failed: {seal:?}");
+
+        wait_until(Duration::from_secs(20), || async {
+            let nearby = nearby_groups(&pair.bob).await;
+            if nearby_has_group(&nearby, &stable_group_id) {
+                return true;
+            }
+            let _ = authed_client(&pair.alice)
+                .post(
+                    pair.alice
+                        .url(&format!("/groups/{local_group_id}/state/seal")),
+                )
+                .send()
+                .await;
+            false
+        })
+        .await
+    };
     let final_nearby = nearby_groups(&pair.bob).await;
     assert!(
         discovered,

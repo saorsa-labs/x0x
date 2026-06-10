@@ -132,8 +132,12 @@ header {
 </div>
 
 <script>
-const API_URL = "http://localhost:12700";
-const WS_URL = "ws://localhost:12700/ws";
+const CONFIG = new URLSearchParams(location.search);
+const API_URL = (CONFIG.get("api") || localStorage.getItem("x0x.apiBase") || "http://localhost:12700").replace(/\/$/, "");
+const API_TOKEN = CONFIG.get("token") || localStorage.getItem("x0x.apiToken") || "";
+if (CONFIG.get("api")) localStorage.setItem("x0x.apiBase", API_URL);
+if (CONFIG.get("token")) localStorage.setItem("x0x.apiToken", API_TOKEN);
+const WS_URL = API_URL.replace(/^http/, "ws") + "/ws" + (API_TOKEN ? "?token=" + encodeURIComponent(API_TOKEN) : "");
 
 const DEFAULT_ROOM = "x0x-chat/general";
 const RECONNECT_MS = 3000;

@@ -134,9 +134,12 @@ commit so there is no window of uncommitted state.
 cargo fmt --all -- --check
 cargo clippy --all-features --all-targets -- -D warnings
 cargo nextest run --all-features --workspace
-cargo build --release --bin x0xd --bin x0x --bin x0x-user-keygen
+cargo build --release --bin x0xd --bin x0x
 bash tests/e2e_named_groups.sh > tests/proof-reports/named-groups-d3-run{1,2,3}.log 2>&1
 ```
+
+`x0x-user-keygen` remains buildable from source as a deprecated compatibility shim;
+runtime scripts use the canonical `x0x user-id create` command.
 
 ## Unit + Integration evidence
 

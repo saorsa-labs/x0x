@@ -91,8 +91,12 @@ textarea:focus,input:focus{outline:none;border-color:var(--cyan)}
   </div>
 </main>
 <script>
-const API_URL = "http://localhost:12700";
-const WS_URL = "ws://localhost:12700/ws";
+const CONFIG = new URLSearchParams(location.search);
+const API_URL = (CONFIG.get("api") || localStorage.getItem("x0x.apiBase") || "http://localhost:12700").replace(/\/$/, "");
+const API_TOKEN = CONFIG.get("token") || localStorage.getItem("x0x.apiToken") || "";
+if (CONFIG.get("api")) localStorage.setItem("x0x.apiBase", API_URL);
+if (CONFIG.get("token")) localStorage.setItem("x0x.apiToken", API_TOKEN);
+const WS_URL = API_URL.replace(/^http/, "ws") + "/ws" + (API_TOKEN ? "?token=" + encodeURIComponent(API_TOKEN) : "");
 
 let ws = null, connected = false, myAgentId = null, sessionId = null, taskListId = null;
 let myTasks = [], feedEvents = [], agents = new Map(), taskMap = new Map();
@@ -103,6 +107,8 @@ function ago(ts) { const s = Math.floor((Date.now() - ts) / 1000); if (s < 5) re
 function b64e(obj) { return btoa(JSON.stringify(obj)); }
 function b64d(s) { try { return JSON.parse(atob(s)); } catch { return null; } }
 function esc(s) { if (!s) return ""; const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function taskTopic() { return "x0x-swarm/" + sessionId + "/tasks"; }
+function resultTopic() { return "x0x-swarm/" + sessionId + "/results"; }
 
 function initSession() {
   const hash = location.hash.slice(1);
@@ -124,7 +130,7 @@ function setStatus(ok, msg) {
 }
 
 async function api(method, path, body) {
-  const opts = { method, headers: { "Content-Type": "application/json" } };
+  const opts = { method, headers: { "Content-Type": "application/json", ...(API_TOKEN ? { Authorization: "Bearer " + API_TOKEN } : {}) } };
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(API_URL + path, opts);
   if (!r.ok) throw new Error(r.status + " " + r.statusText);
@@ -138,7 +144,7 @@ async function init() {
     const info = await api("GET", "/agent");
     myAgentId = info.agent_id || "unknown";
     document.getElementById("agentLabel").innerHTML = 'You: <code class="mono">' + shortId(myAgentId) + "</code>";
-    setStatus(true, "Connected to x0xd");
+    setStatus(false, "Opening websocket");
     await ensureTaskList();
     connectWs();
     pollLoop();
@@ -166,16 +172,21 @@ function connectWs() {
   if (ws) try { ws.close(); } catch (e) { /* ignore */ }
   ws = new WebSocket(WS_URL);
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "subscribe", topics: ["x0x-swarm/tasks", "x0x-swarm/results"] }));
-    setStatus(true, "Connected");
+    setStatus(false, "Subscribing");
   };
   ws.onmessage = ev => {
     const msg = JSON.parse(ev.data);
-    if (msg.type === "message") {
+    if (msg.type === "connected") {
+      myAgentId = msg.agent_id || myAgentId;
+      document.getElementById("agentLabel").innerHTML = 'You: <code class="mono">' + shortId(myAgentId) + "</code>";
+      ws.send(JSON.stringify({ type: "subscribe", topics: [taskTopic(), resultTopic()] }));
+    } else if (msg.type === "subscribed") {
+      setStatus(true, "Connected");
+    } else if (msg.type === "message") {
       const data = b64d(msg.payload);
       if (!data) return;
-      if (msg.topic === "x0x-swarm/tasks") handleTaskEvent(data, msg.origin);
-      if (msg.topic === "x0x-swarm/results") handleResultEvent(data, msg.origin);
+      if (msg.topic === taskTopic()) handleTaskEvent(data, msg.origin);
+      if (msg.topic === resultTopic()) handleResultEvent(data, msg.origin);
     }
   };
   ws.onclose = () => { setStatus(false, "Disconnected"); setTimeout(connectWs, 3000); };
@@ -233,7 +244,7 @@ async function submitTask() {
   const taskId = genId(8);
   const task = { task_id: taskId, description: desc, capability: cap || null, requester: myAgentId, timestamp: Date.now() };
   if (taskListId) { try { await api("POST", "/task-lists/" + taskListId + "/tasks", { title: desc }); } catch (e) { /* ok */ } }
-  wsPub("x0x-swarm/tasks", { ...task, event: "posted" });
+  wsPub(taskTopic(), { ...task, event: "posted" });
   myTasks.unshift({ ...task, state: "pending", ts: Date.now() });
   taskMap.set(taskId, { ...task, state: "pending", ts: Date.now() });
   addFeedEvent("posted", '<span class="agent">' + shortId(myAgentId) + "</span> posted" + (cap ? ' <span class="tag tag-pending">' + esc(cap) + "</span>" : "") + '<div style="margin-top:.25rem;color:var(--text)">' + esc(desc) + "</div>");

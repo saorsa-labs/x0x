@@ -315,8 +315,8 @@ fn test_version_tracking() {
     task_list.add_task(task, peer_id, 1).expect("Failed to add");
 
     let version_after_add = task_list.version();
-    // Version should change after adding a task
-    assert!(version_after_add >= initial_version);
+    // Version should advance after adding a task.
+    assert!(version_after_add > initial_version);
 
     // Claim the task
     task_list
@@ -324,8 +324,8 @@ fn test_version_tracking() {
         .expect("Failed to claim");
 
     let version_after_claim = task_list.version();
-    // Version should be >= version after add (may or may not increment depending on implementation)
-    assert!(version_after_claim >= version_after_add);
+    // Version should advance after claiming a task.
+    assert!(version_after_claim > version_after_add);
 }
 
 /// Test updating task list name.

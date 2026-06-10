@@ -3,8 +3,8 @@
   WIRED     GET /groups
   WIRED     GET /groups/:id
   WIRED     GET /groups/:id/members
-  WIRED     POST /groups/:id/members
-  WIRED     DELETE /groups/:id/members/:agent_id
+  DEFERRED  POST /groups/:id/members  // admin flow; GUI currently uses invite links instead of direct add-by-agent
+  DEFERRED  DELETE /groups/:id/members/:agent_id  // admin flow; GUI currently uses ban rather than direct remove-by-agent
   WIRED     POST /groups/:id/send
   WIRED     GET /groups/:id/messages
   WIRED     POST /groups/:id/invite
@@ -23,17 +23,17 @@
   WIRED     POST /groups/:id/requests
   WIRED     POST /groups/:id/requests/:request_id/approve
   WIRED     POST /groups/:id/requests/:request_id/reject
-  WIRED     DELETE /groups/:id/requests/:request_id
+  DEFERRED  DELETE /groups/:id/requests/:request_id  // GUI gap: requester-side cancel-request UI not yet wired
   WIRED     GET /groups/discover
   WIRED     GET /groups/discover/nearby
-  WIRED     GET /groups/discover/subscriptions
-  WIRED     POST /groups/discover/subscribe
-  WIRED     DELETE /groups/discover/subscribe/:kind/:shard
-  WIRED     GET /groups/cards/:id
+  DEFERRED  GET /groups/discover/subscriptions  // power-user surface; CLI covers it
+  DEFERRED  POST /groups/discover/subscribe  // power-user surface; CLI covers it
+  DEFERRED  DELETE /groups/discover/subscribe/:kind/:shard  // power-user surface; CLI covers it
+  DEFERRED  GET /groups/cards/:id  // GUI gap: card inspection-by-id UI not yet wired (import action is)
   WIRED     POST /groups/cards/import
-  WIRED     POST /groups/:id/secure/encrypt
-  WIRED     POST /groups/:id/secure/decrypt
-  WIRED     POST /groups/:id/secure/reseal
-  WIRED     POST /groups/secure/open-envelope
+  DEFERRED  POST /groups/:id/secure/encrypt  // secure-plane primitive; consumed implicitly by encrypted chat
+  DEFERRED  POST /groups/:id/secure/decrypt  // secure-plane primitive; consumed implicitly by encrypted chat
+  DEFERRED  POST /groups/:id/secure/reseal  // secure-plane primitive; server-side rekey on approve/ban
+  DEFERRED  POST /groups/secure/open-envelope  // adversarial test endpoint, not a user-facing action
 
-Coverage: 36/36 wired; 0 deferred; 0 missing
+Coverage: 25/36 wired; 11 deferred; 0 missing

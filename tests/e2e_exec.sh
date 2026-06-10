@@ -307,8 +307,8 @@ wait_health "$API_BOB" bob
 ALICE_TK="$(cat "$ALICE_DATA/api-token")"
 BOB_TK="$(cat "$BOB_DATA/api-token")"
 
-ALICE_CARD="$(api_get "$API_ALICE" "$ALICE_TK" /agent/card | json_card_link)"
-BOB_CARD="$(api_get "$API_BOB" "$BOB_TK" /agent/card | json_card_link)"
+ALICE_CARD="$(api_get "$API_ALICE" "$ALICE_TK" '/agent/card?include_local_addresses=true' | json_card_link)"
+BOB_CARD="$(api_get "$API_BOB" "$BOB_TK" '/agent/card?include_local_addresses=true' | json_card_link)"
 api_post "$API_ALICE" "$ALICE_TK" /agent/card/import "{\"card\":\"$BOB_CARD\",\"trust_level\":\"Trusted\"}" >/dev/null
 api_post "$API_BOB" "$BOB_TK" /agent/card/import "{\"card\":\"$ALICE_CARD\",\"trust_level\":\"Trusted\"}" >/dev/null
 # Connection attempts are best-effort; gossip DM delivery is the required exec substrate.

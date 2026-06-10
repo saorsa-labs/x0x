@@ -275,7 +275,7 @@ represent a silent gap.
 ## Appendix — reproducing this report
 
 ```bash
-cargo build --release --bin x0xd --bin x0x --bin x0x-user-keygen
+cargo build --release --bin x0xd --bin x0x
 
 # Static proofs (fast)
 cargo nextest run --test gui_named_group_parity --test api_manifest \
@@ -288,3 +288,6 @@ for i in 1 2 3; do bash tests/e2e_feature_parity.sh; done
 Logs land in `tests/proof-reports/parity/feature-parity-*.log`.
 The GUI per-endpoint coverage lands in
 `tests/proof-reports/parity/gui-named-groups-coverage.txt`.
+
+`x0x-user-keygen` remains buildable from source as a deprecated compatibility shim;
+runtime scripts use the canonical `x0x user-id create` command.

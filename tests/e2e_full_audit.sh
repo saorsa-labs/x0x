@@ -4,7 +4,6 @@ set -euo pipefail
 ROOT="$(pwd)"
 X0XD="${X0XD:-$ROOT/target/release/x0xd}"
 X0X="${X0X:-$ROOT/target/release/x0x}"
-X0X_USER_KEYGEN="${X0X_USER_KEYGEN:-$ROOT/target/release/x0x-user-keygen}"
 AA="http://127.0.0.1:19811"
 BA="http://127.0.0.1:19812"
 CA="http://127.0.0.1:19813"
@@ -36,12 +35,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ ! -x "$X0XD" ] || [ ! -x "$X0X" ] || [ ! -x "$X0X_USER_KEYGEN" ]; then
-  echo "Build first: cargo build --release --bin x0xd --bin x0x --bin x0x-user-keygen" >&2
+if [ ! -x "$X0XD" ] || [ ! -x "$X0X" ]; then
+  echo "Build first: cargo build --release --bin x0xd --bin x0x" >&2
   exit 1
 fi
 
-"$X0X_USER_KEYGEN" "$USER_KEY_PATH" >/dev/null
+"$X0X" user-id create "$USER_KEY_PATH" >/dev/null
 
 for port in 19811 19812 19813 19881 19882 19883; do
   lsof -ti tcp:$port 2>/dev/null | xargs kill -9 2>/dev/null || true

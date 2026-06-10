@@ -1,10 +1,10 @@
 //! Sender-side gossip DM path (phase 4 of `docs/design/dm-over-gossip.md`).
 
 use crate::dm::{
-    now_unix_ms, DmAckOutcome, DmEnvelope, DmError, DmPath, DmReceipt, DmSendConfig,
-    EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_VERSION, MAX_PAYLOAD_BYTES,
+    dm_inbox_topic, now_unix_ms, DmAckOutcome, DmEnvelope, DmError, DmPath, DmReceipt,
+    DmSendConfig, EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_VERSION, MAX_PAYLOAD_BYTES,
 };
-use crate::dm_inbox::DmInboxService;
+use crate::dm_inbox::{DmInboxService, DM_BUS_TOPIC};
 use crate::error::IdentityError;
 use crate::gossip::{PubSubManager, SigningContext};
 use crate::identity::{AgentId, MachineId};
@@ -32,6 +32,8 @@ pub struct DmLifecycleHint {
 }
 
 pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
+const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::from_millis(250);
+const ACK_LEGACY_BUS_FALLBACK_DELAY: Duration = Duration::from_millis(250);
 
 #[allow(clippy::too_many_arguments)]
 pub async fn send_via_gossip(
@@ -90,8 +92,9 @@ pub async fn send_via_gossip(
         .map_err(|e| DmError::EnvelopeConstruction(format!("sign: {e}")))?;
     let wire = envelope.to_wire_bytes().map_err(map_identity_err)?;
     let topic = DmInboxService::inbox_topic_name(&recipient_agent_id);
+    let topic_id = dm_inbox_topic(&recipient_agent_id);
 
-    tracing::info!(
+    tracing::debug!(
         target: "dm.trace",
         stage = "path_chosen",
         request_id = %hex::encode(request_id),
@@ -99,7 +102,7 @@ pub async fn send_via_gossip(
         path = "gossip_inbox",
         timeout_ms = config.timeout_per_attempt.as_millis() as u64,
     );
-    tracing::info!(
+    tracing::debug!(
         target: "dm.trace",
         stage = "wire_encoded",
         request_id = %hex::encode(request_id),
@@ -120,7 +123,7 @@ pub async fn send_via_gossip(
         if attempt > 0 {
             match rx.try_recv() {
                 Ok(outcome) => {
-                    tracing::info!(
+                    tracing::debug!(
                         target: "dm.trace",
                         stage = "outbound_send_returned_ok",
                         request_id = %hex::encode(request_id),
@@ -146,20 +149,77 @@ pub async fn send_via_gossip(
         // their curl/user-visible deadline without returning a structured
         // `DmError::Timeout`.
         let attempt_result = tokio::time::timeout(config.timeout_per_attempt, async {
-            pubsub
-                .publish(topic.clone(), Bytes::from(wire.clone()))
-                .await
-                .map_err(|e| DmError::LocalGossipUnavailable(e.to_string()))?;
+            let primary_publish = pubsub
+                .publish_topic_id(topic.clone(), topic_id, Bytes::from(wire.clone()))
+                .await;
+            let primary_publish_ok = match primary_publish {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "dm.trace",
+                        stage = "primary_inbox_publish_failed",
+                        request_id = %hex::encode(request_id),
+                        recipient = %crate::logging::LogAgentId::from(&recipient_agent_id),
+                        attempt,
+                        error = %e,
+                    );
+                    false
+                }
+            };
 
-            (&mut rx).await.map_err(|_| {
+            if !config.require_gossip_ack {
+                if !primary_publish_ok {
+                    return Err(DmError::LocalGossipUnavailable(
+                        "primary inbox publish failed".to_string(),
+                    ));
+                }
+                return Ok(None);
+            }
+
+            if primary_publish_ok {
+                if let Some(outcome) =
+                    wait_for_ack_or_backoff(&mut rx, ACK_LEGACY_BUS_FALLBACK_DELAY).await?
+                {
+                    return Ok(Some(outcome));
+                }
+            }
+
+            tracing::debug!(
+                target: "dm.trace",
+                stage = "legacy_bus_fallback_publish",
+                request_id = %hex::encode(request_id),
+                recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                attempt,
+                primary_publish_ok,
+                bus_topic = DM_BUS_TOPIC,
+            );
+            if let Err(e) = pubsub
+                .publish(DM_BUS_TOPIC.to_string(), Bytes::from(wire.clone()))
+                .await
+            {
+                if primary_publish_ok {
+                    tracing::warn!(
+                        target: "dm.trace",
+                        stage = "legacy_bus_fallback_publish_failed",
+                        request_id = %hex::encode(request_id),
+                        recipient = %crate::logging::LogAgentId::from(&recipient_agent_id),
+                        attempt,
+                        error = %e,
+                    );
+                } else {
+                    return Err(DmError::LocalGossipUnavailable(e.to_string()));
+                }
+            }
+
+            (&mut rx).await.map(Some).map_err(|_| {
                 DmError::PublishFailed("in-flight ACK registry replaced our waiter".to_string())
             })
         })
         .await;
 
         match attempt_result {
-            Ok(Ok(outcome)) => {
-                tracing::info!(
+            Ok(Ok(Some(outcome))) => {
+                tracing::debug!(
                     target: "dm.trace",
                     stage = "outbound_send_returned_ok",
                     request_id = %hex::encode(request_id),
@@ -168,6 +228,29 @@ pub async fn send_via_gossip(
                 );
                 guard.mark_resolved();
                 return ack_outcome_to_receipt(outcome, request_id, attempt);
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(
+                    target: "dm.trace",
+                    stage = "outbound_send_publish_only_attempt",
+                    request_id = %hex::encode(request_id),
+                    recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                    attempt,
+                    ack_required = false,
+                );
+                if attempt < config.max_retries {
+                    tokio::time::sleep(PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY).await;
+                    continue;
+                }
+                tracing::debug!(
+                    target: "dm.trace",
+                    stage = "outbound_send_returned_ok",
+                    request_id = %hex::encode(request_id),
+                    recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                    retries_used = attempt,
+                    ack_required = false,
+                );
+                return Ok(gossip_publish_receipt(request_id, attempt));
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -181,7 +264,7 @@ pub async fn send_via_gossip(
                     .await?;
                     match wait_outcome {
                         BackoffWait::Ack(outcome) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "dm.trace",
                                 stage = "outbound_send_returned_ok",
                                 request_id = %hex::encode(request_id),
@@ -193,7 +276,7 @@ pub async fn send_via_gossip(
                             return ack_outcome_to_receipt(outcome, request_id, attempt);
                         }
                         BackoffWait::ReplacedShortCircuit { new_generation } => {
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "dm.trace",
                                 stage = "outbound_send_replaced_short_circuit",
                                 request_id = %hex::encode(request_id),
@@ -211,7 +294,7 @@ pub async fn send_via_gossip(
     }
 
     if let Ok(outcome) = rx.try_recv() {
-        tracing::info!(
+        tracing::debug!(
             target: "dm.trace",
             stage = "outbound_send_returned_ok",
             request_id = %hex::encode(request_id),
@@ -376,6 +459,15 @@ fn ack_outcome_to_receipt(
     }
 }
 
+fn gossip_publish_receipt(request_id: [u8; 16], retries_used: u8) -> DmReceipt {
+    DmReceipt {
+        request_id,
+        accepted_at: Instant::now(),
+        retries_used,
+        path: DmPath::GossipInbox,
+    }
+}
+
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if !self.resolved {
@@ -424,6 +516,34 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn backoff_wait_zero_delay_returns_none_without_consuming_ack() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tx.send(DmAckOutcome::Accepted).expect("send ack");
+
+        let outcome = wait_for_ack_or_backoff(&mut rx, Duration::ZERO)
+            .await
+            .expect("zero-delay wait should not fail");
+
+        assert_eq!(outcome, None);
+        assert_eq!(
+            rx.try_recv().expect("ack still pending"),
+            DmAckOutcome::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn backoff_wait_errors_when_ack_sender_dropped() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<DmAckOutcome>();
+        drop(tx);
+
+        let err = wait_for_ack_or_backoff(&mut rx, Duration::from_secs(1))
+            .await
+            .expect_err("closed waiter should be a publish failure");
+
+        assert!(matches!(err, DmError::PublishFailed(_)));
+    }
+
+    #[tokio::test]
     async fn backoff_wait_returns_late_ack_before_retry() {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -447,6 +567,22 @@ mod tests {
             .expect("backoff timeout is not an error");
 
         assert_eq!(outcome, None);
+    }
+
+    #[tokio::test]
+    async fn x0x_0041_zero_delay_returns_elapsed_even_with_hint() {
+        let (_ack_tx, mut rx) = tokio::sync::oneshot::channel::<DmAckOutcome>();
+        let (_replaced_tx, replaced_rx) = tokio::sync::broadcast::channel::<(MachineId, u64)>(1);
+        let mut hint = DmLifecycleHint {
+            recipient_machine_id: MachineId([0x44; 32]),
+            replaced_rx,
+        };
+
+        let outcome = wait_for_ack_or_backoff_or_replaced(&mut rx, Duration::ZERO, Some(&mut hint))
+            .await
+            .expect("zero-delay wait should not fail");
+
+        assert!(matches!(outcome, BackoffWait::Elapsed));
     }
 
     /// X0X-0041: a `Replaced` event for the target peer fires during the
@@ -517,6 +653,51 @@ mod tests {
         assert!(matches!(outcome, BackoffWait::Elapsed));
     }
 
+    #[tokio::test]
+    async fn x0x_0041_closed_replaced_channel_falls_back_to_ack_wait() {
+        let (ack_tx, mut rx) = tokio::sync::oneshot::channel();
+        let (replaced_tx, replaced_rx) = tokio::sync::broadcast::channel::<(MachineId, u64)>(1);
+        drop(replaced_tx);
+        let mut hint = DmLifecycleHint {
+            recipient_machine_id: MachineId([0x55; 32]),
+            replaced_rx,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = ack_tx.send(DmAckOutcome::Accepted);
+        });
+
+        let outcome =
+            wait_for_ack_or_backoff_or_replaced(&mut rx, Duration::from_secs(1), Some(&mut hint))
+                .await
+                .expect("closed replaced channel should fall back to ack wait");
+
+        assert!(matches!(outcome, BackoffWait::Ack(DmAckOutcome::Accepted)));
+    }
+
+    #[tokio::test]
+    async fn x0x_0041_lagged_replaced_channel_drains_target_event() {
+        let (_ack_tx, mut rx) = tokio::sync::oneshot::channel::<DmAckOutcome>();
+        let (replaced_tx, replaced_rx) = tokio::sync::broadcast::channel::<(MachineId, u64)>(1);
+        let target = MachineId([0x66; 32]);
+        let mut hint = DmLifecycleHint {
+            recipient_machine_id: target,
+            replaced_rx,
+        };
+        let _ = replaced_tx.send((MachineId([0x67; 32]), 1));
+        let _ = replaced_tx.send((target, 7));
+
+        let outcome =
+            wait_for_ack_or_backoff_or_replaced(&mut rx, Duration::from_secs(1), Some(&mut hint))
+                .await
+                .expect("lagged channel should drain target event");
+
+        match outcome {
+            BackoffWait::ReplacedShortCircuit { new_generation } => assert_eq!(new_generation, 7),
+            other => panic!("expected replacement short-circuit, got {other:?}"),
+        }
+    }
+
     /// X0X-0041: a late ACK during the backoff still wins over a same-peer
     /// supersede when the ACK fires first.
     #[tokio::test]
@@ -540,6 +721,30 @@ mod tests {
                 .expect("wait should not error");
 
         assert!(matches!(outcome, BackoffWait::Ack(DmAckOutcome::Accepted)));
+    }
+
+    #[test]
+    fn inflight_guard_drop_cancels_unresolved_waiter() {
+        let inflight = Arc::new(InFlightAcks::new());
+        let request_id = [0x88; 16];
+        let _rx = inflight.register(request_id);
+        assert_eq!(inflight.outstanding(), 1);
+        {
+            let _guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
+        }
+        assert_eq!(inflight.outstanding(), 0);
+    }
+
+    #[test]
+    fn inflight_guard_mark_resolved_preserves_waiter_on_drop() {
+        let inflight = Arc::new(InFlightAcks::new());
+        let request_id = [0x89; 16];
+        let _rx = inflight.register(request_id);
+        let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
+        guard.mark_resolved();
+        drop(guard);
+        assert_eq!(inflight.outstanding(), 1);
+        inflight.cancel(&request_id);
     }
 
     #[test]
@@ -598,6 +803,15 @@ mod tests {
     }
 
     #[test]
+    fn gossip_publish_receipt_uses_gossip_path() {
+        let request_id = [3u8; 16];
+        let receipt = gossip_publish_receipt(request_id, 1);
+        assert_eq!(receipt.request_id, request_id);
+        assert_eq!(receipt.retries_used, 1);
+        assert_eq!(receipt.path, DmPath::GossipInbox);
+    }
+
+    #[test]
     fn ack_outcome_to_receipt_rejected_returns_error() {
         let outcome = DmAckOutcome::RejectedByPolicy {
             reason: "not trusted".to_string(),
@@ -641,5 +855,10 @@ mod tests {
         // Verify DmLifecycleHint can be sent between threads
         fn assert_send<T: Send>() {}
         assert_send::<DmLifecycleHint>();
+    }
+
+    #[test]
+    fn default_send_config_requires_gossip_ack() {
+        assert!(DmSendConfig::default().require_gossip_ack);
     }
 }

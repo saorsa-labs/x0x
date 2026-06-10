@@ -1,23 +1,19 @@
-//! MLS group management backed by saorsa-mls (RFC 9420, TreeKEM, PQC).
+//! Legacy GSS group management backed by `saorsa_mls::MlsGroup`.
 //!
 //! This module wraps `saorsa_mls::MlsGroup` with an x0x-native API that uses
-//! `AgentId` for member identity. The inner group provides real TreeKEM key
-//! management, ML-KEM-768 key encapsulation, and ML-DSA-65 signatures.
+//! `AgentId` for member identity. **This is the legacy Group-Shared-Secret
+//! (GSS) plane, not real TreeKEM:** the inner `saorsa_mls::MlsGroup` distributes
+//! a per-epoch shared secret (ML-KEM-768-sealed in the Welcome) and derives
+//! per-member keys from it, so it provides **neither forward secrecy nor
+//! post-compromise security**. Real RFC-9420 TreeKEM (FS + PCS) lives in
+//! `crate::mls::treekem`, wrapping `saorsa_mls::TreeKemGroup`. New
+//! `MlsEncrypted` groups use the TreeKEM plane; this wrapper remains for
+//! grandfathered groups (see ADR-0010 / ADR-0012).
 
 use crate::identity::{AgentCertificate, AgentId, UserId};
-use crate::mls::{MlsError, Result};
+use crate::mls::{agent_id_to_member_id, MlsError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-/// Deterministic bridge from x0x `AgentId` (32 bytes) to saorsa-mls `MemberId`
-/// (UUID, 16 bytes). Uses the first 16 bytes of the AgentId.
-fn agent_id_to_member_id(agent_id: &AgentId) -> saorsa_mls::MemberId {
-    // SAFETY: AgentId is always 32 bytes, so slicing [..16] is guaranteed.
-    let bytes: [u8; 16] = agent_id.as_bytes()[..16]
-        .try_into()
-        .expect("AgentId is always 32 bytes");
-    saorsa_mls::MemberId::from_bytes(bytes)
-}
 
 /// MLS group context containing cryptographic state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,8 +236,10 @@ impl MlsCommit {
 
 /// An MLS group managing encrypted communication between agents.
 ///
-/// Wraps `saorsa_mls::MlsGroup` for real TreeKEM key management and PQC
-/// cryptography, exposed through an `AgentId`-based API.
+/// Wraps `saorsa_mls::MlsGroup` (the legacy **GSS** plane — per-epoch shared
+/// secret, no forward secrecy / no post-compromise security) behind an
+/// `AgentId`-based API. For real TreeKEM (FS + PCS) use
+/// [`crate::mls::treekem::TreeKemMlsGroup`].
 ///
 /// Note: `new()` and `add_member()`/`remove_member()` are async because
 /// the saorsa-mls backend performs key generation asynchronously.
@@ -249,7 +247,7 @@ impl MlsCommit {
 pub struct MlsGroup {
     /// Unique identifier for this group.
     group_id: Vec<u8>,
-    /// Inner saorsa-mls group (real TreeKEM, PQC).
+    /// Inner saorsa-mls group (legacy GSS plane — shared secret, no FS/PCS).
     inner: saorsa_mls::MlsGroup,
     /// Adapter context tracking epoch and hashes.
     context: MlsGroupContext,

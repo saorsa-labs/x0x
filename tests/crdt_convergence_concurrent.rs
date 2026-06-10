@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! CRDT Convergence Tests - Concurrent Operations
 //!
 //! Verifies that task list CRDTs converge correctly under concurrent operations
@@ -59,6 +61,21 @@ fn unix_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+async fn wait_until_clock_after(timestamp: u64) {
+    while unix_timestamp_ms() <= timestamp {
+        sleep(Duration::from_millis(1)).await;
+    }
+}
+
+fn merge_all_replicas(replicas: &mut [TaskList]) {
+    let clones: Vec<TaskList> = replicas.to_vec();
+    for replica in replicas {
+        for other in &clones {
+            replica.merge(other).expect("Failed to merge replica");
+        }
+    }
 }
 
 /// Test 1: Concurrent add_task() from multiple replicas
@@ -196,6 +213,73 @@ async fn test_concurrent_claim_same_task() {
     }
 }
 
+#[tokio::test]
+async fn test_same_task_claim_conflict_different_timestamps_converges() {
+    let task_list_id = list_id(7);
+    let tid = task_id(101);
+
+    let mut replicas: Vec<TaskList> = (1..=3)
+        .map(|i| {
+            let mut list = TaskList::new(task_list_id, "Claim Conflict".to_string(), peer_id(i));
+            let task = TaskItem::new(tid, metadata("Contested Task", 1), peer_id(1));
+            list.add_task(task, peer_id(1), 1)
+                .expect("Failed to add task");
+            list
+        })
+        .collect();
+
+    replicas[0]
+        .claim_task(&tid, agent_id(1), peer_id(1), 1)
+        .expect("Agent 1 claim failed");
+    let first_claim = replicas[0]
+        .get_task(&tid)
+        .expect("Task should exist")
+        .current_state();
+    let first_timestamp = first_claim
+        .timestamp()
+        .expect("Claim should have timestamp");
+
+    wait_until_clock_after(first_timestamp).await;
+    replicas[1]
+        .claim_task(&tid, agent_id(2), peer_id(2), 1)
+        .expect("Agent 2 claim failed");
+    let second_timestamp = replicas[1]
+        .get_task(&tid)
+        .expect("Task should exist")
+        .current_state()
+        .timestamp()
+        .expect("Claim should have timestamp");
+    assert!(second_timestamp > first_timestamp);
+
+    wait_until_clock_after(second_timestamp).await;
+    replicas[2]
+        .claim_task(&tid, agent_id(3), peer_id(3), 1)
+        .expect("Agent 3 claim failed");
+    let third_timestamp = replicas[2]
+        .get_task(&tid)
+        .expect("Task should exist")
+        .current_state()
+        .timestamp()
+        .expect("Claim should have timestamp");
+    assert!(third_timestamp > second_timestamp);
+
+    merge_all_replicas(&mut replicas);
+
+    for replica in &replicas {
+        let state = replica
+            .get_task(&tid)
+            .expect("Task should exist")
+            .current_state();
+        assert!(state.is_claimed(), "Task should be claimed");
+        assert_eq!(
+            state.claimed_by(),
+            Some(&agent_id(1)),
+            "Earliest claim should win for same-task claim conflicts"
+        );
+        assert_eq!(state.timestamp(), Some(first_timestamp));
+    }
+}
+
 /// Test 3: Concurrent metadata updates (LWW-Register)
 ///
 /// Scenario: 5 agents update task title concurrently.
@@ -251,14 +335,91 @@ async fn test_concurrent_metadata_updates() {
         right[0].merge(&left[0]).expect("Failed to merge back");
     }
 
-    // All replicas should converge to latest title (Title v5)
+    let metadata_snapshot = |task: &TaskItem| {
+        (
+            task.title().to_string(),
+            task.description().to_string(),
+            task.assignee().copied(),
+            task.priority(),
+            *task.created_by(),
+            task.created_at(),
+        )
+    };
+    let expected_metadata =
+        metadata_snapshot(replicas[0].get_task(&tid).expect("Task should exist"));
+    assert_eq!(
+        expected_metadata.0, "Title v5",
+        "Latest metadata title should win"
+    );
+
+    // All replicas should converge to latest title (Title v5) and identical metadata.
     for replica in &replicas {
         let task = replica.get_task(&tid).expect("Task should exist");
-        // LWW-Register: latest timestamp wins
-        // This test verifies merge doesn't lose data
-        assert!(
-            task.title().starts_with("Title"),
-            "Title should be preserved"
+        assert_eq!(task.title(), "Title v5", "Latest metadata title should win");
+        assert_eq!(
+            metadata_snapshot(task),
+            expected_metadata,
+            "Task metadata should converge exactly across replicas"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_same_task_metadata_conflict_different_lww_clocks_converges() {
+    let task_list_id = list_id(8);
+    let tid = task_id(201);
+
+    let mut meta = metadata("Original Title", 1);
+    meta.created_at = 1_000;
+
+    let mut task_v1 = TaskItem::new(tid, meta, peer_id(1));
+    task_v1.update_title("Title v1".to_string(), peer_id(1));
+
+    let mut task_v2 = task_v1.clone();
+    task_v2.update_title("Title v2".to_string(), peer_id(1));
+
+    let mut task_v3 = task_v2.clone();
+    task_v3.update_title("Title v3".to_string(), peer_id(1));
+
+    let mut replicas: Vec<TaskList> = vec![
+        TaskList::new(task_list_id, "Metadata Conflict 1".to_string(), peer_id(1)),
+        TaskList::new(task_list_id, "Metadata Conflict 2".to_string(), peer_id(2)),
+        TaskList::new(task_list_id, "Metadata Conflict 3".to_string(), peer_id(3)),
+    ];
+
+    replicas[0]
+        .add_task(task_v1, peer_id(1), 1)
+        .expect("Failed to add task v1");
+    replicas[1]
+        .add_task(task_v2, peer_id(2), 1)
+        .expect("Failed to add task v2");
+    replicas[2]
+        .add_task(task_v3, peer_id(3), 1)
+        .expect("Failed to add task v3");
+
+    merge_all_replicas(&mut replicas);
+
+    let metadata_snapshot = |task: &TaskItem| {
+        (
+            task.title().to_string(),
+            task.description().to_string(),
+            task.assignee().copied(),
+            task.priority(),
+            *task.created_by(),
+            task.created_at(),
+        )
+    };
+    let expected_metadata =
+        metadata_snapshot(replicas[0].get_task(&tid).expect("Task should exist"));
+    assert_eq!(expected_metadata.0, "Title v3");
+
+    for replica in &replicas {
+        let task = replica.get_task(&tid).expect("Task should exist");
+        assert_eq!(task.title(), "Title v3", "Latest LWW clock should win");
+        assert_eq!(
+            metadata_snapshot(task),
+            expected_metadata,
+            "Task metadata should converge exactly across replicas"
         );
     }
 }
@@ -417,7 +578,6 @@ async fn test_convergence_time() {
     use std::time::Instant;
 
     let task_list_id = list_id(6);
-    let start = Instant::now();
 
     // Create 10 replicas
     let mut replicas: Vec<TaskList> = (1..=10)
@@ -438,6 +598,7 @@ async fn test_convergence_time() {
 
     // Full mesh merge
     let clones: Vec<TaskList> = replicas.clone();
+    let start = Instant::now();
     for replica in &mut replicas {
         for other in &clones {
             replica.merge(other).expect("Failed to merge");

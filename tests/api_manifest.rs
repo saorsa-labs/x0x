@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::panic)]
+
 //! API manifest — deterministic projection of `x0x::api::ENDPOINTS` to JSON.
 //!
 //! Downstream clients (communitas Rust client, Swift client, the embedded

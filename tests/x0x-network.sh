@@ -80,12 +80,18 @@ x0x_network_select() {
         export X0X_API_PORT=12600
         export X0X_GOSSIP_PORT=5483
         export X0X_SERVICE="x0xd.service"
+        # Prod owns the canonical binary path; its self-update writes here.
+        export X0X_BINARY_PATH="/opt/x0x/x0xd"
         export X0X_TOKEN_FILE="$(dirname "${BASH_SOURCE[0]}")/.vps-tokens-prod.env"
         export X0X_TOKEN_VAR_PREFIX="PROD"
     else
         export X0X_API_PORT=13600
         export X0X_GOSSIP_PORT=6483
         export X0X_SERVICE="x0xd-testnet.service"
+        # Testnet has its OWN binary path so prod self-upgrades cannot clobber
+        # the testnet binary (the shared /opt/x0x/x0xd previously caused prod's
+        # auto-upgrade to overwrite a freshly-deployed testnet build).
+        export X0X_BINARY_PATH="/opt/x0x/x0xd-testnet"
         export X0X_TOKEN_FILE="$(dirname "${BASH_SOURCE[0]}")/.vps-tokens-test.env"
         export X0X_TOKEN_VAR_PREFIX="TEST"
     fi

@@ -31,7 +31,7 @@ set -uo pipefail
 
 ROOT="$(pwd)"
 X0XD="${X0XD:-$ROOT/target/release/x0xd}"
-X0X_USER_KEYGEN="${X0X_USER_KEYGEN:-$ROOT/target/release/x0x-user-keygen}"
+X0X="${X0X:-$ROOT/target/release/x0x}"
 AA="http://127.0.0.1:19911"
 BA="http://127.0.0.1:19912"
 CA="http://127.0.0.1:19913"
@@ -45,19 +45,25 @@ AT=""; BT=""; CT=""
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; CYAN='\033[0;36m'; YEL='\033[0;33m'; NC='\033[0m'
 P=0; F=0
+D4_PREFLIGHT_OK=0
+D4_PREFLIGHT_OUT=""
 
 cleanup() {
   [ -n "$AP" ] && kill "$AP" 2>/dev/null || true
   [ -n "$BP" ] && kill "$BP" 2>/dev/null || true
   [ -n "$CP" ] && kill "$CP" 2>/dev/null || true
   wait "$AP" "$BP" "$CP" 2>/dev/null || true
+  if [ "${X0X_NG_KEEP:-0}" = "1" ]; then
+    info "Keeping named-groups temp dirs: $ADIR $BDIR $CDIR"
+    return
+  fi
   rm -rf "$ADIR" "$BDIR" "$CDIR"
   rm -f "$USER_KEY_PATH"
 }
 trap cleanup EXIT
 
-if [ ! -x "$X0XD" ] || [ ! -x "$X0X_USER_KEYGEN" ]; then
-  echo "Build first: cargo build --release --bin x0xd --bin x0x-user-keygen" >&2
+if [ ! -x "$X0XD" ] || [ ! -x "$X0X" ]; then
+  echo "Build first: cargo build --release --bin x0xd --bin x0x" >&2
   exit 1
 fi
 
@@ -171,7 +177,15 @@ printf "${CYAN}║    Run: $TS                                 ║${NC}\n"
 printf "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
 
 # Generate shared user key so daemons have a common user identity.
-"$X0X_USER_KEYGEN" "$USER_KEY_PATH" >/dev/null
+"$X0X" user-id create "$USER_KEY_PATH" >/dev/null
+
+info "Running D.4 apply-commit preflight before named-groups mesh starts..."
+D4_PREFLIGHT_OUT=$(cd "$ROOT" && cargo test --test named_group_d4_apply -- --ignored --nocapture --test-threads=1 2>&1 || true)
+if grep -q 'test result: ok' <<<"$D4_PREFLIGHT_OUT"; then
+  D4_PREFLIGHT_OK=1
+else
+  D4_PREFLIGHT_OK=0
+fi
 
 info "Starting 3 daemons..."
 AP=$(start_daemon "$ADIR" alice 19921 19911 '"127.0.0.1:19922"')
@@ -197,9 +211,9 @@ info "Alice: ${AID:0:24}...  Bob: ${BID:0:24}...  Charlie: ${CID:0:24}..."
 # On loopback, explicit card import drives peer discovery faster than bootstrap
 # alone, so exchange agent cards between all three daemons up-front.
 info "Bootstrapping full mesh via agent-card exchange..."
-ACARD=$(jf "$(GET /agent/card)" "link")
-BCARD=$(jf "$(BGET /agent/card)" "link")
-CCARD=$(jf "$(CGET /agent/card)" "link")
+ACARD=$(jf "$(GET /agent/card?include_local_addresses=true)" "link")
+BCARD=$(jf "$(BGET /agent/card?include_local_addresses=true)" "link")
+CCARD=$(jf "$(CGET /agent/card?include_local_addresses=true)" "link")
 [ -n "$ACARD" ] && BPOST /agent/card/import "{\"card\":\"$ACARD\",\"trust_level\":\"Trusted\"}" >/dev/null
 [ -n "$ACARD" ] && CPOST /agent/card/import "{\"card\":\"$ACARD\",\"trust_level\":\"Trusted\"}" >/dev/null
 [ -n "$BCARD" ] && POST /agent/card/import "{\"card\":\"$BCARD\",\"trust_level\":\"Trusted\"}" >/dev/null
@@ -931,7 +945,7 @@ DEL /groups/$GID_AZ >/dev/null
 sec "8. Ban/unban lifecycle + P0-4 MLS removal"
 # ═════════════════════════════════════════════════════════════════════════
 
-R=$(POST /groups '{"name":"ng-ban"}')
+R=$(POST /groups '{"name":"ng-ban","preset":"public_open"}')
 GID_B=$(jf "$R" "group_id")
 INV=$(jf "$(POST /groups/$GID_B/invite '{}')" "invite_link")
 BPOST /groups/join "{\"invite\":\"$INV\"}" >/dev/null
@@ -991,13 +1005,10 @@ ok "ban: delete"
 # ═════════════════════════════════════════════════════════════════════════
 sec "D.3 Stable identity + evolving validity"
 
-# Create a public-request-secure group so we get a discoverable card.
-R=$(POST /groups '{"name":"D3 Chain Test","description":"state-commit chain"}')
+# Create a public-request-secure group so we get a discoverable GSS card.
+R=$(POST /groups '{"name":"D3 Chain Test","description":"state-commit chain","preset":"public_request_secure"}')
 GID_D3=$(jf "$R" "group_id")
 [ -n "$GID_D3" ] && ok "D.3: create group ($GID_D3)" || fail "D.3: create" "$R"
-
-R=$(PATCH /groups/$GID_D3/policy '{"discoverability":"public_directory","admission":"request_access","confidentiality":"mls_encrypted","read_access":"members_only","write_access":"members_only"}')
-[ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "D.3: set public_request_secure policy" || fail "D.3: policy" "$R"
 
 # GET /groups/:id/state returns the chain view.
 R=$(GET /groups/$GID_D3/state)
@@ -1163,11 +1174,10 @@ DEL /groups/$GID_D3 >/dev/null 2>&1 || true
 # ═════════════════════════════════════════════════════════════════════════
 sec "D.4 Apply-side commit wiring"
 
-D4_OUT=$(cd "$ROOT" && cargo test --test named_group_d4_apply -- --ignored --nocapture 2>&1 || true)
-if echo "$D4_OUT" | grep -q 'test result: ok'; then
+if [ "$D4_PREFLIGHT_OK" = "1" ]; then
   ok "D.4: pair-harness apply-commit suite passes (metadata/roster + join-request + MlsEncrypted ban)"
 else
-  fail "D.4: pair-harness apply-commit suite" "$D4_OUT"
+  fail "D.4: pair-harness apply-commit suite" "$D4_PREFLIGHT_OUT"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1308,7 +1318,7 @@ NEW_COUNT=$(jf "$R" "count")
 # "test result: ok" line — see proofs/full-suite-20260429T214746Z/01-local
 # for the original flake (4/4 pass standalone, 1/98 fail under harness).
 C2_LIVE_LOG="$(mktemp -t x0x-c2-live-XXXXXX.log)"
-( cd "$ROOT" && cargo test --test named_group_c2_live -- --ignored --nocapture ) \
+( cd "$ROOT" && cargo test --test named_group_c2_live -- --ignored --nocapture --test-threads=1 ) \
   >"$C2_LIVE_LOG" 2>&1 || true
 if grep -q 'test result: ok' "$C2_LIVE_LOG"; then
   ok "C.2: live proof suite passes (nearby + AE repair + LTC + restart)"
@@ -1460,7 +1470,7 @@ else
 fi
 
 # Ban a member and verify their send is rejected, even on ModeratedPublic.
-R=$(POST /groups '{"name":"E Moderated","description":"moderated"}')
+R=$(POST /groups '{"name":"E Moderated","description":"moderated","preset":"public_open"}')
 GID_MOD=$(jf "$R" "group_id")
 R=$(PATCH /groups/$GID_MOD/policy '{"discoverability":"public_directory","admission":"open_join","confidentiality":"signed_public","read_access":"public","write_access":"moderated_public"}')
 [ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] \

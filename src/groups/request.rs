@@ -30,6 +30,10 @@ pub struct JoinRequest {
     /// Optional free-text justification.
     #[serde(default)]
     pub message: Option<String>,
+    /// Base64-encoded TreeKEM KeyPackage for ADR-0012 Phase 3 joins. Present
+    /// for TreeKEM groups; absent for legacy GSS groups and old requests.
+    #[serde(default)]
+    pub treekem_key_package_b64: Option<String>,
     /// Unix milliseconds when the request was submitted.
     pub created_at: u64,
     /// Unix milliseconds when an admin reviewed (approved/rejected) the request.
@@ -57,6 +61,7 @@ impl JoinRequest {
             requester_user_id: None,
             requested_role: GroupRole::Member,
             message,
+            treekem_key_package_b64: None,
             created_at: now_ms,
             reviewed_at: None,
             reviewed_by: None,

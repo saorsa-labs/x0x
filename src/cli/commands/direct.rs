@@ -133,6 +133,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_returns_mock_response() {
+        let mock_resp = serde_json::json!({"outcome": "Connected"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = connect(&client, &"aa".repeat(32)).await;
+        assert!(result.is_ok(), "connect should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn send_returns_mock_response_without_ack() {
+        let mock_resp = serde_json::json!({"ok": true, "path": "gossip_inbox"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = send(&client, &"aa".repeat(32), "hello", None).await;
+        assert!(result.is_ok(), "send should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn send_returns_mock_response_with_ack_probe() {
+        let mock_resp = serde_json::json!({"ok": true, "require_ack": {"ok": true, "rtt_ms": 12}});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = send(&client, &"aa".repeat(32), "hello", Some(500)).await;
+        assert!(result.is_ok(), "send with ack should succeed: {:?}", result);
+    }
+
+    async fn start_sse_server(body: &'static str) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let app = axum::Router::new().fallback(move |_req: axum::extract::Request| async move {
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://{}", addr), tx)
+    }
+
+    #[tokio::test]
+    async fn events_streams_json_sse_frame() {
+        let (url, _shutdown) = start_sse_server("data: {\"message\":\"hello\"}\n\n").await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = events(&client).await;
+        assert!(result.is_ok(), "events should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn events_streams_text_sse_frame() {
+        let (url, _shutdown) = start_sse_server("data: plain text\n\n").await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Text).unwrap();
+        let result = events(&client).await;
+        assert!(result.is_ok(), "events should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
     async fn connections_returns_mock_response() {
         let mock_resp = serde_json::json!({"status": "ok"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;

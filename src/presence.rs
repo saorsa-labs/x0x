@@ -444,13 +444,26 @@ pub struct PresenceWrapper {
 impl PresenceWrapper {
     /// Create a new presence wrapper.
     ///
-    /// Generates a fresh ML-DSA-65 signing keypair for beacon authentication,
-    /// creates an empty group context map, and initializes the underlying
-    /// `PresenceManager`.
+    /// Signs beacons with the ML-DSA-65 keypair that backs `peer_id` (the
+    /// machine keypair), creates an empty group context map, and initializes
+    /// the underlying `PresenceManager`.
+    ///
+    /// # Beacon signer binding
+    ///
+    /// The presence layer rejects a signed beacon unless
+    /// `PeerId::from_pubkey(record.signer_pubkey) == sender`. Because the
+    /// beacon's `sender` is `peer_id` (the transport/machine peer id), the
+    /// signing key MUST be the machine keypair whose public key derives
+    /// `peer_id`. Earlier this generated a fresh throwaway keypair, which
+    /// meant a node's own beacons failed the signer-binding check (and, before
+    /// that check existed, allowed forging a beacon as any peer). Callers pass
+    /// the machine keypair bytes via `signing_key_bytes`.
     ///
     /// # Arguments
     ///
     /// * `peer_id` — The local node's gossip `PeerId` (equals the `MachineId`).
+    /// * `signing_key_bytes` — `(public, secret)` ML-DSA-65 bytes of the
+    ///   keypair that derives `peer_id` (i.e. `machine_keypair().to_bytes()`).
     /// * `network` — Shared handle to the transport layer.
     /// * `config` — Presence configuration (intervals, TTLs, etc.).
     /// * `bootstrap_cache` — Optional bootstrap cache; when `Some`, presence
@@ -458,16 +471,17 @@ impl PresenceWrapper {
     ///
     /// # Errors
     ///
-    /// Returns [`NetworkError`] if keypair generation fails.
+    /// Returns [`NetworkError`] if presence initialization fails.
     pub fn new(
         peer_id: PeerId,
+        signing_key_bytes: (Vec<u8>, Vec<u8>),
         network: Arc<NetworkNode>,
         config: PresenceConfig,
         bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
     ) -> Result<Self, NetworkError> {
-        let signing_key = saorsa_gossip_identity::MlDsaKeyPair::generate().map_err(|e| {
-            NetworkError::NodeCreation(format!("failed to create presence signing key: {e}"))
-        })?;
+        let (public_key, secret_key) = signing_key_bytes;
+        let signing_key =
+            saorsa_gossip_identity::MlDsaKeyPair::from_keypair_bytes(public_key, secret_key);
 
         let global_topic = global_presence_topic();
         let mut initial_groups = HashMap::new();
@@ -742,8 +756,13 @@ mod tests {
         let network = crate::network::NetworkNode::new(config, None, None)
             .await
             .unwrap();
+        // Use a consistent (peer_id, signing key) pair so the signer binding
+        // holds: peer_id is derived from the keypair we sign beacons with.
+        let signing = saorsa_gossip_identity::MlDsaKeyPair::generate().unwrap();
+        let peer_id = signing.peer_id();
         let wrapper = PresenceWrapper::new(
-            PeerId::new([9u8; 32]),
+            peer_id,
+            (signing.public_key().to_vec(), signing.secret_key().to_vec()),
             std::sync::Arc::new(network),
             PresenceConfig::default(),
             None,

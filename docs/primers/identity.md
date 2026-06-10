@@ -34,6 +34,24 @@ All three IDs are 32-byte hashes of ML-DSA-65 public keys, shown as 64 hex chara
 
 The daemon generates `machine.key` and `agent.key` on first use. It does not generate `user.key` by default.
 
+## Creating a user identity
+
+```bash
+x0x user-id create
+```
+
+This writes a fresh ML-DSA-65 keypair to `~/.x0x/user.key`. Pass a path argument to write elsewhere:
+
+```bash
+x0x user-id create /path/to/user.key
+```
+
+Restart `x0xd`, or set `user_key_path` in `config.toml`, for the daemon to load the new identity. Per ADR 0007, this is an explicit opt-in command; no daemon or other CLI command creates a user key automatically. Once loaded, `x0x agent user-id` returns the resulting `user_id`.
+
+Note: `x0x user-id create` overwrites an existing file at the target path. Back up any existing `user.key` first if you want to keep that identity.
+
+The standalone `x0x-user-keygen` binary remains buildable from source as a deprecated compatibility shim for existing scripts, but new code should use `x0x user-id create`.
+
 Inspect your local identity:
 
 ```bash

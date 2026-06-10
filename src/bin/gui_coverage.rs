@@ -439,7 +439,10 @@ fn main() -> ExitCode {
         .map(String::as_str)
         .collect();
     let counted_total = total - whitelisted.len();
-    let covered = called.len();
+    let covered = called
+        .keys()
+        .filter(|k| !whitelist.contains(k.as_str()))
+        .count();
     let pct = if counted_total == 0 {
         100.0
     } else {

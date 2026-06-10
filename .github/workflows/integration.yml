@@ -78,11 +78,17 @@ jobs:
       - name: Run daemon API integration tests
         run: cargo nextest run --all-features --test daemon_api_integration -- --ignored
       - name: Run named group integration tests
-        run: cargo nextest run --all-features --test named_group_integration -- --ignored
+        run: cargo nextest run --all-features --test named_group_integration --run-ignored ignored-only
+      - name: Run named group D4 signed commit integration tests
+        run: cargo nextest run --all-features --test named_group_d4_apply -- --ignored
       - name: Run GUI smoke tests
         run: cargo nextest run --all-features --test gui_smoke
       - name: Run WebSocket tests
         run: cargo nextest run --all-features --test ws_integration -- --ignored
+      - name: Run KvStore first-join bootstrap tests (issue 96)
+        run: cargo nextest run --all-features --test kv_first_join_bootstrap --test-threads 1 -- --ignored
+      - name: Run local-topic routing tests (issue 89)
+        run: cargo nextest run --all-features --test local_topics --test-threads 1 -- --ignored
 
   # ── Soak test (weekly, ~90min) ────────────────────────────────────────
   soak:

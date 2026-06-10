@@ -65,7 +65,7 @@ agent.cert    # optional
 
 Named daemon instances use separate identity directories such as `~/.x0x-alice` and `~/.x0x-bob`.
 
-`machine.key` and `agent.key` are generated when missing. `user.key` is not generated automatically.
+`machine.key` and `agent.key` are generated when missing. `user.key` is not generated automatically. Create it explicitly with `x0x user-id create [PATH]`; without `PATH`, the command writes `~/.x0x/user.key`, overwriting any existing target file.
 
 If an existing `agent.cert` does not match the configured user key and current agent key, x0x should treat it as stale and issue a new certificate when a user key is active. Without an active user key, the certificate is inert local state.
 

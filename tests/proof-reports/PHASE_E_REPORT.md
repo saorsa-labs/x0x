@@ -175,7 +175,7 @@ cargo clippy --all-features --all-targets -- -D warnings
 cargo test --lib groups::public_message::tests --quiet
 cargo test --test named_group_public_messages --quiet
 cargo test --test named_group_discovery --quiet
-cargo build --release --bin x0xd --bin x0x-user-keygen
+cargo build --release --bin x0xd --bin x0x
 cargo test --test named_group_e_live -- --ignored --nocapture \
   > tests/proof-reports/named-groups-e-live-run1.log 2>&1
 cargo test --test named_group_e_live -- --ignored --nocapture \
@@ -187,6 +187,9 @@ cargo nextest run --test named_group_e_live --run-ignored ignored-only \
 bash tests/e2e_named_groups.sh > \
   tests/proof-reports/named-groups-phasef-clean.log 2>&1
 ```
+
+`x0x-user-keygen` remains buildable from source as a deprecated compatibility shim;
+runtime scripts use the canonical `x0x user-id create` command.
 
 Approved plan: D.3 → C.2 → **E (now landed)** → D.4 → F. C.2
 proof-hardening is now closed; broader final signoff remains under Phase F.

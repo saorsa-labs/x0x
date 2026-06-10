@@ -91,6 +91,68 @@ async fn ws_subscribe_topic(
     panic!("did not receive subscribed frame after subscribe command");
 }
 
+async fn ws_unsubscribe_topic(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    topic: &str,
+) {
+    ws_send(
+        ws,
+        &format!(r#"{{"type":"unsubscribe","topics":["{topic}"]}}"#),
+    )
+    .await;
+
+    let mut confirmed = false;
+    for _ in 0..5 {
+        let Some(msg) = ws_recv_text(ws, 5).await else {
+            break;
+        };
+        let Ok(frame) = serde_json::from_str::<Value>(&msg) else {
+            continue;
+        };
+        match frame["type"].as_str() {
+            Some("unsubscribed") => {
+                confirmed = true;
+                break;
+            }
+            Some("pong") | Some("connected") => continue,
+            _ => {}
+        }
+    }
+
+    assert!(confirmed, "did not receive unsubscribed frame");
+}
+
+async fn ws_recv_topic_message(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    topic: &str,
+    timeout_secs: u64,
+) -> Option<Value> {
+    tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    if frame["type"].as_str() == Some("message")
+                        && frame["topic"].as_str() == Some(topic)
+                    {
+                        return Some(frame);
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .unwrap_or(None)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -170,6 +232,79 @@ async fn ws_subscribe_publish_receive() {
     );
 
     ws.close(None).await.expect("close");
+}
+
+/// Unsubscribe removes only that session's topic forwarder; duplicate subscribe is idempotent.
+#[tokio::test]
+#[ignore]
+async fn ws_unsubscribe_stops_forwarder_and_repeat_subscribe_is_idempotent() {
+    let d = daemon().await;
+    let client = client_with_auth(&d);
+    let topic = format!("unsubscribe-test-{}", rand::random::<u32>());
+
+    let mut unsubscribed = ws_connect(&d, "/ws").await;
+    let _ = ws_recv_text(&mut unsubscribed, 5).await;
+    ws_subscribe_topic(&mut unsubscribed, &topic).await;
+    ws_subscribe_topic(&mut unsubscribed, &topic).await;
+
+    let mut subscribed = ws_connect(&d, "/ws").await;
+    let _ = ws_recv_text(&mut subscribed, 5).await;
+    ws_subscribe_topic(&mut subscribed, &topic).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let first_payload =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"first");
+    let first_status = client
+        .post(d.url("/publish"))
+        .json(&json!({"topic": &topic, "payload": &first_payload}))
+        .send()
+        .await
+        .ok()
+        .map(|resp| resp.status().as_u16());
+    assert_eq!(first_status, Some(200));
+
+    let first = ws_recv_topic_message(&mut unsubscribed, &topic, 10).await;
+    assert_eq!(
+        first.as_ref().and_then(|frame| frame["payload"].as_str()),
+        Some(first_payload.as_str())
+    );
+    assert!(
+        ws_recv_topic_message(&mut unsubscribed, &topic, 1)
+            .await
+            .is_none(),
+        "repeat subscribe delivered a duplicate message"
+    );
+    let _ = ws_recv_topic_message(&mut subscribed, &topic, 10).await;
+
+    ws_unsubscribe_topic(&mut unsubscribed, &topic).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let second_payload =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"second");
+    let second_status = client
+        .post(d.url("/publish"))
+        .json(&json!({"topic": &topic, "payload": &second_payload}))
+        .send()
+        .await
+        .ok()
+        .map(|resp| resp.status().as_u16());
+    assert_eq!(second_status, Some(200));
+
+    let second = ws_recv_topic_message(&mut subscribed, &topic, 10).await;
+    assert_eq!(
+        second.as_ref().and_then(|frame| frame["payload"].as_str()),
+        Some(second_payload.as_str())
+    );
+    assert!(
+        ws_recv_topic_message(&mut unsubscribed, &topic, 1)
+            .await
+            .is_none(),
+        "unsubscribed session received a topic message"
+    );
+
+    unsubscribed.close(None).await.ok();
+    subscribed.close(None).await.ok();
 }
 
 /// Session shows up in /ws/sessions while connected.
@@ -254,23 +389,31 @@ async fn ws_requires_auth() {
     let url = format!("ws://{}/ws", d.api_addr());
     let result = tokio_tungstenite::connect_async(&url).await;
 
-    // Should either fail to connect or get an error frame
+    // Should either fail to connect, close immediately, or get an auth error frame.
     match result {
         Err(_) => {} // Expected — connection rejected
         Ok((mut ws, _)) => {
-            // May connect but send an auth error
-            let msg = ws_recv_text(&mut ws, 5).await;
-            if let Some(text) = msg {
-                let frame: Value = serde_json::from_str(&text).unwrap_or_default();
-                // Either an error or the server closes immediately
-                if frame["type"] == "error" {
-                    // Good — auth error
-                } else {
-                    // The server allowed connection — this is fine if it has
-                    // a permissive auth model for WS
-                }
-            }
+            let (rejected, observed) =
+                match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                    Err(_) => (false, "no frame before timeout".to_string()),
+                    Ok(None) => (true, "connection closed".to_string()),
+                    Ok(Some(Err(err))) => (true, format!("read error: {err}")),
+                    Ok(Some(Ok(Message::Close(_)))) => (true, "close frame".to_string()),
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        let frame = serde_json::from_str::<Value>(&text);
+                        let is_error = matches!(
+                            frame.as_ref().ok().and_then(|frame| frame["type"].as_str()),
+                            Some("error")
+                        );
+                        (is_error, format!("text frame: {text}"))
+                    }
+                    Ok(Some(Ok(frame))) => (false, format!("non-error frame: {frame:?}")),
+                };
             ws.close(None).await.ok();
+            assert!(
+                rejected,
+                "unauthenticated websocket accepted connection without closing or sending an auth error: {observed}"
+            );
         }
     }
 }
@@ -317,11 +460,13 @@ async fn ws_concurrent_subscribers() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish N messages via REST
+    let mut expected_payloads = Vec::new();
     for i in 0..n_messages {
         let payload = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             format!("msg-{i}").as_bytes(),
         );
+        expected_payloads.push(payload.clone());
         client
             .post(d.url("/publish"))
             .json(&json!({"topic": &topic, "payload": payload}))
@@ -331,16 +476,30 @@ async fn ws_concurrent_subscribers() {
     }
 
     // Each client should receive all messages
+    expected_payloads.sort();
     for (idx, ws) in clients.iter_mut().enumerate() {
-        let mut received = 0;
+        let mut received_payloads = Vec::new();
         for _ in 0..n_messages {
-            if ws_recv_text(ws, 5).await.is_some() {
-                received += 1;
+            let Some(frame) = ws_recv_topic_message(ws, &topic, 5).await else {
+                break;
+            };
+            let payload = frame["payload"].as_str().map(str::to_owned);
+            assert!(
+                payload.is_some(),
+                "Client {idx} received topic message without payload: {frame}"
+            );
+            if let Some(payload) = payload {
+                received_payloads.push(payload);
             }
         }
+        received_payloads.sort();
+        assert_eq!(
+            received_payloads, expected_payloads,
+            "Client {idx} should receive all published payloads exactly once"
+        );
         assert!(
-            received >= 1,
-            "Client {idx} should receive at least 1 message, got {received}"
+            ws_recv_topic_message(ws, &topic, 1).await.is_none(),
+            "Client {idx} received more than {n_messages} topic messages"
         );
     }
 
@@ -379,29 +538,34 @@ async fn ws_message_ordering() {
             .expect("publish");
     }
 
-    // Receive and verify ordering
-    let mut received = Vec::new();
-    for _ in 0..n {
-        if let Some(msg) = ws_recv_text(&mut ws, 10).await {
-            received.push(msg);
+    let expected_payloads = (0..n).map(|i| format!("seq-{i:04}")).collect::<Vec<_>>();
+    let mut received_payloads = Vec::with_capacity(n);
+    for idx in 0..n {
+        let Some(frame) = ws_recv_topic_message(&mut ws, &topic, 10).await else {
+            break;
+        };
+        let decoded = frame["payload"]
+            .as_str()
+            .and_then(|payload| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload).ok()
+            })
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        assert!(
+            decoded.is_some(),
+            "ordered message {idx} should contain a base64 UTF-8 payload: {frame}"
+        );
+        if let Some(decoded) = decoded {
+            received_payloads.push(decoded);
         }
     }
 
-    // Verify received messages are in order (by checking sequence in payload)
-    for window in received.windows(2) {
-        // Parse both messages and compare sequence numbers if extractable
-        // At minimum, verify we got messages in the order they were published
-        assert!(
-            !window[0].is_empty() && !window[1].is_empty(),
-            "messages should not be empty"
-        );
-    }
-
+    assert_eq!(
+        received_payloads, expected_payloads,
+        "received payloads should match the published FIFO sequence"
+    );
     assert!(
-        received.len() >= n / 2,
-        "should receive at least half of {} messages, got {}",
-        n,
-        received.len()
+        ws_recv_topic_message(&mut ws, &topic, 1).await.is_none(),
+        "received more than {n} ordered topic messages"
     );
 
     ws.close(None).await.expect("close");

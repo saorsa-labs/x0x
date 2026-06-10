@@ -23,18 +23,56 @@ REPO="saorsa-labs/x0x"
 URL="https://github.com/$REPO/releases/latest/download"
 BIN="$HOME/.local/bin"
 NAME=""
+NAME_SET=false
 AUTOSTART=false
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --autostart) AUTOSTART=true ;;
-        --name)      shift; NAME="$1" ;;
-        --name=*)    NAME="${1#*=}" ;;
+        --autostart)
+            AUTOSTART=true
+            shift
+            ;;
+        --name)
+            shift
+            NAME="${1-}"
+            NAME_SET=true
+            if [ $# -gt 0 ]; then
+                shift
+            fi
+            ;;
+        --name=*)
+            NAME="${1#*=}"
+            NAME_SET=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
     esac
-    shift
 done
+
+if [ "$NAME_SET" = true ]; then
+    if [ -z "$NAME" ] || [ ${#NAME} -gt 64 ]; then
+        echo "Error: instance name must be 1-64 characters" >&2
+        exit 1
+    fi
+    case "$NAME" in
+        [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*)
+            ;;
+        *)
+            echo "Error: instance name must start with alphanumeric and contain only alphanumeric or hyphens" >&2
+            exit 1
+            ;;
+    esac
+    case "$NAME" in
+        *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-]*)
+            echo "Error: instance name must start with alphanumeric and contain only alphanumeric or hyphens" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 # ── Detect platform ──────────────────────────────────────────────────────────
 
@@ -90,29 +128,48 @@ echo "  Install:  $BIN"
 
 ARCHIVE="x0x-${PLATFORM}.tar.gz"
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+NEW_XOXD=""
+NEW_XOX=""
+trap 'rm -rf "$TMP"; rm -f "$NEW_XOXD" "$NEW_XOX"' EXIT
 
 echo "Downloading..."
 if command -v curl >/dev/null 2>&1; then
+    DOWNLOADER="curl"
     curl -sfL "$URL/$ARCHIVE" -o "$TMP/$ARCHIVE"
 elif command -v wget >/dev/null 2>&1; then
+    DOWNLOADER="wget"
     wget -qO "$TMP/$ARCHIVE" "$URL/$ARCHIVE"
 else
     echo "Error: need curl or wget"; exit 1
 fi
 
+http_get() {
+    if [ "$DOWNLOADER" = "curl" ]; then
+        curl -sf "$1"
+    else
+        wget -qO- "$1"
+    fi
+}
+
 mkdir -p "$BIN"
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 
-INSTALLED=""
 for bin in x0xd x0x; do
     SRC="$TMP/x0x-${PLATFORM}/$bin"
-    if [ -f "$SRC" ]; then
-        cp "$SRC" "$BIN/$bin"
-        chmod +x "$BIN/$bin"
-        INSTALLED="$INSTALLED $bin"
+    if [ ! -f "$SRC" ] || [ -L "$SRC" ] || [ ! -x "$SRC" ]; then
+        echo "Error: release archive missing executable $bin" >&2
+        exit 1
     fi
 done
+
+NEW_XOXD="$BIN/x0xd.new.$$"
+NEW_XOX="$BIN/x0x.new.$$"
+cp "$TMP/x0x-${PLATFORM}/x0xd" "$NEW_XOXD"
+cp "$TMP/x0x-${PLATFORM}/x0x" "$NEW_XOX"
+chmod +x "$NEW_XOXD" "$NEW_XOX"
+mv "$NEW_XOXD" "$BIN/x0xd"
+mv "$NEW_XOX" "$BIN/x0x"
+INSTALLED=" x0xd x0x"
 echo "Installed:$INSTALLED"
 
 # Clean up stale x0x-bootstrap binary (removed in v0.8.0)
@@ -141,14 +198,15 @@ mkdir -p "$SHARED_DIR"
 
 echo ""
 XOXD="$BIN/x0xd"
-CMD="$XOXD"
-if [ -n "$NAME" ]; then
-    CMD="$XOXD --name $NAME"
-fi
 
 mkdir -p "$INSTANCE_DIR"
-echo "Starting: $CMD"
-nohup $CMD >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
+if [ -n "$NAME" ]; then
+    echo "Starting: $XOXD --name $NAME"
+    nohup "$XOXD" --name "$NAME" >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
+else
+    echo "Starting: $XOXD"
+    nohup "$XOXD" >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
+fi
 PID=$!
 
 # Wait for port file
@@ -168,14 +226,22 @@ API=$(cat "$PORTFILE")
 
 # Wait for healthy
 TRIES=0
+HEALTH_OK=false
 while [ $TRIES -lt 15 ]; do
-    if curl -sf "http://$API/health" >/dev/null 2>&1; then break; fi
+    if HEALTH=$(http_get "http://$API/health" 2>/dev/null); then
+        HEALTH_OK=true
+        break
+    fi
     sleep 1
     TRIES=$((TRIES + 1))
 done
 
-HEALTH=$(curl -sf "http://$API/health" 2>/dev/null || echo '{"ok":false}')
-AGENT=$(curl -sf "http://$API/agent" 2>/dev/null || echo '{}')
+if [ "$HEALTH_OK" != true ]; then
+    echo "Timeout waiting for healthy daemon. Check: cat $INSTANCE_DIR/x0xd.log"
+    exit 1
+fi
+
+AGENT=$(http_get "http://$API/agent" 2>/dev/null || echo '{}')
 
 echo ""
 echo "x0x is running"
@@ -189,7 +255,11 @@ echo "  PID:    $PID"
 
 if [ "$AUTOSTART" = true ]; then
     echo ""
-    "$XOX" autostart
+    if [ -n "$NAME" ]; then
+        "$XOX" --name "$NAME" autostart
+    else
+        "$XOX" autostart
+    fi
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────

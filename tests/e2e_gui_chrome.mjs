@@ -62,6 +62,22 @@ function resolveToken() {
 
 const TOKEN = resolveToken();
 
+const chromeCandidates = [
+    process.env.CHROME_BIN,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+].filter(Boolean);
+const executablePath = chromeCandidates.find(p => {
+    try {
+        return existsSync(p);
+    } catch (_) {
+        return false;
+    }
+});
+
 // ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
@@ -113,7 +129,10 @@ async function main() {
         process.exit(2);
     }
 
-    const browser = await chromium.launch({ headless: !HEADED });
+    const browser = await chromium.launch({
+        headless: !HEADED,
+        ...(executablePath ? { executablePath } : {}),
+    });
     const context = await browser.newContext({
         recordHar: { path: join(PROOF_DIR, "chrome-gui.har") },
         viewport: { width: 1440, height: 900 },

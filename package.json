@@ -32,10 +32,13 @@
   },
   "files": [
     "scripts/",
+    "index.js",
+    "index.d.ts",
     "SKILL.md",
     ".well-known/"
   ],
   "devDependencies": {
+    "playwright": "1.59.1",
     "playwright-core": "1.59.1"
   }
 }

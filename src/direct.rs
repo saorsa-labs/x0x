@@ -96,6 +96,61 @@ const DIRECT_DIAGNOSTICS_MIN_RETAIN: usize = 1024;
 /// [`DirectMessaging::current_generation`] after a lag.
 const LIFECYCLE_REPLACED_BROADCAST_CAPACITY: usize = 256;
 
+#[doc(hidden)]
+pub struct RawQuicAckRaceTestHook {
+    first_attempt_started: Notify,
+    first_attempt_result_release: Notify,
+    replaced_short_circuit: Notify,
+}
+
+impl std::fmt::Debug for RawQuicAckRaceTestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawQuicAckRaceTestHook")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for RawQuicAckRaceTestHook {
+    fn default() -> Self {
+        Self {
+            first_attempt_started: Notify::new(),
+            first_attempt_result_release: Notify::new(),
+            replaced_short_circuit: Notify::new(),
+        }
+    }
+}
+
+impl RawQuicAckRaceTestHook {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn wait_first_attempt_started(&self) {
+        self.first_attempt_started.notified().await;
+    }
+
+    pub fn release_first_attempt_result(&self) {
+        self.first_attempt_result_release.notify_one();
+    }
+
+    pub async fn wait_replaced_short_circuit(&self) {
+        self.replaced_short_circuit.notified().await;
+    }
+
+    pub(crate) fn notify_first_attempt_started(&self) {
+        self.first_attempt_started.notify_one();
+    }
+
+    pub(crate) async fn hold_first_attempt_result(&self) {
+        self.first_attempt_result_release.notified().await;
+    }
+
+    pub(crate) fn notify_replaced_short_circuit(&self) {
+        self.replaced_short_circuit.notify_one();
+    }
+}
+
 /// A direct message received from another agent.
 ///
 /// # Security Note
@@ -401,6 +456,7 @@ struct DirectDiagnosticsCounters {
     incoming_decode_failed: AtomicU64,
     incoming_signature_failed: AtomicU64,
     incoming_trust_rejected: AtomicU64,
+    incoming_typed_route_dropped: AtomicU64,
     incoming_delivered_to_subscribe: AtomicU64,
     subscriber_channel_lagged: AtomicU64,
     subscriber_events_evicted: AtomicU64,
@@ -444,6 +500,11 @@ pub struct DmDiagnosticsStats {
     pub incoming_decode_failed: u64,
     pub incoming_signature_failed: u64,
     pub incoming_trust_rejected: u64,
+    /// Redundant typed-route gossip-DM fallback hand-offs dropped on a full
+    /// route channel (non-zero ⇒ a route consumer is lagging). Safe drops —
+    /// the primary per-group/store pubsub path still delivers.
+    #[serde(default)]
+    pub incoming_typed_route_dropped: u64,
     pub incoming_delivered_to_subscribe: u64,
     /// Number of oldest buffered events evicted from slow subscriber queues.
     pub subscriber_events_evicted: u64,
@@ -512,6 +573,9 @@ pub struct DirectMessaging {
     /// Late or absent subscribers do not block the producer.
     lifecycle_replaced_tx: broadcast::Sender<(MachineId, u64)>,
 
+    /// Test hook for deterministic raw-QUIC ACK/Replaced race coverage.
+    raw_quic_ack_race_test_hook: Arc<Mutex<Option<Arc<RawQuicAckRaceTestHook>>>>,
+
     /// Internal sender for the receiver task.
     internal_tx: mpsc::Sender<DirectMessage>,
 
@@ -548,6 +612,7 @@ impl DirectMessaging {
             peer_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_replaced_tx,
+            raw_quic_ack_race_test_hook: Arc::new(Mutex::new(None)),
             internal_tx,
             internal_rx: Arc::new(tokio::sync::Mutex::new(internal_rx)),
         }
@@ -643,6 +708,27 @@ impl DirectMessaging {
     #[must_use]
     pub fn subscribe_lifecycle_replaced(&self) -> broadcast::Receiver<(MachineId, u64)> {
         self.lifecycle_replaced_tx.subscribe()
+    }
+
+    #[doc(hidden)]
+    pub fn set_raw_quic_ack_race_test_hook_for_testing(
+        &self,
+        hook: Option<Arc<RawQuicAckRaceTestHook>>,
+    ) {
+        match self.raw_quic_ack_race_test_hook.lock() {
+            Ok(mut guard) => *guard = hook,
+            Err(e) => tracing::error!("raw QUIC ACK race test hook poisoned: {e}"),
+        }
+    }
+
+    pub(crate) fn raw_quic_ack_race_test_hook(&self) -> Option<Arc<RawQuicAckRaceTestHook>> {
+        match self.raw_quic_ack_race_test_hook.lock() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                tracing::error!("raw QUIC ACK race test hook poisoned: {e}");
+                None
+            }
+        }
     }
 
     /// Record a closing/closed lifecycle state for a machine.
@@ -795,6 +881,17 @@ impl DirectMessaging {
         self.with_peer_diagnostics(agent_id, |_| {});
     }
 
+    /// Record a typed-payload route hand-off dropped because the (bounded)
+    /// route channel was full. These are best-effort, redundant gossip-DM
+    /// fallback deliveries (group-public / KvStore-delta); dropping one is
+    /// safe because the primary per-group/store pubsub path still delivers.
+    /// A non-zero value here means a route consumer is lagging.
+    pub(crate) fn record_incoming_typed_route_dropped(&self) {
+        self.diagnostics
+            .incoming_typed_route_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot direct-message diagnostics for API surfaces.
     #[must_use]
     pub fn diagnostics_snapshot(&self) -> DmDiagnosticsSnapshot {
@@ -835,6 +932,10 @@ impl DirectMessaging {
             incoming_trust_rejected: self
                 .diagnostics
                 .incoming_trust_rejected
+                .load(Ordering::Relaxed),
+            incoming_typed_route_dropped: self
+                .diagnostics
+                .incoming_typed_route_dropped
                 .load(Ordering::Relaxed),
             incoming_delivered_to_subscribe: self
                 .diagnostics

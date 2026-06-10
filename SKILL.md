@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.19.46
+version: 0.22.0
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -110,24 +110,26 @@ cp "x0x-${PLATFORM}/x0x" ~/.local/bin/
 chmod +x ~/.local/bin/x0xd ~/.local/bin/x0x
 ```
 
-**Option B: Install script** (adds GPG verification)
+**Option B: Install script** (download, review, then run — adds GPG verification)
+
+Download the installer and read it before running it — don't pipe a remote
+script straight into a shell:
 
 ```bash
-# Install only (installs x0x CLI + x0xd daemon)
-curl -sfL https://x0x.md | sh
-
-# Then start the daemon
-x0x start
-
-# Install + start in one step
-curl -sfL https://x0x.md | sh -s -- --start
-
-# Fallback if x0x.md is unreachable (same script, from GitHub)
-curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh | sh
-
-# Autostart on boot (systemd on Linux, launchd on macOS)
-curl -sfL https://x0x.md | sh -s -- --autostart
+curl -sfLO https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh
+less install.sh        # review exactly what it will do
+sh install.sh          # install the x0x CLI + x0xd daemon (GPG-verified)
 ```
+
+Starting the daemon is a separate, explicit step you run yourself (see Step 2):
+
+```bash
+x0x start              # start the daemon when you're ready
+```
+
+The installer also accepts opt-in flags if you want them — pass them to the
+downloaded script explicitly: `sh install.sh --start` (start after install) or
+`sh install.sh --autostart` (enable start-on-boot via systemd/launchd).
 
 **Option C: Build from source** (requires Rust)
 
@@ -144,12 +146,12 @@ cp target/release/x0x ~/.local/bin/
 cargo add x0x
 ```
 
-| Option | x0x.md? | GitHub? | Rust? | curl? |
-|--------|:---:|:---:|:---:|:---:|
-| A (binary) | No | Yes | No | Yes |
-| B (script) | Optional | Yes | No | Yes |
-| C (source) | No | Yes | Yes | No |
-| D (library) | No | No | Yes | No |
+| Option | GitHub? | Rust? | curl? |
+|--------|:---:|:---:|:---:|
+| A (binary) | Yes | No | Yes |
+| B (script) | Yes | No | Yes |
+| C (source) | Yes | Yes | No |
+| D (library) | No | Yes | No |
 
 ### Step 2: Start the Daemon
 

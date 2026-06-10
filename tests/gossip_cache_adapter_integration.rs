@@ -3,15 +3,16 @@
 //! Verifies that the gossip cache adapter is properly wired into the Agent
 //! and shares the same bootstrap cache.
 
+#![allow(clippy::unwrap_used)]
+
 use saorsa_gossip_coordinator::{AddrHint, CoordinatorAdvert, CoordinatorRoles, NatClass};
 use saorsa_gossip_types::PeerId;
 use tempfile::TempDir;
 use x0x::network::NetworkConfig;
 use x0x::Agent;
 
-async fn agent_with_network() -> (Agent, TempDir) {
-    let dir = TempDir::new().unwrap();
-    let agent = Agent::builder()
+async fn agent_with_network_in(dir: &TempDir) -> Agent {
+    Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_network_config(NetworkConfig {
             bind_addr: Some("0.0.0.0:0".parse().unwrap()),
@@ -21,7 +22,12 @@ async fn agent_with_network() -> (Agent, TempDir) {
         .with_peer_cache_dir(dir.path().join("peers"))
         .build()
         .await
-        .unwrap();
+        .unwrap()
+}
+
+async fn agent_with_network() -> (Agent, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let agent = agent_with_network_in(&dir).await;
     (agent, dir)
 }
 
@@ -49,24 +55,45 @@ async fn adapter_present_with_network_config() {
 
 #[tokio::test]
 async fn adapter_insert_advert_enriches_cache() {
-    let (agent, _dir) = agent_with_network().await;
-    let adapter = agent.gossip_cache_adapter().unwrap();
-
-    assert_eq!(adapter.advert_count(), 0);
+    let dir = TempDir::new().unwrap();
 
     let peer_id = PeerId::new([42u8; 32]);
+    let addr = "127.0.0.1:5483".parse().unwrap();
     let advert = CoordinatorAdvert::new(
         peer_id,
         CoordinatorRoles::default(),
-        vec![AddrHint::new("127.0.0.1:5483".parse().unwrap())],
+        vec![AddrHint::new(addr)],
         NatClass::Unknown,
         60_000,
     );
 
-    let inserted = adapter.insert_advert(advert).await;
-    assert!(inserted);
-    assert_eq!(adapter.advert_count(), 1);
-    assert!(adapter.get_advert(&peer_id).is_some());
+    {
+        let agent = agent_with_network_in(&dir).await;
+        let adapter = agent.gossip_cache_adapter().unwrap();
+
+        assert_eq!(adapter.advert_count(), 0);
+        assert_eq!(adapter.peer_count().await, 0);
+
+        let inserted = adapter.insert_advert(advert).await;
+        assert!(inserted);
+        assert_eq!(adapter.advert_count(), 1);
+        assert!(adapter.get_advert(&peer_id).is_some());
+        assert!(adapter.get_peer(&peer_id).await.is_some());
+
+        agent.shutdown().await;
+    }
+
+    {
+        let agent = agent_with_network_in(&dir).await;
+        let adapter = agent.gossip_cache_adapter().unwrap();
+
+        assert_eq!(adapter.advert_count(), 0);
+        let cached_peer = adapter.get_peer(&peer_id).await.unwrap();
+        assert_eq!(cached_peer.peer_id, ant_quic::PeerId(*peer_id.as_bytes()));
+        assert!(cached_peer.addresses.contains(&addr));
+
+        agent.shutdown().await;
+    }
 }
 
 #[tokio::test]

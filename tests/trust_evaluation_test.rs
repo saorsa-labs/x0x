@@ -38,6 +38,7 @@ fn store_with(dir: &TempDir, trust: TrustLevel, id_type: IdentityType) -> (Conta
         last_seen: None,
         identity_type: id_type,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     (store, aid)
 }
@@ -125,6 +126,7 @@ fn pinned_agent_correct_machine_yields_accept() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, Some("laptop".into())));
     store.pin_machine(&aid, &mid);
@@ -157,6 +159,7 @@ fn pinned_agent_wrong_machine_yields_reject_mismatch() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, None));
     store.pin_machine(&aid, &mid);
@@ -189,6 +192,7 @@ fn blocked_takes_priority_over_machine_mismatch() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, None));
     store.pin_machine(&aid, &mid);
@@ -224,6 +228,7 @@ fn unpin_machine_removes_constraint() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, None));
     store.pin_machine(&aid, &mid);
@@ -265,6 +270,7 @@ fn multiple_machines_only_one_pinned() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid1, Some("desktop".into())));
     store.add_machine(&aid, MachineRecord::new(mid2, Some("laptop".into())));
@@ -312,6 +318,7 @@ fn set_trust_updates_existing_contact() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
 
     {
@@ -374,6 +381,7 @@ fn machines_accessor_returns_correct_records() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid1, None));
     store.add_machine(&aid, MachineRecord::new(mid2, Some("server".into())));
@@ -404,6 +412,7 @@ fn remove_machine_removes_correct_record() {
         last_seen: None,
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid1, None));
     store.add_machine(&aid, MachineRecord::new(mid2, None));
@@ -415,7 +424,102 @@ fn remove_machine_removes_correct_record() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 13: ContactStore in-memory state round-trip
+// Test 13: Removing the only pinned machine removes the pinning constraint
+// ---------------------------------------------------------------------------
+
+#[test]
+fn remove_only_pinned_machine_removes_constraint() {
+    let dir = TempDir::new().unwrap();
+    let mut store = empty_store(&dir);
+    let aid = fresh_agent_id();
+    let mid = fresh_machine_id();
+
+    store.add(Contact {
+        agent_id: aid,
+        trust_level: TrustLevel::Trusted,
+        label: None,
+        added_at: 0,
+        last_seen: None,
+        identity_type: IdentityType::Anonymous,
+        machines: Vec::new(),
+        dm_capabilities: None,
+    });
+    store.add_machine(&aid, MachineRecord::new(mid, None));
+    store.pin_machine(&aid, &mid);
+
+    assert!(store.remove_machine(&aid, &mid));
+    assert!(store.machines(&aid).is_empty());
+    assert_eq!(
+        store.get(&aid).map(|contact| contact.identity_type),
+        Some(IdentityType::Known)
+    );
+
+    let evaluator = TrustEvaluator::new(&store);
+    assert_eq!(
+        evaluator.evaluate(&TrustContext {
+            agent_id: &aid,
+            machine_id: &fresh_machine_id(),
+        }),
+        TrustDecision::Accept
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: Removing one pinned machine keeps remaining pins constrained
+// ---------------------------------------------------------------------------
+
+#[test]
+fn remove_one_pinned_machine_keeps_remaining_pin() {
+    let dir = TempDir::new().unwrap();
+    let mut store = empty_store(&dir);
+    let aid = fresh_agent_id();
+    let mid1 = fresh_machine_id();
+    let mid2 = fresh_machine_id();
+
+    store.add(Contact {
+        agent_id: aid,
+        trust_level: TrustLevel::Trusted,
+        label: None,
+        added_at: 0,
+        last_seen: None,
+        identity_type: IdentityType::Anonymous,
+        machines: Vec::new(),
+        dm_capabilities: None,
+    });
+    store.add_machine(&aid, MachineRecord::new(mid1, Some("desktop".into())));
+    store.add_machine(&aid, MachineRecord::new(mid2, Some("laptop".into())));
+    store.pin_machine(&aid, &mid1);
+    store.pin_machine(&aid, &mid2);
+
+    assert!(store.remove_machine(&aid, &mid1));
+    let machines = store.machines(&aid);
+    assert_eq!(machines.len(), 1);
+    assert_eq!(machines[0].machine_id, mid2);
+    assert!(machines[0].pinned);
+    assert_eq!(
+        store.get(&aid).map(|contact| contact.identity_type),
+        Some(IdentityType::Pinned)
+    );
+
+    let evaluator = TrustEvaluator::new(&store);
+    assert_eq!(
+        evaluator.evaluate(&TrustContext {
+            agent_id: &aid,
+            machine_id: &mid2,
+        }),
+        TrustDecision::Accept
+    );
+    assert_eq!(
+        evaluator.evaluate(&TrustContext {
+            agent_id: &aid,
+            machine_id: &mid1,
+        }),
+        TrustDecision::RejectMachineMismatch
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: ContactStore in-memory state round-trip
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -436,6 +540,7 @@ fn contact_store_in_memory_state_round_trip() {
         last_seen: Some(2_000),
         identity_type: IdentityType::Anonymous,
         machines: Vec::new(),
+        dm_capabilities: None,
     });
     store.add_machine(&aid, MachineRecord::new(mid, Some("workstation".into())));
     store.pin_machine(&aid, &mid);

@@ -315,49 +315,72 @@ async fn test_agent_certificate_issue_and_verify() {
     );
 }
 
-/// Test that certificate verification catches wrong keys.
+/// Test that the builder does not reuse a certificate issued by a different user.
 #[tokio::test]
 async fn test_agent_certificate_wrong_key_fails() {
     let user_a = UserKeypair::generate().expect("Failed to generate user A");
     let user_b = UserKeypair::generate().expect("Failed to generate user B");
     let agent_kp = AgentKeypair::generate().expect("Failed to generate agent keypair");
 
-    // Issue cert from user A
-    let cert = AgentCertificate::issue(&user_a, &agent_kp).expect("Failed to issue certificate");
+    let user_a_id = user_a.user_id();
+    let user_b_id = user_b.user_id();
+    let agent_id = agent_kp.agent_id();
+
+    // Issue and persist a stale cert from user A for this agent key.
+    let stale_cert =
+        AgentCertificate::issue(&user_a, &agent_kp).expect("Failed to issue certificate");
 
     // Verify with correct key works
-    cert.verify().expect("Valid cert should verify");
+    stale_cert.verify().expect("Valid cert should verify");
+    assert_eq!(
+        stale_cert.user_id().expect("user_id"),
+        user_a_id,
+        "Stale cert should be for user A"
+    );
 
-    // Now tamper: replace user public key with user B's key
-    // The signature was made by user A, so verification should fail
-    // We need to access the internal field — the test in identity.rs already covers this,
-    // but here we verify the builder-level flow
-
-    // Build agent with user B but agent already has cert from user A
+    // Build agent with user B while storage already contains user A's cert.
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let temp_path = temp_dir.path();
+    let cert_path = temp_path.join("agent.cert");
 
-    // Save user B's key
-    storage::save_user_keypair_to(&user_b, temp_path.join("user_b.key"))
+    storage::save_agent_certificate_to(&stale_cert, &cert_path)
         .await
-        .expect("Failed to save user B keypair");
+        .expect("Failed to save stale certificate");
 
-    // Build agent — it should generate a new cert for user B (not reuse A's cert)
+    // Build agent: it should reject the stale user A cert and issue one for user B.
     let agent = Agent::builder()
         .with_machine_key(temp_path.join("machine.key"))
-        .with_agent_key_path(temp_path.join("agent.key"))
-        .with_user_key_path(temp_path.join("user_b.key"))
+        .with_agent_key(agent_kp)
+        .with_user_key(user_b)
+        .with_agent_cert_path(&cert_path)
         .build()
         .await
         .expect("Failed to create agent");
 
-    // Cert should be valid for user B
     let agent_cert = agent.agent_certificate().expect("Should have cert");
     agent_cert.verify().expect("New cert should verify");
+    let actual_user_id = agent_cert.user_id().expect("user_id");
     assert_eq!(
-        agent_cert.user_id().expect("user_id"),
-        user_b.user_id(),
-        "Cert should be for user B"
+        actual_user_id, user_b_id,
+        "Builder should replace stale user A cert with a user B cert"
+    );
+    assert_ne!(
+        actual_user_id, user_a_id,
+        "Builder must not reuse a cert issued by the wrong user"
+    );
+    assert_eq!(
+        agent_cert.agent_id().expect("agent_id"),
+        agent_id,
+        "Replacement cert should still bind the imported agent key"
+    );
+
+    let persisted_cert = storage::load_agent_certificate_from(&cert_path)
+        .await
+        .expect("Failed to load persisted replacement cert");
+    assert_eq!(
+        persisted_cert.user_id().expect("user_id"),
+        user_b_id,
+        "Replacement cert should be saved over the stale cert"
     );
 }
 

@@ -379,26 +379,28 @@ fn test_large_value_over_limit_rejected() {
 }
 
 #[test]
-fn test_exactly_at_limit_rejected() {
+fn test_large_value_exact_limit_allowed() {
     let peer = test_peer(1);
     let mut store = make_store(1, "Exact", 1);
 
-    // Exactly MAX_INLINE_SIZE (65536) should be rejected (> check, not >=).
+    // Exactly MAX_INLINE_SIZE (65536) is allowed; only larger values are rejected.
     let value = vec![0u8; 65_536];
     let result = store.put(
         "exact".to_string(),
-        value,
+        value.clone(),
         "application/octet-stream".to_string(),
         peer,
     );
 
-    // The implementation uses `value.len() > MAX_INLINE_SIZE`, so 65536 is not > 65536.
-    // This test documents the boundary behavior.
-    if result.is_ok() {
-        let entry = store.get("exact").expect("get");
+    assert!(result.is_ok(), "exactly MAX_INLINE_SIZE should be accepted");
+    assert_eq!(store.len(), 1);
+
+    let entry = store.get("exact");
+    assert!(entry.is_some(), "exact-limit value should be stored");
+    if let Some(entry) = entry {
         assert_eq!(entry.value.len(), 65_536);
+        assert_eq!(entry.value, value);
     }
-    // Either way, the behavior is documented.
 }
 
 // ---------------------------------------------------------------------------
@@ -643,36 +645,37 @@ async fn test_concurrent_writes_same_key_lww() {
         },
     );
 
-    // Both write to the same key.
-    store_a
-        .put(
-            "shared".to_string(),
-            b"from-A".to_vec(),
-            "text/plain".to_string(),
-            peer_a,
-        )
-        .expect("put A");
+    // Both write to the same key with controlled timestamps.
+    let mut entry_a = KvEntry::new(
+        "shared".to_string(),
+        b"from-A".to_vec(),
+        "text/plain".to_string(),
+    );
+    entry_a.created_at = 100;
+    entry_a.updated_at = 100;
+    let delta_a = KvStoreDelta::for_put("shared".to_string(), entry_a, (peer_a, 1), 1);
 
-    // Small delay to ensure different timestamps.
-    std::thread::sleep(std::time::Duration::from_millis(2));
+    let mut entry_b = KvEntry::new(
+        "shared".to_string(),
+        b"from-B".to_vec(),
+        "text/plain".to_string(),
+    );
+    entry_b.created_at = 200;
+    entry_b.updated_at = 200;
+    let delta_b = KvStoreDelta::for_put("shared".to_string(), entry_b, (peer_b, 1), 1);
 
-    store_b
-        .put(
-            "shared".to_string(),
-            b"from-B".to_vec(),
-            "text/plain".to_string(),
-            peer_b,
-        )
-        .expect("put B");
+    store_a.merge_delta(&delta_a, peer_a, None).expect("put A");
+    store_b.merge_delta(&delta_b, peer_b, None).expect("put B");
 
     // Merge both ways.
     store_a.merge(&store_b).expect("merge B->A");
     store_b.merge(&store_a).expect("merge A->B");
 
-    // LWW: both should converge to the same value.
+    // LWW: the newer write should win on both replicas.
     let val_a = &store_a.get("shared").expect("get A").value;
     let val_b = &store_b.get("shared").expect("get B").value;
-    assert_eq!(val_a, val_b, "LWW should converge to the same value");
+    assert_eq!(val_a, b"from-B", "A should choose the newer B value");
+    assert_eq!(val_b, b"from-B", "B should keep the newer B value");
 }
 
 #[tokio::test]

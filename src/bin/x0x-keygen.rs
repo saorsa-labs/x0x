@@ -10,10 +10,12 @@
 //! x0x-keygen embed-rust --key public.key
 //! ```
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
+use fips204::traits::{SerDes, Signer};
 use saorsa_pqc::api::sig::{
     ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, MlDsaVariant,
 };
@@ -111,12 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (public_key, secret_key) = dsa.generate_keypair()?;
 
             // Write secret key (contains both secret and public portions)
-            std::fs::write(&output, secret_key.to_bytes())?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))?;
-            }
+            write_secret_key(&output, &secret_key.to_bytes())?;
 
             // Also write the public key alongside
             let public_path = output.with_extension("pub");
@@ -176,29 +173,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::ExportPublic { key, output } => {
             let sk_bytes = std::fs::read(&key)?;
             let secret_key = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &sk_bytes)?;
-
-            // ML-DSA-65: the public key can be derived from the secret key.
-            // The secret key file contains the full secret key (4032 bytes).
-            // We re-derive the public key by generating from the same bytes.
-            // Actually, saorsa_pqc doesn't have a direct extract-public function,
-            // so we read the .pub file that was generated alongside.
-            let pub_path = key.with_extension("pub");
-            if pub_path.exists() {
-                let pk_bytes = std::fs::read(&pub_path)?;
-                std::fs::write(&output, &pk_bytes)?;
-                eprintln!("Exported public key to {}", output.display());
-            } else {
-                // Fallback: the last 1952 bytes of a 4032-byte ML-DSA-65 secret key
-                // are NOT the public key in all implementations. Instead, generate a
-                // new keypair and instruct user to use the .pub file.
-                drop(secret_key);
-                return Err(format!(
-                    "Public key file not found at {}. \
-                     The .pub file is created alongside the secret key during generation.",
-                    pub_path.display()
-                )
-                .into());
-            }
+            let public_key_bytes = derive_public_key_bytes(&secret_key)?;
+            std::fs::write(&output, public_key_bytes)?;
+            eprintln!("Exported public key to {}", output.display());
         }
         Commands::Manifest {
             version,
@@ -243,6 +220,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn write_secret_key(path: &Path, key_bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+    file.write_all(key_bytes)?;
+    file.sync_all()
+}
+
+fn derive_public_key_bytes(
+    secret_key: &MlDsaSecretKey,
+) -> Result<[u8; fips204::ml_dsa_65::PK_LEN], Box<dyn std::error::Error>> {
+    let secret_key_bytes: [u8; fips204::ml_dsa_65::SK_LEN] =
+        secret_key.to_bytes().try_into().map_err(|bytes: Vec<u8>| {
+            format!(
+                "Expected {} bytes for ML-DSA-65 secret key, got {}",
+                fips204::ml_dsa_65::SK_LEN,
+                bytes.len()
+            )
+        })?;
+    let secret_key = fips204::ml_dsa_65::PrivateKey::try_from_bytes(secret_key_bytes)
+        .map_err(|err| format!("invalid ML-DSA-65 secret key: {err}"))?;
+
+    Ok(secret_key.get_public_key().into_bytes())
+}
+
 /// Known platform archive mappings: (target triple, archive prefix, extension).
 const PLATFORM_ARCHIVES: &[(&str, &str, &str)] = &[
     ("x86_64-unknown-linux-gnu", "x0x-linux-x64-gnu", "tar.gz"),
@@ -277,6 +285,15 @@ fn generate_manifest(
         let archive_sha256: [u8; 32] = Sha256::digest(&archive_data).into();
 
         let sig_name = format!("{archive_name}.sig");
+        let sig_path = assets_dir.join(&sig_name);
+        if !sig_path.is_file() {
+            return Err(format!(
+                "signature file missing for {archive_name}: {}",
+                sig_path.display()
+            )
+            .into());
+        }
+
         let archive_url = format!("{repo_url}/v{version}/{archive_name}");
         let signature_url = format!("{repo_url}/v{version}/{sig_name}");
 

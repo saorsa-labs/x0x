@@ -60,6 +60,21 @@ SOAK_MAX_CONSECUTIVE_DISPATCHER_ANOMALY_WINDOWS = 2
 # evidence and a documented mechanism-layer change.
 SOAK_MIN_AGGREGATE_PHASE_A_RATIO = 0.98
 
+# Transport-degradation attribution. The aggregate Phase-A SLO above answers
+# "did delivery hold?" but cannot tell a CODE regression (delivery failed on a
+# healthy mesh) from an INFRA degradation (delivery failed because the
+# cross-region QUIC/UDP transport was black-holed/lossy — e.g. the recurring
+# Hetzner-DE <-> DigitalOcean-APAC PMTU + UDP-loss problem: ICMP clean but
+# current_mtu floored to 1200, high black_holes_detected, pp_to spikes).
+# A window's Phase-A shortfall is attributed to infra — and tolerated for the
+# Phase-A SLO — when that window's transport metrics show genuine degradation.
+# Hard guards remain: recv_pump.dropped_full must stay 0 (separate gate), and
+# aggregate delivery must stay above a catastrophe floor even under infra
+# degradation (below the floor, something is badly wrong regardless of cause).
+SOAK_TRANSPORT_DEGRADED_LOSS_PPM = 5000           # >= 0.5% UDP packet loss
+SOAK_TRANSPORT_DEGRADED_RTT_MS = 2000             # >= 2s RTT = black-holed/churning link
+SOAK_MIN_AGGREGATE_PHASE_A_RATIO_DEGRADED = 0.70  # catastrophe floor under infra degradation
+
 
 def _int_field(row: Dict[str, str], key: str, default: int = 0) -> int:
     try:
@@ -479,6 +494,16 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
             and _int_field(row, "phase_a_sent") >= SOAK_MIN_PHASE_A_PAIRS
         )
 
+    def _transport_degraded(row: Dict[str, str]) -> bool:
+        """True when this window's transport metrics show genuine cross-region
+        degradation (high UDP loss or black-hole-floored RTT), making a Phase-A
+        shortfall infra-attributable rather than a code regression. Missing
+        metrics ('?' -> 0) are treated as not-degraded (conservative)."""
+        return (
+            _int_field(row, "max_transport_loss_ppm") >= SOAK_TRANSPORT_DEGRADED_LOSS_PPM
+            or _int_field(row, "max_transport_rtt_ms") >= SOAK_TRANSPORT_DEGRADED_RTT_MS
+        )
+
     def _violation_messages(row: Dict[str, str]) -> List[str]:
         raw = row.get("violation_messages", "")
         if not raw:
@@ -488,11 +513,17 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
     def _is_dispatcher_violation(msg: str) -> bool:
         return "dispatcher_timed_out delta" in msg
 
-    def _is_phase_a_violation(msg: str) -> bool:
-        return (
-            "phase A received" in msg
-            or "scenario errored: phase A exit code" in msg
-        )
+    def _is_phase_a_violation(row: Dict[str, str], msg: str) -> bool:
+        if "scenario errored: phase A exit code" in msg:
+            return not _phase_a_ok(row)
+        match = re.search(r"phase A (received|sent) (\d+) < gate (\d+)", msg)
+        if not match:
+            return False
+        metric, observed_text, gate_text = match.groups()
+        key = f"phase_a_{metric}"
+        observed = int(observed_text)
+        gate = int(gate_text)
+        return observed == _int_field(row, key) and observed < gate
 
     def _only_dispatcher_timeout_violations(row: Dict[str, str]) -> bool:
         messages = _violation_messages(row)
@@ -508,7 +539,7 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         """
         messages = _violation_messages(row)
         return bool(messages) and all(
-            _is_dispatcher_violation(m) or _is_phase_a_violation(m)
+            _is_dispatcher_violation(m) or _is_phase_a_violation(row, m)
             for m in messages
         )
 
@@ -535,6 +566,7 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
     effective_failed: List[int] = []
     tolerated_dispatcher_windows: List[int] = []
     tolerated_phase_a_windows: List[int] = []
+    tolerated_infra_phase_a_windows: List[int] = []
     for idx, row in enumerate(rows, 1):
         if row["verdict"] == "GO":
             continue
@@ -554,7 +586,37 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
                 # while the aggregate Phase A ratio stays above SLO.
                 tolerated_phase_a_windows.append(idx)
                 continue
+            if _transport_degraded(row):
+                # Phase-A shortfall is attributable to degraded transport
+                # (infra: cross-region UDP black-hole / loss), not a code
+                # regression. Tolerated here; the aggregate catastrophe floor
+                # + drop_full=0 hard gate still bound the run below.
+                tolerated_infra_phase_a_windows.append(idx)
+                continue
         effective_failed.append(idx)
+
+    # Phase-A passes if it held the SLO, OR every shortfall was infra-attributed
+    # (transport-degraded windows only) while staying above the catastrophe
+    # floor. A healthy-transport Phase-A failure is NOT infra-attributable, so
+    # it lands in effective_failed and fails the run — code regressions still
+    # caught.
+    aggregate_phase_a_infra_degraded = (
+        not aggregate_phase_a_ok
+        and agg_phase_a_target > 0
+        and not tolerated_phase_a_windows
+        and bool(tolerated_infra_phase_a_windows)
+        and agg_phase_a_sent_ratio >= SOAK_MIN_AGGREGATE_PHASE_A_RATIO_DEGRADED
+        and agg_phase_a_received_ratio >= SOAK_MIN_AGGREGATE_PHASE_A_RATIO_DEGRADED
+    )
+    aggregate_phase_a_pass = aggregate_phase_a_ok or aggregate_phase_a_infra_degraded
+
+    if aggregate_phase_a_ok:
+        phase_a_slo_status = "PASS"
+    elif aggregate_phase_a_infra_degraded:
+        floor_pct = int(SOAK_MIN_AGGREGATE_PHASE_A_RATIO_DEGRADED * 100)
+        phase_a_slo_status = f"INFRA-DEGRADED (tolerated, ≥ {floor_pct}% floor)"
+    else:
+        phase_a_slo_status = "FAIL"
 
     overall_pass = (
         total > 0
@@ -563,7 +625,7 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         and not unaccounted_gap_windows
         and dispatcher_policy["passed"] == "true"
         and cumulative_drop_full <= drop_limit
-        and aggregate_phase_a_ok
+        and aggregate_phase_a_pass
     )
 
     lines = [
@@ -590,11 +652,13 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         f"anomaly_windows={dispatcher_policy['anomaly_windows']})",
         f"- tolerated dispatcher-only windows: **{','.join(str(i) for i in tolerated_dispatcher_windows) or 'none'}**",
         f"- tolerated phase-A tail windows: **{','.join(str(i) for i in tolerated_phase_a_windows) or 'none'}**",
+        f"- tolerated phase-A INFRA-degraded windows (transport black-hole/loss): "
+        f"**{','.join(str(i) for i in tolerated_infra_phase_a_windows) or 'none'}**",
         f"- aggregate Phase A sent: **{agg_phase_a_sent}/{agg_phase_a_target}** "
         f"({(agg_phase_a_sent_ratio * 100):.3f}%, gate ≥ {SOAK_MIN_AGGREGATE_PHASE_A_RATIO * 100:.0f}%)",
         f"- aggregate Phase A received: **{agg_phase_a_received}/{agg_phase_a_target}** "
         f"({(agg_phase_a_received_ratio * 100):.3f}%, gate ≥ {SOAK_MIN_AGGREGATE_PHASE_A_RATIO * 100:.0f}%)",
-        f"- aggregate Phase A SLO: **{'PASS' if aggregate_phase_a_ok else 'FAIL'}**",
+        f"- aggregate Phase A SLO: **{phase_a_slo_status}**",
         f"- effective failed windows: **{','.join(str(i) for i in effective_failed) or 'none'}**",
         f"- unaccounted telemetry-gap windows: **{','.join(str(i) for i in unaccounted_gap_windows) or 'none'}**",
         "",
@@ -652,6 +716,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     from x0x_network import select_network as _x0x_select, banner as _x0x_banner
     _net = _x0x_select(args)
     _x0x_banner(_net)
+
+    # Scale the aggregate Phase A target to the active node set. Phase A is an
+    # all-directed-pairs DM matrix (n*(n-1) pairs), so excluding a node from the
+    # token file must scale this bar instead of failing every window. 6 nodes
+    # -> 30 (unchanged), 5 -> 20. Mirrors the per-window scaling in
+    # launch_readiness.py. This corrects the denominator for the matrix size; it
+    # is not a relaxation of the per-pair delivery requirement.
+    global SOAK_MIN_PHASE_A_PAIRS
+    try:
+        _node_count = sum(
+            1 for _ln in Path(_net.token_file).read_text().splitlines()
+            if re.search(r"_IP\s*=", _ln)
+        )
+        if _node_count >= 2:
+            SOAK_MIN_PHASE_A_PAIRS = _node_count * (_node_count - 1)
+            LOG.info(
+                "phase A aggregate target scaled to %d pairs for %d-node set",
+                SOAK_MIN_PHASE_A_PAIRS, _node_count,
+            )
+    except OSError as _e:
+        LOG.warning("could not read token file to scale phase A target: %s", _e)
 
     repo_root = Path(__file__).resolve().parents[1]
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())

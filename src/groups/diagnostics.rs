@@ -47,6 +47,12 @@ pub struct GroupCounters {
     pub last_message_at_ms: Option<u64>,
     /// Number of `MemberJoined` metadata events applied to this group.
     pub member_joined_events_applied: u64,
+    /// Number of `MemberJoined` events rejected because the joiner requested
+    /// a role other than the invite-join Member role.
+    pub member_joined_events_rejected_non_member_role: u64,
+    /// Number of `MemberJoined` events rejected because the invite secret was
+    /// not issued by this local inviter.
+    pub member_joined_events_rejected_invite_secret_unknown: u64,
 }
 
 /// Public snapshot of all known groups, returned by `GET /diagnostics/groups`.
@@ -157,6 +163,24 @@ impl GroupsDiagnostics {
         });
     }
 
+    /// Record a `MemberJoined` rejection for a requested role other than Member.
+    pub fn record_member_joined_rejected_non_member_role(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.member_joined_events_rejected_non_member_role = c
+                .member_joined_events_rejected_non_member_role
+                .saturating_add(1);
+        });
+    }
+
+    /// Record a `MemberJoined` rejection for an unknown invite secret.
+    pub fn record_member_joined_rejected_invite_secret_unknown(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.member_joined_events_rejected_invite_secret_unknown = c
+                .member_joined_events_rejected_invite_secret_unknown
+                .saturating_add(1);
+        });
+    }
+
     /// Build a snapshot for `GET /diagnostics/groups`. Joins the live
     /// per-group counters with the caller-supplied `members_v2` and
     /// subscription views (the daemon already holds those locks higher up
@@ -193,6 +217,12 @@ impl GroupsDiagnostics {
             dst.member_joined_events_applied = dst
                 .member_joined_events_applied
                 .saturating_add(src.member_joined_events_applied);
+            dst.member_joined_events_rejected_non_member_role = dst
+                .member_joined_events_rejected_non_member_role
+                .saturating_add(src.member_joined_events_rejected_non_member_role);
+            dst.member_joined_events_rejected_invite_secret_unknown = dst
+                .member_joined_events_rejected_invite_secret_unknown
+                .saturating_add(src.member_joined_events_rejected_invite_secret_unknown);
             dst.last_message_at_ms = match (dst.last_message_at_ms, src.last_message_at_ms) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (None, Some(b)) => Some(b),
@@ -273,6 +303,8 @@ mod tests {
         diag.record_write_policy_violation("g1");
         diag.record_decode_failed("g2");
         diag.record_member_joined("g2");
+        diag.record_member_joined_rejected_non_member_role("g2");
+        diag.record_member_joined_rejected_invite_secret_unknown("g2");
 
         let mut groups: HashMap<String, GroupInfo> = HashMap::new();
         groups.insert("g1".into(), group("G1", "g1"));
@@ -293,6 +325,12 @@ mod tests {
         let g2 = snap.groups.iter().find(|g| g.group_id == "g2").unwrap();
         assert_eq!(g2.counters.messages_dropped_decode_failed, 1);
         assert_eq!(g2.counters.member_joined_events_applied, 1);
+        assert_eq!(g2.counters.member_joined_events_rejected_non_member_role, 1);
+        assert_eq!(
+            g2.counters
+                .member_joined_events_rejected_invite_secret_unknown,
+            1
+        );
         assert!(!g2.subscribed_metadata);
         assert!(!g2.subscribed_public);
     }

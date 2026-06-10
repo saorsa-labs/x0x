@@ -1,7 +1,11 @@
 # ADR 0010: GSS Before MLS TreeKEM for v1 Secure Groups
 
-- Status: Accepted
+- Status: Accepted, but **forward path superseded by [ADR 0012](./0012-treekem-default-secure-groups.md)** (accepted/shipped in x0x 0.21.0). New **private** secure groups now run real TreeKEM, not GSS; GSS applies only to grandfathered groups and public encrypted presets.
 - Date: 2026-05-11
+- Superseded (forward path) by: [ADR 0012](./0012-treekem-default-secure-groups.md)
+  on 2026-05-30, now that `saorsa-mls 0.3.6` ships real TreeKEM. This ADR still
+  accurately describes the **legacy GSS plane** that grandfathered groups run on
+  until their owner opts into a TreeKEM upgrade.
 
 ## Context
 
@@ -126,8 +130,10 @@ GSS does not provide:
    uses GSS, not full TreeKEM.
 2. Keep tests proving cross-daemon encrypt/decrypt and rekey-on-ban behavior.
 3. Keep `security_binding` tied to GSS epoch changes for `MlsEncrypted` groups.
-4. File or maintain a separate TreeKEM migration ticket when named-group v1 is
-   stable enough to absorb the larger protocol change.
+4. **Migration trigger**: Migrate to full MLS TreeKEM when `saorsa-mls`
+   implements the post-quantum ciphersuites from `draft-ietf-mls-pq-ciphersuites-04`
+   (or its successor RFC) AND named-group v1 has been stable in production for
+   at least one release cycle. Until then, keep GSS as the shipped secure plane.
 5. Before migrating existing groups, define whether GSS groups are upgraded in
    place, bridged for a transition period, or recreated as TreeKEM groups.
 

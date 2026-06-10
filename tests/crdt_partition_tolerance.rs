@@ -1,12 +1,20 @@
 //! CRDT Partition Tolerance Tests
 //!
 //! Verifies that CRDTs repair correctly after network partitions and message loss.
-//! Tests anti-entropy, IBLT reconciliation, and eventual consistency.
+//! Tests direct state merges, delta-based anti-entropy repair, and eventual consistency.
 
+use anyhow::{anyhow, ensure, Result};
+use saorsa_gossip_crdt_sync::{AntiEntropyManager, DeltaCrdt};
 use saorsa_gossip_types::PeerId;
-use std::time::{SystemTime, UNIX_EPOCH};
-use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListDelta, TaskListId, TaskMetadata};
 use x0x::identity::AgentId;
+
+type AntiEntropyFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 /// Helper to create unique agent ID
 fn agent_id(n: u8) -> AgentId {
@@ -58,6 +66,144 @@ fn unix_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn wait_until_clock_after(timestamp: u64) {
+    while unix_timestamp_ms() <= timestamp {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn anti_entropy_callback(
+    target: Arc<AntiEntropyManager<TaskList>>,
+    sender: PeerId,
+) -> impl Fn(PeerId, TaskListDelta) -> AntiEntropyFuture + Send + Sync + 'static {
+    move |_target_peer, delta| {
+        let target = Arc::clone(&target);
+        Box::pin(async move { target.apply_delta(sender, &delta, delta.version).await })
+    }
+}
+
+async fn generated_delta(
+    replica: &Arc<RwLock<TaskList>>,
+    since_version: u64,
+) -> Result<TaskListDelta> {
+    let list = replica.read().await;
+    DeltaCrdt::delta(&*list, since_version)
+        .ok_or_else(|| anyhow!("expected a delta since version {since_version}"))
+}
+
+fn has_exact_tasks(replica: &TaskList, task_ids: &[TaskId]) -> bool {
+    replica.tasks_ordered().len() == task_ids.len()
+        && task_ids
+            .iter()
+            .all(|task_id| replica.get_task(task_id).is_some())
+}
+
+async fn wait_for_convergence(
+    replica_a: &Arc<RwLock<TaskList>>,
+    replica_b: &Arc<RwLock<TaskList>>,
+    task_ids: &[TaskId],
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+
+    loop {
+        let converged = {
+            let a = replica_a.read().await;
+            let b = replica_b.read().await;
+            has_exact_tasks(&a, task_ids) && has_exact_tasks(&b, task_ids)
+        };
+
+        if converged {
+            return true;
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Test 0: Dropped delta repaired through anti-entropy.
+///
+/// Scenario: A normal update is omitted during a partition. When the partition
+/// heals, the production anti-entropy manager generates and applies deltas until
+/// both task lists converge without using full-state TaskList::merge as repair.
+#[tokio::test]
+async fn test_anti_entropy_repairs_dropped_delta() -> Result<()> {
+    let task_list_id = list_id(6);
+    let peer_a = peer_id(1);
+    let peer_b = peer_id(2);
+
+    let replica_a = Arc::new(RwLock::new(TaskList::new(
+        task_list_id,
+        "Anti-Entropy".to_string(),
+        peer_a,
+    )));
+    let replica_b = Arc::new(RwLock::new(TaskList::new(
+        task_list_id,
+        "Anti-Entropy".to_string(),
+        peer_b,
+    )));
+
+    let anti_entropy_a = Arc::new(AntiEntropyManager::new(Arc::clone(&replica_a), 1));
+    let anti_entropy_b = Arc::new(AntiEntropyManager::new(Arc::clone(&replica_b), 1));
+
+    anti_entropy_a.add_peer(peer_b).await;
+    anti_entropy_b.add_peer(peer_a).await;
+
+    {
+        let mut a = replica_a.write().await;
+        let task = TaskItem::new(
+            task_id(1),
+            metadata("Delivered before partition", 1),
+            peer_a,
+        );
+        a.add_task(task, peer_a, 1)?;
+    }
+
+    let delivered_delta = generated_delta(&replica_a, 0).await?;
+    anti_entropy_b
+        .apply_delta(peer_a, &delivered_delta, delivered_delta.version)
+        .await?;
+
+    {
+        let mut a = replica_a.write().await;
+        let task = TaskItem::new(task_id(2), metadata("Dropped during partition", 1), peer_a);
+        a.add_task(task, peer_a, 2)?;
+    }
+
+    {
+        let mut b = replica_b.write().await;
+        let task = TaskItem::new(task_id(3), metadata("Created on far side", 2), peer_b);
+        b.add_task(task, peer_b, 3)?;
+    }
+
+    {
+        let a = replica_a.read().await;
+        let b = replica_b.read().await;
+        ensure!(a.get_task(&task_id(3)).is_none());
+        ensure!(b.get_task(&task_id(2)).is_none());
+    }
+
+    anti_entropy_a
+        .start(anti_entropy_callback(Arc::clone(&anti_entropy_b), peer_a))
+        .await?;
+    anti_entropy_b
+        .start(anti_entropy_callback(Arc::clone(&anti_entropy_a), peer_b))
+        .await?;
+
+    let required_tasks = [task_id(1), task_id(2), task_id(3)];
+    let converged = wait_for_convergence(&replica_a, &replica_b, &required_tasks).await;
+
+    anti_entropy_a.stop().await?;
+    anti_entropy_b.stop().await?;
+
+    ensure!(converged, "anti-entropy repair did not converge");
+
+    Ok(())
 }
 
 /// Test 1: Simple partition - add tasks on both sides, verify merge
@@ -167,7 +313,7 @@ fn test_simple_partition_recovery() {
 /// Scenario: Both groups claim the same task during partition, verify earliest-wins resolution.
 /// This prevents claim stealing - first to claim keeps the task.
 #[test]
-fn test_partition_conflicting_claims() {
+fn test_partition_conflicting_claims() -> Result<()> {
     let task_list_id = list_id(2);
     let contested_task_id = task_id(100);
 
@@ -177,60 +323,63 @@ fn test_partition_conflicting_claims() {
 
     // Group A: 2 replicas
     let mut group_a: Vec<TaskList> = (1..=2)
-        .map(|i| {
+        .map(|i| -> Result<TaskList> {
             let mut list = TaskList::new(task_list_id, "Contested List".to_string(), peer_id(i));
-            list.add_task(initial_task.clone(), peer_id(1), 1)
-                .expect("Failed to add initial task");
-            list
+            list.add_task(initial_task.clone(), peer_id(1), 1)?;
+            Ok(list)
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     // Group B: 2 replicas
     let mut group_b: Vec<TaskList> = (3..=4)
-        .map(|i| {
+        .map(|i| -> Result<TaskList> {
             let mut list = TaskList::new(task_list_id, "Contested List".to_string(), peer_id(i));
-            list.add_task(initial_task.clone(), peer_id(1), 1)
-                .expect("Failed to add initial task");
-            list
+            list.add_task(initial_task.clone(), peer_id(1), 1)?;
+            Ok(list)
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
-    // Partition: Group A claims task (timestamp t1, later)
-    let timestamp_b = unix_timestamp_ms();
-    group_b[0]
-        .claim_task(&contested_task_id, agent_id(2), peer_id(2), timestamp_b)
-        .expect("Group B claim failed");
+    // Partition: Group A claims first. claim_task's fourth argument is the
+    // OR-Set sequence tag; TaskItem::claim generates the conflict timestamp.
+    group_a[0].claim_task(&contested_task_id, agent_id(1), peer_id(1), 2)?;
+    let group_a_claim_timestamp = group_a[0]
+        .get_task(&contested_task_id)
+        .and_then(|task| task.current_state().timestamp())
+        .ok_or_else(|| anyhow!("Group A claim should have a timestamp"))?;
 
-    // Partition: Group B claims task (timestamp t2, earlier)
-    let timestamp_a = timestamp_b - 100; // Earlier timestamp wins
-    group_a[0]
-        .claim_task(&contested_task_id, agent_id(1), peer_id(1), timestamp_a)
-        .expect("Group A claim failed");
+    wait_until_clock_after(group_a_claim_timestamp);
+
+    // Partition: Group B claims after the clock advances, using its own sequence tag.
+    group_b[0].claim_task(&contested_task_id, agent_id(2), peer_id(3), 2)?;
+    let group_b_claim_timestamp = group_b[0]
+        .get_task(&contested_task_id)
+        .and_then(|task| task.current_state().timestamp())
+        .ok_or_else(|| anyhow!("Group B claim should have a timestamp"))?;
+    ensure!(
+        group_b_claim_timestamp > group_a_claim_timestamp,
+        "Group B claim timestamp should be later than Group A"
+    );
 
     // Internal propagation within groups
     {
         let a0 = group_a[0].clone();
-        group_a[1].merge(&a0).expect("Group A propagation failed");
+        group_a[1].merge(&a0)?;
     }
     {
         let b0 = group_b[0].clone();
-        group_b[1].merge(&b0).expect("Group B propagation failed");
+        group_b[1].merge(&b0)?;
     }
 
     // Network heals: merge groups
     for replica_a in &mut group_a {
         for replica_b in &group_b {
-            replica_a
-                .merge(replica_b)
-                .expect("Cross-group merge failed");
+            replica_a.merge(replica_b)?;
         }
     }
 
     for replica_b in &mut group_b {
         for replica_a in &group_a {
-            replica_b
-                .merge(replica_a)
-                .expect("Cross-group merge failed");
+            replica_b.merge(replica_a)?;
         }
     }
 
@@ -239,18 +388,20 @@ fn test_partition_conflicting_claims() {
     for replica in group_a.iter().chain(group_b.iter()) {
         let task = replica
             .get_task(&contested_task_id)
-            .expect("Task should exist");
-        assert!(task.current_state().is_claimed(), "Task should be claimed");
-
-        // Earliest claim (Group A, timestamp_a) should win
-        if let Some(claiming_agent) = task.current_state().claimed_by() {
-            assert_eq!(
-                claiming_agent,
-                &agent_id(1),
-                "Earliest claim (Group A, agent 1) should win - prevents claim stealing"
-            );
-        }
+            .ok_or_else(|| anyhow!("Task should exist"))?;
+        let state = task.current_state();
+        ensure!(state.is_claimed(), "Task should be claimed");
+        ensure!(
+            state.claimed_by().copied() == Some(agent_id(1)),
+            "Earliest claim (Group A, agent 1) should win - prevents claim stealing"
+        );
+        ensure!(
+            state.timestamp() == Some(group_a_claim_timestamp),
+            "Winning claim should keep Group A's timestamp"
+        );
     }
+
+    Ok(())
 }
 
 /// Test 3: Asymmetric partition - one group sees partial updates
