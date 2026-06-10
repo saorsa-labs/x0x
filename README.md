@@ -314,6 +314,26 @@ Each instance gets its own identity, port, and data directory.
 
 ---
 
+## Logging
+
+`x0xd` is quiet by default: when neither `RUST_LOG` nor the config
+`log_level` is set, only `warn` and `error` lines are emitted. This is a
+privacy default — verbose levels include peer and topic activity that an
+operator may not want written to logs.
+
+Opt in to verbose logging explicitly:
+
+```bash
+RUST_LOG=info x0xd            # standard verbosity
+RUST_LOG=debug x0xd           # full debugging
+RUST_LOG=ant_quic=debug x0xd  # per-module filters work too
+```
+
+Operator visibility via `GET /health` and `GET /diagnostics/*` is
+independent of the log level.
+
+---
+
 ## GUI
 
 x0x includes a built-in web interface. No download, no install — it's embedded in the binary.

@@ -331,6 +331,9 @@ enum AgentSub {
         /// Base64-encoded bytes to sign.
         #[arg(long)]
         payload_b64: Option<String>,
+        /// Optional domain-separation string; signs `domain || 0x00 || payload`.
+        #[arg(long)]
+        domain: Option<String>,
     },
 }
 
@@ -340,6 +343,12 @@ enum UserIdSub {
     /// Overwrites any existing file at the target path without prompting.
     Create {
         /// Output path. Existing file at this path is overwritten.
+        path: Option<PathBuf>,
+    },
+    /// Read and validate a user identity file (no daemon needed).
+    /// Defaults to ~/.x0x/user.key.
+    Inspect {
+        /// Path of the key file to inspect.
         path: Option<PathBuf>,
     },
 }
@@ -1113,6 +1122,22 @@ async fn run(
                 }
                 return Ok(());
             }
+            UserIdSub::Inspect { path } => {
+                let report = commands::user_id::inspect(path.clone()).await?;
+                match format {
+                    OutputFormat::Json => {
+                        x0x::cli::print_value(format, &serde_json::to_value(&report)?)
+                    }
+                    OutputFormat::Text => {
+                        println!("User identity at {}:", report.path);
+                        println!("user_id:    {}", report.user_id);
+                        if let Some(words) = &report.user_words {
+                            println!("user_words: {words}");
+                        }
+                    }
+                }
+                return Ok(());
+            }
         },
         _ => {}
     }
@@ -1173,8 +1198,18 @@ async fn run(
             Some(AgentSub::Import { card, trust }) => {
                 commands::identity::import_card(&client, &card, Some(trust.as_str())).await
             }
-            Some(AgentSub::Sign { file, payload_b64 }) => {
-                commands::identity::sign(&client, file.as_deref(), payload_b64.as_deref()).await
+            Some(AgentSub::Sign {
+                file,
+                payload_b64,
+                domain,
+            }) => {
+                commands::identity::sign(
+                    &client,
+                    file.as_deref(),
+                    payload_b64.as_deref(),
+                    domain.as_deref(),
+                )
+                .await
             }
         },
         Commands::Announce {
@@ -1649,6 +1684,7 @@ x0x (v{VERSION})
 |   |   +-- card           Generate shareable identity card
 |   |   +-- import         Import an agent card to contacts
 |   +-- user-id create     Create user identity keypair
+|   +-- user-id inspect    Validate a user identity file (daemonless)
 |   +-- announce           Announce identity to network
 |
 +-- Network

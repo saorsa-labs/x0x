@@ -151,6 +151,99 @@ async fn daemon_api_agent_sign_roundtrip() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_agent_sign_domain_separation_roundtrip() {
+    let d = daemon().await;
+
+    // Domain-separated signing (issue #90): the signature must verify over
+    // domain || 0x00 || payload, NOT over the raw payload — otherwise a
+    // signature issued in one protocol context could be replayed in another.
+    let payload = b"register envelope bytes";
+    let domain = "community.jams.pair.v1.register-pop";
+    let r: Value = ca(&d)
+        .post(d.url("/agent/sign"))
+        .json(&serde_json::json!({ "payload_b64": b64(payload), "domain": domain }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(r["ok"], true);
+    assert_eq!(
+        r["domain"].as_str().unwrap(),
+        domain,
+        "response must echo the domain so verifiers know the canonical-bytes shape"
+    );
+
+    let pk_bytes = base64::engine::general_purpose::STANDARD
+        .decode(r["public_key_b64"].as_str().unwrap())
+        .unwrap();
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(r["signature_b64"].as_str().unwrap())
+        .unwrap();
+    let public_key = ant_quic::MlDsaPublicKey::from_bytes(&pk_bytes).unwrap();
+    let signature =
+        ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes).unwrap();
+
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(domain.as_bytes());
+    canonical.push(0);
+    canonical.extend_from_slice(payload);
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&public_key, &canonical, &signature)
+        .expect("signature verifies over domain || 0x00 || payload");
+
+    assert!(
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            &public_key,
+            payload,
+            &signature
+        )
+        .is_err(),
+        "domain-separated signature must NOT verify over the raw payload"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_sign_without_domain_omits_domain_field() {
+    let d = daemon().await;
+    // Pre-#90 behavior must be unchanged: no domain in, no domain out.
+    let r: Value = ca(&d)
+        .post(d.url("/agent/sign"))
+        .json(&serde_json::json!({ "payload_b64": b64(b"plain payload") }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert!(
+        r.get("domain").is_none(),
+        "response must not contain a domain field when none was supplied"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_sign_rejects_nul_in_domain() {
+    let d = daemon().await;
+    let r = ca(&d)
+        .post(d.url("/agent/sign"))
+        .json(&serde_json::json!({ "payload_b64": b64(b"x"), "domain": "bad\u{0}domain" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::BAD_REQUEST,
+        "NUL bytes in domain would make the separator framing ambiguous"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_agent_sign_rejects_empty_payload() {
     let d = daemon().await;
     let r = ca(&d)

@@ -6214,9 +6214,12 @@ impl Agent {
         // this channel and republishes immediately on change.
         let upgraded =
             dm::DmCapabilities::pending().with_kem_public_key(kem_keypair.public_bytes.clone());
-        if self.dm_capabilities_tx.send(upgraded).is_err() {
-            tracing::debug!("dm_capabilities watch has no receivers; skipping upgrade broadcast");
-        }
+        // send_replace stores the value even when no receiver is subscribed
+        // yet; a plain send() drops the upgrade if this runs before the
+        // capability advert service subscribes, leaving peers cached on
+        // gossip_inbox=false and forcing the raw-QUIC fallback that fails
+        // across NAT (issue #101).
+        self.dm_capabilities_tx.send_replace(upgraded);
         tracing::info!("DM inbox service started");
         Ok(())
     }
@@ -9902,6 +9905,49 @@ fn sort_discovered_machine_sorts_fields() {
     assert_eq!(machine.agent_ids[1], identity::AgentId([2u8; 32]));
     assert_eq!(machine.user_ids[0], identity::UserId([1u8; 32]));
     assert_eq!(machine.user_ids[1], identity::UserId([2u8; 32]));
+}
+
+#[tokio::test]
+async fn dm_inbox_capability_upgrade_visible_to_late_subscriber() {
+    // Regression test for issue #101: x0xd starts the DM inbox before the
+    // capability advert service subscribes to the capabilities watch. The
+    // upgrade must be stored in the channel (send_replace), not merely
+    // broadcast to current receivers (send) — otherwise a late subscriber
+    // observes the stale pending state, advertises gossip_inbox=false for
+    // the process lifetime, and cross-NAT DMs fall back to the raw-QUIC
+    // path that black-holes.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let agent = Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_peer_cache_dir(dir.path().join("peers"))
+        .with_network_config(network::NetworkConfig::default())
+        .build()
+        .await
+        .expect("agent");
+
+    let kem = std::sync::Arc::new(
+        groups::kem_envelope::AgentKemKeypair::generate().expect("kem keypair"),
+    );
+    agent
+        .start_dm_inbox(kem, dm_inbox::DmInboxConfig::default())
+        .await
+        .expect("start dm inbox");
+
+    // Subscribe only AFTER the inbox started — mirrors the x0xd startup
+    // order (start_dm_inbox_when_gossip_ready runs before
+    // start_capability_advert_service).
+    let late_rx = agent.dm_capabilities_tx.subscribe();
+    let caps = late_rx.borrow().clone();
+    assert!(
+        caps.gossip_inbox,
+        "DM capability upgrade must be visible to subscribers that attach after start_dm_inbox (issue #101)"
+    );
+    assert!(
+        !caps.kem_public_key.is_empty(),
+        "upgraded capabilities must carry the KEM public key"
+    );
+    agent.stop_dm_inbox().await;
 }
 
 #[test]
