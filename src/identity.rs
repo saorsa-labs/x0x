@@ -334,6 +334,35 @@ impl UserKeypair {
             secret_key,
         })
     }
+
+    /// Generate a UserKeypair deterministically from a 32-byte seed.
+    ///
+    /// Uses the FIPS 204 seeded KeyGen (the ξ input), so the same seed
+    /// produces the same ML-DSA-65 keypair on any machine, every time —
+    /// the foundation for mnemonic-based identity portability (issue #95).
+    /// Mnemonic ↔ seed encoding (e.g. BIP-39) is the consumer
+    /// application's responsibility; x0x performs only the
+    /// seed → keypair step.
+    ///
+    /// The seed must be high-entropy (32 random bytes). Anyone who learns
+    /// the seed can reconstruct the secret key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the generated key bytes cannot be converted
+    /// into the transport key types (never expected for a valid seed).
+    pub fn from_seed(seed: &[u8; 32]) -> Result<Self, crate::error::IdentityError> {
+        use fips204::traits::{KeyGen, SerDes};
+        let (pk, sk) = fips204::ml_dsa_65::KG::keygen_from_seed(seed);
+        let public_key = MlDsaPublicKey::from_bytes(&pk.into_bytes())
+            .map_err(|e| crate::error::IdentityError::KeyGeneration(format!("{e:?}")))?;
+        let secret_key = MlDsaSecretKey::from_bytes(&sk.into_bytes())
+            .map_err(|e| crate::error::IdentityError::KeyGeneration(format!("{e:?}")))?;
+        Ok(Self {
+            public_key,
+            secret_key,
+        })
+    }
     /// Get a reference to the public key.
     #[inline]
     #[must_use]
@@ -875,6 +904,34 @@ mod tests {
         let keypair = MachineKeypair::generate().unwrap();
         let machine_id = MachineId::from_public_key(keypair.public_key());
         machine_id.verify(keypair.public_key()).unwrap();
+    }
+    #[test]
+    fn user_keypair_from_seed_is_deterministic_and_functional() {
+        // Issue #95: identical seeds must yield byte-identical keypairs
+        // (the portability contract), and the derived keypair must be a
+        // working ML-DSA-65 signer — not just stable bytes.
+        let seed = [7u8; 32];
+        let kp1 = UserKeypair::from_seed(&seed).unwrap();
+        let kp2 = UserKeypair::from_seed(&seed).unwrap();
+        assert_eq!(
+            kp1.public_key().as_bytes(),
+            kp2.public_key().as_bytes(),
+            "same seed must derive the same public key"
+        );
+        assert_eq!(kp1.user_id(), kp2.user_id());
+
+        let kp3 = UserKeypair::from_seed(&[8u8; 32]).unwrap();
+        assert_ne!(kp1.user_id(), kp3.user_id());
+
+        // UserId binds to the derived public key.
+        kp1.user_id().verify(kp1.public_key()).unwrap();
+
+        // Derived secret key signs; derived public key verifies.
+        let msg = b"seeded keypair must be usable";
+        let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(kp1.secret_key(), msg)
+            .unwrap();
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(kp1.public_key(), msg, &sig)
+            .unwrap();
     }
     #[test]
     fn test_agent_id_from_public_key() {

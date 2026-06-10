@@ -156,6 +156,9 @@ pub mod exec;
 /// The x0x Constitution — The Four Laws of Intelligent Coexistence — embedded at compile time.
 pub mod constitution;
 
+/// Privacy-preserving log identifier wrappers (salted-hash redaction).
+pub mod logging;
+
 /// Shared API endpoint registry consumed by both x0xd and the x0x CLI.
 pub mod api;
 
@@ -8317,6 +8320,7 @@ impl Agent {
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
             30,
+            peer_id,
         )
         .map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -8372,6 +8376,7 @@ impl Agent {
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
             30,
+            peer_id,
         )
         .map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(

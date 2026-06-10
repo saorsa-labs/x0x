@@ -28,6 +28,8 @@ covers project-wide rules and architecture.
 | `presence_wiring_test.rs` | PresenceWrapper lifecycle, config defaults, shutdown |
 | `presence_integration.rs` | Presence API surface: subscribe, cached_agent, foaf_peer_candidates |
 | `kv_store_integration.rs` | KV store CRUD, access policies, CRDT sync |
+| `kv_first_join_bootstrap.rs` | Issue #96: cold first-join state bootstrap via state-sync side topic (daemon-backed, `--ignored`) |
+| `local_topics.rs` | Issue #89: `local:` topics deliver same-daemon only, never gossipped (daemon-backed, `--ignored`) |
 | `named_group_integration.rs` | Named groups, invites, join/leave, display names |
 | `bootstrap_cache_integration.rs` | Bootstrap cache persistence, quality scoring |
 | `constitution_integration.rs` | Constitution embedding and serving |

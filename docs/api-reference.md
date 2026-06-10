@@ -134,6 +134,16 @@ Notes:
 }
 ```
 
+### `local:` topics (same-daemon IPC)
+
+Topics whose name starts with `local:` (e.g. `local:my-app/events`) are
+never gossipped: messages are delivered only to subscribers attached to
+the same `x0xd` instance — they never enter the PlumTree EAGER set or
+IHAVE digests. All primitives work unchanged (`/publish`, `/subscribe`,
+`/events`, WebSocket subscribe, bearer-token auth). Use them as a local
+pub/sub substrate for multi-process applications sharing one daemon,
+without leaking events to the mesh.
+
 ## Discovery
 
 | Method | Endpoint | CLI | Purpose |
