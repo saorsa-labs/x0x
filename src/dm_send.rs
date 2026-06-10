@@ -159,7 +159,7 @@ pub async fn send_via_gossip(
                         target: "dm.trace",
                         stage = "primary_inbox_publish_failed",
                         request_id = %hex::encode(request_id),
-                        recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                        recipient = %crate::logging::LogAgentId::from(&recipient_agent_id),
                         attempt,
                         error = %e,
                     );
@@ -202,7 +202,7 @@ pub async fn send_via_gossip(
                         target: "dm.trace",
                         stage = "legacy_bus_fallback_publish_failed",
                         request_id = %hex::encode(request_id),
-                        recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                        recipient = %crate::logging::LogAgentId::from(&recipient_agent_id),
                         attempt,
                         error = %e,
                     );

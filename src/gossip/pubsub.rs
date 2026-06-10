@@ -598,7 +598,10 @@ impl PubSubManager {
     /// processing (EAGER/IHAVE/IWANT/AntiEntropy).
     pub async fn handle_incoming(&self, peer: PeerId, data: Bytes) {
         if let Err(e) = self.plumtree.handle_message(peer, data).await {
-            tracing::warn!("Failed to handle PlumTree pubsub message from {peer}: {e}");
+            tracing::warn!(
+                "Failed to handle PlumTree pubsub message from {}: {e}",
+                crate::logging::LogPeerId::from(peer)
+            );
         }
     }
 

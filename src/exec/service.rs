@@ -403,8 +403,8 @@ impl ExecService {
                 if session.cancel_tx.send(CancelReason::IdleTimeout).is_ok() {
                     tracing::warn!(
                         request_id = %request_id,
-                        agent_id = %hex::encode(session.agent_id.as_bytes()),
-                        machine_id = %hex::encode(session.machine_id.as_bytes()),
+                        agent_id = %crate::logging::LogAgentId::from(&session.agent_id),
+                        machine_id = %crate::logging::LogMachineId::from(&session.machine_id),
                         idle_ms = now.duration_since(last_activity).as_millis() as u64,
                         "exec session idle timeout; cancelling remote child"
                     );

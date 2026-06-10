@@ -2432,7 +2432,7 @@ impl Agent {
             tracing::warn!(
                 target: "x0x::connect",
                 stage = "connect_to_agent",
-                %agent_prefix,
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
                 outcome = "unreachable_no_network",
                 "network layer not initialised"
             );
@@ -2563,11 +2563,11 @@ impl Agent {
                         tracing::warn!(
                             target: "x0x::connect",
                             stage = "connect_to_agent",
-                            %agent_prefix,
+                            agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
                             strategy = "local_direct_first",
-                            requested_addr = %addr,
-                            selected_addr = %selected_addr,
-                            connected_machine_prefix = %network::hex_prefix(&connected_peer_id.0, 4),
+                            requested_addr = %crate::logging::LogHexId::addr(&addr.to_string()),
+                            selected_addr = %crate::logging::LogHexId::addr(&selected_addr.to_string()),
+                            connected_machine_prefix = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&connected_peer_id.0, 4)),
                             "local peer-authenticated dial reached unexpected peer"
                         );
                     }
@@ -2626,10 +2626,10 @@ impl Agent {
                         tracing::warn!(
                             target: "x0x::connect",
                             stage = "connect_to_agent",
-                            %agent_prefix,
+                            agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
                             strategy = "local_direct_raw_fallback",
-                            %addr,
-                            connected_machine_prefix = %network::hex_prefix(&connected_peer_id.0, 4),
+                            addr = %crate::logging::LogHexId::addr(&addr.to_string()),
+                            connected_machine_prefix = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&connected_peer_id.0, 4)),
                             "verified local raw-address fallback reached unexpected peer"
                         );
                     }
@@ -2971,7 +2971,7 @@ impl Agent {
         tracing::warn!(
             target: "x0x::connect",
             stage = "connect_to_agent",
-            %agent_prefix,
+            agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
             outcome = "unreachable",
             reason = "all_strategies_exhausted",
             dur_ms = call_start.elapsed().as_millis() as u64,
@@ -3026,7 +3026,7 @@ impl Agent {
             tracing::warn!(
                 target: "x0x::connect",
                 stage = "connect_to_machine",
-                %machine_prefix,
+                machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
                 outcome = "unreachable_no_network",
                 "network layer not initialised"
             );
@@ -3104,10 +3104,10 @@ impl Agent {
                     tracing::warn!(
                         target: "x0x::connect",
                         stage = "connect_to_machine",
-                        %machine_prefix,
-                        requested_addr = %addr,
-                        selected_addr = %selected_addr,
-                        connected_machine_prefix = %network::hex_prefix(&connected_peer_id.0, 4),
+                        machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                        requested_addr = %crate::logging::LogHexId::addr(&addr.to_string()),
+                        selected_addr = %crate::logging::LogHexId::addr(&selected_addr.to_string()),
+                        connected_machine_prefix = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&connected_peer_id.0, 4)),
                         "machine local direct dial reached unexpected peer"
                     );
                 }
@@ -3162,10 +3162,10 @@ impl Agent {
                     tracing::warn!(
                         target: "x0x::connect",
                         stage = "connect_to_machine",
-                        %machine_prefix,
+                        machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
                         strategy = "local_direct_raw_fallback",
-                        %addr,
-                        connected_machine_prefix = %network::hex_prefix(&connected_peer_id.0, 4),
+                        addr = %crate::logging::LogHexId::addr(&addr.to_string()),
+                        connected_machine_prefix = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&connected_peer_id.0, 4)),
                         "verified machine local raw-address fallback reached unexpected peer"
                     );
                 }
@@ -3236,9 +3236,9 @@ impl Agent {
                 tracing::warn!(
                     target: "x0x::connect",
                     stage = "connect_to_machine",
-                    %machine_prefix,
-                    selected_addr = %addr,
-                    verified_machine_prefix = %network::hex_prefix(&verified_peer_id.0, 4),
+                    machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                    selected_addr = %crate::logging::LogHexId::addr(&addr.to_string()),
+                    verified_machine_prefix = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&verified_peer_id.0, 4)),
                     "machine dial reached unexpected peer"
                 );
             }
@@ -3294,9 +3294,9 @@ impl Agent {
                         tracing::warn!(
                             target: "x0x::connect",
                             stage = "connect_to_machine",
-                            %machine_prefix,
-                            %addr,
-                            connected_machine_prefix = %network::hex_prefix(&connected_peer_id.0, 4),
+                            machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                            addr = %crate::logging::LogHexId::addr(&addr.to_string()),
+                            connected_machine_prefix = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&connected_peer_id.0, 4)),
                             "machine direct dial reached unexpected peer"
                         );
                     }
@@ -3327,7 +3327,7 @@ impl Agent {
         tracing::warn!(
             target: "x0x::connect",
             stage = "connect_to_machine",
-            %machine_prefix,
+            machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
             outcome = "unreachable",
             reason = "all_strategies_exhausted",
             dur_ms = call_start.elapsed().as_millis() as u64,
@@ -3813,7 +3813,7 @@ impl Agent {
             tracing::warn!(
                 target: "x0x::direct",
                 stage = "send",
-                %agent_prefix,
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
                 outcome = "err_no_network",
                 "network not initialised"
             );
@@ -3866,7 +3866,7 @@ impl Agent {
                         tracing::warn!(
                             target: "x0x::direct",
                             stage = "send",
-                            %agent_prefix,
+                            agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
                             outcome = "err_agent_not_found",
                             dur_ms = send_start.elapsed().as_millis() as u64,
                             "no machine_id after connect_to_agent"
@@ -3935,8 +3935,8 @@ impl Agent {
                 tracing::warn!(
                     target: "x0x::direct",
                     stage = "send",
-                    %agent_prefix,
-                    %machine_prefix,
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
                     resolution,
                     ?repair_outcome,
                     reason = %reason,
@@ -3950,8 +3950,8 @@ impl Agent {
                 tracing::warn!(
                     target: "x0x::direct",
                     stage = "send",
-                    %agent_prefix,
-                    %machine_prefix,
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
                     resolution,
                     ?repair_outcome,
                     outcome = "err_peer_disconnected",
@@ -3966,8 +3966,8 @@ impl Agent {
             tracing::warn!(
                 target: "x0x::direct",
                 stage = "send",
-                %agent_prefix,
-                %machine_prefix,
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
                 resolution,
                 ?repair_outcome,
                 outcome = "err_not_connected",
@@ -4076,7 +4076,7 @@ impl Agent {
                     stage = "send",
                     from = %self_prefix,
                     to = %agent_prefix,
-                    %machine_prefix,
+                    machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
                     resolution,
                     bytes,
                     dur_ms = send_start.elapsed().as_millis() as u64,
@@ -5480,9 +5480,9 @@ impl Agent {
                         }
                         trust::TrustDecision::RejectMachineMismatch => {
                             tracing::warn!(
-                                "Dropping identity announcement from agent {:?}: machine {:?} not in pinned list",
-                                hex::encode(&announcement.agent_id.0[..8]),
-                                hex::encode(&announcement.machine_id.0[..8]),
+                                "Dropping identity announcement from agent {}: machine {} not in pinned list",
+                                crate::logging::LogAgentId::from(&announcement.agent_id),
+                                crate::logging::LogMachineId::from(&announcement.machine_id),
                             );
                             continue;
                         }
@@ -7040,7 +7040,7 @@ impl Agent {
                     tracing::warn!(
                         target: "x0x::direct",
                         stage = "listener",
-                        machine_prefix = %network::hex_prefix(&ant_peer_id.0, 4),
+                        machine_prefix = %crate::logging::LogTransportPeerId::from(&ant_peer_id),
                         raw_bytes,
                         outcome = "drop_too_short",
                         "direct message too short to contain sender id"

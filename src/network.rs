@@ -976,7 +976,7 @@ fn warn_forward_channel_pressure<T>(
             used,
             max,
             used_pct,
-            peer = ?peer_id,
+            peer = %crate::logging::LogTransportPeerId::from(&peer_id),
             stream = ?stream_type,
             channel = channel_name,
             "[1/6 network] receive forward channel >80% full — back-pressure active before ant-quic recv drain (rate-limited; see recv_pump.<stream>.{{producer_per_sec, consumer_per_sec, max_depth, dropped_full}} for steady-state)"
@@ -1029,7 +1029,7 @@ async fn forward_gossip_payload(
                 CHANNEL_PRESSURE_INFO_INTERVAL,
             ) {
                 warn!(
-                    peer = ?peer_id,
+                    peer = %crate::logging::LogTransportPeerId::from(&peer_id),
                     stream = ?stream_type,
                     channel = channel_name,
                     depth,
@@ -1057,7 +1057,7 @@ async fn forward_gossip_payload(
                         .dropped_full
                         .load(std::sync::atomic::Ordering::Relaxed);
                     warn!(
-                        peer = ?peer_id,
+                        peer = %crate::logging::LogTransportPeerId::from(&peer_id),
                         stream = ?stream_type,
                         channel = channel_name,
                         depth,
@@ -1567,8 +1567,9 @@ impl NetworkNode {
     ) -> NetworkResult<()> {
         tracing::warn!(
             target: "x0x::connect",
-            peer_id_prefix = %hex_prefix(&peer_id.0, 4),
-            ?fallback_addr,
+            peer_id_prefix = %crate::logging::LogTransportPeerId::from(peer_id),
+            fallback_addr = ?fallback_addr
+                .map(|a| crate::logging::LogHexId::addr(&a.to_string()).to_string()),
             reason,
             "refreshing peer connection before send"
         );
@@ -2062,7 +2063,7 @@ impl NetworkNode {
                 tracing::warn!(
                     target: "x0x::connect",
                     strategy = "peer_with_addrs",
-                    peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                    peer_id_prefix = %crate::logging::LogTransportPeerId::from(&peer_id),
                     dur_ms,
                     "connected but transport type unsupported"
                 );

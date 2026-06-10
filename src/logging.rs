@@ -118,6 +118,12 @@ log_id_wrapper!(
     UserId,
     "user"
 );
+log_id_wrapper!(
+    /// Displays an ant-quic transport [`ant_quic::PeerId`] as `peer_xxxxxxxx`.
+    LogTransportPeerId,
+    ant_quic::PeerId,
+    "peer"
+);
 
 /// Privacy wrapper for identifiers that travel as strings (hex group
 /// ids, topic names, addresses). Displays as `<prefix>_xxxxxxxx`.
@@ -130,31 +136,34 @@ pub struct LogHexId<'a> {
 impl<'a> LogHexId<'a> {
     /// Wrap an arbitrary string identifier with a custom prefix.
     #[must_use]
-    pub fn new(prefix: &'static str, id: &'a str) -> Self {
-        Self { prefix, id }
+    pub fn new<S: AsRef<str> + ?Sized>(prefix: &'static str, id: &'a S) -> Self {
+        Self {
+            prefix,
+            id: id.as_ref(),
+        }
     }
 
     /// Wrap a hex group id → `group_xxxxxxxx`.
     #[must_use]
-    pub fn group(id: &'a str) -> Self {
+    pub fn group<S: AsRef<str> + ?Sized>(id: &'a S) -> Self {
         Self::new("group", id)
     }
 
     /// Wrap a topic name → `topic_xxxxxxxx`.
     #[must_use]
-    pub fn topic(id: &'a str) -> Self {
+    pub fn topic<S: AsRef<str> + ?Sized>(id: &'a S) -> Self {
         Self::new("topic", id)
     }
 
     /// Wrap a hex agent id string → `agent_xxxxxxxx`.
     #[must_use]
-    pub fn agent(id: &'a str) -> Self {
+    pub fn agent<S: AsRef<str> + ?Sized>(id: &'a S) -> Self {
         Self::new("agent", id)
     }
 
     /// Wrap a network address → `addr_xxxxxxxx`.
     #[must_use]
-    pub fn addr(id: &'a str) -> Self {
+    pub fn addr<S: AsRef<str> + ?Sized>(id: &'a S) -> Self {
         Self::new("addr", id)
     }
 }

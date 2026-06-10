@@ -380,7 +380,7 @@ async fn run_pubsub_dispatcher(
                         let elapsed = started.elapsed();
                         dispatch_stats.pubsub.record_timed_out(elapsed);
                         tracing::warn!(
-                            from = %peer,
+                            from = %crate::logging::LogPeerId::from(peer),
                             bytes,
                             elapsed_ms = duration_ms(elapsed),
                             timeout_secs = PUBSUB_MESSAGE_HANDLE_TIMEOUT.as_secs(),
@@ -712,7 +712,7 @@ async fn run_membership_dispatcher(
                         let elapsed = started.elapsed();
                         dispatch_stats.membership.record_timed_out(elapsed);
                         tracing::warn!(
-                            from = %peer,
+                            from = %crate::logging::LogPeerId::from(peer),
                             bytes,
                             elapsed_ms = duration_ms(elapsed),
                             timeout_secs = MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT.as_secs(),
@@ -799,7 +799,7 @@ async fn run_bulk_dispatcher(
                             let elapsed = started.elapsed();
                             dispatch_stats.bulk.record_timed_out(elapsed);
                             tracing::warn!(
-                                from = %peer,
+                                from = %crate::logging::LogPeerId::from(peer),
                                 bytes,
                                 elapsed_ms = duration_ms(elapsed),
                                 timeout_secs = PRESENCE_MESSAGE_HANDLE_TIMEOUT.as_secs(),

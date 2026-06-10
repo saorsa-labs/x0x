@@ -444,13 +444,13 @@ impl InboxPipeline {
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.dm.record_incoming_typed_route_dropped();
                 tracing::warn!(
-                    sender = %hex::encode(sender_agent_id.as_bytes()),
+                    sender = %crate::logging::LogAgentId::from(&sender_agent_id),
                     "typed DM payload route channel full; dropping redundant fallback payload"
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!(
-                    sender = %hex::encode(sender_agent_id.as_bytes()),
+                    sender = %crate::logging::LogAgentId::from(&sender_agent_id),
                     "typed DM payload route receiver is closed; dropping payload"
                 );
             }

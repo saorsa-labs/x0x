@@ -59,6 +59,7 @@ pub static MALLOC_CONF: &[u8] =
 use x0x::contacts::{ContactStore, IdentityType, MachineRecord, TrustLevel};
 use x0x::identity::AgentId;
 use x0x::identity::MachineId;
+use x0x::logging::LogHexId;
 use x0x::network::NetworkConfig;
 use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
@@ -4853,7 +4854,7 @@ async fn subscribe(
                             "[5/6 x0xd] broadcast sent to {n} SSE receivers"
                         ),
                         Err(_) => tracing::warn!(
-                            topic = %topic,
+                            topic = %LogHexId::topic(&topic),
                             "[5/6 x0xd] broadcast send failed (no SSE receivers)"
                         ),
                     }
@@ -6389,7 +6390,7 @@ async fn publish_secure_share(
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
-                    recipient = %recipient_hex,
+                    recipient = %LogHexId::agent(&recipient_hex),
                     "publish_secure_share: recipient KEM public key not valid base64: {e}"
                 );
                 return false;
@@ -6404,7 +6405,7 @@ async fn publish_secure_share(
         ) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(recipient = %recipient_hex, "KEM seal failed: {e}");
+                tracing::warn!(recipient = %LogHexId::agent(&recipient_hex), "KEM seal failed: {e}");
                 return false;
             }
         };
@@ -6614,7 +6615,7 @@ async fn publish_group_card_to_discovery_inner(
                 "C.2: published signed card to shard"
             ),
             Err(e) => tracing::warn!(
-                topic = %topic,
+                topic = %LogHexId::topic(&topic),
                 "C.2: shard publish failed: {e}"
             ),
         }
@@ -6802,7 +6803,7 @@ async fn subscribe_shard(state: Arc<AppState>, kind: x0x::groups::ShardKind, sha
     let mut sub = match state.agent.subscribe(&topic).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(topic = %topic, "C.2: failed to subscribe to shard: {e}");
+            tracing::warn!(topic = %LogHexId::topic(&topic), "C.2: failed to subscribe to shard: {e}");
             return;
         }
     };
@@ -7259,11 +7260,11 @@ async fn publish_named_group_metadata_event(
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    tracing::warn!(topic = %metadata_topic, "failed to publish named-group metadata event: {e}");
+                    tracing::warn!(topic = %LogHexId::topic(&metadata_topic), "failed to publish named-group metadata event: {e}");
                 }
                 Err(_) => {
                     tracing::warn!(
-                        topic = %metadata_topic,
+                        topic = %LogHexId::topic(&metadata_topic),
                         timeout_ms = NAMED_GROUP_METADATA_PUBLISH_TIMEOUT.as_millis() as u64,
                         "timed out publishing named-group metadata event"
                     );
@@ -7301,7 +7302,7 @@ fn spawn_named_group_event_delivery(
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(
-                requester = %recipient_hex,
+                requester = %LogHexId::agent(&recipient_hex),
                 "cannot direct-deliver named-group event: invalid requester id: {e}"
             );
             return;
@@ -7322,7 +7323,7 @@ fn spawn_named_group_event_delivery(
             .await
         {
             tracing::warn!(
-                requester = %requester,
+                requester = %LogHexId::agent(&requester),
                 "failed to direct-deliver named-group review event: {e}"
             );
         }
@@ -7339,7 +7340,7 @@ fn spawn_named_group_event_delivery_after(
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(
-                requester = %recipient_hex,
+                requester = %LogHexId::agent(&recipient_hex),
                 "cannot delayed-direct-deliver named-group event: invalid requester id: {e}"
             );
             return;
@@ -7363,7 +7364,7 @@ fn spawn_named_group_event_delivery_after(
             .await
         {
             tracing::warn!(
-                requester = %requester,
+                requester = %LogHexId::agent(&requester),
                 "failed to delayed-direct-deliver named-group event: {e}"
             );
         }
@@ -7769,7 +7770,7 @@ async fn queue_treekem_membership_event(
             queue.pop_front();
         }
     }
-    tracing::warn!(group_id = %group_id, reason, "queued TreeKEM membership event pending catch-up/replay");
+    tracing::warn!(group_id = %LogHexId::group(&group_id), reason, "queued TreeKEM membership event pending catch-up/replay");
     request_treekem_catchup_for_gap(state, group_id, &event, sender).await;
 }
 
@@ -7830,7 +7831,7 @@ async fn request_treekem_catchup_for_gap(
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
             Err(e) => {
-                tracing::warn!(group_id = %group_id, "failed to serialize TreeKEM catch-up request: {e}");
+                tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize TreeKEM catch-up request: {e}");
                 continue;
             }
         };
@@ -7948,7 +7949,7 @@ async fn handle_treekem_catchup_request(
         })
     };
     if !authorized && !target_of_cached_add {
-        tracing::warn!(group_id = %request.group_id, requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
+        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
         return;
     }
     let mut events = {
@@ -7981,7 +7982,7 @@ async fn handle_treekem_catchup_request(
     let payload = match serde_json::to_vec(&response) {
         Ok(payload) => payload,
         Err(e) => {
-            tracing::warn!(group_id = %request.group_id, "failed to serialize TreeKEM catch-up response: {e}");
+            tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to serialize TreeKEM catch-up response: {e}");
             return;
         }
     };
@@ -7990,7 +7991,7 @@ async fn handle_treekem_catchup_request(
         .send_direct_with_config(sender, payload, direct_message_send_config())
         .await
     {
-        tracing::warn!(group_id = %request.group_id, requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
+        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
     }
 }
 
@@ -8051,7 +8052,7 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
     let payload = match serde_json::to_vec(&request) {
         Ok(payload) => payload,
         Err(e) => {
-            tracing::warn!(group_id = %group_id, "failed to serialize paged TreeKEM catch-up request: {e}");
+            tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize paged TreeKEM catch-up request: {e}");
             return;
         }
     };
@@ -8208,7 +8209,7 @@ async fn apply_named_group_metadata_event_inner(
         && treekem_metadata_event_requires_phase3(&event)
     {
         tracing::warn!(
-            group_id = %resolved_group_key,
+            group_id = %LogHexId::group(&resolved_group_key),
             "ignoring TreeKEM metadata membership event without Phase 3 Commit/Welcome transport"
         );
         tracing::debug!(
@@ -8345,7 +8346,7 @@ async fn apply_named_group_metadata_event_inner(
                         {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                tracing::warn!(group_id = %resolved_group_key, welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
                                 return false;
                             }
                         }
@@ -8363,7 +8364,7 @@ async fn apply_named_group_metadata_event_inner(
                     ) {
                         Ok(prepared) => prepared,
                         Err(e) => {
-                            tracing::warn!(group_id = %resolved_group_key, "failed to prepare local TreeKEM identity for MemberAdded Welcome: {e}");
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to prepare local TreeKEM identity for MemberAdded Welcome: {e}");
                             return false;
                         }
                     };
@@ -8373,7 +8374,7 @@ async fn apply_named_group_metadata_event_inner(
                     ) {
                         Ok(group) => group,
                         Err(e) => {
-                            tracing::warn!(group_id = %resolved_group_key, "failed to join TreeKEM group from MemberAdded Welcome: {e}");
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to join TreeKEM group from MemberAdded Welcome: {e}");
                             return false;
                         }
                     };
@@ -8388,7 +8389,7 @@ async fn apply_named_group_metadata_event_inner(
                     )
                     .await
                     {
-                        tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after MemberAdded Welcome: {e}");
+                        tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after MemberAdded Welcome: {e}");
                         return false;
                     }
                     state.treekem_groups.write().await.insert(
@@ -8403,7 +8404,7 @@ async fn apply_named_group_metadata_event_inner(
                     if let Some(group) = group {
                         let mut guard = group.lock().await;
                         if let Err(e) = guard.process_commit(&commit_bytes) {
-                            tracing::warn!(group_id = %resolved_group_key, "failed to process TreeKEM MemberAdded commit: {e}");
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM MemberAdded commit: {e}");
                             return false;
                         }
                         if guard.epoch() != epoch {
@@ -8417,7 +8418,7 @@ async fn apply_named_group_metadata_event_inner(
                         )
                         .await
                         {
-                            tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after MemberAdded commit: {e}");
+                            tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after MemberAdded commit: {e}");
                             return false;
                         }
                     } else if !info.has_active_member(&local_agent_hex) {
@@ -8552,7 +8553,7 @@ async fn apply_named_group_metadata_event_inner(
                 let treekem_snapshot = state.treekem_dir.join(format!("{resolved_group_key}.snap"));
                 if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
                     if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(group_id = %resolved_group_key, "failed to remove TreeKEM snapshot after self removal: {e}");
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to remove TreeKEM snapshot after self removal: {e}");
                     }
                 }
                 save_named_groups(state).await;
@@ -8575,11 +8576,11 @@ async fn apply_named_group_metadata_event_inner(
                 };
                 let mut guard = group.lock().await;
                 if let Err(e) = guard.process_commit(&commit_bytes) {
-                    tracing::warn!(group_id = %resolved_group_key, "failed to process TreeKEM remove commit: {e}");
+                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM remove commit: {e}");
                     return false;
                 }
                 if guard.epoch() != _epoch {
-                    tracing::warn!(group_id = %resolved_group_key, expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM remove commit advanced to unexpected epoch");
+                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM remove commit advanced to unexpected epoch");
                     return false;
                 }
                 if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
@@ -8590,7 +8591,7 @@ async fn apply_named_group_metadata_event_inner(
                 )
                 .await
                 {
-                    tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after remove commit: {e}");
+                    tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after remove commit: {e}");
                     return false;
                 }
             }
@@ -8822,7 +8823,7 @@ async fn apply_named_group_metadata_event_inner(
                 let treekem_snapshot = state.treekem_dir.join(format!("{resolved_group_key}.snap"));
                 if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
                     if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(group_id = %resolved_group_key, "failed to remove TreeKEM snapshot after ban: {e}");
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to remove TreeKEM snapshot after ban: {e}");
                     }
                 }
             } else if let Some((commit_b64, epoch)) = treekem_payload {
@@ -8841,7 +8842,7 @@ async fn apply_named_group_metadata_event_inner(
                 };
                 let mut guard = group.lock().await;
                 if let Err(e) = guard.process_commit(&commit_bytes) {
-                    tracing::warn!(group_id = %resolved_group_key, "failed to process TreeKEM ban commit: {e}");
+                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM ban commit: {e}");
                     return false;
                 }
                 if guard.epoch() != epoch {
@@ -8855,7 +8856,7 @@ async fn apply_named_group_metadata_event_inner(
                 )
                 .await
                 {
-                    tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after ban commit: {e}");
+                    tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after ban commit: {e}");
                     return false;
                 }
             }
@@ -9095,7 +9096,7 @@ async fn apply_named_group_metadata_event_inner(
                         {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                tracing::warn!(group_id = %resolved_group_key, welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
                                 return false;
                             }
                         }
@@ -9113,7 +9114,7 @@ async fn apply_named_group_metadata_event_inner(
                     ) {
                         Ok(prepared) => prepared,
                         Err(e) => {
-                            tracing::warn!(group_id = %resolved_group_key, "failed to prepare local TreeKEM identity for welcome: {e}");
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to prepare local TreeKEM identity for welcome: {e}");
                             return false;
                         }
                     };
@@ -9123,12 +9124,12 @@ async fn apply_named_group_metadata_event_inner(
                     ) {
                         Ok(group) => group,
                         Err(e) => {
-                            tracing::warn!(group_id = %resolved_group_key, "failed to join TreeKEM group from Welcome: {e}");
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to join TreeKEM group from Welcome: {e}");
                             return false;
                         }
                     };
                     if tk.epoch() != _epoch {
-                        tracing::warn!(group_id = %resolved_group_key, expected_epoch = _epoch, actual_epoch = tk.epoch(), "TreeKEM Welcome joined at unexpected epoch");
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), expected_epoch = _epoch, actual_epoch = tk.epoch(), "TreeKEM Welcome joined at unexpected epoch");
                         return false;
                     }
                     if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
@@ -9139,7 +9140,7 @@ async fn apply_named_group_metadata_event_inner(
                     )
                     .await
                     {
-                        tracing::error!(group_id = %resolved_group_key, "failed to persist joined TreeKEM snapshot: {e}");
+                        tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist joined TreeKEM snapshot: {e}");
                         return false;
                     }
                     state.treekem_groups.write().await.insert(
@@ -9157,11 +9158,11 @@ async fn apply_named_group_metadata_event_inner(
                     {
                         let mut guard = group.lock().await;
                         if let Err(e) = guard.process_commit(&commit_bytes) {
-                            tracing::warn!(group_id = %resolved_group_key, "failed to process TreeKEM add commit: {e}");
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM add commit: {e}");
                             return false;
                         }
                         if guard.epoch() != _epoch {
-                            tracing::warn!(group_id = %resolved_group_key, expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM add commit advanced to unexpected epoch");
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM add commit advanced to unexpected epoch");
                             return false;
                         }
                         if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
@@ -9172,7 +9173,7 @@ async fn apply_named_group_metadata_event_inner(
                         )
                         .await
                         {
-                            tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after add commit: {e}");
+                            tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after add commit: {e}");
                             return false;
                         }
                     }
@@ -9645,8 +9646,8 @@ async fn apply_named_group_metadata_event_inner(
                     Ok(commit) => commit,
                     Err(e) => {
                         tracing::warn!(
-                            group_id = %resolved_group_key,
-                            member = %member_agent_id,
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
                             "MemberJoined: failed to seal authoritative add: {e}"
                         );
                         return false;
@@ -9655,7 +9656,7 @@ async fn apply_named_group_metadata_event_inner(
                 let out = match guard.add_member(member_id, kp_bytes) {
                     Ok(out) => out,
                     Err(e) => {
-                        tracing::warn!(group_id = %resolved_group_key, member = %member_agent_id, "MemberJoined: TreeKEM add_member failed: {e}");
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), member = %LogHexId::agent(&member_agent_id), "MemberJoined: TreeKEM add_member failed: {e}");
                         return false;
                     }
                 };
@@ -9670,7 +9671,7 @@ async fn apply_named_group_metadata_event_inner(
                 )
                 .await
                 {
-                    tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after invite add: {e}");
+                    tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after invite add: {e}");
                     return false;
                 }
                 treekem_epoch = Some(expected_epoch);
@@ -9682,8 +9683,8 @@ async fn apply_named_group_metadata_event_inner(
                     Ok(commit) => commit,
                     Err(e) => {
                         tracing::warn!(
-                            group_id = %resolved_group_key,
-                            member = %member_agent_id,
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
                             "MemberJoined: failed to seal authoritative add: {e}"
                         );
                         return false;
@@ -9775,7 +9776,7 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
     let mut sub = match state.agent.subscribe(&metadata_topic).await {
         Ok(sub) => sub,
         Err(e) => {
-            tracing::warn!(group_id = %group_id, topic = %metadata_topic, "failed to subscribe to named-group metadata topic: {e}");
+            tracing::warn!(group_id = %LogHexId::group(&group_id), topic = %LogHexId::topic(&metadata_topic), "failed to subscribe to named-group metadata topic: {e}");
             return;
         }
     };
@@ -10339,7 +10340,7 @@ async fn send_group_public_message(
         }
     };
     if let Err(e) = state.agent.publish(&topic, bytes.clone()).await {
-        tracing::warn!(topic = %topic, "E: public-send publish failed: {e}");
+        tracing::warn!(topic = %LogHexId::topic(&topic), "E: public-send publish failed: {e}");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -10491,7 +10492,7 @@ fn spawn_group_public_message_delivery(
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(
-                recipient = %recipient_hex,
+                recipient = %LogHexId::agent(&recipient_hex),
                 "cannot direct-deliver public group message: invalid recipient id: {e}"
             );
             return;
@@ -10520,8 +10521,8 @@ fn spawn_group_public_message_delivery(
             .await
         {
             tracing::warn!(
-                group_id = %group_id,
-                recipient = %recipient_label,
+                group_id = %LogHexId::group(&group_id),
+                recipient = %LogHexId::agent(&recipient_label),
                 "failed to direct-deliver public group message: {e}"
             );
         }
@@ -10676,7 +10677,7 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     let mut sub = match state.agent.subscribe(&topic).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(topic = %topic, "E: failed to subscribe to public chat: {e}");
+            tracing::warn!(topic = %LogHexId::topic(&topic), "E: failed to subscribe to public chat: {e}");
             return;
         }
     };
@@ -11406,7 +11407,7 @@ async fn add_treekem_named_group_member(
     if let Err(e) =
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
     {
-        tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after direct add: {e}");
+        tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after direct add: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(
@@ -11617,7 +11618,7 @@ async fn drop_local_named_group_state(state: &AppState, id: &str, reason: &str) 
     let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
     if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
         if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(group_id = %id, reason = %reason, "failed to remove TreeKEM snapshot while dropping local group state: {e}");
+            tracing::warn!(group_id = %LogHexId::group(&id), reason = %reason, "failed to remove TreeKEM snapshot while dropping local group state: {e}");
         }
     }
     save_named_groups(state).await;
@@ -11688,7 +11689,7 @@ async fn leave_treekem_group(
     let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
     if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
         if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(group_id = %id, "failed to remove TreeKEM snapshot after leave: {e}");
+            tracing::warn!(group_id = %LogHexId::group(&id), "failed to remove TreeKEM snapshot after leave: {e}");
         }
     }
     save_named_groups(&state).await;
@@ -11851,7 +11852,7 @@ async fn remove_treekem_named_group_member(
     if let Err(e) =
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
     {
-        tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after removal: {e}");
+        tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after removal: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -12180,7 +12181,7 @@ async fn leave_group(
     let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
     if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
         if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(group_id = %id, "failed to remove TreeKEM snapshot on delete: {e}");
+            tracing::warn!(group_id = %LogHexId::group(&id), "failed to remove TreeKEM snapshot on delete: {e}");
         }
     }
     save_named_groups(&state).await;
@@ -12616,7 +12617,7 @@ async fn ban_group_member(
             }
             let Some(kem_b64) = recipient_kem_b64 else {
                 tracing::warn!(
-                    recipient = %recipient,
+                    recipient = %LogHexId::agent(&recipient),
                     "rekey: no KEM pubkey on record for remaining member; cannot seal"
                 );
                 continue;
@@ -12799,7 +12800,7 @@ async fn ban_treekem_group_member(
     if let Err(e) =
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
     {
-        tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after ban: {e}");
+        tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after ban: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(
@@ -13194,14 +13195,14 @@ async fn approve_join_request(
             }
             (None, _) => {
                 tracing::warn!(
-                    group_id = %id,
+                    group_id = %LogHexId::group(&id),
                     "approval: no group shared secret yet; requester will receive via next rekey"
                 );
             }
             (_, None) => {
                 tracing::warn!(
-                    group_id = %id,
-                    requester = %requester_hex,
+                    group_id = %LogHexId::group(&id),
+                    requester = %LogHexId::agent(&requester_hex),
                     "approval: requester KEM pubkey unknown; cannot seal secure share"
                 );
             }
@@ -13409,7 +13410,7 @@ async fn approve_treekem_join_request(
     if let Err(e) =
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
     {
-        tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after approval: {e}");
+        tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after approval: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -14910,7 +14911,7 @@ fn spawn_kv_store_delta_delivery_one(
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(
-                recipient = %recipient_hex,
+                recipient = %LogHexId::agent(&recipient_hex),
                 "cannot direct-deliver kv-store delta: invalid recipient id: {e}"
             );
             return;
@@ -14939,7 +14940,7 @@ fn spawn_kv_store_delta_delivery_one(
         {
             tracing::warn!(
                 store_id = %store_label,
-                recipient = %recipient_label,
+                recipient = %LogHexId::agent(&recipient_label),
                 "failed to direct-deliver kv-store delta: {e}"
             );
         }
@@ -18439,7 +18440,7 @@ async fn handle_join_result_message(
                 sender = %sender_hex,
             );
             if sender_hex != member_agent_id {
-                tracing::warn!(group_id = %group_id, sender = %sender_hex, member = %member_agent_id, "ignoring unauthorized join-result fetch");
+                tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), member = %LogHexId::agent(&member_agent_id), "ignoring unauthorized join-result fetch");
                 return;
             }
             let key = join_result_key(&group_id, &member_agent_id);
@@ -18478,7 +18479,7 @@ async fn handle_join_result_message(
             let payload = match serde_json::to_vec(&response) {
                 Ok(payload) => payload,
                 Err(e) => {
-                    tracing::warn!(group_id = %group_id, "failed to serialize join-result event: {e}");
+                    tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize join-result event: {e}");
                     return;
                 }
             };
@@ -18497,7 +18498,7 @@ async fn handle_join_result_message(
                 .send_direct_with_config(sender, payload, direct_message_send_config())
                 .await
             {
-                tracing::warn!(group_id = %group_id, member = %member_agent_id, "failed to send join-result response: {e}");
+                tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "failed to send join-result response: {e}");
                 tracing::debug!(
                     target: "treekem.trace",
                     stage = "join_result_send_err",
@@ -18537,7 +18538,7 @@ async fn handle_join_result_message(
             };
             let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
             if member_agent_id != local_agent_hex {
-                tracing::warn!(group_id = %group_id, member = %member_agent_id, local = %local_agent_hex, "ignoring join-result for different member");
+                tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), local = %LogHexId::agent(&local_agent_hex), "ignoring join-result for different member");
                 return;
             }
             let sender_hex = hex::encode(sender.as_bytes());
@@ -18553,11 +18554,11 @@ async fn handle_join_result_message(
                     .map(|info| hex::encode(info.creator.as_bytes()))
             };
             let Some(creator_hex) = creator_hex else {
-                tracing::warn!(group_id = %group_id, "ignoring join-result for unknown local group");
+                tracing::warn!(group_id = %LogHexId::group(&group_id), "ignoring join-result for unknown local group");
                 return;
             };
             if sender_hex != creator_hex {
-                tracing::warn!(group_id = %group_id, sender = %sender_hex, creator = %creator_hex, "ignoring join-result from non-creator");
+                tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), creator = %LogHexId::agent(&creator_hex), "ignoring join-result from non-creator");
                 return;
             }
             apply_named_group_metadata_event(state, event, *sender, true).await;
@@ -18584,7 +18585,7 @@ async fn poll_join_result_until_treekem_ready(
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
             Err(e) => {
-                tracing::warn!(group_id = %group_id, "failed to serialize join-result fetch request: {e}");
+                tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize join-result fetch request: {e}");
                 return;
             }
         };
@@ -18628,7 +18629,7 @@ async fn poll_join_result_until_treekem_ready(
         }
         tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
     }
-    tracing::warn!(group_id = %group_id, member = %member_agent_id, "timed out polling anchor for TreeKEM join result");
+    tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "timed out polling anchor for TreeKEM join result");
 }
 
 async fn stage_treekem_welcome(
@@ -18930,7 +18931,7 @@ async fn handle_welcome_fetch_request(
         return;
     }
     if pending.group_id != group_id || pending.joiner_agent != sender_hex {
-        tracing::warn!(welcome_id, sender = %sender_hex, "unauthorized Welcome fetch request");
+        tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sender = %LogHexId::agent(&sender_hex), "unauthorized Welcome fetch request");
         return;
     }
     let state = Arc::clone(state);
@@ -19076,7 +19077,7 @@ async fn handle_welcome_blob_chunk(
             tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence);
         }
         Err(e) => {
-            tracing::warn!(welcome_id = %welcome_id, sequence, "failed to ack Welcome blob chunk: {e}");
+            tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sequence, "failed to ack Welcome blob chunk: {e}");
         }
     }
 }
