@@ -5,7 +5,7 @@
 
 use crate::identity::AgentId;
 use crate::kv::{KvEntry, KvStore};
-use saorsa_gossip_crdt_sync::DeltaCrdt;
+use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -25,8 +25,10 @@ pub struct KvStoreDelta {
     /// Value updates to existing keys (key -> full entry).
     pub updated: HashMap<String, KvEntry>,
 
-    /// Name update (LWW semantics).
-    pub name_update: Option<String>,
+    /// Name update, carried as the full LWW register (value + vector clock)
+    /// so the receiver resolves it by causality rather than adopting it
+    /// unconditionally.
+    pub name_update: Option<LwwRegister<String>>,
 
     /// Agents added to the allowlist (owner-only, propagated via delta).
     pub allowlist_additions: Option<Vec<AgentId>>,
@@ -181,8 +183,13 @@ mod tests {
         let id = store_id(1);
         let mut store = KvStore::new(id, "Original".to_string(), owner, AccessPolicy::Signed);
 
+        // A peer renames the store on top of the shared initial state; its
+        // name register causally dominates ours, so the LWW merge adopts it.
+        let mut other = KvStore::new(id, "Original".to_string(), owner, AccessPolicy::Signed);
+        other.update_name("Updated".to_string(), peer(1));
+
         let mut delta = KvStoreDelta::new(1);
-        delta.name_update = Some("Updated".to_string());
+        delta.name_update = Some(other.name_register().clone());
 
         store
             .merge_delta(&delta, peer(1), Some(&owner))

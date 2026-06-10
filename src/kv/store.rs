@@ -181,6 +181,16 @@ impl KvStore {
         self.name.get()
     }
 
+    /// The name register, including its vector clock.
+    ///
+    /// Deltas carry this whole register (not just the value) so receivers can
+    /// resolve a remote name change by causality rather than adopting it
+    /// unconditionally.
+    #[must_use]
+    pub fn name_register(&self) -> &LwwRegister<String> {
+        &self.name
+    }
+
     /// Get the access policy.
     #[must_use]
     pub fn policy(&self) -> &AccessPolicy {
@@ -439,9 +449,10 @@ impl KvStore {
             }
         }
 
-        // Apply name update
-        if let Some(ref new_name) = delta.name_update {
-            self.name.set(new_name.clone(), peer_id);
+        // Apply name update via LWW (vector-clock) merge so a stale delta
+        // cannot overwrite a newer local name; mirrors the full-state merge.
+        if let Some(ref name_register) = delta.name_update {
+            self.name.merge(name_register);
         }
 
         self.version += 1;
@@ -490,7 +501,7 @@ impl KvStore {
             }
         }
 
-        delta.name_update = Some(self.name().to_string());
+        delta.name_update = Some(self.name.clone());
 
         // Include allowlist in full delta
         if !self.allowed_writers.is_empty() {

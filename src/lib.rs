@@ -8279,7 +8279,12 @@ impl TaskListHandle {
                     e
                 )))
             })?;
-            crdt::TaskListDelta::for_reorder(task_ids, list.current_version())
+            // Carry the post-reorder ordering register (value + clock) so the
+            // change merges by causality on receivers.
+            crdt::TaskListDelta::for_reorder(
+                list.ordering_register().clone(),
+                list.current_version(),
+            )
         };
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish reorder delta: {}", e);
