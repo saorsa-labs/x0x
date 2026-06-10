@@ -1,42 +1,63 @@
-//! Task list synchronization using anti-entropy gossip.
+//! Task list synchronization using gossip pub/sub.
 //!
 //! This module provides automatic synchronization of TaskLists across peers
-//! using saorsa-gossip's anti-entropy mechanism combined with pub/sub.
+//! using saorsa-gossip's pub/sub delta propagation.
 //!
 //! ## Architecture
 //!
 //! - `TaskListSync` wraps a TaskList in Arc<RwLock<>> for concurrent access
-//! - Uses `AntiEntropyManager` for periodic background synchronization
 //! - Publishes deltas to a gossip topic when local changes occur
 //! - Subscribes to the topic to receive and apply remote deltas
+//! - Runs a `StateRequest` cold-start side channel so a first-time joiner
+//!   bootstraps tasks written before it subscribed (mirrors `KvStoreSync`)
 //!
 //! This provides eventual consistency across all peers sharing the same topic.
 
 use crate::crdt::{Result, TaskList, TaskListDelta};
+use crate::gossip::wire::{decode_delta, encode_delta};
 use crate::gossip::PubSubManager;
-use saorsa_gossip_crdt_sync::AntiEntropyManager;
 use saorsa_gossip_types::PeerId;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Suffix appended to a task-list topic to form its state-sync side channel.
+///
+/// State requests travel on a separate topic so the main topic keeps its
+/// existing `(PeerId, TaskListDelta)` wire format — peers that predate this
+/// channel simply never subscribe to it and are unaffected.
+const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
+
+/// Delays between state-request retries for a first-time joiner whose task
+/// list is still empty. Spread out so a slow mesh still converges without
+/// flooding.
+const STATE_REQUEST_RETRY_SECS: [u64; 4] = [1, 5, 15, 30];
+
+/// Message exchanged on the state-sync side topic.
+#[derive(Debug, Serialize, Deserialize)]
+enum TaskListSyncMessage {
+    /// A peer with no local state for the list asks holders to republish
+    /// their full state (as a regular delta) on the main topic.
+    StateRequest { requester: PeerId },
+}
+
 /// Synchronization wrapper for a TaskList.
 ///
-/// Manages automatic background synchronization of a TaskList using
-/// anti-entropy gossip. Changes are propagated via deltas published
-/// to a gossip topic.
+/// Manages automatic background synchronization of a TaskList using gossip
+/// pub/sub. Changes are propagated via deltas published to a gossip topic.
 pub struct TaskListSync {
     /// The task list being synchronized (wrapped for concurrent access).
     task_list: Arc<RwLock<TaskList>>,
-
-    /// Anti-entropy manager for periodic sync.
-    #[allow(dead_code)]
-    anti_entropy: AntiEntropyManager<TaskList>,
 
     /// Pub/sub manager for topic-based messaging.
     pubsub: Arc<PubSubManager>,
 
     /// Topic name for this task list.
     topic: String,
+
+    /// This node's gossip peer id — identifies our deltas and state
+    /// requests on the wire.
+    local_peer_id: PeerId,
 }
 
 impl TaskListSync {
@@ -47,7 +68,7 @@ impl TaskListSync {
     /// * `task_list` - The TaskList to synchronize
     /// * `pubsub` - Pub/sub manager for gossip messaging
     /// * `topic` - Topic name for pub/sub (typically task list ID)
-    /// * `sync_interval_secs` - How often to run anti-entropy (seconds)
+    /// * `local_peer_id` - This node's gossip peer id
     ///
     /// # Returns
     ///
@@ -65,33 +86,40 @@ impl TaskListSync {
     ///     task_list,
     ///     pubsub,
     ///     "tasklist-abc123".to_string(),
-    ///     30, // Sync every 30 seconds
+    ///     peer_id,
     /// )?;
     /// ```
     pub fn new(
         task_list: TaskList,
         pubsub: Arc<PubSubManager>,
         topic: String,
-        sync_interval_secs: u64,
+        local_peer_id: PeerId,
     ) -> Result<Self> {
         // Wrap task list for concurrent access
         let task_list = Arc::new(RwLock::new(task_list));
 
-        // Create anti-entropy manager
-        let anti_entropy = AntiEntropyManager::new(Arc::clone(&task_list), sync_interval_secs);
-
         Ok(Self {
             task_list,
-            anti_entropy,
             pubsub,
             topic,
+            local_peer_id,
         })
+    }
+
+    /// The state-sync side topic for this task list.
+    fn state_sync_topic(&self) -> String {
+        format!("{}{}", self.topic, STATE_SYNC_TOPIC_SUFFIX)
     }
 
     /// Start background synchronization.
     ///
     /// Subscribes to the gossip topic and begins receiving remote deltas.
-    /// This method returns immediately; synchronization runs in the background.
+    /// Also joins the state-sync side channel: holders answer state requests
+    /// by republishing their full state, and a first-time joiner (empty local
+    /// list) requests that state so it bootstraps tasks written before it
+    /// subscribed. Without this, only deltas published *after* subscribing
+    /// ever arrive. This method returns immediately; synchronization runs in
+    /// the background.
     ///
     /// # Returns
     ///
@@ -99,24 +127,15 @@ impl TaskListSync {
     ///
     /// # Errors
     ///
-    /// Returns an error if subscription or anti-entropy startup fails.
+    /// Returns an error if subscription startup fails.
     pub async fn start(&self) -> Result<()> {
         // Subscribe to topic — received messages will contain serialized deltas.
-        // The background task applies them via apply_remote_delta.
         let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
         let task_list = Arc::clone(&self.task_list);
 
         tokio::spawn(async move {
             while let Some(msg) = sub.recv().await {
-                let decoded = {
-                    use bincode::Options;
-                    bincode::options()
-                        .with_fixint_encoding()
-                        .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-                        .allow_trailing_bytes()
-                        .deserialize::<(PeerId, TaskListDelta)>(&msg.payload)
-                };
-                match decoded {
+                match decode_delta::<TaskListDelta>(&msg.payload) {
                     Ok((peer_id, delta)) => {
                         let mut list = task_list.write().await;
                         if let Err(e) = list.merge_delta(&delta, peer_id) {
@@ -130,12 +149,80 @@ impl TaskListSync {
             }
         });
 
+        // Responder: holders with non-empty state answer StateRequests by
+        // republishing their full state as a regular delta on the main topic.
+        // CRDT merge makes duplicate responses from multiple holders harmless
+        // (idempotent), so no response suppression is needed at current mesh
+        // sizes.
+        let mut sync_sub = self.pubsub.subscribe(self.state_sync_topic()).await;
+        let responder_list = Arc::clone(&self.task_list);
+        let responder_pubsub = Arc::clone(&self.pubsub);
+        let responder_topic = self.topic.clone();
+        let local_peer_id = self.local_peer_id;
+        tokio::spawn(async move {
+            while let Some(msg) = sync_sub.recv().await {
+                let Ok(TaskListSyncMessage::StateRequest { requester }) =
+                    bincode::deserialize::<TaskListSyncMessage>(&msg.payload)
+                else {
+                    continue;
+                };
+                if requester == local_peer_id {
+                    continue;
+                }
+                let full = {
+                    let list = responder_list.read().await;
+                    if list.task_count() == 0 {
+                        continue;
+                    }
+                    list.full_delta()
+                };
+                let Ok(serialized) = encode_delta(local_peer_id, &full) else {
+                    continue;
+                };
+                if let Err(e) = responder_pubsub
+                    .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
+                    .await
+                {
+                    tracing::warn!("TaskList state-response publish failed: {e}");
+                }
+            }
+        });
+
+        // Bootstrap requester: a first-time joiner starts with an empty list
+        // and has no other way to learn tasks written before it subscribed
+        // (the gossip message cache only replays recent deltas). Ask holders
+        // to republish over a short retry schedule. Requests and the
+        // full-delta responses they trigger are idempotent CRDT merges, so the
+        // extra chatter is bounded and harmless. A creator of a genuinely new
+        // list also sends these — nobody answers.
+        if self.task_list.read().await.task_count() == 0 {
+            let requester_pubsub = Arc::clone(&self.pubsub);
+            let sync_topic = self.state_sync_topic();
+            tokio::spawn(async move {
+                for delay_secs in STATE_REQUEST_RETRY_SECS {
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    let request = TaskListSyncMessage::StateRequest {
+                        requester: local_peer_id,
+                    };
+                    let Ok(serialized) = bincode::serialize(&request) else {
+                        return;
+                    };
+                    if let Err(e) = requester_pubsub
+                        .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
+                        .await
+                    {
+                        tracing::debug!("TaskList state-request publish failed: {e}");
+                    }
+                }
+            });
+        }
+
         Ok(())
     }
 
     /// Stop background synchronization.
     ///
-    /// Unsubscribes from the gossip topic.
+    /// Unsubscribes from the gossip topic and its state-sync side channel.
     ///
     /// # Returns
     ///
@@ -146,6 +233,7 @@ impl TaskListSync {
     /// Returns an error if operations fail.
     pub async fn stop(&self) -> Result<()> {
         self.pubsub.unsubscribe(&self.topic).await;
+        self.pubsub.unsubscribe(&self.state_sync_topic()).await;
         Ok(())
     }
 
@@ -189,7 +277,7 @@ impl TaskListSync {
     ///
     /// Returns an error if serialization or publishing fails.
     pub async fn publish_delta(&self, local_peer_id: PeerId, delta: TaskListDelta) -> Result<()> {
-        let serialized = bincode::serialize(&(local_peer_id, delta)).map_err(|e| {
+        let serialized = encode_delta(local_peer_id, &delta).map_err(|e| {
             crate::crdt::CrdtError::Gossip(format!("failed to serialize delta: {e}"))
         })?;
 

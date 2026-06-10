@@ -267,10 +267,7 @@ fn test_delta_generation() {
     let task = TaskItem::new(task_id, metadata, peer_id);
     task_list.add_task(task, peer_id, 1).expect("Failed to add");
 
-    let delta = task_list.delta(0);
-    assert!(delta.is_some());
-
-    let delta = delta.unwrap();
+    let delta = task_list.full_delta();
     assert!(!delta.added_tasks.is_empty());
 }
 

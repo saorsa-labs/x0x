@@ -302,14 +302,14 @@ impl KvStore {
     }
 
     /// Get an entry by key.
+    ///
+    /// `entries` and the active-key OR-Set are kept in lockstep by `put`,
+    /// `remove`, `merge`, and `merge_delta` (a tombstoned key is removed from
+    /// both), so a direct `entries` lookup already excludes inactive keys
+    /// without materializing and scanning the OR-Set on every read.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&KvEntry> {
-        let key_string = key.to_string();
-        if self.keys.elements().contains(&&key_string) {
-            self.entries.get(key)
-        } else {
-            None
-        }
+        self.entries.get(key)
     }
 
     /// Remove a key from the store.
@@ -474,10 +474,11 @@ impl KvStore {
     #[must_use]
     pub fn full_delta(&self) -> KvStoreDelta {
         let mut delta = KvStoreDelta::new(self.version);
-        let active: HashSet<String> = self.keys.elements().into_iter().cloned().collect();
 
-        for (key, entry) in &self.entries {
-            if active.contains(key) {
+        // Walk the active-key OR-Set directly and look entries up, rather than
+        // cloning the whole key set into an intermediate HashSet first.
+        for key in self.keys.elements() {
+            if let Some(entry) = self.entries.get(key) {
                 let tag = (PeerId::new([0u8; 32]), 0);
                 delta.added.insert(key.clone(), (entry.clone(), tag));
             }

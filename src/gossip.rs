@@ -6,6 +6,7 @@
 pub mod config;
 pub mod pubsub;
 pub mod runtime;
+pub(crate) mod wire;
 
 pub use config::GossipConfig;
 pub use pubsub::{

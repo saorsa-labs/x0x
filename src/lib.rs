@@ -7428,7 +7428,7 @@ impl Agent {
             task_list,
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
-            30,
+            peer_id,
         )
         .map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -7490,7 +7490,7 @@ impl Agent {
             task_list,
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
-            30,
+            peer_id,
         )
         .map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -8321,7 +8321,6 @@ impl Agent {
             store,
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
-            30,
             peer_id,
         )
         .map_err(|e| {
@@ -8377,7 +8376,6 @@ impl Agent {
             store,
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
-            30,
             peer_id,
         )
         .map_err(|e| {

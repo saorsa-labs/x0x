@@ -351,6 +351,9 @@ impl TaskList {
 
         let current_order = self.ordering.get();
         let or_set_tasks: HashSet<TaskId> = self.tasks.elements().into_iter().copied().collect();
+        // Membership set over the ordering vector so the append phase below is
+        // O(1) per task instead of an O(n) `Vec::contains` inside the loop.
+        let ordered_ids: HashSet<&TaskId> = current_order.iter().collect();
 
         // Start with tasks in the ordering vector, but only if they're in the OR-Set
         let mut ordered: Vec<&TaskItem> = current_order
@@ -361,7 +364,7 @@ impl TaskList {
 
         // Append tasks that are in OR-Set but not in ordering
         for task_id in &or_set_tasks {
-            if !current_order.contains(task_id) {
+            if !ordered_ids.contains(task_id) {
                 if let Some(task) = self.task_data.get(task_id) {
                     ordered.push(task);
                 }
