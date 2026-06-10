@@ -85,6 +85,10 @@ jobs:
         run: cargo nextest run --all-features --test gui_smoke
       - name: Run WebSocket tests
         run: cargo nextest run --all-features --test ws_integration -- --ignored
+      - name: Run KvStore first-join bootstrap tests (issue 96)
+        run: cargo nextest run --all-features --test kv_first_join_bootstrap --test-threads 1 -- --ignored
+      - name: Run local-topic routing tests (issue 89)
+        run: cargo nextest run --all-features --test local_topics --test-threads 1 -- --ignored
 
   # ── Soak test (weekly, ~90min) ────────────────────────────────────────
   soak:

@@ -344,6 +344,10 @@ enum UserIdSub {
     Create {
         /// Output path. Existing file at this path is overwritten.
         path: Option<PathBuf>,
+        /// Derive the keypair deterministically from a 32-byte hex seed
+        /// (64 hex chars) via FIPS 204 seeded KeyGen. Same seed, same keypair.
+        #[arg(long, value_name = "HEX")]
+        from_seed: Option<String>,
     },
     /// Read and validate a user identity file (no daemon needed).
     /// Defaults to ~/.x0x/user.key.
@@ -1109,8 +1113,9 @@ async fn run(
             };
         }
         Commands::UserId { sub } => match sub {
-            UserIdSub::Create { path } => {
-                let resolved = commands::user_id::create(path.clone()).await?;
+            UserIdSub::Create { path, from_seed } => {
+                let resolved =
+                    commands::user_id::create(path.clone(), from_seed.as_deref()).await?;
                 match format {
                     OutputFormat::Json => x0x::cli::print_value(
                         format,

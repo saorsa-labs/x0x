@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .context("usage: x0x-user-keygen <output-path>")?;
 
-    let resolved = x0x::cli::commands::user_id::create(Some(output)).await?;
+    let resolved = x0x::cli::commands::user_id::create(Some(output), None).await?;
     println!("{}", resolved.display());
     Ok(())
 }
