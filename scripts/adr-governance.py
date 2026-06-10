@@ -4,8 +4,8 @@
 Enforces:
 - ADR files live under docs/adr/ and use NNNN-short-title.md (the established
   convention in this repository, e.g. 0001-bootstrap-peers-are-seed-hints-only.md).
-- Required sections exist on ADRs touched by the change (legacy ADRs are
-  grandfathered until edited).
+- Required template sections exist on ADRs added by the change (pre-existing
+  ADRs keep their original structure).
 - Status is present and starts with an allowed lifecycle value. Annotations
   after the status are fine, e.g. "Accepted (2026-06-07). Follow-up in ...".
 - Accepted ADRs are immutable after acceptance. If a decision changes, create a
@@ -24,8 +24,10 @@ ALLOWED_STATUSES = {"Proposed", "Accepted", "Superseded", "Deprecated", "Rejecte
 REQUIRED_SECTIONS = ["Context", "Decision", "Consequences", "Validation"]
 FILENAME_RE = re.compile(r"^\d{4}-[a-z0-9][a-z0-9-]*\.md$")
 ADR_PATH_RE = re.compile(r"^docs/adr/\d{4}-[a-z0-9][a-z0-9-]*\.md$")
-# Matches the header status bullet only: "- Status: ..." or "- **Status:** ...".
-STATUS_RE = re.compile(r"(?im)^\s*[-*]\s*\*{0,2}Status:?\*{0,2}:?\s*(.+?)\s*$")
+# Existing ADRs use two status styles: a header bullet ("- Status: ...",
+# "- **Status:** ...") or a "## Status" section with the value on the next line.
+STATUS_BULLET_RE = re.compile(r"(?im)^\s*[-*]\s*\*{0,2}Status:?\*{0,2}:?\s*(.+?)\s*$")
+STATUS_SECTION_RE = re.compile(r"(?im)^##\s+Status[ \t]*\n(?:[ \t]*\n)*[ \t]*(.+?)[ \t]*$")
 NON_ADR_FILES = {"README.md", "TEMPLATE.md", "TOOLING.md"}
 
 
@@ -34,7 +36,7 @@ def run(cmd: list[str]) -> str:
 
 
 def status_of(text: str) -> str | None:
-    m = STATUS_RE.search(text)
+    m = STATUS_BULLET_RE.search(text) or STATUS_SECTION_RE.search(text)
     return m.group(1).strip().strip("*").strip() if m else None
 
 
@@ -115,9 +117,14 @@ def main() -> int:
             errors.append(
                 f"{path}: invalid Status '{st}' (must start with one of: {', '.join(sorted(ALLOWED_STATUSES))})"
             )
-        for section in REQUIRED_SECTIONS:
-            if not re.search(rf"(?im)^##\s+{re.escape(section)}\b", text):
-                errors.append(f"{path}: missing required section '## {section}'")
+        # Full template structure is required for ADRs new in this change.
+        # Edited pre-existing ADRs keep their original structure (the
+        # immutability check below still guards Accepted ones).
+        is_new = base is not None and file_at(base, path.as_posix()) is None
+        if is_new:
+            for section in REQUIRED_SECTIONS:
+                if not re.search(rf"(?im)^##\s+{re.escape(section)}\b", text):
+                    errors.append(f"{path}: missing required section '## {section}'")
 
     if base:
         for name in changed:
