@@ -2,9 +2,12 @@
 """Repository-local ADR governance checks.
 
 Enforces:
-- ADR files live under docs/adr/ and use ADR-NNNN-short-title.md.
-- Required sections exist.
-- Status is present and from the allowed lifecycle.
+- ADR files live under docs/adr/ and use NNNN-short-title.md (the established
+  convention in this repository, e.g. 0001-bootstrap-peers-are-seed-hints-only.md).
+- Required sections exist on ADRs touched by the change (legacy ADRs are
+  grandfathered until edited).
+- Status is present and starts with an allowed lifecycle value. Annotations
+  after the status are fine, e.g. "Accepted (2026-06-07). Follow-up in ...".
 - Accepted ADRs are immutable after acceptance. If a decision changes, create a
   new ADR and supersede by reference rather than editing the Accepted ADR.
 """
@@ -19,8 +22,11 @@ from pathlib import Path
 ADR_DIR = Path("docs/adr")
 ALLOWED_STATUSES = {"Proposed", "Accepted", "Superseded", "Deprecated", "Rejected"}
 REQUIRED_SECTIONS = ["Context", "Decision", "Consequences", "Validation"]
-FILENAME_RE = re.compile(r"^ADR-\d{4}-[a-z0-9][a-z0-9-]*\.md$")
-STATUS_RE = re.compile(r"(?im)^\s*(?:[-*]\s*)?.*?Status.*?:\s*(.+?)\s*$")
+FILENAME_RE = re.compile(r"^\d{4}-[a-z0-9][a-z0-9-]*\.md$")
+ADR_PATH_RE = re.compile(r"^docs/adr/\d{4}-[a-z0-9][a-z0-9-]*\.md$")
+# Matches the header status bullet only: "- Status: ..." or "- **Status:** ...".
+STATUS_RE = re.compile(r"(?im)^\s*[-*]\s*\*{0,2}Status:?\*{0,2}:?\s*(.+?)\s*$")
+NON_ADR_FILES = {"README.md", "TEMPLATE.md", "TOOLING.md"}
 
 
 def run(cmd: list[str]) -> str:
@@ -30,6 +36,12 @@ def run(cmd: list[str]) -> str:
 def status_of(text: str) -> str | None:
     m = STATUS_RE.search(text)
     return m.group(1).strip().strip("*").strip() if m else None
+
+
+def status_token(status: str) -> str:
+    """Leading lifecycle word of a status line, e.g. 'Accepted' from
+    'Accepted (2026-06-07). The roster-removal half ships in PR #99'."""
+    return status.split()[0].strip("*").rstrip(".,;:") if status.split() else status
 
 
 def base_ref() -> str | None:
@@ -66,45 +78,56 @@ def main() -> int:
         print("No docs/adr directory; nothing to validate.")
         return 0
 
-    adr_files = sorted(p for p in ADR_DIR.glob("ADR-*.md") if p.is_file())
+    # Every markdown file in docs/adr/ must either be a known support file or
+    # follow the NNNN-short-title.md convention. This catches misnamed new
+    # ADRs that would otherwise dodge validation entirely.
+    adr_files: list[Path] = []
+    for path in sorted(ADR_DIR.glob("*.md")):
+        if path.name in NON_ADR_FILES:
+            continue
+        if not FILENAME_RE.match(path.name):
+            errors.append(f"{path}: filename must match NNNN-short-title.md")
+            continue
+        adr_files.append(path)
+
     base = base_ref()
     changed = changed_files_against_base(base) if base else []
-    changed_adr_paths = {Path(name) for name in changed if name.startswith("docs/adr/ADR-") and name.endswith(".md")}
+    changed_adr_paths = {Path(name) for name in changed if ADR_PATH_RE.match(name)}
 
     # Grandfather legacy ADRs when first installing governance. Enforce full
     # structure on ADRs touched by this PR, while still checking duplicate
     # numbers across the full directory.
-    files_to_validate = sorted((Path(p) for p in changed_adr_paths if Path(p).exists()), key=str) if base else adr_files
+    files_to_validate = sorted((p for p in changed_adr_paths if p.exists()), key=str) if base else adr_files
 
     seen_numbers: dict[str, Path] = {}
     for path in adr_files:
-        number = path.name.split("-", 2)[1] if "-" in path.name else path.name
+        number = path.name.split("-", 1)[0]
         if number in seen_numbers:
             errors.append(f"{path}: duplicate ADR number also used by {seen_numbers[number]}")
         seen_numbers[number] = path
 
     for path in files_to_validate:
-        if not FILENAME_RE.match(path.name):
-            errors.append(f"{path}: filename must match ADR-NNNN-short-title.md")
         text = path.read_text(encoding="utf-8")
         st = status_of(text)
         if not st:
             errors.append(f"{path}: missing Status")
-        elif st not in ALLOWED_STATUSES:
-            errors.append(f"{path}: invalid Status '{st}' (allowed: {', '.join(sorted(ALLOWED_STATUSES))})")
+        elif status_token(st) not in ALLOWED_STATUSES:
+            errors.append(
+                f"{path}: invalid Status '{st}' (must start with one of: {', '.join(sorted(ALLOWED_STATUSES))})"
+            )
         for section in REQUIRED_SECTIONS:
             if not re.search(rf"(?im)^##\s+{re.escape(section)}\b", text):
                 errors.append(f"{path}: missing required section '## {section}'")
 
     if base:
         for name in changed:
-            if not (name.startswith("docs/adr/ADR-") and name.endswith(".md")):
+            if not ADR_PATH_RE.match(name):
                 continue
             old = file_at(base, name)
             if old is None:
                 continue
             old_status = status_of(old)
-            if old_status == "Accepted":
+            if old_status and status_token(old_status) == "Accepted":
                 errors.append(
                     f"{name}: Accepted ADRs are immutable. Create a new superseding ADR instead of editing this file."
                 )

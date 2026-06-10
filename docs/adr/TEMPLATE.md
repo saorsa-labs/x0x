@@ -1,11 +1,13 @@
-# ADR-NNNN: <Decision Title>
+# ADR NNNN: <Decision Title>
+
+<!-- File name: docs/adr/NNNN-short-title.md (e.g. 0001-bootstrap-peers-are-seed-hints-only.md) -->
 
 - **Status:** Proposed
 - **Date:** YYYY-MM-DD
 - **Decision owners:** <names/handles>
 - **Reviewers:** <names/handles>
-- **Supersedes:** <ADR-NNNN or none>
-- **Superseded by:** <ADR-NNNN or none>
+- **Supersedes:** <ADR NNNN or none>
+- **Superseded by:** <ADR NNNN or none>
 - **Related:** <issues/PRs/specs>
 
 ## Context
