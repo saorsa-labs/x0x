@@ -131,23 +131,7 @@ pub async fn sign(
 ) -> Result<()> {
     client.ensure_running().await?;
 
-    let payload_b64 = match (file, payload_b64) {
-        (Some(path), None) => {
-            let bytes = if path == "-" {
-                let mut buf = Vec::new();
-                std::io::stdin()
-                    .read_to_end(&mut buf)
-                    .context("failed to read stdin")?;
-                buf
-            } else {
-                std::fs::read(path).with_context(|| format!("failed to read file: {path}"))?
-            };
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        }
-        (None, Some(b64)) => b64.to_string(),
-        (Some(_), Some(_)) => bail!("pass either --file or --payload-b64, not both"),
-        (None, None) => bail!("pass either --file <PATH> or --payload-b64 <BASE64>"),
-    };
+    let payload_b64 = payload_b64_from_args(file, payload_b64)?;
 
     let mut body = serde_json::json!({ "payload_b64": payload_b64 });
     if let Some(domain) = domain {
@@ -158,13 +142,76 @@ pub async fn sign(
     Ok(())
 }
 
+/// `x0x agent verify` — POST /agent/verify
+///
+/// Verifies a detached ML-DSA-65 signature against a caller-supplied
+/// public key. The payload comes from `--file <PATH>` (or stdin when the
+/// path is `-`) OR `--payload-b64 <BASE64>`, exactly as for `sign`. Pass
+/// `--domain <STRING>` when the signature was produced with domain
+/// separation (`domain || 0x00 || payload`, issue #90). Verification is
+/// stateless — the daemon uses only the supplied public material.
+///
+/// Exit status: 0 when the signature is valid; non-zero when it is not
+/// (the daemon reports `valid: false`) or on malformed input.
+pub async fn verify(
+    client: &DaemonClient,
+    file: Option<&str>,
+    payload_b64: Option<&str>,
+    signature_b64: &str,
+    public_key_b64: &str,
+    domain: Option<&str>,
+) -> Result<()> {
+    // Usage errors (missing/ambiguous payload args) must win over daemon
+    // reachability, so validate local inputs before probing the daemon.
+    let payload_b64 = payload_b64_from_args(file, payload_b64)?;
+
+    client.ensure_running().await?;
+
+    let mut body = serde_json::json!({
+        "payload_b64": payload_b64,
+        "signature_b64": signature_b64,
+        "public_key_b64": public_key_b64,
+    });
+    if let Some(domain) = domain {
+        body["domain"] = serde_json::Value::String(domain.to_string());
+    }
+    let resp = client.post("/agent/verify", &body).await?;
+    print_value(client.format(), &resp);
+    if resp.get("valid").and_then(|v| v.as_bool()) != Some(true) {
+        bail!("signature verification failed");
+    }
+    Ok(())
+}
+
+/// Resolve the payload for `sign`/`verify` from `--file <PATH>` (with `-`
+/// meaning stdin) or `--payload-b64 <BASE64>`, returning base64 bytes.
+fn payload_b64_from_args(file: Option<&str>, payload_b64: Option<&str>) -> Result<String> {
+    match (file, payload_b64) {
+        (Some(path), None) => {
+            let bytes = if path == "-" {
+                let mut buf = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .context("failed to read stdin")?;
+                buf
+            } else {
+                std::fs::read(path).with_context(|| format!("failed to read file: {path}"))?
+            };
+            Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        (None, Some(b64)) => Ok(b64.to_string()),
+        (Some(_), Some(_)) => bail!("pass either --file or --payload-b64, not both"),
+        (None, None) => bail!("pass either --file <PATH> or --payload-b64 <BASE64>"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::cli::{DaemonClient, OutputFormat};
 
-    use crate::cli::commands::test_support::start_mock_server;
+    use crate::cli::commands::test_support::{start_capturing_mock_server, start_mock_server};
     #[test]
     fn identity_words_encodes_known_hex() {
         let encoder = IdentityEncoder::new();
@@ -396,5 +443,106 @@ mod tests {
             "ampersand was not percent-encoded: {uri}"
         );
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn verify_posts_full_body_to_verify_endpoint() {
+        let mock_resp = serde_json::json!({
+            "ok": true, "valid": true, "algorithm": "x0x.agent-sign.v1.ml-dsa-65"
+        });
+        let (url, _shutdown, captured) = start_capturing_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+
+        let result = verify(
+            &client,
+            None,
+            Some("aGVsbG8="),
+            "c2ln",
+            "cGs=",
+            Some("x0x.test.v1"),
+        )
+        .await;
+        assert!(result.is_ok(), "verify should succeed: {:?}", result);
+
+        let captured = captured.lock().unwrap();
+        let (_, body) = captured
+            .iter()
+            .find(|(path, _)| path == "/agent/verify")
+            .expect("a request must be POSTed to /agent/verify");
+        assert_eq!(body["payload_b64"], "aGVsbG8=");
+        assert_eq!(body["signature_b64"], "c2ln");
+        assert_eq!(body["public_key_b64"], "cGs=");
+        assert_eq!(body["domain"], "x0x.test.v1");
+    }
+
+    #[tokio::test]
+    async fn verify_omits_domain_when_not_passed() {
+        let mock_resp = serde_json::json!({"ok": true, "valid": true});
+        let (url, _shutdown, captured) = start_capturing_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+
+        let result = verify(&client, None, Some("aGVsbG8="), "c2ln", "cGs=", None).await;
+        assert!(result.is_ok(), "verify should succeed: {:?}", result);
+
+        let captured = captured.lock().unwrap();
+        let (_, body) = captured
+            .iter()
+            .find(|(path, _)| path == "/agent/verify")
+            .expect("a request must be POSTed to /agent/verify");
+        assert!(
+            body.get("domain").is_none(),
+            "request must not contain a domain field when none was passed"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_fails_when_daemon_reports_invalid() {
+        // The daemon's 200 + valid:false is a result, not an HTTP error —
+        // but for scripts the CLI exit code must still reflect it.
+        let mock_resp = serde_json::json!({
+            "ok": true, "valid": false, "algorithm": "x0x.agent-sign.v1.ml-dsa-65"
+        });
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+
+        let result = verify(&client, None, Some("aGVsbG8="), "c2ln", "cGs=", None).await;
+        assert!(result.is_err(), "valid:false must map to a non-zero exit");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("signature verification failed"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_ambiguous_or_missing_payload() {
+        let mock_resp = serde_json::json!({"unused": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+
+        let both = verify(&client, Some("-"), Some("aGVsbG8="), "c2ln", "cGs=", None).await;
+        assert!(both.is_err());
+        assert!(both.unwrap_err().to_string().contains("pass either --file"));
+
+        let neither = verify(&client, None, None, "c2ln", "cGs=", None).await;
+        assert!(neither.is_err());
+        assert!(neither
+            .unwrap_err()
+            .to_string()
+            .contains("pass either --file <PATH>"));
+    }
+
+    #[tokio::test]
+    async fn verify_arg_errors_win_over_unreachable_daemon() {
+        // No server listening: if verify probed the daemon before validating
+        // its arguments, this would surface a connectivity error instead of
+        // the usage error.
+        let client =
+            DaemonClient::new(None, Some("http://127.0.0.1:9"), OutputFormat::Json).unwrap();
+        let neither = verify(&client, None, None, "c2ln", "cGs=", None).await;
+        assert!(neither.is_err());
+        assert!(neither
+            .unwrap_err()
+            .to_string()
+            .contains("pass either --file <PATH>"));
     }
 }

@@ -69,6 +69,7 @@ curl http://127.0.0.1:12700/status
 | GET | `/agent/card` | `x0x agent card` | Generate a shareable identity card |
 | POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
+| POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 
 ### Announce request body
 
@@ -106,6 +107,38 @@ Notes:
   `x0x.<purpose>.<version>` is the conventional shape for x0x protocols.
 - Response: `ok`, `agent_id` (hex), `public_key_b64`, `signature_b64`,
   `algorithm` (`x0x.agent-sign.v1.ml-dsa-65`), and `domain` when supplied.
+
+### Verify request body
+
+```json
+{
+  "payload_b64": "<base64 payload bytes>",
+  "signature_b64": "<base64 detached ML-DSA-65 signature>",
+  "public_key_b64": "<base64 ML-DSA-65 public key>",
+  "domain": "my-protocol.v1.register",
+  "algorithm": "x0x.agent-sign.v1.ml-dsa-65"
+}
+```
+
+Notes:
+- Stateless: verification uses only the caller-supplied public material —
+  no key access, no identity state. The counterpart to `/agent/sign` for
+  applications reading signed records back from disk or distributed
+  storage.
+- A failed signature check is a **result, not an error**: the response is
+  `200` with `{ "ok": true, "valid": false, "algorithm": "x0x.agent-sign.v1.ml-dsa-65" }`.
+- `400` is reserved for malformed input: bad base64 in any field, empty
+  payload, a public key that is not exactly 1952 bytes, a signature that
+  is not exactly 3309 bytes, an invalid `domain` (empty, NUL bytes, or
+  over 1024 bytes), or an unknown `algorithm`. `413` for payloads over
+  the 256 KiB cap. Limits mirror `/agent/sign` exactly.
+- `domain` is optional and must match the value used at signing time:
+  verification is then performed over `domain || 0x00 || payload`.
+- `algorithm` is optional; when the field is present — including as JSON
+  null — it must be the exact scheme string
+  `x0x.agent-sign.v1.ml-dsa-65`, so any future scheme migration is
+  explicit rather than silent.
+- Response: `ok`, `valid` (boolean), `algorithm`.
 
 ## Network
 

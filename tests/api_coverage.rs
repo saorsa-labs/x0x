@@ -59,6 +59,7 @@ const COVERED: &[CoveredEndpoint] = &[
         daemon_api_import_card_invalid_trust_level_rejected
     ),
     covered!(Post, "/agent/sign", daemon_api_agent_sign_roundtrip),
+    covered!(Post, "/agent/verify", daemon_api_agent_verify_roundtrip),
     // ── Network ─────────────────────────────────────────────────────────
     covered!(Get, "/peers", daemon_api_peers),
     // ── Presence ────────────────────────────────────────────────────────

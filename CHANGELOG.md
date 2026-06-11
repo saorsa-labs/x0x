@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /agent/verify` + `x0x agent verify` — signature-verify counterpart to `/agent/sign`** (#106, PR #109). Stateless detached ML-DSA-65 signature verification using only caller-supplied public material: applications that persist signed records no longer need to bundle their own FIPS-204 library or re-derive the `domain || 0x00 || payload` framing when reading records back. A failed check is a result (`200` + `valid: false`), not an error; `400`/`413` mirror `/agent/sign`'s malformed-input and size rules, with explicit key-length (1952) and signature-length (3309) validation and an optional `algorithm` field rejecting unknown schemes (including present-but-null). Proposed by @JimCollinson.
+
 ## [v0.23.0] - 2026-06-10
 
 ### Fixed

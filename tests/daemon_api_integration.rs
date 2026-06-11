@@ -283,6 +283,562 @@ async fn daemon_api_agent_sign_rejects_oversize_payload() {
     assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+// ── POST /agent/verify (issue #106) ─────────────────────────────────────
+
+/// Sign `payload` via POST /agent/sign and return (signature_b64, public_key_b64).
+async fn sign_via_daemon(
+    d: &DaemonFixture,
+    payload: &[u8],
+    domain: Option<&str>,
+) -> (String, String) {
+    let mut body = serde_json::json!({ "payload_b64": b64(payload) });
+    if let Some(domain) = domain {
+        body["domain"] = serde_json::Value::String(domain.to_string());
+    }
+    let r: Value = ca(d)
+        .post(d.url("/agent/sign"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true, "sign must succeed before verify: {r}");
+    (
+        r["signature_b64"].as_str().unwrap().to_string(),
+        r["public_key_b64"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_roundtrip() {
+    let d = daemon().await;
+    let payload = b"audit record bytes read back from storage";
+    let (sig, pk) = sign_via_daemon(&d, payload, None).await;
+
+    let resp = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: Value = resp.json().await.unwrap();
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["valid"], true);
+    assert_eq!(r["algorithm"], "x0x.agent-sign.v1.ml-dsa-65");
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_independent_keypair() {
+    // The primary third-party use case: the verifying daemon never authored
+    // the signature and holds none of the key material — a record signed by
+    // an arbitrary ML-DSA-65 keypair must verify from the supplied bytes alone.
+    let d = daemon().await;
+    let (public_key, secret_key) =
+        ant_quic::crypto::raw_public_keys::pqc::generate_ml_dsa_keypair()
+            .expect("keypair generation");
+    let payload = b"record authored on a machine this daemon has never seen";
+    let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret_key, payload)
+        .expect("local signing");
+
+    let r: Value = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": b64(signature.as_bytes()),
+            "public_key_b64": b64(public_key.as_bytes()),
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert_eq!(
+        r["valid"], true,
+        "a signature from a caller-supplied keypair must verify"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_tampered_payload_is_result_not_error() {
+    let d = daemon().await;
+    let (sig, pk) = sign_via_daemon(&d, b"the original payload", None).await;
+
+    let resp = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(b"the tampered payload"),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a failed signature check is a result, not an error"
+    );
+    let r: Value = resp.json().await.unwrap();
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["valid"], false);
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_tampered_signature_is_result_not_error() {
+    let d = daemon().await;
+    let payload = b"payload whose signature gets corrupted in storage";
+    let (sig, pk) = sign_via_daemon(&d, payload, None).await;
+
+    // Flip one bit mid-signature: still 3309 bytes, so it passes the
+    // malformed-input checks and must fail as `valid: false`, not 400.
+    let mut sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&sig)
+        .unwrap();
+    sig_bytes[100] ^= 0x01;
+
+    let resp = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": b64(&sig_bytes),
+            "public_key_b64": pk,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: Value = resp.json().await.unwrap();
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["valid"], false);
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_domain_separation_enforced() {
+    let d = daemon().await;
+    let payload = b"register envelope bytes";
+    let domain = "x0x.test.v1.verify";
+    let (sig, pk) = sign_via_daemon(&d, payload, Some(domain)).await;
+
+    // With the matching domain the signature verifies.
+    let r: Value = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig.clone(),
+            "public_key_b64": pk.clone(),
+            "domain": domain,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["valid"], true);
+
+    // The same bytes WITHOUT the domain must not verify — the
+    // domain || 0x00 || payload framing is enforced, not advisory.
+    let r: Value = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert_eq!(
+        r["valid"], false,
+        "domain-separated signature must NOT verify over the raw payload"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_accepts_explicit_algorithm() {
+    let d = daemon().await;
+    let payload = b"payload";
+    let (sig, pk) = sign_via_daemon(&d, payload, None).await;
+
+    let r: Value = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+            "algorithm": "x0x.agent-sign.v1.ml-dsa-65",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["valid"], true);
+}
+
+/// Assert a rejection response: expected status, `ok: false`, and an error
+/// string naming the gate that fired.
+///
+/// The substring assertion is load-bearing: every rejection test sends a
+/// request that is fully valid except for the one field under test, so
+/// without it a deleted guard could go unnoticed when a *different* check
+/// downstream happens to return the same status.
+async fn assert_rejection(resp: reqwest::Response, status: StatusCode, needle: &str) {
+    assert_eq!(resp.status(), status);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains(needle),
+        "error must identify the failing gate: expected substring {needle:?}, got {err:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_unknown_algorithm() {
+    let d = daemon().await;
+    // Real signature and key: with the algorithm gate removed this request
+    // would verify as 200 valid:true — the silent scheme migration the
+    // explicit 400 exists to prevent.
+    let payload = b"x";
+    let (sig, pk) = sign_via_daemon(&d, payload, None).await;
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+            "algorithm": "x0x.agent-sign.v2.something-else",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(r, StatusCode::BAD_REQUEST, "unsupported algorithm").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_null_algorithm() {
+    let d = daemon().await;
+    // JSON null is a *present* algorithm field, not an omitted one: an
+    // `Option<String>` request field would fold it to None and silently
+    // accept — this pins the explicit 400 instead.
+    let payload = b"x";
+    let (sig, pk) = sign_via_daemon(&d, payload, None).await;
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+            "algorithm": null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(r, StatusCode::BAD_REQUEST, "unsupported algorithm").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_requires_auth() {
+    let d = daemon().await;
+    // Bearer-token like every other endpoint — stateless or not, an
+    // unauthenticated carve-out isn't worth the inconsistency (issue #106,
+    // maintainer refinement 6).
+    let r = c()
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(b"x"),
+            "signature_b64": b64(b"sig"),
+            "public_key_b64": b64(b"pk"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_accepts_exact_boundary_sizes() {
+    let d = daemon().await;
+    // Exactly AT the caps must round-trip: the limits reject payloads
+    // *over* 256 KiB and domains *over* 1 KiB, not at them.
+    let payload = vec![0xA5u8; 256 * 1024];
+    let domain = "d".repeat(1024);
+    let (sig, pk) = sign_via_daemon(&d, &payload, Some(domain.as_str())).await;
+    let r: Value = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(&payload),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+            "domain": domain,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["valid"], true);
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_wrong_key_is_result_not_error() {
+    let d = daemon().await;
+    // A well-formed 1952-byte key that simply isn't the signer's: that is
+    // a verification *result* (valid:false), never malformed input.
+    let payload = b"signed by the daemon, checked against a stranger's key";
+    let (sig, _pk) = sign_via_daemon(&d, payload, None).await;
+    let (other_pk, _sk) = ant_quic::crypto::raw_public_keys::pqc::generate_ml_dsa_keypair()
+        .expect("keypair generation");
+    let resp = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": b64(other_pk.as_bytes()),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: Value = resp.json().await.unwrap();
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["valid"], false);
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_invalid_base64_payload() {
+    let d = daemon().await;
+    let (sig, pk) = sign_via_daemon(&d, b"x", None).await;
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": "@@@not-base64@@@",
+            "signature_b64": sig,
+            "public_key_b64": pk,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(r, StatusCode::BAD_REQUEST, "invalid base64 payload").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_invalid_base64_signature() {
+    let d = daemon().await;
+    let payload = b"x";
+    let (_sig, pk) = sign_via_daemon(&d, payload, None).await;
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": "@@@not-base64@@@",
+            "public_key_b64": pk,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(r, StatusCode::BAD_REQUEST, "invalid base64 signature").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_invalid_base64_public_key() {
+    let d = daemon().await;
+    let payload = b"x";
+    let (sig, _pk) = sign_via_daemon(&d, payload, None).await;
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": "@@@not-base64@@@",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(r, StatusCode::BAD_REQUEST, "invalid base64 public key").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_empty_payload() {
+    let d = daemon().await;
+    let (sig, pk) = sign_via_daemon(&d, b"x", None).await;
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": "",
+            "signature_b64": sig,
+            "public_key_b64": pk,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(r, StatusCode::BAD_REQUEST, "payload must be non-empty").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_oversize_payload() {
+    let d = daemon().await;
+    let (sig, pk) = sign_via_daemon(&d, b"x", None).await;
+    // Just over the 256 KiB cap — same limit as /agent/sign.
+    let oversize = vec![0u8; 256 * 1024 + 1];
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(&oversize),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(
+        r,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "exceeds maximum verifiable size",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_wrong_public_key_length() {
+    let d = daemon().await;
+    let payload = b"x";
+    let (sig, _pk) = sign_via_daemon(&d, payload, None).await;
+    // A 32-byte value is a plausible wrong-key-type paste (e.g. an agent id
+    // or an Ed25519 key) — it must be 400, never a confusing valid:false.
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": b64(&[0u8; 32]),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(r, StatusCode::BAD_REQUEST, "public key must be exactly").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_wrong_signature_length() {
+    let d = daemon().await;
+    let payload = b"x";
+    let (_sig, pk) = sign_via_daemon(&d, payload, None).await;
+    // A truncated signature is malformed input, not a failed check.
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": b64(&[0u8; 100]),
+            "public_key_b64": pk,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(r, StatusCode::BAD_REQUEST, "signature must be exactly").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_nul_in_domain() {
+    let d = daemon().await;
+    let payload = b"x";
+    let (sig, pk) = sign_via_daemon(&d, payload, None).await;
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+            "domain": "bad\u{0}domain",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(
+        r,
+        StatusCode::BAD_REQUEST,
+        "domain must not contain NUL bytes",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_empty_domain() {
+    let d = daemon().await;
+    let payload = b"x";
+    let (sig, pk) = sign_via_daemon(&d, payload, None).await;
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+            "domain": "",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(r, StatusCode::BAD_REQUEST, "domain must be non-empty").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_agent_verify_rejects_oversize_domain() {
+    let d = daemon().await;
+    let payload = b"x";
+    let (sig, pk) = sign_via_daemon(&d, payload, None).await;
+    // Just over the 1 KiB domain cap — same limit as /agent/sign.
+    let r = ca(&d)
+        .post(d.url("/agent/verify"))
+        .json(&serde_json::json!({
+            "payload_b64": b64(payload),
+            "signature_b64": sig,
+            "public_key_b64": pk,
+            "domain": "d".repeat(1025),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_rejection(r, StatusCode::BAD_REQUEST, "domain exceeds maximum length").await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn daemon_api_peers() {

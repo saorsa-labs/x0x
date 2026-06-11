@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 131,
+  "endpoint_count": 132,
   "endpoints": [
     {
       "category": "status",
@@ -70,6 +70,13 @@
       "description": "Detached ML-DSA-65 signature over a caller-supplied payload",
       "method": "POST",
       "path": "/agent/sign"
+    },
+    {
+      "category": "identity",
+      "cli_name": "agent verify",
+      "description": "Verify a detached ML-DSA-65 signature against a caller-supplied public key",
+      "method": "POST",
+      "path": "/agent/verify"
     },
     {
       "category": "network",

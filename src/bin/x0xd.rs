@@ -790,6 +790,46 @@ struct AgentSignRequest {
     domain: Option<String>,
 }
 
+/// POST /agent/verify request body — a detached ML-DSA-65 signature to
+/// verify against caller-supplied public key material.
+#[derive(Debug, Deserialize)]
+struct AgentVerifyRequest {
+    /// Base64-encoded bytes the signature was computed over. Same caveat
+    /// as `/agent/sign`: the bytes are taken verbatim, so the caller must
+    /// reproduce the exact canonical serialization that was signed.
+    payload_b64: String,
+    /// Base64-encoded detached ML-DSA-65 signature (3309 bytes decoded).
+    signature_b64: String,
+    /// Base64-encoded ML-DSA-65 public key (1952 bytes decoded).
+    public_key_b64: String,
+    /// Optional domain-separation string. When present, verification is
+    /// performed over `domain || 0x00 || payload`, mirroring the
+    /// `/agent/sign` framing (issue #90). Must not contain NUL bytes.
+    #[serde(default)]
+    domain: Option<String>,
+    /// Optional signing-scheme identifier. When the field is present —
+    /// including as JSON null — it must be exactly
+    /// `x0x.agent-sign.v1.ml-dsa-65`; anything else is rejected with 400
+    /// so a future scheme migration is explicit rather than silent.
+    /// Deserialized via `deserialize_present` because a plain
+    /// `Option<String>` folds present-but-null into `None` and would
+    /// silently accept `"algorithm": null`.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    algorithm: Option<serde_json::Value>,
+}
+
+/// Deserialize a field as `Some(value)` whenever the field is present —
+/// even when the value is JSON null — so present-but-null can be
+/// distinguished from an omitted field (serde's `Option<T>` maps both
+/// to `None`).
+fn deserialize_present<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 /// POST /announce request body.
 #[derive(Debug, Default, Deserialize)]
 struct AnnounceIdentityRequest {
@@ -2085,6 +2125,7 @@ async fn main() -> Result<()> {
         .route("/agent/card", get(get_agent_card))
         .route("/agent/card/import", post(import_agent_card))
         .route("/agent/sign", post(agent_sign))
+        .route("/agent/verify", post(agent_verify))
         .route("/announce", post(announce_identity))
         .route("/peers", get(peers))
         .route("/network/status", get(network_status))
@@ -4641,6 +4682,154 @@ async fn agent_sign(
     }
 
     (StatusCode::OK, Json(resp))
+}
+
+/// POST /agent/verify — verify a detached ML-DSA-65 signature against a
+/// caller-supplied public key (issue #106).
+///
+/// Rationale. The counterpart to `POST /agent/sign`: applications that
+/// persist signed records read them back — often on machines that never
+/// authored them — and must verify from the stored bytes alone. Without
+/// this endpoint every consumer would bundle its own FIPS-204 library and
+/// re-derive x0x's `domain || 0x00 || payload` framing, which would drift
+/// the moment the convention evolves.
+///
+/// Statelessness. Verification uses only caller-supplied public material:
+/// no key access, no identity state. The handler deliberately takes no
+/// `State` extractor so this property is enforced at compile time.
+///
+/// Authentication. Bearer-token authenticated like every other endpoint.
+///
+/// Semantics. A failed signature check is a *result*, not an error:
+/// `200` with `valid: false`. `400` is reserved for malformed input (bad
+/// base64, empty payload, wrong key or signature length, invalid domain,
+/// unknown `algorithm`); `413` for payloads over the cap — mirroring
+/// `/agent/sign` exactly. When `domain` is present, verification is
+/// performed over `domain || 0x00 || payload` (issue #90 framing).
+async fn agent_verify(Json(req): Json<AgentVerifyRequest>) -> impl IntoResponse {
+    let payload = match BASE64.decode(&req.payload_b64) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return bad_request(format!("invalid base64 payload: {e}"));
+        }
+    };
+
+    if payload.is_empty() {
+        return bad_request("payload must be non-empty");
+    }
+
+    if payload.len() > AGENT_SIGN_MAX_PAYLOAD_BYTES {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "payload exceeds maximum verifiable size of {} bytes",
+                AGENT_SIGN_MAX_PAYLOAD_BYTES
+            ),
+        );
+    }
+
+    // Same domain rules and canonical-bytes assembly as `agent_sign`: the
+    // verifier must reconstruct exactly the bytes the signer committed to.
+    let canonical = match req.domain.as_deref() {
+        Some(domain) => {
+            if domain.is_empty() {
+                return bad_request("domain must be non-empty when provided");
+            }
+            if domain.as_bytes().contains(&0u8) {
+                return bad_request("domain must not contain NUL bytes");
+            }
+            if domain.len() > AGENT_SIGN_MAX_DOMAIN_BYTES {
+                return bad_request(format!(
+                    "domain exceeds maximum length of {} bytes",
+                    AGENT_SIGN_MAX_DOMAIN_BYTES
+                ));
+            }
+            let mut buf = Vec::with_capacity(domain.len() + 1 + payload.len());
+            buf.extend_from_slice(domain.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(&payload);
+            buf
+        }
+        None => payload,
+    };
+
+    // A present `algorithm` must be exactly the supported scheme string;
+    // JSON null and non-string values are present-but-wrong, not omitted.
+    if let Some(algorithm) = req.algorithm.as_ref() {
+        if algorithm.as_str() != Some(AGENT_SIGN_SCHEME_ID) {
+            return bad_request(format!(
+                "unsupported algorithm: {algorithm} (expected {AGENT_SIGN_SCHEME_ID})"
+            ));
+        }
+    }
+
+    let signature_bytes = match BASE64.decode(&req.signature_b64) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return bad_request(format!("invalid base64 signature: {e}"));
+        }
+    };
+
+    // A wrong-length signature is malformed input, not a failed check —
+    // reject it with 400 so a truncated paste never reads as `valid: false`.
+    if signature_bytes.len() != ant_quic::crypto::raw_public_keys::pqc::ML_DSA_65_SIGNATURE_SIZE {
+        return bad_request(format!(
+            "signature must be exactly {} bytes for ML-DSA-65, got {}",
+            ant_quic::crypto::raw_public_keys::pqc::ML_DSA_65_SIGNATURE_SIZE,
+            signature_bytes.len()
+        ));
+    }
+
+    let signature = match ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
+        &signature_bytes,
+    ) {
+        Ok(sig) => sig,
+        Err(e) => {
+            return bad_request(format!("invalid signature format: {e:?}"));
+        }
+    };
+
+    let public_key_bytes = match BASE64.decode(&req.public_key_b64) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return bad_request(format!("invalid base64 public key: {e}"));
+        }
+    };
+
+    // An ML-DSA-65 public key is exactly 1952 bytes; anything else is a
+    // wrong-key-type paste and gets 400, never a confusing `valid: false`.
+    if public_key_bytes.len() != ant_quic::crypto::raw_public_keys::pqc::ML_DSA_65_PUBLIC_KEY_SIZE {
+        return bad_request(format!(
+            "public key must be exactly {} bytes for ML-DSA-65, got {}",
+            ant_quic::crypto::raw_public_keys::pqc::ML_DSA_65_PUBLIC_KEY_SIZE,
+            public_key_bytes.len()
+        ));
+    }
+
+    let public_key =
+        match ant_quic::crypto::raw_public_keys::pqc::MlDsaPublicKey::from_bytes(&public_key_bytes)
+        {
+            Ok(pk) => pk,
+            Err(e) => {
+                return bad_request(format!("invalid public key format: {e:?}"));
+            }
+        };
+
+    let valid = ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+        &public_key,
+        &canonical,
+        &signature,
+    )
+    .is_ok();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "valid": valid,
+            "algorithm": AGENT_SIGN_SCHEME_ID,
+        })),
+    )
 }
 
 /// GET /peers

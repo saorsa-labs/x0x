@@ -119,6 +119,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Detached ML-DSA-65 signature over a caller-supplied payload",
         category: "identity",
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/agent/verify",
+        cli_name: "agent verify",
+        description: "Verify a detached ML-DSA-65 signature against a caller-supplied public key",
+        category: "identity",
+    },
     // ── Network ─────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

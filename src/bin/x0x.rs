@@ -346,6 +346,27 @@ enum AgentSub {
         #[arg(long)]
         domain: Option<String>,
     },
+    /// Verify a detached ML-DSA-65 signature against a caller-supplied
+    /// public key. Pass either `--file <PATH>` (use `-` for stdin) or
+    /// `--payload-b64 <BASE64>`. Exits 0 when the signature is valid,
+    /// non-zero when it is not.
+    Verify {
+        /// Path to a file whose bytes were signed verbatim. Use `-` for stdin.
+        #[arg(long, conflicts_with = "payload_b64")]
+        file: Option<String>,
+        /// Base64-encoded bytes the signature was computed over.
+        #[arg(long)]
+        payload_b64: Option<String>,
+        /// Base64-encoded detached ML-DSA-65 signature.
+        #[arg(long)]
+        signature_b64: String,
+        /// Base64-encoded ML-DSA-65 public key (1952 bytes decoded).
+        #[arg(long)]
+        public_key_b64: String,
+        /// Optional domain-separation string; verifies `domain || 0x00 || payload`.
+        #[arg(long)]
+        domain: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1238,6 +1259,23 @@ async fn run(
                     &client,
                     file.as_deref(),
                     payload_b64.as_deref(),
+                    domain.as_deref(),
+                )
+                .await
+            }
+            Some(AgentSub::Verify {
+                file,
+                payload_b64,
+                signature_b64,
+                public_key_b64,
+                domain,
+            }) => {
+                commands::identity::verify(
+                    &client,
+                    file.as_deref(),
+                    payload_b64.as_deref(),
+                    &signature_b64,
+                    &public_key_b64,
                     domain.as_deref(),
                 )
                 .await
