@@ -349,17 +349,21 @@ def validate_version_sync(rule, state, tag_version=None):
     skill_version = extract_skill_version(skill_path)
     cargo_version = extract_cargo_version(cargo_path)
 
+    fix_hint = "run `just bump-version <X.Y.Z>` to sync every version-bearing file"
+
     if skill_version != cargo_version:
         state.add(
             rule["level"],
-            f"SKILL.md version {skill_version} does not match Cargo.toml version {cargo_version}",
+            f"SKILL.md version {skill_version} does not match Cargo.toml version "
+            f"{cargo_version} — {fix_hint}",
             skill_path,
         )
 
     if tag_version and skill_version != tag_version:
         state.add(
             rule["level"],
-            f"SKILL.md version {skill_version} does not match release tag v{tag_version}",
+            f"SKILL.md version {skill_version} does not match release tag v{tag_version} "
+            f"— {fix_hint}",
             skill_path,
         )
 

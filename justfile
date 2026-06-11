@@ -96,7 +96,15 @@ routes-json:
 build-linux:
     cargo zigbuild --release --target x86_64-unknown-linux-gnu --bin x0xd
 
-# ── Release dry-run ───────────────────────────────────────────────────────
+# ── Release ───────────────────────────────────────────────────────────────
+
+# Bump the version everywhere the release `version_sync` gate checks
+# (Cargo.toml + SKILL.md) in one shot, then verify they agree. Always use
+# this instead of hand-editing a version — hand-editing one file and
+# forgetting the other is what broke the 0.22.1 and 0.23.0 release tags.
+# Usage: just bump-version 0.24.0
+bump-version VERSION:
+    bash scripts/bump-version.sh {{VERSION}}
 
 release-dryrun:
     bash scripts/release-dryrun.sh
