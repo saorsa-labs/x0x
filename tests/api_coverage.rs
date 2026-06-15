@@ -713,9 +713,18 @@ fn route_set_matches_registry() {
         .map(|ep| (format!("{}", ep.method), ep.path.to_string()))
         .collect();
 
-    let known_extras: HashSet<(String, String)> = [(String::from("GET"), String::from("/gui/"))]
-        .into_iter()
-        .collect();
+    // Routes intentionally outside the CLI-mapped ENDPOINTS registry:
+    // `/gui/` (static UI) and the A2A well-known discovery URI (ADR-0017),
+    // which is a standards-mandated discovery path, not a CLI command.
+    let known_extras: HashSet<(String, String)> = [
+        (String::from("GET"), String::from("/gui/")),
+        (
+            String::from("GET"),
+            String::from("/.well-known/agent-card.json"),
+        ),
+    ]
+    .into_iter()
+    .collect();
 
     let missing_from_registry: Vec<String> = routes
         .difference(&endpoints)

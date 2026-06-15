@@ -106,6 +106,9 @@ pub mod groups;
 /// MLS (Messaging Layer Security) group encryption.
 pub mod mls;
 
+/// A2A (Agent2Agent) interoperability — Agent Card adapter (ADR-0017).
+pub mod a2a;
+
 /// Direct agent-to-agent messaging.
 ///
 /// Point-to-point communication that bypasses gossip for private,

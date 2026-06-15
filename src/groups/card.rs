@@ -7,8 +7,16 @@
 //! When imported, the card adds the agent to the local contact store
 //! so they can be discovered, trusted, and communicated with.
 
-use crate::identity::AgentId;
+use crate::error::IdentityError;
+use crate::identity::{AgentId, AgentKeypair};
+use ant_quic::crypto::raw_public_keys::pqc::{
+    sign_with_ml_dsa, verify_with_ml_dsa, MlDsaSignature,
+};
+use ant_quic::MlDsaPublicKey;
 use serde::{Deserialize, Serialize};
+
+/// Domain separator for agent card signatures (ADR-0017).
+const AGENT_CARD_SIGNATURE_DOMAIN: &[u8] = b"x0x-agent-card-v1";
 
 /// A shareable identity card for an x0x agent.
 ///
@@ -51,6 +59,17 @@ pub struct AgentCard {
     /// `None`, interpreted by senders as "raw-QUIC / legacy only".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dm_capabilities: Option<crate::dm::DmCapabilities>,
+
+    /// Hex ML-DSA-65 public key of the signing agent. Present on signed
+    /// cards (x0x ≥ 0.24, ADR-0017) so verifiers can check `signature` and
+    /// bind it to `agent_id` (which is SHA-256 of this key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_public_key: Option<String>,
+
+    /// Hex ML-DSA-65 signature over [`AgentCard::signable_bytes`]. Present on
+    /// signed cards; legacy unsigned cards carry `None` and still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// A group reference inside an agent card.
@@ -92,6 +111,8 @@ impl AgentCard {
             // AgentCard is created without knowing the KEM pubkey; callers
             // that want a full advert populate via with_kem_public_key.
             dm_capabilities: Some(crate::dm::DmCapabilities::pending()),
+            agent_public_key: None,
+            signature: None,
         }
     }
 
@@ -136,6 +157,103 @@ impl AgentCard {
         };
         format!("{} ({}…)", self.display_name, id_short)
     }
+
+    /// Canonical bytes signed by the agent to produce [`AgentCard::signature`].
+    ///
+    /// Deterministic, domain-prefixed, length-prefixed encoding of every
+    /// semantic field plus `agent_public_key`. Excludes `signature` itself.
+    /// Mirrors the `GroupCard` signing scheme for consistency.
+    #[must_use]
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(512);
+        buf.extend_from_slice(AGENT_CARD_SIGNATURE_DOMAIN);
+        push_len_prefixed(&mut buf, self.display_name.as_bytes());
+        push_len_prefixed(&mut buf, self.agent_id.as_bytes());
+        push_len_prefixed(&mut buf, self.machine_id.as_bytes());
+        push_len_prefixed(&mut buf, self.user_id.as_deref().unwrap_or("").as_bytes());
+        buf.extend_from_slice(&(self.addresses.len() as u32).to_le_bytes());
+        for a in &self.addresses {
+            push_len_prefixed(&mut buf, a.as_bytes());
+        }
+        buf.extend_from_slice(&(self.groups.len() as u32).to_le_bytes());
+        for g in &self.groups {
+            push_len_prefixed(&mut buf, g.name.as_bytes());
+            push_len_prefixed(&mut buf, g.invite_link.as_bytes());
+        }
+        buf.extend_from_slice(&(self.stores.len() as u32).to_le_bytes());
+        for s in &self.stores {
+            push_len_prefixed(&mut buf, s.name.as_bytes());
+            push_len_prefixed(&mut buf, s.topic.as_bytes());
+        }
+        buf.extend_from_slice(&self.created_at.to_le_bytes());
+        let dm_bytes = bincode::serialize(&self.dm_capabilities).unwrap_or_default();
+        push_len_prefixed(&mut buf, &dm_bytes);
+        push_len_prefixed(
+            &mut buf,
+            self.agent_public_key.as_deref().unwrap_or("").as_bytes(),
+        );
+        buf
+    }
+
+    /// Sign this card with the agent keypair (ADR-0017).
+    ///
+    /// Populates `agent_public_key` and `signature`. The signature commits to
+    /// the agent public key, binding it to `agent_id` (SHA-256 of that key) so
+    /// a recipient cannot swap in a foreign key.
+    ///
+    /// # Errors
+    /// Returns an error if ML-DSA-65 signing fails.
+    pub fn sign(&mut self, keypair: &AgentKeypair) -> Result<(), IdentityError> {
+        self.agent_public_key = Some(hex::encode(keypair.public_key().as_bytes()));
+        self.signature = None;
+        let sig = sign_with_ml_dsa(keypair.secret_key(), &self.signable_bytes()).map_err(|e| {
+            IdentityError::CertificateVerification(format!("agent card sign: {e:?}"))
+        })?;
+        self.signature = Some(hex::encode(sig.as_bytes()));
+        Ok(())
+    }
+
+    /// Verify the agent signature on this card.
+    ///
+    /// Checks the embedded `agent_public_key` hashes to `agent_id` and that
+    /// `signature` verifies over [`AgentCard::signable_bytes`].
+    ///
+    /// # Errors
+    /// Returns an error if the card is unsigned, the key/id binding fails, or
+    /// the signature is invalid.
+    pub fn verify_signature(&self) -> Result<(), IdentityError> {
+        let (Some(sig_hex), Some(pk_hex)) =
+            (self.signature.as_ref(), self.agent_public_key.as_ref())
+        else {
+            return Err(IdentityError::CertificateVerification(
+                "agent card is not signed".to_string(),
+            ));
+        };
+        let pubkey_bytes = hex::decode(pk_hex)
+            .map_err(|e| IdentityError::CertificateVerification(format!("bad pubkey hex: {e}")))?;
+        let pubkey = MlDsaPublicKey::from_bytes(&pubkey_bytes)
+            .map_err(|e| IdentityError::CertificateVerification(format!("bad pubkey: {e:?}")))?;
+        let derived = hex::encode(ant_quic::derive_peer_id_from_public_key(&pubkey).0);
+        if derived != self.agent_id {
+            return Err(IdentityError::CertificateVerification(format!(
+                "agent_id {} does not match key-derived id {derived}",
+                self.agent_id
+            )));
+        }
+        let sig_bytes = hex::decode(sig_hex)
+            .map_err(|e| IdentityError::CertificateVerification(format!("bad sig hex: {e}")))?;
+        let sig = MlDsaSignature::from_bytes(&sig_bytes)
+            .map_err(|e| IdentityError::CertificateVerification(format!("bad sig: {e:?}")))?;
+        verify_with_ml_dsa(&pubkey, &self.signable_bytes(), &sig).map_err(|e| {
+            IdentityError::CertificateVerification(format!("agent card verify: {e:?}"))
+        })?;
+        Ok(())
+    }
+}
+
+fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
 }
 
 #[cfg(test)]
@@ -215,5 +333,90 @@ mod tests {
         assert!(!json.contains("user_id"));
         assert!(!json.contains("groups"));
         assert!(!json.contains("stores"));
+    }
+
+    #[test]
+    fn test_sign_and_verify_roundtrip() {
+        let kp = AgentKeypair::generate().expect("keypair");
+        let mut card = AgentCard::new(
+            "Signer".to_string(),
+            &kp.agent_id(),
+            &hex::encode([9u8; 32]),
+        );
+        card.addresses = vec!["1.2.3.4:5483".to_string()];
+        card.sign(&kp).expect("sign");
+        assert!(card.signature.is_some());
+        assert!(card.agent_public_key.is_some());
+        card.verify_signature().expect("verify");
+    }
+
+    #[test]
+    fn test_signature_detects_tamper() {
+        let kp = AgentKeypair::generate().expect("keypair");
+        let mut card = AgentCard::new(
+            "Signer".to_string(),
+            &kp.agent_id(),
+            &hex::encode([9u8; 32]),
+        );
+        card.sign(&kp).expect("sign");
+
+        // Tampering with any signed field must invalidate the signature —
+        // this is WHY the card is signed: reachability hints and capabilities
+        // cannot be forged by a relay.
+        let mut bad = card.clone();
+        bad.display_name = "Mallory".to_string();
+        assert!(bad.verify_signature().is_err());
+
+        let mut bad = card.clone();
+        bad.addresses.push("9.9.9.9:1".to_string());
+        assert!(bad.verify_signature().is_err());
+    }
+
+    #[test]
+    fn test_signature_rejects_forged_pubkey() {
+        // Swapping in another agent's public key must fail: the key no longer
+        // hashes to the card's agent_id, so the binding check rejects it.
+        let kp = AgentKeypair::generate().expect("kp");
+        let other = AgentKeypair::generate().expect("kp2");
+        let mut card = AgentCard::new(
+            "Signer".to_string(),
+            &kp.agent_id(),
+            &hex::encode([9u8; 32]),
+        );
+        card.sign(&kp).expect("sign");
+        card.agent_public_key = Some(hex::encode(other.public_key().as_bytes()));
+        assert!(card.verify_signature().is_err());
+    }
+
+    #[test]
+    fn test_unsigned_legacy_card_parses_but_verify_fails() {
+        let card = AgentCard::new("Legacy".to_string(), &agent(1), &hex::encode([2u8; 32]));
+        assert!(card.signature.is_none());
+        assert!(card.verify_signature().is_err());
+        let link = card.to_link();
+        let restored = AgentCard::from_link(&link).expect("parse");
+        assert!(restored.signature.is_none());
+    }
+
+    #[test]
+    fn test_signed_card_link_roundtrip_verifies() {
+        // The signature must survive the base64-link transport that carries
+        // cards between agents, or import-time verification is pointless.
+        let kp = AgentKeypair::generate().expect("kp");
+        let mut card = AgentCard::new(
+            "Signer".to_string(),
+            &kp.agent_id(),
+            &hex::encode([9u8; 32]),
+        );
+        card.stores.push(CardStore {
+            name: "s".to_string(),
+            topic: "t".to_string(),
+        });
+        card.sign(&kp).expect("sign");
+        let link = card.to_link();
+        let restored = AgentCard::from_link(&link).expect("parse");
+        restored
+            .verify_signature()
+            .expect("verify after link roundtrip");
     }
 }

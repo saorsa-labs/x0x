@@ -2123,6 +2123,7 @@ async fn main() -> Result<()> {
         .route("/agent", get(agent_info))
         .route("/introduction", get(introduction))
         .route("/agent/card", get(get_agent_card))
+        .route("/.well-known/agent-card.json", get(get_a2a_agent_card))
         .route("/agent/card/import", post(import_agent_card))
         .route("/agent/sign", post(agent_sign))
         .route("/agent/verify", post(agent_verify))
@@ -4414,6 +4415,14 @@ async fn get_agent_card(
         });
     }
 
+    // Sign the card (ADR-0017) so its reachability hints and capability
+    // advertisements are tamper-evident in transit. Signing should not fail
+    // for a valid keypair; degrade to an unsigned card with a warning rather
+    // than failing the request.
+    if let Err(e) = card.sign(state.agent.identity().agent_keypair()) {
+        tracing::warn!("failed to sign agent card: {e}");
+    }
+
     let link = card.to_link();
 
     Json(serde_json::json!({
@@ -4421,6 +4430,65 @@ async fn get_agent_card(
         "card": card,
         "link": link,
     }))
+}
+
+/// GET /.well-known/agent-card.json — A2A-compatible discovery card (ADR-0017).
+///
+/// Serves the local agent's identity as a Google A2A Agent Card so the agent
+/// is discoverable by the A2A ecosystem. The underlying x0x card is signed,
+/// and the signature/public key are surfaced as `x0x`-namespaced extensions.
+async fn get_a2a_agent_card(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let agent_id = state.agent.agent_id();
+    let machine_id = hex::encode(state.agent.machine_id().as_bytes());
+
+    let mut card = x0x::groups::card::AgentCard::new(String::new(), &agent_id, &machine_id);
+    card.dm_capabilities = Some(x0x::dm::DmCapabilities::v1_gossip_ready(
+        state.agent_kem_keypair.public_bytes.clone(),
+    ));
+    card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
+
+    // Only globally-advertisable addresses belong in a publicly-served card.
+    if let Some(network) = state.agent.network() {
+        if let Some(ns) = network.node_status().await {
+            card.addresses = ns
+                .external_addrs
+                .iter()
+                .filter(|a| x0x::is_publicly_advertisable(**a))
+                .map(|a| a.to_string())
+                .collect();
+        }
+    }
+
+    // Public stores become A2A skills.
+    {
+        let stores = state.kv_stores.read().await;
+        for (topic, _) in stores.iter() {
+            card.stores.push(x0x::groups::card::CardStore {
+                name: topic.clone(),
+                topic: topic.clone(),
+            });
+        }
+    }
+
+    if let Err(e) = card.sign(state.agent.identity().agent_keypair()) {
+        tracing::warn!("failed to sign A2A agent card: {e}");
+    }
+
+    let certificate_b64 = state.agent.identity().agent_certificate().and_then(|c| {
+        use base64::Engine;
+        bincode::serialize(c)
+            .ok()
+            .map(|b| base64::engine::general_purpose::STANDARD.encode(b))
+    });
+
+    let ctx = x0x::a2a::A2aContext {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        exec_enabled: state.exec_service.enabled(),
+        certificate_b64,
+    };
+
+    // `Json` sets `content-type: application/json`.
+    Json(x0x::a2a::a2a_card_from(&card, &ctx))
 }
 
 /// POST /agent/card/import — import an agent card to contacts.
@@ -4435,6 +4503,16 @@ async fn import_agent_card(
             return bad_request(format!("invalid card: {e}"));
         }
     };
+
+    // ADR-0017: reject tampered signed cards. A signed card whose signature
+    // fails verification (or whose embedded key does not match its agent_id)
+    // is dropped. Legacy unsigned cards (signature == None) remain importable
+    // for backward compatibility.
+    if card.signature.is_some() {
+        if let Err(e) = card.verify_signature() {
+            return bad_request(format!("agent card signature invalid: {e}"));
+        }
+    }
 
     // Parse trust level — surface the FromStr error rather than silently
     // coercing unknown values to Known. Matches the AddContactRequest path.

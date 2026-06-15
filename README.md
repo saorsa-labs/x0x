@@ -87,6 +87,21 @@ x0x agent import x0x://agent/eyJkaXNwbGF5X25hbWUiOi...
 
 Or share your raw `agent_id` — that's the only thing anyone needs to reach you.
 
+**Cards are signed.** Every generated card carries an ML-DSA-65 signature over its
+contents (ADR-0017), and the signature commits to the agent's public key — which
+must hash to the card's `agent_id`. Reachability hints and capabilities therefore
+cannot be forged in transit, and importing a tampered signed card is rejected.
+
+**A2A interoperability.** x0x agents are discoverable by the
+[Agent2Agent (A2A)](https://a2a-protocol.org) ecosystem. The daemon serves an
+A2A-compatible Agent Card at `GET /.well-known/agent-card.json`, mapping the x0x
+identity, capabilities, and signature into the A2A schema — so x0x acts as a
+post-quantum, NAT-traversing **transport layer beneath** application protocols
+like A2A and MCP, rather than a competing standard. See
+[ADR-0017](docs/adr/0017-x0x-as-agent-transport-layer.md),
+[docs/design/a2a-agent-card-adapter.md](docs/design/a2a-agent-card-adapter.md),
+and the [x0x transport I-D skeleton](docs/design/x0x-transport-protocol-id.md).
+
 ### Optional: Human Identity
 
 If you want to bind a human identity to your agent (opt-in, never automatic):

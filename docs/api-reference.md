@@ -66,8 +66,9 @@ curl http://127.0.0.1:12700/status
 | GET | `/agent` | `x0x agent` | Local agent identity |
 | POST | `/announce` | `x0x announce` | Re-announce identity to the network |
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
-| GET | `/agent/card` | `x0x agent card` | Generate a shareable identity card |
-| POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts |
+| GET | `/agent/card` | `x0x agent card` | Generate a shareable, signed identity card |
+| GET | `/.well-known/agent-card.json` | — | A2A-compatible discovery card (ADR-0017) |
+| POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature) |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 
@@ -87,6 +88,32 @@ Notes:
 ### Agent card query params
 
 `GET /agent/card?display_name=Alice&include_groups=true`
+
+### Agent card signing (ADR-0017)
+
+Generated cards are signed with the agent's ML-DSA-65 key. The card carries two
+extra fields:
+
+- `agent_public_key` — hex ML-DSA-65 public key of the signer.
+- `signature` — hex ML-DSA-65 signature over the canonical card bytes.
+
+Verification binds the embedded public key to the card's `agent_id`
+(`agent_id == SHA-256(agent_public_key)`) and then checks the signature, so a
+relay cannot substitute a foreign key. `POST /agent/card/import` rejects a signed
+card whose signature fails; legacy unsigned cards (`signature` absent) still
+import for backward compatibility.
+
+### A2A discovery card
+
+`GET /.well-known/agent-card.json` returns an
+[Agent2Agent (A2A)](https://a2a-protocol.org)-compatible Agent Card
+(`application/json`) derived from the local agent's signed card. x0x-native data
+is carried under `x0x`-prefixed extension members (`x0xAgentId`,
+`x0xAgentPublicKey`, `x0xSignature`, `x0xCertificate`, …); KV stores and public
+groups become A2A `skills`; the `exec` skill is advertised only when remote-exec
+is enabled. This is the discovery half of A2A interop — see
+`docs/design/a2a-agent-card-adapter.md`. The A2A-over-x0x message binding
+(`docs/design/a2a-over-x0x-binding.md`) is a tracked follow-up.
 
 ### Sign request body
 
