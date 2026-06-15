@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.24.0] - 2026-06-15
+
+### Added
+
+- **Signed agent cards + A2A (Agent2Agent) discovery — foundation of [ADR-0017](docs/adr/0017-x0x-as-agent-transport-layer.md) (positioning x0x as the agent transport layer).** `AgentCard` now carries an `agent_public_key` and an ML-DSA-65 `signature` over canonical, domain-separated, length-prefixed bytes (mirroring the existing `GroupCard` scheme). The signature commits to the agent's public key, which must hash to the card's `agent_id`, so a relay cannot substitute a foreign key — reachability hints and capability advertisements are now tamper-evident. `GET /agent/card` signs; `POST /agent/card/import` verifies signed cards and rejects tampered ones. Legacy unsigned cards still parse and import for backward compatibility.
+- **`GET /.well-known/agent-card.json` — A2A-compatible discovery card.** The daemon serves an [Agent2Agent](https://a2a-protocol.org)-shaped Agent Card derived from the signed x0x card: KV stores and public groups map to A2A `skills`, the `exec` skill is advertised only when remote-exec is enabled, and the self-authenticating x0x identity (agent/machine/user ids, public key, signature, certificate) is carried under `x0x`-namespaced extension members. This is the discovery half of A2A interop ([docs/design/a2a-agent-card-adapter.md](docs/design/a2a-agent-card-adapter.md)); the A2A-over-x0x message binding ([docs/design/a2a-over-x0x-binding.md](docs/design/a2a-over-x0x-binding.md)) is a tracked follow-up. A transport/identity Internet-Draft skeleton ([docs/design/x0x-transport-protocol-id.md](docs/design/x0x-transport-protocol-id.md)) accompanies the ADR.
+
 ## [v0.23.1] - 2026-06-11
 
 ### Added
