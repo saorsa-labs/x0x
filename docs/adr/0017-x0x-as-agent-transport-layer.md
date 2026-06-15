@@ -9,6 +9,8 @@
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** [ADR 0001](./0001-bootstrap-peers-are-seed-hints-only.md) (bootstrap = hints, not authority); [ADR 0011](./0011-multi-port-bootstrap.md) (UDP/443 strategy); `docs/design/x0x-transport-protocol-id.md`; `docs/design/a2a-over-x0x-binding.md`; `docs/design/a2a-agent-card-adapter.md`
+- **Follow-up issues:** [#112](https://github.com/saorsa-labs/x0x/issues/112) (A2A-over-x0x message binding, workstream #3); [#113](https://github.com/saorsa-labs/x0x/issues/113) (publish transport+identity Internet-Draft, workstream #1)
+- **Shipped in:** v0.24.0 (signed AgentCard + A2A discovery card)
 
 ## Context
 
@@ -88,9 +90,11 @@ Foundation shipped on branch `feat/adr-0017-agentcard-signing-a2a-card`:
   clean, full workspace suite green (9 new tests: 5 card-signing + 4 adapter).
 
 Deferred (tracked follow-up): workstream #3, the A2A-over-x0x message binding
-(`docs/design/a2a-over-x0x-binding.md`) — it needs a live A2A peer for true
-cross-client validation. The I-D (`docs/design/x0x-transport-protocol-id.md`)
-remains a skeleton pending standards engagement.
+(`docs/design/a2a-over-x0x-binding.md`, [#112](https://github.com/saorsa-labs/x0x/issues/112))
+— it needs a live A2A peer for true cross-client validation. The I-D
+(`docs/design/x0x-transport-protocol-id.md`,
+[#113](https://github.com/saorsa-labs/x0x/issues/113)) remains a skeleton
+pending standards engagement.
 
 ## Consequences
 
