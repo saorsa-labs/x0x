@@ -206,6 +206,14 @@ class X0xClient:
             return self._req(
                 "GET", f"/groups/{params['group_id']}/messages",
             )
+        if action == "group_state_commits":
+            path = (
+                f"/groups/{params['group_id']}/state/commits"
+                f"?from_revision={params.get('from_revision', 0)}"
+            )
+            if params.get("limit") is not None:
+                path += f"&limit={params['limit']}"
+            return self._req("GET", path)
         raise ValueError(f"unhandled action: {action}")
 
     def open_sse(self, path: str, timeout: float = 3600 * 6):
@@ -823,6 +831,210 @@ class FleetHarness:
                 f"bodies={list(anchor_bodies)[:5]}",
             )
 
+        # 7. Retained state-commit history (issue #111) — committer path.
+        # The public_open creator is the deterministic committer (ADR-0014):
+        # it authors GroupCreated + one MemberAdded per joiner via seal_commit
+        # and retains each. Every retained commit must independently verify —
+        # recomputing roster_root from the stored projection equals the signed
+        # commit.roster_root (the ADR-0016 "who held which role at revision N"
+        # audit property). public_open JOINERS are intentionally NOT checked
+        # here: a GSS joiner bootstraps at state_revision=0 WITHOUT the
+        # authority base-state (only TreeKEM invites seed it — see x0xd.rs
+        # group-join handler), so it cannot replay the signed chain. The
+        # applied-over-gossip retention path (finalize_applied_commit) is
+        # exercised against a TreeKEM group in run_treekem_state_commit_audit().
+        ok, details, commits = self._fetch_state_commits(self.anchor_name, gid)
+        self.assert_pass(
+            f"{self.anchor_name} reads retained state-commits (authored)",
+            ok and len(commits) >= 1,
+            f"ok={ok} state_revision={details.get('state_revision')} "
+            f"total_retained={details.get('total_retained')}",
+        )
+        if commits:
+            self._assert_chain_consistent(
+                self.anchor_name, commits, "authored",
+            )
+
+    def run_treekem_state_commit_audit(self) -> None:
+        """Issue #111 — applied-over-gossip retention on a TreeKEM group.
+
+        Unlike public_open, a private_secure (TreeKEM) invite seeds the
+        joiner's authority base-state, so joiners CAN apply later members'
+        signed MemberAdded commits via finalize_applied_commit and retain
+        them. This is the cross-region proof of the #111 *applied* path.
+
+        A joiner's OWN join seeds base-state but does not retain a commit; a
+        retained commit only appears once a LATER member's commit reaches and
+        applies on it. So the first joiner accumulates commits and the last
+        may have none — we assert correctness (ascending + every commit
+        re-derives its signed roster_root) on whatever chain each joiner has,
+        and liveness as ">=1 joiner retains a verified applied commit".
+        """
+        members = [n for n in self.runners if n != self.anchor_name]
+        self.log.info(
+            "[treekem #111] anchor=%s creates private_secure group",
+            self.anchor_name,
+        )
+        create = self.call(
+            self.anchor_name, "group_create",
+            {"name": "Phase-B TreeKEM #111 Audit",
+             "description": "applied-over-gossip state-commit retention",
+             "preset": "private_secure"},
+        )
+        if create.get("outcome") != "ok":
+            self.failures.append("anchor failed to create TreeKEM group")
+            return
+        details = create.get("details") or {}
+        gid = (
+            details.get("group_id")
+            or (details.get("group") or {}).get("id")
+        )
+        if not gid:
+            self.failures.append("anchor failed to extract TreeKEM group_id")
+            return
+
+        joined: List[str] = []
+        for member in members:
+            inv = self.call(
+                self.anchor_name, "group_invite", {"group_id": gid},
+            )
+            invite = (inv.get("details") or {}).get("invite_link")
+            if not invite or not invite.startswith("x0x://invite/"):
+                self.failures.append(f"TreeKEM invite for {member} missing")
+                continue
+            try:
+                resp = self.call(member, "group_join", {"invite": invite})
+            except Exception as exc:
+                if self.allow_skips:
+                    self.log.warning("  SKIP %s TreeKEM join: %s", member, exc)
+                    continue
+                self.failures.append(
+                    f"{member} TreeKEM join unreachable: {exc}"
+                )
+                continue
+            if resp.get("outcome") == "ok":
+                joined.append(member)
+            else:
+                self.assert_pass(
+                    f"{member} joins TreeKEM group", False,
+                    f"outcome={resp.get('outcome')}",
+                )
+
+        self.assert_pass(
+            "TreeKEM group has >=2 joiners (needed to exercise applied path)",
+            len(joined) >= 2,
+            f"joined={joined}",
+        )
+        if len(joined) < 2:
+            return
+
+        # Wait for the anchor (committer) to seal a commit per joiner.
+        deadline = time.time() + 30.0
+        anchor_commits: List[Dict[str, Any]] = []
+        while time.time() < deadline:
+            ok, _d, anchor_commits = self._fetch_state_commits(
+                self.anchor_name, gid,
+            )
+            if ok and len(anchor_commits) >= len(joined):
+                break
+            time.sleep(1.0)
+        self.assert_pass(
+            f"{self.anchor_name} authored a TreeKEM commit per joiner",
+            len(anchor_commits) >= len(joined),
+            f"commits={len(anchor_commits)} joined={len(joined)}",
+        )
+        if anchor_commits:
+            self._assert_chain_consistent(
+                self.anchor_name, anchor_commits, "treekem-authored",
+            )
+
+        # Liveness: poll until >=1 joiner has applied + retained a verified
+        # commit over gossip. A base-state seed alone does NOT count — a real
+        # retained applied commit must be present. Correctness is asserted on
+        # whatever each joiner already has, every poll (never flaky).
+        deadline = time.time() + 90.0
+        applied_joiner: Optional[str] = None
+        while time.time() < deadline and applied_joiner is None:
+            for m in joined:
+                ok, _d, commits = self._fetch_state_commits(m, gid)
+                if ok and commits:
+                    self._assert_chain_consistent(m, commits, "treekem-applied")
+                    applied_joiner = m
+                    break
+            if applied_joiner is None:
+                time.sleep(3.0)
+        self.assert_pass(
+            "a TreeKEM joiner applied + retained a verified state-commit over "
+            "gossip (issue #111 applied path)",
+            applied_joiner is not None,
+            f"checked joiners={joined}",
+        )
+
+    def _fetch_state_commits(
+        self, node: str, gid: str,
+    ) -> Tuple[bool, Dict[str, Any], List[Dict[str, Any]]]:
+        """(ok, details, commits) — (False, {}, []) on error/unreachable."""
+        try:
+            resp = self.call(node, "group_state_commits", {"group_id": gid})
+        except Exception as exc:
+            self.log.warning("  %s state-commits call failed: %s", node, exc)
+            return (False, {}, [])
+        if resp.get("outcome") != "ok":
+            return (False, {}, [])
+        details = resp.get("details") or {}
+        return (True, details, self._state_commits(details))
+
+    def _assert_chain_consistent(
+        self, node: str, commits: List[Dict[str, Any]], path_kind: str,
+    ) -> None:
+        """Correctness invariants for ANY non-empty chain (never flaky)."""
+        revisions = [c.get("revision") for c in commits]
+        ascending = all(
+            isinstance(a, int) and isinstance(b, int) and a < b
+            for a, b in zip(revisions, revisions[1:])
+        )
+        self.assert_pass(
+            f"{node} commit revisions strictly ascending ({path_kind})",
+            ascending,
+            f"revisions={revisions[:8]}",
+        )
+        unverified = [
+            c.get("revision")
+            for c in commits
+            if not c.get("roster_root_verified")
+        ]
+        self.assert_pass(
+            f"{node} every retained commit re-derives its signed roster_root "
+            f"({path_kind})",
+            not unverified,
+            f"unverified_revisions={unverified[:8]}",
+        )
+
+    @staticmethod
+    def _state_commits(payload: Any) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        raw = payload.get("commits")
+        if not isinstance(raw, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            commit = entry.get("commit")
+            revision = (
+                commit.get("revision") if isinstance(commit, dict) else None
+            )
+            out.append(
+                {
+                    "revision": revision,
+                    "roster_root_verified": bool(
+                        entry.get("roster_root_verified")
+                    ),
+                }
+            )
+        return out
+
     @staticmethod
     def _member_aids(payload: Any) -> List[str]:
         if not isinstance(payload, dict):
@@ -1029,6 +1241,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             harness.run_contacts_lifecycle()
             harness.run_group_lifecycle()
+            harness.run_treekem_state_commit_audit()
         except Exception as exc:
             log.exception("scenario crashed: %s", exc)
             harness.failures.append(f"scenario crash: {exc}")

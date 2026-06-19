@@ -31,6 +31,15 @@ const GUI_HTML: &str = include_str!("../src/gui/x0x-gui.html");
 /// Adding an entry here is a downgrade that must show up in
 /// `docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md`.
 const DEFERRED: &[(Method, &str, &str)] = &[
+    // issue #111: retained state-commit history is a verification / governance
+    // read surface (audit, dispute evidence), not a routine browser action.
+    // Exposed via the CLI (`x0x group state-commits`) and the REST API; a GUI
+    // history viewer is deferred until there is a product need.
+    (
+        Method::Get,
+        "/groups/:id/state/commits",
+        "verification/audit read surface; exposed via CLI + REST, GUI viewer deferred",
+    ),
     // The adversarial test endpoint is only meaningful as a CLI /
     // harness probe; exposing it in the browser UI would be confusing
     // and has no product use case.

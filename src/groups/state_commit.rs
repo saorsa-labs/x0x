@@ -72,22 +72,107 @@ fn blake3_hex(input: &[u8]) -> String {
 /// currently affect effective access.
 #[must_use]
 pub fn compute_roster_root(members_v2: &BTreeMap<String, GroupMember>) -> String {
-    let mut entries: Vec<(&String, &GroupMember)> = members_v2
+    let mut entries: Vec<(&str, GroupRole, GroupMemberState)> = members_v2
         .iter()
         .filter(|(_, m)| matches!(m.state, GroupMemberState::Active | GroupMemberState::Banned))
+        .map(|(id, m)| (id.as_str(), m.role, m.state))
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
+    roster_root_from_entries(&mut entries)
+}
 
+/// Shared hashing core for the roster root. Sorts `entries` by id and folds
+/// `(id, role, state)` into the canonical `x0x.roster-root.v1` digest. Both
+/// [`compute_roster_root`] (over a live roster) and
+/// [`roster_root_of_projection`] (over a retained projection) route through
+/// this so a retained projection re-derives the exact root its commit signed.
+fn roster_root_from_entries(entries: &mut [(&str, GroupRole, GroupMemberState)]) -> String {
+    entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut buf = Vec::with_capacity(entries.len() * 48 + 16);
     buf.extend_from_slice(b"x0x.roster-root.v1");
-    for (id, m) in entries {
+    for (id, role, state) in entries.iter() {
         buf.push(b'|');
         buf.extend_from_slice(id.as_bytes());
         buf.push(b':');
-        buf.push(role_byte(m.role));
-        buf.push(state_byte(m.state));
+        buf.push(role_byte(*role));
+        buf.push(state_byte(*state));
     }
     blake3_hex(&buf)
+}
+
+/// Minimal, verifiable roster projection captured alongside a retained commit:
+/// exactly the `(role, state)` tuples that feed [`compute_roster_root`]
+/// (`Active` + `Banned` members). Sufficient to answer "what did the signed
+/// roster say at revision N" and to re-derive the commit's `roster_root`
+/// independently — without having witnessed every prior commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterMemberSnapshot {
+    pub role: GroupRole,
+    pub state: GroupMemberState,
+}
+
+/// Project the roster-root-relevant view of a roster: `Active` + `Banned`
+/// members with their `(role, state)`. Mirrors [`compute_roster_root`]'s
+/// filter exactly so [`roster_root_of_projection`] re-derives the same root.
+#[must_use]
+pub fn roster_projection(
+    members_v2: &BTreeMap<String, GroupMember>,
+) -> BTreeMap<String, RosterMemberSnapshot> {
+    members_v2
+        .iter()
+        .filter(|(_, m)| matches!(m.state, GroupMemberState::Active | GroupMemberState::Banned))
+        .map(|(id, m)| {
+            (
+                id.clone(),
+                RosterMemberSnapshot {
+                    role: m.role,
+                    state: m.state,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Re-derive the roster root from a projection (see [`roster_projection`]).
+#[must_use]
+pub fn roster_root_of_projection(projection: &BTreeMap<String, RosterMemberSnapshot>) -> String {
+    let mut entries: Vec<(&str, GroupRole, GroupMemberState)> = projection
+        .iter()
+        .map(|(id, s)| (id.as_str(), s.role, s.state))
+        .collect();
+    roster_root_from_entries(&mut entries)
+}
+
+/// A retained, applied state commit paired with the roster projection it
+/// effected (issue #111). Each entry is independently verifiable: recomputing
+/// the root over `roster` yields `commit.roster_root` (see
+/// [`RetainedCommit::roster_root_consistent`]). Retained entries let
+/// verification and governance integrators answer roster-at-revision questions
+/// long after the fact, which the head-only `GroupInfo` snapshot cannot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedCommit {
+    pub commit: GroupStateCommit,
+    pub roster: BTreeMap<String, RosterMemberSnapshot>,
+}
+
+impl RetainedCommit {
+    /// Capture a retained entry from a just-committed roster and the signed
+    /// commit that produced it. `members_v2` must already reflect the
+    /// committed state.
+    #[must_use]
+    pub fn capture(commit: GroupStateCommit, members_v2: &BTreeMap<String, GroupMember>) -> Self {
+        Self {
+            roster: roster_projection(members_v2),
+            commit,
+        }
+    }
+
+    /// True iff the retained roster projection re-derives the commit's signed
+    /// `roster_root` — i.e. the entry is internally consistent and was not
+    /// corrupted at rest.
+    #[must_use]
+    pub fn roster_root_consistent(&self) -> bool {
+        roster_root_of_projection(&self.roster) == self.commit.roster_root
+    }
 }
 
 /// Compute the canonical policy hash.
@@ -624,6 +709,78 @@ mod tests {
         // Different nonce => different id even with same creator/time.
         let g2 = GroupGenesis::new("aa".repeat(32), 1_000);
         assert_ne!(g.group_id, g2.group_id);
+    }
+
+    #[test]
+    fn roster_projection_rederives_roster_root() {
+        // issue #111: a retained roster projection must hash to the exact root
+        // its commit signed — that is what makes a single retained entry
+        // independently verifiable without the prior chain.
+        let mut m = BTreeMap::new();
+        m.insert("aa".repeat(32), make_owner(&"aa".repeat(32)));
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Admin),
+        );
+        m.insert("cc".repeat(32), make_banned(&"cc".repeat(32)));
+        // Excluded from the root: Removed + Pending must not appear in the
+        // projection (mirrors compute_roster_root's filter exactly).
+        m.insert("dd".repeat(32), make_removed(&"dd".repeat(32)));
+
+        let projection = roster_projection(&m);
+        assert!(
+            projection.contains_key(&"cc".repeat(32)),
+            "banned members are part of the root and must be projected"
+        );
+        assert!(
+            !projection.contains_key(&"dd".repeat(32)),
+            "removed members are excluded from the root and the projection"
+        );
+        assert_eq!(
+            roster_root_of_projection(&projection),
+            compute_roster_root(&m),
+            "projection must re-derive the live roster root"
+        );
+    }
+
+    #[test]
+    fn retained_commit_capture_is_self_consistent() {
+        let mut m = BTreeMap::new();
+        m.insert("aa".repeat(32), make_owner(&"aa".repeat(32)));
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+
+        let kp = AgentKeypair::generate().unwrap();
+        let commit = GroupStateCommit::sign(
+            "gid".into(),
+            1,
+            Some("prev".into()),
+            compute_roster_root(&m),
+            compute_policy_hash(&GroupPolicy::default()),
+            compute_public_meta_hash(&GroupPublicMeta::default()),
+            None,
+            false,
+            5_000,
+            &kp,
+        )
+        .unwrap();
+
+        let retained = RetainedCommit::capture(commit, &m);
+        assert!(
+            retained.roster_root_consistent(),
+            "captured projection must re-derive the commit's signed roster_root"
+        );
+
+        // A tampered projection must fail the consistency check (this is the
+        // on-disk-corruption guard the endpoint surfaces as roster_root_verified).
+        let mut tampered = retained.clone();
+        tampered.roster.get_mut(&"bb".repeat(32)).unwrap().role = GroupRole::Admin;
+        assert!(
+            !tampered.roster_root_consistent(),
+            "a mutated projection must no longer match the signed root"
+        );
     }
 
     #[test]

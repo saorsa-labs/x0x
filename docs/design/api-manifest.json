@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 132,
+  "endpoint_count": 133,
   "endpoints": [
     {
       "category": "status",
@@ -588,6 +588,13 @@
       "description": "Inspect the signed state-commit chain for a group",
       "method": "GET",
       "path": "/groups/:id/state"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group state-commits",
+      "description": "Read retained state-commit history (members only, paged)",
+      "method": "GET",
+      "path": "/groups/:id/state/commits"
     },
     {
       "category": "named-groups",

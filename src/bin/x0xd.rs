@@ -2233,6 +2233,7 @@ async fn main() -> Result<()> {
         .route("/groups/:id/display-name", put(set_group_display_name))
         // Phase D.3 — state-commit chain endpoints.
         .route("/groups/:id/state", get(get_group_state))
+        .route("/groups/:id/state/commits", get(get_group_state_commits))
         .route("/groups/:id/state/seal", post(seal_group_state))
         .route("/groups/:id/state/withdraw", post(withdraw_group_state))
         .route("/groups/:id", delete(leave_group))
@@ -11848,6 +11849,111 @@ async fn get_group_state(
             "roster_root": roster_root,
             "policy_hash": policy_hash,
             "public_meta_hash": public_meta_hash,
+        })),
+    )
+}
+
+/// Query parameters for [`get_group_state_commits`].
+#[derive(Debug, Deserialize)]
+struct StateCommitsQuery {
+    /// Only return retained commits with `revision >= from_revision`.
+    #[serde(default)]
+    from_revision: u64,
+    /// Page size (clamped to `[1, STATE_COMMITS_MAX_LIMIT]`).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// GET /groups/:id/state/commits — issue #111: paged read over the retained
+/// state-commit history (ADR-0016 verification / governance use-cases).
+///
+/// **Members-only.** Unlike `/groups/:id/state` (which serves the public
+/// projection even to non-member card-importers), retained roster projections
+/// are member content, so this endpoint requires the local agent to be an
+/// **active member** of the group — it deliberately does NOT reuse the
+/// public-projection gate.
+///
+/// Each entry is `{ commit, roster, roster_root_verified }`, ordered by
+/// ascending revision. `roster_root_verified` recomputes the roster root over
+/// the retained projection and compares it to the commit's signed
+/// `roster_root`, so on-disk corruption surfaces loudly rather than serving
+/// silently-wrong history. `first_available_revision` lets callers distinguish
+/// a real gap (history began after their `from_revision`, because each daemon
+/// retains only the suffix it witnessed) from an empty result.
+async fn get_group_state_commits(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<StateCommitsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    const STATE_COMMITS_DEFAULT_LIMIT: usize = 100;
+    const STATE_COMMITS_MAX_LIMIT: usize = 500;
+    let limit = q
+        .limit
+        .unwrap_or(STATE_COMMITS_DEFAULT_LIMIT)
+        .clamp(1, STATE_COMMITS_MAX_LIMIT);
+
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(&id) else {
+        return not_found("group not found");
+    };
+
+    // Members-only gate: retained roster projections are member content.
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if !info.has_active_member(&local_agent_hex) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "members only: retained state-commit history is member content",
+        );
+    }
+
+    let matched = info
+        .commit_log
+        .iter()
+        .filter(|rc| rc.commit.revision >= q.from_revision)
+        .count();
+    let entries: Vec<serde_json::Value> = info
+        .commit_log
+        .iter()
+        .filter(|rc| rc.commit.revision >= q.from_revision)
+        .take(limit)
+        .map(|rc| {
+            serde_json::json!({
+                "commit": rc.commit,
+                "roster": rc.roster,
+                "roster_root_verified": rc.roster_root_consistent(),
+            })
+        })
+        .collect();
+
+    let has_more = matched > entries.len();
+    // Cursor for the next page: one past the last returned revision. Safe
+    // because the log is monotonic in revision and truncated only from the
+    // front, so `last()` is the highest revision on this page.
+    let next_from_revision = if has_more {
+        info.commit_log
+            .iter()
+            .filter(|rc| rc.commit.revision >= q.from_revision)
+            .nth(entries.len().saturating_sub(1))
+            .map(|rc| rc.commit.revision + 1)
+    } else {
+        None
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": info.stable_group_id(),
+            "state_revision": info.state_revision,
+            "total_retained": info.commit_log.len(),
+            "first_available_revision": info.commit_log.first().map(|rc| rc.commit.revision),
+            "latest_retained_revision": info.commit_log.last().map(|rc| rc.commit.revision),
+            "from_revision": q.from_revision,
+            "limit": limit,
+            "count": entries.len(),
+            "has_more": has_more,
+            "next_from_revision": next_from_revision,
+            "commits": entries,
         })),
     )
 }

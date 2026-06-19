@@ -950,6 +950,17 @@ enum GroupSub {
         /// Group ID.
         group_id: String,
     },
+    /// Read retained state-commit history (members only, paged).
+    StateCommits {
+        /// Group ID.
+        group_id: String,
+        /// Only return commits with revision >= this value.
+        #[arg(long, default_value_t = 0)]
+        from_revision: u64,
+        /// Page size (daemon caps at 500).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Advance the state-commit chain and republish the signed card.
     StateSeal {
         /// Group ID.
@@ -1614,6 +1625,11 @@ async fn run(
                 commands::group::messages(&client, &group_id).await
             }
             Some(GroupSub::State { group_id }) => commands::group::state(&client, &group_id).await,
+            Some(GroupSub::StateCommits {
+                group_id,
+                from_revision,
+                limit,
+            }) => commands::group::state_commits(&client, &group_id, from_revision, limit).await,
             Some(GroupSub::StateSeal { group_id }) => {
                 commands::group::state_seal(&client, &group_id).await
             }

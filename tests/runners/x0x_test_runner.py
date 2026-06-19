@@ -252,6 +252,14 @@ class X0xClient:
     def groups_messages(self, gid: str) -> Dict[str, Any]:
         return self._request("GET", f"/groups/{gid}/messages")
 
+    def groups_state_commits(
+        self, gid: str, from_revision: int = 0, limit: Optional[int] = None
+    ) -> Dict[str, Any]:
+        path = f"/groups/{gid}/state/commits?from_revision={from_revision}"
+        if limit is not None:
+            path += f"&limit={limit}"
+        return self._request("GET", path)
+
     def groups_set_display_name(self, gid: str, name: str) -> Dict[str, Any]:
         return self._request(
             "PUT", f"/groups/{gid}/display-name", body={"name": name},
@@ -845,6 +853,7 @@ class TestRunner:
                 "group_members",
                 "group_send_message",
                 "group_messages",
+                "group_state_commits",
                 "group_set_display_name",
                 "group_leave",
             ):
@@ -1139,6 +1148,12 @@ class TestRunner:
             )
         if action == "group_messages":
             return self.client.groups_messages(params["group_id"])
+        if action == "group_state_commits":
+            return self.client.groups_state_commits(
+                params["group_id"],
+                params.get("from_revision", 0),
+                params.get("limit"),
+            )
         if action == "group_set_display_name":
             return self.client.groups_set_display_name(
                 params["group_id"], params["name"]

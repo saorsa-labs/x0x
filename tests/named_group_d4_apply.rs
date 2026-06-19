@@ -676,3 +676,112 @@ async fn d4_mls_ban_commit_advances_binding_and_converges() {
         .send()
         .await;
 }
+
+/// issue #111: the retained state-commit history endpoint serves applied
+/// commits paired with independently-verifiable roster projections, ordered by
+/// revision, with working pagination. Members-only (the local owner is a
+/// member, so it is served here).
+#[tokio::test]
+#[ignore = "requires spawning real x0xd daemons"]
+async fn state_commits_endpoint_serves_retained_history() {
+    let _guard = suite_lock().await;
+    let pair = pair().await;
+    let alice = &pair.alice;
+
+    let group_id =
+        create_group_preset(alice, "Issue111", "retained history", "private_secure").await;
+
+    // Advance the signed chain a few times via owner-authored metadata edits;
+    // each distinct edit reseals a new commit.
+    for name in ["rev-a", "rev-b", "rev-c"] {
+        let resp = authed_client(alice)
+            .patch(alice.url(&format!("/groups/{group_id}")))
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .expect("patch group");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "metadata patch should succeed"
+        );
+    }
+
+    let head = get_state(alice, &group_id).await;
+    let head_rev = head["state_revision"].as_u64().expect("head revision");
+    assert!(head_rev >= 3, "expected >=3 commits, head at {head_rev}");
+
+    // Full history.
+    let body: Value = authed_client(alice)
+        .get(alice.url(&format!("/groups/{group_id}/state/commits")))
+        .send()
+        .await
+        .expect("get commits")
+        .json()
+        .await
+        .expect("commits json");
+    assert_eq!(body["ok"], true, "commits response: {body:?}");
+
+    let commits = body["commits"].as_array().expect("commits array");
+    assert!(
+        commits.len() as u64 >= head_rev,
+        "retained {} commits but head at {head_rev}",
+        commits.len()
+    );
+
+    // Each retained entry must self-verify and be strictly revision-ordered.
+    let mut prev_rev = 0u64;
+    for entry in commits {
+        assert_eq!(
+            entry["roster_root_verified"], true,
+            "retained roster must re-derive the signed roster_root: {entry:?}"
+        );
+        let rev = entry["commit"]["revision"]
+            .as_u64()
+            .expect("commit revision");
+        assert!(
+            rev > prev_rev,
+            "commits must be strictly ascending in revision"
+        );
+        prev_rev = rev;
+        assert!(
+            entry["roster"].as_object().is_some_and(|r| !r.is_empty()),
+            "roster projection should be non-empty (owner present): {entry:?}"
+        );
+    }
+
+    // Pagination: limit + from_revision cursor must advance across pages.
+    let page1: Value = authed_client(alice)
+        .get(alice.url(&format!("/groups/{group_id}/state/commits?limit=1")))
+        .send()
+        .await
+        .expect("page1")
+        .json()
+        .await
+        .expect("page1 json");
+    assert_eq!(page1["count"], 1, "limit=1 returns one entry: {page1:?}");
+    assert_eq!(page1["has_more"], true, "more pages expected: {page1:?}");
+    let next = page1["next_from_revision"].as_u64().expect("cursor");
+    let page2: Value = authed_client(alice)
+        .get(alice.url(&format!(
+            "/groups/{group_id}/state/commits?from_revision={next}&limit=1"
+        )))
+        .send()
+        .await
+        .expect("page2")
+        .json()
+        .await
+        .expect("page2 json");
+    let p1_rev = page1["commits"][0]["commit"]["revision"]
+        .as_u64()
+        .expect("p1 rev");
+    let p2_rev = page2["commits"][0]["commit"]["revision"]
+        .as_u64()
+        .expect("p2 rev");
+    assert!(p2_rev > p1_rev, "cursor must advance past the first page");
+
+    let _ = authed_client(alice)
+        .delete(alice.url(&format!("/groups/{group_id}")))
+        .send()
+        .await;
+}

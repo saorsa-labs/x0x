@@ -329,6 +329,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/groups/join` | `x0x group join <invite>` | Join via invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
 | GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
+| GET | `/groups/:id/state/commits` | `x0x group state-commits <group_id>` | **issue #111**: read retained state-commit history (members only, paged) |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group state-withdraw <group_id>` | **Phase D.3**: seal terminal withdrawal; evicts public card on peers |
 | POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish a signed message to a SignedPublic group |
@@ -418,6 +419,37 @@ Each named group maintains a signed commit chain:
   higher-revision commit with `withdrawn=true` and broadcasts the
   withdrawal card. Peers evict stale listings on receipt regardless of
   TTL.
+
+#### Retained commit history (issue #111)
+
+`GET /groups/:id/state` exposes only the chain **head**. To answer
+"what did the signed roster say at revision N" long after the fact (for
+verification and group-governance integrators per ADR-0016), each daemon
+retains every commit it applies — from both local authorship and peer
+commits — paired with the roster projection it effected:
+
+- `GET /groups/:id/state/commits?from_revision=0&limit=100` —
+  **members only** (retained roster projections are member content, so
+  this does *not* use `/state`'s public-projection gate). Returns
+  `{ ok, group_id, state_revision, total_retained,
+  first_available_revision, latest_retained_revision, from_revision,
+  limit, count, has_more, next_from_revision, commits }`, where each
+  `commits[]` entry is `{ commit, roster, roster_root_verified }`.
+  `roster` is the `{ agent_id: { role, state } }` projection of `Active` +
+  `Banned` members; `roster_root_verified` recomputes the root over that
+  projection and compares it to the commit's signed `roster_root`, so any
+  at-rest corruption surfaces rather than serving silently-wrong history.
+  `limit` is capped at 500.
+
+Scope and honest limits: retention is **not retroactive** — history begins
+at the first release that retains it, and each daemon holds only the suffix
+it witnessed (a member who joined at revision 50 has no earlier entries;
+`first_available_revision` lets callers distinguish a real gap from an empty
+result). Each retained entry is independently verifiable against its
+commit's `roster_root` with no dependence on the prior chain. Storage is
+bounded per group (`COMMIT_LOG_CAP`, oldest dropped past the cap with a
+logged warning — never silent); checkpoint-and-truncate and cross-peer
+backfill are deferred.
 
 Cards and commits carry ML-DSA-65 signatures. Peers verify both the
 signature and the chain link (`prev_state_hash`) before accepting; stale

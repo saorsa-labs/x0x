@@ -651,6 +651,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "named-groups",
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/state/commits",
+        cli_name: "group state-commits",
+        description: "Read retained state-commit history (members only, paged)",
+        category: "named-groups",
+    },
+    EndpointDef {
         method: Method::Post,
         path: "/groups/:id/state/seal",
         cli_name: "group state-seal",

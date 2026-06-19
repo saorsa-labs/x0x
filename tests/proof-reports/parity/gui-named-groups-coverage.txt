@@ -1,4 +1,4 @@
-# GUI named-groups parity report — 36 endpoints total
+# GUI named-groups parity report — 37 endpoints total
   WIRED     POST /groups
   WIRED     GET /groups
   WIRED     GET /groups/:id
@@ -12,6 +12,7 @@
   WIRED     PUT /groups/:id/display-name
   WIRED     DELETE /groups/:id
   WIRED     GET /groups/:id/state
+  DEFERRED  GET /groups/:id/state/commits  // verification/audit read surface; exposed via CLI + REST, GUI viewer deferred
   WIRED     POST /groups/:id/state/seal
   WIRED     POST /groups/:id/state/withdraw
   WIRED     PATCH /groups/:id
@@ -36,4 +37,4 @@
   DEFERRED  POST /groups/:id/secure/reseal  // secure-plane primitive; server-side rekey on approve/ban
   DEFERRED  POST /groups/secure/open-envelope  // adversarial test endpoint, not a user-facing action
 
-Coverage: 25/36 wired; 11 deferred; 0 missing
+Coverage: 25/37 wired; 12 deferred; 0 missing

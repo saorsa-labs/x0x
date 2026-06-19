@@ -416,6 +416,23 @@ pub async fn state(client: &DaemonClient, group_id: &str) -> Result<()> {
     client.run_get(&format!("/groups/{group_id}/state")).await
 }
 
+/// `x0x group state-commits` — GET /groups/:id/state/commits.
+///
+/// Reads the retained state-commit history (members only). `from_revision`
+/// and `limit` page the result; the daemon caps `limit` at 500.
+pub async fn state_commits(
+    client: &DaemonClient,
+    group_id: &str,
+    from_revision: u64,
+    limit: Option<usize>,
+) -> Result<()> {
+    let mut path = format!("/groups/{group_id}/state/commits?from_revision={from_revision}");
+    if let Some(limit) = limit {
+        path.push_str(&format!("&limit={limit}"));
+    }
+    client.run_get(&path).await
+}
+
 /// `x0x group state-seal` — POST /groups/:id/state/seal.
 pub async fn state_seal(client: &DaemonClient, group_id: &str) -> Result<()> {
     client.ensure_running().await?;

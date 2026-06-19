@@ -375,6 +375,11 @@ const COVERED: &[CoveredEndpoint] = &[
         d4_stateful_events_converge_via_signed_commits
     ),
     covered!(
+        Get,
+        "/groups/:id/state/commits",
+        state_commits_endpoint_serves_retained_history
+    ),
+    covered!(
         Post,
         "/groups/:id/state/seal",
         d4_stateful_events_converge_via_signed_commits

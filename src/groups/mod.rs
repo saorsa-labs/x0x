@@ -50,7 +50,8 @@ pub use self::public_message::{
 pub use self::request::{JoinRequest, JoinRequestStatus};
 pub use self::state_commit::{
     compute_policy_hash, compute_public_meta_hash, compute_roster_root, compute_state_hash,
-    ActionKind, ApplyContext, ApplyError, GroupGenesis, GroupPublicMeta, GroupStateCommit,
+    roster_projection, roster_root_of_projection, ActionKind, ApplyContext, ApplyError,
+    GroupGenesis, GroupPublicMeta, GroupStateCommit, RetainedCommit, RosterMemberSnapshot,
     CARD_SIGNATURE_DOMAIN, DEFAULT_CARD_TTL_SECS, EVENT_SIGNATURE_DOMAIN, STATE_COMMIT_DOMAIN,
 };
 
@@ -195,6 +196,22 @@ pub struct GroupInfo {
     #[serde(default)]
     pub withdrawn: bool,
 
+    /// Retained, applied state-commit history (issue #111, follow-up to
+    /// ADR-0016). Each entry pairs a signed
+    /// [`state_commit::GroupStateCommit`] with the roster projection it
+    /// effected, so "what did the signed roster say at revision N" is
+    /// answerable and independently verifiable long after the fact — the
+    /// head-only chain fields above cannot do this. Appended by
+    /// [`GroupInfo::seal_commit`] (local authorship) and
+    /// [`GroupInfo::finalize_applied_commit`] (peer commits); it therefore
+    /// captures every commit this daemon applied, from either path, with no
+    /// per-call-site wiring. Bounded by [`COMMIT_LOG_CAP`]: past the cap the
+    /// oldest entries are dropped and the loss is logged (never silent).
+    /// History begins at the first retaining release and each daemon retains
+    /// only the suffix it witnessed.
+    #[serde(default)]
+    pub commit_log: Vec<state_commit::RetainedCommit>,
+
     /// Legacy pre-v1.1 invite-secret set. Retained for JSON compatibility
     /// with already-persisted group blobs, but new admission checks use
     /// `issued_invites` so expiry, role cap, and one-time consumption can be
@@ -218,6 +235,13 @@ pub struct GroupInfo {
 fn secure_plane_legacy_default() -> SecureGroupPlane {
     SecureGroupPlane::Gss
 }
+
+/// Hard cap on retained state-commits per group (issue #111). Private-group
+/// roster churn is low-frequency, so this bounds `named_groups.json` growth
+/// while keeping a deep history. Past the cap the oldest entries are dropped
+/// (checkpoint-and-truncate is deferred — see issue #111); the drop is logged
+/// so history loss can never be silent.
+pub const COMMIT_LOG_CAP: usize = 4096;
 
 impl GroupInfo {
     /// Create a new `GroupInfo` with the given policy (defaults to `private_secure`).
@@ -310,6 +334,7 @@ impl GroupInfo {
             members_v2,
             join_requests: BTreeMap::new(),
             discovery_card_topic,
+            commit_log: Vec::new(),
             shared_secret,
             secret_epoch: 0,
             // Generic constructor stays on the legacy GSS plane (matching the
@@ -446,7 +471,7 @@ impl GroupInfo {
         let policy_hash = state_commit::compute_policy_hash(&self.policy);
         let meta_hash = state_commit::compute_public_meta_hash(&self.public_meta());
 
-        state_commit::GroupStateCommit::sign(
+        let commit = state_commit::GroupStateCommit::sign(
             self.stable_group_id().to_string(),
             self.state_revision,
             Some(prev),
@@ -457,7 +482,33 @@ impl GroupInfo {
             self.withdrawn,
             now_ms,
             keypair,
-        )
+        )?;
+        // issue #111: retain the locally-authored commit + the roster it
+        // committed. `self` already reflects the committed state here.
+        self.retain_commit(&commit);
+        Ok(commit)
+    }
+
+    /// Append a retained commit for the just-committed state and enforce
+    /// [`COMMIT_LOG_CAP`]. `self` must already reflect the committed roster
+    /// (callers mutate then seal/finalize, so this holds). The single
+    /// chokepoint both commit-production paths route through, so retention
+    /// cannot be forgotten at an individual apply site.
+    fn retain_commit(&mut self, commit: &state_commit::GroupStateCommit) {
+        self.commit_log.push(state_commit::RetainedCommit::capture(
+            commit.clone(),
+            &self.members_v2,
+        ));
+        if self.commit_log.len() > COMMIT_LOG_CAP {
+            let overflow = self.commit_log.len() - COMMIT_LOG_CAP;
+            self.commit_log.drain(0..overflow);
+            tracing::warn!(
+                group_id = %self.stable_group_id(),
+                dropped = overflow,
+                cap = COMMIT_LOG_CAP,
+                "commit_log exceeded cap; dropped oldest retained commits",
+            );
+        }
     }
 
     /// Mark the group as withdrawn and seal the terminal higher-revision
@@ -522,6 +573,10 @@ impl GroupInfo {
                 got: self.state_hash.clone(),
             });
         }
+        // issue #111: retain the peer-authored commit only after it has
+        // validated and applied cleanly (post hash-match), so rejected
+        // commits never enter the history.
+        self.retain_commit(commit);
         Ok(())
     }
 
@@ -979,6 +1034,49 @@ mod tests {
         assert!(owner.is_active());
         assert_eq!(info.policy, GroupPolicy::default());
         assert_eq!(info.active_member_count(), 1);
+    }
+
+    #[test]
+    fn seal_commit_retains_verifiable_history() {
+        // issue #111: every locally-authored commit is retained in-struct,
+        // paired with a roster projection that re-derives its signed root.
+        let mut info = GroupInfo::new("Test".into(), String::new(), agent(1), "aabb".repeat(8));
+        let kp = crate::identity::AgentKeypair::generate().unwrap();
+        assert!(
+            info.commit_log.is_empty(),
+            "fresh group has no retained commits"
+        );
+
+        let c1 = info.seal_commit(&kp, 1_000).unwrap();
+        info.add_member(
+            hex::encode([2u8; 32]),
+            GroupRole::Member,
+            Some("alice".into()),
+            None,
+        );
+        let c2 = info.seal_commit(&kp, 2_000).unwrap();
+
+        assert_eq!(
+            info.commit_log.len(),
+            2,
+            "each seal retains exactly one entry"
+        );
+        assert_eq!(info.commit_log[0].commit.revision, c1.revision);
+        assert_eq!(info.commit_log[1].commit.revision, c2.revision);
+        assert!(c2.revision > c1.revision, "revisions are monotonic");
+
+        for entry in &info.commit_log {
+            assert!(
+                entry.roster_root_consistent(),
+                "retained entry must re-derive its signed roster_root"
+            );
+        }
+        assert!(
+            info.commit_log[1]
+                .roster
+                .contains_key(&hex::encode([2u8; 32])),
+            "newly added member must appear in the latest retained projection"
+        );
     }
 
     #[test]

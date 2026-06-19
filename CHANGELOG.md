@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.25.0] - 2026-06-19
+
+### Added
+
+- **Retained named-group state-commit history + `GET /groups/:id/state/commits` (members-only, paged) — a verifiable role/roster audit trail ([#111](https://github.com/saorsa-labs/x0x/issues/111), proposed by @nkoteskey).** Every authored or applied `GroupStateCommit` is now retained in-struct alongside an independently-verifiable roster projection: recomputing the BLAKE3 `roster_root` from the stored `{agent_id → (role, state)}` snapshot must equal the signed `commit.roster_root`. This makes "who held which role at revision N" auditable after the fact — closing the verification gap that [ADR-0016](docs/adr/0016-role-based-group-authority-flat-admin.md)'s flat Admin/Member delegated authority left open. The endpoint serves the chain to members with pagination (`from_revision`, `limit`) and reports `roster_root_verified` per entry. Retention rides the existing atomic group writes through the two methods every commit-production path funnels through (`seal_commit` for the authoring committer, `finalize_applied_commit` for commits applied over gossip), bounded by `COMMIT_LOG_CAP`. CLI: `x0x group state-commits <group_id>`. Verified on the live 6-node testnet across both the authored (committer) and applied-over-gossip (TreeKEM joiner) paths.
+
 ## [v0.24.0] - 2026-06-15
 
 ### Added
