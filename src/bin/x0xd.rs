@@ -233,7 +233,16 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Phase 1 (Issue #110): hand the server bring-up to the library.
+    // `--check-updates` is a print-and-exit mode: run the update check, report,
+    // and return without serving (matches pre-extraction behaviour).
+    if check_updates_only {
+        return x0x::server::run_update_check_and_report(&config, skip_update_check).await;
+    }
+
+    // Phase 2 (Issue #110): start the server via the library handle. The daemon
+    // opts in to self-update (so behaviour is unchanged) and owns Ctrl-C itself
+    // — the library must not steal the host's signal.
+    let self_update_enabled = config.update_enabled();
     let options = ServeOptions {
         skip_update_check,
         check_updates_only,
@@ -241,8 +250,21 @@ async fn main() -> anyhow::Result<()> {
         cli_disable_peer_cache,
         instance_name,
         exec_policy,
+        self_update_enabled,
     };
-    x0x::server::run(config, options).await
+    let handle = x0x::server::serve_with_options(config, options).await?;
+
+    // Own Ctrl-C in the binary: a detached watcher cancels the server's
+    // shutdown token on signal, while the main path awaits run-to-completion.
+    // The `/shutdown` HTTP path drives the same exit. The library never installs
+    // a Ctrl-C handler itself — that signal belongs to the host process.
+    let cancel = handle.cancellation_token();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel.cancel();
+        }
+    });
+    handle.wait().await
 }
 
 async fn run_doctor(config: &DaemonConfig) -> Result<()> {

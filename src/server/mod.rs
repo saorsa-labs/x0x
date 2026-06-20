@@ -29,7 +29,6 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use tokio::signal;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use x0x::contacts::{ContactStore, IdentityType, MachineRecord, TrustLevel};
@@ -46,6 +45,7 @@ use x0x::{Agent, KvStoreHandle, TaskListHandle};
 ///
 /// Carries the CLI-derived flags that the server-bringup path consumes.
 /// Phase 1: minimal — do not redesign config here.
+#[derive(Default)]
 pub struct ServeOptions {
     /// Skip the startup GitHub update check.
     pub skip_update_check: bool,
@@ -59,6 +59,87 @@ pub struct ServeOptions {
     pub instance_name: Option<String>,
     /// Loaded exec ACL policy.
     pub exec_policy: x0x::exec::ExecPolicy,
+    /// Whether the self-update install/restart paths are allowed to run.
+    ///
+    /// AND-ed with `config.update.enabled`. The daemon binary sets this to
+    /// `config.update.enabled` so its behaviour is unchanged. The public
+    /// [`serve`] entrypoint defaults it to `false` — an embedded library must
+    /// never replace or restart the host application. Manifest *propagation*
+    /// (broadcast/listen for informational purposes) is unaffected; only the
+    /// paths that download + install + restart are gated.
+    pub self_update_enabled: bool,
+}
+
+/// Handle to a running, in-process x0x server.
+///
+/// Returned by [`serve`] / [`serve_with_options`]. The server runs on a
+/// detached supervisor task; the handle owns its lifecycle. All synchronous,
+/// fallible startup (data-dir create, identity load/gen, listener bind, state
+/// and router build, `api.port` write) has already completed by the time the
+/// handle is returned, so [`local_addr`](ServerHandle::local_addr) is readable
+/// immediately, which matters when binding `127.0.0.1:0` for tests.
+///
+/// Dropping the handle requests shutdown (the supervisor is cancelled) but does
+/// not block; await [`wait`](ServerHandle::wait) or
+/// [`shutdown_and_wait`](ServerHandle::shutdown_and_wait) to observe completion.
+pub struct ServerHandle {
+    local_addr: SocketAddr,
+    cancel: tokio_util::sync::CancellationToken,
+    // `Option` so the consuming `wait`/`shutdown_and_wait` can take the join
+    // handle out without conflicting with the `Drop` impl (which only cancels).
+    task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl ServerHandle {
+    /// The actual bound API address. Readable immediately after the handle is
+    /// returned, including the resolved port when the caller bound to port 0.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Request graceful shutdown. Idempotent and non-consuming — safe to call
+    /// repeatedly and from a `&self` reference. Returns immediately; await the
+    /// handle to observe run-to-completion.
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Await the server's run-to-completion, returning its supervisor result.
+    pub async fn wait(mut self) -> anyhow::Result<()> {
+        // `task` is always `Some` here — it is only taken by this consuming
+        // method, so a single `wait`/`shutdown_and_wait` call sees it set.
+        let Some(task) = self.task.take() else {
+            return Err(anyhow::anyhow!("server handle already consumed"));
+        };
+        match task.await {
+            Ok(res) => res,
+            Err(e) => Err(anyhow::Error::new(e).context("server supervisor task failed")),
+        }
+    }
+
+    /// A clone of the cancellation token that drives shutdown. Lets a host
+    /// `select!` over its own signal handling and cancel without holding the
+    /// handle (the daemon binary uses this for Ctrl-C). Cancelling the returned
+    /// token is equivalent to calling [`shutdown`](ServerHandle::shutdown).
+    #[must_use]
+    pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Request shutdown, then await run-to-completion.
+    pub async fn shutdown_and_wait(self) -> anyhow::Result<()> {
+        self.cancel.cancel();
+        self.wait().await
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        // No detached daemon: dropping the handle requests shutdown. Drop does
+        // not block — callers that need to observe completion use `wait`.
+        self.cancel.cancel();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +258,17 @@ pub struct DaemonConfig {
     /// When set, identity and data are scoped to this name.
     #[serde(default)]
     pub instance_name: Option<String>,
+
+    /// Explicit directory for identity material (machine/agent/user/cert keys).
+    ///
+    /// When set, ALL identity keys derive from this directory and the daemon
+    /// never falls back to `~/.x0x`. This is the storage boundary required for
+    /// in-process embedding ([`serve`]): the host supplies its own directory so
+    /// nothing is written under the user's home. When unset (the default for
+    /// the daemon binary), identity falls back to the existing behaviour
+    /// (`~/.x0x`, or the `--name`-scoped `~/.x0x-<name>` directory).
+    #[serde(default)]
+    pub identity_dir: Option<PathBuf>,
 
     /// Override the shard digest anti-entropy interval (seconds) for tests.
     #[serde(default)]
@@ -345,6 +437,16 @@ fn default_rendezvous_validity_ms() -> u64 {
     3_600_000 // 1 hour
 }
 
+impl DaemonConfig {
+    /// Whether self-update is enabled in this config. The daemon binary uses
+    /// this to set [`ServeOptions::self_update_enabled`] so its behaviour is
+    /// unchanged by the embed-path default of `false`.
+    #[must_use]
+    pub fn update_enabled(&self) -> bool {
+        self.update.enabled
+    }
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -369,6 +471,7 @@ impl Default for DaemonConfig {
             presence_event_poll_interval_secs: None,
             presence_offline_timeout_secs: None,
             instance_name: None,
+            identity_dir: None,
             directory_digest_interval_secs: None,
             group_card_republish_interval_secs: None,
             directory_resubscribe_jitter_ms: None,
@@ -510,6 +613,9 @@ struct AppState {
     shutdown_notify: watch::Sender<bool>,
     /// Update configuration honored by manual API-triggered update checks.
     update_config: DaemonUpdateConfig,
+    /// Whether install/restart-capable self-update is allowed. `false` on the
+    /// embed path so `/upgrade/apply` cannot replace/restart the host process.
+    self_update_enabled: bool,
     /// Cached `/upgrade` response so polling clients cannot hammer GitHub.
     upgrade_check_cache: Mutex<Option<CachedUpgradeCheck>>,
     /// Serializes all destructive binary replacement attempts.
@@ -1185,10 +1291,65 @@ struct TaskEntry {
 
 /// Run the daemon HTTP/WebSocket server to completion.
 ///
-/// Builds the agent + shared state, binds the API listener, writes the
-/// `api.port` file, spawns the serving-side background tasks, and serves
-/// the axum router until shutdown. Blocking/run-to-completion for Phase 1.
+/// Thin blocking wrapper over [`serve_with_options`]: performs all fallible
+/// startup, then awaits run-to-completion. Shutdown is driven by the `/shutdown`
+/// HTTP endpoint. This entrypoint does NOT install a Ctrl-C handler — a host
+/// process that wants Ctrl-C must use [`serve_with_options`] and select over
+/// [`ServerHandle::wait`] alongside its own signal handling (the daemon binary
+/// does exactly that).
 pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<()> {
+    serve_with_options(config, options).await?.wait().await
+}
+
+/// CLI `--check-updates`: run the startup update check, print its outcome, and
+/// return without serving. Mirrors the print-and-exit behaviour the daemon had
+/// inline before the [`serve_with_options`] extraction. Only the binary calls
+/// this; the embed path never installs updates.
+pub async fn run_update_check_and_report(
+    config: &DaemonConfig,
+    skip_update_check: bool,
+) -> anyhow::Result<()> {
+    if config.update.enabled && !skip_update_check {
+        match run_startup_update_check(config, None).await {
+            Ok(Some(version)) => println!("x0xd updated to {version}"),
+            Ok(None) => println!("x0xd is up to date ({})", x0x::VERSION),
+            Err(e) => return Err(e).context("self-update check failed"),
+        }
+    } else if !config.update.enabled {
+        println!("self-update checks are disabled by configuration");
+    } else {
+        println!("self-update check skipped by --skip-update-check");
+    }
+    Ok(())
+}
+
+/// Start the x0x server in-process and return a [`ServerHandle`].
+///
+/// Self-update install/restart is DISABLED and the startup update check is
+/// skipped — an embedded library must never replace or restart the host
+/// application. Supply an `identity_dir` (or `data_dir`) in `config` so no
+/// state is written under `~/.x0x`. See [`serve_with_options`] for full
+/// control over runtime options.
+pub async fn serve(config: DaemonConfig) -> anyhow::Result<ServerHandle> {
+    let options = ServeOptions {
+        skip_update_check: true,
+        self_update_enabled: false,
+        ..ServeOptions::default()
+    };
+    serve_with_options(config, options).await
+}
+
+/// Start the x0x server in-process with explicit runtime options.
+///
+/// All synchronous, fallible startup (data-dir create, identity load/gen,
+/// API-token load, listener bind, state + router build, `api.port` write) runs
+/// here and surfaces as `Err` BEFORE any long-lived task is spawned. On success
+/// a single supervisor task is spawned and a [`ServerHandle`] is returned with
+/// the bound address already readable.
+pub async fn serve_with_options(
+    config: DaemonConfig,
+    options: ServeOptions,
+) -> anyhow::Result<ServerHandle> {
     let ServeOptions {
         skip_update_check,
         check_updates_only,
@@ -1196,6 +1357,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
         cli_disable_peer_cache,
         instance_name,
         exec_policy,
+        self_update_enabled,
     } = options;
     // Ensure data directory exists early so self-update has a working directory.
     tokio::fs::create_dir_all(&config.data_dir)
@@ -1210,35 +1372,22 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
         "x0xd started"
     );
 
-    // Startup GitHub check (fallback mechanism — gossip is primary)
-    if config.update.enabled && !skip_update_check {
-        match run_startup_update_check(&config, None).await {
-            Ok(Some(version)) => {
-                if check_updates_only {
-                    println!("x0xd updated to {version}");
-                    return Ok(());
-                }
-            }
-            Ok(None) => {
-                if check_updates_only {
-                    println!("x0xd is up to date ({})", x0x::VERSION);
-                    return Ok(());
-                }
-            }
-            Err(e) => {
-                if check_updates_only {
-                    return Err(e).context("self-update check failed");
-                }
-                tracing::warn!(error = %e, "Startup update check failed: {e}");
-            }
+    // `--check-updates` is a CLI-only print-and-exit mode handled by the binary
+    // (see `run_update_check_and_report`) BEFORE this path is reached, so it is
+    // never set here. Assert that contract loudly rather than silently serving.
+    debug_assert!(
+        !check_updates_only,
+        "check_updates_only must be handled by the binary before serve_with_options"
+    );
+    let _ = check_updates_only;
+
+    // Startup GitHub check (fallback mechanism — gossip is primary).
+    // Gated on `self_update_enabled` so embedders never download/install a new
+    // binary in-process; the daemon binary sets it to `config.update.enabled`.
+    if self_update_enabled && config.update.enabled && !skip_update_check {
+        if let Err(e) = run_startup_update_check(&config, None).await {
+            tracing::warn!(error = %e, "Startup update check failed: {e}");
         }
-    } else if check_updates_only {
-        if !config.update.enabled {
-            println!("self-update checks are disabled by configuration");
-        } else {
-            println!("self-update check skipped by --skip-update-check");
-        }
-        return Ok(());
     }
 
     tracing::info!("Starting x0xd v{}", x0x::VERSION);
@@ -1267,9 +1416,21 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
         config.bind_address
     };
 
-    // Derive instance-scoped identity directory
-    let identity_dir = match &instance_name {
-        Some(name) => {
+    // Resolve the identity directory. Precedence:
+    //   1. `config.identity_dir` — explicit host-supplied directory. This is the
+    //      storage boundary for in-process embedding: when set, ALL identity
+    //      keys derive from it and `~/.x0x` is never touched.
+    //   2. `~/.x0x-<name>` — instance-scoped directory when `--name` is active.
+    //   3. `None` — default daemon behaviour (keys fall back to `~/.x0x`).
+    let identity_dir = match (&config.identity_dir, &instance_name) {
+        (Some(dir), _) => {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .context("failed to create configured identity directory")?;
+            tracing::info!("Identity directory: {} (configured)", dir.display());
+            Some(dir.clone())
+        }
+        (None, Some(name)) => {
             let dir = dirs::home_dir()
                 .context("home directory required for instance identity directory")?
                 .join(format!(".x0x-{name}"));
@@ -1279,7 +1440,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
             tracing::info!("Identity directory: {}", dir.display());
             Some(dir)
         }
-        None => None,
+        (None, None) => None,
     };
 
     // Create agent
@@ -1350,22 +1511,22 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     if let Some(ref user_key_path) = config.user_key_path {
         builder = builder.with_user_key_path(user_key_path);
         tracing::info!("User key path: {}", user_key_path.display());
+    } else if let Some(ref id_dir) = identity_dir {
+        // Storage boundary: with an explicit identity directory and no
+        // configured user key, scope the (opt-in) user key lookup to that
+        // directory so the builder never falls back to reading `~/.x0x/user.key`.
+        // `with_user_key_path` loads only if the file exists and never
+        // auto-generates, so this stays opt-in.
+        builder = builder.with_user_key_path(id_dir.join("user.key"));
     }
 
-    let agent = builder.build().await.context("failed to create agent")?;
-
-    tracing::info!("Agent ID: {}", agent.agent_id());
-    tracing::info!("Machine ID: {}", agent.machine_id());
-    if let Some(uid) = agent.user_id() {
-        tracing::info!("User ID: {}", uid);
-    }
-
-    // Attach the agent-owned contact store to gossip and API state so the
-    // DM inbox trust evaluator observes the same mutations made by REST
-    // contact/card endpoints.
-    let contacts = Arc::clone(agent.contacts());
-    agent.set_contacts(Arc::clone(&contacts));
-    tracing::info!("Contact store loaded from {}", contacts_path.display());
+    // Fix A (Issue #110 Phase 2): perform every agent-independent fallible
+    // startup step BEFORE building the agent. `Agent::builder().build()` spawns
+    // the NetworkNode receiver/accept/eviction tasks (and binds the QUIC
+    // socket), so any error AFTER it would leak those running tasks for an
+    // embedder. The common failure — API port already in use — is caught here,
+    // before the agent exists, so `serve_with_options()` returns Err having
+    // started nothing.
 
     // MLS groups are session-scoped (saorsa-mls groups are not serializable)
     let mls_groups_path = config.data_dir.join("mls_groups.bin");
@@ -1389,15 +1550,13 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     let api_token = load_or_generate_api_token(&config.data_dir).await?;
 
     // Bind the API listener early so the daemon can report the actual bound
-    // address even when configured with an ephemeral port.
+    // address even when configured with an ephemeral port. Done before the agent
+    // is built so a bind failure (port in use) returns Err with nothing running.
     let listener = tokio::net::TcpListener::bind(config.api_address)
         .await
         .context("failed to bind API address")?;
     let actual_api_addr = listener.local_addr()?;
 
-    // Build shared state BEFORE joining network so the API server can
-    // start immediately. Network-dependent endpoints will return errors
-    // until join completes, which is better than blocking the entire API.
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
     // Load or generate the per-daemon ML-KEM-768 keypair. Persisted under
     // `<data_dir>/agent_kem.key` with mode 0600. This keypair is the root of
@@ -1413,6 +1572,25 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
         "agent KEM-768 public key loaded ({} bytes)",
         agent_kem_keypair.public_bytes.len()
     );
+
+    // All agent-independent fallible startup has succeeded. Build the agent now
+    // (this spawns the network tasks and binds the QUIC socket). From here on,
+    // any fallible step must `agent.shutdown().await` on the error path so a
+    // failure does not leak the agent/network/tasks.
+    let agent = builder.build().await.context("failed to create agent")?;
+
+    tracing::info!("Agent ID: {}", agent.agent_id());
+    tracing::info!("Machine ID: {}", agent.machine_id());
+    if let Some(uid) = agent.user_id() {
+        tracing::info!("User ID: {}", uid);
+    }
+
+    // Attach the agent-owned contact store to gossip and API state so the
+    // DM inbox trust evaluator observes the same mutations made by REST
+    // contact/card endpoints.
+    let contacts = Arc::clone(agent.contacts());
+    agent.set_contacts(Arc::clone(&contacts));
+    tracing::info!("Contact store loaded from {}", contacts_path.display());
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (shutdown_notify, _) = watch::channel(false);
@@ -1479,6 +1657,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
         shutdown_tx,
         shutdown_notify,
         update_config: config.update.clone(),
+        self_update_enabled,
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         api_token,
@@ -1486,26 +1665,53 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
     });
 
+    // Fix A (Issue #110 Phase 2): the `api.port` advertisement is written here,
+    // before any long-lived background task is spawned. The agent IS already
+    // built by this point (it is needed for AppState), so on the error path we
+    // must tear it down — `agent.shutdown()` stops the network tasks and closes
+    // the QUIC node — so a failed write does not leak the agent/network. (The
+    // ExecService tasks are not yet stoppable; that residual is the tracked
+    // Phase 2b follow-up.) The file is removed again in the shutdown tail.
+    let port_file = config.data_dir.join("api.port");
+    if let Err(e) = tokio::fs::write(&port_file, actual_api_addr.to_string()).await {
+        agent.shutdown().await;
+        return Err(anyhow::Error::new(e).context("failed to write api.port"));
+    }
+    tracing::info!(
+        "API server listening on {actual_api_addr} (port file: {})",
+        port_file.display()
+    );
+
+    // Fix C (Issue #110 Phase 2): collect every server-owned background-task
+    // `JoinHandle` spawned in the startup path so the shutdown tail can
+    // grace-await then abort any straggler. (Agent-internal and ExecService tasks
+    // are not collected here — see the Phase 2b note in the shutdown tail.)
+    let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     let existing_group_ids: Vec<String> = {
         let groups = state.named_groups.read().await;
         groups.keys().cloned().collect()
     };
     for group_id in existing_group_ids {
+        // The metadata + public-message listeners spawned here self-register in
+        // `state.group_metadata_tasks` / `state.public_message_tasks`; the
+        // shutdown tail drains and aborts those maps directly (Fix C), so there
+        // is nothing to collect into `bg_tasks` from this call.
         ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
     }
 
     // P0-1: subscribe to the global group discovery topic so remote public
     // groups populate the local card cache without manual import.
-    spawn_global_discovery_listener(Arc::clone(&state)).await;
+    bg_tasks.extend(spawn_global_discovery_listener(Arc::clone(&state)).await);
     // Phase C.2: load persisted shard subscriptions and re-subscribe with
     // staggered jitter to avoid anti-entropy storms.
-    spawn_directory_resubscribe(Arc::clone(&state)).await;
+    bg_tasks.extend(spawn_directory_resubscribe(Arc::clone(&state)).await);
     // Phase C.2: subscribe inbound direct messages for the
     // ListedToContacts pairwise sync channel.
-    spawn_listed_to_contacts_listener(Arc::clone(&state)).await;
+    bg_tasks.extend(spawn_listed_to_contacts_listener(Arc::clone(&state)).await);
     // Phase E: subscribe to a stable global SignedPublic message fallback so
     // first messages are not dependent on a brand-new per-group topic tree.
-    spawn_global_public_message_listener(Arc::clone(&state)).await;
+    bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
 
     // Re-publish our own discoverable group cards after startup so late joiners
     // pick them up.
@@ -1522,7 +1728,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     let republish_interval_secs = config.group_card_republish_interval_secs.unwrap_or(300);
     if republish_interval_secs > 0 {
         let state_for_republish = Arc::clone(&state);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             // First publish after a short warmup so the gossip mesh has a chance
             // to form. Then republish periodically so late joiners also see cards.
             // Without this, a peer that starts after another daemon published
@@ -1548,7 +1754,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                     _ = shutdown.changed() => break,
                 }
             }
-        });
+        }));
     }
     // Consume the pre-computed list to avoid the dead-warning.
     let _ = discoverable_ids;
@@ -1567,15 +1773,15 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     let dm_inbox_exec_route_tx = exec_dm_tx.clone();
     let dm_inbox_group_public_route_tx = group_public_dm_tx.clone();
     let dm_inbox_kv_store_delta_route_tx = kv_store_delta_dm_tx.clone();
-    tokio::spawn(start_dm_inbox_when_gossip_ready(
+    bg_tasks.push(tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
         dm_inbox_exec_route_tx,
         dm_inbox_group_public_route_tx,
         dm_inbox_kv_store_delta_route_tx,
-    ));
+    )));
 
-    tokio::spawn(async move {
+    bg_tasks.push(tokio::spawn(async move {
         match join_agent.join_network().await {
             Ok(()) => {
                 tracing::info!("Network joined");
@@ -1591,16 +1797,19 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                 tracing::error!("Failed to join network: {e}");
             }
         }
-    });
+    }));
 
     let self_published_release_manifests =
         Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
 
     // Reclaim upgrade debris left by previous failed/interrupted attempts:
     // orphaned `.x0x-upgrade-*` temp dirs and `*.x0xold-*` sidelined binaries.
-    // Runs unconditionally (cheap one-shot dir scan) so a machine that hit the
-    // old disk-fill loop is cleaned up even if updates are now disabled.
-    tokio::spawn(async {
+    // Runs UNCONDITIONALLY (deliberately NOT gated on self_update_enabled): this
+    // is the disk-fill safety net from the Windows self-update fix and must clean
+    // a machine even when self-update is disabled. It only matches x0x-specific
+    // artifact patterns next to the binary, so it is a harmless no-op for an
+    // embedder (which never creates such artifacts) — no host files can match.
+    bg_tasks.push(tokio::spawn(async {
         let removed = tokio::task::spawn_blocking(|| {
             let exe = x0x::upgrade::apply::current_binary_path().ok()?;
             let dir = exe.parent()?.to_path_buf();
@@ -1616,16 +1825,18 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
         if removed > 0 {
             tracing::info!(removed, "Reclaimed stale upgrade artifacts at startup");
         }
-    });
+    }));
 
-    // Gossip-based release subscription (primary update mechanism)
-    if config.update.enabled && config.update.gossip_updates {
+    // Gossip-based release subscription (primary update mechanism). This
+    // listener can download + install + restart, so it is gated on
+    // `self_update_enabled` — embedders never replace the host binary.
+    if self_update_enabled && config.update.enabled && config.update.gossip_updates {
         let update_config = config.update.clone();
         let agent_for_gossip = Arc::clone(&state.agent);
         let data_dir = config.data_dir.clone();
         let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             run_gossip_update_listener(
                 agent_for_gossip,
                 update_config,
@@ -1634,18 +1845,22 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                 self_published_for_gossip,
             )
             .await;
-        });
+        }));
     }
 
     // Broadcast current manifest to gossip after joining the network.
     // Ensures nodes that missed the initial gossip window can still receive it.
     // Also syncs SKILL.md with the current manifest.
-    if config.update.enabled {
+    // Fix D (Issue #110 Phase 2): gated on `self_update_enabled` — this fetches a
+    // GitHub release manifest and writes SKILL.md, both updater side-effects an
+    // embedder with self-update off must not perform. The daemon keeps it on
+    // (self_update_enabled = config.update_enabled()), so behaviour is unchanged.
+    if self_update_enabled && config.update.enabled {
         let agent_for_broadcast = Arc::clone(&state.agent);
         let update_config = config.update.clone();
         let data_dir_for_broadcast = config.data_dir.clone();
         let self_published_for_broadcast = Arc::clone(&self_published_release_manifests);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             broadcast_current_manifest(
                 &agent_for_broadcast,
                 &update_config.repo,
@@ -1654,17 +1869,21 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                 self_published_for_broadcast,
             )
             .await;
-        });
+        }));
     }
 
-    // GitHub fallback poll (safety net, default every 48h)
-    if config.update.enabled && config.update.fallback_check_interval_minutes > 0 {
+    // GitHub fallback poll (safety net, default every 48h). Install/restart
+    // capable, so gated on `self_update_enabled` (embedders opt out).
+    if self_update_enabled
+        && config.update.enabled
+        && config.update.fallback_check_interval_minutes > 0
+    {
         let update_config = config.update.clone();
         let agent_for_poll = Arc::clone(&state.agent);
         let data_dir_for_poll = config.data_dir.clone();
         let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let self_published_for_poll = Arc::clone(&self_published_release_manifests);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             run_fallback_github_poll(
                 agent_for_poll,
                 update_config,
@@ -1673,26 +1892,32 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                 self_published_for_poll,
             )
             .await;
-        });
+        }));
     }
 
     // Background rendezvous re-advertisement (re-advertise every validity_ms / 2)
     if config.rendezvous_enabled && config.rendezvous_validity_ms > 0 {
         let rendezvous_agent = Arc::clone(&state.agent);
         let validity_ms = config.rendezvous_validity_ms;
-        tokio::spawn(async move {
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
             let interval_secs = (validity_ms / 2).max(60_000) / 1000;
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
             ticker.tick().await; // skip immediate tick (already advertised at startup)
             loop {
-                ticker.tick().await;
+                // Watch shutdown so teardown is prompt (Fix C): without this the
+                // loop would only stop when aborted at the end of the grace window.
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = ticker.tick() => {}
+                }
                 if let Err(e) = rendezvous_agent.advertise_identity(validity_ms).await {
                     tracing::warn!("Periodic rendezvous re-advertisement failed: {e}");
                 } else {
                     tracing::debug!("Rendezvous re-advertisement published");
                 }
             }
-        });
+        }));
     }
 
     // Background connectivity snapshot logger — writes an ant-quic NodeStatus
@@ -1703,11 +1928,16 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     // polling the HTTP diagnostics endpoint.
     {
         let diag_state = Arc::clone(&state);
-        tokio::spawn(async move {
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             ticker.tick().await; // skip the immediate tick — node is still warming up
             loop {
-                ticker.tick().await;
+                // Watch shutdown so teardown is prompt (Fix C).
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = ticker.tick() => {}
+                }
                 let Some(network) = diag_state.agent.network() else {
                     continue;
                 };
@@ -1734,13 +1964,13 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                     "connectivity snapshot"
                 );
             }
-        });
+        }));
     }
 
     // Background file-message listener — processes FileMessage on the direct channel
     {
         let file_state = Arc::clone(&state);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             if let Err(e) = tokio::fs::create_dir_all(&file_state.transfers_dir).await {
                 tracing::error!("Failed to create transfers dir: {e}");
             }
@@ -1753,14 +1983,14 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                 };
                 handle_file_message(&file_state, &msg.sender, file_msg).await;
             }
-        });
+        }));
     }
 
     // Background join-result listener — joiner-initiated recovery path for
     // fresh TreeKEM members that miss the anchor's opportunistic MemberAdded push.
     {
         let join_result_state = Arc::clone(&state);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             let mut rx = join_result_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
@@ -1776,14 +2006,14 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                 );
                 handle_join_result_message(&join_result_state, &msg.sender, join_msg).await;
             }
-        });
+        }));
     }
 
     // Background TreeKEM Welcome blob listener — pull-based bulk delivery for
     // oversized Welcome payloads referenced by named-group metadata events.
     {
         let welcome_state = Arc::clone(&state);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             let mut rx = welcome_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
@@ -1800,7 +2030,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                 );
                 handle_welcome_blob_message(&welcome_state, &msg.sender, welcome_msg).await;
             }
-        });
+        }));
     }
 
     // Background TreeKEM catch-up listener — explicit anti-entropy for
@@ -1808,7 +2038,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     // ahead of the local epoch/state frontier.
     {
         let catchup_state = Arc::clone(&state);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             let mut rx = catchup_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
@@ -1837,7 +2067,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                     }
                 }
             }
-        });
+        }));
     }
 
     // Background named-group metadata listener on the direct channel — applies
@@ -1850,7 +2080,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     // and gossip channels is safe.
     {
         let meta_state = Arc::clone(&state);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             let mut rx = meta_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
@@ -1869,7 +2099,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                 apply_named_group_metadata_event(&meta_state, event, msg.sender, msg.verified)
                     .await;
             }
-        });
+        }));
     }
 
     // Background signed public-message listener for typed gossip-DM fallback
@@ -1878,7 +2108,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     // delivers it to active members.
     {
         let public_dm_state = Arc::clone(&state);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = group_public_dm_rx.recv().await {
                 if !typed.verified {
                     continue;
@@ -1903,7 +2133,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                 );
                 ingest_public_message(&public_dm_state, msg, &group_id).await;
             }
-        });
+        }));
     }
 
     // Background KvStore delta listener for typed gossip-DM fallback delivery.
@@ -1912,7 +2142,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     // late or congested. Peers that have not joined the store simply ignore it.
     {
         let kv_delta_state = Arc::clone(&state);
-        tokio::spawn(async move {
+        bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = kv_store_delta_dm_rx.recv().await {
                 if !typed.verified {
                     continue;
@@ -1929,7 +2159,7 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
                 };
                 apply_direct_kv_store_delta(&kv_delta_state, typed.sender, delta_msg).await;
             }
-        });
+        }));
     }
 
     // Build router
@@ -2145,52 +2375,141 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
         ))
         .with_state(Arc::clone(&state));
 
-    // Start server
-    let port_file = config.data_dir.join("api.port");
-    tokio::fs::write(&port_file, actual_api_addr.to_string()).await?;
-    tracing::info!(
-        "API server listening on {actual_api_addr} (port file: {})",
-        port_file.display()
-    );
+    // Note: the `api.port` advertisement is written above (Fix A), before any
+    // background task is spawned, so a failure there leaves nothing to tear down.
 
-    let mut server_shutdown_rx = state.shutdown_notify.subscribe();
-    let mut server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = server_shutdown_rx.changed().await;
-            })
+    // Lifecycle: a CancellationToken drives library-initiated shutdown
+    // (ServerHandle::shutdown / Drop). The mpsc `/shutdown` HTTP path still
+    // works — the supervisor selects on both. Ctrl-C is deliberately NOT
+    // handled here: a library must not steal the host's signal. The daemon
+    // binary installs its own Ctrl-C handler around `ServerHandle::wait`.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let supervisor_cancel = cancel.clone();
+
+    let task = tokio::spawn(async move {
+        let mut server_shutdown_rx = state.shutdown_notify.subscribe();
+        let mut server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = server_shutdown_rx.changed().await;
+                })
+                .await
+        });
+
+        // Fix B (Issue #110 Phase 2): include the axum server `JoinHandle` in the
+        // select so that if the HTTP task ends on its own (panic / bind loss /
+        // Err) the supervisor wakes immediately instead of waiting for an external
+        // shutdown signal. The result is still drained and propagated below.
+        // When the select observes the axum task ending on its own, capture its
+        // result here so it can be propagated out of the supervisor — an Err or a
+        // panic (JoinError) must surface from `wait()`/`shutdown_and_wait()`. A
+        // clean self-requested graceful stop stays `Ok(())`.
+        let mut server_result: Option<anyhow::Result<()>> = None;
+        tokio::select! {
+            _ = supervisor_cancel.cancelled() => {
+                tracing::info!("Received shutdown request (cancellation)");
+            }
+            _ = shutdown_rx.recv() => {
+                tracing::info!("Received API shutdown request");
+            }
+            res = &mut server => {
+                server_result = Some(match res {
+                    Ok(Ok(())) => {
+                        tracing::info!("API server task ended on its own");
+                        Ok(())
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("API server exited with error: {e}");
+                        Err(anyhow::Error::new(e).context("API server error"))
+                    }
+                    Err(e) => {
+                        tracing::error!("API server task failed: {e}");
+                        Err(anyhow::Error::new(e).context("API server task failed"))
+                    }
+                });
+            }
+        }
+
+        // Tell every `shutdown_notify`-watching loop (and the axum graceful
+        // shutdown future) to stop.
+        let _ = state.shutdown_notify.send(true);
+
+        // Drain the axum server result and propagate any failure. If the select
+        // already observed it ending, `server` was consumed there and its result
+        // captured above; otherwise await it (with a bound) and propagate.
+        let server_result: anyhow::Result<()> = match server_result {
+            Some(res) => res,
+            None => match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(e))) => Err(anyhow::Error::new(e).context("API server error")),
+                Ok(Err(e)) => Err(anyhow::Error::new(e).context("API server task failed")),
+                Err(_) => {
+                    tracing::warn!(
+                        "API server did not shut down within 2s; aborting lingering connections"
+                    );
+                    server.abort();
+                    let _ = server.await;
+                    Ok(())
+                }
+            },
+        };
+
+        // Fix C (Issue #110 Phase 2): tear down the server-owned tasks and the
+        // QUIC node so that when this supervisor returns, the HTTP/SSE server,
+        // the server-owned background tasks, the gossip runtime, and the QUIC
+        // NetworkNode are all stopped/closed. (Some Agent-internal listeners and
+        // the ExecService tasks are NOT yet tracked/stopped here — fully
+        // deterministic teardown of those is the Phase 2b follow-up.)
+        //
+        // 1. `Agent::shutdown()` stops presence/heartbeat/cache, shuts down the
+        //    gossip runtime, and shuts down the QUIC NetworkNode (aborting its
+        //    receiver/accept/eviction tasks and closing the ant-quic node) — see
+        //    `Agent::shutdown`. This also drops the gossip/direct senders so
+        //    channel-close-driven receive loops end. (The OS frees the UDP
+        //    socket itself on process exit; ant-quic does not release it
+        //    in-process — embedders that restart should use an ephemeral QUIC
+        //    port.)
+        state.agent.shutdown().await;
+        // 2. Grace-await then abort every background task. Tasks tracked in the
+        //    AppState handle maps (metadata / public-message / directory shard
+        //    listeners spawned at startup AND by request handlers) are included
+        //    so nothing leaks. The grace window is a single bounded 2s budget
+        //    across all tasks (not 2s each) so shutdown stays prompt regardless
+        //    of task count; any task still running after the window is aborted.
+        //    A cancelled/aborted task returns a `JoinError`; that is expected,
+        //    not a failure — never unwrap it.
+        let mut bg_tasks = bg_tasks;
+        bg_tasks
+            .extend(std::mem::take(&mut *state.group_metadata_tasks.write().await).into_values());
+        bg_tasks
+            .extend(std::mem::take(&mut *state.public_message_tasks.write().await).into_values());
+        bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
+        // Keep abort handles so stragglers can be aborted after the grace window.
+        let abort_handles: Vec<tokio::task::AbortHandle> =
+            bg_tasks.iter().map(|h| h.abort_handle()).collect();
+        let grace = futures::future::join_all(bg_tasks);
+        if tokio::time::timeout(Duration::from_secs(2), grace)
             .await
+            .is_err()
+        {
+            tracing::warn!("background tasks did not stop within grace; aborting stragglers");
+            for handle in abort_handles {
+                handle.abort();
+            }
+        }
+
+        // Clean up port file on shutdown (kept after task teardown so the
+        // existing ordering — port advertisement removed last — is preserved).
+        let _ = tokio::fs::remove_file(&port_file).await;
+        tracing::info!("Shutdown complete");
+        server_result
     });
 
-    tokio::select! {
-        _ = signal::ctrl_c() => {
-            tracing::info!("Received Ctrl+C shutdown signal");
-        }
-        _ = shutdown_rx.recv() => {
-            tracing::info!("Received API shutdown request");
-        }
-    }
-
-    let _ = state.shutdown_notify.send(true);
-
-    match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => return Err(anyhow::Error::new(e).context("API server error")),
-        Ok(Err(e)) => return Err(anyhow::Error::new(e).context("API server task failed")),
-        Err(_) => {
-            tracing::warn!(
-                "API server did not shut down within 2s; aborting lingering connections"
-            );
-            server.abort();
-            let _ = server.await;
-        }
-    }
-
-    // Clean up port file on shutdown
-    let _ = tokio::fs::remove_file(&port_file).await;
-    state.agent.shutdown().await;
-    tracing::info!("Shutdown complete");
-    Ok(())
+    Ok(ServerHandle {
+        local_addr: actual_api_addr,
+        cancel,
+        task: Some(task),
+    })
 }
 
 /// Bearer-token authentication middleware.
@@ -6321,12 +6640,12 @@ async fn publish_group_card_to_discovery_inner(
 
 /// Subscribe to the global discovery topic and insert incoming cards into the cache.
 /// Listener lives for the daemon's lifetime.
-async fn spawn_global_discovery_listener(state: Arc<AppState>) {
+async fn spawn_global_discovery_listener(state: Arc<AppState>) -> Vec<tokio::task::JoinHandle<()>> {
     let mut sub = match state.agent.subscribe(GLOBAL_GROUP_DISCOVERY_TOPIC).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("failed to subscribe to discovery topic: {e}");
-            return;
+            return Vec::new();
         }
     };
     tracing::info!(
@@ -6334,7 +6653,7 @@ async fn spawn_global_discovery_listener(state: Arc<AppState>) {
         "P0-1: global group discovery listener subscribed"
     );
     let mut shutdown_rx = state.shutdown_notify.subscribe();
-    tokio::spawn(async move {
+    vec![tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
@@ -6419,7 +6738,7 @@ async fn spawn_global_discovery_listener(state: Arc<AppState>) {
                 }
             }
         }
-    });
+    })]
 }
 
 // ────────────────────────── Phase C.2: shard subscriptions ──────────────
@@ -6716,25 +7035,27 @@ async fn handle_directory_message(
 
 /// Spawn all persisted shard subscriptions at startup, with jitter so the
 /// mesh doesn't storm on restart.
-async fn spawn_directory_resubscribe(state: Arc<AppState>) {
+async fn spawn_directory_resubscribe(state: Arc<AppState>) -> Vec<tokio::task::JoinHandle<()>> {
     load_directory_subscriptions(&state).await;
     let subs = state.directory_subscriptions.read().await.clone();
     if subs.is_empty() {
-        return;
+        return Vec::new();
     }
     use rand::Rng;
     let jitter_ms = state.directory_resubscribe_jitter_ms.max(1);
+    let mut handles = Vec::new();
     for rec in subs.subscriptions {
         let delay_ms = {
             let mut rng = rand::thread_rng();
             rng.gen_range(0..jitter_ms)
         };
         let state_for_spawn = Arc::clone(&state);
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             subscribe_shard(state_for_spawn, rec.kind, rec.shard).await;
-        });
+        }));
     }
+    handles
 }
 
 // ────────────────────── Phase C.2: ListedToContacts pairwise sync ───────
@@ -6806,10 +7127,12 @@ async fn publish_listed_to_contacts_card(state: &AppState, card: x0x::groups::Gr
 /// Background listener that consumes inbound direct messages and, when it
 /// sees an LTC-framed envelope, verifies the card signature and caches it
 /// in `group_card_cache` (never on public shards).
-async fn spawn_listed_to_contacts_listener(state: Arc<AppState>) {
+async fn spawn_listed_to_contacts_listener(
+    state: Arc<AppState>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let mut direct_rx = state.agent.subscribe_direct();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
-    tokio::spawn(async move {
+    vec![tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
@@ -6880,7 +7203,7 @@ async fn spawn_listed_to_contacts_listener(state: Arc<AppState>) {
                 }
             }
         }
-    });
+    })]
 }
 
 /// Domain-separation tag for the `MemberJoined` metadata event signature.
@@ -10229,9 +10552,11 @@ async fn ingest_public_message(
     }
 }
 
-async fn spawn_global_public_message_listener(state: Arc<AppState>) {
+async fn spawn_global_public_message_listener(
+    state: Arc<AppState>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let mut shutdown_rx = state.shutdown_notify.subscribe();
-    tokio::spawn(async move {
+    vec![tokio::spawn(async move {
         let mut sub = match state.agent.subscribe(GLOBAL_PUBLIC_MESSAGE_TOPIC).await {
             Ok(s) => s,
             Err(e) => {
@@ -10272,7 +10597,7 @@ async fn spawn_global_public_message_listener(state: Arc<AppState>) {
                 }
             }
         }
-    });
+    })]
 }
 
 /// Spawn a listener on `x0x.groups.public.{group_id}`. Idempotent — a
@@ -15720,6 +16045,18 @@ async fn store_upgrade_response(
 /// JSON result, then schedules restart/exec after the response has a chance to
 /// flush.
 async fn apply_upgrade(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if !state.self_update_enabled {
+        // Embed path: never replace/restart the host process via the API.
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "applied": false,
+                "reason": "self-update disabled for embedded server",
+                "current_version": env!("CARGO_PKG_VERSION")
+            })),
+        );
+    }
     if !state.update_config.enabled {
         return (
             StatusCode::OK,
