@@ -168,6 +168,9 @@ pub mod api;
 /// CLI infrastructure and command implementations.
 pub mod cli;
 
+/// HTTP/WebSocket server: axum router, handlers, and the daemon serving entrypoint.
+pub mod server;
+
 // Re-export key gossip types (including new pubsub components)
 pub use gossip::{
     GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot,

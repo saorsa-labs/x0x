@@ -706,11 +706,12 @@ fn cli_names_unique() {
     );
 }
 
-/// Verifies the route set in x0xd.rs matches the ENDPOINTS registry exactly,
-/// excluding documented aliases.
+/// Verifies the route set in `src/server/mod.rs` matches the ENDPOINTS registry
+/// exactly, excluding documented aliases. The router was relocated from the
+/// `x0xd` binary into the library `server` module in Issue #110 Phase 1.
 #[test]
 fn route_set_matches_registry() {
-    let source = include_str!("../src/bin/x0xd.rs");
+    let source = include_str!("../src/server/mod.rs");
     let routes = extract_route_defs(source);
 
     let endpoints: HashSet<(String, String)> = ENDPOINTS
@@ -745,8 +746,8 @@ fn route_set_matches_registry() {
     assert!(
         missing_from_registry.is_empty() && missing_from_router.is_empty(),
         "\n\nRegistry/router drift detected.\n\
-         Routes in x0xd.rs missing from ENDPOINTS:\n{}\n\n\
-         ENDPOINTS entries missing from x0xd.rs:\n{}\n",
+         Routes in server::mod missing from ENDPOINTS:\n{}\n\n\
+         ENDPOINTS entries missing from server::mod:\n{}\n",
         if missing_from_registry.is_empty() {
             String::from("  <none>")
         } else {
