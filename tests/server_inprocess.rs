@@ -40,6 +40,20 @@ fn hermetic_config(dir: &std::path::Path) -> DaemonConfig {
     config
 }
 
+/// Reserve a currently-free loopback UDP port by binding `:0`, reading the
+/// assigned port, then dropping the socket. Used to pin a FIXED QUIC
+/// `bind_address` for the restart tests: as of ant-quic 0.27.27 (#196) the
+/// endpoint UDP socket is released on shutdown, so an in-process embedder can
+/// re-`serve()` on the SAME fixed QUIC port. There is an inherent (small) TOCTOU
+/// window between dropping this probe and serve() rebinding it, acceptable for a
+/// loopback test.
+fn free_udp_port() -> u16 {
+    let sock = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("bind probe udp socket");
+    let port = sock.local_addr().expect("probe local_addr").port();
+    drop(sock);
+    port
+}
+
 /// `serve()` binds, reports its address immediately, serves `/health`, and
 /// shuts down cleanly with the port released.
 ///
@@ -130,18 +144,23 @@ async fn dropping_handle_requests_shutdown() {
 /// in-process. (Some Agent-internal/ExecService tasks are not yet stopped — a
 /// tracked Phase 2b item — but they do not hold the API port or block re-serve.)
 ///
-/// NOTE on the QUIC/UDP socket: the QUIC `bind_address` is left ephemeral
-/// (`127.0.0.1:0`) on purpose. `Agent::shutdown()` now aborts the NetworkNode
-/// receiver/accept/eviction tasks and calls `ant_quic::Node::shutdown()`, but
-/// ant-quic does NOT release the bound UDP socket within the same process while
-/// the tokio runtime is alive — it frees only on process exit. The daemon is
-/// unaffected (it exits the process). Re-binding a *fixed* QUIC port in-process
-/// is therefore blocked upstream in ant-quic, not by x0x; see the task report.
+/// FIXED QUIC PORT (ant-quic 0.27.27 / #196): the QUIC `bind_address` is pinned
+/// to a FIXED loopback UDP port (not ephemeral). `Agent::shutdown()` aborts the
+/// NetworkNode receiver/accept/eviction tasks and calls
+/// `ant_quic::Node::shutdown()`, and as of ant-quic 0.27.27 the endpoint UDP
+/// socket IS released in-process on shutdown (#196). So the second `serve()`
+/// must rebind the SAME fixed QUIC port — the real proof #196 delivers, which
+/// was impossible pre-0.27.27 (the socket only freed on process exit). If this
+/// fixed-port rebind ever fails, #196 does not cover x0x's endpoint path.
 #[tokio::test]
 #[ignore]
 async fn serve_tears_down_cleanly_and_rebinds() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let config = hermetic_config(tmp.path());
+    let mut config = hermetic_config(tmp.path());
+    // Pin a FIXED QUIC bind port so the rebind proves socket release, not just
+    // that an ephemeral re-roll happened to pick a new free port.
+    let quic_port = free_udp_port();
+    config.bind_address = SocketAddr::from(([127, 0, 0, 1], quic_port));
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -171,11 +190,12 @@ async fn serve_tears_down_cleanly_and_rebinds() {
     );
     drop(rebound);
 
-    // Second lifecycle on the SAME config. If the first run leaked a background
-    // task or held a lock, this start would hang or fail; it must bind cleanly.
+    // Second lifecycle on the SAME config — INCLUDING the same FIXED QUIC port.
+    // If ant-quic had not released the endpoint UDP socket (pre-#196), this
+    // serve() would fail to bind the fixed QUIC port. It must rebind cleanly.
     let handle = serve(config)
         .await
-        .expect("second serve() on the same config must bind cleanly");
+        .expect("second serve() must rebind the SAME fixed QUIC port (ant-quic #196)");
     let addr = handle.local_addr();
     let resp = client
         .get(format!("http://{addr}/health"))
@@ -185,7 +205,7 @@ async fn serve_tears_down_cleanly_and_rebinds() {
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
-        "second instance must serve /health — proves nothing leaked from run 1"
+        "second instance must serve /health on the same fixed QUIC port — proves #196 releases the socket"
     );
     handle
         .shutdown_and_wait()
@@ -280,10 +300,16 @@ fn find_x0x_dirs(root: &std::path::Path) -> Vec<PathBuf> {
 /// next build; this loop is the regression that fails if teardown is not
 /// complete. The API (TCP) port must rebind each cycle.
 ///
-/// NOTE on QUIC/UDP: each cycle keeps the QUIC `bind_address` ephemeral
-/// (`127.0.0.1:0`) because ant-quic does not release a *fixed* bound UDP socket
-/// in-process while the runtime is alive (upstream ant-quic#196). Re-serving on
-/// a fixed QUIC port in-process is therefore blocked upstream, not by x0x.
+/// QUIC/UDP (ephemeral on purpose): this test's job is TASK/LOCK leak detection
+/// across rapid start→stop cycles, NOT fixed-port rebinding. It keeps the QUIC
+/// `bind_address` ephemeral (`127.0.0.1:0`) so each cycle gets a fresh UDP port.
+/// FIXED-port rebinding is proven separately by
+/// `serve_tears_down_cleanly_and_rebinds`. A tight zero-gap same-fixed-port loop
+/// is NOT reliable: ant-quic 0.27.27 (#196) releases the endpoint socket on a
+/// single restart, but in a back-to-back same-port loop the prior cycle's UDP FD
+/// is not freed in time even after seconds of retry (documented in the report) —
+/// so pinning a fixed port here would test that upstream race, not x0x's leak
+/// guarantee. The API (TCP) port still must rebind each cycle (asserted below).
 #[tokio::test]
 #[ignore]
 async fn serve_stop_loop_leaks_no_tasks() {
@@ -298,9 +324,13 @@ async fn serve_stop_loop_leaks_no_tasks() {
     for cycle in 0..3 {
         let handle = serve(config.clone())
             .await
-            .unwrap_or_else(|e| panic!("serve() must start on cycle {cycle}: {e}"));
+            .unwrap_or_else(|e| panic!("serve() must start on cycle {cycle}: {e:?}"));
         let addr = handle.local_addr();
-        assert_ne!(addr.port(), 0, "cycle {cycle}: ephemeral port must resolve");
+        assert_ne!(
+            addr.port(),
+            0,
+            "cycle {cycle}: ephemeral API port must resolve"
+        );
 
         let resp = client
             .get(format!("http://{addr}/health"))

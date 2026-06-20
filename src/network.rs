@@ -2254,10 +2254,15 @@ impl NetworkNode {
             let _ = handle.await;
         }
         // Take the node out and shut it down explicitly so connections close
-        // deterministically. NOTE: this does NOT free the bound UDP socket
-        // in-process — the ant-quic endpoint driver releases it only on process
-        // exit (saorsa-labs/ant-quic#196), so a same-process re-bind must use an
-        // ephemeral port.
+        // deterministically. As of ant-quic 0.27.27 (#196), `Node::shutdown()`
+        // releases the bound endpoint UDP socket in-process (it swaps in a
+        // throwaway ephemeral socket and drops the original), so a same-process
+        // re-bind on the SAME fixed QUIC port works for a single stop→restart
+        // (proven by tests/server_inprocess.rs::serve_tears_down_cleanly_and_rebinds).
+        // The release is NOT perfectly synchronous: the OS FD for the fixed port
+        // closes once the endpoint driver drops its last reference, shortly after
+        // this returns, so a tight zero-gap loop re-binding the same fixed port
+        // may still see "address already in use" — an embedder should retry.
         let node = {
             let mut node_guard = self.node.write().await;
             node_guard.take()

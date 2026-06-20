@@ -763,8 +763,12 @@ handle.shutdown_and_wait().await?;
   server-owned background tasks (discovery / DM-inbox / group / KV listeners,
   republish, connectivity logger, etc.), the gossip runtime, and the QUIC
   `NetworkNode` (its receiver/accept/eviction tasks are aborted and the ant-quic
-  node is shut down); the API (TCP) port is released, so a fresh `serve()` on the
-  same config (with an ephemeral QUIC port) binds cleanly.
+  node is shut down); both the API (TCP) port and the QUIC endpoint UDP socket
+  are released, so a fresh `serve()` on the same config — including the same
+  FIXED QUIC `bind_address` — binds cleanly (ant-quic 0.27.27 / #196). The
+  endpoint socket release is not perfectly synchronous: a single stop→restart on
+  a fixed QUIC port works reliably, but a host that tears down and immediately
+  re-binds the *same* fixed UDP port in a tight loop should allow a brief retry.
 
   Background tasks now stop deterministically (issue #116): the `Agent`-internal
   loops (identity / network-event / direct / lifecycle listeners, the presence
@@ -783,9 +787,11 @@ handle.shutdown_and_wait().await?;
   - **Presence stop timeout.** On a rare `PresenceManager::stop_beacons()` 5 s
     timeout the upstream dependency detaches (does not abort) the beacon task;
     it is bounded by its own per-send timeout. Tracked upstream.
-  - **QUIC/UDP socket.** ant-quic does not release the bound UDP socket in-process
-    until process exit (upstream limitation). An embedder that stops and restarts
-    x0x in the same process should keep the QUIC `bind_address` ephemeral.
+  - **Fixed QUIC-port rebind is not instantaneous.** ant-quic 0.27.27 (#196)
+    releases the endpoint UDP socket on shutdown, so a single stop→restart on the
+    same fixed QUIC port works. The OS FD closes shortly after
+    `shutdown_and_wait()` returns, so an embedder that immediately re-binds the
+    *same* fixed UDP port in a tight loop should allow a brief retry.
   - **One-shot contract.** Do not call agent start/subscribe methods after
     `shutdown_and_wait()` — the lifecycle is single-use.
 - Dropping the handle requests shutdown (Drop does not block).
