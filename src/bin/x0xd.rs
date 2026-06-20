@@ -245,7 +245,6 @@ async fn main() -> anyhow::Result<()> {
     let self_update_enabled = config.update_enabled();
     let options = ServeOptions {
         skip_update_check,
-        check_updates_only,
         cli_no_port_mapping,
         cli_disable_peer_cache,
         instance_name,

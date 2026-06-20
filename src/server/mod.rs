@@ -49,8 +49,6 @@ use x0x::{Agent, KvStoreHandle, TaskListHandle};
 pub struct ServeOptions {
     /// Skip the startup GitHub update check.
     pub skip_update_check: bool,
-    /// `--check-updates`: print update status and exit instead of serving.
-    pub check_updates_only: bool,
     /// Disable ant-quic UPnP IGD port mapping for this invocation.
     pub cli_no_port_mapping: bool,
     /// Do not load or save the cached peer set.
@@ -1352,7 +1350,6 @@ pub async fn serve_with_options(
 ) -> anyhow::Result<ServerHandle> {
     let ServeOptions {
         skip_update_check,
-        check_updates_only,
         cli_no_port_mapping,
         cli_disable_peer_cache,
         instance_name,
@@ -1372,14 +1369,9 @@ pub async fn serve_with_options(
         "x0xd started"
     );
 
-    // `--check-updates` is a CLI-only print-and-exit mode handled by the binary
-    // (see `run_update_check_and_report`) BEFORE this path is reached, so it is
-    // never set here. Assert that contract loudly rather than silently serving.
-    debug_assert!(
-        !check_updates_only,
-        "check_updates_only must be handled by the binary before serve_with_options"
-    );
-    let _ = check_updates_only;
+    // Note: `--check-updates` is a CLI-only print-and-exit mode handled entirely
+    // by the binary (see `run_update_check_and_report`) before it ever calls
+    // `serve_with_options`; it is intentionally not a `ServeOptions` field.
 
     // Startup GitHub check (fallback mechanism — gossip is primary).
     // Gated on `self_update_enabled` so embedders never download/install a new

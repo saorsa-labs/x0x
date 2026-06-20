@@ -1162,9 +1162,9 @@ pub struct NetworkNode {
     /// Tracked so [`shutdown`] can abort them: the receiver and accept loops park
     /// in `node.recv()/accept().await` while holding a *read* guard on `node`, so
     /// they must be aborted before `shutdown` can take the *write* lock to drop
-    /// the node — and before the QUIC/UDP socket can be released. Without this,
-    /// `shutdown` would deadlock on an idle node that never receives another
-    /// packet/connection, and the socket would leak until process exit.
+    /// the node. Without this, `shutdown` would deadlock on an idle node that
+    /// never receives another packet/connection. (Note: ant-quic frees the bound
+    /// UDP socket only on process exit — saorsa-labs/ant-quic#196.)
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -1283,10 +1283,11 @@ impl NetworkNode {
         let receiver = network_node.spawn_receiver();
         let accept = network_node.spawn_accept_loop();
         let eviction = network_node.spawn_connection_pool_eviction();
-        // Record the handles so `shutdown` can abort them and release the QUIC
-        // socket. This runs at construction before the node is shared, so there
-        // is no contention; if the lock is somehow poisoned, recover the guard
-        // rather than panic (the handles are only used for clean teardown).
+        // Record the handles so `shutdown` can abort them (letting it take the
+        // node write lock and shut the node down without deadlocking). This runs
+        // at construction before the node is shared, so there is no contention;
+        // if the lock is somehow poisoned, recover the guard rather than panic
+        // (the handles are only used for clean teardown).
         match network_node.background_tasks.lock() {
             Ok(mut tasks) => tasks.extend([receiver, accept, eviction]),
             Err(poisoned) => poisoned.into_inner().extend([receiver, accept, eviction]),
@@ -2224,17 +2225,20 @@ impl NetworkNode {
         self.recv_pump_diagnostics.snapshot()
     }
 
-    /// Gracefully shutdown the node.
-    ///
-    /// Drops the inner node, closing all connections and releasing the QUIC/UDP
-    /// socket.
+    /// Gracefully shut down the node: abort the background tasks, close all
+    /// connections, and shut down the ant-quic node.
     ///
     /// The background receiver and accept loops park in `recv()`/`accept().await`
     /// while holding a *read* guard on `node`, so they are aborted FIRST —
     /// otherwise taking the *write* lock below would deadlock on an idle node
-    /// that never receives another packet, and the socket would leak. After the
-    /// tasks are aborted (releasing their read guards and `node` clones), taking
-    /// the node drops it, which closes connections and frees the socket.
+    /// that never receives another packet. After the tasks are aborted (releasing
+    /// their read guards and `node` clones), the node is taken and shut down.
+    ///
+    /// NOTE: this closes connections but does **not** synchronously free the
+    /// bound UDP socket — ant-quic's endpoint driver releases it only on process
+    /// exit (saorsa-labs/ant-quic#196). In-process callers that restart must bind
+    /// an *ephemeral* QUIC port rather than reuse a fixed one, until that upstream
+    /// fix lands.
     pub async fn shutdown(&self) {
         let handles: Vec<tokio::task::JoinHandle<()>> = match self.background_tasks.lock() {
             Ok(mut tasks) => tasks.drain(..).collect(),
@@ -2243,19 +2247,17 @@ impl NetworkNode {
         for handle in &handles {
             handle.abort();
         }
-        // Await the aborted tasks so their `Node` clones are actually dropped
-        // before we drop the node here — otherwise an in-process caller could
-        // re-bind the QUIC socket before the runtime finished tearing the tasks
-        // down (the socket only closes once the last `Node` clone drops). An
-        // aborted task yields `Err(JoinError::Cancelled)`; that is expected.
+        // Await the aborted tasks so their `Node` clones are dropped before we
+        // drop the node here. An aborted task yields `Err(JoinError::Cancelled)`;
+        // that is expected.
         for handle in handles {
             let _ = handle.await;
         }
-        // Take the node out and shut it down explicitly. Dropping a `Node` alone
-        // does NOT synchronously release the UDP/QUIC socket (the ant-quic
-        // endpoint driver winds down lazily), which would block an in-process
-        // re-bind. `Node::shutdown()` closes all connections and releases the
-        // socket before returning.
+        // Take the node out and shut it down explicitly so connections close
+        // deterministically. NOTE: this does NOT free the bound UDP socket
+        // in-process — the ant-quic endpoint driver releases it only on process
+        // exit (saorsa-labs/ant-quic#196), so a same-process re-bind must use an
+        // ephemeral port.
         let node = {
             let mut node_guard = self.node.write().await;
             node_guard.take()
