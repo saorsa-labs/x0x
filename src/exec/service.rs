@@ -212,7 +212,7 @@ impl ExecService {
                 for session in active.values() {
                     // Watch sender: ok if the handler already dropped its receiver.
                     let _ = session.cancel_tx.send(CancelReason::Shutdown);
-                    let pid = session.child_pid.load(Ordering::Relaxed);
+                    let pid = session.child_pid.load(Ordering::Acquire);
                     if pid != 0 {
                         pids.push(pid);
                     }
@@ -266,7 +266,7 @@ impl ExecService {
                     let active = self.active_servers.lock().await;
                     active
                         .values()
-                        .map(|s| s.child_pid.load(Ordering::Relaxed))
+                        .map(|s| s.child_pid.load(Ordering::Acquire))
                         .filter(|&p| p != 0)
                         .collect()
                 };
@@ -1045,7 +1045,7 @@ impl ExecService {
         // Publish the PID so `shutdown()` can SIGKILL out-of-band without
         // waiting for this loop to observe its cancel signal (issue #118).
         if pid != 0 {
-            child_pid.store(pid, Ordering::Relaxed);
+            child_pid.store(pid, Ordering::Release);
         }
         self.diagnostics.record_started();
         self.audit.started(request_id, pid).await;
@@ -1146,7 +1146,7 @@ impl ExecService {
                     // the published PID immediately, before any further await, so
                     // `shutdown()` can never SIGKILL a PID the OS may have
                     // recycled to an unrelated process.
-                    child_pid.store(0, Ordering::Relaxed);
+                    child_pid.store(0, Ordering::Release);
                     break Some(status);
                 }
                 Ok(None) => {}
@@ -2011,7 +2011,7 @@ mod tests {
             loop {
                 let guard = service.active_servers.lock().await;
                 if let Some(session) = guard.get(&request_id) {
-                    let pid = session.child_pid.load(Ordering::Relaxed);
+                    let pid = session.child_pid.load(Ordering::Acquire);
                     if pid != 0 {
                         break pid;
                     }
