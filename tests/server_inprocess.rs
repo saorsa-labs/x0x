@@ -268,3 +268,110 @@ fn find_x0x_dirs(root: &std::path::Path) -> Vec<PathBuf> {
     }
     found
 }
+
+/// Deterministic teardown (Issue #116): repeated start → /health → stop cycles
+/// on the SAME config must each succeed, proving no Agent/ExecService background
+/// task or lock leaks across cycles.
+///
+/// WHY: before #116 the Agent identity/network-event/direct listeners and the
+/// presence refresh loop, plus the three ExecService loops (notably the pure
+/// session-idle timer), kept running after `shutdown_and_wait()` returned. A
+/// leaked task per cycle would accumulate, and a surviving lock would hang the
+/// next build; this loop is the regression that fails if teardown is not
+/// complete. The API (TCP) port must rebind each cycle.
+///
+/// NOTE on QUIC/UDP: each cycle keeps the QUIC `bind_address` ephemeral
+/// (`127.0.0.1:0`) because ant-quic does not release a *fixed* bound UDP socket
+/// in-process while the runtime is alive (upstream ant-quic#196). Re-serving on
+/// a fixed QUIC port in-process is therefore blocked upstream, not by x0x.
+#[tokio::test]
+#[ignore]
+async fn serve_stop_loop_leaks_no_tasks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = hermetic_config(tmp.path());
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    for cycle in 0..3 {
+        let handle = serve(config.clone())
+            .await
+            .unwrap_or_else(|e| panic!("serve() must start on cycle {cycle}: {e}"));
+        let addr = handle.local_addr();
+        assert_ne!(addr.port(), 0, "cycle {cycle}: ephemeral port must resolve");
+
+        let resp = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("GET /health on cycle {cycle}: {e}"));
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "cycle {cycle}: /health must be 200"
+        );
+
+        handle
+            .shutdown_and_wait()
+            .await
+            .unwrap_or_else(|e| panic!("shutdown_and_wait must return Ok on cycle {cycle}: {e}"));
+
+        // API (TCP) port released each cycle — proves the listener and its
+        // supervisor were torn down before the next start.
+        let rebound = tokio::net::TcpListener::bind(addr).await;
+        assert!(
+            rebound.is_ok(),
+            "cycle {cycle}: API port {addr} must be released after shutdown"
+        );
+    }
+}
+
+/// join_network shutdown race (Issue #116): `serve()` then *immediately*
+/// `shutdown_and_wait()` — without ever touching /health — must return Ok and
+/// return promptly.
+///
+/// WHY: `serve()` kicks off `join_network`, which starts the listener tasks and
+/// the presence-refresh loop. If shutdown fires mid-bootstrap, the registry's
+/// closed-flag + `spawn_tracked` refusal + the join_network token guard must
+/// ensure no listener is left running. A regression here would either hang
+/// (a listener blocking on a transport that is shutting down) or leak a task.
+#[tokio::test]
+#[ignore]
+async fn serve_then_immediate_shutdown_is_ok_and_prompt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut config = hermetic_config(tmp.path());
+    // Point bootstrap at an unroutable RFC 5737 TEST-NET-1 address so
+    // `join_network` actually enters its connect/retry phase and is genuinely
+    // still bootstrapping when shutdown fires — this exercises the
+    // begin_shutdown-before-drain window (Codex finding 1): the racing
+    // join_network's in-flight start_identity_heartbeat / discovery_reaper /
+    // presence-start / capability-advert / delayed-reannounce must all no-op
+    // because the token is cancelled before bg_tasks are drained.
+    config.bootstrap_peers = vec![SocketAddr::from(([192, 0, 2, 1], 5483))];
+
+    let handle = serve(config).await.expect("serve() should start");
+    let addr = handle.local_addr();
+
+    // Give the bootstrap a brief head start so join_network is mid-flight, then
+    // stop without a /health round-trip to race it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = std::time::Instant::now();
+    handle
+        .shutdown_and_wait()
+        .await
+        .expect("immediate shutdown_and_wait should return Ok");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "immediate shutdown must return promptly, took {elapsed:?}"
+    );
+
+    // Port released afterwards — nothing survived the racing shutdown.
+    let rebound = tokio::net::TcpListener::bind(addr).await;
+    assert!(
+        rebound.is_ok(),
+        "API port {addr} must be released after an immediate shutdown"
+    );
+}

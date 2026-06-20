@@ -275,6 +275,29 @@ pub struct Agent {
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
     /// Handle for the running DM inbox service.
     dm_inbox_service: tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>,
+    /// Cancellation token driving deterministic teardown of all long-lived
+    /// Agent background loops (identity/network-event/direct listeners and the
+    /// presence broadcast-peer refresh). Cancelling it makes every token-aware
+    /// loop break promptly; `shutdown()` cancels it before tearing down gossip
+    /// and the network so listeners (which call network methods) stop first.
+    shutdown_token: tokio_util::sync::CancellationToken,
+    /// Registry of tracked background-task handles. Once `closed` is set (by
+    /// `shutdown()`), `spawn_tracked` refuses to spawn — this defeats the
+    /// join_network race where a listener could otherwise start after shutdown
+    /// began. A plain `std::sync::Mutex` (not tokio) keeps lock holds trivially
+    /// short: never await while holding it.
+    tracked_tasks: std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+}
+
+/// Closed-flag task registry for deterministic Agent teardown.
+///
+/// `spawn_tracked` pushes handles here while `closed` is false; `shutdown()`
+/// sets `closed` and drains the handles. The flag closes the join_network
+/// shutdown race: a spawn requested after `shutdown()` began is dropped rather
+/// than leaked.
+struct TrackedTasks {
+    closed: bool,
+    handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -3344,14 +3367,119 @@ impl Agent {
         Ok(connectivity::ConnectOutcome::Unreachable)
     }
 
+    /// Spawn a background task whose handle is tracked for deterministic
+    /// teardown. Returns without spawning once the registry is `closed` (i.e.
+    /// `shutdown()` has begun) — this is what closes the join_network race:
+    /// a listener requested after shutdown started must never run.
+    fn spawn_tracked<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        // Lock held only to inspect `closed` and push the handle; no await
+        // happens under it (Rule: keep the std::Mutex hold trivially short).
+        let mut guard = match self.tracked_tasks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.closed {
+            return;
+        }
+        guard.handles.push(tokio::spawn(fut));
+    }
+
+    /// Begin shutdown WITHOUT tearing anything down yet: cancel the shutdown
+    /// token and close the tracked-task registry. Idempotent and synchronous.
+    ///
+    /// This is the prefix of `shutdown()`, split out so an embedder/server can
+    /// cancel BEFORE draining its own background tasks (notably a still-running
+    /// `join_network`). Once this returns, every `start_*` helper refuses to
+    /// start (they check `shutdown_token.is_cancelled()` under their handle
+    /// lock) and `spawn_tracked` refuses to spawn — so a `join_network` that is
+    /// still finishing cannot leak a heartbeat/reaper/presence/advert/inbox
+    /// task past the subsequent `shutdown()`. `shutdown()` still cancels the
+    /// token itself (idempotent), so calling `shutdown()` alone remains correct.
+    pub fn begin_shutdown(&self) {
+        self.shutdown_token.cancel();
+        let mut guard = match self.tracked_tasks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.closed = true;
+    }
+
     /// Save the bootstrap cache and release resources.
     ///
     /// Call this before dropping the agent to ensure the peer cache is
     /// persisted to disk. The background maintenance task saves periodically,
     /// but this guarantees a final save.
+    ///
+    /// Shutdown ordering is deliberate: the cancellation token is cancelled and
+    /// the listener tasks are stopped *before* the gossip runtime and the
+    /// network node are torn down. The listeners call into the network (e.g.
+    /// `is_connected`), so stopping them first avoids a Phase-2-style hang where
+    /// a listener blocks on a transport that is concurrently shutting down.
+    /// Idempotent: `cancel()` is idempotent, the registry drains empty on a
+    /// second call, and the `stop_*` helpers use `Option::take`.
     pub async fn shutdown(&self) {
+        // 1. Signal every token-aware loop to break. Inert until now, so this
+        //    is the first thing that changes steady-state behavior.
+        self.shutdown_token.cancel();
+
+        // 2. Stop the simple Option<JoinHandle> background tasks.
         self.stop_identity_heartbeat().await;
         self.stop_discovery_cache_reaper().await;
+
+        // 3. Stop the DM inbox and the capability advert service (current gaps:
+        //    neither was stopped by shutdown() before). Both abort their own
+        //    spawned tasks.
+        self.stop_dm_inbox().await;
+        {
+            let service = {
+                let mut guard = self.capability_advert_service.lock().await;
+                guard.take()
+            };
+            if let Some(service) = service {
+                service.abort();
+            }
+        }
+
+        // 4. Drain the tracked-task registry: mark closed (so any in-flight
+        //    spawn_tracked is refused), take the handles, grace-await them all
+        //    under a SINGLE bounded budget (not per-task — keeps shutdown
+        //    prompt), then abort+await any straggler. A cancelled/aborted task
+        //    yields Err(JoinError); that is expected, never unwrap it.
+        let handles = {
+            let mut guard = match self.tracked_tasks.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.closed = true;
+            std::mem::take(&mut guard.handles)
+        };
+        if !handles.is_empty() {
+            // Grace-await all tracked tasks under a SINGLE bounded budget (not
+            // per-task — keeps shutdown prompt regardless of task count). On
+            // timeout, abort the stragglers and await the aborts so none
+            // outlives shutdown(). The select! keeps the JoinHandles owned by
+            // the awaiting future so the post-abort join can still observe each
+            // task's terminal JoinError (cancelled tasks → Err — never
+            // unwrapped).
+            let abort_handles: Vec<tokio::task::AbortHandle> =
+                handles.iter().map(|h| h.abort_handle()).collect();
+            let mut join = futures::future::join_all(handles);
+            tokio::select! {
+                _results = &mut join => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {
+                    tracing::warn!(
+                        "Agent background tasks did not stop within grace; aborting stragglers"
+                    );
+                    for handle in &abort_handles {
+                        handle.abort();
+                    }
+                    let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+                }
+            }
+        }
 
         // Shut down presence beacons.
         if let Some(ref pw) = self.presence {
@@ -3462,6 +3590,11 @@ impl Agent {
 
     async fn start_discovery_cache_reaper(&self) -> error::Result<()> {
         let mut guard = self.discovery_cache_reaper_handle.lock().await;
+        // Shutdown race (issue #116): refuse to start once shutdown began.
+        // Checked under the same lock stop_discovery_cache_reaper takes from.
+        if self.shutdown_token.is_cancelled() {
+            return Ok(());
+        }
         if guard.is_some() {
             return Ok(());
         }
@@ -5234,8 +5367,9 @@ impl Agent {
         let own_machine_id = self.machine_id();
         let own_user_id = self.user_id();
         let rebroadcast_pubsub = std::sync::Arc::clone(runtime.pubsub());
+        let token = self.shutdown_token.clone();
 
-        tokio::spawn(async move {
+        self.spawn_tracked(async move {
             enum DiscoveryMessage {
                 Identity(crate::gossip::PubSubMessage),
                 Machine(crate::gossip::PubSubMessage),
@@ -5307,6 +5441,16 @@ impl Agent {
                             None => std::future::pending().await,
                         }
                     } => DiscoveryMessage::User(m),
+                    // Required for PROMPT shutdown: without this arm the listener
+                    // only exits when every gossip subscription closes (the
+                    // `else => break` path), forcing shutdown() to wait out its
+                    // 3s grace-then-abort window. Cancelling the token here lets
+                    // it break immediately. Adding this always-eligible-on-cancel
+                    // branch only shifts tokio::select!'s pseudo-random tie-break
+                    // distribution among the recv arms — behaviorally inert here
+                    // because each per-topic message is handled independently
+                    // with no cross-topic ordering guarantee.
+                    _ = token.cancelled() => break,
                     else => break,
                 };
                 let msg = match msg {
@@ -5836,6 +5980,13 @@ impl Agent {
             })?;
             tracing::info!("Gossip runtime started");
         }
+        // Race guard (issue #116): if shutdown() already fired (token cancelled),
+        // do not start the listeners. Combined with spawn_tracked's closed-check,
+        // a shutdown that races mid-bootstrap cannot leave a listener running.
+        if self.shutdown_token.is_cancelled() {
+            tracing::info!("join_network aborted: shutdown already in progress");
+            return Ok(());
+        }
         self.start_identity_listener().await?;
         self.start_network_event_listener();
         self.start_direct_listener();
@@ -6008,11 +6159,17 @@ impl Agent {
                 let pw_clone = pw.clone();
                 let runtime_clone = runtime.clone();
                 let network_clone = self.network.as_ref().map(std::sync::Arc::clone);
-                tokio::spawn(async move {
+                let token = self.shutdown_token.clone();
+                self.spawn_tracked(async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                     interval.tick().await; // first tick fires immediately; startup already seeded
                     loop {
-                        interval.tick().await;
+                        tokio::select! {
+                            _ = interval.tick() => {}
+                            // Inert until shutdown; then the 30s timer loop exits
+                            // instead of being merely aborted.
+                            _ = token.cancelled() => break,
+                        }
 
                         let active = runtime_clone.membership().active_view();
                         let active_view_count = active.len();
@@ -6062,27 +6219,33 @@ impl Agent {
                 }
             }
 
-            if pw.config().enable_beacons {
-                if let Err(e) = pw
-                    .manager()
-                    .start_beacons(pw.config().beacon_interval_secs)
-                    .await
-                {
-                    tracing::warn!("Failed to start presence beacons: {e}");
-                } else {
-                    tracing::info!(
-                        "Presence beacons started (interval={}s)",
-                        pw.config().beacon_interval_secs
-                    );
+            // Shutdown race (issue #116): skip starting presence beacons / event
+            // loop if shutdown began mid-bootstrap; Agent::shutdown() runs
+            // pw.shutdown() AFTER cancel(), so checking here ensures we never
+            // start beacons that pw.shutdown() already stopped.
+            if !self.shutdown_token.is_cancelled() {
+                if pw.config().enable_beacons {
+                    if let Err(e) = pw
+                        .manager()
+                        .start_beacons(pw.config().beacon_interval_secs)
+                        .await
+                    {
+                        tracing::warn!("Failed to start presence beacons: {e}");
+                    } else {
+                        tracing::info!(
+                            "Presence beacons started (interval={}s)",
+                            pw.config().beacon_interval_secs
+                        );
+                    }
                 }
-            }
 
-            // Start the presence event-emission loop so that subscribers
-            // automatically receive AgentOnline/AgentOffline events after
-            // join_network() returns.
-            pw.start_event_loop(std::sync::Arc::clone(&self.identity_discovery_cache))
-                .await;
-            tracing::debug!("Presence event loop started");
+                // Start the presence event-emission loop so that subscribers
+                // automatically receive AgentOnline/AgentOffline events after
+                // join_network() returns.
+                pw.start_event_loop(std::sync::Arc::clone(&self.identity_discovery_cache))
+                    .await;
+                tracing::debug!("Presence event loop started");
+            }
         }
 
         if let Err(e) = self.announce_identity(false, false).await {
@@ -6112,7 +6275,10 @@ impl Agent {
                 user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
                 allow_local_discovery_addrs: allow_local_discovery_addresses(network.config()),
             };
-            tokio::spawn(async move {
+            // Routed through spawn_tracked (issue #116) so a shutdown racing
+            // bootstrap refuses to start it once the registry is closed; it is
+            // a one-shot self-completing task so no token arm is needed.
+            self.spawn_tracked(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 if let Err(e) = ctx.announce().await {
                     tracing::warn!("Delayed identity re-announcement failed: {e}");
@@ -6175,6 +6341,13 @@ impl Agent {
         })?;
 
         let mut guard = self.capability_advert_service.lock().await;
+        // Shutdown race (issue #116): if shutdown began while we were spawning,
+        // abort the freshly-spawned service instead of storing it. Checked under
+        // the same lock shutdown() takes the service from, so it can't leak.
+        if self.shutdown_token.is_cancelled() {
+            service.abort();
+            return Ok(());
+        }
         if let Some(prev) = guard.take() {
             prev.abort();
         }
@@ -6233,6 +6406,14 @@ impl Agent {
             )))
         })?;
         let mut guard = self.dm_inbox_service.lock().await;
+        // Shutdown race (issue #116): if shutdown began while we were spawning,
+        // abort the freshly-spawned service instead of storing it (and skip the
+        // capability upgrade below). Checked under the same lock stop_dm_inbox
+        // takes the service from, so it can't leak.
+        if self.shutdown_token.is_cancelled() {
+            service.abort();
+            return Ok(());
+        }
         if let Some(prev) = guard.take() {
             prev.abort();
         }
@@ -6919,19 +7100,27 @@ impl Agent {
 
         let lifecycle_network = std::sync::Arc::clone(&network);
         let lifecycle_dm = std::sync::Arc::clone(&dm);
+        let event_token = self.shutdown_token.clone();
+        let lifecycle_token = self.shutdown_token.clone();
 
-        tokio::spawn(async move {
+        self.spawn_tracked(async move {
             let mut rx = network.subscribe();
             tracing::info!("Network event reconciliation listener started");
 
             loop {
-                let event = match rx.recv().await {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!("Network event listener lagged by {skipped} events");
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                let event = tokio::select! {
+                    // event_sender is a NetworkNode struct field that outlives
+                    // network.shutdown(), so this loop never ended on shutdown
+                    // before; the token is what stops it now.
+                    _ = event_token.cancelled() => break,
+                    recv = rx.recv() => match recv {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!("Network event listener lagged by {skipped} events");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
                 };
 
                 match event {
@@ -6974,7 +7163,7 @@ impl Agent {
             }
         });
 
-        tokio::spawn(async move {
+        self.spawn_tracked(async move {
             let Some(mut rx) = lifecycle_network.subscribe_all_peer_events().await else {
                 tracing::debug!(
                     "Peer lifecycle listener unavailable: network node not initialised"
@@ -6983,13 +7172,16 @@ impl Agent {
             };
             tracing::info!("Peer lifecycle watcher started for direct messaging");
             loop {
-                let (peer_id, event) = match rx.recv().await {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!("Peer lifecycle watcher lagged by {skipped} events");
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                let (peer_id, event) = tokio::select! {
+                    _ = lifecycle_token.cancelled() => break,
+                    recv = rx.recv() => match recv {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!("Peer lifecycle watcher lagged by {skipped} events");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
                 };
                 let machine_id = identity::MachineId(peer_id.0);
                 match event {
@@ -7046,11 +7238,19 @@ impl Agent {
         let dm = std::sync::Arc::clone(&self.direct_messaging);
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
+        let token = self.shutdown_token.clone();
 
-        tokio::spawn(async move {
+        self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
             loop {
-                let Some((ant_peer_id, payload)) = network.recv_direct().await else {
+                // direct_tx is a NetworkNode struct field that outlives
+                // network.shutdown(), so recv_direct() does not return None on
+                // shutdown; the token is what stops this loop now.
+                let recv = tokio::select! {
+                    _ = token.cancelled() => break,
+                    r = network.recv_direct() => r,
+                };
+                let Some((ant_peer_id, payload)) = recv else {
                     tracing::warn!(
                         target: "x0x::direct",
                         stage = "listener",
@@ -7176,6 +7376,14 @@ impl Agent {
     /// Returns an error if a required network or gossip component is missing.
     pub async fn start_identity_heartbeat(&self) -> error::Result<()> {
         let mut handle_guard = self.heartbeat_handle.lock().await;
+        // Shutdown race (issue #116): a still-bootstrapping join_network can call
+        // this after shutdown() began. Checking under the SAME lock that
+        // stop_identity_heartbeat takes the handle from makes it TOCTOU-free:
+        // stop_X runs after cancel(), so a handle stored before stop_X runs is
+        // taken+aborted, and a store attempted after sees cancelled → refused.
+        if self.shutdown_token.is_cancelled() {
+            return Ok(());
+        }
         if handle_guard.is_some() {
             return Ok(());
         }
@@ -8109,6 +8317,11 @@ impl AgentBuilder {
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
             dm_inbox_service: tokio::sync::Mutex::new(None),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            tracked_tasks: std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
+                closed: false,
+                handles: Vec::new(),
+            })),
         })
     }
 }

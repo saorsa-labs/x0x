@@ -1657,15 +1657,16 @@ pub async fn serve_with_options(
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
     });
 
-    // Fix A (Issue #110 Phase 2): the `api.port` advertisement is written here,
-    // before any long-lived background task is spawned. The agent IS already
-    // built by this point (it is needed for AppState), so on the error path we
-    // must tear it down — `agent.shutdown()` stops the network tasks and closes
-    // the QUIC node — so a failed write does not leak the agent/network. (The
-    // ExecService tasks are not yet stoppable; that residual is the tracked
-    // Phase 2b follow-up.) The file is removed again in the shutdown tail.
+    // Fix A (Issue #110 Phase 2 + #116): the `api.port` advertisement is written
+    // here, before any long-lived server-owned task is spawned. The agent and the
+    // ExecService ARE already built/spawned by this point (both needed for
+    // AppState), so on the error path we must tear BOTH down — ExecService first
+    // (its loops use the agent transport), then `agent.shutdown()` — so a failed
+    // write does not leak the exec loops or the agent/network. The file is removed
+    // again in the shutdown tail.
     let port_file = config.data_dir.join("api.port");
     if let Err(e) = tokio::fs::write(&port_file, actual_api_addr.to_string()).await {
+        exec_service.shutdown().await;
         agent.shutdown().await;
         return Err(anyhow::Error::new(e).context("failed to write api.port"));
     }
@@ -1677,7 +1678,8 @@ pub async fn serve_with_options(
     // Fix C (Issue #110 Phase 2): collect every server-owned background-task
     // `JoinHandle` spawned in the startup path so the shutdown tail can
     // grace-await then abort any straggler. (Agent-internal and ExecService tasks
-    // are not collected here — see the Phase 2b note in the shutdown tail.)
+    // are owned by the Agent/ExecService and stopped by their own `shutdown()`
+    // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     let existing_group_ids: Vec<String> = {
@@ -2446,30 +2448,36 @@ pub async fn serve_with_options(
             },
         };
 
-        // Fix C (Issue #110 Phase 2): tear down the server-owned tasks and the
-        // QUIC node so that when this supervisor returns, the HTTP/SSE server,
-        // the server-owned background tasks, the gossip runtime, and the QUIC
-        // NetworkNode are all stopped/closed. (Some Agent-internal listeners and
-        // the ExecService tasks are NOT yet tracked/stopped here — fully
-        // deterministic teardown of those is the Phase 2b follow-up.)
+        // Fix C (Issue #110 Phase 2 + 2b): tear down the server-owned tasks, the
+        // ExecService loops, the Agent listeners, and the QUIC node so that when
+        // this supervisor returns, the HTTP/SSE server, the server-owned
+        // background tasks, the ExecService loops, the Agent-internal listeners,
+        // the gossip runtime, and the QUIC NetworkNode are all stopped/closed.
         //
-        // 1. `Agent::shutdown()` stops presence/heartbeat/cache, shuts down the
-        //    gossip runtime, and shuts down the QUIC NetworkNode (aborting its
-        //    receiver/accept/eviction tasks and closing the ant-quic node) — see
-        //    `Agent::shutdown`. This also drops the gossip/direct senders so
-        //    channel-close-driven receive loops end. (The OS frees the UDP
-        //    socket itself on process exit; ant-quic does not release it
-        //    in-process — embedders that restart should use an ephemeral QUIC
-        //    port.)
-        state.agent.shutdown().await;
-        // 2. Grace-await then abort every background task. Tasks tracked in the
-        //    AppState handle maps (metadata / public-message / directory shard
-        //    listeners spawned at startup AND by request handlers) are included
-        //    so nothing leaks. The grace window is a single bounded 2s budget
-        //    across all tasks (not 2s each) so shutdown stays prompt regardless
-        //    of task count; any task still running after the window is aborted.
-        //    A cancelled/aborted task returns a `JoinError`; that is expected,
-        //    not a failure — never unwrap it.
+        // 0. `ExecService::shutdown()` first (issue #116): stop the exec inbound,
+        //    peer-lifecycle, and session-idle loops while the Agent transport is
+        //    still alive, so in-flight sessions can cancel cleanly before the
+        //    network goes away.
+        state.exec_service.shutdown().await;
+        // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
+        //    Agent's shutdown token and close its tracked-task registry NOW,
+        //    BEFORE draining the server bg_tasks. A still-bootstrapping
+        //    `join_network` is one of those bg_tasks; cancelling first makes its
+        //    in-flight `start_identity_heartbeat`/`start_discovery_cache_reaper`/
+        //    presence-start/`start_capability_advert_service`/delayed-reannounce
+        //    no-op (each checks `is_cancelled()` under its handle lock), so it
+        //    cannot leak a dedicated-handle service past `agent.shutdown()`.
+        state.agent.begin_shutdown();
+        // 2. Grace-await then abort every server background task, INCLUDING
+        //    join_network. Tasks tracked in the AppState handle maps (metadata /
+        //    public-message / directory shard listeners spawned at startup AND
+        //    by request handlers) are included so nothing leaks. The grace
+        //    window is a single bounded 2s budget across all tasks (not 2s each)
+        //    so shutdown stays prompt regardless of task count; any task still
+        //    running after the window is aborted. A cancelled/aborted task
+        //    returns a `JoinError`; that is expected, never unwrap it. Draining
+        //    here (after begin_shutdown, before agent.shutdown) guarantees
+        //    join_network has fully stopped before the Agent stops are run.
         let mut bg_tasks = bg_tasks;
         bg_tasks
             .extend(std::mem::take(&mut *state.group_metadata_tasks.write().await).into_values());
@@ -2477,18 +2485,33 @@ pub async fn serve_with_options(
             .extend(std::mem::take(&mut *state.public_message_tasks.write().await).into_values());
         bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
         // Keep abort handles so stragglers can be aborted after the grace window.
+        // Fix C (issue #116): on the timeout path, AWAIT the aborts too — keep the
+        // JoinHandles owned by `join` (select! over `&mut join` vs the 2s sleep)
+        // so that after aborting we `join.await` the remainder. Without this, the
+        // "join_network fully stopped before agent.shutdown()" guarantee would
+        // only hold on the non-timeout path; now it holds on BOTH. A cancelled/
+        // aborted task yields Err(JoinError) — expected, never unwrapped.
         let abort_handles: Vec<tokio::task::AbortHandle> =
             bg_tasks.iter().map(|h| h.abort_handle()).collect();
-        let grace = futures::future::join_all(bg_tasks);
-        if tokio::time::timeout(Duration::from_secs(2), grace)
-            .await
-            .is_err()
-        {
-            tracing::warn!("background tasks did not stop within grace; aborting stragglers");
-            for handle in abort_handles {
-                handle.abort();
+        let mut join = futures::future::join_all(bg_tasks);
+        tokio::select! {
+            _results = &mut join => {}
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                tracing::warn!("background tasks did not stop within grace; aborting stragglers");
+                for handle in &abort_handles {
+                    handle.abort();
+                }
+                let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
             }
         }
+        // 3. Now that join_network is stopped (and the token cancelled so any
+        //    in-flight start_* no-ops), tear the Agent down: stop heartbeat /
+        //    reaper / DM-inbox / advert / presence, drain the Agent's own
+        //    tracked listener tasks, shut down the gossip runtime, and shut down
+        //    the QUIC NetworkNode. (The OS frees the UDP socket on process exit;
+        //    ant-quic does not release it in-process — embedders that restart
+        //    should use an ephemeral QUIC port.)
+        state.agent.shutdown().await;
 
         // Clean up port file on shutdown (kept after task teardown so the
         // existing ordering — port advertisement removed last — is preserved).

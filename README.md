@@ -766,15 +766,28 @@ handle.shutdown_and_wait().await?;
   node is shut down); the API (TCP) port is released, so a fresh `serve()` on the
   same config (with an ephemeral QUIC port) binds cleanly.
 
-  Two caveats, both tracked:
-  - **Not yet fully deterministic.** Some `Agent`-internal listeners (identity,
-    network-lifecycle, direct, capability-advert) and the `ExecService` tasks
-    (including the session idle loop) are **not** currently tracked or stopped by
-    `shutdown_and_wait()`. Complete teardown of every internal task is a Phase 2b
-    follow-up. Do not rely on "no task survives" yet.
+  Background tasks now stop deterministically (issue #116): the `Agent`-internal
+  loops (identity / network-event / direct / lifecycle listeners, the presence
+  broadcast-peer refresh, heartbeat, discovery reaper), the presence beacons
+  (wrapper *and* `PresenceManager`), the capability-advert and DM-inbox services,
+  and the `ExecService` loops (inbound / peer-lifecycle / session-idle) are all
+  cancelled and awaited (bounded grace, then abort). A listener that a
+  still-bootstrapping `join_network` would otherwise start after shutdown is
+  refused (a cancellation token + a closed task registry close that race).
+
+  Remaining caveats, all tracked:
+  - **In-flight exec sessions.** `ExecService::shutdown()` stops the background
+    loops but does not force-cancel a per-request remote command already running
+    (or its child process); it completes, hits its duration/idle/lease cap, or is
+    reaped on process exit.
+  - **Presence stop timeout.** On a rare `PresenceManager::stop_beacons()` 5 s
+    timeout the upstream dependency detaches (does not abort) the beacon task;
+    it is bounded by its own per-send timeout. Tracked upstream.
   - **QUIC/UDP socket.** ant-quic does not release the bound UDP socket in-process
     until process exit (upstream limitation). An embedder that stops and restarts
     x0x in the same process should keep the QUIC `bind_address` ephemeral.
+  - **One-shot contract.** Do not call agent start/subscribe methods after
+    `shutdown_and_wait()` — the lifecycle is single-use.
 - Dropping the handle requests shutdown (Drop does not block).
 
 For full control (instance name, exec ACL, self-update opt-in) use

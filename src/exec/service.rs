@@ -52,6 +52,11 @@ pub struct ExecService {
     pending_clients: Mutex<HashMap<ExecRequestId, PendingClient>>,
     active_servers: Mutex<HashMap<ExecRequestId, ActiveServerSession>>,
     active_counts: Mutex<ActiveCounts>,
+    /// Cancellation token driving deterministic teardown of the three
+    /// long-lived loops below (inbound dispatch, peer lifecycle, session idle).
+    cancellation_token: tokio_util::sync::CancellationToken,
+    /// Handles for the three spawned loops, drained by `shutdown()`.
+    task_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 struct PendingClient {
@@ -123,20 +128,68 @@ impl ExecService {
             pending_clients: Mutex::new(HashMap::new()),
             active_servers: Mutex::new(HashMap::new()),
             active_counts: Mutex::new(ActiveCounts::default()),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            task_handles: Mutex::new(Vec::new()),
         });
         let loop_service = Arc::clone(&service);
-        tokio::spawn(async move {
+        let inbound_handle = tokio::spawn(async move {
             loop_service.run_inbound_loop(inbound_rx).await;
         });
         let lifecycle_service = Arc::clone(&service);
-        tokio::spawn(async move {
+        let lifecycle_handle = tokio::spawn(async move {
             lifecycle_service.run_peer_lifecycle_loop().await;
         });
         let idle_service = Arc::clone(&service);
-        tokio::spawn(async move {
+        let idle_handle = tokio::spawn(async move {
             idle_service.run_session_idle_loop().await;
         });
+        // Stash the handles so `shutdown()` can grace-await then abort them.
+        // `try_lock` always succeeds here: this is the only access before the
+        // service is shared, and the lock is uncontended at construction.
+        if let Ok(mut guard) = service.task_handles.try_lock() {
+            guard.extend([inbound_handle, lifecycle_handle, idle_handle]);
+        }
         service
+    }
+
+    /// Stop the three background loops deterministically. Idempotent.
+    ///
+    /// Cancels the token (the idle-timer loop only ends this way; the two
+    /// channel loops also exit promptly instead of waiting on their channels),
+    /// grace-awaits the handles under a single bounded budget, then aborts and
+    /// awaits any straggler. A cancelled/aborted task yields `Err(JoinError)`;
+    /// that is expected and never unwrapped.
+    ///
+    /// SCOPE BOUNDARY (issue #116): this stops the three long-lived background
+    /// LOOPS only. It does NOT force-cancel per-request exec handler tasks that
+    /// are in flight (the `tokio::spawn` in `run_inbound_loop` for an
+    /// `ExecFrame::Request`) nor the child processes they are running. An
+    /// in-flight remote command is active-session work: it completes on its own,
+    /// hits its own duration/idle/lease cap, or is reaped when the process
+    /// exits. Force-cancelling active exec sessions on `shutdown()` is a separate
+    /// follow-up, intentionally out of scope for the background-loop teardown.
+    pub async fn shutdown(&self) {
+        self.cancellation_token.cancel();
+        let handles = {
+            let mut guard = self.task_handles.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        if handles.is_empty() {
+            return;
+        }
+        let abort_handles: Vec<tokio::task::AbortHandle> =
+            handles.iter().map(|h| h.abort_handle()).collect();
+        let mut join = futures::future::join_all(handles);
+        tokio::select! {
+            _results = &mut join => {}
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {
+                tracing::warn!("exec background loops did not stop within grace; aborting stragglers");
+                for handle in &abort_handles {
+                    handle.abort();
+                }
+                let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+            }
+        }
     }
 
     /// Whether exec is enabled on this daemon.
@@ -339,13 +392,16 @@ impl ExecService {
         };
         tracing::info!("exec peer lifecycle watcher started");
         loop {
-            let (peer_id, event) = match rx.recv().await {
-                Ok(event) => event,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "exec peer lifecycle watcher lagged");
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            let (peer_id, event) = tokio::select! {
+                _ = self.cancellation_token.cancelled() => break,
+                recv = rx.recv() => match recv {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "exec peer lifecycle watcher lagged");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
             };
             let disconnect_reason = match event {
                 ant_quic::PeerLifecycleEvent::Closed { reason, .. }
@@ -386,7 +442,13 @@ impl ExecService {
 
     async fn run_session_idle_loop(self: Arc<Self>) {
         loop {
-            tokio::time::sleep(SESSION_IDLE_SCAN_INTERVAL).await;
+            // This loop is a pure timer — it never self-terminates, so the
+            // token is the ONLY thing that stops it. Without this arm it leaked
+            // for the lifetime of the process.
+            tokio::select! {
+                _ = tokio::time::sleep(SESSION_IDLE_SCAN_INTERVAL) => {}
+                _ = self.cancellation_token.cancelled() => break,
+            }
             let sessions: Vec<(ExecRequestId, ActiveServerSession)> = {
                 let active = self.active_servers.lock().await;
                 active
@@ -441,7 +503,14 @@ impl ExecService {
     }
 
     async fn run_inbound_loop(self: Arc<Self>, mut inbound_rx: mpsc::Receiver<DmTypedPayload>) {
-        while let Some(inbound) = inbound_rx.recv().await {
+        loop {
+            let inbound = tokio::select! {
+                _ = self.cancellation_token.cancelled() => break,
+                recv = inbound_rx.recv() => match recv {
+                    Some(inbound) => inbound,
+                    None => break,
+                },
+            };
             let frame = match decode_frame_payload(&inbound.payload) {
                 Ok(frame) => frame,
                 Err(e) => {
@@ -1405,6 +1474,8 @@ mod tests {
             pending_clients: Mutex::new(HashMap::new()),
             active_servers: Mutex::new(HashMap::new()),
             active_counts: Mutex::new(ActiveCounts::default()),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            task_handles: Mutex::new(Vec::new()),
         })
     }
 

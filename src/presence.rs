@@ -698,7 +698,10 @@ impl PresenceWrapper {
 
     /// Shut down the presence system.
     ///
-    /// Aborts both the beacon broadcast task and the event-loop task if running.
+    /// Aborts both the wrapper-owned beacon broadcast task and the event-loop
+    /// task if running, AND stops the `PresenceManager`-owned beacon task
+    /// (started via `manager().start_beacons()`), which the wrapper handles do
+    /// not cover (issue #116: that manager task otherwise survives shutdown).
     /// Safe to call multiple times.
     pub async fn shutdown(&self) {
         let mut beacon = self.beacon_handle.lock().await;
@@ -708,6 +711,12 @@ impl PresenceWrapper {
         let mut event = self.event_handle.lock().await;
         if let Some(h) = event.take() {
             h.abort();
+        }
+        // Stop the manager-owned beacon task. It signals + joins its own task
+        // (with an internal 5s timeout); a timeout/error here is non-fatal to
+        // shutdown — log and continue rather than block teardown.
+        if let Err(e) = self.manager().stop_beacons().await {
+            tracing::debug!("PresenceManager stop_beacons during shutdown: {e}");
         }
     }
 }
