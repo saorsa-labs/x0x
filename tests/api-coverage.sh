@@ -2,7 +2,9 @@
 set -euo pipefail
 
 # x0x API Coverage Report
-# Compares routes defined in x0xd.rs against endpoints tested in E2E scripts.
+# Compares routes defined in src/server/mod.rs against endpoints tested in E2E
+# scripts. The router was relocated from the x0xd binary into the library
+# server module in Issue #110 Phase 1.
 # Usage:
 #   bash tests/api-coverage.sh          # standard report
 #   bash tests/api-coverage.sh -v       # show all routes with suite coverage
@@ -11,7 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-X0XD="$PROJECT_DIR/src/bin/x0xd.rs"
+X0XD="$PROJECT_DIR/src/server/mod.rs"
 
 if [[ ! -f "$X0XD" ]]; then
     echo "ERROR: $X0XD not found" >&2
@@ -26,7 +28,7 @@ import sys
 import os
 
 project_dir = os.environ["PROJECT_DIR"]
-x0xd_path = os.path.join(project_dir, "src/bin/x0xd.rs")
+x0xd_path = os.path.join(project_dir, "src/server/mod.rs")
 test_dir = os.path.join(project_dir, "tests")
 
 def extract_routes(filepath):
@@ -262,7 +264,7 @@ pct = (covered / total * 100) if total > 0 else 0
 print()
 print("x0x API Coverage Report")
 print("=" * 50)
-print(f"Routes in x0xd.rs:     {total:>3}")
+print(f"Routes in server::mod: {total:>3}")
 for name in suites:
     exists = os.path.exists(suites[name])
     count = len(suite_tested[name]) if exists else 0

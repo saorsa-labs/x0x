@@ -168,6 +168,9 @@ pub mod api;
 /// CLI infrastructure and command implementations.
 pub mod cli;
 
+/// HTTP/WebSocket server: axum router, handlers, and the daemon serving entrypoint.
+pub mod server;
+
 // Re-export key gossip types (including new pubsub components)
 pub use gossip::{
     GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot,
@@ -3362,6 +3365,24 @@ impl Agent {
             } else {
                 tracing::info!("Bootstrap cache saved on shutdown");
             }
+        }
+
+        // Issue #110 Phase 2: tear down the gossip runtime and the QUIC node so
+        // an in-process embedder gets the socket and all background tasks back
+        // when `shutdown()` returns. The gossip runtime's dispatcher/peer-sync/
+        // keepalive tasks hold the transport (and thus the ant-quic endpoint)
+        // alive; the daemon binary survives only by process exit, but an
+        // embedded host needs these released to re-`serve()` on the same port.
+        if let Some(ref runtime) = self.gossip_runtime {
+            if let Err(e) = runtime.shutdown().await {
+                tracing::warn!("Gossip runtime shutdown error: {e}");
+            } else {
+                tracing::info!("Gossip runtime shut down");
+            }
+        }
+        if let Some(ref network) = self.network {
+            network.shutdown().await;
+            tracing::info!("Network node shut down");
         }
     }
 

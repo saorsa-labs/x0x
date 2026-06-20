@@ -723,6 +723,81 @@ let mut rx = agent.subscribe("topic").await?;
 
 ---
 
+## Embedding x0x as a library (mobile / in-process)
+
+The full daemon — the same REST + WebSocket API the `x0x` CLI talks to — can run
+**in-process** inside another application instead of as a separate `x0xd`
+binary. This is how mobile and desktop hosts (e.g. a Tauri/Swift app) bundle x0x:
+start the server on a loopback port, then drive it over local HTTP exactly as
+the CLI does.
+
+```rust
+use x0x::server::{serve, DaemonConfig};
+
+// Host owns the filesystem: supply data + identity directories explicitly.
+let mut config = DaemonConfig::default();
+config.api_address = "127.0.0.1:0".parse()?;   // ephemeral loopback port
+config.data_dir    = app_data_dir.join("x0x");
+config.identity_dir = Some(app_data_dir.join("x0x-identity"));
+
+// Non-blocking: returns once the server is bound and serving.
+let handle = serve(config).await?;
+let base = format!("http://{}", handle.local_addr()); // resolved port (esp. for :0)
+
+// ... the app talks to `base` over HTTP, or embeds a WebView pointed at it ...
+
+// Teardown: stops the HTTP/SSE server, the server-owned background tasks, and
+// shuts down the gossip runtime + QUIC node. See the note below on what is and
+// is not yet guaranteed.
+handle.shutdown_and_wait().await?;
+```
+
+`serve(config)` returns a `ServerHandle`:
+
+- `local_addr()` — the actual bound address, readable immediately (so a host
+  that binds `127.0.0.1:0` can discover the real port without racing startup).
+- `shutdown()` — request graceful shutdown; idempotent, non-blocking, `&self`.
+- `wait().await` — await run-to-completion.
+- `shutdown_and_wait().await` — request shutdown, then await completion. When it
+  returns, the following are guaranteed stopped/closed: the HTTP/SSE server, the
+  server-owned background tasks (discovery / DM-inbox / group / KV listeners,
+  republish, connectivity logger, etc.), the gossip runtime, and the QUIC
+  `NetworkNode` (its receiver/accept/eviction tasks are aborted and the ant-quic
+  node is shut down); the API (TCP) port is released, so a fresh `serve()` on the
+  same config (with an ephemeral QUIC port) binds cleanly.
+
+  Two caveats, both tracked:
+  - **Not yet fully deterministic.** Some `Agent`-internal listeners (identity,
+    network-lifecycle, direct, capability-advert) and the `ExecService` tasks
+    (including the session idle loop) are **not** currently tracked or stopped by
+    `shutdown_and_wait()`. Complete teardown of every internal task is a Phase 2b
+    follow-up. Do not rely on "no task survives" yet.
+  - **QUIC/UDP socket.** ant-quic does not release the bound UDP socket in-process
+    until process exit (upstream limitation). An embedder that stops and restarts
+    x0x in the same process should keep the QUIC `bind_address` ephemeral.
+- Dropping the handle requests shutdown (Drop does not block).
+
+For full control (instance name, exec ACL, self-update opt-in) use
+`serve_with_options(config, options)`. The blocking `run(config, options)`
+wrapper is also still available.
+
+### Two policies embedders must know
+
+1. **Self-update is disabled by default on the embed path.** `serve()` never
+   downloads, installs, or restarts anything — an embedded library must not
+   replace or restart its host application. The gossip update listener, the
+   GitHub fallback poll, the startup update check, and `POST /upgrade/apply` are
+   all gated off. (The standalone `x0xd` binary opts back in, so its behaviour
+   is unchanged.) To opt in from an embedder, use `serve_with_options` with
+   `self_update_enabled: true`.
+2. **The host must supply data/identity paths — there is no `~/.x0x`
+   fallback.** When you set `identity_dir` (and `data_dir`), *all* identity
+   material (machine/agent/user keys + agent certificate), the peer cache, and
+   the contact store derive from those directories. x0x will not silently write
+   keys or state under the user's home directory.
+
+---
+
 ## Security by Design
 
 x0x uses NIST-standardised post-quantum cryptography throughout:

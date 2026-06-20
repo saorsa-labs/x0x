@@ -1156,6 +1156,16 @@ pub struct NetworkNode {
     liveness_last_ready: Arc<Mutex<HashMap<AntPeerId, Instant>>>,
     /// Daemon-local cap for concurrent pre-send probe/reconnect work.
     liveness_repair_semaphore: Arc<Semaphore>,
+    /// Handles to the background tasks spawned at construction (receiver, accept
+    /// loop, connection-pool eviction).
+    ///
+    /// Tracked so [`shutdown`] can abort them: the receiver and accept loops park
+    /// in `node.recv()/accept().await` while holding a *read* guard on `node`, so
+    /// they must be aborted before `shutdown` can take the *write* lock to drop
+    /// the node. Without this, `shutdown` would deadlock on an idle node that
+    /// never receives another packet/connection. (Note: ant-quic frees the bound
+    /// UDP socket only on process exit — saorsa-labs/ant-quic#196.)
+    background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl NetworkNode {
@@ -1267,11 +1277,21 @@ impl NetworkNode {
             liveness_locks: Arc::new(Mutex::new(HashMap::new())),
             liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
+            background_tasks: Arc::new(Mutex::new(Vec::new())),
         };
 
-        network_node.spawn_receiver();
-        network_node.spawn_accept_loop();
-        network_node.spawn_connection_pool_eviction();
+        let receiver = network_node.spawn_receiver();
+        let accept = network_node.spawn_accept_loop();
+        let eviction = network_node.spawn_connection_pool_eviction();
+        // Record the handles so `shutdown` can abort them (letting it take the
+        // node write lock and shut the node down without deadlocking). This runs
+        // at construction before the node is shared, so there is no contention;
+        // if the lock is somehow poisoned, recover the guard rather than panic
+        // (the handles are only used for clean teardown).
+        match network_node.background_tasks.lock() {
+            Ok(mut tasks) => tasks.extend([receiver, accept, eviction]),
+            Err(poisoned) => poisoned.into_inner().extend([receiver, accept, eviction]),
+        }
 
         Ok(network_node)
     }
@@ -2205,13 +2225,46 @@ impl NetworkNode {
         self.recv_pump_diagnostics.snapshot()
     }
 
-    /// Gracefully shutdown the node.
+    /// Gracefully shut down the node: abort the background tasks, close all
+    /// connections, and shut down the ant-quic node.
     ///
-    /// Drops the inner node, closing all connections.
+    /// The background receiver and accept loops park in `recv()`/`accept().await`
+    /// while holding a *read* guard on `node`, so they are aborted FIRST —
+    /// otherwise taking the *write* lock below would deadlock on an idle node
+    /// that never receives another packet. After the tasks are aborted (releasing
+    /// their read guards and `node` clones), the node is taken and shut down.
+    ///
+    /// NOTE: this closes connections but does **not** synchronously free the
+    /// bound UDP socket — ant-quic's endpoint driver releases it only on process
+    /// exit (saorsa-labs/ant-quic#196). In-process callers that restart must bind
+    /// an *ephemeral* QUIC port rather than reuse a fixed one, until that upstream
+    /// fix lands.
     pub async fn shutdown(&self) {
-        let mut node_guard = self.node.write().await;
-        // Taking the node drops it, closing all connections
-        let _ = node_guard.take();
+        let handles: Vec<tokio::task::JoinHandle<()>> = match self.background_tasks.lock() {
+            Ok(mut tasks) => tasks.drain(..).collect(),
+            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+        };
+        for handle in &handles {
+            handle.abort();
+        }
+        // Await the aborted tasks so their `Node` clones are dropped before we
+        // drop the node here. An aborted task yields `Err(JoinError::Cancelled)`;
+        // that is expected.
+        for handle in handles {
+            let _ = handle.await;
+        }
+        // Take the node out and shut it down explicitly so connections close
+        // deterministically. NOTE: this does NOT free the bound UDP socket
+        // in-process — the ant-quic endpoint driver releases it only on process
+        // exit (saorsa-labs/ant-quic#196), so a same-process re-bind must use an
+        // ephemeral port.
+        let node = {
+            let mut node_guard = self.node.write().await;
+            node_guard.take()
+        };
+        if let Some(node) = node {
+            node.shutdown().await;
+        }
     }
 
     /// Get a clone of the inner node, returning an error if not initialized.
@@ -2350,7 +2403,7 @@ impl NetworkNode {
     /// stream type from the first byte, and forwards parsed messages to:
     /// - Direct message channel (for 0x10 direct messages)
     /// - Gossip transport channel (for 0x00, 0x01, 0x02 gossip messages)
-    fn spawn_receiver(&self) {
+    fn spawn_receiver(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
         let recv_pubsub_tx = self.recv_pubsub_tx.clone();
         let recv_membership_tx = self.recv_membership_tx.clone();
@@ -2492,7 +2545,7 @@ impl NetworkNode {
             }
 
             debug!("NetworkNode receiver task stopped");
-        });
+        })
     }
 
     /// Spawn a background task that accepts inbound connections.
@@ -2501,7 +2554,7 @@ impl NetworkNode {
     /// are registered in `connected_peers`. Inbound peers would complete the
     /// QUIC handshake but never have a reader task spawned, so `recv()` would
     /// never deliver their data.
-    fn spawn_accept_loop(&self) {
+    fn spawn_accept_loop(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
         let event_sender = self.event_sender.clone();
         let bootstrap_cache = self.bootstrap_cache.clone();
@@ -2575,10 +2628,10 @@ impl NetworkNode {
             }
 
             debug!("NetworkNode accept loop stopped");
-        });
+        })
     }
 
-    fn spawn_connection_pool_eviction(&self) {
+    fn spawn_connection_pool_eviction(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
         let event_sender = self.event_sender.clone();
         let connection_pool = Arc::clone(&self.connection_pool);
@@ -2619,7 +2672,7 @@ impl NetworkNode {
                 )
                 .await;
             }
-        });
+        })
     }
 }
 

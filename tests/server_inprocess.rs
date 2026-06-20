@@ -1,0 +1,270 @@
+//! Phase 2 — in-process library tests for Issue #110 (mobile embedding).
+//!
+//! These exercise the embeddable `x0x::server::serve` API *in-process* (no
+//! spawned daemon binary) — the counterpart to the bin-spawning regression
+//! oracle in `server_characterization.rs`. They prove the lifecycle and the
+//! storage boundary that mobile/embedding hosts depend on:
+//!
+//! - `serve(config)` binds, returns a handle whose `local_addr()` is readable
+//!   immediately (even when binding `127.0.0.1:0`), serves `/health`, and
+//!   `shutdown_and_wait()` returns `Ok` with the port released afterwards.
+//! - With a fully-specified config and a sentinel `HOME`/XDG environment, the
+//!   embed path writes NOTHING under the sentinel home — there is no `~/.x0x`
+//!   fallback once the host supplies an identity directory.
+//!
+//! All tests are `#[ignore]` (they bind real sockets and build a real agent),
+//! matching the `daemon_api_integration.rs` / `server_characterization.rs`
+//! convention. Run them with:
+//!
+//! ```text
+//! cargo nextest run --all-features --test server_inprocess --run-ignored all
+//! ```
+
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use x0x::server::{serve, DaemonConfig};
+
+/// Build a hermetic in-process config: ephemeral API + QUIC ports, no
+/// hard-coded bootstrap peers, and all persistent state under `dir`.
+fn hermetic_config(dir: &std::path::Path) -> DaemonConfig {
+    let mut config = DaemonConfig::default();
+    config.api_address = SocketAddr::from(([127, 0, 0, 1], 0));
+    config.bind_address = SocketAddr::from(([127, 0, 0, 1], 0));
+    config.bootstrap_peers = Vec::new();
+    config.data_dir = dir.join("data");
+    config.identity_dir = Some(dir.join("identity"));
+    config
+}
+
+/// `serve()` binds, reports its address immediately, serves `/health`, and
+/// shuts down cleanly with the port released.
+///
+/// WHY: this is the embedding contract a mobile host relies on — start the
+/// server in-process, read back the actual bound port (it asked for `0`),
+/// talk to it over loopback HTTP, then stop it deterministically. If any of
+/// these regress, embedding is broken even though the daemon binary still works.
+#[tokio::test]
+#[ignore]
+async fn serve_binds_serves_health_and_shuts_down() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = hermetic_config(tmp.path());
+
+    let handle = serve(config).await.expect("serve() should start");
+    let addr = handle.local_addr();
+    assert_ne!(
+        addr.port(),
+        0,
+        "local_addr() must resolve the ephemeral port"
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    // `/health` is auth-exempt — same contract the oracle pins for the bin.
+    let resp = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .expect("GET /health");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "/health should be 200"
+    );
+
+    handle
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown_and_wait should return Ok");
+
+    // Port released: a fresh bind on the same address must now succeed.
+    let rebound = tokio::net::TcpListener::bind(addr).await;
+    assert!(
+        rebound.is_ok(),
+        "API port {addr} must be released after shutdown"
+    );
+}
+
+/// Dropping the handle (without awaiting) requests shutdown — no detached
+/// daemon survives. After a drop + a brief settle, the port is reusable.
+///
+/// WHY: an embedding host may drop the handle on teardown; the server must not
+/// keep running and holding the port behind the host's back.
+#[tokio::test]
+#[ignore]
+async fn dropping_handle_requests_shutdown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = hermetic_config(tmp.path());
+
+    let handle = serve(config).await.expect("serve() should start");
+    let addr = handle.local_addr();
+    drop(handle);
+
+    // Drop cancels the supervisor; give the graceful-shutdown tail time to run
+    // (it removes the port file and shuts the agent down within ~2s).
+    let mut rebound = false;
+    for _ in 0..40 {
+        if tokio::net::TcpListener::bind(addr).await.is_ok() {
+            rebound = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(rebound, "dropping the handle must shut the server down");
+}
+
+/// Clean teardown (Fix C, Issue #110 Phase 2): after `shutdown_and_wait()`
+/// returns Ok, the in-process server can be started AGAIN on the same config —
+/// the API (TCP) port is released and no server-owned task or lock survives to
+/// deadlock the second build. The second instance binds and serves `/health`.
+///
+/// WHY: a leaked API listener, a surviving server-owned background task, or a
+/// held lock from the first run would make the second `serve()` fail or hang.
+/// This is the load-bearing embedding contract: a host can stop and restart x0x
+/// in-process. (Some Agent-internal/ExecService tasks are not yet stopped — a
+/// tracked Phase 2b item — but they do not hold the API port or block re-serve.)
+///
+/// NOTE on the QUIC/UDP socket: the QUIC `bind_address` is left ephemeral
+/// (`127.0.0.1:0`) on purpose. `Agent::shutdown()` now aborts the NetworkNode
+/// receiver/accept/eviction tasks and calls `ant_quic::Node::shutdown()`, but
+/// ant-quic does NOT release the bound UDP socket within the same process while
+/// the tokio runtime is alive — it frees only on process exit. The daemon is
+/// unaffected (it exits the process). Re-binding a *fixed* QUIC port in-process
+/// is therefore blocked upstream in ant-quic, not by x0x; see the task report.
+#[tokio::test]
+#[ignore]
+async fn serve_tears_down_cleanly_and_rebinds() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = hermetic_config(tmp.path());
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    // First lifecycle.
+    let handle = serve(config.clone()).await.expect("first serve() starts");
+    let first_addr = handle.local_addr();
+    let resp = client
+        .get(format!("http://{first_addr}/health"))
+        .send()
+        .await
+        .expect("GET /health (run 1)");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    handle
+        .shutdown_and_wait()
+        .await
+        .expect("first shutdown_and_wait returns Ok");
+
+    // The API (TCP) port must be released after the first teardown — proves the
+    // axum listener and its supervisor were actually torn down.
+    let rebound = tokio::net::TcpListener::bind(first_addr).await;
+    assert!(
+        rebound.is_ok(),
+        "API port {first_addr} must be released after the first shutdown"
+    );
+    drop(rebound);
+
+    // Second lifecycle on the SAME config. If the first run leaked a background
+    // task or held a lock, this start would hang or fail; it must bind cleanly.
+    let handle = serve(config)
+        .await
+        .expect("second serve() on the same config must bind cleanly");
+    let addr = handle.local_addr();
+    let resp = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .expect("GET /health (run 2)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "second instance must serve /health — proves nothing leaked from run 1"
+    );
+    handle
+        .shutdown_and_wait()
+        .await
+        .expect("second shutdown_and_wait returns Ok");
+}
+
+/// Storage boundary: with a fully-specified config and a sentinel HOME/XDG
+/// environment, the embed path creates NOTHING under the sentinel home.
+///
+/// WHY: this is the load-bearing guarantee for mobile embedding — the host
+/// owns the filesystem, and x0x must never silently write keys/caches/contacts
+/// to `~/.x0x`. The test would fail the moment any identity/cache/contact path
+/// re-introduced a `dirs::home_dir()` fallback on the serve() path.
+#[tokio::test]
+#[ignore]
+async fn serve_writes_nothing_under_sentinel_home() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sentinel_home = tmp.path().join("sentinel-home");
+    std::fs::create_dir_all(&sentinel_home).expect("create sentinel home");
+
+    // Point every home/XDG knob `dirs` consults at the sentinel directory.
+    std::env::set_var("HOME", &sentinel_home);
+    std::env::set_var("XDG_DATA_HOME", sentinel_home.join("xdg-data"));
+    std::env::set_var("XDG_CONFIG_HOME", sentinel_home.join("xdg-config"));
+    std::env::set_var("XDG_CACHE_HOME", sentinel_home.join("xdg-cache"));
+
+    let config = hermetic_config(tmp.path());
+    let handle = serve(config).await.expect("serve() should start");
+    let addr = handle.local_addr();
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let resp = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .expect("GET /health");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    handle.shutdown_and_wait().await.expect("clean shutdown");
+
+    // Assert no x0x state directory was created anywhere under the sentinel home.
+    // This covers BOTH the dotfile fallback (`~/.x0x*`, created by a
+    // `dirs::home_dir()` fallback) AND the XDG fallback (`<data_dir>/x0x`,
+    // created by a `dirs::data_dir()` fallback) — either would silently persist
+    // host-owned state outside the config-supplied directory.
+    let offenders = find_x0x_dirs(&sentinel_home);
+    assert!(
+        offenders.is_empty(),
+        "serve() must not write x0x state under the sentinel home; found: {offenders:?}"
+    );
+}
+
+/// Walk `root` and collect any directory that an `~/.x0x` *or* XDG fallback
+/// would create:
+/// - a name beginning with `.x0x` (`.x0x`, `.x0x-<name>` — the home fallback), or
+/// - a directory named exactly `x0x` (no leading dot — the `dirs::data_dir()`
+///   XDG fallback, e.g. `$XDG_DATA_HOME/x0x`).
+fn find_x0x_dirs(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with(".x0x") || name == "x0x" {
+                        found.push(path.clone());
+                    }
+                }
+                stack.push(path);
+            }
+        }
+    }
+    found
+}

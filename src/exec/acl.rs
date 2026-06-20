@@ -38,6 +38,19 @@ pub enum ExecPolicy {
     Enabled(ExecAcl),
 }
 
+impl Default for ExecPolicy {
+    /// Exec is disabled unless an ACL is explicitly loaded. This is the
+    /// safe default for embedders that build [`ServeOptions`](crate::server::ServeOptions)
+    /// without supplying an exec ACL.
+    fn default() -> Self {
+        Self::Disabled {
+            path: default_exec_acl_path(),
+            reason: "no exec ACL configured".to_string(),
+            loaded_at_unix_ms: 0,
+        }
+    }
+}
+
 impl ExecPolicy {
     /// Whether the policy enables remote exec.
     #[must_use]
