@@ -53,10 +53,20 @@ pub struct ExecService {
     active_servers: Mutex<HashMap<ExecRequestId, ActiveServerSession>>,
     active_counts: Mutex<ActiveCounts>,
     /// Cancellation token driving deterministic teardown of the three
-    /// long-lived loops below (inbound dispatch, peer lifecycle, session idle).
+    /// long-lived loops below (inbound dispatch, peer lifecycle, session idle)
+    /// and of per-request handler tasks (issue #118).
     cancellation_token: tokio_util::sync::CancellationToken,
     /// Handles for the three spawned loops, drained by `shutdown()`.
     task_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Per-request handler task handles, drained by `shutdown()` (issue #118).
+    /// A handler removes its own entry on completion; `shutdown()` aborts any
+    /// that are still alive after the grace window.
+    request_task_handles: Mutex<HashMap<ExecRequestId, tokio::task::JoinHandle<()>>>,
+    /// Serializes concurrent `shutdown()` calls (issue #118): without it a
+    /// second caller could observe a half-cleared state, complete
+    /// `join_all(empty)` immediately, clear bookkeeping, and return while the
+    /// first caller is still aborting stragglers.
+    shutdown_lock: tokio::sync::Mutex<()>,
 }
 
 struct PendingClient {
@@ -78,6 +88,10 @@ struct ActiveServerSession {
     last_activity: Arc<Mutex<Instant>>,
     argv_summary: String,
     started_at: Instant,
+    /// PID of the spawned child (0 until `cmd.spawn()` succeeds). Stored so
+    /// `shutdown()` can SIGKILL out-of-band without waiting for the handler
+    /// task to observe its cancel signal (issue #118).
+    child_pid: Arc<AtomicU32>,
 }
 
 #[derive(Default)]
@@ -93,6 +107,9 @@ enum CancelReason {
     PeerDisconnected,
     DurationCap,
     IdleTimeout,
+    /// Service-wide shutdown: skip the normal CANCEL_GRACE and terminate the
+    /// child immediately. Sent by `shutdown()` to every active session.
+    Shutdown,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +147,8 @@ impl ExecService {
             active_counts: Mutex::new(ActiveCounts::default()),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             task_handles: Mutex::new(Vec::new()),
+            request_task_handles: Mutex::new(HashMap::new()),
+            shutdown_lock: tokio::sync::Mutex::new(()),
         });
         let loop_service = Arc::clone(&service);
         let inbound_handle = tokio::spawn(async move {
@@ -152,43 +171,126 @@ impl ExecService {
         service
     }
 
-    /// Stop the three background loops deterministically. Idempotent.
+    /// Stop the three background loops AND any in-flight per-request exec
+    /// handler tasks deterministically, killing their child processes.
+    /// Idempotent.
     ///
-    /// Cancels the token (the idle-timer loop only ends this way; the two
-    /// channel loops also exit promptly instead of waiting on their channels),
-    /// grace-awaits the handles under a single bounded budget, then aborts and
-    /// awaits any straggler. A cancelled/aborted task yields `Err(JoinError)`;
-    /// that is expected and never unwrapped.
+    /// Steps (issue #118):
+    /// 1. Cancel the service token (stops the loops; newly-arriving requests
+    ///    are declined; in-flight `handle_request` tasks that have not yet
+    ///    spawned a child bail out).
+    /// 2. Snapshot active sessions, send `CancelReason::Shutdown` to each
+    ///    (sets `kill_at = now` in `run_child` so it SIGKILLs this iteration),
+    ///    and collect every nonzero `child_pid`.
+    /// 3. SIGKILL those PIDs **out-of-band** as a hard guarantee that does not
+    ///    depend on the handler task observing the cancel in time.
+    /// 4. Drain and grace-await the three loop handles plus every in-flight
+    ///    request handler handle, under a single bounded budget.
+    /// 5. On timeout, re-snapshot currently-active `child_pid`s (not the
+    ///    initial list, which may now be stale/reused) and SIGKILL them, then
+    ///    abort+await stragglers.
+    /// 6. Clear `active_servers` / `active_counts` — aborted handler tasks may
+    ///    not have run their cleanup, so reset the bookkeeping explicitly.
     ///
-    /// SCOPE BOUNDARY (issue #116): this stops the three long-lived background
-    /// LOOPS only. It does NOT force-cancel per-request exec handler tasks that
-    /// are in flight (the `tokio::spawn` in `run_inbound_loop` for an
-    /// `ExecFrame::Request`) nor the child processes they are running. An
-    /// in-flight remote command is active-session work: it completes on its own,
-    /// hits its own duration/idle/lease cap, or is reaped when the process
-    /// exits. Force-cancelling active exec sessions on `shutdown()` is a separate
-    /// follow-up, intentionally out of scope for the background-loop teardown.
+    /// A cancelled/aborted task yields `Err(JoinError)`; that is expected and
+    /// never unwrapped.
     pub async fn shutdown(&self) {
+        // Issue #118: serialize concurrent shutdown() calls so a second caller
+        // can't race the first into a half-cleared state.
+        let _shutdown_guard = self.shutdown_lock.lock().await;
         self.cancellation_token.cancel();
-        let handles = {
+
+        // (2) Snapshot active sessions and signal shutdown. Record whether any
+        // sessions existed (even with pid==0) so the bookkeeping reset below
+        // runs even when no child PID has been published yet.
+        let mut pids: Vec<u32> = Vec::new();
+        let had_active_sessions = {
+            let active = self.active_servers.lock().await;
+            if active.is_empty() {
+                false
+            } else {
+                for session in active.values() {
+                    // Watch sender: ok if the handler already dropped its receiver.
+                    let _ = session.cancel_tx.send(CancelReason::Shutdown);
+                    let pid = session.child_pid.load(Ordering::Acquire);
+                    if pid != 0 {
+                        pids.push(pid);
+                    }
+                }
+                true
+            }
+        };
+
+        // (3) Out-of-band SIGKILL guarantee. `kill_on_drop(true)` will also
+        // fire when the handler task is dropped/aborted, but we do not rely on
+        // it here: a reaped PID is the acceptance bar for #118.
+        for &pid in &pids {
+            send_signal(pid, TermSignal::Kill);
+        }
+
+        // (4) Drain loop handles and request handler handles.
+        let loop_handles = {
             let mut guard = self.task_handles.lock().await;
             std::mem::take(&mut *guard)
         };
-        if handles.is_empty() {
+        let request_handles = {
+            let mut guard = self.request_task_handles.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        let any_work =
+            had_active_sessions || !loop_handles.is_empty() || !request_handles.is_empty();
+        if !any_work {
             return;
         }
+
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = loop_handles;
+        handles.extend(request_handles.into_values());
         let abort_handles: Vec<tokio::task::AbortHandle> =
             handles.iter().map(|h| h.abort_handle()).collect();
         let mut join = futures::future::join_all(handles);
         tokio::select! {
             _results = &mut join => {}
             _ = tokio::time::sleep(Duration::from_secs(3)) => {
-                tracing::warn!("exec background loops did not stop within grace; aborting stragglers");
+                tracing::warn!(
+                    active = pids.len(),
+                    "exec tasks did not stop within grace; re-killing children and aborting stragglers"
+                );
+                // (5) Hard guarantee. Kill only CURRENTLY-active children from
+                // a fresh snapshot, not the initial `pids` list: a handler may
+                // have completed and reaped its child during the grace window,
+                // and after ~3s the OS could hand that PID to an unrelated
+                // process. A fresh snapshot also catches PIDs published after
+                // our initial snapshot (shutdown began between the
+                // active_session insert and `child_pid.store`).
+                let live_pids: Vec<u32> = {
+                    let active = self.active_servers.lock().await;
+                    active
+                        .values()
+                        .map(|s| s.child_pid.load(Ordering::Acquire))
+                        .filter(|&p| p != 0)
+                        .collect()
+                };
+                for pid in live_pids {
+                    send_signal(pid, TermSignal::Kill);
+                }
                 for handle in &abort_handles {
                     handle.abort();
                 }
                 let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
             }
+        }
+
+        // (6) Reset bookkeeping that aborted handlers may not have cleaned up.
+        // This runs whenever shutdown observed any work (sessions or handles),
+        // including sessions whose child PID was never published.
+        {
+            let mut active = self.active_servers.lock().await;
+            active.clear();
+        }
+        {
+            let mut counts = self.active_counts.lock().await;
+            counts.total = 0;
+            counts.per_agent.clear();
         }
     }
 
@@ -528,11 +630,9 @@ impl ExecService {
                     cwd,
                 } => {
                     let service = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        service
-                            .handle_request(inbound, request_id, argv, stdin, timeout_ms, cwd)
-                            .await;
-                    });
+                    service
+                        .spawn_request_handler(inbound, request_id, argv, stdin, timeout_ms, cwd)
+                        .await;
                 }
                 ExecFrame::LeaseRenew { request_id } => {
                     self.handle_lease_renew(inbound.sender, inbound.machine_id, request_id)
@@ -600,6 +700,57 @@ impl ExecService {
             return;
         }
         let _ = session.cancel_tx.send(CancelReason::ExplicitCancel);
+    }
+
+    /// Spawn a per-request handler task for an inbound `ExecFrame::Request`,
+    /// recording its `JoinHandle` under `request_task_handles` so `shutdown()`
+    /// can abort it (issue #118). Race-safe: the handle is inserted while
+    /// holding the lock, and the spawned wrapper removes its own entry on
+    /// completion, so `shutdown()` never aborts an already-finished task or
+    /// misses one that is about to start. If the service is already shutting
+    /// down, no task is spawned.
+    async fn spawn_request_handler(
+        self: &Arc<Self>,
+        inbound: DmTypedPayload,
+        request_id: ExecRequestId,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u32,
+        cwd: Option<String>,
+    ) {
+        // Hold the lock across spawn + insert so `shutdown()` draining the map
+        // observes a consistent set: either this handle is present (and will be
+        // awaited/aborted) or the token was already cancelled and we decline.
+        let mut handles = self.request_task_handles.lock().await;
+        if self.cancellation_token.is_cancelled() {
+            tracing::debug!(
+                request_id = %request_id,
+                "dropping inbound exec request: service shutting down"
+            );
+            return;
+        }
+        let service = Arc::clone(self);
+        let cleanup_service = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            service
+                .handle_request(inbound, request_id, argv, stdin, timeout_ms, cwd)
+                .await;
+            // Self-remove on completion. Race-free: `shutdown()` uses
+            // `std::mem::take` to move all handles out under the lock, so once
+            // it has run the map is empty and a late remove here is a harmless
+            // no-op. We use the awaited lock (not `try_lock`) so that a handler
+            // which finishes while its parent holds the map lock during insert
+            // cannot leak a stale finished `JoinHandle`.
+            let mut guard = cleanup_service.request_task_handles.lock().await;
+            guard.remove(&request_id);
+        });
+        // Issue #118: request IDs are client-allocated, so a reused id would
+        // otherwise orphan the earlier handler — `insert` drops its `JoinHandle`
+        // without aborting, leaving its child running past shutdown. Abort the
+        // displaced handler so its `Child` drops and `kill_on_drop` reaps it.
+        if let Some(previous) = handles.insert(request_id, handle) {
+            previous.abort();
+        }
     }
 
     async fn handle_request(
@@ -686,6 +837,17 @@ impl ExecService {
             return;
         };
 
+        // If shutdown began while this request was waiting on a lock / slot,
+        // decline to spawn a child rather than racing teardown (issue #118).
+        if self.cancellation_token.is_cancelled() {
+            tracing::debug!(
+                request_id = %request_id,
+                "declining exec request after slot acquire: service shutting down"
+            );
+            self.release_slot(inbound.sender).await;
+            return;
+        }
+
         self.diagnostics.record_allowed();
         self.audit
             .request(
@@ -703,6 +865,7 @@ impl ExecService {
         let now = Instant::now();
         let lease_deadline = Arc::new(Mutex::new(now + LEASE_TIMEOUT));
         let last_activity = Arc::new(Mutex::new(now));
+        let child_pid = Arc::new(AtomicU32::new(0));
         let active_session = ActiveServerSession {
             agent_id: inbound.sender,
             machine_id: inbound.machine_id,
@@ -711,6 +874,7 @@ impl ExecService {
             last_activity: Arc::clone(&last_activity),
             argv_summary: argv_summary(&argv),
             started_at: now,
+            child_pid: Arc::clone(&child_pid),
         };
         self.active_servers
             .lock()
@@ -726,6 +890,7 @@ impl ExecService {
             cancel_rx,
             lease_deadline,
             last_activity,
+            child_pid,
         )
         .await;
 
@@ -837,6 +1002,7 @@ impl ExecService {
         mut cancel_rx: watch::Receiver<CancelReason>,
         lease_deadline: Arc<Mutex<Instant>>,
         last_activity: Arc<Mutex<Instant>>,
+        child_pid: Arc<AtomicU32>,
     ) {
         let started = Instant::now();
         let mut cmd = Command::new(&argv[0]);
@@ -876,6 +1042,11 @@ impl ExecService {
         };
 
         let pid = child.id().unwrap_or(0);
+        // Publish the PID so `shutdown()` can SIGKILL out-of-band without
+        // waiting for this loop to observe its cancel signal (issue #118).
+        if pid != 0 {
+            child_pid.store(pid, Ordering::Release);
+        }
         self.diagnostics.record_started();
         self.audit.started(request_id, pid).await;
         if let Err(e) = self
@@ -970,7 +1141,14 @@ impl ExecService {
         let mut kill_at = started + checked.max_duration;
         let status = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
+                Ok(Some(status)) => {
+                    // Issue #118: the child has exited (and been reaped) — clear
+                    // the published PID immediately, before any further await, so
+                    // `shutdown()` can never SIGKILL a PID the OS may have
+                    // recycled to an unrelated process.
+                    child_pid.store(0, Ordering::Release);
+                    break Some(status);
+                }
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(request_id = %request_id, error = %e, "exec wait failed");
@@ -1010,6 +1188,8 @@ impl ExecService {
                             CancelReason::PeerDisconnected => WarningKind::PeerDisconnected,
                             CancelReason::DurationCap => WarningKind::DurationApproachingCap,
                             CancelReason::IdleTimeout => WarningKind::LeaseExpired,
+                            // Service-wide shutdown: report as cancelled.
+                            CancelReason::Shutdown => WarningKind::Cancelled,
                         };
                         self.emit_warning(
                             to,
@@ -1021,7 +1201,15 @@ impl ExecService {
                             None,
                         )
                         .await;
-                        kill_at = now + CANCEL_GRACE;
+                        // Shutdown terminates immediately (no grace); the
+                        // service is going away and the embedder needs the
+                        // child dead before `shutdown()` returns. Other reasons
+                        // keep the normal grace window.
+                        kill_at = if reason == CancelReason::Shutdown {
+                            now
+                        } else {
+                            now + CANCEL_GRACE
+                        };
                     }
                     Ok(false) => {}
                     Err(_) => {}
@@ -1476,6 +1664,8 @@ mod tests {
             active_counts: Mutex::new(ActiveCounts::default()),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             task_handles: Mutex::new(Vec::new()),
+            request_task_handles: Mutex::new(HashMap::new()),
+            shutdown_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -1532,6 +1722,7 @@ mod tests {
                 last_activity: Arc::clone(&last_activity),
                 argv_summary: "lease-test".to_string(),
                 started_at: Instant::now(),
+                child_pid: Arc::new(AtomicU32::new(0)),
             },
         );
 
@@ -1684,6 +1875,7 @@ mod tests {
                 last_activity: Arc::new(Mutex::new(Instant::now())),
                 argv_summary: "lease mismatch".to_string(),
                 started_at: Instant::now(),
+                child_pid: Arc::new(AtomicU32::new(0)),
             },
         );
 
@@ -1735,6 +1927,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(CancelReason::DurationCap);
         let lease_deadline = Arc::new(Mutex::new(Instant::now() + Duration::from_secs(30)));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let child_pid = Arc::new(AtomicU32::new(0));
         let started = Instant::now();
 
         service
@@ -1747,6 +1940,7 @@ mod tests {
                 cancel_rx,
                 lease_deadline,
                 last_activity,
+                child_pid,
             )
             .await;
 
@@ -1759,6 +1953,103 @@ mod tests {
         assert_eq!(
             snapshot.totals.cap_warnings.get("duration_approaching_cap"),
             Some(&1)
+        );
+    }
+
+    /// Issue #118 regression: an in-flight exec child must be killed by
+    /// `shutdown()`, and the request handler task must not outlive it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_kills_in_flight_exec_child_and_aborts_handler() {
+        if !Path::new("/bin/sleep").exists() {
+            return;
+        }
+        let inbound = inbound_payload(true, Some(TrustDecision::Accept));
+        // ACL allowing a long sleep so the child would otherwise outlive the test.
+        let acl = ExecAcl {
+            loaded_from: PathBuf::from("exec-acl.toml"),
+            loaded_at_unix_ms: 1,
+            caps: ExecCaps {
+                max_duration_secs: 300,
+                warn_duration_secs: 290,
+                ..ExecCaps::default()
+            },
+            audit_log_path: PathBuf::from("audit.jsonl"),
+            audit_tasklist_id: None,
+            allow: vec![AllowEntry {
+                description: Some("long sleep".to_string()),
+                agent_id: inbound.sender,
+                machine_id: inbound.machine_id,
+                max_duration_secs: Some(300),
+                commands: vec![AllowedCommand {
+                    argv: vec![
+                        AllowedToken::Literal("/bin/sleep".to_string()),
+                        AllowedToken::Literal("60".to_string()),
+                    ],
+                }],
+            }],
+        };
+        let (service, _dir) = enabled_test_service(acl).await;
+        let request_id = ExecRequestId([77; 16]);
+
+        // Drive the request through the real handler-spawn path so the task is
+        // tracked in `request_task_handles` (the path #118 adds).
+        Arc::clone(&service)
+            .spawn_request_handler(
+                inbound,
+                request_id,
+                vec!["/bin/sleep".to_string(), "60".to_string()],
+                None,
+                60_000,
+                None,
+            )
+            .await;
+
+        // Wait for the child to be spawned and published.
+        let pid = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let guard = service.active_servers.lock().await;
+                if let Some(session) = guard.get(&request_id) {
+                    let pid = session.child_pid.load(Ordering::Acquire);
+                    if pid != 0 {
+                        break pid;
+                    }
+                }
+                drop(guard);
+                if Instant::now() >= deadline {
+                    panic!("exec child never started");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+
+        // Sanity: the child is alive right now.
+        assert!(
+            process_alive(pid),
+            "child {pid} should be alive before shutdown"
+        );
+
+        service.shutdown().await;
+
+        // The child must be gone: shutdown SIGKILLed it out-of-band and/or
+        // aborted the handler (which drops the Child, firing kill_on_drop).
+        let mut gone = false;
+        for _ in 0..50 {
+            if !process_alive(pid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(gone, "child {pid} should be dead after shutdown");
+        assert!(
+            service.active_servers.lock().await.is_empty(),
+            "active_servers should be cleared after shutdown"
+        );
+        assert!(
+            service.request_task_handles.lock().await.is_empty(),
+            "request_task_handles should be drained after shutdown"
         );
     }
 
@@ -1817,6 +2108,7 @@ mod tests {
                 last_activity: Arc::new(Mutex::new(Instant::now())),
                 argv_summary: "echo active".to_string(),
                 started_at: Instant::now() - Duration::from_millis(20),
+                child_pid: Arc::new(AtomicU32::new(0)),
             },
         );
 
@@ -2092,6 +2384,7 @@ mod tests {
                 last_activity: Arc::new(Mutex::new(Instant::now())),
                 argv_summary: "cancel".to_string(),
                 started_at: Instant::now(),
+                child_pid: Arc::new(AtomicU32::new(0)),
             },
         );
 
@@ -2121,6 +2414,21 @@ mod tests {
         assert_eq!(snap.totals.requests_denied, 1);
         assert_eq!(snap.totals.denial_breakdown.get(reason.as_str()), Some(&1));
         assert!(service.active_servers.lock().await.is_empty());
+    }
+
+    /// Whether a Unix process is still alive (signal 0 succeeds). EPERM (exists
+    /// but not ours) is treated as alive; ESRCH (no such process) as gone.
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        // SAFETY: `libc::kill` with signal 0 is a standard liveness probe and
+        // takes no action on the target.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return true;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        // ESRCH: no such process. EPERM: exists but not ours (treat as alive).
+        errno != libc::ESRCH
     }
 
     #[tokio::test]
