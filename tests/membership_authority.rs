@@ -640,6 +640,7 @@ fn membership_authority_promoted_admin_bans_legacy_owner_not_last_admin() {
 
 #[test]
 fn membership_authority_signed_role_update_apply_accepts_current_and_legacy_labels() {
+    // ADR-0016: authoring enforces reserved role assignment; signed apply accepts Moderator/Guest for legacy/cross-version convergence while Owner stays rejected as admin-equivalent.
     assert_signed_role_update_applies(GroupRole::Admin);
     assert_signed_role_update_applies(GroupRole::Member);
     assert_signed_role_update_applies(GroupRole::Moderator);

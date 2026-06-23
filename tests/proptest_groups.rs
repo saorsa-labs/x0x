@@ -288,6 +288,7 @@ fn arb_initial_roster() -> impl Strategy<Value = Vec<RosterMemberSpec>> {
         })
 }
 
+// ADR-0016: authoring enforces reserved role assignment; signed apply accepts Moderator/Guest for legacy/cross-version convergence while Owner stays rejected as admin-equivalent.
 fn arb_role_update() -> impl Strategy<Value = GroupRole> {
     prop_oneof![
         Just(GroupRole::Admin),

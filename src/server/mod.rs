@@ -9002,6 +9002,10 @@ async fn apply_named_group_metadata_event_inner(
             if target.is_removed() || target.is_banned() {
                 return false;
             }
+            // ADR-0016 enforces reserved-role assignment at authoring: the REST API rejects
+            // Owner/Moderator/Guest. On signed gossip apply, reject only Owner because it is
+            // admin-equivalent; Moderator/Guest are below Admin, grant no admin authority, and
+            // must still replay from validly signed legacy/cross-version commits for convergence.
             if role == x0x::groups::GroupRole::Owner {
                 return false;
             }
