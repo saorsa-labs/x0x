@@ -410,11 +410,13 @@ x0x group remove-member <group_id> <agent_id>
 x0x group list
 ```
 
-Current note: creator-authored named-space member add/remove and creator delete now propagate across subscribed peers, and removed peers drop the space locally. This is much stronger than a purely local roster, but it is still not yet a full distributed admin/ACL system by itself.
+Current note: admin-authored named-space member add/remove and explicit delete now propagate across subscribed peers, removed peers drop the space locally, and deleted groups retain a keyless tombstone/terminality marker. This is much stronger than a purely local roster, but it is still not a full distributed app-level ACL system by itself.
+
+Admin is root for the group: a hostile or compromised Admin can admit, remove, rekey, change policy, assign roles, and delete the group for everyone. Keep the admin set small, and do not map softer application roles onto x0x Admin. Role assignment accepts only `admin` and `member`; legacy `owner` entries render/read as admin-equivalent for old groups but are not assignable.
 
 ### Phase D.3 — stable identity + evolving validity
 
-Each group has a **stable `group_id`** plus an authority-signed **state-commit chain** (`revision`, `prev_state_hash`, `state_hash`, owner/admin ML-DSA-65 signature). Public directory cards are ML-DSA-65 signed and peers supersede by revision immediately — stale cards are dropped regardless of TTL. Owners can **withdraw** a group to evict its public card across the reachable partition.
+Each group has a **stable `group_id`** plus an authority-signed **state-commit chain** (`revision`, `prev_state_hash`, `state_hash`, Admin ML-DSA-65 signature; legacy Owner counts as Admin). Public directory cards are ML-DSA-65 signed and peers supersede by revision immediately — stale cards are dropped regardless of TTL. Any Admin can **delete** a group by sealing a terminal withdrawal commit that evicts its public card across the reachable partition.
 
 ```bash
 # Inspect the signed chain
@@ -424,7 +426,7 @@ x0x group state <group_id>
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://$API/groups/<group_id>/state/seal"
 
-# Terminal withdrawal (owner)
+# Delete for everyone with a terminal withdrawal commit (any admin)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://$API/groups/<group_id>/state/withdraw"
 ```

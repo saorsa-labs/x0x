@@ -32,7 +32,7 @@ fn hex_id(kp: &AgentKeypair) -> String {
     hex::encode(kp.agent_id().as_bytes())
 }
 
-/// Build an MlsEncrypted group whose sole Owner is `owner_kp`.
+/// Build an MlsEncrypted group whose sole Admin is `owner_kp`.
 fn build_owner_group(owner_kp: &AgentKeypair, name: &str) -> GroupInfo {
     GroupInfo::with_policy(
         name.to_string(),
@@ -298,12 +298,12 @@ fn apply_commit_rejects_unauthorized_signer() {
     replica.policy = GroupPolicyPreset::PublicAnnounce.to_policy();
     let forged = replica.seal_commit(&bob, 2_000).unwrap();
 
-    // Authority tries to apply bob's forged commit as OwnerOnly —
+    // Authority tries to apply bob's forged commit as AdminOrHigher —
     // mirrors the mutation locally so chain+hash are consistent;
     // authority is still at revision 1.
     authority.policy = GroupPolicyPreset::PublicAnnounce.to_policy();
     let err = authority
-        .apply_commit(&forged, ActionKind::OwnerOnly)
+        .apply_commit(&forged, ActionKind::AdminOrHigher)
         .unwrap_err();
     assert!(
         matches!(err, ApplyError::Unauthorized { .. }),
@@ -318,7 +318,7 @@ fn apply_commit_rejects_post_withdrawal_non_withdrawal() -> Result<(), Box<dyn s
     let _ = g.seal_withdrawal(&owner, 1_000)?;
     assert!(g.withdrawn);
 
-    // Try to apply a new non-withdrawal owner action from the same owner —
+    // Try to apply a new non-withdrawal admin action from the same signer —
     // must reject because the group is terminated.
     g.policy = GroupPolicyPreset::PublicAnnounce.to_policy();
     let commit = GroupStateCommit::sign(
@@ -336,7 +336,7 @@ fn apply_commit_rejects_post_withdrawal_non_withdrawal() -> Result<(), Box<dyn s
     let commit = commit?;
     assert!(!commit.withdrawn);
 
-    let result = g.apply_commit(&commit, ActionKind::OwnerOnly);
+    let result = g.apply_commit(&commit, ActionKind::AdminOrHigher);
     assert!(
         matches!(&result, Err(ApplyError::Withdrawn)),
         "expected Withdrawn, got: {result:?}"

@@ -50,9 +50,10 @@ pub use self::public_message::{
 pub use self::request::{JoinRequest, JoinRequestStatus};
 pub use self::state_commit::{
     compute_policy_hash, compute_public_meta_hash, compute_roster_root, compute_state_hash,
-    roster_projection, roster_root_of_projection, ActionKind, ApplyContext, ApplyError,
-    GroupGenesis, GroupPublicMeta, GroupStateCommit, RetainedCommit, RosterMemberSnapshot,
-    CARD_SIGNATURE_DOMAIN, DEFAULT_CARD_TTL_SECS, EVENT_SIGNATURE_DOMAIN, STATE_COMMIT_DOMAIN,
+    enforce_last_admin_invariant, roster_projection, roster_root_of_projection, ActionKind,
+    ApplyContext, ApplyError, GroupGenesis, GroupPublicMeta, GroupStateCommit, RetainedCommit,
+    RosterMemberSnapshot, CARD_SIGNATURE_DOMAIN, DEFAULT_CARD_TTL_SECS, EVENT_SIGNATURE_DOMAIN,
+    STATE_COMMIT_DOMAIN,
 };
 
 fn now_millis() -> u64 {
@@ -243,6 +244,55 @@ fn secure_plane_legacy_default() -> SecureGroupPlane {
 /// so history loss can never be silent.
 pub const COMMIT_LOG_CAP: usize = 4096;
 
+/// Exact ADR-0016 §3 REST error string for acts that would leave a live
+/// group with zero active admins. Fixed verbatim by the Phase 1 spec.
+pub const LAST_ADMIN_PRECHECK_ERROR: &str =
+    "a group must always have at least one admin; make another member an admin first";
+
+/// Exact ADR-0016 §3 REST error string for last-admin self-leave attempts.
+/// Fixed verbatim by the Phase 1 spec.
+pub const LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR: &str =
+    "a group must always have at least one admin; make another member an admin before leaving";
+
+/// Return the ADR-0016 last-admin REST pre-check error for a proposed
+/// post-mutation group state.
+///
+/// Callers provide the same mutation they are about to author/apply; this
+/// helper runs it on a clone and maps the shared invariant to the exact §3
+/// user-facing string. It is a UX pre-check only — the authoritative guard
+/// remains [`state_commit::enforce_last_admin_invariant`] at the commit
+/// authoring/apply choke-points.
+#[must_use]
+pub fn last_admin_precheck_error(
+    info: &GroupInfo,
+    apply: impl FnOnce(&mut GroupInfo),
+) -> Option<&'static str> {
+    let mut proposed = info.clone();
+    apply(&mut proposed);
+    state_commit::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn)
+        .err()
+        .map(|_| LAST_ADMIN_PRECHECK_ERROR)
+}
+
+/// Return the ADR-0016 last-admin REST pre-check error for a proposed
+/// self-leave by `leaver_hex`.
+///
+/// This is the self-leave variant of [`last_admin_precheck_error`], with the
+/// separate §3 user-facing recovery hint. It deliberately evaluates the removal
+/// on a clone so rejected leaves cannot mutate live group state before the
+/// authoritative commit-time invariant rejects them.
+#[must_use]
+pub fn last_admin_self_leave_precheck_error(
+    info: &GroupInfo,
+    leaver_hex: &str,
+) -> Option<&'static str> {
+    let mut proposed = info.clone();
+    proposed.remove_member(leaver_hex, None);
+    state_commit::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn)
+        .err()
+        .map(|_| LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
+}
+
 impl GroupInfo {
     /// Create a new `GroupInfo` with the given policy (defaults to `private_secure`).
     #[must_use]
@@ -287,7 +337,7 @@ impl GroupInfo {
         let mut members_v2 = BTreeMap::new();
         members_v2.insert(
             creator_hex.clone(),
-            GroupMember::new_owner(creator_hex.clone(), None, now),
+            GroupMember::new_admin(creator_hex.clone(), None, now),
         );
 
         // Generate a fresh shared secret for MlsEncrypted groups. SignedPublic
@@ -442,6 +492,11 @@ impl GroupInfo {
         keypair: &AgentKeypair,
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        // ADR-0016 R2: never author a commit whose post-mutation,
+        // non-withdrawn state has zero active admins. `self` already holds
+        // the caller's domain mutations, so this evaluates the proposed
+        // post-mutation roster before any chain field is touched.
+        state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
         // Ensure the genesis record is present — callers may reach here via
         // migrated paths that didn't set it yet.
         if self.genesis.is_none() {
@@ -516,7 +571,7 @@ impl GroupInfo {
     /// discovery purposes — peers holding stale public cards must drop them
     /// on receipt of this commit regardless of TTL.
     ///
-    /// Withdrawal is owner-authored; callers must check role before calling.
+    /// Withdrawal is admin-authored; callers must check role before calling.
     pub fn seal_withdrawal(
         &mut self,
         keypair: &AgentKeypair,
@@ -573,9 +628,14 @@ impl GroupInfo {
                 got: self.state_hash.clone(),
             });
         }
+        // ADR-0016 R2: reject any applied commit whose post-mutation,
+        // non-withdrawn state has zero active admins. Runs after the hash
+        // check so the roster being validated is provably the roster the
+        // signed commit's `roster_root` committed to.
+        state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
         // issue #111: retain the peer-authored commit only after it has
-        // validated and applied cleanly (post hash-match), so rejected
-        // commits never enter the history.
+        // validated and applied cleanly (post hash-match + invariants), so
+        // rejected commits never enter the history.
         self.retain_commit(commit);
         Ok(())
     }
@@ -622,7 +682,7 @@ impl GroupInfo {
             for id in all_ids {
                 let display_name = self.display_names.get(&id).cloned();
                 let member = if id == creator_hex {
-                    GroupMember::new_owner(id.clone(), display_name, now)
+                    GroupMember::new_admin(id.clone(), display_name, now)
                 } else {
                     GroupMember::new_member(
                         id.clone(),
@@ -924,7 +984,7 @@ impl GroupInfo {
         self.active_members().count()
     }
 
-    /// Count of currently active Admins (including Owner).
+    /// Count of currently active Admins (including legacy Owner).
     #[must_use]
     pub fn active_admin_count(&self) -> usize {
         self.members_v2
@@ -933,7 +993,7 @@ impl GroupInfo {
             .count()
     }
 
-    /// Owner's agent hex, if one exists.
+    /// Active legacy Owner's agent hex, if one exists.
     #[must_use]
     pub fn owner_agent_id(&self) -> Option<String> {
         self.members_v2
@@ -1021,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_info_new_seeds_owner() {
+    fn test_group_info_new_seeds_admin() {
         let info = GroupInfo::new(
             "Test Group".to_string(),
             "A test".to_string(),
@@ -1029,9 +1089,9 @@ mod tests {
             "aabb".repeat(8),
         );
         let creator_hex = hex::encode([1u8; 32]);
-        let owner = info.members_v2.get(&creator_hex).unwrap();
-        assert_eq!(owner.role, GroupRole::Owner);
-        assert!(owner.is_active());
+        let admin = info.members_v2.get(&creator_hex).unwrap();
+        assert_eq!(admin.role, GroupRole::Admin);
+        assert!(admin.is_active());
         assert_eq!(info.policy, GroupPolicy::default());
         assert_eq!(info.active_member_count(), 1);
     }
@@ -1156,7 +1216,7 @@ mod tests {
         assert_eq!(info.members_v2.len(), 3);
         let creator_hex = hex::encode([1u8; 32]);
         let bob_hex = hex::encode([2u8; 32]);
-        assert_eq!(info.members_v2[&creator_hex].role, GroupRole::Owner);
+        assert_eq!(info.members_v2[&creator_hex].role, GroupRole::Admin);
         assert_eq!(info.members_v2[&bob_hex].role, GroupRole::Member);
         assert_eq!(
             info.members_v2[&bob_hex].display_name.as_deref(),
@@ -1238,7 +1298,7 @@ mod tests {
     fn test_caller_role() {
         let info = GroupInfo::new("T".into(), "".into(), agent(1), "aa".repeat(16));
         let creator_hex = hex::encode([1u8; 32]);
-        assert_eq!(info.caller_role(&creator_hex), Some(GroupRole::Owner));
+        assert_eq!(info.caller_role(&creator_hex), Some(GroupRole::Admin));
         let stranger_hex = hex::encode([9u8; 32]);
         assert_eq!(info.caller_role(&stranger_hex), None);
     }

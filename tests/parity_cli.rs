@@ -99,6 +99,48 @@ fn group_update_rejects_empty_patch_before_daemon_check() {
     );
 }
 
+#[test]
+fn group_delete_primary_and_state_withdraw_alias_parse() {
+    let delete_help =
+        run_cli(&["group", "delete", "--help"]).expect("spawn x0x group delete --help");
+    assert!(
+        delete_help.status.success(),
+        "group delete --help should parse"
+    );
+
+    let alias_help = run_cli(&["group", "state-withdraw", "--help"])
+        .expect("spawn x0x group state-withdraw --help");
+    assert!(
+        alias_help.status.success(),
+        "hidden state-withdraw alias should remain parseable"
+    );
+}
+
+#[test]
+fn group_set_role_help_lists_only_assignable_roles() {
+    let help = run_cli(&["group", "set-role", "--help"]).expect("spawn x0x group set-role --help");
+    assert!(help.status.success(), "group set-role --help should parse");
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        text.contains("admin   Full group control: membership, policy, rekey, and delete."),
+        "set-role help must explain admin semantics:\n{text}"
+    );
+    assert!(
+        text.contains("member  Group participant."),
+        "set-role help must explain member semantics:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "Legacy owner entries render/read as admin-equivalent but cannot be assigned."
+        ),
+        "set-role help must preserve legacy owner readability without assignability:\n{text}"
+    );
+    assert!(
+        !text.contains("moderator") && !text.contains("guest"),
+        "set-role help must not list reserved roles as assignable:\n{text}"
+    );
+}
+
 /// `x0x exec` exposes `sessions` and `cancel` as real, discoverable
 /// subcommands (not magic first-positional sentinels), while the
 /// `x0x exec <agent> -- <argv>` run form still parses. These assert the

@@ -4385,21 +4385,19 @@ async function nagRenderAdmin(gid){
   const myAid=(meResp&&meResp.agent_id)||null;
   const mine=members.find(m=>m.agent_id===myAid);
   const myRole=mine?mine.role:null;
-  const isOwner=myRole==='owner';
   const isAdminOrAbove=myRole==='owner'||myRole==='admin';
-  host.innerHTML=nagPolicyPanelHtml(gid,isOwner)
-    +nagStatePanelHtml(gid,stateResp&&stateResp.ok?stateResp:null,isOwner)
-    +nagRosterPanelHtml(gid,members,myAid,isAdminOrAbove,isOwner)
+  host.innerHTML=nagPolicyPanelHtml(gid,isAdminOrAbove)
+    +nagStatePanelHtml(gid,stateResp&&stateResp.ok?stateResp:null,isAdminOrAbove)
+    +nagRosterPanelHtml(gid,members,myAid,isAdminOrAbove)
     +(isAdminOrAbove?nagRequestsPanelHtml(gid,requests.filter(r=>r.status==='pending')):'');
   nagBindAdminHandlers(gid);
 }
 
-function nagPolicyPanelHtml(gid,isOwner){
-  const disabled=!isOwner?'disabled':'';
+function nagPolicyPanelHtml(gid,canAdminister){
+  const disabled=!canAdminister?'disabled':'';
   const axisOpts=(opts)=>['<option value="">(leave unchanged)</option>',...opts.map(o=>`<option value="${o}">${o}</option>`)].join('');
-  // Rename inputs are admin+ — daemon enforces; we surface for owners
-  // here for simplicity. Wraps PATCH /groups/:id.
-  const renameRow=isOwner?`<div class="nag-panel" style="margin:0 0 var(--sp2) 0;border:0;background:transparent;padding:0">
+  // Rename inputs are admin+ — daemon enforces. Wraps PATCH /groups/:id.
+  const renameRow=canAdminister?`<div class="nag-panel" style="margin:0 0 var(--sp2) 0;border:0;background:transparent;padding:0">
     <div class="row" style="display:flex;gap:var(--sp2);flex-wrap:wrap;align-items:center">
       <input id="nag-rename-name-${esc(gid)}" placeholder="New name (optional)" style="flex:1;min-width:160px;padding:4px 8px;border:1px solid var(--bd);background:var(--bg3);color:var(--tx1);border-radius:var(--r-sm);font-size:12px">
       <input id="nag-rename-desc-${esc(gid)}" placeholder="New description (optional)" style="flex:2;min-width:200px;padding:4px 8px;border:1px solid var(--bd);background:var(--bg3);color:var(--tx1);border-radius:var(--r-sm);font-size:12px">
@@ -4409,8 +4407,8 @@ function nagPolicyPanelHtml(gid,isOwner){
   </div>`:'';
   return `<div class="nag-panel" data-nag-policy="${esc(gid)}">
     <h3>Policy</h3>
-    <div class="sub">Five-axis access control (owner only).</div>
-    ${!isOwner?'<div class="sub" style="color:var(--am)">Only the owner can change policy.</div>':''}
+    <div class="sub">Five-axis access control (admin+; legacy owner counts as admin).</div>
+    ${!canAdminister?'<div class="sub" style="color:var(--am)">Only an admin can change policy.</div>':''}
     ${renameRow}
     <div class="nag-policy-grid">
       <label>Preset</label>
@@ -4427,16 +4425,16 @@ function nagPolicyPanelHtml(gid,isOwner){
       <select data-k="write_access" ${disabled}>${axisOpts(['members_only','moderated_public','admin_only'])}</select>
     </div>
     <div class="nag-feedback" data-k="policy-feedback" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
-    ${isOwner?'<div style="display:flex;justify-content:flex-end;margin-top:var(--sp2)"><button class="pri" data-nag-policy-apply>Apply policy change</button></div>':''}
+    ${canAdminister?'<div style="display:flex;justify-content:flex-end;margin-top:var(--sp2)"><button class="pri" data-nag-policy-apply>Apply policy change</button></div>':''}
   </div>`;
 }
 
-function nagStatePanelHtml(gid,state,isOwner){
+function nagStatePanelHtml(gid,state,canAdminister){
   let readout='<div class="sub">Loading state chain…</div>';
   if(state){
     const prev=state.prev_state_hash||'(genesis — no parent)';
     const bind=state.security_binding||'(none)';
-    const status=state.withdrawn?'<span style="color:var(--rd)">withdrawn</span>':'<span style="color:var(--gn)">active</span>';
+    const status=state.withdrawn?'<span style="color:var(--rd)">deleted (withdrawn terminal)</span>':'<span style="color:var(--gn)">active</span>';
     readout=`<div class="nag-state-readout">
       <span class="k">revision</span><span class="v">${state.state_revision}</span>
       <span class="k">status</span><span class="v">${status}</span>
@@ -4453,22 +4451,21 @@ function nagStatePanelHtml(gid,state,isOwner){
     <div class="sub">Signed state-commit chain binds roster, policy, public metadata, and MLS epoch.</div>
     ${readout}
     <div class="nag-feedback" data-k="state-feedback" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
-    ${isOwner?`<div style="display:flex;gap:var(--sp2);margin-top:var(--sp2)">
+    ${canAdminister?`<div style="display:flex;gap:var(--sp2);margin-top:var(--sp2)">
       <button class="pri" data-nag-state-seal>Seal state</button>
-      <button class="danger" data-nag-state-withdraw>Withdraw (hide publicly)</button>
-    </div>`:'<div class="sub">Only the owner can seal or withdraw the state chain.</div>'}
+      <button class="danger" data-nag-state-withdraw>Delete (end for everyone)</button>
+    </div>`:'<div class="sub">Only an admin can seal the state chain or delete the group.</div>'}
   </div>`;
 }
 
-function nagRosterPanelHtml(gid,members,myAid,canManage,isOwner){
+function nagRosterPanelHtml(gid,members,myAid,canManage){
   const rows=members.map(m=>{
     const dn=m.display_name&&m.display_name.trim()||nagShort(m.agent_id);
-    const isTargetOwner=m.role==='owner';
-    const manage=canManage && !isTargetOwner;
+    const manage=canManage;
     const isBanned=m.state==='banned';
     let actions='';
     if(manage){
-      const promote=isOwner && m.role!=='admin' ? `<button data-nag-role="${esc(m.agent_id)}">Promote to admin</button>`:'';
+      const promote=canManage && m.role!=='admin' ? `<button data-nag-role="${esc(m.agent_id)}">${m.role==='owner'?'Set legacy owner to admin':'Promote to admin'}</button>`:'';
       const ban=isBanned
         ? `<button data-nag-unban="${esc(m.agent_id)}">Unban</button>`
         : `<button class="danger" data-nag-ban="${esc(m.agent_id)}">Ban</button>`;
@@ -4586,8 +4583,8 @@ async function nagSealState(gid){
 async function nagWithdrawState(gid){
   nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Working…');
   const r=await api('/groups/'+gid+'/state/withdraw',{method:'POST'});
-  if(r&&r.ok){nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Withdrawal sealed — public card superseded.','ok');nagRenderAdmin(gid)}
-  else{nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,(r&&r.error)||'Withdraw failed.','err')}
+  if(r&&r.ok){nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Group deleted — public card superseded.','ok');nagRenderAdmin(gid)}
+  else{nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,(r&&r.error)||'Delete failed.','err')}
 }
 
 function nagMemberFeedback(gid,aid,msg,tone){

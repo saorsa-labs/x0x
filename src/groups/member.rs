@@ -2,8 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Role of a member within a group. Ordered by privilege: Owner > Admin >
-/// Moderator > Member > Guest.
+/// Role of a member within a group.
+///
+/// New role assignments use the flat ADR-0016 model: `Admin` is the full
+/// group authority role and `Member` is the ordinary participant role.
+/// `Owner`, `Moderator`, and `Guest` remain parseable for legacy rosters but
+/// are not assignable by current APIs. Privilege ordering is kept stable for
+/// legacy evaluation and hashing: Owner > Admin > Moderator > Member > Guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupRole {
@@ -15,6 +20,10 @@ pub enum GroupRole {
 }
 
 impl GroupRole {
+    /// Exact ADR-0016 §3 error when a caller tries to assign legacy `owner`.
+    pub const OWNER_ASSIGNMENT_ERROR: &'static str =
+        "'owner' is a legacy role and cannot be assigned; valid roles: 'admin', 'member'";
+
     /// Numeric rank: higher means more privileged.
     fn rank(self) -> u8 {
         match self {
@@ -72,6 +81,22 @@ impl GroupRole {
             _ => None,
         }
     }
+
+    /// Parse a role name for **new assignments**.
+    ///
+    /// This deliberately accepts exactly the current ADR-0016 assignment
+    /// vocabulary (`admin`, `member`) while [`Self::from_name`] continues to
+    /// parse every stored legacy role name for deserialization and migration.
+    pub fn assignable_from_name(name: &str) -> Result<Self, String> {
+        match name {
+            "admin" => Ok(Self::Admin),
+            "member" => Ok(Self::Member),
+            "owner" => Err(Self::OWNER_ASSIGNMENT_ERROR.to_string()),
+            other => Err(format!(
+                "role '{other}' is reserved and cannot be assigned; valid roles: 'admin', 'member'"
+            )),
+        }
+    }
 }
 
 /// Membership state for a `GroupMember` record.
@@ -101,7 +126,7 @@ pub struct GroupMember {
     pub joined_at: u64,
     /// Unix milliseconds of the last state/role change.
     pub updated_at: u64,
-    /// Agent hex that added this member (None for the owner seed).
+    /// Agent hex that added this member (None for the initial admin seed).
     #[serde(default)]
     pub added_by: Option<String>,
     /// Agent hex that removed/banned this member.
@@ -122,7 +147,26 @@ pub struct GroupMember {
 }
 
 impl GroupMember {
-    /// Create the initial Owner record for a new group.
+    /// Create the initial Admin record for a new group.
+    #[must_use]
+    pub fn new_admin(agent_id_hex: String, display_name: Option<String>, now_ms: u64) -> Self {
+        Self {
+            agent_id: agent_id_hex,
+            user_id: None,
+            role: GroupRole::Admin,
+            state: GroupMemberState::Active,
+            display_name,
+            joined_at: now_ms,
+            updated_at: now_ms,
+            added_by: None,
+            removed_by: None,
+            kem_public_key_b64: None,
+            treekem_key_package_b64: None,
+        }
+    }
+
+    /// Create a legacy Owner record for historical fixtures and migrations
+    /// that must preserve already-stored role vocabulary.
     #[must_use]
     pub fn new_owner(agent_id_hex: String, display_name: Option<String>, now_ms: u64) -> Self {
         Self {
@@ -202,13 +246,58 @@ mod tests {
     fn role_from_name() {
         assert_eq!(GroupRole::from_name("admin"), Some(GroupRole::Admin));
         assert_eq!(GroupRole::from_name("OWNER"), Some(GroupRole::Owner));
+        assert_eq!(
+            GroupRole::from_name("moderator"),
+            Some(GroupRole::Moderator)
+        );
+        assert_eq!(GroupRole::from_name("guest"), Some(GroupRole::Guest));
         assert_eq!(GroupRole::from_name("bogus"), None);
+    }
+
+    #[test]
+    fn role_assignment_accepts_only_admin_and_member_with_exact_errors() {
+        assert_eq!(
+            GroupRole::assignable_from_name("admin"),
+            Ok(GroupRole::Admin)
+        );
+        assert_eq!(
+            GroupRole::assignable_from_name("member"),
+            Ok(GroupRole::Member)
+        );
+        assert_eq!(
+            GroupRole::assignable_from_name("owner").unwrap_err(),
+            "'owner' is a legacy role and cannot be assigned; valid roles: 'admin', 'member'"
+        );
+        assert_eq!(
+            GroupRole::assignable_from_name("moderator").unwrap_err(),
+            "role 'moderator' is reserved and cannot be assigned; valid roles: 'admin', 'member'"
+        );
+        assert_eq!(
+            GroupRole::assignable_from_name("guest").unwrap_err(),
+            "role 'guest' is reserved and cannot be assigned; valid roles: 'admin', 'member'"
+        );
+    }
+
+    #[test]
+    fn role_assignment_is_exact_lowercase_vocabulary() {
+        assert_eq!(
+            GroupRole::assignable_from_name("ADMIN").unwrap_err(),
+            "role 'ADMIN' is reserved and cannot be assigned; valid roles: 'admin', 'member'"
+        );
     }
 
     #[test]
     fn new_owner_is_active_owner() {
         let m = GroupMember::new_owner("ff".repeat(32), None, 100);
         assert_eq!(m.role, GroupRole::Owner);
+        assert!(m.is_active());
+        assert_eq!(m.joined_at, 100);
+    }
+
+    #[test]
+    fn new_admin_is_active_admin() {
+        let m = GroupMember::new_admin("ff".repeat(32), None, 100);
+        assert_eq!(m.role, GroupRole::Admin);
         assert!(m.is_active());
         assert_eq!(m.joined_at, 100);
     }

@@ -578,7 +578,7 @@
     {
       "category": "named-groups",
       "cli_name": "group leave",
-      "description": "Leave or delete a group",
+      "description": "Leave a group",
       "method": "DELETE",
       "path": "/groups/:id"
     },
@@ -605,8 +605,8 @@
     },
     {
       "category": "named-groups",
-      "cli_name": "group state-withdraw",
-      "description": "Seal a terminal withdrawal commit and supersede public card",
+      "cli_name": "group delete",
+      "description": "Delete a group with a terminal withdrawal commit",
       "method": "POST",
       "path": "/groups/:id/state/withdraw"
     },
@@ -620,7 +620,7 @@
     {
       "category": "named-groups",
       "cli_name": "group policy",
-      "description": "Update group policy (owner only)",
+      "description": "Update group policy (admin+)",
       "method": "PATCH",
       "path": "/groups/:id/policy"
     },

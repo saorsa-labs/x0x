@@ -8,6 +8,8 @@
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::time::Duration;
+use x0x::groups::GroupCard;
+use x0x::identity::AgentKeypair;
 
 #[path = "harness/src/cluster.rs"]
 mod cluster;
@@ -61,6 +63,65 @@ async fn create_group(
 
 fn fake_agent_id(fill: u8) -> String {
     hex::encode([fill; 32])
+}
+
+fn agent_hex(kp: &AgentKeypair) -> String {
+    hex::encode(kp.agent_id().as_bytes())
+}
+
+fn withdrawn_card_from(card: Value, signer: &AgentKeypair) -> Value {
+    let mut card: GroupCard = serde_json::from_value(card).expect("group card json");
+    card.withdrawn = true;
+    card.revision = card.revision.saturating_add(10);
+    card.prev_state_hash = Some(card.state_hash.clone());
+    card.state_hash = format!("withdrawn-test-{}", card.revision);
+    card.issued_at = card.issued_at.saturating_add(10_000);
+    card.updated_at = card.issued_at;
+    card.expires_at = card.issued_at.saturating_add(60_000);
+    card.sign(signer).expect("sign withdrawn test card");
+    serde_json::to_value(card).expect("withdrawn card json")
+}
+
+fn signed_test_card(
+    group_id: &str,
+    owner: &AgentKeypair,
+    signer: &AgentKeypair,
+    revision: u64,
+    withdrawn: bool,
+) -> Value {
+    let now = 10_000 + revision;
+    let owner_hex = agent_hex(owner);
+    let policy = x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy();
+    let mut card = GroupCard {
+        group_id: group_id.to_string(),
+        name: format!("Stub {group_id}"),
+        description: "test stub".to_string(),
+        avatar_url: None,
+        banner_url: None,
+        tags: vec!["withdraw-test".to_string()],
+        policy_summary: (&policy).into(),
+        owner_agent_id: owner_hex,
+        admin_count: 1,
+        member_count: 1,
+        created_at: now,
+        updated_at: now,
+        request_access_enabled: true,
+        metadata_topic: Some(format!(
+            "x0x.group.{}.meta",
+            &group_id[..16.min(group_id.len())]
+        )),
+        revision,
+        state_hash: format!("stub-state-{revision}"),
+        prev_state_hash: (revision > 1).then(|| format!("stub-state-{}", revision - 1)),
+        issued_at: now,
+        expires_at: now + 60_000,
+        authority_agent_id: String::new(),
+        authority_public_key: String::new(),
+        withdrawn,
+        signature: String::new(),
+    };
+    card.sign(signer).expect("sign test card");
+    serde_json::to_value(card).expect("test card json")
 }
 
 async fn wait_until<F, Fut>(timeout: Duration, mut check: F) -> bool
@@ -376,16 +437,92 @@ async fn named_group_generate_invite() {
 // ===========================================================================
 
 /// Since both alice and bob share a single daemon in this test suite,
-/// we test the join flow by: (a) creating a group, (b) generating an invite,
-/// (c) leaving the group, and (d) joining back via the invite link.
+/// we test the join flow by: (a) creating a group, (b) proving sole-admin
+/// self-leave is rejected, (c) installing a backup admin, (d) generating an
+/// invite, (e) leaving as a non-sole-admin, and (f) joining back via the invite.
 /// This exercises the full invite/join codepath on a single daemon.
 #[tokio::test]
 #[ignore]
 async fn named_group_join_via_invite() {
     let d = daemon().await;
-    let (group_id, _) = create_group(&d, "Join Test Group", "", Some("Alice")).await;
+    // This single-daemon rejoin path needs a local roster backup admin. Use a
+    // public_open (GSS) group because direct add-by-agent_id is valid there;
+    // private_secure TreeKEM groups require the target's KeyPackage instead.
+    let create_r: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Join Test Group",
+            "description": "",
+            "display_name": "Alice",
+            "preset": "public_open"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group_id = create_r["group_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !group_id.is_empty(),
+        "create public_open group: {create_r:?}"
+    );
 
-    // Generate invite
+    // DELETE is pure self-leave; while Alice is the only admin it must be
+    // rejected rather than implicitly ending the group.
+    let sole_admin_leave = authed_client(&d)
+        .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sole_admin_leave.status(), StatusCode::CONFLICT);
+    let sole_admin_leave_r: Value = sole_admin_leave.json().await.unwrap();
+    assert_eq!(
+        sole_admin_leave_r["ok"], false,
+        "sole-admin leave response: {sole_admin_leave_r:?}"
+    );
+    assert_eq!(
+        sole_admin_leave_r["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin before leaving"),
+        "sole-admin leave response: {sole_admin_leave_r:?}"
+    );
+
+    let backup_admin = fake_agent_id(0x44);
+    let add_admin_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/members")))
+        .json(&serde_json::json!({
+            "agent_id": backup_admin,
+            "display_name": "Backup Admin"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        add_admin_r["ok"], true,
+        "add admin response: {add_admin_r:?}"
+    );
+
+    let promote_admin: Value = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{backup_admin}/role")))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        promote_admin["ok"], true,
+        "promote admin response: {promote_admin:?}"
+    );
+
+    // Generate invite before the successful non-sole-admin self-leave.
     let invite_resp: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/invite")))
         .json(&serde_json::json!({"expiry_secs": 3600}))
@@ -395,15 +532,21 @@ async fn named_group_join_via_invite() {
         .json()
         .await
         .unwrap();
+    assert_eq!(
+        invite_resp["ok"], true,
+        "create invite response: {invite_resp:?}"
+    );
     let invite_link = invite_resp["invite_link"].as_str().unwrap().to_string();
 
-    // Leave the group first so we can rejoin
-    let leave_r = authed_client(&d)
+    // Alice can leave once another active admin remains in the roster.
+    let leave_resp = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
         .unwrap();
-    assert_eq!(leave_r.status(), StatusCode::OK);
+    assert_eq!(leave_resp.status(), StatusCode::OK);
+    let leave_r: Value = leave_resp.json().await.unwrap();
+    assert_eq!(leave_r["ok"], true, "leave response: {leave_r:?}");
 
     // Join via invite
     let join_r: Value = authed_client(&d)
@@ -501,30 +644,55 @@ async fn named_group_leave() {
     let d = daemon().await;
     let (group_id, _) = create_group(&d, "Leave Group", "", None).await;
 
-    // Leave
-    let r: Value = authed_client(&d)
+    // DELETE is pure self-leave. A sole-admin self-leave is rejected rather
+    // than implicitly ending the group.
+    let leave_resp = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave_resp.status(), StatusCode::CONFLICT);
+    let r: Value = leave_resp.json().await.unwrap();
+
+    assert_eq!(r["ok"], false, "sole-admin leave response: {r:?}");
+    assert_eq!(
+        r["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin before leaving"),
+        "sole-admin leave response: {r:?}"
+    );
+
+    // Verify the live group remains accessible after the rejected self-leave.
+    let info_r = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info_r.status(), StatusCode::OK);
+    let info: Value = info_r.json().await.unwrap();
+    assert_eq!(info["ok"], true, "group after rejected leave: {info:?}");
+    assert_eq!(info["name"], "Leave Group");
+
+    // Ending the group is explicit delete/withdraw and retains a withdrawn tombstone.
+    let delete_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/state/withdraw")))
+        .json(&serde_json::json!({}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
+    assert_eq!(delete_r["ok"], true, "delete response: {delete_r:?}");
 
-    assert_eq!(r["ok"], true, "leave response: {r:?}");
-    assert_eq!(r["left"], "Leave Group");
-
-    // Verify group is gone
-    let info_r = authed_client(&d)
-        .get(d.url(&format!("/groups/{group_id}")))
+    let state_r: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    assert_eq!(
-        info_r.status(),
-        StatusCode::NOT_FOUND,
-        "group should not exist after leaving"
-    );
+    assert_eq!(state_r["withdrawn"], true, "withdrawn state: {state_r:?}");
 }
 
 // ===========================================================================
@@ -563,7 +731,59 @@ async fn named_group_rejoin_after_leave() {
         "create public_open group: {create_r:?}"
     );
 
-    // Generate invite before leaving
+    // DELETE is pure self-leave. A sole-admin self-leave is rejected before the
+    // roster changes, so make that behavior explicit before setting up the
+    // non-sole-admin leave path exercised by the rejoin flow.
+    let sole_admin_leave = authed_client(&d)
+        .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sole_admin_leave.status(), StatusCode::CONFLICT);
+    let sole_admin_leave_r: Value = sole_admin_leave.json().await.unwrap();
+    assert_eq!(
+        sole_admin_leave_r["ok"], false,
+        "sole-admin leave response: {sole_admin_leave_r:?}"
+    );
+    assert_eq!(
+        sole_admin_leave_r["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin before leaving"),
+        "sole-admin leave response: {sole_admin_leave_r:?}"
+    );
+
+    let backup_admin = fake_agent_id(0x43);
+    let add_admin_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/members")))
+        .json(&serde_json::json!({
+            "agent_id": backup_admin,
+            "display_name": "Backup Admin"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        add_admin_r["ok"], true,
+        "add admin response: {add_admin_r:?}"
+    );
+
+    let promote_admin: Value = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{backup_admin}/role")))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        promote_admin["ok"], true,
+        "promote admin response: {promote_admin:?}"
+    );
+
+    // Generate invite before the successful non-sole-admin leave.
     let invite_resp: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/invite")))
         .json(&serde_json::json!({"expiry_secs": 3600}))
@@ -575,7 +795,7 @@ async fn named_group_rejoin_after_leave() {
         .unwrap();
     let invite_link = invite_resp["invite_link"].as_str().unwrap().to_string();
 
-    // Leave
+    // Leave now succeeds because another active admin remains in the roster.
     let leave_r: Value = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
@@ -922,7 +1142,7 @@ async fn named_group_create_minimal() {
 }
 
 // ===========================================================================
-// 17. Full lifecycle: create -> invite -> leave -> join -> display-name -> leave
+// 17. Full lifecycle: create -> invite/list -> display-name -> leave rejection -> delete
 // ===========================================================================
 
 #[tokio::test]
@@ -959,6 +1179,7 @@ async fn named_group_full_lifecycle() {
         .unwrap();
     assert_eq!(invite_r["ok"], true);
     let invite_link = invite_r["invite_link"].as_str().unwrap().to_string();
+    assert!(!invite_link.is_empty(), "invite link should be returned");
 
     // Step 4: Appears in list
     let list_r: Value = authed_client(&d)
@@ -973,33 +1194,7 @@ async fn named_group_full_lifecycle() {
     let found = groups.iter().any(|g| g["group_id"] == group_id);
     assert!(found, "group should appear in list");
 
-    // Step 5: Leave
-    let leave_r: Value = authed_client(&d)
-        .delete(d.url(&format!("/groups/{group_id}")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(leave_r["ok"], true);
-
-    // Step 6: Rejoin via invite
-    let join_r: Value = authed_client(&d)
-        .post(d.url("/groups/join"))
-        .json(&serde_json::json!({
-            "invite": invite_link,
-            "display_name": "Rejoined"
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(join_r["ok"], true);
-
-    // Step 7: Update display name
+    // Step 5: Update display name
     let dn_r: Value = authed_client(&d)
         .put(d.url(&format!("/groups/{group_id}/display-name")))
         .json(&serde_json::json!({"name": "Final Name"}))
@@ -1011,8 +1206,8 @@ async fn named_group_full_lifecycle() {
         .unwrap();
     assert_eq!(dn_r["ok"], true);
 
-    // Step 8: Verify final state
-    let final_info: Value = authed_client(&d)
+    // Step 6: Verify display name via group info
+    let updated_info: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -1020,29 +1215,64 @@ async fn named_group_full_lifecycle() {
         .json()
         .await
         .unwrap();
-    assert_eq!(final_info["ok"], true);
-    let members = final_info["members"].as_array().unwrap();
+    assert_eq!(updated_info["ok"], true);
+    let members = updated_info["members"].as_array().unwrap();
     let has_final = members.iter().any(|m| m["display_name"] == "Final Name");
     assert!(has_final, "'Final Name' not in members: {members:?}");
 
-    // Step 9: Final leave (cleanup)
-    let final_leave: Value = authed_client(&d)
+    // Step 7: DELETE is now pure self-leave; sole-admin leave is rejected.
+    let leave_resp = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave_resp.status(), StatusCode::CONFLICT);
+    let leave_r: Value = leave_resp.json().await.unwrap();
+    assert_eq!(
+        leave_r["ok"], false,
+        "sole-admin leave response: {leave_r:?}"
+    );
+    assert_eq!(
+        leave_r["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin before leaving"),
+        "sole-admin leave response: {leave_r:?}"
+    );
+
+    // Step 8: Explicit delete/withdraw succeeds and retains a terminality marker.
+    let delete_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/state/withdraw")))
+        .json(&serde_json::json!({}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(final_leave["ok"], true);
+    assert_eq!(delete_r["ok"], true, "delete response: {delete_r:?}");
 
-    // Step 10: Confirm gone
-    let gone = authed_client(&d)
+    let marker_resp = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
         .unwrap();
-    assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    assert_eq!(marker_resp.status(), StatusCode::OK);
+    let marker_info: Value = marker_resp.json().await.unwrap();
+    assert_eq!(
+        marker_info["ok"], true,
+        "withdrawn tombstone: {marker_info:?}"
+    );
+    assert_eq!(marker_info["group_id"], group_id);
+
+    let state_r: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state_r["ok"], true, "withdrawn state: {state_r:?}");
+    assert_eq!(state_r["withdrawn"], true, "withdrawn state: {state_r:?}");
 }
 
 // ===========================================================================
@@ -1287,13 +1517,187 @@ async fn named_group_import_rejects_tampered_metadata_topic() {
     let _ = alice.delete(&format!("/groups/{group_id}")).await;
 }
 
+#[tokio::test]
+#[ignore]
+async fn withdrawn_card_from_non_admin_does_not_terminate_live_keyed_group() {
+    let d = daemon().await;
+    let create: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Non-admin withdrawn card guard",
+            "description": "live keyed group must survive",
+            "preset": "public_request_secure"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(create["ok"], true, "create response: {create:?}");
+    let group_id = create["group_id"].as_str().unwrap().to_string();
+    let card: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/cards/{group_id}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let outsider = AgentKeypair::generate().unwrap();
+    let withdrawn = withdrawn_card_from(card, &outsider);
+
+    let import = authed_client(&d)
+        .post(d.url("/groups/cards/import"))
+        .json(&withdrawn)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(import.status(), StatusCode::OK);
+
+    let state: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["withdrawn"], false, "state after import: {state:?}");
+
+    let named_groups: Value = serde_json::from_str(
+        &tokio::fs::read_to_string(d.data_dir().join("named_groups.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        named_groups[group_id.as_str()]["shared_secret"].is_array(),
+        "non-admin withdrawn card must not wipe GSS secret: {named_groups:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn withdrawn_card_from_roster_admin_does_not_terminate_live_keyed_group() {
+    let d = daemon().await;
+    let admin = AgentKeypair::generate().unwrap();
+    let admin_hex = agent_hex(&admin);
+    let create: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Admin withdrawn card guard",
+            "description": "live keyed group must require signed terminal commit",
+            "preset": "public_request_secure"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(create["ok"], true, "create response: {create:?}");
+    let group_id = create["group_id"].as_str().unwrap().to_string();
+
+    let add: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/members")))
+        .json(&serde_json::json!({ "agent_id": admin_hex, "display_name": "Card Admin" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(add["ok"], true, "add response: {add:?}");
+    let promote = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{admin_hex}/role")))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(promote.status(), StatusCode::OK);
+
+    let card: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/cards/{group_id}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let withdrawn = withdrawn_card_from(card, &admin);
+    let import = authed_client(&d)
+        .post(d.url("/groups/cards/import"))
+        .json(&withdrawn)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(import.status(), StatusCode::OK);
+
+    let state: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["withdrawn"], false, "state after import: {state:?}");
+    let named_groups: Value = serde_json::from_str(
+        &tokio::fs::read_to_string(d.data_dir().join("named_groups.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        named_groups[group_id.as_str()]["shared_secret"].is_array(),
+        "admin-signed withdrawn card alone must not wipe live GSS secret; signed terminal GroupStateCommit is required: {named_groups:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn withdrawn_card_supersedes_keyless_discovery_stub() {
+    let d = daemon().await;
+    let owner = AgentKeypair::generate().unwrap();
+    let outsider = AgentKeypair::generate().unwrap();
+    let group_id = "cafe".repeat(16);
+    let live_card = signed_test_card(&group_id, &owner, &owner, 1, false);
+    let import_live = authed_client(&d)
+        .post(d.url("/groups/cards/import"))
+        .json(&live_card)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(import_live.status(), StatusCode::OK);
+
+    let withdrawn_card = signed_test_card(&group_id, &owner, &outsider, 2, true);
+    let import_withdrawn = authed_client(&d)
+        .post(d.url("/groups/cards/import"))
+        .json(&withdrawn_card)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(import_withdrawn.status(), StatusCode::OK);
+
+    let state: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["withdrawn"], true, "stub state: {state:?}");
+}
+
 // ===========================================================================
-// 21. Creator delete propagates to peers
+// 21. Admin delete propagates to peers after creator DELETE stays self-leave
 // ===========================================================================
 
 #[tokio::test]
 #[ignore]
-async fn named_group_creator_delete_propagates_to_peer() {
+async fn named_group_admin_delete_propagates_to_peer_after_creator_delete_409() {
     let pair = pair().await;
     let alice = &pair.alice;
     let bob = &pair.bob;
@@ -1321,7 +1725,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
         alice_state["security_binding"]
             .as_str()
             .is_some_and(|binding| binding.starts_with("treekem:")),
-        "creator-delete regression must exercise a private_secure TreeKEM group: {alice_state:?}"
+        "delete propagation regression must exercise a private_secure TreeKEM group: {alice_state:?}"
     );
 
     let invite: Value = alice
@@ -1364,7 +1768,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
     .await;
     assert!(
         alice_sees_bob,
-        "alice never observed bob's invite join before delete"
+        "alice never observed bob's invite join before delete checks"
     );
     let alice_hash = group_state_hash(alice, &group_id)
         .await
@@ -1375,24 +1779,201 @@ async fn named_group_creator_delete_propagates_to_peer() {
     .await;
     assert!(
         bob_caught_up,
-        "bob never applied alice's authoritative member add before delete"
+        "bob never applied alice's authoritative member add before delete checks"
     );
 
-    let delete_resp: Value = alice
-        .delete(&format!("/groups/{group_id}"))
+    let delete_resp = alice.delete(&format!("/groups/{group_id}")).await;
+    assert_eq!(delete_resp.status(), StatusCode::CONFLICT);
+    let delete_body: Value = delete_resp.json().await.unwrap();
+    assert_eq!(
+        delete_body["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin before leaving"),
+        "creator DELETE must remain pure self-leave: {delete_body:?}"
+    );
+    assert!(
+        group_state(alice, &group_id).await.is_some(),
+        "rejected creator DELETE must not remove alice's local group"
+    );
+    assert!(
+        group_state(bob, &bob_group_id).await.is_some(),
+        "rejected creator DELETE must not delete bob's group"
+    );
+
+    let promote: Value = alice
+        .patch(
+            &format!("/groups/{group_id}/members/{bob_agent_id}/role"),
+            serde_json::json!({ "role": "admin" }),
+        )
         .await
         .json()
         .await
         .unwrap();
-    assert_eq!(delete_resp["ok"], true, "delete response: {delete_resp:?}");
+    assert_eq!(promote["ok"], true, "promote response: {promote:?}");
 
-    let deleted_seen = wait_until(Duration::from_secs(30), || async {
-        let resp = bob.get(&format!("/groups/{bob_group_id}")).await;
-        resp.status() == StatusCode::NOT_FOUND
+    let promoted_hash = group_state_hash(alice, &group_id)
+        .await
+        .expect("alice state hash after bob promotion");
+    let bob_promoted = wait_until(Duration::from_secs(30), || async {
+        let caught_up =
+            group_state_hash(bob, &bob_group_id).await.as_deref() == Some(promoted_hash.as_str());
+        let members: Value = bob
+            .get(&format!("/groups/{bob_group_id}/members"))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        let has_admin_role = members["members"]
+            .as_array()
+            .map(|members| {
+                members
+                    .iter()
+                    .any(|m| m["agent_id"] == bob_agent_id && m["role"] == "admin")
+            })
+            .unwrap_or(false);
+        caught_up && has_admin_role
+    })
+    .await;
+    assert!(bob_promoted, "bob never observed his admin promotion");
+
+    let delete: Value = bob
+        .post(
+            &format!("/groups/{bob_group_id}/state/withdraw"),
+            serde_json::json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(delete["ok"], true, "delete response: {delete:?}");
+
+    let bob_withdrawn = group_state(bob, &bob_group_id)
+        .await
+        .expect("deleting admin should retain terminal state");
+    assert_eq!(
+        bob_withdrawn["withdrawn"], true,
+        "bob state: {bob_withdrawn:?}"
+    );
+    let bob_encrypt = bob
+        .post(
+            &format!("/groups/{bob_group_id}/secure/encrypt"),
+            serde_json::json!({ "payload_b64": "aGk=" }),
+        )
+        .await;
+    assert_eq!(
+        bob_encrypt.status(),
+        StatusCode::CONFLICT,
+        "deleter authoring must be rejected after withdrawal"
+    );
+    assert!(
+        !tokio::fs::try_exists(
+            bob.data_dir()
+                .join("treekem")
+                .join(format!("{bob_group_id}.snap"))
+        )
+        .await
+        .unwrap_or(false),
+        "deleting admin TreeKEM snapshot should be wiped"
+    );
+
+    let withdrawn_seen = wait_until(Duration::from_secs(30), || async {
+        group_state(alice, &group_id)
+            .await
+            .is_some_and(|state| state["withdrawn"] == true)
     })
     .await;
     assert!(
-        deleted_seen,
-        "bob never observed creator deletion of the space"
+        withdrawn_seen,
+        "alice never observed non-creator admin delete as retained withdrawn tombstone"
     );
+    let alice_encrypt = alice
+        .post(
+            &format!("/groups/{group_id}/secure/encrypt"),
+            serde_json::json!({ "payload_b64": "aGk=" }),
+        )
+        .await;
+    assert_eq!(
+        alice_encrypt.status(),
+        StatusCode::CONFLICT,
+        "recipient authoring must be rejected after withdrawal"
+    );
+    assert!(
+        !tokio::fs::try_exists(
+            alice
+                .data_dir()
+                .join("treekem")
+                .join(format!("{group_id}.snap"))
+        )
+        .await
+        .unwrap_or(false),
+        "recipient TreeKEM snapshot should be wiped after GroupDeleted"
+    );
+}
+
+// ===========================================================================
+// ADR-0016 R2 — last-admin invariant REST pre-check (exact §3 contract)
+// ===========================================================================
+
+/// Why: ADR-0016 fixes this REST contract verbatim — demoting the sole
+/// admin-or-higher member (here: the creator/admin demoting itself) must
+/// return 409 with exactly the §3 error string, and the roster must be
+/// left untouched.
+#[tokio::test]
+#[ignore]
+async fn last_admin_rest_self_demote_returns_409_exact_string() {
+    let d = daemon().await;
+    let (group_id, _) = create_group(&d, "last-admin-409", "sole admin demote", None).await;
+    assert!(!group_id.is_empty());
+
+    let agent: Value = authed_client(&d)
+        .get(d.url("/agent"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let self_hex = agent["agent_id"].as_str().expect("agent_id").to_string();
+
+    let resp = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{self_hex}/role")))
+        .json(&serde_json::json!({ "role": "member" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin first")
+    );
+
+    // The roster must be unchanged: the creator still holds admin rank.
+    let members: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/members")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let still_admin = members["members"]
+        .as_array()
+        .map(|ms| {
+            ms.iter()
+                .any(|m| m["agent_id"] == self_hex.as_str() && m["role"] == "admin")
+        })
+        .unwrap_or(false);
+    assert!(
+        still_admin,
+        "roster mutated by a rejected demote: {members}"
+    );
+
+    // Re-asserting admin keeps the admin count at 1 and passes.
+    let resp = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{self_hex}/role")))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

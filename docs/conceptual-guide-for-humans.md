@@ -229,7 +229,7 @@ Public groups are found through gossip-based discovery: you subscribe to a tag �
 
 Every group has a stable identifier that doesn't change as members come and go, paired with an evolving state recorded as a signed, tamper-evident chain. Every authoritative change — adding a member, banning someone, updating policy — produces a new signed commit linked to the previous one. Peers verify the signature and the chain before accepting changes. Higher-revision commits supersede lower ones immediately on receipt.
 
-The result is a verifiable group history: who was a member when, who was banned, what the policy was at each point. Nothing tampers with that record without showing. Owners can also issue a terminal *withdrawal* — a final commit that takes a public group's card out of circulation across the reachable network, regardless of any cached copies' TTL.
+The result is a verifiable group history: who was a member when, who was banned, what the policy was at each point. Nothing tampers with that record without showing. Admin is root for the group, so keep the admin set small: any Admin can admit, remove, rekey, change policy, assign roles, or delete the group for everyone with a terminal *withdrawal* commit that takes a public group's card out of circulation across the reachable network, regardless of any cached copies' TTL.
 
 **Public messaging with access control.**
 

@@ -154,10 +154,10 @@ Disabled unless an exec ACL is loaded with `[exec].enabled = true`. See
 | GET | `/groups` | `x0x group list` | List groups |
 | GET | `/groups/:id` | `x0x group info` | Group info |
 | PATCH | `/groups/:id` | `x0x group update` | Update name/description (admin+) |
-| DELETE | `/groups/:id` | `x0x group leave` | Leave or delete group |
+| DELETE | `/groups/:id` | `x0x group leave` | Leave group; last admin is blocked |
 | GET | `/groups/:id/members` | `x0x group members` | List members |
-| POST | `/groups/:id/members` | `x0x group add-member` | Add member (creator-authored) |
-| DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member` | Remove member (creator-authored) |
+| POST | `/groups/:id/members` | `x0x group add-member` | Add member (admin-authored) |
+| DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member` | Remove member (admin-authored) |
 | POST | `/groups/:id/invite` | `x0x group invite` | Generate invite link |
 | POST | `/groups/join` | `x0x group join` | Join from invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name` | Set display name |
@@ -173,7 +173,7 @@ Disabled unless an exec ACL is loaded with `[exec].enabled = true`. See
 
 | Method | Path | CLI | Description |
 |---|---|---|---|
-| PATCH | `/groups/:id/policy` | `x0x group policy` | Update group policy (owner only) |
+| PATCH | `/groups/:id/policy` | `x0x group policy` | Update group policy (admin+) |
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role` | Change a member's role (admin+) |
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban` | Ban a member (admin+) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban` | Unban a member (admin+) |
@@ -183,13 +183,19 @@ Disabled unless an exec ACL is loaded with `[exec].enabled = true`. See
 | POST | `/groups/:id/requests/:request_id/reject` | `x0x group reject-request` | Reject join request (admin+) |
 | DELETE | `/groups/:id/requests/:request_id` | `x0x group cancel-request` | Cancel own pending request |
 
+Role assignment accepts only `admin` and `member`. Admin is root for the group:
+a hostile or compromised Admin can admit, remove, rekey, change policy, assign
+roles, and delete the group. Keep the admin set small; do not map softer
+application roles onto x0x Admin. Legacy `owner` entries render/read as
+admin-equivalent for old groups but are not assignable.
+
 ## Named groups — state-commit chain (Phase D.3)
 
 | Method | Path | CLI | Description |
 |---|---|---|---|
 | GET | `/groups/:id/state` | `x0x group state` | Inspect signed state-commit chain |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal` | Advance commit chain + republish signed card |
-| POST | `/groups/:id/state/withdraw` | `x0x group state-withdraw` | Seal a terminal withdrawal |
+| POST | `/groups/:id/state/withdraw` | `x0x group delete` | Delete group with a terminal withdrawal commit (admin+) |
 
 ## Named groups — discovery (Phase C.2)
 

@@ -19,7 +19,7 @@ use std::time::Duration;
 #[path = "harness/src/cluster.rs"]
 mod cluster;
 
-use cluster::{pair, AgentInstance};
+use cluster::{pair, trio_with_extra_config, AgentInstance};
 
 fn authed_client(d: &AgentInstance) -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -52,13 +52,13 @@ where
     }
 }
 
-async fn create_public_open_group(d: &AgentInstance, name: &str) -> String {
+async fn create_group_with_preset(d: &AgentInstance, name: &str, preset: &str) -> String {
     let resp: Value = authed_client(d)
         .post(d.url("/groups"))
         .json(&serde_json::json!({
             "name": name,
             "description": "join-metadata-event test",
-            "preset": "public_open",
+            "preset": preset,
         }))
         .send()
         .await
@@ -68,6 +68,10 @@ async fn create_public_open_group(d: &AgentInstance, name: &str) -> String {
         .expect("create group json");
     assert_eq!(resp["ok"], true, "create group response: {resp:?}");
     resp["group_id"].as_str().expect("group_id").to_string()
+}
+
+async fn create_public_open_group(d: &AgentInstance, name: &str) -> String {
+    create_group_with_preset(d, name, "public_open").await
 }
 
 async fn create_invite(d: &AgentInstance, group_id: &str) -> String {
@@ -181,6 +185,56 @@ async fn group_details(d: &AgentInstance, group_id: &str) -> Value {
         .json()
         .await
         .expect("group details json")
+}
+
+async fn group_state_field(d: &AgentInstance, group_id: &str, field: &str) -> Option<String> {
+    let resp = authed_client(d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: Value = resp.json().await.ok()?;
+    body[field].as_str().map(ToString::to_string)
+}
+
+async fn set_member_role(d: &AgentInstance, group_id: &str, agent_id: &str, role: &str) -> Value {
+    let resp = authed_client(d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{agent_id}/role")))
+        .json(&serde_json::json!({ "role": role }))
+        .send()
+        .await
+        .expect("set-role request");
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("set-role json");
+    assert_eq!(status, StatusCode::OK, "set-role response: {body:?}");
+    assert_eq!(body["ok"], true, "set-role body: {body:?}");
+    body
+}
+
+fn member_row(details: &Value, agent_id: &str) -> Option<Value> {
+    details["members"]
+        .as_array()?
+        .iter()
+        .find(|m| m["agent_id"].as_str() == Some(agent_id))
+        .cloned()
+}
+
+fn member_has_role(details: &Value, agent_id: &str, role: &str) -> bool {
+    member_row(details, agent_id)
+        .and_then(|m| m["role"].as_str().map(ToString::to_string))
+        .as_deref()
+        == Some(role)
+}
+
+fn member_is_active_added_by(details: &Value, agent_id: &str, added_by: &str) -> bool {
+    member_row(details, agent_id).is_some_and(|m| {
+        m["role"].as_str() == Some("member")
+            && m["state"].as_str() == Some("active")
+            && m["added_by"].as_str() == Some(added_by)
+    })
 }
 
 async fn publish_raw(d: &AgentInstance, topic: &str, payload: &[u8]) -> Value {
@@ -693,4 +747,196 @@ async fn issued_invite_secret_is_recorded_on_inviter() {
         .delete(alice.url(&format!("/groups/{group_id}")))
         .send()
         .await;
+}
+
+async fn non_creator_admin_invite_e2e_converges_for_preset(
+    preset: &str,
+    group_name: &str,
+    expect_treekem: bool,
+) {
+    let cluster = trio_with_extra_config("").await;
+    let creator = &cluster.alice;
+    let admin = &cluster.bob;
+    let joiner = &cluster.charlie;
+    let join_timeout = if expect_treekem {
+        Duration::from_secs(90)
+    } else {
+        Duration::from_secs(45)
+    };
+    let final_timeout = if expect_treekem {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(60)
+    };
+
+    let creator_id = creator.agent_id().await;
+    let admin_id = admin.agent_id().await;
+    let joiner_id = joiner.agent_id().await;
+    assert_ne!(creator_id, admin_id, "fixture needs non-creator admin");
+
+    let group_id = create_group_with_preset(creator, group_name, preset).await;
+    if expect_treekem {
+        let binding = group_state_field(creator, &group_id, "security_binding")
+            .await
+            .expect("creator TreeKEM security binding after create");
+        assert!(
+            binding.starts_with("treekem:epoch="),
+            "private_secure variant must exercise TreeKEM, got {binding:?}"
+        );
+    }
+    let admin_bootstrap_invite = create_invite(creator, &group_id).await;
+    let admin_join = join_via_invite(admin, &admin_bootstrap_invite, "admin-before-role").await;
+    assert_eq!(admin_join["ok"], true, "admin join: {admin_join:?}");
+    let admin_group_id = admin_join["group_id"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
+
+    let creator_sees_admin = wait_until(join_timeout, || async {
+        list_members(creator, &group_id).await.contains(&admin_id)
+    })
+    .await;
+    assert!(
+        creator_sees_admin,
+        "creator never observed admin's initial join"
+    );
+    let creator_hash_after_admin_join = group_state_field(creator, &group_id, "state_hash")
+        .await
+        .expect("creator state_hash after admin join");
+    let admin_caught_up = wait_until(join_timeout, || async {
+        group_state_field(admin, &admin_group_id, "state_hash")
+            .await
+            .as_deref()
+            == Some(creator_hash_after_admin_join.as_str())
+    })
+    .await;
+    assert!(admin_caught_up, "admin never caught up after initial join");
+
+    let _ = set_member_role(creator, &group_id, &admin_id, "admin").await;
+    let role_converged = wait_until(join_timeout, || async {
+        let creator_details = group_details(creator, &group_id).await;
+        let admin_details = group_details(admin, &admin_group_id).await;
+        let creator_hash = group_state_field(creator, &group_id, "state_hash").await;
+        let admin_hash = group_state_field(admin, &admin_group_id, "state_hash").await;
+        member_has_role(&creator_details, &admin_id, "admin")
+            && member_has_role(&admin_details, &admin_id, "admin")
+            && creator_hash.is_some()
+            && creator_hash == admin_hash
+    })
+    .await;
+    assert!(role_converged, "promoted admin role did not converge");
+
+    let admin_invite = create_invite(admin, &admin_group_id).await;
+    let parsed_invite = x0x::groups::invite::SignedInvite::from_link(&admin_invite)
+        .expect("admin-issued invite parses");
+    assert_eq!(
+        parsed_invite.inviter, admin_id,
+        "invite routing target must be the issuing admin"
+    );
+    assert_eq!(
+        parsed_invite
+            .creator_agent_id_from_base_state()
+            .expect("creator provenance derives from base state"),
+        creator_id,
+        "creator provenance must stay historical, not authority-bearing inviter metadata"
+    );
+
+    let join_resp = join_via_invite(joiner, &admin_invite, "joiner-via-admin").await;
+    assert_eq!(join_resp["ok"], true, "joiner response: {join_resp:?}");
+    let joiner_group_id = join_resp["group_id"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
+
+    let converged = wait_until(final_timeout, || async {
+        let creator_details = group_details(creator, &group_id).await;
+        let admin_details = group_details(admin, &admin_group_id).await;
+        let joiner_details = group_details(joiner, &joiner_group_id).await;
+        let creator_hash = group_state_field(creator, &group_id, "state_hash").await;
+        let admin_hash = group_state_field(admin, &admin_group_id, "state_hash").await;
+        let joiner_hash = group_state_field(joiner, &joiner_group_id, "state_hash").await;
+        let creator_roster = group_state_field(creator, &group_id, "roster_root").await;
+        let admin_roster = group_state_field(admin, &admin_group_id, "roster_root").await;
+        let joiner_roster = group_state_field(joiner, &joiner_group_id, "roster_root").await;
+        let security_bindings_ok = if expect_treekem {
+            let creator_binding = group_state_field(creator, &group_id, "security_binding").await;
+            let admin_binding = group_state_field(admin, &admin_group_id, "security_binding").await;
+            let joiner_binding =
+                group_state_field(joiner, &joiner_group_id, "security_binding").await;
+            creator_binding
+                .as_deref()
+                .is_some_and(|binding| binding.starts_with("treekem:epoch="))
+                && creator_binding == admin_binding
+                && admin_binding == joiner_binding
+        } else {
+            true
+        };
+
+        [&creator_details, &admin_details, &joiner_details]
+            .iter()
+            .all(|details| {
+                member_has_role(details, &admin_id, "admin")
+                    && member_is_active_added_by(details, &joiner_id, &admin_id)
+            })
+            && creator_hash.is_some()
+            && creator_hash == admin_hash
+            && admin_hash == joiner_hash
+            && creator_roster.is_some()
+            && creator_roster == admin_roster
+            && admin_roster == joiner_roster
+            && security_bindings_ok
+    })
+    .await;
+    assert!(
+        converged,
+        "admin-authored MemberAdded did not converge coherently across creator/admin/joiner"
+    );
+
+    for (label, daemon, local_group_id) in [
+        ("creator", creator, group_id.as_str()),
+        ("admin", admin, admin_group_id.as_str()),
+        ("joiner", joiner, joiner_group_id.as_str()),
+    ] {
+        let details = group_details(daemon, local_group_id).await;
+        assert_eq!(
+            details["creator"].as_str(),
+            Some(creator_id.as_str()),
+            "{label} must retain best-effort historical creator provenance"
+        );
+        assert_ne!(
+            details["creator"].as_str(),
+            Some(admin_id.as_str()),
+            "{label} must not treat the invite issuer as creator provenance"
+        );
+    }
+
+    let _ = authed_client(creator)
+        .delete(creator.url(&format!("/groups/{group_id}")))
+        .send()
+        .await;
+}
+
+/// ADR-0016 Slice 4 daemon proof: a promoted, non-creator Admin issues an
+/// invite through the real REST handler, a separate daemon consumes it through
+/// `POST /groups/join`, and the resulting admin-authored `MemberAdded` commit
+/// converges across creator, admin, and joiner.
+#[tokio::test]
+async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
+    non_creator_admin_invite_e2e_converges_for_preset("public_open", "Admin Invite E2E", false)
+        .await;
+}
+
+/// TreeKEM variant of the Slice 4 daemon proof: for a `private_secure` group,
+/// a non-creator Admin's invite drives the real join path to coherent
+/// TreeKEM-backed convergence. Direct expected-inviter sender validation is
+/// covered by the focused `join_result_requires_stored_expected_inviter` unit
+/// regression; this daemon test proves the secure-plane end-to-end join shape.
+#[tokio::test]
+async fn non_creator_admin_private_secure_invite_e2e_converges_through_real_daemons() {
+    non_creator_admin_invite_e2e_converges_for_preset(
+        "private_secure",
+        "TreeKEM Admin Invite E2E",
+        true,
+    )
+    .await;
 }

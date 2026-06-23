@@ -22,9 +22,16 @@ commit; stale actions and chain breaks are rejected.
 
 Public directory cards carry the same authority signature. Higher
 revisions supersede lower ones immediately on peers — TTL is only cache
-cleanup, not the primary validity mechanism. Owners can seal a terminal
-**withdrawal** commit that instructs peers to evict any prior public
-card regardless of TTL.
+cleanup, not the primary validity mechanism. Any Admin can delete the
+group by sealing a terminal **withdrawal** commit that instructs peers to
+evict any prior public card regardless of TTL.
+
+Admin is root for the group. A hostile or compromised Admin can admit members,
+remove members, rekey secure material, change policy, assign roles, and delete
+the group for everyone. Keep the admin set small, and do not map softer
+application roles onto x0x Admin. Role assignment accepts only `admin` and
+`member`; legacy `owner` entries render/read as admin-equivalent for old groups
+but are not assignable.
 
 ```bash
 # Inspect the signed state chain
@@ -32,11 +39,11 @@ x0x group state <group_id>
 # or
 curl -H "Authorization: Bearer $TOKEN" "http://$API/groups/<group_id>/state"
 
-# Advance the chain + republish the signed card (owner/admin)
+# Advance the chain + republish the signed card (any admin)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://$API/groups/<group_id>/state/seal"
 
-# Terminally withdraw / hide the group (owner)
+# Delete the group for everyone with a terminal withdrawal commit (any admin)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://$API/groups/<group_id>/state/withdraw"
 ```
@@ -105,7 +112,7 @@ daemon restart and resubscribe with 0–30s random jitter to avoid
 anti-entropy storms. Every 60s each subscriber emits a `Digest` on its
 shards; peers compare and issue `Pull` requests for missing/stale
 entries. Receivers verify each card's ML-DSA-65 signature before caching;
-the cache supersedes by revision and evicts on withdrawal regardless of
+the cache supersedes by revision and evicts on delete/withdrawal regardless of
 TTL.
 
 ```bash
@@ -152,7 +159,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://$API/groups/<group_id>/send" \
   -d '{"body":"hello world","kind":"chat"}'
 
-# Publish an announcement (AdminOnly write — owner/admin only).
+# Publish an announcement (AdminOnly write — active admins only; legacy Owner counts).
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   "http://$API/groups/<group_id>/send" \
@@ -169,7 +176,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 |----------------------|------------------------------------------------------|
 | `MembersOnly`        | active members                                       |
 | `ModeratedPublic`    | any non-banned author (moderators clean up later)    |
-| `AdminOnly`          | active `Admin` or `Owner` only                       |
+| `AdminOnly`          | active Admins; legacy `Owner` counts as Admin        |
 
 Banned authors are **always** rejected regardless of write-access mode.
 Every message carries a ML-DSA-65 signature, the signer's public key
@@ -264,9 +271,15 @@ curl -X POST "http://$API/groups/join" \
   -d '{"invite":"<invite_link>","display_name":"Worker"}'
 ```
 
-Important: x0xd does not currently expose a named-group `send` endpoint. If you want group messaging, use the returned `chat_topic` with the normal `/publish` and `/subscribe` APIs, or use direct messaging between members.
+Important: named-group public messaging exists for `SignedPublic` groups via
+`/groups/:id/send` and `/groups/:id/messages`. For custom app messaging or
+encrypted flows, use the returned `chat_topic`, direct messaging, or the secure
+group endpoints.
 
-Important: creator-authored member add/remove and creator delete now propagate across subscribed peers, so removed members drop the space locally. That said, this is still not yet a complete distributed admin/ACL system on its own.
+Important: admin-authored member add/remove and explicit delete now propagate
+across subscribed peers, so removed members drop the space locally and deleted
+groups retain a keyless tombstone/terminality marker. That said, this is still
+not yet a complete distributed app-level ACL system on its own.
 
 ## MLS helpers: encrypt, decrypt, and manage key material
 
@@ -320,10 +333,10 @@ Treat these MLS endpoints as app-building primitives. They are useful when your 
 ## Current limits
 
 - Named groups are not yet a full secure group-chat surface.
-- Named-group member views now converge across subscribed peers for creator-authored membership changes, but they should still not yet be treated as complete distributed access control.
-- There is no built-in named-group send/receive API in x0xd.
+- Named-group member views now converge across subscribed peers for admin-authored membership changes, but they should still not yet be treated as complete distributed application access control.
+- Public-message send/read is available for `SignedPublic` groups; encrypted group-chat UX remains application work.
 - No backlog/history sync for new members.
-- No admin-role model in the current named-group daemon surface.
+- The x0x Admin role is deliberately flat and powerful; application-level moderator/guest semantics must be implemented above it.
 
 ## References
 

@@ -639,7 +639,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Delete,
         path: "/groups/:id",
         cli_name: "group leave",
-        description: "Leave or delete a group",
+        description: "Leave a group",
         category: "named-groups",
     },
     // ── Phase D.3: state-commit chain ────────────────────────────────────
@@ -667,8 +667,8 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     EndpointDef {
         method: Method::Post,
         path: "/groups/:id/state/withdraw",
-        cli_name: "group state-withdraw",
-        description: "Seal a terminal withdrawal commit and supersede public card",
+        cli_name: "group delete",
+        description: "Delete a group with a terminal withdrawal commit",
         category: "named-groups",
     },
     // ── Named groups: policy, roles, join requests, discovery ───────────
@@ -683,7 +683,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Patch,
         path: "/groups/:id/policy",
         cli_name: "group policy",
-        description: "Update group policy (owner only)",
+        description: "Update group policy (admin+)",
         category: "named-groups",
     },
     EndpointDef {

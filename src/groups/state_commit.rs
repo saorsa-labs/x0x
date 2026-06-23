@@ -24,7 +24,7 @@
 //! 2. **Prev-hash chain** — `prev_state_hash` must equal the current
 //!    `state_hash` of the local `GroupInfo`.
 //! 3. **Authority** — the signer's role at the local view must permit the
-//!    action (e.g. Owner for policy changes, Admin for member management).
+//!    action (e.g. Admin or legacy Owner for privileged group changes).
 //! 4. **Signature** — the event is signed by the advertised signer's
 //!    ML-DSA-65 key, and the `committed_by` field binds the actor.
 //! 5. **Withdrawal terminality** — once a group is marked withdrawn by a
@@ -526,11 +526,11 @@ pub enum ApplyError {
     #[error("invalid signature: {0}")]
     InvalidSignature(String),
 
-    /// A structural invariant was violated (e.g. owner removal, duplicate).
+    /// A structural invariant was violated (e.g. zero active admins, duplicate).
     #[error("invariant violation: {0}")]
     Invariant(String),
 
-    /// The group has been withdrawn; no further non-owner actions apply.
+    /// The group has been withdrawn; no further live-state actions apply.
     #[error("group is withdrawn")]
     Withdrawn,
 
@@ -555,10 +555,8 @@ pub enum ApplyError {
 /// apply-time against the signer's current effective role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
-    /// Owner-only: policy change, role-change-of-admin-or-above, withdrawal.
-    OwnerOnly,
-    /// Admin or higher: add/remove member, approve/reject request, ban, unban,
-    /// role-change-of-member-or-below, metadata edit.
+    /// Admin or higher: privileged group control-plane changes. Legacy Owner
+    /// entries also satisfy this through [`GroupRole::at_least`].
     AdminOrHigher,
     /// Active-member self-action (e.g. leave group).
     MemberSelf,
@@ -571,11 +569,42 @@ impl ActionKind {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::OwnerOnly => "owner-only",
             Self::AdminOrHigher => "admin-or-higher",
             Self::MemberSelf => "member-self",
             Self::NonMemberRequest => "non-member-request",
         }
+    }
+}
+
+/// Enforce the ADR-0016 last-admin invariant over a proposed post-mutation
+/// roster: a live (non-withdrawn) group state must always contain at least
+/// one **active** member of rank ≥ Admin. Legacy `Owner` entries count as
+/// Admin (`Owner` rank 4 > `Admin` rank 3, via [`GroupRole::at_least`]).
+/// Withdrawn (group-ending) state is exempt — it is the last admin's exit
+/// valve.
+///
+/// The commit object carries only `roster_root` (a hash of the post-mutation
+/// roster), so the invariant must be evaluated over the proposed roster
+/// computed by the applier. This one helper is the shared check for every
+/// delivery path: commit authoring (`GroupInfo::seal_commit`) and apply-side
+/// validation (`GroupInfo::finalize_applied_commit`, reached from both the
+/// daemon gossip-apply pipeline and `GroupInfo::apply_commit`).
+pub fn enforce_last_admin_invariant(
+    proposed_members: &BTreeMap<String, GroupMember>,
+    withdrawn: bool,
+) -> Result<(), ApplyError> {
+    if withdrawn {
+        return Ok(());
+    }
+    let has_active_admin = proposed_members
+        .values()
+        .any(|m| m.is_active() && m.role.at_least(GroupRole::Admin));
+    if has_active_admin {
+        Ok(())
+    } else {
+        Err(ApplyError::Invariant(
+            "post-mutation state would leave a live group with zero active admins".to_string(),
+        ))
     }
 }
 
@@ -653,7 +682,6 @@ pub fn validate_apply(
         .map(|m| m.role);
 
     let authorized = match action_kind {
-        ActionKind::OwnerOnly => signer_role == Some(GroupRole::Owner),
         ActionKind::AdminOrHigher => signer_role
             .map(|r| r.at_least(GroupRole::Admin))
             .unwrap_or(false),
@@ -698,6 +726,113 @@ mod tests {
         let mut m = make_member(hex_id, GroupRole::Member);
         m.state = GroupMemberState::Removed;
         m
+    }
+
+    // ── ADR-0016 R2: last-admin invariant (choke-point unit tests) ──────
+
+    /// Why: rejecting a demotion that leaves zero admins is the entire point
+    /// of the invariant — a live group must never become unadministrable.
+    #[test]
+    fn last_admin_demote_sole_admin_rejected() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        // Proposed post-mutation roster: the sole admin demoted to member.
+        admin.role = GroupRole::Member;
+        m.insert("aa".repeat(32), admin);
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: a removal that strips the last admin must be rejected; Removed
+    /// entries are not active and must not count toward the admin set.
+    #[test]
+    fn last_admin_remove_sole_admin_rejected() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        admin.state = GroupMemberState::Removed;
+        m.insert("aa".repeat(32), admin);
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: a banned admin is not an active admin — ban of the last admin
+    /// must be rejected like removal.
+    #[test]
+    fn last_admin_ban_sole_admin_rejected() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        admin.state = GroupMemberState::Banned;
+        m.insert("aa".repeat(32), admin);
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: withdrawal is the last admin's exit valve (ADR-0016) — the
+    /// group-ending commit is exempt even when the roster has no admins.
+    #[test]
+    fn last_admin_withdrawal_exempt() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        admin.state = GroupMemberState::Removed;
+        m.insert("aa".repeat(32), admin);
+        enforce_last_admin_invariant(&m, true).unwrap();
+        // Even an empty roster is fine once the state is withdrawn.
+        enforce_last_admin_invariant(&BTreeMap::new(), true).unwrap();
+    }
+
+    /// Why: a sole legacy Owner normalising itself to Admin keeps the admin
+    /// count at 1 — this ordinary normalization commit must pass.
+    #[test]
+    fn last_admin_owner_self_demote_to_admin_accepted() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "aa".repeat(32),
+            make_member(&"aa".repeat(32), GroupRole::Admin),
+        );
+        enforce_last_admin_invariant(&m, false).unwrap();
+    }
+
+    /// Why: a sole legacy Owner demoted to plain member leaves zero
+    /// admin-or-higher actives — Owner gets no special pass.
+    #[test]
+    fn last_admin_owner_demote_to_member_rejected() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "aa".repeat(32),
+            make_member(&"aa".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: legacy `Owner` (rank 4) must count as Admin (rank 3) via
+    /// `at_least`, so a mixed roster whose only privileged active entry is
+    /// an Owner satisfies the invariant.
+    #[test]
+    fn last_admin_legacy_owner_counts_as_admin() {
+        let mut m = BTreeMap::new();
+        m.insert("aa".repeat(32), make_owner(&"aa".repeat(32)));
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        // A banned Admin alongside must not be needed for the pass.
+        let mut banned_admin = make_member(&"cc".repeat(32), GroupRole::Admin);
+        banned_admin.state = GroupMemberState::Banned;
+        m.insert("cc".repeat(32), banned_admin);
+        enforce_last_admin_invariant(&m, false).unwrap();
     }
 
     #[test]
@@ -1129,7 +1264,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::StaleRevision { got: 1, have: 1 }));
         let _ = owner_hex; // silence unused
     }
@@ -1161,12 +1296,12 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::PrevHashMismatch { .. }));
     }
 
     #[test]
-    fn validate_apply_rejects_unauthorized_owner_action() {
+    fn validate_apply_rejects_unauthorized_admin_action() {
         let kp = AgentKeypair::generate().unwrap();
         let signer_hex = hex::encode(kp.agent_id().as_bytes());
         let owner_hex = "ff".repeat(32);
@@ -1197,7 +1332,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::Unauthorized { .. }));
     }
 
@@ -1263,7 +1398,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::Withdrawn));
     }
 
@@ -1294,7 +1429,7 @@ mod tests {
             members_v2: &members,
             group_id: "g-right",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::GroupIdMismatch { .. }));
     }
 }
