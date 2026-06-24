@@ -7867,36 +7867,48 @@ fn authorized_treekem_membership_event_for_queue(
     match event {
         NamedGroupMetadataEvent::MemberAdded {
             actor,
-            commit: Some(commit),
+            commit: Some(_),
             treekem_commit_b64: Some(_),
             treekem_epoch: Some(_),
             ..
-        } => actor == &commit.committed_by,
+        } => {
+            actor == sender_hex
+                && info
+                    .caller_role(actor)
+                    .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
+        }
         NamedGroupMetadataEvent::MemberRemoved {
             actor,
             agent_id,
-            commit: Some(commit),
+            commit: Some(_),
             treekem_commit_b64,
             treekem_epoch,
             ..
         } => {
-            let admin_remove = actor == &commit.committed_by
+            let admin_remove = actor == sender_hex
+                && info
+                    .caller_role(actor)
+                    .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
                 && treekem_commit_b64.is_some()
                 && treekem_epoch.is_some();
-            let self_leave = actor == &commit.committed_by
-                && agent_id == &commit.committed_by
+            let self_leave = sender_hex == agent_id
+                && actor == sender_hex
                 && treekem_commit_b64.is_none()
                 && treekem_epoch.is_none();
             admin_remove || self_leave
         }
         NamedGroupMetadataEvent::MemberBanned {
             actor,
-            agent_id: _,
-            commit: Some(commit),
+            commit: Some(_),
             treekem_commit_b64: Some(_),
             treekem_epoch: Some(_),
             ..
-        } => actor == &commit.committed_by,
+        } => {
+            actor == sender_hex
+                && info
+                    .caller_role(actor)
+                    .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
+        }
         NamedGroupMetadataEvent::JoinRequestApproved {
             actor,
             requester_agent_id,
@@ -8408,7 +8420,7 @@ async fn apply_named_group_metadata_event_inner(
     // propagation event (and remains old-peer/replay compatible), carrying the
     // signed terminal withdrawal commit. The apply arms below re-check
     // authority from the signed commit (GroupDeleted: AdminOrHigher via
-    // `commit.committed_by`; MemberRemoved: actor/committer consistency plus
+    // `commit.committed_by`; MemberRemoved: actor/sender binding plus
     // AdminOrHigher or MemberSelf signed-commit validation). The authenticated
     // DM `sender_hex` is reliable regardless of the cache, so bypassing
     // `verified` does not weaken membership authorization — only the racy cache
@@ -8565,7 +8577,10 @@ async fn apply_named_group_metadata_event_inner(
             let Some(commit) = commit else {
                 return false;
             };
-            if actor.as_str() != commit.committed_by.as_str() {
+            let actor_role = info.caller_role(&actor);
+            let actor_authorized = actor == sender_hex
+                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+            if !actor_authorized {
                 return false;
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
@@ -8772,12 +8787,13 @@ async fn apply_named_group_metadata_event_inner(
             let Some(commit) = commit else {
                 return false;
             };
-            if actor.as_str() != commit.committed_by.as_str() {
+            let actor_role = info.caller_role(&actor);
+            let admin_remove_auth = actor == sender_hex
+                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+            let self_leave_auth = sender_hex == agent_id && actor == sender_hex;
+            if !admin_remove_auth && !self_leave_auth {
                 return false;
             }
-            let self_leave_auth = agent_id.as_str() == commit.committed_by.as_str()
-                && treekem_commit_b64.is_none()
-                && treekem_epoch.is_none();
             let action_kind = if self_leave_auth {
                 x0x::groups::ActionKind::MemberSelf
             } else {
@@ -9041,7 +9057,10 @@ async fn apply_named_group_metadata_event_inner(
             let Some(commit) = commit else {
                 return false;
             };
-            if actor.as_str() != commit.committed_by.as_str() {
+            let actor_role = info.caller_role(&actor);
+            let actor_authorized = actor == sender_hex
+                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+            if !actor_authorized {
                 return false;
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
@@ -23292,6 +23311,7 @@ mod tests {
         let creator = AgentId([0x11; 32]);
         let creator_hex = hex::encode(creator.as_bytes());
         let member_hex = "22".repeat(32);
+        let admin_hex = "33".repeat(32);
         let mut info = x0x::groups::GroupInfo::with_policy(
             "secure".to_string(),
             String::new(),
@@ -23300,16 +23320,45 @@ mod tests {
             x0x::groups::GroupPolicy::default(),
         );
         info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.add_member(
+            admin_hex.clone(),
+            x0x::groups::GroupRole::Admin,
+            Some(creator_hex.clone()),
+            None,
+        );
         let group_id = info.stable_group_id().to_string();
+
+        let member_added_by_admin = NamedGroupMetadataEvent::MemberAdded {
+            group_id: group_id.clone(),
+            revision: 2,
+            actor: admin_hex.clone(),
+            agent_id: member_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: Some("dw==".to_string()),
+            welcome_ref: None,
+            treekem_epoch: Some(2),
+            commit: Some(fake_group_state_commit(&group_id, 2, &admin_hex)),
+        };
+        assert!(authorized_treekem_membership_event_for_queue(
+            &info,
+            &member_added_by_admin,
+            &admin_hex
+        ));
+        assert!(!authorized_treekem_membership_event_for_queue(
+            &info,
+            &member_added_by_admin,
+            &creator_hex
+        ));
 
         let self_leave = NamedGroupMetadataEvent::MemberRemoved {
             group_id: group_id.clone(),
-            revision: 2,
+            revision: 3,
             actor: member_hex.clone(),
             agent_id: member_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
-            commit: Some(fake_group_state_commit(&group_id, 2, &member_hex)),
+            commit: Some(fake_group_state_commit(&group_id, 3, &member_hex)),
         };
 
         assert!(authorized_treekem_membership_event_for_queue(
@@ -23317,7 +23366,7 @@ mod tests {
             &self_leave,
             &member_hex
         ));
-        assert!(authorized_treekem_membership_event_for_queue(
+        assert!(!authorized_treekem_membership_event_for_queue(
             &info,
             &self_leave,
             &creator_hex
@@ -23325,12 +23374,12 @@ mod tests {
 
         let admin_remove_without_treekem = NamedGroupMetadataEvent::MemberRemoved {
             group_id: group_id.clone(),
-            revision: 3,
+            revision: 4,
             actor: creator_hex.clone(),
             agent_id: member_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
-            commit: Some(fake_group_state_commit(&group_id, 3, &creator_hex)),
+            commit: Some(fake_group_state_commit(&group_id, 4, &creator_hex)),
         };
         assert!(!authorized_treekem_membership_event_for_queue(
             &info,
@@ -23340,16 +23389,42 @@ mod tests {
 
         let admin_remove_with_treekem = NamedGroupMetadataEvent::MemberRemoved {
             group_id: group_id.clone(),
-            revision: 4,
-            actor: creator_hex.clone(),
-            agent_id: member_hex,
+            revision: 5,
+            actor: admin_hex.clone(),
+            agent_id: member_hex.clone(),
             treekem_commit_b64: Some("Yw==".to_string()),
             treekem_epoch: Some(2),
-            commit: Some(fake_group_state_commit(&group_id, 4, &creator_hex)),
+            commit: Some(fake_group_state_commit(&group_id, 5, &admin_hex)),
         };
         assert!(authorized_treekem_membership_event_for_queue(
             &info,
             &admin_remove_with_treekem,
+            &admin_hex
+        ));
+        assert!(!authorized_treekem_membership_event_for_queue(
+            &info,
+            &admin_remove_with_treekem,
+            &creator_hex
+        ));
+
+        let ban_owner_by_admin = NamedGroupMetadataEvent::MemberBanned {
+            group_id: group_id.clone(),
+            revision: 6,
+            actor: admin_hex.clone(),
+            agent_id: creator_hex.clone(),
+            secret_epoch: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_epoch: Some(3),
+            commit: Some(fake_group_state_commit(&group_id, 6, &admin_hex)),
+        };
+        assert!(authorized_treekem_membership_event_for_queue(
+            &info,
+            &ban_owner_by_admin,
+            &admin_hex
+        ));
+        assert!(!authorized_treekem_membership_event_for_queue(
+            &info,
+            &ban_owner_by_admin,
             &creator_hex
         ));
     }

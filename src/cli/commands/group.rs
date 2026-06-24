@@ -9,6 +9,7 @@ use crate::cli::{print_value, DaemonClient};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 
+// Intentionally isolated as the maintainer-facing verb-swap handle.
 pub const DELETE_VERB: &str = "delete";
 
 // ── Core CRUD ───────────────────────────────────────────────────────────

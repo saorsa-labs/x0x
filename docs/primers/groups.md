@@ -55,10 +55,10 @@ now *Accepted*), **private** secure groups (`private_secure` preset — `Hidden`
 `MlsEncrypted`) run **real TreeKEM** (forward secrecy + post-compromise security).
 **Single-member** private groups work end-to-end (invite → join → `Welcome` →
 bidirectional secure → ban/epoch-advance → forward secrecy, verified on testnet).
-0.21.0 also fixed owner-side **multi-member roster convergence** (serialized per
+0.21.0 also fixed authority-side **multi-member roster convergence** (serialized per
 group by `group_membership_lock`).
 
-> **Known limitation (multi-member):** for a 2nd+ member the owner's roster
+> **Known limitation (multi-member):** for a 2nd+ member the authority roster
 > converges, but the joiner's `MemberAdded`+`Welcome` is not yet delivered (the
 > joiner's anchor-poll times out), so it never enters the tree and cannot
 > encrypt. Multi-member *secure participation* is a tracked follow-up; today,

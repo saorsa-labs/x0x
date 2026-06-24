@@ -524,7 +524,7 @@ revisions are silently dropped.
 preset — `Hidden` + `MlsEncrypted`) run **real TreeKEM** (forward secrecy +
 post-compromise security). **Single-member** private groups work end-to-end
 (invite → join → bidirectional secure → ban → forward secrecy). **Multi-member
-limitation:** a 2nd+ member converges into the owner's roster but its
+limitation:** a 2nd+ member converges into the authority roster but its
 `MemberAdded`+`Welcome` is not yet delivered, so it cannot yet encrypt — tracked
 follow-up. Public encrypted presets (`public_request_secure`) and grandfathered
 groups remain on the legacy **GSS** plane. See `docs/primers/groups.md`.
