@@ -211,7 +211,7 @@ x0x currently has the beginnings of a real named-space model, but it is not yet 
 Today we have:
 - human-friendly named groups via `/groups`
 - invite join flow
-- local + creator-authored roster convergence via metadata events
+- local + authority-authored roster convergence via metadata events
 - low-level MLS helpers via `/mls/groups`
 - per-group chat and metadata gossip topics
 
@@ -813,7 +813,7 @@ Notes:
 ### `public_announce`
 - discoverable
 - public read
-- only owner/admin may publish
+- only admins may publish
 - useful for release channels, project updates, public notices
 
 ## Migration plan from current state
@@ -905,7 +905,7 @@ We should not claim this product is done until all of these are proven.
 ### Authorization negative-path proof
 - non-admin cannot change policy
 - non-admin cannot approve requests
-- non-admin cannot remove owner/admin improperly
+- non-admin cannot remove admins improperly
 - banned peer cannot rejoin improperly
 - stale actions referencing old `state_hash` are rejected
 
@@ -914,7 +914,7 @@ We should not claim this product is done until all of these are proven.
 - request status converges across peers
 - policy changes converge across peers
 - card supersession converges across peers
-- deletion / hidden withdrawal converges across peers
+- delete / internal withdrawal terminality converges across peers
 
 ## Review and signoff requirements
 
@@ -1052,7 +1052,7 @@ This is the critical validity rule.
 
 A discoverable card has two signatures in play:
 1. **Outer transport signature** — the gossip message is signed by the node relaying/publishing it on the mesh.
-2. **Inner authority signature** — the `GroupCard` itself is signed by the owner/admin/canonical state authority over canonical card fields.
+2. **Inner authority signature** — the `GroupCard` itself is signed by an admin/canonical state authority over canonical card fields.
 
 Rules:
 - any node may relay or republish the **exact signed card blob**
