@@ -425,10 +425,9 @@ pub struct GroupMember {
 
 ### Rules
 
-- Every group has exactly one `Owner` initially.
-- Owners can appoint admins.
-- Admins can manage requests and membership according to policy.
-- Moderators are mainly useful in public groups.
+- New groups seed the creator as an `Admin`; stored legacy `Owner` entries remain parseable and admin-equivalent for replay/compatibility.
+- Admins can appoint other admins and manage requests/membership according to policy.
+- `Moderator` and `Guest` are reserved legacy labels, not assignable by current ADR-0016 APIs.
 - `Banned` is distinct from `Removed`.
 - Pending access belongs in requests, but pending member-state may still be useful for synchronization.
 
