@@ -257,11 +257,21 @@ fn apply_group_deleted_event(
     if !commit.withdrawn {
         return Err(GroupDeletedEventApplyError::NotWithdrawal);
     }
-    gossip_apply(replica, commit, ActionKind::AdminOrHigher, |next| {
-        next.roster_revision = revision.max(next.roster_revision);
-        next.updated_at = commit.committed_at;
-    })
-    .map_err(GroupDeletedEventApplyError::Commit)
+    let ctx = ApplyContext {
+        current_state_hash: &replica.state_hash,
+        current_revision: replica.state_revision,
+        current_withdrawn: replica.withdrawn,
+        members_v2: &replica.members_v2,
+        group_id: replica.stable_group_id(),
+    };
+    validate_apply(&ctx, commit, ActionKind::AdminOrHigher)
+        .map_err(GroupDeletedEventApplyError::Commit)?;
+    let mut next = replica.clone();
+    next.roster_revision = revision.max(next.roster_revision);
+    next.updated_at = commit.committed_at;
+    next.finalize_applied_terminal_commit(commit)
+        .map_err(GroupDeletedEventApplyError::Commit)?;
+    Ok(next)
 }
 
 fn assert_self_leave_converges(mut authority: GroupInfo, actor: &AgentKeypair) {
@@ -670,6 +680,7 @@ fn membership_authority_group_deleted_withdrawal_commit_applies_under_admin_auth
     let next = apply_group_deleted_event(&replica, event_revision, &hex_id(&admin), &commit)
         .expect("GroupDeleted withdrawal applies through signed admin path");
     assert!(next.withdrawn);
+    assert!(next.shared_secret.is_none());
     assert_eq!(next.mls_group_id, replica.mls_group_id);
     assert_eq!(next.stable_group_id(), replica.stable_group_id());
     assert_eq!(next.members_v2, replica.members_v2);

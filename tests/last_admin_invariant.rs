@@ -100,6 +100,26 @@ fn gossip_apply(
     Ok(next)
 }
 
+fn gossip_apply_terminal(
+    replica: &GroupInfo,
+    commit: &GroupStateCommit,
+    action_kind: ActionKind,
+    mutate: impl FnOnce(&mut GroupInfo),
+) -> Result<GroupInfo, ApplyError> {
+    let ctx = ApplyContext {
+        current_state_hash: &replica.state_hash,
+        current_revision: replica.state_revision,
+        current_withdrawn: replica.withdrawn,
+        members_v2: &replica.members_v2,
+        group_id: replica.stable_group_id(),
+    };
+    validate_apply(&ctx, commit, action_kind)?;
+    let mut next = replica.clone();
+    mutate(&mut next);
+    next.finalize_applied_terminal_commit(commit)?;
+    Ok(next)
+}
+
 // ── Authoring path: seal_commit refuses to mint zero-admin commits ──────
 
 /// Why: the last admin must not be able to self-demote out of a live
@@ -270,7 +290,7 @@ fn last_admin_gossip_apply_allows_zero_admin_withdrawal_commit() {
     let commit = craft_commit(&replica, &scratch, &owner, 1_000);
     assert!(commit.withdrawn);
 
-    let next = gossip_apply(&replica, &commit, ActionKind::AdminOrHigher, |next| {
+    let next = gossip_apply_terminal(&replica, &commit, ActionKind::AdminOrHigher, |next| {
         next.remove_member(&owner_hex, Some(owner_hex.clone()));
     })
     .unwrap();

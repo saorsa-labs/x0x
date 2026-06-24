@@ -203,11 +203,13 @@ pub struct GroupInfo {
     /// effected, so "what did the signed roster say at revision N" is
     /// answerable and independently verifiable long after the fact — the
     /// head-only chain fields above cannot do this. Appended by
-    /// [`GroupInfo::seal_commit`] (local authorship) and
-    /// [`GroupInfo::finalize_applied_commit`] (peer commits); it therefore
-    /// captures every commit this daemon applied, from either path, with no
-    /// per-call-site wiring. Bounded by [`COMMIT_LOG_CAP`]: past the cap the
-    /// oldest entries are dropped and the loss is logged (never silent).
+    /// [`GroupInfo::seal_commit`] (local authorship),
+    /// [`GroupInfo::finalize_applied_commit`] (peer non-terminal commits), and
+    /// [`GroupInfo::finalize_applied_terminal_commit`] (peer terminal commits);
+    /// it therefore captures every commit this daemon applied, from either
+    /// path, with no per-call-site wiring. Bounded by [`COMMIT_LOG_CAP`]: past
+    /// the cap the oldest entries are dropped and the loss is logged (never
+    /// silent).
     /// History begins at the first retaining release and each daemon retains
     /// only the suffix it witnessed.
     #[serde(default)]
@@ -606,15 +608,18 @@ impl GroupInfo {
         }
     }
 
-    /// Accept a peer-authored signed commit on the apply-side.
+    /// Accept a peer-authored signed non-terminal commit on the apply-side.
     ///
     /// Performs [`state_commit::validate_apply`] with the given action kind
-    /// and, on success, updates the local chain fields
-    /// (`state_revision`, `state_hash`, `prev_state_hash`, `withdrawn`) to
-    /// mirror the commit. Domain-specific mutations (roster/policy/meta)
-    /// are the caller's responsibility and must be performed **before**
-    /// calling this method, so the post-mutation recomputed hash matches
-    /// `commit.state_hash`.
+    /// and, on success, updates the local chain fields (`state_revision`,
+    /// `state_hash`, `prev_state_hash`) to mirror the commit. Domain-specific
+    /// mutations (roster/policy/meta) are the caller's responsibility and must
+    /// be performed **before** calling this method, so the post-mutation
+    /// recomputed hash matches `commit.state_hash`.
+    ///
+    /// A live -> withdrawn transition is intentionally rejected here: terminal
+    /// withdrawal must arrive through explicit terminal event handling so the
+    /// withdrawn marker and key wipe stay one atomic act.
     pub fn apply_commit(
         &mut self,
         commit: &state_commit::GroupStateCommit,
@@ -631,18 +636,22 @@ impl GroupInfo {
         self.finalize_applied_commit(commit)
     }
 
-    /// Finalize a commit **after** the caller has already performed
-    /// any action-specific pre-validation and mirrored the payload
-    /// mutation into `self`.
-    ///
-    /// This is the second half of D.4 apply-side handling: callers may
-    /// need the pre-mutation roster view to validate signer authority
-    /// (e.g. self-leave), then mutate local state, then verify the
-    /// recomputed post-mutation hash matches the signed commit.
-    pub fn finalize_applied_commit(
+    fn finalize_applied_commit_with_terminal_mode(
         &mut self,
         commit: &state_commit::GroupStateCommit,
+        allow_live_withdrawal: bool,
     ) -> Result<(), state_commit::ApplyError> {
+        if self.withdrawn && !commit.withdrawn {
+            return Err(state_commit::ApplyError::Withdrawn);
+        }
+
+        let live_to_withdrawn = !self.withdrawn && commit.withdrawn;
+        if live_to_withdrawn && !allow_live_withdrawal {
+            return Err(state_commit::ApplyError::Invariant(
+                "live withdrawal commit requires terminal finalization".to_string(),
+            ));
+        }
+
         self.state_revision = commit.revision;
         self.prev_state_hash = commit.prev_state_hash.clone();
         self.withdrawn = commit.withdrawn;
@@ -658,11 +667,53 @@ impl GroupInfo {
         // check so the roster being validated is provably the roster the
         // signed commit's `roster_root` committed to.
         state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
+        if live_to_withdrawn {
+            self.shared_secret = None;
+        }
         // issue #111: retain the peer-authored commit only after it has
         // validated and applied cleanly (post hash-match + invariants), so
         // rejected commits never enter the history.
         self.retain_commit(commit);
         Ok(())
+    }
+
+    /// Finalize a non-terminal commit **after** the caller has already performed
+    /// any action-specific pre-validation and mirrored the payload
+    /// mutation into `self`.
+    ///
+    /// This is the second half of D.4 apply-side handling: callers may
+    /// need the pre-mutation roster view to validate signer authority
+    /// (e.g. self-leave), then mutate local state, then verify the
+    /// recomputed post-mutation hash matches the signed commit. This default
+    /// finalizer deliberately rejects live -> withdrawn commits; use
+    /// [`GroupInfo::finalize_applied_terminal_commit`] only from explicit
+    /// terminal event handling.
+    pub fn finalize_applied_commit(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+    ) -> Result<(), state_commit::ApplyError> {
+        self.finalize_applied_commit_with_terminal_mode(commit, false)
+    }
+
+    /// Finalize an explicitly terminal, already-authorized withdrawal commit.
+    ///
+    /// This is the terminal counterpart to [`GroupInfo::finalize_applied_commit`]:
+    /// callers must first run [`state_commit::validate_apply`] with the
+    /// appropriate terminal event context (currently server `GroupDeleted`) and
+    /// mirror any terminal metadata fields into `self`. On a live -> withdrawn
+    /// transition this method clears GSS key material before retaining the
+    /// terminal commit; the daemon's `GroupDeleted` path additionally tombstones
+    /// the record and wipes local MLS/TreeKEM material.
+    pub fn finalize_applied_terminal_commit(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+    ) -> Result<(), state_commit::ApplyError> {
+        if !commit.withdrawn {
+            return Err(state_commit::ApplyError::Invariant(
+                "terminal finalization requires withdrawn commit".to_string(),
+            ));
+        }
+        self.finalize_applied_commit_with_terminal_mode(commit, true)
     }
 
     /// Derive the per-message AEAD key from the group's current shared secret.

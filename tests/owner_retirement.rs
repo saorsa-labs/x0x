@@ -3,7 +3,8 @@
 //! These tests stay at the `GroupInfo` + state-commit layer so they run in
 //! the normal cargo/nextest gates. The daemon REST handlers author through the
 //! same `seal_commit` / `seal_withdrawal` seam, and the gossip receiver uses
-//! the same validate → mirror mutation → finalize sequence exercised here.
+//! the same validate → mirror mutation → nonterminal/terminal finalize sequence
+//! exercised here.
 
 use std::collections::BTreeMap;
 
@@ -128,6 +129,26 @@ fn gossip_apply(
     let mut next = replica.clone();
     mutate(&mut next);
     next.finalize_applied_commit(commit)?;
+    Ok(next)
+}
+
+fn gossip_apply_terminal(
+    replica: &GroupInfo,
+    commit: &GroupStateCommit,
+    action_kind: ActionKind,
+    mutate: impl FnOnce(&mut GroupInfo),
+) -> Result<GroupInfo, ApplyError> {
+    let ctx = ApplyContext {
+        current_state_hash: &replica.state_hash,
+        current_revision: replica.state_revision,
+        current_withdrawn: replica.withdrawn,
+        members_v2: &replica.members_v2,
+        group_id: replica.stable_group_id(),
+    };
+    validate_apply(&ctx, commit, action_kind)?;
+    let mut next = replica.clone();
+    mutate(&mut next);
+    next.finalize_applied_terminal_commit(commit)?;
     Ok(next)
 }
 
@@ -273,10 +294,11 @@ fn owner_retirement_promoted_admin_ends_group_on_gossip_apply_path() {
         .expect("promoted admin can author group-ending commit");
     assert!(commit.withdrawn);
 
-    let next = gossip_apply(&replica, &commit, ActionKind::AdminOrHigher, |_| {})
-        .expect("promoted admin group-ending commit applies through role layer");
+    let next = gossip_apply_terminal(&replica, &commit, ActionKind::AdminOrHigher, |_| {})
+        .expect("promoted admin group-ending commit applies through terminal role layer");
 
     assert!(next.withdrawn);
+    assert!(next.shared_secret.is_none());
     assert_eq!(next.state_hash, authority.state_hash);
 }
 

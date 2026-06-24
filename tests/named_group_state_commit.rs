@@ -345,6 +345,68 @@ fn apply_commit_rejects_post_withdrawal_non_withdrawal() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn apply_commit_rejects_live_withdrawal_without_terminal_context() {
+    let owner = AgentKeypair::generate().unwrap();
+    let mut authority = build_owner_group(&owner, "T");
+    let mut replica = authority.clone();
+    let before_secret = replica.shared_secret.clone();
+    let before_hash = replica.state_hash.clone();
+    let before_revision = replica.state_revision;
+    let before_log_len = replica.commit_log.len();
+    assert!(
+        before_secret.is_some(),
+        "secure group starts with GSS key material"
+    );
+
+    let commit = authority.seal_withdrawal(&owner, 2_000).unwrap();
+    assert!(commit.withdrawn);
+
+    let err = replica
+        .apply_commit(&commit, ActionKind::AdminOrHigher)
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ApplyError::Invariant(ref msg) if msg == "live withdrawal commit requires terminal finalization"),
+        "expected terminal-finalization invariant, got: {err}"
+    );
+    assert!(!replica.withdrawn);
+    assert_eq!(replica.shared_secret, before_secret);
+    assert_eq!(replica.state_hash, before_hash);
+    assert_eq!(replica.state_revision, before_revision);
+    assert_eq!(replica.commit_log.len(), before_log_len);
+}
+
+#[test]
+fn finalize_applied_commit_rejects_live_withdrawal_without_terminal_context() {
+    let owner = AgentKeypair::generate().unwrap();
+    let mut authority = build_owner_group(&owner, "T");
+    let mut replica = authority.clone();
+    let before_secret = replica.shared_secret.clone();
+    let before_hash = replica.state_hash.clone();
+    let before_revision = replica.state_revision;
+    let before_log_len = replica.commit_log.len();
+    assert!(
+        before_secret.is_some(),
+        "secure group starts with GSS key material"
+    );
+
+    let commit = authority.seal_withdrawal(&owner, 2_000).unwrap();
+    assert!(commit.withdrawn);
+
+    let err = replica.finalize_applied_commit(&commit).unwrap_err();
+
+    assert!(
+        matches!(err, ApplyError::Invariant(ref msg) if msg == "live withdrawal commit requires terminal finalization"),
+        "expected terminal-finalization invariant, got: {err}"
+    );
+    assert!(!replica.withdrawn);
+    assert_eq!(replica.shared_secret, before_secret);
+    assert_eq!(replica.state_hash, before_hash);
+    assert_eq!(replica.state_revision, before_revision);
+    assert_eq!(replica.commit_log.len(), before_log_len);
+}
+
+#[test]
 fn signed_card_verifies_across_peers() {
     let owner = AgentKeypair::generate().unwrap();
     let mut g = build_owner_group(&owner, "Public Group");

@@ -7575,6 +7575,29 @@ where
     Ok(next)
 }
 
+fn apply_terminal_stateful_event_to_group<F>(
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::GroupStateCommit,
+    action_kind: x0x::groups::ActionKind,
+    mutate: F,
+) -> Result<x0x::groups::GroupInfo, x0x::groups::ApplyError>
+where
+    F: FnOnce(&mut x0x::groups::GroupInfo),
+{
+    let ctx = x0x::groups::ApplyContext {
+        current_state_hash: &current.state_hash,
+        current_revision: current.state_revision,
+        current_withdrawn: current.withdrawn,
+        members_v2: &current.members_v2,
+        group_id: current.stable_group_id(),
+    };
+    x0x::groups::state_commit::validate_apply(&ctx, commit, action_kind)?;
+    let mut next = current.clone();
+    mutate(&mut next);
+    next.finalize_applied_terminal_commit(commit)?;
+    Ok(next)
+}
+
 async fn refresh_group_card_cache_from_info(
     state: &AppState,
     key: &str,
@@ -8965,7 +8988,7 @@ async fn apply_named_group_metadata_event_inner(
                 return false;
             }
             let current = info.clone();
-            let next = match apply_stateful_event_to_group(
+            let next = match apply_terminal_stateful_event_to_group(
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,

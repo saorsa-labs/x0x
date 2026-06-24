@@ -700,9 +700,13 @@ fn apply_withdrawn_flag_commit(
     };
     validate_apply(&ctx, commit, action_kind)?;
 
+    let live_to_withdrawn = !info.withdrawn && commit.withdrawn;
     let mut next = info.clone();
-    next.withdrawn = commit.withdrawn;
-    next.finalize_applied_commit(commit)?;
+    if live_to_withdrawn && event_kind.allows_live_withdrawal() {
+        next.finalize_applied_terminal_commit(commit)?;
+    } else {
+        next.finalize_applied_commit(commit)?;
+    }
     *info = next;
     Ok(())
 }
@@ -903,6 +907,7 @@ fn apply_gossip_commit(
     info: &mut GroupInfo,
     commit: &GroupStateCommit,
     action_kind: ActionKind,
+    terminal: bool,
     mutate: impl FnOnce(&mut GroupInfo),
     before: &str,
 ) -> SequenceOutcome {
@@ -919,7 +924,12 @@ fn apply_gossip_commit(
 
     let mut next = info.clone();
     mutate(&mut next);
-    match next.finalize_applied_commit(commit) {
+    let result = if terminal {
+        next.finalize_applied_terminal_commit(commit)
+    } else {
+        next.finalize_applied_commit(commit)
+    };
+    match result {
         Ok(()) => {
             assert_ne!(state_snapshot(&next), before);
             *info = next;
@@ -952,6 +962,7 @@ fn apply_gossip_action(
                     info,
                     &commit,
                     ActionKind::AdminOrHigher,
+                    false,
                     |next| mutate_add_member(next, keypairs, *actor, *target),
                     &before,
                 ),
@@ -969,6 +980,7 @@ fn apply_gossip_action(
                     info,
                     &commit,
                     ActionKind::AdminOrHigher,
+                    false,
                     |next| mutate_remove_member(next, keypairs, *actor, *target),
                     &before,
                 ),
@@ -986,6 +998,7 @@ fn apply_gossip_action(
                     info,
                     &commit,
                     ActionKind::AdminOrHigher,
+                    false,
                     |next| mutate_ban_member(next, keypairs, *actor, *target),
                     &before,
                 ),
@@ -1007,6 +1020,7 @@ fn apply_gossip_action(
                     info,
                     &commit,
                     ActionKind::AdminOrHigher,
+                    false,
                     |next| mutate_set_role(next, keypairs, *target, *role),
                     &before,
                 ),
@@ -1021,6 +1035,7 @@ fn apply_gossip_action(
                     info,
                     &commit,
                     ActionKind::MemberSelf,
+                    false,
                     |next| mutate_self_leave(next, keypairs, *actor),
                     &before,
                 ),
@@ -1035,6 +1050,7 @@ fn apply_gossip_action(
                     info,
                     &commit,
                     ActionKind::AdminOrHigher,
+                    false,
                     |next| mutate_policy(next, *preset),
                     &before,
                 ),
@@ -1049,7 +1065,8 @@ fn apply_gossip_action(
                     info,
                     &commit,
                     ActionKind::AdminOrHigher,
-                    |next| next.withdrawn = true,
+                    true,
+                    |_| {},
                     &before,
                 ),
                 Err(_) => reject_without_mutation(info, &before),
