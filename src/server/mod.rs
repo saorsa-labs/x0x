@@ -300,6 +300,15 @@ const TREEKEM_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
 const DM_INBOX_START_MAX_ATTEMPTS: u32 = 120;
 const DM_INBOX_START_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+#[cfg(test)]
+static NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST: StdMutex<Vec<(String, String)>> =
+    StdMutex::new(Vec::new());
+
+#[cfg(test)]
+static TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY: StdMutex<
+    Option<(String, Arc<tokio::sync::Notify>)>,
+> = StdMutex::new(None);
+
 fn default_bootstrap_peers() -> Vec<SocketAddr> {
     x0x::network::DEFAULT_BOOTSTRAP_PEERS
         .iter()
@@ -4351,6 +4360,24 @@ fn prioritize_local_card_addresses(addresses: &mut [String]) {
     });
 }
 
+fn populate_invite_base_state_from_group_info(
+    invite: &mut x0x::groups::invite::SignedInvite,
+    info: &x0x::groups::GroupInfo,
+) {
+    invite.stable_group_id = Some(info.stable_group_id().to_string());
+    invite.group_created_at = Some(info.created_at);
+    invite.group_description = Some(info.description.clone());
+    invite.policy = Some(info.policy.clone());
+    invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
+    invite.base_state_revision = Some(info.state_revision);
+    invite.base_state_hash = Some(info.state_hash.clone());
+    invite.base_members_v2 = Some(info.members_v2.clone());
+    invite.base_prev_state_hash = info.prev_state_hash.clone();
+    invite.secure_plane = Some(info.secure_plane);
+    invite.base_secret_epoch = Some(info.secret_epoch);
+    invite.base_security_binding = info.security_binding.clone();
+}
+
 /// GET /agent/card — generate a shareable identity card.
 async fn get_agent_card(
     State(state): State<Arc<AppState>>,
@@ -4395,12 +4422,22 @@ async fn get_agent_card(
     if query.include_groups.unwrap_or(false) {
         let groups = state.named_groups.read().await;
         for info in groups.values() {
-            let invite = x0x::groups::invite::SignedInvite::new(
+            if info.withdrawn
+                || has_withdrawn_same_stable_group_record(
+                    &groups,
+                    &info.mls_group_id,
+                    Some(info.stable_group_id()),
+                )
+            {
+                continue;
+            }
+            let mut invite = x0x::groups::invite::SignedInvite::new(
                 info.mls_group_id.clone(),
                 info.name.clone(),
                 &agent_id,
                 x0x::groups::invite::DEFAULT_EXPIRY_SECS,
             );
+            populate_invite_base_state_from_group_info(&mut invite, info);
             card.groups.push(x0x::groups::card::CardGroup {
                 name: info.name.clone(),
                 invite_link: invite.to_link(),
@@ -7395,6 +7432,14 @@ async fn publish_named_group_metadata_event(
     metadata_topic: &str,
     event: &NamedGroupMetadataEvent,
 ) {
+    #[cfg(test)]
+    if let Ok(mut attempts) = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST.lock() {
+        attempts.push((
+            metadata_topic.to_string(),
+            named_group_metadata_event_group_id(event).to_string(),
+        ));
+    }
+
     match serde_json::to_vec(event) {
         Ok(bytes) => {
             match tokio::time::timeout(
@@ -7690,6 +7735,22 @@ fn rollback_treekem_group_after_failed_install(
     }
 }
 
+#[cfg(test)]
+fn notify_treekem_final_install_before_map_write_for_test(group_id: &str) {
+    let notify = TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .filter(|(target_group_id, _)| target_group_id == group_id)
+                .map(|(_, notify)| Arc::clone(notify))
+        });
+    if let Some(notify) = notify {
+        notify.notify_waiters();
+    }
+}
+
 async fn install_joined_treekem_group_after_crypto_recheck(
     state: &AppState,
     group_id: &str,
@@ -7713,7 +7774,32 @@ async fn install_joined_treekem_group_after_crypto_recheck(
         reason,
     )
     .await?;
-    state.treekem_groups.write().await.insert(
+    #[cfg(test)]
+    notify_treekem_final_install_before_map_write_for_test(group_id);
+
+    let mut treekem_groups = state.treekem_groups.write().await;
+    let groups = state.named_groups.read().await;
+    if has_withdrawn_same_stable_group_record(&groups, group_id, Some(&stable_group_id)) {
+        drop(groups);
+        drop(treekem_groups);
+        if !repair_withdrawn_named_groups_json_and_wipe_key_material(
+            state,
+            group_id,
+            Some(&stable_group_id),
+            reason,
+        )
+        .await?
+        {
+            remove_treekem_persistence_for_group_id(state, group_id, reason).await;
+        }
+        anyhow::bail!("refusing to install key material for withdrawn group");
+    }
+    // Keep the named-groups read guard through the final insert. That removes
+    // the post-check/pre-insert window: a withdrawal that already won is
+    // observed above; a later withdrawal cannot acquire the named-groups write
+    // lock until after this in-memory insert, then its teardown path removes the
+    // key material.
+    treekem_groups.insert(
         group_id.to_string(),
         Arc::new(tokio::sync::Mutex::new(group)),
     );
@@ -11104,18 +11190,7 @@ async fn create_group_invite(
             &agent_id,
             req.expiry_secs,
         );
-        invite.stable_group_id = Some(info.stable_group_id().to_string());
-        invite.group_created_at = Some(info.created_at);
-        invite.group_description = Some(info.description.clone());
-        invite.policy = Some(info.policy.clone());
-        invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
-        invite.base_state_revision = Some(info.state_revision);
-        invite.base_state_hash = Some(info.state_hash.clone());
-        invite.base_members_v2 = Some(info.members_v2.clone());
-        invite.base_prev_state_hash = info.prev_state_hash.clone();
-        invite.secure_plane = Some(info.secure_plane);
-        invite.base_secret_epoch = Some(info.secret_epoch);
-        invite.base_security_binding = info.security_binding.clone();
+        populate_invite_base_state_from_group_info(&mut invite, info);
 
         // Track this one-time secret on the inviter so a future
         // MemberJoined request carrying it can be authenticated, role-capped,
@@ -21501,6 +21576,43 @@ mod tests {
         AtomicPersistPostJsonForcedWithdrawal { ids }
     }
 
+    struct TreeKemFinalInstallBeforeMapWriteGuard {
+        group_id: String,
+    }
+
+    impl Drop for TreeKemFinalInstallBeforeMapWriteGuard {
+        fn drop(&mut self) {
+            let Ok(mut guard) = TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY.lock() else {
+                return;
+            };
+            if guard
+                .as_ref()
+                .is_some_and(|(group_id, _)| group_id == &self.group_id)
+            {
+                *guard = None;
+            }
+        }
+    }
+
+    fn notify_before_treekem_final_install_map_write(
+        group_id: &str,
+    ) -> (
+        Arc<tokio::sync::Notify>,
+        TreeKemFinalInstallBeforeMapWriteGuard,
+    ) {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let mut guard = TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY
+            .lock()
+            .expect("TreeKEM final install notify hook poisoned");
+        *guard = Some((group_id.to_string(), Arc::clone(&notify)));
+        (
+            notify,
+            TreeKemFinalInstallBeforeMapWriteGuard {
+                group_id: group_id.to_string(),
+            },
+        )
+    }
+
     async fn secure_endpoint_test_state() -> Result<(Arc<AppState>, tempfile::TempDir)> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path();
@@ -21586,6 +21698,221 @@ mod tests {
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
         });
         Ok((state, dir))
+    }
+
+    async fn response_json(response: Response) -> Result<(StatusCode, serde_json::Value)> {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .context("read response body")?;
+        let body = serde_json::from_slice(&bytes).context("decode response body")?;
+        Ok((status, body))
+    }
+
+    #[tokio::test]
+    async fn agent_card_group_invite_from_get_card_is_accepted_on_join() -> Result<()> {
+        let (authority, _authority_dir) = secure_endpoint_test_state().await?;
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let group_id = "5c".repeat(32);
+        let authority_id = authority.agent.agent_id();
+        let mut authority_info = x0x::groups::GroupInfo::with_policy(
+            "card invite provenance".to_string(),
+            "base-state fields should survive card export".to_string(),
+            authority_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        authority_info.recompute_state_hash();
+        let stable_group_id = authority_info.stable_group_id().to_string();
+        let authority_state_hash = authority_info.state_hash.clone();
+        let authority_members = authority_info.members_v2.clone();
+        authority
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), authority_info);
+
+        let card_response = get_agent_card(
+            State(Arc::clone(&authority)),
+            Query(CardQuery {
+                display_name: Some("authority".to_string()),
+                include_groups: Some(true),
+                include_local_addresses: false,
+            }),
+        )
+        .await
+        .into_response();
+        let (card_status, card_body) = response_json(card_response).await?;
+        assert_eq!(card_status, StatusCode::OK);
+        let card: x0x::groups::card::AgentCard = serde_json::from_value(card_body["card"].clone())
+            .context("decode agent card from handler response")?;
+        let card_group = card
+            .groups
+            .iter()
+            .find(|group| group.name == "card invite provenance")
+            .expect("agent card should include the named group invite");
+        let invite = x0x::groups::invite::SignedInvite::from_link(&card_group.invite_link)
+            .map_err(|e| anyhow::anyhow!("decode card invite: {e}"))?;
+
+        assert_eq!(
+            invite.stable_group_id.as_deref(),
+            Some(stable_group_id.as_str())
+        );
+        assert_eq!(
+            invite.base_state_hash.as_deref(),
+            Some(authority_state_hash.as_str())
+        );
+        assert_eq!(invite.base_members_v2.as_ref(), Some(&authority_members));
+        assert_eq!(
+            invite
+                .creator_agent_id_from_base_state()
+                .map_err(|e| anyhow::anyhow!("derive creator provenance: {e}"))?,
+            hex::encode(authority_id.as_bytes())
+        );
+        {
+            let groups = authority.named_groups.read().await;
+            let info = groups.get(&group_id).expect("authority group retained");
+            assert!(
+                info.issued_invites.is_empty(),
+                "GET /agent/card must not record or persist card-generated invite secrets"
+            );
+        }
+
+        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .clear();
+        let join_response = join_group_via_invite(
+            State(Arc::clone(&joiner)),
+            Json(JoinGroupRequest {
+                invite: card_group.invite_link.clone(),
+                display_name: Some("joiner".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        let (join_status, join_body) = response_json(join_response).await?;
+
+        assert_eq!(
+            join_status,
+            StatusCode::OK,
+            "card invite join should be accepted, body: {join_body}"
+        );
+        assert_ne!(
+            join_status,
+            StatusCode::BAD_REQUEST,
+            "card invite join must not fail with the pre-fix missing-base-state 400"
+        );
+        let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+        let metadata_topic = {
+            let groups = joiner.named_groups.read().await;
+            let stub = groups
+                .get(&group_id)
+                .expect("accepted card invite should create a local join stub");
+            assert_eq!(stub.stable_group_id(), stable_group_id.as_str());
+            assert_eq!(stub.state_hash, authority_state_hash);
+            assert_eq!(stub.members_v2, authority_members);
+            assert!(
+                !stub.has_active_member(&joiner_hex),
+                "card-derived convergence remains Phase 2; this guard only proves accepted join stub formation"
+            );
+            stub.metadata_topic.clone()
+        };
+        let publish_attempts = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned");
+        assert!(
+            publish_attempts
+                .iter()
+                .any(|(topic, event_group_id)| topic == &metadata_topic
+                    && event_group_id == &stable_group_id),
+            "join handler should attempt to publish the joiner-authored MemberJoined request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_card_does_not_export_withdrawn_group_invites() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let active_group_id = "6a".repeat(32);
+        let withdrawn_group_id = "6b".repeat(32);
+        let stale_active_group_id = "6c".repeat(32);
+        let withdrawn_alias_group_id = "6d".repeat(32);
+        let agent_id = state.agent.agent_id();
+        let mut active = x0x::groups::GroupInfo::with_policy(
+            "active card group".to_string(),
+            String::new(),
+            agent_id,
+            active_group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        active.recompute_state_hash();
+        let mut withdrawn = x0x::groups::GroupInfo::with_policy(
+            "withdrawn card group".to_string(),
+            String::new(),
+            agent_id,
+            withdrawn_group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        withdrawn.withdrawn = true;
+        clear_group_info_key_material(&mut withdrawn);
+        withdrawn.recompute_state_hash();
+        let mut stale_active = x0x::groups::GroupInfo::with_policy(
+            "stale active alias".to_string(),
+            String::new(),
+            agent_id,
+            stale_active_group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        stale_active.recompute_state_hash();
+        let mut withdrawn_same_stable_alias = stale_active.clone();
+        withdrawn_same_stable_alias.name = "withdrawn same-stable alias".to_string();
+        withdrawn_same_stable_alias.mls_group_id = withdrawn_alias_group_id.clone();
+        withdrawn_same_stable_alias.withdrawn = true;
+        clear_group_info_key_material(&mut withdrawn_same_stable_alias);
+        withdrawn_same_stable_alias.recompute_state_hash();
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.insert(active_group_id, active);
+            groups.insert(withdrawn_group_id, withdrawn);
+            groups.insert(stale_active_group_id, stale_active);
+            groups.insert(withdrawn_alias_group_id, withdrawn_same_stable_alias);
+        }
+
+        let card_response = get_agent_card(
+            State(Arc::clone(&state)),
+            Query(CardQuery {
+                display_name: Some("authority".to_string()),
+                include_groups: Some(true),
+                include_local_addresses: false,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(card_response).await?;
+        assert_eq!(status, StatusCode::OK);
+        let card: x0x::groups::card::AgentCard = serde_json::from_value(body["card"].clone())
+            .context("decode agent card from handler response")?;
+
+        assert!(
+            card.groups
+                .iter()
+                .any(|group| group.name == "active card group"),
+            "active groups should still be exported when include_groups=true"
+        );
+        assert!(
+            card.groups
+                .iter()
+                .all(|group| group.name != "withdrawn card group"),
+            "withdrawn tombstones must not be re-advertised as joinable card invites"
+        );
+        assert!(
+            card.groups
+                .iter()
+                .all(|group| group.name != "stale active alias"),
+            "stale active aliases for a withdrawn stable group must not be re-advertised"
+        );
+        Ok(())
     }
 
     fn secure_endpoint_group_for_agent(
@@ -22496,6 +22823,77 @@ mod tests {
             .expect("withdrawn group tombstone remains in memory");
         assert!(in_memory.withdrawn);
         assert!(!in_memory.has_active_member(&added_member));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn treekem_final_install_lock_rechecks_withdrawal_before_insert() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "59".repeat(32);
+        let stable_group_id = "5a".repeat(32);
+        let group_id_bytes = hex::decode(&group_id)?;
+        let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let group =
+            x0x::mls::TreeKemMlsGroup::create(group_id_bytes, state.agent.agent_id(), &seed)?;
+        let epoch = group.epoch();
+        let mut info =
+            treekem_metadata_group_info(state.agent.agent_id(), &group_id, &stable_group_id);
+        info.secret_epoch = epoch;
+        info.security_binding = Some(format!("treekem:epoch={epoch}"));
+        info.recompute_state_hash();
+
+        let map_guard = state.treekem_groups.write().await;
+        let (notify, _notify_guard) = notify_before_treekem_final_install_map_write(&group_id);
+        let state_for_install = Arc::clone(&state);
+        let group_id_for_install = group_id.clone();
+        let info_for_install = info.clone();
+        let install = tokio::spawn(async move {
+            install_joined_treekem_group_after_crypto_recheck(
+                state_for_install.as_ref(),
+                &group_id_for_install,
+                info_for_install,
+                group,
+                "test_treekem_final_install_lock_recheck",
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .context("install did not reach the final in-memory map write")?;
+        {
+            let mut groups = state.named_groups.write().await;
+            let mut withdrawn = info.clone();
+            withdrawn.withdrawn = true;
+            clear_group_info_key_material(&mut withdrawn);
+            groups.insert(group_id.clone(), withdrawn);
+        }
+        drop(map_guard);
+
+        let result = install.await.context("install task panicked")?;
+        assert!(
+            result.is_err(),
+            "withdrawal observed under the TreeKEM map lock must reject final install"
+        );
+        assert!(
+            !state.treekem_groups.read().await.contains_key(&group_id),
+            "rejected final install must not leave resident TreeKEM key material"
+        );
+        assert!(
+            !tokio::fs::try_exists(treekem_snapshot_path(&state.treekem_dir, &group_id)).await?,
+            "rejected final install must wipe the just-persisted TreeKEM snapshot"
+        );
+        assert!(
+            !tokio::fs::try_exists(treekem_journal_path(&state.treekem_dir, &group_id)).await?,
+            "rejected final install must wipe the just-persisted TreeKEM journal"
+        );
+        let durable_groups = load_named_groups(&state.named_groups_path).await?;
+        assert!(
+            durable_groups
+                .get(&group_id)
+                .is_some_and(|info| info.withdrawn),
+            "final check should leave the withdrawn tombstone durable"
+        );
         Ok(())
     }
 

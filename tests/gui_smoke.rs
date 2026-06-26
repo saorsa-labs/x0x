@@ -72,6 +72,54 @@ fn gui_files_requires_explicit_recipient_selection() {
     );
 }
 
+/// Verify named-group roster role controls can both promote and demote.
+#[test]
+fn gui_named_group_roster_exposes_demote_role_binding() {
+    let html = include_str!("../src/gui/x0x-gui.html");
+    assert!(
+        html.contains("Demote to member"),
+        "Roster actions should expose a Demote to member control"
+    );
+    assert!(
+        html.contains(r#"data-nag-role="admin""#),
+        "Promote control should carry desired admin role"
+    );
+    assert!(
+        html.contains(r#"data-nag-role="member""#),
+        "Demote control should carry desired member role"
+    );
+    assert!(
+        html.contains("data-nag-role-agent"),
+        "Role controls should carry a separate target agent id"
+    );
+    let compact = compact_html(html);
+    assert!(
+        compact.contains(
+            "nagSetRole(gid,btn.getAttribute('data-nag-role-agent'),btn.getAttribute('data-nag-role'))"
+        ),
+        "Role binding should pass target id and desired role from button attributes"
+    );
+    assert!(
+        !compact.contains("getAttribute('data-nag-role'),'admin'"),
+        "Role binding must not hard-code all role changes to admin"
+    );
+}
+
+/// Verify named-group roster management controls are hidden on the caller row.
+#[test]
+fn gui_named_group_roster_hides_self_management_actions() {
+    let html = include_str!("../src/gui/x0x-gui.html");
+    let compact = compact_html(html);
+    assert!(
+        compact.contains("constisSelf=m.agent_id===myAid;"),
+        "Roster renderer should identify the caller's own row"
+    );
+    assert!(
+        compact.contains("constmanage=canManage&&!isSelf;"),
+        "Ban/Promote/Demote/Unban actions should be disabled for the caller's own row"
+    );
+}
+
 /// Verify that API paths called from the GUI exist in ENDPOINTS.
 ///
 /// Extracts `api("/path"...)` calls from the JavaScript and checks each
@@ -144,6 +192,10 @@ fn unmatched_gui_api_paths(html: &str, endpoint_paths: &HashSet<&str>) -> Vec<St
     unmatched.sort();
     unmatched.dedup();
     unmatched
+}
+
+fn compact_html(html: &str) -> String {
+    html.split_whitespace().collect()
 }
 
 fn extract_gui_api_paths(html: &str) -> Vec<String> {

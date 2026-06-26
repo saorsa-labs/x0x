@@ -4461,15 +4461,17 @@ function nagStatePanelHtml(gid,state,canAdminister){
 function nagRosterPanelHtml(gid,members,myAid,canManage){
   const rows=members.map(m=>{
     const dn=m.display_name&&m.display_name.trim()||nagShort(m.agent_id);
-    const manage=canManage;
+    const isSelf=m.agent_id===myAid;
+    const manage=canManage && !isSelf;
     const isBanned=m.state==='banned';
     let actions='';
     if(manage){
-      const promote=canManage && m.role!=='admin' ? `<button data-nag-role="${esc(m.agent_id)}">${m.role==='owner'?'Set legacy owner to admin':'Promote to admin'}</button>`:'';
+      const promote=m.role!=='admin' ? `<button data-nag-role-agent="${esc(m.agent_id)}" data-nag-role="admin">${m.role==='owner'?'Set legacy owner to admin':'Promote to admin'}</button>`:'';
+      const demote=m.role==='admin' ? `<button data-nag-role-agent="${esc(m.agent_id)}" data-nag-role="member">Demote to member</button>`:'';
       const ban=isBanned
         ? `<button data-nag-unban="${esc(m.agent_id)}">Unban</button>`
         : `<button class="danger" data-nag-ban="${esc(m.agent_id)}">Ban</button>`;
-      actions=`<div class="actions">${promote}${ban}</div>`;
+      actions=`<div class="actions">${promote}${demote}${ban}</div>`;
     }
     return `<div class="nag-row" data-nag-member="${esc(m.agent_id)}">
       <div class="info">
@@ -4518,7 +4520,7 @@ function nagBindAdminHandlers(gid){
   if(seal)seal.addEventListener('click',()=>nagSealState(gid));
   const withdraw=host.querySelector('[data-nag-state-withdraw]');
   if(withdraw)withdraw.addEventListener('click',()=>nagWithdrawState(gid));
-  host.querySelectorAll('[data-nag-role]').forEach(btn=>btn.addEventListener('click',()=>nagSetRole(gid,btn.getAttribute('data-nag-role'),'admin')));
+  host.querySelectorAll('[data-nag-role-agent][data-nag-role]').forEach(btn=>btn.addEventListener('click',()=>nagSetRole(gid,btn.getAttribute('data-nag-role-agent'),btn.getAttribute('data-nag-role'))));
   host.querySelectorAll('[data-nag-ban]').forEach(btn=>btn.addEventListener('click',()=>nagBan(gid,btn.getAttribute('data-nag-ban'))));
   host.querySelectorAll('[data-nag-unban]').forEach(btn=>btn.addEventListener('click',()=>nagUnban(gid,btn.getAttribute('data-nag-unban'))));
   host.querySelectorAll('[data-nag-req-approve]').forEach(btn=>btn.addEventListener('click',()=>nagApproveRequest(gid,btn.getAttribute('data-nag-req-approve'))));
