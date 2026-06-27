@@ -5,7 +5,7 @@ covers project-wide rules and architecture.
 
 ## Integration Test Organization
 
-29 integration test files in `tests/` (744 tests total):
+33 integration test files in `tests/` (curated core subset; the directory holds more):
 
 | File | Tests |
 |------|-------|
@@ -32,6 +32,10 @@ covers project-wide rules and architecture.
 | `tasklist_first_join_bootstrap.rs` | Task-list cold first-join bootstrap via state-sync side topic + LWW-clock delta merge (daemon-backed, `--ignored`) |
 | `local_topics.rs` | Issue #89: `local:` topics deliver same-daemon only, never gossipped (daemon-backed, `--ignored`) |
 | `named_group_integration.rs` | Named groups, invites, join/leave, display names |
+| `owner_retirement.rs` | ADR-0016 Slice 2: owner retirement / flat Admin authority at the `GroupInfo` + state-commit layer |
+| `membership_authority.rs` | ADR-0016 Slice 3: add/remove/ban authority via library primitives (handler enforcement lives in `src/server/mod.rs` in-crate tests) |
+| `last_admin_invariant.rs` | ADR-0016 R2: no commit may leave a live group with zero active admins, enforced at the state-commit choke-point |
+| `invite_authority.rs` | ADR-0016 Slice 4: invite-issue authority and creator provenance from base-state |
 | `bootstrap_cache_integration.rs` | Bootstrap cache persistence, quality scoring |
 | `constitution_integration.rs` | Constitution embedding and serving |
 | `daemon_api_integration.rs` | Daemon REST API endpoint coverage |

@@ -92,6 +92,14 @@ impl GroupRole {
             "admin" => Ok(Self::Admin),
             "member" => Ok(Self::Member),
             "owner" => Err(Self::OWNER_ASSIGNMENT_ERROR.to_string()),
+            other
+                if other.eq_ignore_ascii_case("admin") || other.eq_ignore_ascii_case("member") =>
+            {
+                Err(format!(
+                    "role names are case-sensitive; use '{}'",
+                    other.to_ascii_lowercase()
+                ))
+            }
             other => Err(format!(
                 "role '{other}' is reserved and cannot be assigned; valid roles: 'admin', 'member'"
             )),
@@ -280,9 +288,17 @@ mod tests {
 
     #[test]
     fn role_assignment_is_exact_lowercase_vocabulary() {
+        // A mis-cased *valid* role name is right-intent/wrong-casing, so it must
+        // get a case-sensitivity hint rather than the generic "reserved" error
+        // that genuinely-unknown roles (e.g. "moderator") receive — otherwise a
+        // caller typing "ADMIN" is misdirected toward thinking admin is reserved.
         assert_eq!(
             GroupRole::assignable_from_name("ADMIN").unwrap_err(),
-            "role 'ADMIN' is reserved and cannot be assigned; valid roles: 'admin', 'member'"
+            "role names are case-sensitive; use 'admin'"
+        );
+        assert_eq!(
+            GroupRole::assignable_from_name("Member").unwrap_err(),
+            "role names are case-sensitive; use 'member'"
         );
     }
 

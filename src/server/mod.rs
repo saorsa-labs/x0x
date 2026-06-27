@@ -13068,7 +13068,10 @@ async fn withdraw_group_state(
         // nothing behind" means no MLS/TreeKEM/GSS key material survives, not
         // that the terminal metadata record is deleted. Keeping this record is
         // the stale-card reanimation guard for future imports.
-        clear_group_info_key_material(info);
+        // `seal_withdrawal` already nulls `shared_secret` on success (its
+        // documented contract, covered by `seal_withdrawal_success_clears_shared_secret`),
+        // so the wipe lives inside the library method and stays atomic with the
+        // withdrawn marker — no redundant server-side clear here.
         let metadata_topic = info.metadata_topic.clone();
         let event_group_id = info.stable_group_id().to_string();
         let delivery_roster = info.clone();
@@ -21911,6 +21914,112 @@ mod tests {
                 .iter()
                 .all(|group| group.name != "stale active alias"),
             "stale active aliases for a withdrawn stable group must not be re-advertised"
+        );
+        Ok(())
+    }
+
+    /// Rule 9: prove the *real* REST handlers enforce admin authority.
+    ///
+    /// `tests/membership_authority.rs` exercises the library authority
+    /// primitives, but it re-implements the handler pre-check shape, so it
+    /// cannot catch a handler that silently drops `require_admin_or_above`.
+    /// This test invokes the actual handlers with a non-admin local caller and
+    /// asserts each rejects with 403 — so deleting an authority gate in any of
+    /// the membership handlers fails here, exactly the change class ADR-0016
+    /// makes load-bearing.
+    #[tokio::test]
+    async fn membership_handlers_reject_non_admin_local_caller() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "7c".repeat(32);
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let foreign_admin = crate::identity::AgentKeypair::generate()?;
+        let foreign_admin_hex = hex::encode(foreign_admin.agent_id().as_bytes());
+        let target_hex = "33".repeat(32);
+
+        // GSS (non-TreeKEM) group whose admin is a *foreign* agent; the local
+        // daemon agent is only a plain Member, so it must not be able to
+        // remove/ban/role-change anyone.
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "authority gate".to_string(),
+            String::new(),
+            foreign_admin.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        info.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(foreign_admin_hex.clone()),
+            None,
+        );
+        info.add_member(
+            target_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(foreign_admin_hex),
+            None,
+        );
+        info.roster_revision = info.roster_revision.saturating_add(1);
+        info.recompute_state_hash();
+        assert_ne!(
+            info.secure_plane,
+            x0x::mls::SecureGroupPlane::TreeKem,
+            "test targets the GSS handler path so the admin gate runs before TreeKEM delegation"
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        let remove = remove_named_group_member(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), target_hex.clone())),
+        )
+        .await
+        .into_response();
+        let (remove_status, remove_body) = response_json(remove).await?;
+        assert_eq!(
+            remove_status,
+            StatusCode::FORBIDDEN,
+            "remove_named_group_member must reject a non-admin caller, body: {remove_body}"
+        );
+
+        let ban = ban_group_member(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), target_hex.clone())),
+        )
+        .await
+        .into_response();
+        let (ban_status, ban_body) = response_json(ban).await?;
+        assert_eq!(
+            ban_status,
+            StatusCode::FORBIDDEN,
+            "ban_group_member must reject a non-admin caller, body: {ban_body}"
+        );
+
+        let role = update_member_role(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), target_hex.clone())),
+            Json(UpdateMemberRoleRequest {
+                role: "member".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        let (role_status, role_body) = response_json(role).await?;
+        assert_eq!(
+            role_status,
+            StatusCode::FORBIDDEN,
+            "update_member_role must reject a non-admin caller, body: {role_body}"
+        );
+
+        // The rejected calls must not have mutated the roster.
+        let groups = state.named_groups.read().await;
+        let after = groups.get(&group_id).expect("group retained");
+        assert_eq!(
+            after.caller_role(&target_hex),
+            Some(x0x::groups::GroupRole::Member),
+            "forbidden handler calls must leave the target untouched"
         );
         Ok(())
     }

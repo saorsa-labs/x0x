@@ -4,6 +4,14 @@
 //! daemon. The REST-semantics helpers below mirror the daemon's role pre-check
 //! and clone-first authoring shape; the gossip-apply helper mirrors the signed
 //! state-commit validation path used by `x0xd` receivers.
+//!
+//! Scope (Rule 9): this file proves the *library* authority primitives —
+//! `validate_apply`, `seal_commit`, the last-admin pre-checks — reject
+//! non-admin actors. Because the helpers re-implement the handler shape rather
+//! than calling the private REST handlers, they cannot catch a handler that
+//! drops its `require_admin_or_above` gate. That handler-level enforcement is
+//! covered by `membership_handlers_reject_non_admin_local_caller` in
+//! `src/server/mod.rs`, which invokes the real handlers.
 
 use x0x::groups::state_commit::{validate_apply, validate_apply_terminal};
 use x0x::groups::{
