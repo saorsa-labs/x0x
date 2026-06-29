@@ -167,8 +167,16 @@ jobs:
             fi
           done
 
+      # Notarization contacts Apple and validates the Developer Program License
+      # Agreement; an expired/unsigned agreement returns HTTP 403 and is an
+      # account-level blocker, not a build defect. Binaries are still codesigned
+      # (the Sign step above uses an offline cert), so an un-notarized macOS
+      # binary is usable with a Gatekeeper prompt. Keep this non-blocking so a
+      # lapsed agreement cannot hold back the Linux/Windows release + crates.io
+      # publish; re-run once the agreement is re-signed to ship notarized macOS.
       - name: Notarize macOS binaries
         if: startsWith(matrix.platform, 'macos')
+        continue-on-error: true
         env:
           MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
           MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
@@ -178,12 +186,15 @@ jobs:
             BINARY="target/${{ matrix.target }}/release/${bin}"
             if [ -f "$BINARY" ]; then
               ditto -c -k --keepParent "$BINARY" "$RUNNER_TEMP/notarize-${bin}.zip"
-              xcrun notarytool submit "$RUNNER_TEMP/notarize-${bin}.zip" \
+              if xcrun notarytool submit "$RUNNER_TEMP/notarize-${bin}.zip" \
                 --apple-id "$MACOS_NOTARIZATION_APPLE_ID" \
                 --password "$MACOS_NOTARIZATION_PASSWORD" \
                 --team-id "$MACOS_NOTARIZATION_TEAM_ID" \
-                --wait
-              echo "Notarized ${bin} successfully"
+                --wait; then
+                echo "Notarized ${bin} successfully"
+              else
+                echo "::warning::Notarization failed for ${bin} (likely an expired Apple Developer agreement); shipping signed-but-un-notarized binary. Re-run the release after re-signing the agreement to notarize."
+              fi
             fi
           done
 
