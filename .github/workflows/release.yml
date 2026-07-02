@@ -42,11 +42,58 @@ jobs:
             --mode push_main
 
   # ============================================================
+  # Gate: never ship on red (or unknown) CI (#128 / WS1.7)
+  # ============================================================
+  require-green-ci:
+    name: Require green CI on tagged commit
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    steps:
+      - name: Require a successful CI run for ${{ github.sha }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="${{ github.sha }}"
+          # A release must never ship on red (or still-running / missing) CI.
+          # The CI workflow runs on push to main and on PRs; a commit tagged
+          # for release that was merged to main already has a run we can
+          # observe. ci.yml is NOT triggered by the tag push itself (it gates
+          # on branch main), so this observes the run from the merge. Poll for
+          # up to 20 minutes so a CI run still in flight may finish, then
+          # require conclusion == success.
+          deadline=$(( $(date +%s) + 20 * 60 ))
+          while :; do
+            json=$(gh run list --workflow ci.yml --commit "${SHA}" \
+                   --json status,conclusion --limit 50 || echo '[]')
+            status=$(printf '%s' "${json}" | jq -r '.[0].status // "missing"')
+            conclusion=$(printf '%s' "${json}" | jq -r '.[0].conclusion // "missing"')
+            echo "Newest CI run for ${SHA}: status=${status} conclusion=${conclusion}"
+            if [ "${conclusion}" = "success" ]; then
+              echo "CI is green for ${SHA} — proceeding with release."
+              exit 0
+            fi
+            if [ "${status}" = "completed" ]; then
+              echo "::error::CI concluded '${conclusion}' (not 'success') for ${SHA}. Refusing to release on red CI."
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::CI did not reach a terminal state within 20 minutes for ${SHA} (status=${status}). Refusing to release on unknown CI."
+              exit 1
+            fi
+            echo "CI run is '${status}'; waiting 30s before re-checking..."
+            sleep 30
+          done
+
+  # ============================================================
   # Build release binaries for all platforms
   # ============================================================
   build-release:
     name: Build ${{ matrix.platform }}
-    needs: validate-release-metadata
+    needs: [validate-release-metadata, require-green-ci]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
