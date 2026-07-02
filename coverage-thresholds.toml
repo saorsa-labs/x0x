@@ -11,8 +11,9 @@
 # docs/coverage-exclusions.md — never lower the floor to make a red run green.
 
 [global]
-# 48 → 65 in #124/WS1.3 (actual measured 66.46% with the auth-matrix tranche).
-line_floor = 65.0
+# tranche 1 (#140): 48.0 → 65.0  (auth-matrix; actual 66.46%)
+# tranche 2 (#124): 65.0 → 65.6  (exec-ACL denials; actual 66.61%)
+line_floor = 65.6
 allowed_pr_drop = 0.5
 exclusion_budget_percent = 2.0
 lcov_artifact = "lcov.info"

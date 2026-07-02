@@ -52,7 +52,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: Run property tests
-        run: cargo nextest run --all-features -E 'test(/^proptest_/) | test(/proptest/)'
+        # Scope compilation to ONLY the targets that host property tests
+        # (--lib + the eight tests/proptest_*.rs binaries) instead of the
+        # whole workspace. The full-workspace build links ~72 debug binaries
+        # in parallel, which OOM-kills the runner at ~4m45s; this caps it to
+        # ~9 targets and is several times faster.
+        #
+        # The filter is binary-scoped on purpose: the tests/proptest_*.rs
+        # suites name their test functions descriptively (e.g.
+        # `blocked_overrides_all`), NOT `proptest_*`, so a name filter like
+        # `test(/proptest/)` silently matched only the 2 proptest-named tests
+        # in src/presence.rs and skipped all 58 integration-file property
+        # tests. `test(/^proptest_/) | test(/proptest/)` is kept to pull in
+        # those presence lib tests; the eight `binary(...)` clauses cover the
+        # rest. (60 tests total vs the prior 2.)
+        # --build-jobs 2: belt-and-braces cap on parallel linking, since each
+        # proptest binary links the (large) x0x crate.
+        run: |
+          cargo nextest run --all-features --build-jobs 2 --lib \
+            --test proptest_connectivity --test proptest_crdt --test proptest_files \
+            --test proptest_groups --test proptest_kv --test proptest_mls \
+            --test proptest_presence --test proptest_trust \
+            -E 'binary(proptest_connectivity) | binary(proptest_crdt) | binary(proptest_files) | binary(proptest_groups) | binary(proptest_kv) | binary(proptest_mls) | binary(proptest_presence) | binary(proptest_trust) | test(/^proptest_/) | test(/proptest/)'
 
   # ── Integration tests (every PR, ~10min) ──────────────────────────────
   integration:
