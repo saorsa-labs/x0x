@@ -434,6 +434,8 @@ enum DiagnosticsSub {
     Groups,
     /// Print remote exec counters, warnings, and ACL summary.
     Exec,
+    /// Print WebSocket outbound-queue health (capacity, drops, slow-consumer closes).
+    Ws,
 }
 
 /// Remote exec sub-actions (`x0x exec sessions`, `x0x exec cancel <id>`).
@@ -1334,6 +1336,7 @@ async fn run(
             DiagnosticsSub::Dm => commands::network::diagnostics_dm(&client).await,
             DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
+            DiagnosticsSub::Ws => commands::network::diagnostics_ws(&client).await,
         },
         Commands::Find { words } => commands::find::find(&client, &words).await,
         Commands::Connect { words } => commands::connect::connect(&client, &words).await,

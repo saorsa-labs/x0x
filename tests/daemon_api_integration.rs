@@ -2051,6 +2051,25 @@ async fn daemon_api_diagnostics_dm() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_diagnostics_ws() {
+    // #122 / WS1.1: the bounded WS outbound-queue diagnostics surface.
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/diagnostics/ws"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert!(r["ws_outbound_capacity"].is_number());
+    assert!(r["ws_outbound_dropped"].is_number());
+    assert!(r["ws_slow_consumer_closes"].is_number());
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_diagnostics_exec() {
     let d = daemon().await;
     let r: Value = ca(&d)

@@ -126,6 +126,14 @@ pub async fn diagnostics_groups(client: &DaemonClient) -> Result<()> {
     client.run_get("/diagnostics/groups").await
 }
 
+/// `x0x diagnostics ws` — GET /diagnostics/ws
+///
+/// WebSocket outbound-queue health: capacity and drop/slow-consumer-close
+/// counters (WS1.1 / #122).
+pub async fn diagnostics_ws(client: &DaemonClient) -> Result<()> {
+    client.run_get("/diagnostics/ws").await
+}
+
 /// `x0x peers probe <peer_id>` — POST /peers/:peer_id/probe
 ///
 /// Active liveness probe (ant-quic 0.27.2 #173). Sends a lightweight probe

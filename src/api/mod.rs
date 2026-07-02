@@ -236,6 +236,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "exec",
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/ws",
+        cli_name: "diagnostics ws",
+        description: "WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters",
+        category: "network",
+    },
+    EndpointDef {
         method: Method::Post,
         path: "/peers/:peer_id/probe",
         cli_name: "peer probe",
