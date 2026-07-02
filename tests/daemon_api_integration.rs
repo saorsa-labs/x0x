@@ -1302,16 +1302,44 @@ async fn daemon_api_import_card_invalid_trust_level_rejected() -> Result<()> {
         "unexpected error: {error}"
     );
 
+    // The rejected import must leave the trust surface UNTOUCHED. The naive
+    // "card_agent_id must be absent" check is the WRONG invariant here (#142):
+    // `card_agent_id` is THIS daemon's own agent (the card served at
+    // `/agent/card` is self), and the daemon's background announcement-
+    // processing loop (`lib.rs` announcement handler ->
+    // `ContactStore::add_machine`) legitimately registers any OBSERVED agent —
+    // including, on rebroadcast, itself — with `TrustLevel::Unknown` ("seen but
+    // not user-trusted"). That registration races this assertion, so mere
+    // presence does NOT mean the import ran.
+    //
+    // The import is provably side-effect-free on rejection: it returned 400 at
+    // the `trust_level` parse before any `ContactStore::add`. An ACCEPTED import
+    // would instead set the requested trust level (e.g. `known`) AND attach the
+    // card's display-name label. So the correct, provenance-based assertion is:
+    // if the card's agent is present in contacts, it must be the background-
+    // observation record (`trust_level == "unknown"`, untouched by the rejected
+    // import) — never a record the rejected import could have created (which
+    // would carry a non-`unknown` trust level and/or the card's display-name
+    // label). This pins the real invariant — a rejected import elevates no
+    // trust and creates no import-attributable record — without being flapped
+    // by the legitimate background self-registration race.
     let contacts: Value = client.get(d.url("/contacts")).send().await?.json().await?;
     let contact_entries = contacts["contacts"]
         .as_array()
         .context("contacts response missing contacts array")?;
-    ensure!(
-        !contact_entries
-            .iter()
-            .any(|contact| contact["agent_id"].as_str() == Some(card_agent_id)),
-        "invalid trust import added contact: {contacts:?}"
-    );
+    let matching: Vec<&Value> = contact_entries
+        .iter()
+        .filter(|contact| contact["agent_id"].as_str() == Some(card_agent_id))
+        .collect();
+    for contact in &matching {
+        let trust = contact["trust_level"].as_str().unwrap_or("");
+        ensure!(
+            trust == "unknown",
+            "rejected import must not elevate trust: card agent present with \
+             trust_level {trust:?}, expected `unknown` (background-observation \
+             record untouched by the rejected import) or absence: {contacts:?}"
+        );
+    }
     Ok(())
 }
 
