@@ -2639,4 +2639,173 @@ mod tests {
         let request_id = ExecRequestId([98; 16]);
         service.handle_cancel(agent, machine, request_id).await;
     }
+
+    // ========================================================================
+    // #124 / WS1.3 tranche 2 — handle_request gate-ORDER coverage.
+    //
+    // handle_request evaluates its deny gates in a fixed priority order:
+    //   (1) unverified sender
+    //   (2) trust != Accept
+    //   (3) exec policy disabled
+    //   (4) check_request (agent/machine not in ACL, argv/cwd/shell/stdin/timeout)
+    // That order is itself a security property — an unverified requester must
+    // never learn whether exec is enabled or whether they're in the ACL, so
+    // the (1)/(2) gates must win before any ACL introspection. These pin the
+    // priority AND fill the two gates the existing per-gate tests leave
+    // implicit: the `trust_decision: None` case and the not-in-ACL case at
+    // the handle_request level.
+    // ========================================================================
+
+    #[tokio::test]
+    async fn handle_request_denies_verified_sender_with_no_trust_decision() {
+        // A verified sender that carries NO trust decision at all is treated
+        // as trust-rejected: the gate is `!= Some(Accept)`, so `None` falls
+        // through to TrustRejected before the policy is even consulted.
+        let service = test_service().await;
+        Arc::clone(&service)
+            .handle_request(
+                inbound_payload(true, None),
+                ExecRequestId([62; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::TrustRejected).await;
+    }
+
+    #[tokio::test]
+    async fn handle_request_gate_order_unverified_beats_trust_and_disabled() {
+        // A request that is simultaneously unverified AND trust-rejected AND
+        // would hit a disabled policy must surface the FIRST gate only —
+        // UnverifiedSender — proving the gates are evaluated in order and an
+        // unverified requester learns nothing about trust state or policy.
+        // (The disabled-policy service below would otherwise yield
+        // ExecDisabled; the wrong trust payload would yield TrustRejected.)
+        let service = test_service().await;
+        Arc::clone(&service)
+            .handle_request(
+                // unverified + a rejected trust decision: both gates would fire
+                // if order weren't enforced.
+                inbound_payload(false, Some(TrustDecision::AcceptWithFlag)),
+                ExecRequestId([63; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::UnverifiedSender).await;
+    }
+
+    #[tokio::test]
+    async fn handle_request_gate_order_trust_beats_disabled() {
+        // Verified but trust-rejected, against a disabled policy: TrustRejected
+        // must win over ExecDisabled (the trust gate is checked before the
+        // policy is loaded).
+        let service = test_service().await;
+        Arc::clone(&service)
+            .handle_request(
+                inbound_payload(true, Some(TrustDecision::AcceptWithFlag)),
+                ExecRequestId([64; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::TrustRejected).await;
+    }
+
+    #[tokio::test]
+    async fn handle_request_gate_order_disabled_beats_not_in_acl() {
+        // Verified + trusted, against a DISABLED policy, with a requester pair
+        // that is NOT in any ACL: ExecDisabled must win over the not-in-ACL
+        // gate — the policy is consulted before the ACL, so a disabled exec
+        // never reveals ACL membership.
+        let service = test_service().await; // disabled policy, no ACL entry for [53;32]/[54;32]
+        Arc::clone(&service)
+            .handle_request(
+                inbound_payload(true, Some(TrustDecision::Accept)),
+                ExecRequestId([65; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::ExecDisabled).await;
+    }
+
+    #[tokio::test]
+    async fn handle_request_enabled_policy_denies_agent_machine_not_in_acl() {
+        // The 4th gate at the handle_request level: exec is ENABLED and the
+        // requester is verified + trusted, but their (agent, machine) pair is
+        // absent from the ACL entirely → AgentMachineNotInAcl. (Existing
+        // handle_request tests cover ArgvNotAllowed / StdinTooLarge /
+        // TimeoutTooLarge, all of which require the pair to BE in the ACL;
+        // this one isolates the not-in-ACL gate, the only check_request
+        // rejection that fires before command matching.)
+        let inbound = inbound_payload(true, Some(TrustDecision::Accept));
+        // Build an ACL for a DIFFERENT pair so the requester is not a member.
+        let acl = test_acl(AgentId([77; 32]), MachineId([78; 32]));
+        let (service, _dir) = enabled_test_service(acl).await;
+        Arc::clone(&service)
+            .handle_request(
+                inbound,
+                ExecRequestId([66; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::AgentMachineNotInAcl).await;
+    }
+
+    // ========================================================================
+    // #124 / WS1.3 tranche 2 — check_request shell-metacharacter matrix.
+    //
+    // check_request rejects argv containing shell metacharacters as
+    // defence-in-depth (argv is never passed through a shell, but a stray
+    // metachar in a literal token is a strong signal of an attempted
+    // injection against a downstream consumer). The existing test exercises
+    // only `;`; this table drives EVERY character contains_shell_metachar
+    // guards through the actual check_request path so each one is pinned.
+    // ========================================================================
+
+    #[tokio::test]
+    async fn check_request_rejects_every_shell_metacharacter() {
+        let service = test_service().await;
+        let agent = AgentId([81; 32]);
+        let machine = MachineId([82; 32]);
+        let acl = test_acl(agent, machine);
+        // Each entry injects one metacharacter into the second argv token; all
+        // must be rejected with ShellMetacharInArgv. The first token `echo` is
+        // a clean literal so only the injected token triggers.
+        for poison in [
+            "ok;rm",   // semicolon — command chaining
+            "$(id)",   // command substitution
+            "`id`",    // backtick command substitution
+            "ok|cat",  // pipe
+            "ok&",     // background
+            "ok\ncat", // newline — command injection across lines
+        ] {
+            let reason = denied(service.check_request(
+                &acl,
+                agent,
+                machine,
+                &["echo".to_string(), poison.to_string()],
+                None,
+                1_000,
+                None,
+            ));
+            assert_eq!(
+                reason,
+                DenialReason::ShellMetacharInArgv,
+                "argv with {poison:?} must be rejected as a shell metacharacter"
+            );
+        }
+    }
 }

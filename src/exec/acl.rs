@@ -731,4 +731,207 @@ argv = ["journalctl", "-u", "x0xd", "-n", "<INT>"]
         let enabled = ExecPolicy::Enabled(acl);
         assert!(enabled.enabled());
     }
+
+    // ========================================================================
+    // #124 / WS1.3 tranche 2 — load_exec_policy fail-closed matrix.
+    //
+    // Exec is fail-closed by construction: the only way to ENABLE remote
+    // command execution is a present, valid, enabled ACL. Every other load
+    // outcome yields either Disabled or a hard error. These pin each branch
+    // of that matrix so a future refactor cannot silently flip one to "allow".
+    // ========================================================================
+
+    #[tokio::test]
+    async fn load_policy_missing_file_at_default_path_is_disabled() {
+        // A missing ACL at the DEFAULT path must DISABLE exec safely — the
+        // whole design hinges on "no ACL configured" meaning "no exec", never
+        // "exec anything". Use an explicit nonexistent path (not `None`) so the
+        // result does not depend on whether the real default path exists on
+        // the developer's machine.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let missing = dir.path().join("absent-exec-acl.toml");
+        let policy = load_exec_policy(Some(&missing), LoadMode::DefaultPath)
+            .await
+            .expect("missing-at-default must be Ok(Disabled)");
+        match policy {
+            ExecPolicy::Disabled { reason, .. } => {
+                assert_eq!(reason, "acl_missing", "must report the fail-closed reason");
+            }
+            ExecPolicy::Enabled(_) => panic!("missing ACL must never enable exec"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_policy_missing_file_at_explicit_path_is_hard_error() {
+        // An operator who EXPLICITLY points at an ACL that doesn't exist has a
+        // misconfiguration: that must be a hard error, not a silent disable —
+        // otherwise a typo in the --exec-acl flag would quietly turn exec off
+        // (or, worse, a future change could make it quietly turn on).
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let missing = dir.path().join("absent-exec-acl.toml");
+        let err = load_exec_policy(Some(&missing), LoadMode::ExplicitPath)
+            .await
+            .expect_err("explicit missing path must error");
+        assert!(
+            matches!(err, AclError::Missing(_)),
+            "expected AclError::Missing, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_policy_malformed_toml_is_hard_error() {
+        // Garbage TOML must be a hard Parse error, never a silent disable.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("bad-acl.toml");
+        std::fs::write(&path, "this is not = valid = toml [[[").expect("write");
+        let err = load_exec_policy(Some(&path), LoadMode::ExplicitPath)
+            .await
+            .expect_err("malformed TOML must error");
+        assert!(
+            matches!(err, AclError::Parse { .. }),
+            "expected AclError::Parse, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_policy_missing_exec_section_is_disabled() {
+        // A valid TOML file with no [exec] section disables exec: the file is
+        // present but doesn't configure exec, so exec stays off.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("no-exec-section.toml");
+        std::fs::write(&path, "# some unrelated config\n[other]\nfoo = 1\n").expect("write");
+        let policy = load_exec_policy(Some(&path), LoadMode::ExplicitPath)
+            .await
+            .expect("present file is not a Missing error");
+        match policy {
+            ExecPolicy::Disabled { reason, .. } => {
+                assert_eq!(reason, "missing_exec_section");
+            }
+            ExecPolicy::Enabled(_) => panic!("no [exec] section must not enable exec"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_policy_enabled_false_is_disabled() {
+        // enabled = false is an explicit opt-out: the ACL is well-formed and
+        // present, but the operator turned exec off. Disabled, reason pinned.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("disabled-acl.toml");
+        std::fs::write(&path, "[exec]\nenabled = false\n").expect("write");
+        let policy = load_exec_policy(Some(&path), LoadMode::ExplicitPath)
+            .await
+            .expect("well-formed file is not a Missing error");
+        match policy {
+            ExecPolicy::Disabled { reason, .. } => {
+                assert_eq!(reason, "exec_disabled");
+            }
+            ExecPolicy::Enabled(_) => panic!("enabled=false must not enable exec"),
+        }
+    }
+
+    // ========================================================================
+    // #124 / WS1.3 tranche 2 — match_command token semantics.
+    //
+    // The allowlist is the last line of defence before a child is spawned.
+    // Literal tokens must match EXACTLY (no substring/prefix leakage), and
+    // LiteralWithUrlPathSuffix must not let a registered host be hijacked by
+    // an attacker-controlled suffix (the classic `http://a` vs `http://a.evil`
+    // confusion).
+    // ========================================================================
+
+    fn acl_with_command(agent: u8, machine: u8, argv: Vec<AllowedToken>) -> ExecAcl {
+        ExecAcl {
+            loaded_from: PathBuf::from("exec-acl.toml"),
+            loaded_at_unix_ms: 1,
+            caps: ExecCaps::default(),
+            audit_log_path: PathBuf::from("audit.jsonl"),
+            audit_tasklist_id: None,
+            allow: vec![AllowEntry {
+                description: None,
+                agent_id: AgentId([agent; 32]),
+                machine_id: MachineId([machine; 32]),
+                max_duration_secs: None,
+                commands: vec![AllowedCommand { argv }],
+            }],
+        }
+    }
+
+    #[test]
+    fn literal_token_matches_only_an_exact_string() {
+        // A Literal allowlist entry accepts ONLY the exact string — never a
+        // prefix, suffix, or the same string plus extra argv. This is what
+        // stops `echo ok` from authorising `echo ok && rm -rf /`.
+        let acl = acl_with_command(
+            1,
+            2,
+            vec![
+                AllowedToken::Literal("echo".to_string()),
+                AllowedToken::Literal("ok".to_string()),
+            ],
+        );
+        let agent = AgentId([1; 32]);
+        let machine = MachineId([2; 32]);
+
+        // Exact match — allowed.
+        assert!(acl
+            .match_command(&agent, &machine, &["echo".into(), "ok".into()])
+            .is_some());
+        // Extra argv — the allowlist is length-pinned, so a trailing arg
+        // (e.g. `echo ok; rm`) must NOT match even when the prefix tokens do.
+        assert!(acl
+            .match_command(&agent, &machine, &["echo".into(), "ok".into(), "x".into()])
+            .is_none());
+        // Prefix of a literal — `echop` is not `echo`.
+        assert!(acl
+            .match_command(&agent, &machine, &["echop".into(), "ok".into()])
+            .is_none());
+        // Wrong second token — `echo nope` is not `echo ok`.
+        assert!(acl
+            .match_command(&agent, &machine, &["echo".into(), "nope".into()])
+            .is_none());
+        // Empty argv.
+        assert!(acl.match_command(&agent, &machine, &[]).is_none());
+    }
+
+    #[test]
+    fn url_path_suffix_token_rejects_host_confusion() {
+        // LiteralWithUrlPathSuffix("https://a") must match a path UNDER
+        // `https://a` but NOT a host whose name merely STARTS with `https://a`
+        // — otherwise an attacker registers `https://a.evil` and rides the
+        // allowlist entry. The suffix after the prefix MUST be a valid URL
+        // path (leading `/`, no `..`), which `https://a.evil/path` is not.
+        let acl = acl_with_command(
+            3,
+            4,
+            vec![AllowedToken::LiteralWithUrlPathSuffix(
+                "https://a".to_string(),
+            )],
+        );
+        let agent = AgentId([3; 32]);
+        let machine = MachineId([4; 32]);
+
+        // Valid path under the registered host — allowed.
+        assert!(acl
+            .match_command(&agent, &machine, &["https://a/health".into()])
+            .is_some());
+        // Host confusion: `https://a.evil/...` must NOT match. The bytes after
+        // `https://a` are `.evil/...`, which is not a valid URL path (no
+        // leading `/`), so the suffix token rejects it.
+        assert!(
+            acl.match_command(&agent, &machine, &["https://a.evil/path".into()])
+                .is_none(),
+            "LiteralWithUrlPathSuffix must not let `https://a` authorize `https://a.evil`"
+        );
+        // Bare prefix with no path at all — `https://a` strips to an empty
+        // suffix, which is not a valid URL path, so it is rejected.
+        assert!(
+            acl.match_command(&agent, &machine, &["https://a".into()])
+                .is_none(),
+            "bare prefix with empty suffix must not match (not a valid URL path)"
+        );
+        // Path traversal — rejected by the URL-path validator (no `..`).
+        assert!(acl
+            .match_command(&agent, &machine, &["https://a/../etc".into()])
+            .is_none());
+    }
 }
