@@ -9439,6 +9439,188 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // #124 / WS1.3 tranche 4 — shutdown ordering invariants.
+    //
+    // `shutdown()` and `begin_shutdown()` carry ordering guarantees that are
+    // themselves correctness properties (a still-running join_network must not
+    // leak a task past shutdown; a second shutdown must never panic; a token-
+    // respecting task must be graced, not force-aborted). These pin them as
+    // fast, daemon-free unit tests. The WS/SSE close-on-shutdown notification
+    // path is already covered at integration tier by
+    // `daemon_api_shutdown_with_sse_client` and is not re-duplicated here
+    // (avoiding a src/server/mod.rs touch during Eng B's #125 window).
+    // ========================================================================
+
+    /// `begin_shutdown()` is the synchronous shutdown prefix: it cancels the
+    /// token AND closes the tracked-task registry, without draining. After it
+    /// returns, `spawn_tracked` must refuse (next test) and a subsequent
+    /// `shutdown()` must still complete cleanly. Pins that the two halves of
+    /// the shutdown signal — token + closed-flag — move together.
+    #[tokio::test]
+    async fn begin_shutdown_closes_registry_and_cancels_token() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+
+        assert!(
+            !agent.shutdown_token.is_cancelled(),
+            "token must not be cancelled before shutdown begins"
+        );
+        assert!(
+            !agent.tracked_tasks.lock().expect("tracked_tasks").closed,
+            "registry must be open before shutdown begins"
+        );
+
+        agent.begin_shutdown();
+
+        assert!(
+            agent.shutdown_token.is_cancelled(),
+            "begin_shutdown must cancel the shutdown token"
+        );
+        assert!(
+            agent.tracked_tasks.lock().expect("tracked_tasks").closed,
+            "begin_shutdown must close the tracked-task registry"
+        );
+
+        // begin_shutdown does NOT drain — that is shutdown()'s job. The handles
+        // must still be present (untouched) until shutdown() runs.
+        // (None were spawned here, so the registry is empty-but-closed.)
+    }
+
+    /// Once `begin_shutdown()` has closed the registry, `spawn_tracked` must be
+    /// a no-op: the handle is NOT pushed. This is the invariant that defeats a
+    /// racing `join_network` from leaking heartbeat/reaper/presence tasks past
+    /// the subsequent `shutdown()` (the registry drains empty because nothing
+    // new can enter after close).
+    #[tokio::test]
+    async fn spawn_tracked_refuses_after_begin_shutdown() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+
+        // Before begin_shutdown: spawn_tracked accepts.
+        agent.spawn_tracked(async {});
+        let before = agent
+            .tracked_tasks
+            .lock()
+            .expect("tracked_tasks")
+            .handles
+            .len();
+        assert_eq!(
+            before, 1,
+            "spawn_tracked must register a task before begin_shutdown"
+        );
+
+        // Close the registry, then attempt another spawn.
+        agent.begin_shutdown();
+        agent.spawn_tracked(async {});
+
+        {
+            let after = agent.tracked_tasks.lock().expect("tracked_tasks");
+            assert_eq!(
+                after.handles.len(),
+                before,
+                "spawn_tracked must be a no-op (handle NOT pushed) after begin_shutdown \
+                 closed the registry — a racing join_network would otherwise leak a task"
+            );
+            assert!(after.closed, "registry must remain closed");
+        }
+
+        // Clean up the one task we did register so it does not outlive the test.
+        agent.shutdown().await;
+    }
+
+    /// `shutdown()` is documented idempotent: `cancel()` is idempotent, the
+    /// registry drains empty on a second call, and the `Option<JoinHandle>`
+    /// `stop_*` helpers use `Option::take` (a second take is None). Pin that a
+    /// double shutdown never panics and leaves the registry drained.
+    #[tokio::test]
+    async fn shutdown_is_idempotent_and_never_panics_on_second_call() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+
+        agent.shutdown().await;
+        // The invariant: a second shutdown must be a safe no-op, never panic
+        // (an embedder re-entering shutdown on an error path must not crash).
+        agent.shutdown().await;
+
+        let registry = agent.tracked_tasks.lock().expect("tracked_tasks");
+        assert!(
+            registry.closed,
+            "registry must remain closed after a double shutdown"
+        );
+        assert!(
+            registry.handles.is_empty(),
+            "registry must be drained after a double shutdown"
+        );
+        assert!(
+            agent.shutdown_token.is_cancelled(),
+            "token must remain cancelled after a double shutdown"
+        );
+    }
+
+    /// Shutdown ordering: the registry grace-awaits tracked tasks BEFORE any
+    /// straggler is force-aborted. So a task that RESPECTS the token (awaits
+    /// `shutdown_token.cancelled()`) must run to its natural end and set its
+    /// completed-flag — it is graced, not aborted. This is the positive arm of
+    /// the grace/abort policy.
+    ///
+    /// NOTE: we deliberately do NOT assert what the task observes for
+    /// `is_cancelled()` at first-poll. On a multi-thread runtime `tokio::spawn`
+    /// may schedule the task onto another worker that polls it BEFORE
+    /// `shutdown()` runs on this thread, so first-poll-observes-cancelled is a
+    /// race, not an invariant. The robust, non-racy claim is grace-before-abort:
+    /// the well-behaved task completes naturally (sets its flag) rather than
+    /// being force-aborted by the 3s-straggler path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_graces_a_token_respecting_tracked_task() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+
+        // A token-respecting task: it records that it reached its natural end
+        // (graceful completion, never aborted). If the grace-await path broke
+        // (e.g. the task were force-aborted), this flag would stay false.
+        let completed_gracefully = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let token = agent.shutdown_token.clone();
+        let cg = std::sync::Arc::clone(&completed_gracefully);
+        agent.spawn_tracked(async move {
+            // Graceful: stop as soon as the token fires, without being aborted.
+            token.cancelled().await;
+            cg.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        agent.shutdown().await;
+
+        assert!(
+            completed_gracefully.load(std::sync::atomic::Ordering::SeqCst),
+            "token-respecting task must complete GRACEFULLY (set its flag before \
+             returning) — proves the grace-await precedes any force-abort"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn connected_peer_clears_stale_lifecycle_block_before_raw_send() {
         let dir = tempfile::tempdir().expect("tmpdir");
