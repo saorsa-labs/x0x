@@ -119,31 +119,35 @@ is enabled. This is the discovery half of A2A interop — see
 
 ```json
 {
-  "payload_b64": "<base64 bytes to sign>",
-  "domain": "my-protocol.v1.register"
+  "context": "x0x-symphony-handoff-v1",
+  "payload_b64": "<base64 bytes to sign>"
 }
 ```
 
 Notes:
-- `payload_b64` is decoded and signed verbatim (max 256 KiB). Callers
-  canonicalize structured payloads themselves.
-- `domain` is optional. When present, the daemon signs
-  `domain || 0x00 || payload` and echoes `domain` in the response, so a
-  signature for one protocol context cannot be replayed in another.
-  Domains must be non-empty, NUL-free, and at most 1024 bytes.
-  `x0x.<purpose>.<version>` is the conventional shape for x0x protocols.
+- `context` is **required** (issue #133): a caller-chosen ASCII string
+  matching `[a-z0-9._-]{1,64}` naming the application protocol the
+  signature is bound to. The daemon signs the length-prefixed external DST
+  `[0xF0] | b"x0x.external-agent-sign.v1" | len(context):u32 BE | context | payload`,
+  provably disjoint from every internal x0x signing input (announcements,
+  group commits, certificates, …). A denylist rejects `context` strings
+  naming internal signing domains. There is no raw-payload signing path.
+- `payload_b64` is decoded and signed verbatim under the DST (max 64 KiB —
+  external signing is for hashes/manifests, not blobs). Callers canonicalize
+  structured payloads themselves.
 - Response: `ok`, `agent_id` (hex), `public_key_b64`, `signature_b64`,
-  `algorithm` (`x0x.agent-sign.v1.ml-dsa-65`), and `domain` when supplied.
+  `context` (echoed), and `algorithm` (`x0x.agent-sign.v2.ml-dsa-65`).
+- `400` for an invalid/denied `context`; `413` over the 64 KiB cap.
 
 ### Verify request body
 
 ```json
 {
+  "context": "x0x-symphony-handoff-v1",
   "payload_b64": "<base64 payload bytes>",
   "signature_b64": "<base64 detached ML-DSA-65 signature>",
   "public_key_b64": "<base64 ML-DSA-65 public key>",
-  "domain": "my-protocol.v1.register",
-  "algorithm": "x0x.agent-sign.v1.ml-dsa-65"
+  "algorithm": "x0x.agent-sign.v2.ml-dsa-65"
 }
 ```
 
@@ -151,19 +155,18 @@ Notes:
 - Stateless: verification uses only the caller-supplied public material —
   no key access, no identity state. The counterpart to `/agent/sign` for
   applications reading signed records back from disk or distributed
-  storage.
+  storage. `context` is **required** and must match the value used at
+  signing time — verification reconstructs the same external DST.
 - A failed signature check is a **result, not an error**: the response is
-  `200` with `{ "ok": true, "valid": false, "algorithm": "x0x.agent-sign.v1.ml-dsa-65" }`.
+  `200` with `{ "ok": true, "valid": false, "algorithm": "x0x.agent-sign.v2.ml-dsa-65" }`.
 - `400` is reserved for malformed input: bad base64 in any field, empty
   payload, a public key that is not exactly 1952 bytes, a signature that
-  is not exactly 3309 bytes, an invalid `domain` (empty, NUL bytes, or
-  over 1024 bytes), or an unknown `algorithm`. `413` for payloads over
-  the 256 KiB cap. Limits mirror `/agent/sign` exactly.
-- `domain` is optional and must match the value used at signing time:
-  verification is then performed over `domain || 0x00 || payload`.
+  is not exactly 3309 bytes, an invalid/denied `context`, or an unknown
+  `algorithm`. `413` for payloads over the 64 KiB cap. Limits mirror
+  `/agent/sign` exactly.
 - `algorithm` is optional; when the field is present — including as JSON
   null — it must be the exact scheme string
-  `x0x.agent-sign.v1.ml-dsa-65`, so any future scheme migration is
+  `x0x.agent-sign.v2.ml-dsa-65`, so any future scheme migration is
   explicit rather than silent.
 - Response: `ok`, `valid` (boolean), `algorithm`.
 

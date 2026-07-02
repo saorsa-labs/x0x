@@ -342,9 +342,12 @@ enum AgentSub {
         /// Base64-encoded bytes to sign.
         #[arg(long)]
         payload_b64: Option<String>,
-        /// Optional domain-separation string; signs `domain || 0x00 || payload`.
+        /// Required domain-separation context (e.g.
+        /// `x0x-symphony-handoff-v1`). The daemon signs the external DST
+        /// `[0xF0]|magic|len|context|payload`, disjoint from every internal
+        /// x0x signing input (issue #133). Must match `[a-z0-9._-]{1,64}`.
         #[arg(long)]
-        domain: Option<String>,
+        context: String,
     },
     /// Verify a detached ML-DSA-65 signature against a caller-supplied
     /// public key. Pass either `--file <PATH>` (use `-` for stdin) or
@@ -363,9 +366,9 @@ enum AgentSub {
         /// Base64-encoded ML-DSA-65 public key (1952 bytes decoded).
         #[arg(long)]
         public_key_b64: String,
-        /// Optional domain-separation string; verifies `domain || 0x00 || payload`.
+        /// Required domain-separation context the signature was produced with.
         #[arg(long)]
-        domain: Option<String>,
+        context: String,
     },
 }
 
@@ -1268,22 +1271,17 @@ async fn run(
             Some(AgentSub::Sign {
                 file,
                 payload_b64,
-                domain,
+                context,
             }) => {
-                commands::identity::sign(
-                    &client,
-                    file.as_deref(),
-                    payload_b64.as_deref(),
-                    domain.as_deref(),
-                )
-                .await
+                commands::identity::sign(&client, file.as_deref(), payload_b64.as_deref(), &context)
+                    .await
             }
             Some(AgentSub::Verify {
                 file,
                 payload_b64,
                 signature_b64,
                 public_key_b64,
-                domain,
+                context,
             }) => {
                 commands::identity::verify(
                     &client,
@@ -1291,7 +1289,7 @@ async fn run(
                     payload_b64.as_deref(),
                     &signature_b64,
                     &public_key_b64,
-                    domain.as_deref(),
+                    &context,
                 )
                 .await
             }

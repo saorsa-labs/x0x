@@ -3,6 +3,8 @@
 //! Both `x0xd` (the daemon) and `x0x` (the CLI) consume this registry,
 //! ensuring routes and CLI commands never drift out of sync.
 
+pub mod agent_signing;
+
 /// HTTP method for an endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {

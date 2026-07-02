@@ -119,24 +119,22 @@ pub async fn import_card(
 ///
 /// Reads bytes from `--file <PATH>` (or stdin when path is `-`) OR uses
 /// `--payload-b64 <BASE64>` directly, base64-encodes the bytes, and asks
-/// the daemon to produce a detached ML-DSA-65 signature. The daemon signs
-/// exact bytes; callers should canonicalize structured payloads. Pass
-/// `--domain <STRING>` to sign `domain || 0x00 || payload` for
-/// cross-protocol replay protection (issue #90).
+/// the daemon to produce a detached ML-DSA-65 signature over the
+/// domain-separated external DST `[0xF0]|magic|len|context|payload`. The
+/// required `--context <STRING>` names the caller's application protocol
+/// and is provably disjoint from every internal x0x signing input
+/// (issue #133); callers should canonicalize structured payloads.
 pub async fn sign(
     client: &DaemonClient,
     file: Option<&str>,
     payload_b64: Option<&str>,
-    domain: Option<&str>,
+    context: &str,
 ) -> Result<()> {
     client.ensure_running().await?;
 
     let payload_b64 = payload_b64_from_args(file, payload_b64)?;
 
-    let mut body = serde_json::json!({ "payload_b64": payload_b64 });
-    if let Some(domain) = domain {
-        body["domain"] = serde_json::Value::String(domain.to_string());
-    }
+    let body = serde_json::json!({ "context": context, "payload_b64": payload_b64 });
     let resp = client.post("/agent/sign", &body).await?;
     print_value(client.format(), &resp);
     Ok(())
@@ -146,9 +144,10 @@ pub async fn sign(
 ///
 /// Verifies a detached ML-DSA-65 signature against a caller-supplied
 /// public key. The payload comes from `--file <PATH>` (or stdin when the
-/// path is `-`) OR `--payload-b64 <BASE64>`, exactly as for `sign`. Pass
-/// `--domain <STRING>` when the signature was produced with domain
-/// separation (`domain || 0x00 || payload`, issue #90). Verification is
+/// path is `-`) OR `--payload-b64 <BASE64>`, exactly as for `sign`. The
+/// required `--context <STRING>` must match the context the signature was
+/// produced with — verification reconstructs the same external DST
+/// (`[0xF0]|magic|len|context|payload`, issue #133). Verification is
 /// stateless — the daemon uses only the supplied public material.
 ///
 /// Exit status: 0 when the signature is valid; non-zero when it is not
@@ -159,7 +158,7 @@ pub async fn verify(
     payload_b64: Option<&str>,
     signature_b64: &str,
     public_key_b64: &str,
-    domain: Option<&str>,
+    context: &str,
 ) -> Result<()> {
     // Usage errors (missing/ambiguous payload args) must win over daemon
     // reachability, so validate local inputs before probing the daemon.
@@ -167,14 +166,12 @@ pub async fn verify(
 
     client.ensure_running().await?;
 
-    let mut body = serde_json::json!({
+    let body = serde_json::json!({
+        "context": context,
         "payload_b64": payload_b64,
         "signature_b64": signature_b64,
         "public_key_b64": public_key_b64,
     });
-    if let Some(domain) = domain {
-        body["domain"] = serde_json::Value::String(domain.to_string());
-    }
     let resp = client.post("/agent/verify", &body).await?;
     print_value(client.format(), &resp);
     if resp.get("valid").and_then(|v| v.as_bool()) != Some(true) {
@@ -353,7 +350,7 @@ mod tests {
         let mock_resp = serde_json::json!({"signature_b64": "c2ln"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
-        let result = sign(&client, None, Some("aGVsbG8="), None).await;
+        let result = sign(&client, None, Some("aGVsbG8="), "test.sign.v1").await;
         assert!(result.is_ok(), "sign should succeed: {:?}", result);
     }
 
@@ -365,7 +362,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("payload.txt");
         std::fs::write(&path, b"hello").unwrap();
-        let result = sign(&client, path.to_str(), None, None).await;
+        let result = sign(&client, path.to_str(), None, "test.sign.v1").await;
         assert!(result.is_ok(), "sign file should succeed: {:?}", result);
     }
 
@@ -375,11 +372,11 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
 
-        let both = sign(&client, Some("-"), Some("aGVsbG8="), None).await;
+        let both = sign(&client, Some("-"), Some("aGVsbG8="), "test.sign.v1").await;
         assert!(both.is_err());
         assert!(both.unwrap_err().to_string().contains("pass either --file"));
 
-        let neither = sign(&client, None, None, None).await;
+        let neither = sign(&client, None, None, "test.sign.v1").await;
         assert!(neither.is_err());
         assert!(neither
             .unwrap_err()
@@ -459,7 +456,7 @@ mod tests {
             Some("aGVsbG8="),
             "c2ln",
             "cGs=",
-            Some("x0x.test.v1"),
+            "x0x.test.v1",
         )
         .await;
         assert!(result.is_ok(), "verify should succeed: {:?}", result);
@@ -472,16 +469,26 @@ mod tests {
         assert_eq!(body["payload_b64"], "aGVsbG8=");
         assert_eq!(body["signature_b64"], "c2ln");
         assert_eq!(body["public_key_b64"], "cGs=");
-        assert_eq!(body["domain"], "x0x.test.v1");
+        assert_eq!(body["context"], "x0x.test.v1");
     }
 
     #[tokio::test]
-    async fn verify_omits_domain_when_not_passed() {
+    async fn verify_always_sends_context() {
+        // `context` is required (issue #133), so it is always present in the
+        // request body — there is no "omit context" path.
         let mock_resp = serde_json::json!({"ok": true, "valid": true});
         let (url, _shutdown, captured) = start_capturing_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
 
-        let result = verify(&client, None, Some("aGVsbG8="), "c2ln", "cGs=", None).await;
+        let result = verify(
+            &client,
+            None,
+            Some("aGVsbG8="),
+            "c2ln",
+            "cGs=",
+            "x0x.test.v1",
+        )
+        .await;
         assert!(result.is_ok(), "verify should succeed: {:?}", result);
 
         let captured = captured.lock().unwrap();
@@ -489,9 +496,9 @@ mod tests {
             .iter()
             .find(|(path, _)| path == "/agent/verify")
             .expect("a request must be POSTed to /agent/verify");
-        assert!(
-            body.get("domain").is_none(),
-            "request must not contain a domain field when none was passed"
+        assert_eq!(
+            body["context"], "x0x.test.v1",
+            "request must carry the required context field"
         );
     }
 
@@ -505,7 +512,15 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
 
-        let result = verify(&client, None, Some("aGVsbG8="), "c2ln", "cGs=", None).await;
+        let result = verify(
+            &client,
+            None,
+            Some("aGVsbG8="),
+            "c2ln",
+            "cGs=",
+            "x0x.test.v1",
+        )
+        .await;
         assert!(result.is_err(), "valid:false must map to a non-zero exit");
         assert!(result
             .unwrap_err()
@@ -519,11 +534,19 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
 
-        let both = verify(&client, Some("-"), Some("aGVsbG8="), "c2ln", "cGs=", None).await;
+        let both = verify(
+            &client,
+            Some("-"),
+            Some("aGVsbG8="),
+            "c2ln",
+            "cGs=",
+            "x0x.test.v1",
+        )
+        .await;
         assert!(both.is_err());
         assert!(both.unwrap_err().to_string().contains("pass either --file"));
 
-        let neither = verify(&client, None, None, "c2ln", "cGs=", None).await;
+        let neither = verify(&client, None, None, "c2ln", "cGs=", "x0x.test.v1").await;
         assert!(neither.is_err());
         assert!(neither
             .unwrap_err()
@@ -538,7 +561,7 @@ mod tests {
         // the usage error.
         let client =
             DaemonClient::new(None, Some("http://127.0.0.1:9"), OutputFormat::Json).unwrap();
-        let neither = verify(&client, None, None, "c2ln", "cGs=", None).await;
+        let neither = verify(&client, None, None, "c2ln", "cGs=", "x0x.test.v1").await;
         assert!(neither.is_err());
         assert!(neither
             .unwrap_err()
