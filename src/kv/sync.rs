@@ -89,10 +89,31 @@ impl KvStoreSync {
     /// bootstraps keys written before it joined. Without this, only
     /// deltas published *after* subscribing ever arrive.
     pub async fn start(&self) -> Result<()> {
+        self.start_with_spawner(|fut| {
+            tokio::spawn(fut);
+        })
+        .await
+    }
+
+    /// Start background synchronization with a caller-supplied spawner.
+    ///
+    /// Identical to [`start`](Self::start), but routes the background loops
+    /// (delta-merge listener, state-request responder, and the bounded
+    /// bootstrap requester) through `spawn` instead of detaching them with
+    /// `tokio::spawn`. The `Agent` passes its tracked-task spawner so these
+    /// loops are registered with the `Agent::shutdown()` drain and aborted on
+    /// teardown (issue #126); callers without an `Agent` use
+    /// [`start`](Self::start), which detaches via `tokio::spawn` as before.
+    pub async fn start_with_spawner<S>(&self, spawn: S) -> Result<()>
+    where
+        S: Fn(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>)
+            + Send
+            + Sync,
+    {
         let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
         let store = Arc::clone(&self.store);
 
-        tokio::spawn(async move {
+        spawn(Box::pin(async move {
             while let Some(msg) = sub.recv().await {
                 let decoded = decode_delta::<KvStoreDelta>(&msg.payload);
                 match decoded {
@@ -110,7 +131,7 @@ impl KvStoreSync {
                     }
                 }
             }
-        });
+        }));
 
         // Responder: holders with non-empty state answer StateRequests by
         // republishing their full state as a regular delta on the main
@@ -122,7 +143,7 @@ impl KvStoreSync {
         let responder_pubsub = Arc::clone(&self.pubsub);
         let responder_topic = self.topic.clone();
         let local_peer_id = self.local_peer_id;
-        tokio::spawn(async move {
+        spawn(Box::pin(async move {
             while let Some(msg) = sync_sub.recv().await {
                 let Ok(KvSyncMessage::StateRequest { requester }) =
                     bincode::deserialize::<KvSyncMessage>(&msg.payload)
@@ -149,7 +170,7 @@ impl KvStoreSync {
                     tracing::warn!("KvStore state-response publish failed: {e}");
                 }
             }
-        });
+        }));
 
         // Bootstrap requester: a first-time joiner starts with an empty
         // store and has no other way to learn keys written before it
@@ -165,7 +186,7 @@ impl KvStoreSync {
         if self.store.read().await.is_empty() {
             let requester_pubsub = Arc::clone(&self.pubsub);
             let sync_topic = self.state_sync_topic();
-            tokio::spawn(async move {
+            spawn(Box::pin(async move {
                 for delay_secs in STATE_REQUEST_RETRY_SECS {
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     let request = KvSyncMessage::StateRequest {
@@ -181,7 +202,7 @@ impl KvStoreSync {
                         tracing::debug!("KvStore state-request publish failed: {e}");
                     }
                 }
-            });
+            }));
         }
 
         Ok(())

@@ -7670,12 +7670,14 @@ impl Agent {
         })?;
 
         let sync = std::sync::Arc::new(sync);
-        sync.start().await.map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "task list sync start failed: {}",
-                e
-            )))
-        })?;
+        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "task list sync start failed: {}",
+                    e
+                )))
+            })?;
 
         Ok(TaskListHandle {
             sync,
@@ -7732,12 +7734,14 @@ impl Agent {
         })?;
 
         let sync = std::sync::Arc::new(sync);
-        sync.start().await.map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "task list sync start failed: {}",
-                e
-            )))
-        })?;
+        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "task list sync start failed: {}",
+                    e
+                )))
+            })?;
 
         Ok(TaskListHandle {
             sync,
@@ -8572,11 +8576,13 @@ impl Agent {
         })?;
 
         let sync = std::sync::Arc::new(sync);
-        sync.start().await.map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "kv store sync start failed: {e}",
-            )))
-        })?;
+        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "kv store sync start failed: {e}",
+                )))
+            })?;
 
         Ok(KvStoreHandle {
             sync,
@@ -8627,11 +8633,13 @@ impl Agent {
         })?;
 
         let sync = std::sync::Arc::new(sync);
-        sync.start().await.map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "kv store sync start failed: {e}",
-            )))
-        })?;
+        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "kv store sync start failed: {e}",
+                )))
+            })?;
 
         Ok(KvStoreHandle {
             sync,
@@ -9353,6 +9361,82 @@ mod tests {
         agent.shutdown().await;
         assert!(agent.heartbeat_handle.lock().await.is_none());
         assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// Issue #126 / WS1.5: the delta-merge + state-request subscription loops
+    /// spawned by `create_kv_store` / `create_task_list` must be routed through
+    /// `spawn_tracked` so `Agent::shutdown()` drains and aborts them. Previously
+    /// they detached via bare `tokio::spawn` and only ended when the gossip
+    /// runtime later dropped its topic sender.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_drains_crdt_kv_sync_tasks() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+
+        // Build() constructs the gossip runtime, so creating a store + a list
+        // works without join_network. Each creation spawns the delta-merge and
+        // state-request subscription loops (plus a bounded bootstrap requester
+        // for an empty store/list).
+        let baseline = agent
+            .tracked_tasks
+            .lock()
+            .expect("tracked_tasks")
+            .handles
+            .len();
+
+        agent
+            .create_kv_store("ws15-store", "ws15-store-topic")
+            .await
+            .expect("create kv store");
+        agent
+            .create_task_list("ws15-list", "ws15-list-topic")
+            .await
+            .expect("create task list");
+
+        // The loops must now be registered with spawn_tracked. With the old bare
+        // tokio::spawn this count would NOT have moved.
+        let (registered, abort_handles): (usize, Vec<tokio::task::AbortHandle>) = {
+            let guard = agent.tracked_tasks.lock().expect("tracked_tasks");
+            let aborts = guard.handles.iter().map(|h| h.abort_handle()).collect();
+            (guard.handles.len(), aborts)
+        };
+        assert!(
+            registered > baseline,
+            "CRDT/KV sync loops must register with spawn_tracked \
+             (registry {registered}, baseline {baseline})"
+        );
+
+        agent.shutdown().await;
+
+        // shutdown() closes the registry and drains it (handles taken, grace-
+        // awaited, stragglers aborted).
+        let after = agent.tracked_tasks.lock().expect("tracked_tasks");
+        assert!(
+            after.closed,
+            "tracked-task registry must be closed after shutdown"
+        );
+        assert!(
+            after.handles.is_empty(),
+            "tracked-task registry must be drained after shutdown ({} left)",
+            after.handles.len()
+        );
+        drop(after);
+
+        // Every formerly-tracked sync loop terminated.
+        for handle in &abort_handles {
+            assert!(
+                handle.is_finished(),
+                "a CRDT/KV sync task did not terminate after shutdown"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
