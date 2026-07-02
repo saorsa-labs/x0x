@@ -679,4 +679,165 @@ mod tests {
     async fn machine_keypair_exists_in_dir(dir: &Path) -> bool {
         dir.join(MACHINE_KEY_FILE).exists()
     }
+
+    // ========================================================================
+    // #124 / WS1.3 tranche 3 — storage / identity error paths.
+    //
+    // Key material is the root of trust. These pin the failure modes that
+    // matter for a security daemon: a corrupt/truncated/wrong-size keyfile
+    // must surface as a STRUCTURED `IdentityError` (never a panic), and the
+    // atomic write must fail cleanly when the destination is unwritable.
+    // Round-trip coverage is extended to agent + user keypairs (machine was
+    // already covered above).
+    // ========================================================================
+
+    #[tokio::test]
+    async fn write_private_bytes_fails_when_parent_is_a_file_not_a_dir() {
+        // `write_private_file` begins with `create_dir_all(parent)`; if the
+        // parent path is an existing regular file, that must fail and surface
+        // as a structured Storage error — never a panic, never a silent ok.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let blocker = tmp.path().join("blocker");
+        tokio::fs::write(&blocker, b"x")
+            .await
+            .expect("create blocker file");
+        let target = blocker.join("sub").join("secret.key");
+        let result = write_private_bytes(&target, b"secret".to_vec()).await;
+        let err = result.expect_err("must fail when parent is a regular file");
+        assert!(
+            matches!(err, IdentityError::Storage(_)),
+            "unwritable destination must surface as IdentityError::Storage, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_private_bytes_leaves_no_final_file_on_failure() {
+        // On the failure path above the final target must NOT exist (the
+        // atomic write is temp-then-rename; a failure before rename leaves
+        // no committed file). This guards against a half-written keyfile
+        // being trusted on a later load.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let blocker = tmp.path().join("blocker");
+        tokio::fs::write(&blocker, b"x")
+            .await
+            .expect("create blocker file");
+        let target = blocker.join("sub").join("secret.key");
+        let _ = write_private_bytes(&target, b"secret".to_vec()).await;
+        assert!(
+            !target.exists(),
+            "no committed file must remain after a failed atomic write"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_truncated_and_garbage_bytes_for_every_keypair_type() {
+        // Corrupt / truncated keyfiles must surface as a structured
+        // `Serialization` error (bincode fails) — never a panic. Machine's
+        // `[1,2,3]` case exists above; this extends the matrix to all three
+        // keypair types AND includes empty + larger garbage.
+        let bad_inputs: &[&[u8]] = &[&[], &[1, 2, 3], &[0xA5; 64], &[0xFF; 4096]];
+        for bytes in bad_inputs {
+            let err = deserialize_machine_keypair(bytes)
+                .err()
+                .unwrap_or_else(|| panic!("machine: garbage must error: {bytes:?}"));
+            assert!(
+                matches!(err, IdentityError::Serialization(_)),
+                "machine {bytes:?} must be Serialization, got {err:?}"
+            );
+            let err = deserialize_agent_keypair(bytes)
+                .err()
+                .unwrap_or_else(|| panic!("agent: garbage must error: {bytes:?}"));
+            assert!(
+                matches!(err, IdentityError::Serialization(_)),
+                "agent {bytes:?} must be Serialization, got {err:?}"
+            );
+            let err = deserialize_user_keypair(bytes)
+                .err()
+                .unwrap_or_else(|| panic!("user: garbage must error: {bytes:?}"));
+            assert!(
+                matches!(err, IdentityError::Serialization(_)),
+                "user {bytes:?} must be Serialization, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_valid_bincode_with_wrong_size_key_material() {
+        // A subtler corruption: the bincode frame is well-formed (so bincode
+        // does NOT fail), but the embedded key bytes are the wrong size for
+        // an ML-DSA-65 key. `from_bytes` must reject these as a structured
+        // `InvalidPublicKey`/`InvalidSecretKey` — again, never a panic.
+        let malformed = SerializedKeypair {
+            public_key: vec![0u8; 10], // wrong size (not 1952 bytes)
+            secret_key: vec![0u8; 10],
+        };
+        let bytes = bincode::serialize(&malformed).expect("serialize malformed pair");
+
+        let err = deserialize_machine_keypair(&bytes).expect_err("must reject wrong-size key");
+        assert!(
+            matches!(
+                err,
+                IdentityError::InvalidPublicKey(_) | IdentityError::InvalidSecretKey(_)
+            ),
+            "wrong-size machine key must be InvalidPublicKey/InvalidSecretKey, got {err:?}"
+        );
+        let err = deserialize_agent_keypair(&bytes).expect_err("must reject wrong-size key");
+        assert!(
+            matches!(
+                err,
+                IdentityError::InvalidPublicKey(_) | IdentityError::InvalidSecretKey(_)
+            ),
+            "wrong-size agent key must be InvalidPublicKey/InvalidSecretKey, got {err:?}"
+        );
+        let err = deserialize_user_keypair(&bytes).expect_err("must reject wrong-size key");
+        assert!(
+            matches!(
+                err,
+                IdentityError::InvalidPublicKey(_) | IdentityError::InvalidSecretKey(_)
+            ),
+            "wrong-size user key must be InvalidPublicKey/InvalidSecretKey, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_keypair_round_trips_through_file_storage() {
+        // End-to-end file round-trip for the agent keypair (machine is
+        // covered above): save -> load -> identity preserved, file 0600.
+        let kp = AgentKeypair::generate().expect("generate agent keypair");
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let path = tmp.path().join("agent.key");
+        save_agent_keypair(&kp, &path).await.expect("save");
+        let loaded = load_agent_keypair(&path).await.expect("load");
+        assert_eq!(
+            kp.public_key().as_bytes(),
+            loaded.public_key().as_bytes(),
+            "agent public key must survive a save/load round-trip"
+        );
+        assert_eq!(
+            kp.agent_id(),
+            loaded.agent_id(),
+            "agent_id must survive a save/load round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_keypair_round_trips_through_file_storage() {
+        // End-to-end file round-trip for the user keypair: save -> load ->
+        // identity + user_id preserved.
+        let kp = UserKeypair::generate().expect("generate user keypair");
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let path = tmp.path().join("user.key");
+        save_user_keypair_to(&kp, &path).await.expect("save");
+        let loaded = load_user_keypair_from(&path).await.expect("load");
+        assert_eq!(
+            kp.public_key().as_bytes(),
+            loaded.public_key().as_bytes(),
+            "user public key must survive a save/load round-trip"
+        );
+        assert_eq!(
+            kp.user_id(),
+            loaded.user_id(),
+            "user_id must survive a save/load round-trip"
+        );
+    }
 }

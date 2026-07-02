@@ -1229,4 +1229,65 @@ mod tests {
         let display = format!("{}", id);
         assert!(display.contains("3333"));
     }
+
+    // ========================================================================
+    // #124 / WS1.3 tranche 3 — AgentCertificate verification failure paths.
+    //
+    // The wrong-user-key and tampered-agent-key cases are covered above
+    // (asserting `is_err()`). The gap is a corrupted SIGNATURE: an attacker
+    // (or bit-rot) that changes the signature bytes while leaving the keys
+    // intact must fail verification and surface the failure as the STRUCTURED
+    // `IdentityError::CertificateVerification` variant — never a panic and
+    // never a silent accept. Two sub-cases: a same-length corrupted signature
+    // (reaches the ML-DSA verify step, fails there) and a wrong-length
+    // signature (rejected at the signature-format parse).
+    // ========================================================================
+
+    #[test]
+    fn agent_certificate_corrupted_signature_fails_with_structured_error() {
+        let user_kp = UserKeypair::generate().unwrap();
+        let agent_kp = AgentKeypair::generate().unwrap();
+        let mut cert = AgentCertificate::issue(&user_kp, &agent_kp).unwrap();
+
+        // The freshly-issued cert must verify (positive control).
+        cert.verify().expect("freshly-issued cert must verify");
+
+        // Corrupt one byte of the signature, preserving its length so the
+        // signature still parses as a valid ML-DSA signature blob and the
+        // failure happens at the cryptographic verify step, not format parse.
+        let original_sig = cert.signature.clone();
+        cert.signature[0] ^= 0xFF;
+        assert_ne!(
+            cert.signature, original_sig,
+            "signature must actually change"
+        );
+
+        let err = cert
+            .verify()
+            .expect_err("corrupted signature must fail verify");
+        assert!(
+            matches!(err, crate::error::IdentityError::CertificateVerification(_)),
+            "corrupted signature must surface as CertificateVerification, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn agent_certificate_wrong_length_signature_fails_with_structured_error() {
+        let user_kp = UserKeypair::generate().unwrap();
+        let agent_kp = AgentKeypair::generate().unwrap();
+        let mut cert = AgentCertificate::issue(&user_kp, &agent_kp).unwrap();
+
+        // A truncated / wrong-length signature blob is rejected at the
+        // signature-format parse (before any crypto) — still a structured
+        // CertificateVerification error, never a panic.
+        cert.signature = vec![0u8; 10];
+
+        let err = cert
+            .verify()
+            .expect_err("wrong-length signature must fail verify");
+        assert!(
+            matches!(err, crate::error::IdentityError::CertificateVerification(_)),
+            "wrong-length signature must surface as CertificateVerification, got {err:?}"
+        );
+    }
 }
