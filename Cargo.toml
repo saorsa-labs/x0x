@@ -102,6 +102,10 @@ futures = { version = "0.3", features = ["alloc"] }
 proptest = "1.4"
 serde_json = "1.0"
 tempfile = "3.14"
+# `ServiceExt::oneshot` for the in-process axum router auth-matrix tests
+# (#124 / WS1.3). Already present transitively via axum; listed here so the
+# `tower::ServiceExt` import resolves in `src/server/mod.rs` tests.
+tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
 name = "x0xd"

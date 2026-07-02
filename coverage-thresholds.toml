@@ -2,9 +2,17 @@
 #
 # This file is intentionally data-only. CI and local tooling read it through
 # scripts/check-coverage-thresholds.py after cargo-llvm-cov emits lcov.info.
+#
+# Ratchet schedule (issue #124, plan WS1.3): keep `[global].line_floor` ~1
+# point below *current actual* so any coverage regression fails CI. Raise it
+# +3–5 percentage points every release toward the 70% target. Each bump must
+# add targeted tests (priority: exec ACL denial paths → auth middleware →
+# storage/identity error paths → shutdown ordering) or a documented entry in
+# docs/coverage-exclusions.md — never lower the floor to make a red run green.
 
 [global]
-line_floor = 48.0
+# 48 → 65 in #124/WS1.3 (actual measured 66.46% with the auth-matrix tranche).
+line_floor = 65.0
 allowed_pr_drop = 0.5
 exclusion_budget_percent = 2.0
 lcov_artifact = "lcov.info"

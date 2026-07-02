@@ -59,6 +59,8 @@ Tracking: GitHub issues #122–#133.
 
 **Acceptance.** Floor = actual−1; schedule written; first tranche merged; gates green. **Dependencies.** None; ongoing after.
 
+**Ratchet schedule (committed 2026-07-02, #124 tranche 1).** Keep the gate ~1 point below *current actual*; raise it +3–5 points per release toward 70%. Baseline measured on `main` = **66.43%**; after the auth-matrix tranche = **66.46%** (WS-2 REST/API 64.63→64.66%). Floor raised **48 → 65** in both `.github/workflows/ci.yml` (`--fail-under-lines`) and `coverage-thresholds.toml` (`[global].line_floor`). Each future bump must add targeted tests (priority: exec ACL denial → auth middleware → storage/identity errors → shutdown ordering) or a documented `docs/coverage-exclusions.md` entry — never lower the floor. Tranche 1 (auth-middleware matrix: 401-without/wrong/correct-token, exempt `/health`+`/constitution*`, `?token=` on browser endpoints only, CORS loopback predicate) lives in `src/server/mod.rs::tests` as an in-process router suite.
+
 ### WS1.4 — Decompose `src/server/mod.rs` (#125) — **medium, size L**
 
 **Background.** 25,334 lines in one file: routes, handlers, WS/SSE, auth, state, tests. Biggest maintainability hotspot; precursor to the #110 `serve()` extraction (whose approved plan is P0 characterization tests → P1 move → P2 `serve()` — this task IS essentially P0+P1 and must stay aligned with that plan).

@@ -168,9 +168,19 @@ jobs:
         #     (e.g. forged_member_joined_*) poll a rejection counter that can
         #     exceed the wait window under coverage; the same code paths are
         #     covered by named_group_integration + the x0xd unit tests.
+        #
+        # Coverage ratchet (issue #124, plan WS1.3). The floor is the kill
+        # switch: it must sit just below *current* actual so a coverage
+        # regression fails CI before it merges. Bump cadence: raise this floor
+        # +3–5 percentage points every release toward the 70% target. Each
+        # ratchet bump MUST be accompanied by targeted tests (priority order:
+        # exec ACL denial paths → auth middleware → storage/identity error
+        # paths → shutdown ordering) or a documented entry in
+        # docs/coverage-exclusions.md — never lower the floor to make a red
+        # run green. Floor 48 → 65 in this PR (actual measured 66.46%).
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info --fail-under-lines 48 nextest -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(named_group_join_metadata_event)'
+          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info --fail-under-lines 65 nextest -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(named_group_join_metadata_event)'
           python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global
 
       - name: Upload LCOV report

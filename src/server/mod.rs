@@ -25317,4 +25317,303 @@ mod tests {
         assert_eq!(decoded.peer_id, peer_id);
         assert_eq!(decoded.delta.version, delta.version);
     }
+
+    // ========================================================================
+    // #124 / WS1.3 — auth-middleware coverage matrix (in-process router).
+    //
+    // The production `auth_middleware` is typed to `State<Arc<AppState>>`, and
+    // `AppState` carries a full `Agent` + MLS/gossip runtime that cannot be
+    // constructed in a unit test. These tests therefore use a TEST-ONLY shim
+    // (`test_auth_shim`) that mirrors `auth_middleware`'s control flow and
+    // delegates every policy decision to the REAL private helpers used in
+    // production (`is_auth_exempt_path`, `accepts_query_token`, the token
+    // comparison). The HTTP 401/200 status matrix is exercised through a real
+    // in-process axum `Router` via `tower::ServiceExt::oneshot`, so the
+    // behaviour under test is genuine middleware output — not a daemon spawn
+    // and not a predicate-only assertion.
+    //
+    // If `auth_middleware`'s control flow changes, update `test_auth_shim` to
+    // match; it is the only duplicated logic, the policy helpers are shared.
+    // ========================================================================
+    use tower::ServiceExt as _;
+
+    /// Token the test shim treats as valid. Mirrors `state.api_token`.
+    const TEST_API_TOKEN: &str = "x0x-test-auth-matrix-token";
+
+    /// HTTP method each protected route is registered under, so the accept
+    /// tests actually reach the handler (a wrong method would 405, masking a
+    /// real auth gap). Rejection tests run before method matching so they are
+    /// unaffected, but this keeps the helper honest.
+    fn matrix_method(path: &str) -> axum::http::Method {
+        if path == "/agent/sign" || path == "/agent/verify" {
+            axum::http::Method::POST
+        } else {
+            axum::http::Method::GET
+        }
+    }
+
+    /// Stub handler every route maps to — the auth matrix only cares whether a
+    /// request reaches the handler (200) or is rejected by the middleware
+    /// (401), never what the handler does.
+    async fn matrix_ok_stub() -> impl axum::response::IntoResponse {
+        (StatusCode::OK, axum::Json(serde_json::json!({"ok": true})))
+    }
+
+    /// TEST-ONLY mirror of `auth_middleware`. See the section comment above:
+    /// duplicated control flow only, policy helpers shared with production.
+    async fn test_auth_shim(
+        req: axum::http::Request<axum::body::Body>,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        // (1) CORS preflight: browsers send OPTIONS without auth headers.
+        if req.method() == axum::http::Method::OPTIONS {
+            return next.run(req).await;
+        }
+        let path = req.uri().path();
+        // (2) Exempt: health check + public constitution resources.
+        if is_auth_exempt_path(path) {
+            return next.run(req).await;
+        }
+        // (3) Authorization: Bearer header (works everywhere).
+        if let Some(auth) = req.headers().get(axum::http::header::AUTHORIZATION) {
+            if let Ok(auth_str) = auth.to_str() {
+                if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                    if token == TEST_API_TOKEN {
+                        return next.run(req).await;
+                    }
+                }
+            }
+        }
+        // (4) `?token=` query param, only on browser-only endpoints.
+        if accepts_query_token(path) {
+            if let Some(query) = req.uri().query() {
+                for pair in query.split('&') {
+                    if let Some(token) = pair.strip_prefix("token=") {
+                        if token == TEST_API_TOKEN {
+                            return next.run(req).await;
+                        }
+                    }
+                }
+            }
+        }
+        (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({
+                "error": "missing or invalid Authorization: Bearer token"
+            })),
+        )
+            .into_response()
+    }
+
+    /// Build the in-process auth-matrix router: the production CORS layer
+    /// (same `AllowOrigin::predicate`) + the test auth shim + stub routes
+    /// spanning the policy categories (protected / exempt / browser-query).
+    fn auth_matrix_router() -> axum::Router<()> {
+        use axum::routing::{get, post};
+        use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin};
+        axum::Router::new()
+            // Representative protected control-plane endpoints.
+            .route("/status", get(matrix_ok_stub))
+            .route("/agent", get(matrix_ok_stub))
+            .route("/agent/sign", post(matrix_ok_stub))
+            .route("/agent/verify", post(matrix_ok_stub))
+            // Auth-exempt public resources.
+            .route("/health", get(matrix_ok_stub))
+            .route("/constitution", get(matrix_ok_stub))
+            .route("/constitution/json", get(matrix_ok_stub))
+            // Browser-only endpoints that accept `?token=`.
+            .route("/gui", get(matrix_ok_stub))
+            .route("/gui/", get(matrix_ok_stub))
+            .route("/ws", get(matrix_ok_stub))
+            .route("/ws/direct", get(matrix_ok_stub))
+            .route("/events", get(matrix_ok_stub))
+            .route("/direct/events", get(matrix_ok_stub))
+            .route("/peers/events", get(matrix_ok_stub))
+            .route("/presence/events", get(matrix_ok_stub))
+            // Layer order matches `serve()`: CORS added first, the auth shim
+            // added second (outermost) — so auth runs before CORS, exactly as
+            // the production wiring stacks `auth_middleware` over `CorsLayer`.
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(AllowOrigin::predicate(|origin, _| {
+                        is_allowed_loopback_origin(origin)
+                    }))
+                    .allow_methods(AllowMethods::any())
+                    .allow_headers(AllowHeaders::any()),
+            )
+            .layer(axum::middleware::from_fn(test_auth_shim))
+    }
+
+    /// Build a request and run it through the matrix router, returning the
+    /// response (status + headers) for assertion.
+    async fn matrix_request(
+        method: axum::http::Method,
+        uri: &str,
+        bearer: Option<&str>,
+        origin: Option<&str>,
+    ) -> axum::http::Response<axum::body::Body> {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(token) = bearer {
+            builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if let Some(org) = origin {
+            builder = builder.header(axum::http::header::ORIGIN, org);
+        }
+        let request = builder
+            .body(axum::body::Body::empty())
+            .expect("valid in-process test request");
+        auth_matrix_router()
+            .oneshot(request)
+            .await
+            .expect("in-process router must answer")
+    }
+
+    // -- Protected endpoints: representative sample + /agent/sign + /agent/verify.
+
+    #[tokio::test]
+    async fn auth_matrix_protected_endpoints_reject_without_token() {
+        for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
+            let resp = matrix_request(matrix_method(path), path, None, None).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} without a token must be 401"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_matrix_protected_endpoints_reject_wrong_token() {
+        for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
+            let resp =
+                matrix_request(matrix_method(path), path, Some("not-the-real-token"), None).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} with a wrong bearer must be 401"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_matrix_protected_endpoints_accept_correct_token() {
+        for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
+            let resp = matrix_request(matrix_method(path), path, Some(TEST_API_TOKEN), None).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path} with the correct bearer must reach the handler (200)"
+            );
+        }
+    }
+
+    // -- Auth-exempt public paths: served without any token.
+
+    #[tokio::test]
+    async fn auth_matrix_exempt_paths_serve_without_token() {
+        for path in ["/health", "/constitution", "/constitution/json"] {
+            let resp = matrix_request(axum::http::Method::GET, path, None, None).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path} is auth-exempt and must serve without a token"
+            );
+        }
+    }
+
+    // -- Browser-only endpoints: `?token=` accepted here and only here.
+
+    #[tokio::test]
+    async fn auth_matrix_browser_endpoints_accept_query_token() {
+        for path in [
+            "/gui",
+            "/gui/",
+            "/ws",
+            "/ws/direct",
+            "/events",
+            "/direct/events",
+            "/peers/events",
+            "/presence/events",
+        ] {
+            let uri = format!("{path}?token={TEST_API_TOKEN}");
+            let resp = matrix_request(axum::http::Method::GET, &uri, None, None).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path}?token= is a browser endpoint and must accept the query token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_matrix_query_token_rejected_on_protected_paths() {
+        // The durable bearer token must NOT be passable as a query param on
+        // non-browser endpoints — that would leak it via history/Referer/HAR.
+        for path in ["/status", "/agent/sign", "/agent/verify"] {
+            let method = matrix_method(path);
+            let uri = format!("{path}?token={TEST_API_TOKEN}");
+            let resp = matrix_request(method, &uri, None, None).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path}?token= must reject the query token (not a browser endpoint)"
+            );
+        }
+    }
+
+    // -- CORS preflight exemption: OPTIONS bypasses auth.
+
+    #[tokio::test]
+    async fn auth_matrix_options_preflight_bypasses_auth() {
+        // Browsers cannot attach auth headers to a CORS preflight; the
+        // middleware must pass OPTIONS through even on a protected path.
+        let resp = matrix_request(axum::http::Method::OPTIONS, "/status", None, None).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "OPTIONS preflight must bypass bearer auth"
+        );
+    }
+
+    // -- CORS predicate: literal loopback IPs allowed, `localhost` rejected.
+
+    #[tokio::test]
+    async fn cors_matrix_allows_literal_loopback_origins() {
+        for origin in [
+            "http://127.0.0.1",
+            "http://127.0.0.1:12700",
+            "http://[::1]",
+            "http://[::1]:12700",
+        ] {
+            let resp = matrix_request(axum::http::Method::GET, "/health", None, Some(origin)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "GET /health is auth-exempt");
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .map(|v| v.to_str().expect("ACAO is ascii")),
+                Some(origin),
+                "CORS must echo the literal-loopback origin {origin} back as ACAO"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_matrix_rejects_localhost_origin() {
+        // `localhost` resolution can be redirected (/etc/hosts, split-horizon
+        // DNS), so it is not a trustworthy origin for the local control plane.
+        let resp = matrix_request(
+            axum::http::Method::GET,
+            "/health",
+            None,
+            Some("http://localhost:12700"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "GET /health is auth-exempt");
+        assert!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "CORS must NOT grant a localhost origin (no ACAO header)"
+        );
+    }
 }
