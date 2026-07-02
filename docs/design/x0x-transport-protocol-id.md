@@ -117,10 +117,15 @@ This is x0x's answer to "who runs this agent" without a registry record.
 
 ### 4.4. Detached Signature Verification
 
-x0x exposes a stateless signature primitive (`POST /agent/verify`):
-`algorithm = "x0x.agent-sign.v1.ml-dsa-65"`, domain framing `domain || 0x00 || payload`.
-This is the building block any application uses to verify an agent's claims
-offline.
+x0x exposes stateless signature primitives: `POST /agent/sign` (issue #133)
+and `POST /agent/verify`. Both use the `v2` scheme
+(`algorithm = "x0x.agent-sign.v2.ml-dsa-65"`) over a length-prefixed external
+domain-separation tag
+`[0xF0] | b"x0x.external-agent-sign.v1" | len(context):u32 BE | context | payload`,
+which is provably disjoint from every internal x0x signing input (see
+`src/api/agent_signing.rs`). The caller supplies a required `context` string
+(`[a-z0-9._-]{1,64}`). This is the building block any application uses to sign
+and verify an agent's claims offline.
 
 ## 5. Addressing (vs Pilot §4)
 

@@ -886,20 +886,21 @@ struct SubscribeRequest {
     topic: String,
 }
 
-/// POST /agent/sign request body — a single base64-encoded payload to
-/// sign with the agent's ML-DSA-65 secret key.
+/// POST /agent/sign request body — a caller payload to sign with the
+/// agent's ML-DSA-65 secret key under a mandatory external domain.
 #[derive(Debug, Deserialize)]
 struct AgentSignRequest {
-    /// Base64-encoded bytes to sign. The signature is computed over these
-    /// bytes verbatim — the caller is responsible for choosing a canonical
-    /// serialization for any structured payload.
+    /// Required domain-separation string naming the caller's application
+    /// protocol (e.g. `"x0x-symphony-handoff-v1"`). The daemon signs the
+    /// length-prefixed external DST `[0xF0] | magic | len(context) | context |
+    /// payload` (see [`crate::api::agent_signing`]), which is provably disjoint
+    /// from every internal x0x signing input. Must match `[a-z0-9._-]{1,64}`
+    /// and must not name an internal signing domain (issue #133).
+    context: String,
+    /// Base64-encoded bytes to sign. The signature is computed over the DST
+    /// assembled from `context` and these bytes; callers should canonicalize
+    /// structured payloads.
     payload_b64: String,
-    /// Optional domain-separation string. When present, the signature is
-    /// computed over `domain || 0x00 || payload` instead of the raw payload,
-    /// preventing cross-protocol signature replay (issue #90). Must not
-    /// contain NUL bytes.
-    #[serde(default)]
-    domain: Option<String>,
 }
 
 /// POST /agent/verify request body — a detached ML-DSA-65 signature to
@@ -914,14 +915,14 @@ struct AgentVerifyRequest {
     signature_b64: String,
     /// Base64-encoded ML-DSA-65 public key (1952 bytes decoded).
     public_key_b64: String,
-    /// Optional domain-separation string. When present, verification is
-    /// performed over `domain || 0x00 || payload`, mirroring the
-    /// `/agent/sign` framing (issue #90). Must not contain NUL bytes.
-    #[serde(default)]
-    domain: Option<String>,
+    /// Required domain-separation string; verification is performed over
+    /// the same external DST as `/agent/sign`
+    /// (`[0xF0] | magic | len(context) | context | payload`, issue #133), so a
+    /// signature produced by `/agent/sign` round-trips through `/agent/verify`.
+    context: String,
     /// Optional signing-scheme identifier. When the field is present —
     /// including as JSON null — it must be exactly
-    /// `x0x.agent-sign.v1.ml-dsa-65`; anything else is rejected with 400
+    /// `x0x.agent-sign.v2.ml-dsa-65`; anything else is rejected with 400
     /// so a future scheme migration is explicit rather than silent.
     /// Deserialized via `deserialize_present` because a plain
     /// `Option<String>` folds present-but-null into `None` and would
@@ -4668,19 +4669,18 @@ async fn import_agent_card(
     )
 }
 
-/// Maximum payload size accepted by `POST /agent/sign`, in bytes.
-/// Comfortably larger than any realistic audit-event or governance-vote
-/// envelope (≤1 KiB in practice) while still bounding worst-case work.
-const AGENT_SIGN_MAX_PAYLOAD_BYTES: usize = 256 * 1024;
+/// Maximum payload size accepted by `POST /agent/sign` / `/agent/verify`,
+/// in bytes. External signing is for hashes, manifests, and audit records —
+/// not blobs. Mirrors [`crate::api::agent_signing::MAX_PAYLOAD_BYTES`] (kept
+/// as a local const so the 413 path can format the limit without importing
+/// the helper into every handler call site).
+const AGENT_SIGN_MAX_PAYLOAD_BYTES: usize = crate::api::agent_signing::MAX_PAYLOAD_BYTES;
 
-/// Maximum length of the optional `domain` separation string, in bytes.
-/// Domain strings are protocol identifiers (`x0x.<purpose>.<version>`
-/// convention) — far shorter in practice; the cap keeps the canonical
-/// bytes bounded by AGENT_SIGN_MAX_PAYLOAD_BYTES + 1 KiB + 1.
-const AGENT_SIGN_MAX_DOMAIN_BYTES: usize = 1024;
-
-/// Stable scheme identifier returned by `POST /agent/sign`.
-const AGENT_SIGN_SCHEME_ID: &str = "x0x.agent-sign.v1.ml-dsa-65";
+/// Stable scheme identifier returned by `POST /agent/sign` and accepted by
+/// `/agent/verify`. The `v2` scheme signs the domain-separated external DST
+/// (issue #133); the pre-#133 `v1` scheme (optional `domain || 0x00 ||
+/// payload` / raw payload) is no longer produced.
+const AGENT_SIGN_SCHEME_ID: &str = crate::api::agent_signing::SCHEME_ID;
 
 /// POST /agent/sign — produce a detached ML-DSA-65 signature over a
 /// caller-supplied payload using this agent's signing key.
@@ -4697,22 +4697,40 @@ const AGENT_SIGN_SCHEME_ID: &str = "x0x.agent-sign.v1.ml-dsa-65";
 /// Authentication. Bearer-token authenticated like every other endpoint
 /// — only callers with the agent's local API token can sign as the agent.
 ///
-/// Payload. `payload_b64` is base64-decoded and signed verbatim. The
-/// caller is responsible for choosing a canonical serialization of any
-/// structured payload (e.g. `serde_canonical_json`, `postcard`, or an
-/// explicit field-order convention).
+/// Payload. `payload_b64` is base64-decoded to the raw payload, which is
+/// taken verbatim (the caller owns the canonical serialization of any
+/// structured payload — e.g. `serde_canonical_json`, `postcard`, or an
+/// explicit field-order convention). Payloads are capped at 64 KiB:
+/// external signing is for hashes, manifests, and audit records, not blobs.
 ///
-/// Domain separation. The optional `domain` field, when present, changes
-/// the signed bytes to `domain || 0x00 || payload` and is echoed back in
-/// the response, so a signature produced for one protocol cannot be
-/// replayed as another (`x0x.<purpose>.<version>` is the conventional
-/// shape for x0x's own protocols). When omitted, the raw payload is
-/// signed — unchanged pre-#90 behavior.
+/// Domain separation (issue #133, mandatory). The signature is *never*
+/// computed over the raw payload. A required `context` string — matching
+/// `[a-z0-9._-]{1,64}` and not naming an internal x0x signing domain
+/// (see `INTERNAL_CONTEXT_DENYLIST` in `src/api/agent_signing.rs`) — binds
+/// the signature to a single application protocol. The canonical signed
+/// bytes are the external DST
+///
+/// ```text
+/// [0xF0] | b"x0x.external-agent-sign.v1" | len(context):u32 BE | context | payload
+/// ```
+///
+/// That prologue is provably disjoint from every internal x0x signing
+/// input (none begins with `[0xF0] | magic`), so an external signature
+/// can never be replayed as a protocol message; the `0xF0` namespace tag
+/// and the length-prefixed context make the boundary unambiguous. The
+/// `context` is echoed in the response so a verifier knows the
+/// canonical-bytes shape without out-of-band information.
+///
+/// Scheme. Returns the stable identifier `x0x.agent-sign.v2.ml-dsa-65`.
+/// The `.v2` pins the API-envelope version; the magic's `.v1` pins the DST
+/// byte layout — two independent axes (see `src/api/agent_signing.rs`). A
+/// future scheme migration is therefore explicit in the response, not
+/// silent.
 ///
 /// Response. Returns the agent_id (hex, 32 bytes), the agent's public
-/// key (base64), the signature (base64), and the stable signing scheme
-/// identifier. All values are wire-format ready for inclusion in the
-/// signed record.
+/// key (base64), the signature (base64), the context (echoed), and the
+/// scheme identifier. All values are wire-format ready for inclusion in
+/// the signed record.
 async fn agent_sign(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AgentSignRequest>,
@@ -4738,32 +4756,15 @@ async fn agent_sign(
         );
     }
 
-    // Optional domain separation (issue #90): sign `domain || 0x00 || payload`
-    // so a signature issued for one protocol context cannot be replayed in
-    // another. The NUL separator is rejected inside the domain itself so the
-    // framing stays unambiguous.
-    let canonical = match req.domain.as_deref() {
-        Some(domain) => {
-            if domain.is_empty() {
-                return bad_request("domain must be non-empty when provided");
-            }
-            if domain.as_bytes().contains(&0u8) {
-                return bad_request("domain must not contain NUL bytes");
-            }
-            if domain.len() > AGENT_SIGN_MAX_DOMAIN_BYTES {
-                return bad_request(format!(
-                    "domain exceeds maximum length of {} bytes",
-                    AGENT_SIGN_MAX_DOMAIN_BYTES
-                ));
-            }
-            let mut buf = Vec::with_capacity(domain.len() + 1 + payload.len());
-            buf.extend_from_slice(domain.as_bytes());
-            buf.push(0);
-            buf.extend_from_slice(&payload);
-            buf
-        }
-        None => payload,
-    };
+    // Mandatory external domain separation (issue #133): sign the
+    // length-prefixed external DST `[0xF0] | magic | len(context) | context |
+    // payload`, which is provably disjoint from every internal x0x signing
+    // input (see `src/api/agent_signing.rs`). `context` is required and
+    // validated — there is no raw-payload signing path.
+    if let Err(e) = crate::api::agent_signing::validate_context(&req.context) {
+        return bad_request(e.to_string());
+    }
+    let canonical = crate::api::agent_signing::assemble_buffer(&req.context, &payload);
 
     let identity = state.agent.identity();
     let keypair = identity.agent_keypair();
@@ -4792,11 +4793,9 @@ async fn agent_sign(
         "signature_b64": signature_b64,
         "algorithm": AGENT_SIGN_SCHEME_ID,
     });
-    // Echo the domain back so a verifier knows the canonical-bytes shape
-    // (domain || 0x00 || payload) without out-of-band context.
-    if let Some(domain) = req.domain {
-        resp["domain"] = serde_json::Value::String(domain);
-    }
+    // Echo the context so a verifier knows the canonical-bytes shape
+    // without out-of-band context.
+    resp["context"] = serde_json::Value::String(req.context);
 
     (StatusCode::OK, Json(resp))
 }
@@ -4808,8 +4807,8 @@ async fn agent_sign(
 /// persist signed records read them back — often on machines that never
 /// authored them — and must verify from the stored bytes alone. Without
 /// this endpoint every consumer would bundle its own FIPS-204 library and
-/// re-derive x0x's `domain || 0x00 || payload` framing, which would drift
-/// the moment the convention evolves.
+/// re-derive x0x's canonical external DST framing, which would drift the
+/// moment the convention evolves.
 ///
 /// Statelessness. Verification uses only caller-supplied public material:
 /// no key access, no identity state. The handler deliberately takes no
@@ -4819,10 +4818,15 @@ async fn agent_sign(
 ///
 /// Semantics. A failed signature check is a *result*, not an error:
 /// `200` with `valid: false`. `400` is reserved for malformed input (bad
-/// base64, empty payload, wrong key or signature length, invalid domain,
-/// unknown `algorithm`); `413` for payloads over the cap — mirroring
-/// `/agent/sign` exactly. When `domain` is present, verification is
-/// performed over `domain || 0x00 || payload` (issue #90 framing).
+/// base64, empty payload, wrong key or signature length, an invalid or
+/// internal-reserved `context`, or an unknown `algorithm`); `413` for
+/// payloads over the 64 KiB cap — mirroring `/agent/sign` exactly.
+/// Verification is performed over the *same* external DST as signing,
+/// `[0xF0] | magic | len(context):u32 BE | context | payload`, using the
+/// caller-supplied `context` (required, validated identically to
+/// `/agent/sign`). A signature produced for one context therefore does
+/// not verify under any other — and raw-payload verification is no longer
+/// a valid input.
 async fn agent_verify(Json(req): Json<AgentVerifyRequest>) -> impl IntoResponse {
     let payload = match BASE64.decode(&req.payload_b64) {
         Ok(bytes) => bytes,
@@ -4845,30 +4849,12 @@ async fn agent_verify(Json(req): Json<AgentVerifyRequest>) -> impl IntoResponse 
         );
     }
 
-    // Same domain rules and canonical-bytes assembly as `agent_sign`: the
-    // verifier must reconstruct exactly the bytes the signer committed to.
-    let canonical = match req.domain.as_deref() {
-        Some(domain) => {
-            if domain.is_empty() {
-                return bad_request("domain must be non-empty when provided");
-            }
-            if domain.as_bytes().contains(&0u8) {
-                return bad_request("domain must not contain NUL bytes");
-            }
-            if domain.len() > AGENT_SIGN_MAX_DOMAIN_BYTES {
-                return bad_request(format!(
-                    "domain exceeds maximum length of {} bytes",
-                    AGENT_SIGN_MAX_DOMAIN_BYTES
-                ));
-            }
-            let mut buf = Vec::with_capacity(domain.len() + 1 + payload.len());
-            buf.extend_from_slice(domain.as_bytes());
-            buf.push(0);
-            buf.extend_from_slice(&payload);
-            buf
-        }
-        None => payload,
-    };
+    // Same canonical-bytes assembly as `agent_sign`: the verifier must
+    // reconstruct exactly the bytes the signer committed to.
+    if let Err(e) = crate::api::agent_signing::validate_context(&req.context) {
+        return bad_request(e.to_string());
+    }
+    let canonical = crate::api::agent_signing::assemble_buffer(&req.context, &payload);
 
     // A present `algorithm` must be exactly the supported scheme string;
     // JSON null and non-string values are present-but-wrong, not omitted.
