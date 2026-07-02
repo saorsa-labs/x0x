@@ -7,7 +7,7 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::network::NetworkNode;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 /// Bootstrap configuration for connecting to initial peers.
 ///
@@ -22,6 +22,12 @@ pub struct BootstrapConfig {
     pub initial_backoff: Duration,
     /// Maximum backoff duration.
     pub max_backoff: Duration,
+    /// Per-attempt dial timeout (issue #123). Bounds each `connect_addr`
+    /// call so a black-holed bootstrap address fails fast and the retry
+    /// loop rotates to the next peer instead of stalling indefinitely.
+    /// Mirrors the timeout wrapper applied at every `connect_addr` /
+    /// `connect_cached_peer` call site in `lib.rs`.
+    pub dial_timeout: Duration,
 }
 
 impl Default for BootstrapConfig {
@@ -31,6 +37,7 @@ impl Default for BootstrapConfig {
             backoff_multiplier: 2.0,
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(5),
+            dial_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -82,29 +89,57 @@ impl BootstrapConnector {
         let mut attempt = 0;
 
         loop {
-            match node.connect_addr(addr).await {
-                Ok(_peer_id) => {
+            // Issue #123: bound the dial. `connect_addr` has no reliable
+            // internal timeout (every lib.rs call site wraps it), so without
+            // this a single black-holed bootstrap address would stall the
+            // retry loop — the backoff `sleep` below only runs after a
+            // *returned* error. A timeout is treated as a retryable failure
+            // so the existing capped backoff proceeds to the next
+            // attempt/peer unchanged.
+            match timeout(self.config.dial_timeout, node.connect_addr(addr)).await {
+                Ok(Ok(_peer_id)) => {
                     return Ok(());
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     attempt += 1;
                     if attempt >= self.config.max_retries {
                         return Err(NetworkError::ConnectionFailed(format!(
-                            "Bootstrap connection failed after {} attempts: {}",
-                            attempt, e
+                            "Bootstrap connection to {addr} failed after {attempt} attempts: {e}"
                         )));
                     }
-
-                    // Apply exponential backoff
-                    sleep(backoff).await;
-                    backoff = std::cmp::min(
-                        Duration::from_secs_f64(
-                            backoff.as_secs_f64() * self.config.backoff_multiplier,
-                        ),
-                        self.config.max_backoff,
+                    tracing::debug!(
+                        target: "x0x::bootstrap",
+                        %addr,
+                        attempt,
+                        error = %e,
+                        "bootstrap dial failed; backing off"
+                    );
+                }
+                Err(_elapsed) => {
+                    attempt += 1;
+                    if attempt >= self.config.max_retries {
+                        return Err(NetworkError::ConnectionFailed(format!(
+                            "Bootstrap connection to {addr} timed out after {attempt} attempts \
+                             (dial timeout {:?})",
+                            self.config.dial_timeout
+                        )));
+                    }
+                    tracing::warn!(
+                        target: "x0x::bootstrap",
+                        %addr,
+                        attempt,
+                        dial_timeout = ?self.config.dial_timeout,
+                        "bootstrap dial timed out; backing off and retrying"
                     );
                 }
             }
+
+            // Apply exponential backoff (shared by both retryable outcomes).
+            sleep(backoff).await;
+            backoff = std::cmp::min(
+                Duration::from_secs_f64(backoff.as_secs_f64() * self.config.backoff_multiplier),
+                self.config.max_backoff,
+            );
         }
     }
 
@@ -159,6 +194,7 @@ mod tests {
         assert_eq!(config.backoff_multiplier, 2.0);
         assert_eq!(config.initial_backoff, Duration::from_millis(100));
         assert_eq!(config.max_backoff, Duration::from_secs(5));
+        assert_eq!(config.dial_timeout, Duration::from_secs(10));
     }
 
     #[test]
@@ -168,6 +204,7 @@ mod tests {
             backoff_multiplier: 1.5,
             initial_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(10),
+            dial_timeout: Duration::from_secs(10),
         };
         assert_eq!(config.max_retries, 5);
         assert_eq!(config.backoff_multiplier, 1.5);
@@ -186,6 +223,7 @@ mod tests {
             backoff_multiplier: 2.0,
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(5),
+            dial_timeout: Duration::from_secs(10),
         };
         let connector = BootstrapConnector::with_config(config.clone());
         assert_eq!(connector.config.max_retries, 2);
@@ -204,6 +242,7 @@ mod tests {
             backoff_multiplier: 2.0,
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(5),
+            dial_timeout: Duration::from_secs(10),
         };
 
         let mut backoff = config.initial_backoff;
@@ -229,6 +268,7 @@ mod tests {
             backoff_multiplier: 2.0,
             initial_backoff: Duration::from_millis(1000),
             max_backoff: Duration::from_secs(5),
+            dial_timeout: Duration::from_secs(10),
         };
 
         let mut backoff = config.initial_backoff;
