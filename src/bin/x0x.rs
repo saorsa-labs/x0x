@@ -1715,7 +1715,9 @@ async fn run(
                 commands::tasks::update(&client, &list_id, &task_id, "complete").await
             }
         },
-        Commands::Upgrade { .. } => unreachable!(),
+        Commands::Upgrade { .. } => {
+            anyhow::bail!("command dispatched earlier — dispatch table out of sync")
+        }
         Commands::Ws { sub } => match sub {
             None => commands::ws::general(&client).await,
             Some(WsSub::Sessions) => commands::ws::sessions(&client).await,
@@ -1752,7 +1754,9 @@ async fn run(
         | Commands::UserId { .. }
         | Commands::Start { .. }
         | Commands::Instances
-        | Commands::Autostart { .. } => unreachable!(),
+        | Commands::Autostart { .. } => {
+            anyhow::bail!("command dispatched earlier — dispatch table out of sync")
+        }
     }
 }
 
