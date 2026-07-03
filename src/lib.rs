@@ -507,6 +507,30 @@ where
     }
 }
 
+/// Register a foreign agent's announced machine in the contact store.
+///
+/// Returns `true` if a new machine record was added, `false` otherwise
+/// (the machine was already known, or the announcement is for the daemon's
+/// own agent). The daemon deliberately never creates a contact entry for
+/// itself: a self record would be noise on the `/contacts` surface and would
+/// make contact-set assertions racy (issue #145). The two sibling actions in
+/// the announce loop — epidemic re-broadcast and auto-connect — already
+/// self-skip on `announced != own`; this helper makes the contact upsert the
+/// third self-skipping site.
+async fn register_announced_machine(
+    contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+    own_agent_id: identity::AgentId,
+    announced_agent_id: identity::AgentId,
+    announced_machine_id: identity::MachineId,
+) -> bool {
+    if announced_agent_id == own_agent_id {
+        return false;
+    }
+    let mut store = contact_store.write().await;
+    let record = contacts::MachineRecord::new(announced_machine_id, None);
+    store.add_machine(&announced_agent_id, record)
+}
+
 fn local_scoped_bootstrap_addr(addr: std::net::SocketAddr) -> bool {
     if addr.port() == 0 {
         return false;
@@ -5661,11 +5685,21 @@ impl Agent {
                 }
 
                 // Update machine records in the contact store.
-                {
-                    let mut store = contact_store.write().await;
-                    let record = contacts::MachineRecord::new(announcement.machine_id, None);
-                    store.add_machine(&announcement.agent_id, record);
-                }
+                //
+                // The daemon never registers its own agent as a contact: a self
+                // entry would be noise on the `/contacts` projection and pollute
+                // contact-set assertions (issue #145). The rebroadcast and
+                // auto-connect branches below already self-skip on
+                // `announcement.agent_id != own_agent_id`; the machine-record
+                // upsert was the sole outlier. Foreign observation still
+                // registers normally.
+                register_announced_machine(
+                    &contact_store,
+                    own_agent_id,
+                    announcement.agent_id,
+                    announcement.machine_id,
+                )
+                .await;
 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -9824,6 +9858,71 @@ mod tests {
         assert!(
             result.is_err(),
             "Old-format announcement should not decode as new struct (protocol upgrade required)"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_announced_machine_skips_self_agent() {
+        // The daemon must never create a contact entry for its own agent: a
+        // self record is noise on `/contacts` and makes contact-set
+        // assertions racy (issue #145). A self-announcement is refused even
+        // though it carries a valid (agent, machine) pair.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = std::sync::Arc::new(tokio::sync::RwLock::new(contacts::ContactStore::new(
+            dir.path().join("contacts.json"),
+        )));
+        let own = identity::AgentId([1u8; 32]);
+        let own_machine = identity::MachineId([2u8; 32]);
+
+        let added = super::register_announced_machine(&store, own, own, own_machine).await;
+
+        assert!(!added, "self-announcement must not register a machine");
+        let store = store.read().await;
+        assert!(
+            store.machines(&own).is_empty(),
+            "self-agent must have no machine record after a self-announcement"
+        );
+        // Stronger invariant: the daemon must have NO contact entry at all
+        // for its own agent, not merely an empty machine list. add_machine
+        // creates the Contact shell on first sight (contacts.rs:423), so this
+        // confirms the self-skip happens before that insertion (#145).
+        assert!(
+            store.list().iter().all(|contact| contact.agent_id != own),
+            "self-agent must not appear in the contact store at all after a \
+             self-announcement"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_announced_machine_registers_foreign_agent() {
+        // Foreign observation must keep registering a machine record so peers
+        // remain observable in the contact surface — the self-skip must not be
+        // over-broad. A second announcement of the same (agent, machine) is
+        // idempotent (returns false, no duplicate record).
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = std::sync::Arc::new(tokio::sync::RwLock::new(contacts::ContactStore::new(
+            dir.path().join("contacts.json"),
+        )));
+        let own = identity::AgentId([1u8; 32]);
+        let peer = identity::AgentId([9u8; 32]);
+        let peer_machine = identity::MachineId([7u8; 32]);
+
+        let added = super::register_announced_machine(&store, own, peer, peer_machine).await;
+        assert!(added, "foreign announcement must register a new machine");
+
+        let added_again = super::register_announced_machine(&store, own, peer, peer_machine).await;
+        assert!(
+            !added_again,
+            "re-announcing the same machine must be idempotent"
+        );
+
+        let store = store.read().await;
+        let machines = store.machines(&peer);
+        assert_eq!(machines.len(), 1, "exactly one machine record");
+        assert_eq!(machines[0].machine_id, peer_machine);
+        assert!(
+            store.machines(&own).is_empty(),
+            "own agent must still have no contact entry"
         );
     }
 
