@@ -405,7 +405,7 @@ async fn handle_ws_connection(
     // then exits even if the close frame cannot flush (the reader is stalled).
     let writer_session_id = session_id.clone();
     let writer_slow_close = slow_close.clone();
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         run_ws_writer(&mut outbound_rx, &mut ws_tx, &writer_slow_close).await;
         tracing::debug!(session_id = %writer_session_id, "WebSocket writer stopped");
     });
@@ -514,11 +514,21 @@ async fn handle_ws_connection(
         cleanup_ws_topic_if_empty(&state, topic, &session_id).await;
     }
 
-    writer.abort();
+    // Retire the feeders and drop the last outbound sender so the writer can
+    // observe channel closure and exit on its own.
     keepalive.abort();
     if let Some(h) = direct_handle {
         h.abort();
     }
+    drop(outbound_tx);
+    // Give the writer a bounded grace period instead of aborting it outright:
+    // on a slow-consumer close it is inside its 2s Close(1013) flush budget,
+    // and an immediate abort tears the socket down before the documented
+    // close frame can ever reach the (possibly now-draining) client — the
+    // #149 stalled-reader harness observed a raw connection reset instead of
+    // the 1013. Any other writer exits promptly once the senders are gone.
+    let _ = tokio::time::timeout(Duration::from_secs(3), &mut writer).await;
+    writer.abort();
 
     tracing::info!(session_id = %session_id, "WebSocket session closed");
 }
