@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 133,
+  "endpoint_count": 134,
   "endpoints": [
     {
       "category": "status",
@@ -182,6 +182,13 @@
       "description": "Remote exec counters, warnings, active sessions, and ACL summary",
       "method": "GET",
       "path": "/diagnostics/exec"
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics ws",
+      "description": "WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters",
+      "method": "GET",
+      "path": "/diagnostics/ws"
     },
     {
       "category": "network",
