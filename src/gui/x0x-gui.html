@@ -178,6 +178,9 @@ tr:hover td{background:rgba(255,255,255,.01)}
 .kanban-card:hover{border-color:var(--cy);transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,.2)}
 .kanban-card .title{font-size:12px;font-weight:500}
 .kanban-card .meta{font-size:10px;color:var(--tx3);margin-top:var(--sp1)}
+.kanban-card.pending-approval{border-color:var(--am)}
+.kanban-card-actions{display:flex;gap:var(--sp2);margin-top:var(--sp2)}
+.kanban-card-actions button{flex:1;padding:5px 8px;font-size:11px}
 .sym-badges{display:flex;flex-wrap:wrap;gap:4px;margin-top:var(--sp2)}
 .sym-badge{display:inline-flex;align-items:center;gap:3px;padding:1px 6px;font:600 9px var(--sans);text-transform:uppercase;letter-spacing:.35px;border:1px solid;border-radius:var(--r-full);white-space:nowrap}
 .sym-badge.info{color:var(--cy);border-color:var(--cy);background:var(--cy-dim)}
@@ -705,6 +708,35 @@ async function api(path,opt){
     }
     return data;
   }catch(e){return null}
+}
+
+const DEFAULT_SYMPHONY_DAEMON_URL='http://127.0.0.1:8642';
+function symphonyDaemonUrl(){
+  const v=String(LS.get('symphonyDaemonUrl',DEFAULT_SYMPHONY_DAEMON_URL)||DEFAULT_SYMPHONY_DAEMON_URL).trim();
+  return (v||DEFAULT_SYMPHONY_DAEMON_URL).replace(/\/+$/,'');
+}
+function symphonyDaemonToken(){return String(LS.get('symphonyDaemonToken','')||'').trim()}
+
+async function symApi(path,opt){
+  const base=symphonyDaemonUrl();
+  try{
+    const hdrs={'Content-Type':'application/json',...(opt||{}).headers};
+    const token=symphonyDaemonToken();
+    if(token)hdrs['Authorization']='Bearer '+token;
+    const r=await fetch(base+path,{...opt,headers:hdrs});
+    const data=await r.json().catch(()=>({ok:r.ok,error:r.statusText||'request failed'}));
+    if(data&&typeof data==='object'){
+      data._http_ok=r.ok;
+      data._http_status=r.status;
+      if(!r.ok&&!data.error)data.error=r.statusText||('HTTP '+r.status);
+    }
+    if(r.status===401||r.status===403)toast('symphony daemon token rejected','error');
+    else if(!r.ok)toast('symphony daemon request failed: '+apiError(data),'error');
+    return data;
+  }catch(e){
+    toast('symphony daemon unreachable at '+base,'error');
+    return null;
+  }
 }
 
 async function refreshAgentIdentity(){
@@ -2171,6 +2203,7 @@ function renderSpaceBoard(el,sid){
   el.innerHTML=`<div class="row mb kanban-toolbar"><input id="board-in" placeholder="New task…" style="flex:1"><button class="pri" onclick="addBoardTask()">Add</button><label class="board-filter"><input type="checkbox" id="board-symphony-only" onchange="toggleBoardSymphonyFilter(this.checked)" ${boardSymphonyOnly?'checked':''}> Symphony</label></div>
   <div class="kanban">
     <div class="kanban-col"><div class="kanban-hd">To Do <span class="count" id="kb-todo-n">0</span></div><div class="kanban-body" id="kb-todo"></div></div>
+    <div class="kanban-col"><div class="kanban-hd">Pending Approval <span class="count" id="kb-approval-n">0</span></div><div class="kanban-body" id="kb-approval"></div></div>
     <div class="kanban-col"><div class="kanban-hd">In Progress <span class="count" id="kb-wip-n">0</span></div><div class="kanban-body" id="kb-wip"></div></div>
     <div class="kanban-col"><div class="kanban-hd">Review <span class="count" id="kb-review-n">0</span></div><div class="kanban-body" id="kb-review"></div></div>
     <div class="kanban-col"><div class="kanban-hd">Done <span class="count" id="kb-done-n">0</span></div><div class="kanban-body" id="kb-done"></div></div>
@@ -2255,11 +2288,20 @@ async function boardFetchSymphonySidecars(listId,tasks){
 
 function boardMergeSymphonyMeta(t,sidecars){
   const meta=boardTaskSymphonyMeta(t),sc=sidecars[t.id]||{};
-  if(sc.claimBlob){meta.claimBlob=sc.claimBlob;meta.claim=sc.claimBlob.claim||meta.claim;meta.claimStatus=sc.claimBlob.status;meta.has=true}
+  if(sc.claimBlob){
+    meta.claimBlob=sc.claimBlob;meta.claim=sc.claimBlob.claim||meta.claim;meta.claimStatus=sc.claimBlob.status;meta.has=true;
+    const rr=sc.claimBlob.release_reason||sc.claimBlob.releaseReason||{};
+    if(rr.code!==undefined){meta.releaseReasonCode=boardNormalizeReasonCode(rr.code);meta.releaseReasonMessage=rr.message||''}
+    if(rr.content_hash!==undefined)meta.contentHash=rr.content_hash;
+    if(rr.signer_agent_id!==undefined)meta.signerAgentId=rr.signer_agent_id;
+  }
   if(sc.handoffBlob){meta.handoffBlob=sc.handoffBlob;meta.handoff=sc.handoffBlob.handoff||meta.handoff;meta.has=true}
   if(meta.has&&meta.priority===undefined&&t.priority!==undefined)meta.priority=t.priority;
   return meta;
 }
+
+function boardNormalizeReasonCode(v){return String(v||'').trim().toLowerCase().replace(/[\s-]+/g,'_')}
+function boardIsPendingApprovalReason(v){return['awaiting_approval','approval_verifier_unconfigured','verify_transport_error'].includes(boardNormalizeReasonCode(v))}
 
 function boardNormalizeState(s){
   if(s&&typeof s==='object')s=s.state||s.status||s.name||s.value||'';
@@ -2273,6 +2315,7 @@ function boardNormalizeState(s){
 
 function boardSymphonyState(meta){
   if(!meta||!meta.has)return null;
+  if(boardIsPendingApprovalReason(meta.releaseReasonCode))return'pending_approval';
   if(meta.state!==undefined)return boardNormalizeState(meta.state);
   if(meta.handoff)return'review';
   const st=String(meta.claimStatus||'').toLowerCase();
@@ -2293,7 +2336,7 @@ function boardCheckboxState(t){
 
 function boardColumnForTask(t,meta){
   const s=boardSymphonyState(meta);
-  if(s==='todo'||s==='in_progress'||s==='review'||s==='done')return s;
+  if(s==='todo'||s==='pending_approval'||s==='in_progress'||s==='review'||s==='done')return s;
   return boardCheckboxState(t);
 }
 
@@ -2348,6 +2391,7 @@ function boardSymphonyBadges(meta){
   if(!meta||!meta.has)return'';
   const b=[],role=boardShardRole(meta),status=String(meta.claimStatus||'').toLowerCase();
   if(role)b.push(boardBadge('info','role '+role));
+  if(meta.releaseReasonCode)b.push(boardBadge(boardIsPendingApprovalReason(meta.releaseReasonCode)?'warn':'muted','reason '+meta.releaseReasonCode));
   if(meta.claim||status){
     const hb=boardHeartbeatFreshness(meta),agent=(meta.claim&&(meta.claim.by||meta.claim.agent||meta.claim.agent_id))||'';
     let cls=hb.state==='fresh'?'ok':hb.state==='stale'?'warn':hb.state==='expired'?'bad':'muted';
@@ -2367,7 +2411,7 @@ async function pollBoard(){
   const r=await api('/task-lists/'+spaceBoardId+'/tasks');if(!r||!r.tasks)return;
   const sidecars=await boardFetchSymphonySidecars(spaceBoardId,r.tasks);
   if(seq!==boardPollSeq)return;
-  const cols={todo:[],in_progress:[],review:[],done:[]};
+  const cols={todo:[],pending_approval:[],in_progress:[],review:[],done:[]};
   r.tasks.forEach(t=>{
     const meta=boardMergeSymphonyMeta(t,sidecars);
     if(boardSymphonyOnly&&!meta.has)return;
@@ -2375,23 +2419,56 @@ async function pollBoard(){
     (cols[col]||cols.todo).push({task:t,meta});
   });
   const render=(arr,col)=>arr.map(({task:t,meta})=>{
-    const action=col==='todo'?'claim':col==='in_progress'?'complete':'';
+    const isApproval=col==='pending_approval';
+    const action=isApproval?'':col==='todo'?'claim':col==='in_progress'?'complete':'';
     const who=t.assignee||t.claimed_by||'';
-    return `<div class="kanban-card" ${action?'onclick="boardAction(\''+escJs(t.id)+'\',\''+escJs(action)+'\')"':''}>
+    const guard={};
+    if(meta.contentHash)guard.contentHash=meta.contentHash;
+    if(meta.signerAgentId)guard.signerAgentId=meta.signerAgentId;
+    const guardJson=escJs(JSON.stringify(guard));
+    const approvalActions=isApproval?`<div class="kanban-card-actions">
+        <button class="pri" onclick="event.stopPropagation();boardApprovalAction('${escJs(t.id)}','approve',JSON.parse('${guardJson}'))">Approve</button>
+        <button class="danger" onclick="event.stopPropagation();boardApprovalAction('${escJs(t.id)}','deny',JSON.parse('${guardJson}'))">Deny</button>
+      </div>`:'';
+    return `<div class="kanban-card${isApproval?' pending-approval':''}" ${action?'onclick="boardAction(\''+escJs(t.id)+'\',\''+escJs(action)+'\')"':''}>
       <div class="title">${esc(t.title)}</div>
-      <div class="meta">${action?'click to '+action:''} ${who?trustHtml(getContactTrust(who)):''}</div>
+      <div class="meta">${isApproval?'awaiting operator approval':action?'click to '+action:''} ${who?trustHtml(getContactTrust(who)):''}</div>
       ${boardSymphonyBadges(meta)}
+      ${approvalActions}
     </div>`;
   }).join('')||'<div style="color:var(--tx3);font-size:11px;padding:8px">Empty</div>';
   const e=id=>document.getElementById(id);
   if(e('kb-todo'))e('kb-todo').innerHTML=render(cols.todo,'todo');
+  if(e('kb-approval'))e('kb-approval').innerHTML=render(cols.pending_approval,'pending_approval');
   if(e('kb-wip'))e('kb-wip').innerHTML=render(cols.in_progress,'in_progress');
   if(e('kb-review'))e('kb-review').innerHTML=render(cols.review,'review');
   if(e('kb-done'))e('kb-done').innerHTML=render(cols.done,'done');
   if(e('kb-todo-n'))e('kb-todo-n').textContent=cols.todo.length;
+  if(e('kb-approval-n'))e('kb-approval-n').textContent=cols.pending_approval.length;
   if(e('kb-wip-n'))e('kb-wip-n').textContent=cols.in_progress.length;
   if(e('kb-review-n'))e('kb-review-n').textContent=cols.review.length;
   if(e('kb-done-n'))e('kb-done-n').textContent=cols.done.length;
+}
+
+async function boardLookupPendingApproval(tid){
+  const r=await symApi('/symphony/approvals/pending');
+  if(!r||r._http_ok===false)return false;
+  const rows=Array.isArray(r)?r:(Array.isArray(r.approvals)?r.approvals:[]);
+  return rows.find(x=>String(x.issue_id||x.id||'')===String(tid))||null;
+}
+
+async function boardApprovalAction(tid,verdict,meta){
+  if(!confirm(verdict+' task '+tid+'?'))return;
+  const pending=await boardLookupPendingApproval(tid);
+  if(pending===false)return;
+  const guard=pending||meta||{};
+  const body={verdict};
+  const contentHash=guard.content_hash||guard.contentHash;
+  const signerAgentId=guard.signer_agent_id||guard.signerAgentId;
+  if(contentHash)body.expected_content_hash=contentHash;
+  if(signerAgentId)body.expected_signer_agent_id=signerAgentId;
+  const r=await symApi('/symphony/approvals/'+encodeURIComponent(tid),{method:'POST',body:JSON.stringify(body)});
+  if(r&&r._http_ok!==false){toast((verdict==='approve'?'approved':'denied')+' '+tid,'success');pollBoard()}
 }
 
 async function boardAction(tid,action){
@@ -3944,6 +4021,15 @@ function renderSettings(){
     <div style="font-size:11px;color:var(--tx3);margin-top:4px">Shown in chat messages and your identity card.</div>
   </div>
   <div class="card mb2">
+    <h3 style="margin-top:0">Symphony Daemon</h3>
+    <div class="row" style="gap:var(--sp2);flex-wrap:wrap">
+      <input id="set-symphony-url" value="${esc(symphonyDaemonUrl())}" placeholder="http://127.0.0.1:8642" style="flex:2;min-width:220px">
+      <input id="set-symphony-token" type="password" value="${esc(symphonyDaemonToken())}" placeholder="Bearer token" autocomplete="off" style="flex:1;min-width:180px">
+      <button class="pri" onclick="saveSymphonyDaemonSettings()">Save</button>
+    </div>
+    <div style="font-size:11px;color:var(--tx3);margin-top:4px">Approve/deny uses the separate x0x-symphonyd REST API, not x0xd. Default URL: http://127.0.0.1:8642.</div>
+  </div>
+  <div class="card mb2">
     <h3 style="margin-top:0">Your Identity</h3>
     <p style="font-size:12px;color:var(--tx2);margin-bottom:var(--sp3)">Your identity is permanent — derived from your cryptographic keys. Share your link so others can find and contact you.</p>
     <div class="id-card-ids" style="margin-bottom:var(--sp3)">
@@ -3990,6 +4076,15 @@ function saveName(){
   LS.set('display_name',name);
   renderSidebar();
   toast('Name saved','success');
+}
+
+function saveSymphonyDaemonSettings(){
+  const urlEl=document.getElementById('set-symphony-url'),tokEl=document.getElementById('set-symphony-token');
+  const url=(urlEl&&urlEl.value.trim())||DEFAULT_SYMPHONY_DAEMON_URL;
+  const token=(tokEl&&tokEl.value.trim())||'';
+  LS.set('symphonyDaemonUrl',url);
+  LS.set('symphonyDaemonToken',token);
+  toast('Symphony daemon settings saved','success');
 }
 
 let myCardLink=savedCard||'';
