@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sha2::{Digest, Sha256};
 
-use super::AppState;
+use super::state::AppState;
 
 // ── The pure authorization decision ──────────────────────────────────────
 
