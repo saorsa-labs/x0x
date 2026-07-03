@@ -570,3 +570,200 @@ async fn ws_message_ordering() {
 
     ws.close(None).await.expect("close");
 }
+
+// ---------------------------------------------------------------------------
+// WS1.1 stalled-reader harness (#149, follow-up to #147 / #122)
+// ---------------------------------------------------------------------------
+
+/// Read the WS outbound counters from `GET /diagnostics/ws`.
+async fn ws_outbound_counters(client: &reqwest::Client, d: &DaemonFixture) -> (u64, u64) {
+    let v: Value = client
+        .get(d.url("/diagnostics/ws"))
+        .send()
+        .await
+        .expect("GET /diagnostics/ws")
+        .json()
+        .await
+        .expect("parse /diagnostics/ws");
+    (
+        v["ws_outbound_dropped"]
+            .as_u64()
+            .expect("ws_outbound_dropped field"),
+        v["ws_slow_consumer_closes"]
+            .as_u64()
+            .expect("ws_slow_consumer_closes field"),
+    )
+}
+
+/// A local WS client that stops draining its socket must not grow daemon
+/// memory without bound.
+///
+/// WHY: the per-session outbound queue is the daemon's only memory bound
+/// against a misbehaving local client — one that completes the handshake,
+/// subscribes, then never reads another frame while topic traffic keeps
+/// flowing. PR #147 bounded the queue (`WS_OUTBOUND_CAPACITY=1024`) with two
+/// feeder policies (topic frames drop-with-counter; DM/keepalive frames close
+/// the session with WS 1013) and pinned both with unit tests against fakes.
+/// This test is the deferred end-to-end leg (#149): it proves the policy
+/// actually fires against a REAL stalled socket.
+///
+/// The documented obstacle (issue #149): no external frame flood can fill the
+/// bounded queue on its own — the `gossip → broadcast(256) → outbound(1024) →
+/// writer → TCP` pipeline absorbs any burst unless the writer itself is stuck
+/// flushing to a stalled socket. So the harness uses a cooperating stalled
+/// reader: `tokio-tungstenite` only reads from the TCP socket when the stream
+/// is polled, so after subscribing the client simply never polls `ws.next()`.
+/// The kernel recv buffer fills, the TCP window closes, the daemon's writer
+/// blocks in `ws_tx.send()`, and the queue fills behind it.
+///
+/// End-to-end assertions:
+/// 1. `ws_outbound_dropped` climbs (topic frames dropped on the Full queue);
+/// 2. the 30s keepalive pinger — the reliable detector — closes the session,
+///    incrementing `ws_slow_consumer_closes` exactly once, within a bounded
+///    wall-clock window;
+/// 3. once the client resumes draining, it receives the WS Close frame
+///    carrying 1013 "Try Again Later" — the documented, client-visible
+///    contract (this caught a real bug: session cleanup used to abort the
+///    writer mid-flush, so the 1013 never reached the wire and clients only
+///    ever saw a raw connection reset);
+/// 4. the session is removed from `/ws/sessions` (resources reclaimed).
+///
+/// ~60-90s wall clock (dominated by the 30s keepalive cadence), hence the
+/// `--ignored` integration tier.
+#[tokio::test]
+#[ignore]
+async fn ws_stalled_reader_fills_queue_and_closes_1013() {
+    let d = daemon().await;
+    let client = client_with_auth(&d);
+    let topic = format!("stall-test-{}", rand::random::<u32>());
+
+    let mut ws = ws_connect(&d, "/ws").await;
+    let connected = ws_recv_text(&mut ws, 5).await.expect("connected frame");
+    let frame: Value = serde_json::from_str(&connected).expect("parse connected");
+    let session_id = frame["session_id"]
+        .as_str()
+        .expect("session_id in connected frame")
+        .to_string();
+    ws_subscribe_topic(&mut ws, &topic).await;
+
+    let (base_dropped, base_closes) = ws_outbound_counters(&client, &d).await;
+
+    // ── STALL: from here on the client never polls `ws`, so nothing is read
+    // from the socket. Large payloads (~22KB per frame after base64+JSON)
+    // saturate the kernel buffers quickly so the writer blocks after a few
+    // frames instead of a few thousand.
+    let payload = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        [b'x'; 16 * 1024],
+    );
+
+    // Publish until the per-session queue observes Full (drops counted).
+    // Kernel buffers absorb a few frames and the mpsc holds 1024, so >1100
+    // frames are needed; REST publishes run in concurrent waves because a
+    // single serial publish round-trip is far too slow to beat the deadline.
+    let fill_deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut dropped = base_dropped;
+    let mut published: u32 = 0;
+    while dropped <= base_dropped {
+        assert!(
+            tokio::time::Instant::now() < fill_deadline,
+            "outbound queue never filled: published {published} frames, \
+             ws_outbound_dropped still {dropped} (baseline {base_dropped})"
+        );
+        let wave: Vec<_> = (0..64)
+            .map(|_| {
+                client
+                    .post(d.url("/publish"))
+                    .json(&json!({"topic": &topic, "payload": &payload}))
+                    .send()
+            })
+            .collect();
+        for resp in futures::future::join_all(wave).await {
+            let resp = resp.expect("publish");
+            assert_eq!(resp.status(), 200, "publish #{published} failed");
+            published += 1;
+        }
+        (dropped, _) = ws_outbound_counters(&client, &d).await;
+    }
+    assert!(
+        dropped > base_dropped,
+        "ws_outbound_dropped must climb once the queue is full"
+    );
+
+    // ── The keepalive pinger (30s cadence) is the detector: its feed_critical
+    // hits the Full queue and closes the session. Bounded window: one full
+    // interval plus slack.
+    let close_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut closes = base_closes;
+    while closes <= base_closes {
+        assert!(
+            tokio::time::Instant::now() < close_deadline,
+            "slow-consumer close did not fire within 45s of queue saturation \
+             (ws_slow_consumer_closes still {closes}, baseline {base_closes})"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (_, closes) = ws_outbound_counters(&client, &d).await;
+    }
+    assert_eq!(
+        closes,
+        base_closes + 1,
+        "slow-consumer close must be counted exactly once per session"
+    );
+
+    // ── Resume draining: the kernel-buffered backlog flushes first, then the
+    // writer's Close(1013) (it holds a 2s flush budget and cleanup grants a
+    // bounded grace period before aborting it, so the close frame reaches the
+    // wire once the client drains — the client-visible contract).
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut close_code: Option<u16> = None;
+    while tokio::time::Instant::now() < drain_deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(Message::Close(close_frame)))) => {
+                close_code = close_frame.as_ref().map(|f| u16::from(f.code));
+                break;
+            }
+            Ok(Some(Ok(_))) => continue, // buffered backlog frames
+            Ok(Some(Err(e))) => panic!(
+                "stalled session must end with a Close(1013) frame, \
+                 not an abrupt socket error: {e}"
+            ),
+            Ok(None) => panic!("stalled session must end with a Close(1013) frame, not EOF"),
+            Err(_) => break, // stream open and quiet — deadline loop decides
+        }
+    }
+    assert_eq!(
+        close_code,
+        Some(1013),
+        "slow-consumer close must reach the client as WS 1013 Try Again Later"
+    );
+    eprintln!(
+        "stalled reader: published={published} dropped={} close_code={close_code:?}",
+        dropped - base_dropped
+    );
+
+    // ── The session must be gone from /ws/sessions (resources reclaimed).
+    let sessions_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let v: Value = client
+            .get(d.url("/ws/sessions"))
+            .send()
+            .await
+            .expect("GET /ws/sessions")
+            .json()
+            .await
+            .expect("parse /ws/sessions");
+        let still_present = v["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .any(|s| s["session_id"].as_str() == Some(session_id.as_str()));
+        if !still_present {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < sessions_deadline,
+            "stalled session {session_id} still registered after slow-consumer close"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
