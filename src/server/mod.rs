@@ -9,6 +9,8 @@
 // crate to itself so those paths resolve unchanged inside the library.
 use crate as x0x;
 
+mod auth;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -19,7 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
@@ -659,7 +661,7 @@ struct AppState {
     api_token: String,
     /// Short-lived browser session tokens (#127 / WS1.6). The only tokens
     /// accepted via `?token=` query strings on WS/SSE endpoints.
-    sessions: SessionStore,
+    sessions: auth::SessionStore,
     /// Tier-1 remote exec service.
     exec_service: Arc<x0x::exec::ExecService>,
     /// Per-group ingest diagnostics surfaced via `/diagnostics/groups`.
@@ -1610,7 +1612,7 @@ pub async fn serve_with_options(
     let named_groups = load_named_groups(&named_groups_path).await?;
 
     // Load or generate API bearer token for local authentication.
-    let api_token = load_or_generate_api_token(&config.data_dir).await?;
+    let api_token = auth::load_or_generate_api_token(&config.data_dir).await?;
 
     // Bind the API listener early so the daemon can report the actual bound
     // address even when configured with an ephemeral port. Done before the agent
@@ -1726,7 +1728,7 @@ pub async fn serve_with_options(
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         api_token,
-        sessions: SessionStore::new(SESSION_TOKEN_TTL),
+        sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
         exec_service: Arc::clone(&exec_service),
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
     });
@@ -2427,7 +2429,7 @@ pub async fn serve_with_options(
         .route("/gui/", get(serve_gui))
         // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
         // browser session token, the only kind valid in ?token= query strings.
-        .route("/auth/session", post(create_session))
+        .route("/auth/session", post(auth::create_session))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer({
             // Restrict CORS to exact loopback origins only.
@@ -2435,7 +2437,7 @@ pub async fn serve_with_options(
             use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin};
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(|origin, _| {
-                    is_allowed_loopback_origin(origin)
+                    auth::is_allowed_loopback_origin(origin)
                 }))
                 .allow_methods(AllowMethods::any())
                 .allow_headers(AllowHeaders::any())
@@ -2443,7 +2445,7 @@ pub async fn serve_with_options(
         // Bearer-token authentication: all control-plane endpoints.
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
-            auth_middleware,
+            auth::auth_middleware,
         ))
         .with_state(Arc::clone(&state));
 
@@ -2603,313 +2605,6 @@ pub async fn serve_with_options(
         cancel,
         task: Some(task),
     })
-}
-
-/// Bearer-token authentication middleware.
-///
-/// Exempts:
-/// - `OPTIONS` (CORS preflight — browsers send these without auth headers)
-/// - `/health`
-/// - `/constitution` resources
-///
-/// Accepts `?token=` query parameter on endpoints that browsers cannot send
-/// headers on: the GUI bootstrap (`/gui`, `/gui/`), WebSocket (`/ws`,
-/// `/ws/direct`), and SSE (`/events`, `/direct/events`,
-/// `/peers/events`, `/presence/events`).
-///
-/// All other endpoints require `Authorization: Bearer <token>`.
-async fn auth_middleware(
-    State(state): State<Arc<AppState>>,
-    req: axum::http::Request<axum::body::Body>,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    // CORS preflight: browsers send OPTIONS without auth headers
-    if req.method() == axum::http::Method::OPTIONS {
-        return next.run(req).await;
-    }
-
-    let path = req.uri().path();
-
-    // Exempt: health check and public constitution resources.
-    if is_auth_exempt_path(path) {
-        return next.run(req).await;
-    }
-
-    // Check Authorization: Bearer header first (works everywhere).
-    // Accepts either the durable API token OR a short-lived session token
-    // (#127 / WS1.6) — browser clients use the session token after exchange.
-    if let Some(auth) = req.headers().get(axum::http::header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if ct_eq(token, &state.api_token) || state.sessions.is_valid(token, Instant::now())
-                {
-                    return next.run(req).await;
-                }
-            }
-        }
-    }
-
-    // Endpoints where browsers cannot set headers: accept ?token= query param.
-    // ONLY short-lived session tokens are valid here — the durable API token
-    // is never accepted in a query string (#127 / WS1.6), eliminating the
-    // history/Referer/HAR leak surface for the long-lived secret.
-    if accepts_query_token(path) {
-        if let Some(query) = req.uri().query() {
-            for pair in query.split('&') {
-                if let Some(token) = pair.strip_prefix("token=") {
-                    if state.sessions.is_valid(token, Instant::now()) {
-                        return next.run(req).await;
-                    }
-                }
-            }
-        }
-    }
-
-    (
-        StatusCode::UNAUTHORIZED,
-        axum::Json(serde_json::json!({"error": "missing or invalid Authorization: Bearer token"})),
-    )
-        .into_response()
-}
-
-/// `POST /auth/session` — exchange the durable API token for a short-lived
-/// browser session token (#127 / WS1.6).
-///
-/// Requires the **durable** bearer token specifically — a session token
-/// cannot mint or refresh another session (no privilege amplification). The
-/// returned session token is the only kind accepted via `?token=` query
-/// strings on browser endpoints (WS/SSE), keeping the durable secret out of
-/// URLs entirely.
-async fn create_session(
-    State(state): State<Arc<AppState>>,
-    req: axum::http::Request<axum::body::Body>,
-) -> axum::response::Response {
-    // auth_middleware already validated *some* bearer token (durable or
-    // session). This handler additionally requires the durable token: a
-    // session bearer cannot mint sessions.
-    let is_durable = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .is_some_and(|t| ct_eq(t, &state.api_token));
-
-    if !is_durable {
-        return (
-            StatusCode::FORBIDDEN,
-            axum::Json(serde_json::json!({
-                "error": "durable API token required to mint a session"
-            })),
-        )
-            .into_response();
-    }
-
-    let token = state.sessions.issue(Instant::now());
-    (
-        StatusCode::OK,
-        axum::Json(serde_json::json!({
-            "session_token": token,
-            "expires_in": SESSION_TOKEN_TTL_SECS,
-        })),
-    )
-        .into_response()
-}
-
-fn is_auth_exempt_path(path: &str) -> bool {
-    path == "/health" || path.starts_with("/constitution")
-}
-
-fn accepts_query_token(path: &str) -> bool {
-    matches!(
-        path,
-        "/gui"
-            | "/gui/"
-            | "/ws"
-            | "/ws/direct"
-            | "/events"
-            | "/direct/events"
-            | "/peers/events"
-            | "/presence/events"
-    )
-}
-
-fn is_allowed_loopback_origin(origin: &HeaderValue) -> bool {
-    origin
-        .to_str()
-        .ok()
-        .is_some_and(is_allowed_loopback_origin_str)
-}
-
-fn is_allowed_loopback_origin_str(origin: &str) -> bool {
-    let Some(authority) = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-    else {
-        return false;
-    };
-    if authority.is_empty() || authority.contains('/') || authority.contains('@') {
-        return false;
-    }
-
-    let Some(host) = origin_host_without_port(authority) else {
-        return false;
-    };
-    // Literal loopback IPs only. The `localhost` hostname is intentionally rejected:
-    // its resolution can be redirected (/etc/hosts, split-horizon DNS, OSes that map it
-    // off-loopback), so it is not a trustworthy origin for the local control plane.
-    matches!(host, "127.0.0.1" | "::1")
-}
-
-fn origin_host_without_port(authority: &str) -> Option<&str> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, port) = rest.split_once(']')?;
-        if port.is_empty() || valid_origin_port(port.strip_prefix(':')?) {
-            Some(host)
-        } else {
-            None
-        }
-    } else {
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) if !host.contains(':') => (host, Some(port)),
-            Some(_) => return None,
-            None => (authority, None),
-        };
-        if port.is_none_or(valid_origin_port) {
-            Some(host)
-        } else {
-            None
-        }
-    }
-}
-
-fn valid_origin_port(port: &str) -> bool {
-    !port.is_empty() && port.parse::<u16>().is_ok()
-}
-
-/// Constant-time comparison of two secret token strings.
-///
-/// Both sides are SHA-256 hashed first so the comparison is over fixed-length
-/// 32-byte digests — this avoids any length-timing argument and keeps the
-/// comparison constant-time regardless of the input lengths. Used on every
-/// bearer-token and session-token validation path (#127 / WS1.6).
-fn ct_eq(a: &str, b: &str) -> bool {
-    let ha = Sha256::digest(a.as_bytes());
-    let hb = Sha256::digest(b.as_bytes());
-    use subtle::ConstantTimeEq;
-    ha.ct_eq(&hb).into()
-}
-
-/// Lifetime of a browser session token issued by `POST /auth/session`.
-const SESSION_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
-/// Same value in seconds, surfaced in the `expires_in` JSON field.
-const SESSION_TOKEN_TTL_SECS: u64 = 10 * 60;
-
-/// A single issued browser session token, stored as a SHA-256 digest.
-///
-/// Only the digest is retained so a memory dump cannot recover live tokens;
-/// validation hashes the candidate and scans with [`subtle::ConstantTimeEq`].
-struct AuthSession {
-    token_hash: [u8; 32],
-    expires_at: Instant,
-}
-
-/// In-memory store of short-lived browser session tokens (#127 / WS1.6).
-///
-/// Session tokens are the *only* tokens accepted via `?token=` query strings
-/// on browser endpoints (WS/SSE); the durable API token is never valid in a
-/// query string. The store uses a `std::sync::Mutex` because the critical
-/// sections are trivial (hash + linear scan + prune) and never cross an await.
-struct SessionStore {
-    sessions: StdMutex<Vec<AuthSession>>,
-    ttl: Duration,
-}
-
-impl SessionStore {
-    fn new(ttl: Duration) -> Self {
-        Self {
-            sessions: StdMutex::new(Vec::new()),
-            ttl,
-        }
-    }
-
-    /// Issue a fresh session token, store its digest, and return the raw token
-    /// to hand to the client. `now` is injected so expiry can be unit-tested
-    /// without sleeping.
-    fn issue(&self, now: Instant) -> String {
-        use rand::RngCore;
-        let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        let token = hex::encode(bytes);
-        let session = AuthSession {
-            token_hash: Sha256::digest(token.as_bytes()).into(),
-            expires_at: now + self.ttl,
-        };
-        if let Ok(mut guard) = self.sessions.lock() {
-            guard.push(session);
-            // Bound the store: lazy-prune expired entries on every issue so a
-            // flood of session mints cannot grow the vector without bound.
-            guard.retain(|s| s.expires_at > now);
-        }
-        token
-    }
-
-    /// Validate a candidate token: constant-time compare against every active
-    /// session digest, pruning expired entries along the way. Returns `true`
-    /// only if an unexpired entry matches.
-    fn is_valid(&self, token: &str, now: Instant) -> bool {
-        use subtle::ConstantTimeEq;
-        let candidate = Sha256::digest(token.as_bytes());
-        let Ok(mut guard) = self.sessions.lock() else {
-            return false;
-        };
-        // Prune expired first (fail-closed: an expired token is never valid).
-        guard.retain(|s| s.expires_at > now);
-        guard.iter().any(|s| candidate.ct_eq(&s.token_hash).into())
-    }
-}
-
-/// Load or generate an API bearer token.
-///
-/// Reads from `<data_dir>/api-token`. If the file does not exist, generates a
-/// random 32-byte hex token and writes it with 0600 permissions.
-async fn load_or_generate_api_token(data_dir: &std::path::Path) -> Result<String> {
-    let token_path = data_dir.join("api-token");
-
-    // Try to load existing token
-    if token_path.exists() {
-        let token = tokio::fs::read_to_string(&token_path)
-            .await
-            .context("failed to read api-token")?
-            .trim()
-            .to_string();
-        if token.len() >= 32 {
-            tracing::info!("API token loaded from {}", token_path.display());
-            return Ok(token);
-        }
-    }
-
-    // Generate new token
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let token = hex::encode(bytes);
-
-    tokio::fs::write(&token_path, &token)
-        .await
-        .context("failed to write api-token")?;
-
-    // Set permissions to 0600 (owner read/write only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        tokio::fs::set_permissions(&token_path, perms)
-            .await
-            .context("failed to set api-token permissions")?;
-    }
-
-    tracing::info!("API token generated at {}", token_path.display());
-    Ok(token)
 }
 
 pub fn validate_instance_name(name: &str) -> Result<()> {
@@ -21508,52 +21203,6 @@ mod tests {
     }
 
     #[test]
-    fn cors_origin_allows_only_literal_loopback_ips() {
-        for origin in [
-            "http://127.0.0.1",
-            "http://127.0.0.1:12700",
-            "http://[::1]",
-            "http://[::1]:12700",
-        ] {
-            assert!(
-                is_allowed_loopback_origin_str(origin),
-                "expected literal loopback IP origin to be allowed: {origin}"
-            );
-        }
-
-        for origin in [
-            // `localhost` hostname is rejected — resolution can be redirected.
-            "http://localhost",
-            "http://localhost:12700",
-            "https://localhost",
-            // spoofed / non-loopback
-            "http://localhost.evil.example",
-            "http://127.0.0.1.evil.example",
-            "http://[::1].evil.example",
-            "http://evil.localhost",
-            "http://localhost@evil.example",
-            "http://localhost:bad",
-            "ftp://localhost",
-            "null",
-        ] {
-            assert!(
-                !is_allowed_loopback_origin_str(origin),
-                "expected non-IP-loopback origin to be rejected: {origin}"
-            );
-        }
-    }
-
-    #[test]
-    fn gui_requires_auth_but_accepts_query_token_bootstrap() {
-        assert!(!is_auth_exempt_path("/gui"));
-        assert!(!is_auth_exempt_path("/gui/"));
-        assert!(accepts_query_token("/gui"));
-        assert!(accepts_query_token("/gui/"));
-        assert!(accepts_query_token("/peers/events"));
-        assert!(accepts_query_token("/presence/events"));
-    }
-
-    #[test]
     fn rendered_gui_does_not_disclose_api_token() {
         let html = render_gui_html();
 
@@ -22093,7 +21742,7 @@ mod tests {
             upgrade_check_cache: Mutex::new(None),
             upgrade_apply_lock: Arc::new(Mutex::new(())),
             api_token: "test-token".to_string(),
-            sessions: SessionStore::new(SESSION_TOKEN_TTL),
+            sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
         });
@@ -25727,420 +25376,6 @@ mod tests {
         assert_eq!(decoded.store_id, "store-1");
         assert_eq!(decoded.peer_id, peer_id);
         assert_eq!(decoded.delta.version, delta.version);
-    }
-
-    // ========================================================================
-    // #124 / WS1.3 — auth-middleware coverage matrix (in-process router).
-    //
-    // The production `auth_middleware` is typed to `State<Arc<AppState>>`, and
-    // `AppState` carries a full `Agent` + MLS/gossip runtime that cannot be
-    // constructed in a unit test. These tests therefore use a TEST-ONLY shim
-    // (`test_auth_shim`) that mirrors `auth_middleware`'s control flow and
-    // delegates every policy decision to the REAL private helpers used in
-    // production (`is_auth_exempt_path`, `accepts_query_token`, the token
-    // comparison). The HTTP 401/200 status matrix is exercised through a real
-    // in-process axum `Router` via `tower::ServiceExt::oneshot`, so the
-    // behaviour under test is genuine middleware output — not a daemon spawn
-    // and not a predicate-only assertion.
-    //
-    // If `auth_middleware`'s control flow changes, update `test_auth_shim` to
-    // match; it is the only duplicated logic, the policy helpers are shared.
-    // ========================================================================
-    use tower::ServiceExt as _;
-
-    /// Token the test shim treats as the durable API token. Mirrors `state.api_token`.
-    const TEST_API_TOKEN: &str = "x0x-test-auth-matrix-token";
-    /// Token the test shim treats as a valid session token (#127 / WS1.6).
-    /// Mirrors an entry in `SessionStore`; the shim checks policy (which token
-    /// *kind* is accepted where), not the store mechanics.
-    const TEST_SESSION_TOKEN: &str = "x0x-test-session-token";
-
-    /// HTTP method each protected route is registered under, so the accept
-    /// tests actually reach the handler (a wrong method would 405, masking a
-    /// real auth gap). Rejection tests run before method matching so they are
-    /// unaffected, but this keeps the helper honest.
-    fn matrix_method(path: &str) -> axum::http::Method {
-        if path == "/agent/sign" || path == "/agent/verify" {
-            axum::http::Method::POST
-        } else {
-            axum::http::Method::GET
-        }
-    }
-
-    /// Stub handler every route maps to — the auth matrix only cares whether a
-    /// request reaches the handler (200) or is rejected by the middleware
-    /// (401), never what the handler does.
-    async fn matrix_ok_stub() -> impl axum::response::IntoResponse {
-        (StatusCode::OK, axum::Json(serde_json::json!({"ok": true})))
-    }
-
-    /// TEST-ONLY mirror of `auth_middleware`. See the section comment above:
-    /// duplicated control flow only, policy helpers shared with production.
-    async fn test_auth_shim(
-        req: axum::http::Request<axum::body::Body>,
-        next: axum::middleware::Next,
-    ) -> axum::response::Response {
-        // (1) CORS preflight: browsers send OPTIONS without auth headers.
-        if req.method() == axum::http::Method::OPTIONS {
-            return next.run(req).await;
-        }
-        let path = req.uri().path();
-        // (2) Exempt: health check + public constitution resources.
-        if is_auth_exempt_path(path) {
-            return next.run(req).await;
-        }
-        // (3) Authorization: Bearer header (works everywhere).
-        // Accepts either the durable API token OR a session token (#127).
-        if let Some(auth) = req.headers().get(axum::http::header::AUTHORIZATION) {
-            if let Ok(auth_str) = auth.to_str() {
-                if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                    if ct_eq(token, TEST_API_TOKEN) || ct_eq(token, TEST_SESSION_TOKEN) {
-                        return next.run(req).await;
-                    }
-                }
-            }
-        }
-        // (4) `?token=` query param, only on browser-only endpoints.
-        // ONLY session tokens are valid here (#127 / WS1.6) — the durable
-        // token is never accepted in a query string.
-        if accepts_query_token(path) {
-            if let Some(query) = req.uri().query() {
-                for pair in query.split('&') {
-                    if let Some(token) = pair.strip_prefix("token=") {
-                        if ct_eq(token, TEST_SESSION_TOKEN) {
-                            return next.run(req).await;
-                        }
-                    }
-                }
-            }
-        }
-        (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({
-                "error": "missing or invalid Authorization: Bearer token"
-            })),
-        )
-            .into_response()
-    }
-
-    /// Build the in-process auth-matrix router: the production CORS layer
-    /// (same `AllowOrigin::predicate`) + the test auth shim + stub routes
-    /// spanning the policy categories (protected / exempt / browser-query).
-    fn auth_matrix_router() -> axum::Router<()> {
-        use axum::routing::{get, post};
-        use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin};
-        axum::Router::new()
-            // Representative protected control-plane endpoints.
-            .route("/status", get(matrix_ok_stub))
-            .route("/agent", get(matrix_ok_stub))
-            .route("/agent/sign", post(matrix_ok_stub))
-            .route("/agent/verify", post(matrix_ok_stub))
-            // Auth-exempt public resources.
-            .route("/health", get(matrix_ok_stub))
-            .route("/constitution", get(matrix_ok_stub))
-            .route("/constitution/json", get(matrix_ok_stub))
-            // Browser-only endpoints that accept `?token=`.
-            .route("/gui", get(matrix_ok_stub))
-            .route("/gui/", get(matrix_ok_stub))
-            .route("/ws", get(matrix_ok_stub))
-            .route("/ws/direct", get(matrix_ok_stub))
-            .route("/events", get(matrix_ok_stub))
-            .route("/direct/events", get(matrix_ok_stub))
-            .route("/peers/events", get(matrix_ok_stub))
-            .route("/presence/events", get(matrix_ok_stub))
-            // Layer order matches `serve()`: CORS added first, the auth shim
-            // added second (outermost) — so auth runs before CORS, exactly as
-            // the production wiring stacks `auth_middleware` over `CorsLayer`.
-            .layer(
-                CorsLayer::new()
-                    .allow_origin(AllowOrigin::predicate(|origin, _| {
-                        is_allowed_loopback_origin(origin)
-                    }))
-                    .allow_methods(AllowMethods::any())
-                    .allow_headers(AllowHeaders::any()),
-            )
-            .layer(axum::middleware::from_fn(test_auth_shim))
-    }
-
-    /// Build a request and run it through the matrix router, returning the
-    /// response (status + headers) for assertion.
-    async fn matrix_request(
-        method: axum::http::Method,
-        uri: &str,
-        bearer: Option<&str>,
-        origin: Option<&str>,
-    ) -> axum::http::Response<axum::body::Body> {
-        let mut builder = axum::http::Request::builder().method(method).uri(uri);
-        if let Some(token) = bearer {
-            builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
-        }
-        if let Some(org) = origin {
-            builder = builder.header(axum::http::header::ORIGIN, org);
-        }
-        let request = builder
-            .body(axum::body::Body::empty())
-            .expect("valid in-process test request");
-        auth_matrix_router()
-            .oneshot(request)
-            .await
-            .expect("in-process router must answer")
-    }
-
-    // -- Protected endpoints: representative sample + /agent/sign + /agent/verify.
-
-    #[tokio::test]
-    async fn auth_matrix_protected_endpoints_reject_without_token() {
-        for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
-            let resp = matrix_request(matrix_method(path), path, None, None).await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::UNAUTHORIZED,
-                "{path} without a token must be 401"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn auth_matrix_protected_endpoints_reject_wrong_token() {
-        for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
-            let resp =
-                matrix_request(matrix_method(path), path, Some("not-the-real-token"), None).await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::UNAUTHORIZED,
-                "{path} with a wrong bearer must be 401"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn auth_matrix_protected_endpoints_accept_correct_token() {
-        for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
-            let resp = matrix_request(matrix_method(path), path, Some(TEST_API_TOKEN), None).await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "{path} with the correct bearer must reach the handler (200)"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn auth_matrix_protected_endpoints_accept_session_bearer() {
-        // #127 / WS1.6: a short-lived session token in the Bearer header is
-        // accepted on protected endpoints too (browser clients use it after
-        // exchange, so REST calls work without the durable secret).
-        for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
-            let resp =
-                matrix_request(matrix_method(path), path, Some(TEST_SESSION_TOKEN), None).await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "{path} with a session bearer must reach the handler (200)"
-            );
-        }
-    }
-
-    // -- Auth-exempt public paths: served without any token.
-
-    #[tokio::test]
-    async fn auth_matrix_exempt_paths_serve_without_token() {
-        for path in ["/health", "/constitution", "/constitution/json"] {
-            let resp = matrix_request(axum::http::Method::GET, path, None, None).await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "{path} is auth-exempt and must serve without a token"
-            );
-        }
-    }
-
-    // -- Browser-only endpoints: `?token=` accepted here and only here.
-
-    #[tokio::test]
-    async fn auth_matrix_browser_endpoints_accept_query_token() {
-        // #127 / WS1.6: only a short-lived SESSION token is accepted via
-        // ?token= on browser endpoints (WS/SSE/GUI). The durable token must
-        // never appear in a URL.
-        for path in [
-            "/gui",
-            "/gui/",
-            "/ws",
-            "/ws/direct",
-            "/events",
-            "/direct/events",
-            "/peers/events",
-            "/presence/events",
-        ] {
-            let uri = format!("{path}?token={TEST_SESSION_TOKEN}");
-            let resp = matrix_request(axum::http::Method::GET, &uri, None, None).await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "{path}?token=<session> is a browser endpoint and must accept the session token"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn auth_matrix_browser_endpoints_reject_durable_query_token() {
-        // #127 / WS1.6 — the headline security property: the durable API
-        // token in a query string is REJECTED, even on browser endpoints that
-        // accept ?token=. Only session tokens are valid in URLs. This is what
-        // keeps the long-lived secret out of history/Referer/HAR.
-        for path in ["/gui", "/ws", "/ws/direct", "/events", "/peers/events"] {
-            let uri = format!("{path}?token={TEST_API_TOKEN}");
-            let resp = matrix_request(axum::http::Method::GET, &uri, None, None).await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::UNAUTHORIZED,
-                "{path}?token=<durable> must be 401 — durable tokens are never valid in a query string"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn auth_matrix_query_token_rejected_on_protected_paths() {
-        // The durable bearer token must NOT be passable as a query param on
-        // non-browser endpoints — that would leak it via history/Referer/HAR.
-        for path in ["/status", "/agent/sign", "/agent/verify"] {
-            let method = matrix_method(path);
-            let uri = format!("{path}?token={TEST_API_TOKEN}");
-            let resp = matrix_request(method, &uri, None, None).await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::UNAUTHORIZED,
-                "{path}?token= must reject the query token (not a browser endpoint)"
-            );
-        }
-    }
-
-    // -- CORS preflight exemption: OPTIONS bypasses auth.
-
-    #[tokio::test]
-    async fn auth_matrix_options_preflight_bypasses_auth() {
-        // Browsers cannot attach auth headers to a CORS preflight; the
-        // middleware must pass OPTIONS through even on a protected path.
-        let resp = matrix_request(axum::http::Method::OPTIONS, "/status", None, None).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "OPTIONS preflight must bypass bearer auth"
-        );
-    }
-
-    // -- CORS predicate: literal loopback IPs allowed, `localhost` rejected.
-
-    #[tokio::test]
-    async fn cors_matrix_allows_literal_loopback_origins() {
-        for origin in [
-            "http://127.0.0.1",
-            "http://127.0.0.1:12700",
-            "http://[::1]",
-            "http://[::1]:12700",
-        ] {
-            let resp = matrix_request(axum::http::Method::GET, "/health", None, Some(origin)).await;
-            assert_eq!(resp.status(), StatusCode::OK, "GET /health is auth-exempt");
-            assert_eq!(
-                resp.headers()
-                    .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                    .map(|v| v.to_str().expect("ACAO is ascii")),
-                Some(origin),
-                "CORS must echo the literal-loopback origin {origin} back as ACAO"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn cors_matrix_rejects_localhost_origin() {
-        // `localhost` resolution can be redirected (/etc/hosts, split-horizon
-        // DNS), so it is not a trustworthy origin for the local control plane.
-        let resp = matrix_request(
-            axum::http::Method::GET,
-            "/health",
-            None,
-            Some("http://localhost:12700"),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK, "GET /health is auth-exempt");
-        assert!(
-            resp.headers()
-                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                .is_none(),
-            "CORS must NOT grant a localhost origin (no ACAO header)"
-        );
-    }
-
-    // ========================================================================
-    // #127 / WS1.6 — SessionStore + constant-time-compare unit tests.
-    //
-    // The session store is pure over an injected `Instant` (no sleeps, no
-    // daemon), so expiry and pruning are fully deterministic.
-    // ========================================================================
-
-    #[test]
-    fn session_store_issues_and_validates_a_token() {
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
-        let now = Instant::now();
-        let token = store.issue(now);
-        assert!(token.len() >= 32, "session token must be opaque hex");
-        assert!(
-            store.is_valid(&token, now),
-            "a freshly-issued token must validate"
-        );
-        assert!(
-            !store.is_valid("not-a-real-token", now),
-            "a wrong token must not validate",
-        );
-    }
-
-    #[test]
-    fn session_store_token_expires_after_ttl() {
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
-        let t0 = Instant::now();
-        let token = store.issue(t0);
-        assert!(store.is_valid(&token, t0));
-        // One nanosecond before expiry: still valid.
-        let just_before = t0 + SESSION_TOKEN_TTL - Duration::from_nanos(1);
-        assert!(
-            store.is_valid(&token, just_before),
-            "token must be valid right up to the TTL boundary",
-        );
-        // One nanosecond after expiry: invalid (fail-closed).
-        let just_after = t0 + SESSION_TOKEN_TTL + Duration::from_nanos(1);
-        assert!(
-            !store.is_valid(&token, just_after),
-            "token must be invalid past the TTL",
-        );
-    }
-
-    #[test]
-    fn session_store_prunes_expired_entries_on_validate() {
-        // Pruning is lazy (on issue/validate) so the Vec cannot grow without
-        // bound even if clients never explicitly revoke.
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
-        let t0 = Instant::now();
-        let dead = store.issue(t0); // expires at t0 + TTL
-        let alive = store.issue(t0); // same expiry, but we validate after pruning
-                                     // Advance well past TTL: both should be pruned.
-        let far_future = t0 + SESSION_TOKEN_TTL * 10;
-        assert!(!store.is_valid(&dead, far_future));
-        assert!(!store.is_valid(&alive, far_future));
-        // A new token issued at far_future must still work.
-        let fresh = store.issue(far_future);
-        assert!(store.is_valid(&fresh, far_future));
-    }
-
-    #[test]
-    fn ct_eq_is_constant_time_and_correct() {
-        // Correctness: equal strings compare equal, different do not.
-        assert!(ct_eq("abc", "abc"));
-        assert!(!ct_eq("abc", "abd"));
-        // Different lengths never panic and compare unequal.
-        assert!(!ct_eq("abc", "ab"));
-        assert!(!ct_eq("", "abc"));
-        // Empty vs empty is equal.
-        assert!(ct_eq("", ""));
     }
 
     // ========================================================================
