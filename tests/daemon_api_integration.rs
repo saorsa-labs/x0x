@@ -914,8 +914,9 @@ async fn daemon_api_shutdown_with_sse_client() {
     let mut d = DaemonFixture::start("shutdown-test").await;
 
     let sse_client = reqwest::Client::new();
+    let session = d.session_token().await;
     let sse_response = sse_client
-        .get(format!("{}?token={}", d.url("/events"), d.api_token()))
+        .get(format!("{}?token={session}", d.url("/events")))
         .send()
         .await
         .unwrap();
@@ -2070,6 +2071,39 @@ async fn daemon_api_diagnostics_ws() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_auth_session_exchange() {
+    // #127 / WS1.6: durable bearer → short-lived session token.
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .post(d.url("/auth/session"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r["session_token"].is_string());
+    let session = r["session_token"].as_str().unwrap();
+    assert!(session.len() >= 32, "session token must be opaque");
+    assert_eq!(r["expires_in"], 600);
+
+    // The session token must be accepted on a browser-only query-token
+    // endpoint (the durable token is NOT — tested separately in the unit
+    // auth matrix). Prove it opens /events via ?token=<session>.
+    let sse = ca(&d)
+        .get(d.url(&format!("/events?token={session}")))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        sse.status().is_success(),
+        "session token opens SSE: {}",
+        sse.status()
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_diagnostics_exec() {
     let d = daemon().await;
     let r: Value = ca(&d)
@@ -2183,7 +2217,7 @@ async fn daemon_api_connect_unknown() {
 #[ignore]
 async fn daemon_api_ws_connect() {
     let d = daemon().await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(d.ws_url("/ws"))
+    let (mut ws, _) = tokio_tungstenite::connect_async(d.ws_url("/ws").await)
         .await
         .expect("WS connect failed");
     let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
@@ -2205,7 +2239,7 @@ async fn daemon_api_ws_connect() {
 #[ignore]
 async fn daemon_api_ws_ping_pong() {
     let d = daemon().await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(d.ws_url("/ws"))
+    let (mut ws, _) = tokio_tungstenite::connect_async(d.ws_url("/ws").await)
         .await
         .unwrap();
     let _ = ws.next().await; // consume connected
@@ -2232,7 +2266,7 @@ async fn daemon_api_ws_ping_pong() {
 #[ignore]
 async fn daemon_api_ws_sessions() {
     let d = daemon().await;
-    let (_ws, _) = tokio_tungstenite::connect_async(d.ws_url("/ws"))
+    let (_ws, _) = tokio_tungstenite::connect_async(d.ws_url("/ws").await)
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;

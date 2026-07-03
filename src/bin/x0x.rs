@@ -123,6 +123,11 @@ enum Commands {
         #[command(subcommand)]
         sub: DiagnosticsSub,
     },
+    /// Session-token management (#127 / WS1.6).
+    Auth {
+        #[command(subcommand)]
+        sub: AuthSub,
+    },
     /// Find agents by 4-word speakable identity.
     Find {
         /// Identity words (4 words for agent, or 8 with @ separator).
@@ -436,6 +441,13 @@ enum DiagnosticsSub {
     Exec,
     /// Print WebSocket outbound-queue health (capacity, drops, slow-consumer closes).
     Ws,
+}
+
+/// Auth sub-actions (`x0x auth session`).
+#[derive(Subcommand)]
+enum AuthSub {
+    /// Exchange the durable API token for a short-lived browser session token.
+    Session,
 }
 
 /// Remote exec sub-actions (`x0x exec sessions`, `x0x exec cancel <id>`).
@@ -1219,11 +1231,16 @@ async fn run(
     // Commands that need a running daemon.
     match command {
         Commands::Gui => {
-            // Ensure daemon is running and open GUI in browser
+            // Ensure daemon is running and open GUI in browser.
+            // #127 / WS1.6: exchange the durable API token for a short-lived
+            // session token *before* constructing the URL, so the durable
+            // secret never appears in the browser's address bar / history.
             client.ensure_running().await?;
-            let Some(token) = client.api_token() else {
+            let Some(durable) = client.api_token() else {
                 anyhow::bail!("API token not found; set X0X_API_TOKEN or restart x0xd");
             };
+            let session = client.post_empty("/auth/session").await?;
+            let token = session["session_token"].as_str().unwrap_or(durable);
             let url = format!("{}/gui?token={token}", client.base_url());
             eprintln!("x0x GUI: {}/gui", client.base_url());
 
@@ -1337,6 +1354,9 @@ async fn run(
             DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
             DiagnosticsSub::Ws => commands::network::diagnostics_ws(&client).await,
+        },
+        Commands::Auth { sub } => match sub {
+            AuthSub::Session => commands::auth::session(&client).await,
         },
         Commands::Find { words } => commands::find::find(&client, &words).await,
         Commands::Connect { words } => commands::connect::connect(&client, &words).await,

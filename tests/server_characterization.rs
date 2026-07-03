@@ -154,7 +154,10 @@ async fn invalid_bearer_rejected() {
 #[ignore]
 async fn query_token_authenticates_every_allowlisted_path() {
     let d = daemon().await;
-    // Mirror of `accepts_query_token` in src/bin/x0xd.rs.
+    // #127 / WS1.6: only short-lived session tokens are accepted via ?token=
+    // on browser endpoints — the durable API token is never valid in a URL.
+    let session = d.session_token().await;
+    // Mirror of `accepts_query_token` in src/server/mod.rs.
     let paths = [
         "/gui",
         "/gui/",
@@ -173,7 +176,7 @@ async fn query_token_authenticates_every_allowlisted_path() {
             "{path} with no credential must be 401"
         );
         let with_token = c()
-            .get(format!("{}?token={}", d.url(path), d.api_token()))
+            .get(format!("{}?token={session}", d.url(path)))
             .send()
             .await
             .unwrap();

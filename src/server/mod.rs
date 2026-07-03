@@ -657,6 +657,9 @@ struct AppState {
     upgrade_apply_lock: Arc<Mutex<()>>,
     /// API bearer token for authenticating local clients.
     api_token: String,
+    /// Short-lived browser session tokens (#127 / WS1.6). The only tokens
+    /// accepted via `?token=` query strings on WS/SSE endpoints.
+    sessions: SessionStore,
     /// Tier-1 remote exec service.
     exec_service: Arc<x0x::exec::ExecService>,
     /// Per-group ingest diagnostics surfaced via `/diagnostics/groups`.
@@ -1723,6 +1726,7 @@ pub async fn serve_with_options(
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         api_token,
+        sessions: SessionStore::new(SESSION_TOKEN_TTL),
         exec_service: Arc::clone(&exec_service),
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
     });
@@ -2421,6 +2425,9 @@ pub async fn serve_with_options(
         // Embedded GUI
         .route("/gui", get(serve_gui))
         .route("/gui/", get(serve_gui))
+        // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
+        // browser session token, the only kind valid in ?token= query strings.
+        .route("/auth/session", post(create_session))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer({
             // Restrict CORS to exact loopback origins only.
@@ -2628,11 +2635,14 @@ async fn auth_middleware(
         return next.run(req).await;
     }
 
-    // Check Authorization: Bearer header first (works everywhere)
+    // Check Authorization: Bearer header first (works everywhere).
+    // Accepts either the durable API token OR a short-lived session token
+    // (#127 / WS1.6) — browser clients use the session token after exchange.
     if let Some(auth) = req.headers().get(axum::http::header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
             if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if token == state.api_token {
+                if ct_eq(token, &state.api_token) || state.sessions.is_valid(token, Instant::now())
+                {
                     return next.run(req).await;
                 }
             }
@@ -2640,12 +2650,14 @@ async fn auth_middleware(
     }
 
     // Endpoints where browsers cannot set headers: accept ?token= query param.
-    // WebSocket upgrades and SSE (EventSource API has no header support).
+    // ONLY short-lived session tokens are valid here — the durable API token
+    // is never accepted in a query string (#127 / WS1.6), eliminating the
+    // history/Referer/HAR leak surface for the long-lived secret.
     if accepts_query_token(path) {
         if let Some(query) = req.uri().query() {
             for pair in query.split('&') {
                 if let Some(token) = pair.strip_prefix("token=") {
-                    if token == state.api_token {
+                    if state.sessions.is_valid(token, Instant::now()) {
                         return next.run(req).await;
                     }
                 }
@@ -2656,6 +2668,49 @@ async fn auth_middleware(
     (
         StatusCode::UNAUTHORIZED,
         axum::Json(serde_json::json!({"error": "missing or invalid Authorization: Bearer token"})),
+    )
+        .into_response()
+}
+
+/// `POST /auth/session` — exchange the durable API token for a short-lived
+/// browser session token (#127 / WS1.6).
+///
+/// Requires the **durable** bearer token specifically — a session token
+/// cannot mint or refresh another session (no privilege amplification). The
+/// returned session token is the only kind accepted via `?token=` query
+/// strings on browser endpoints (WS/SSE), keeping the durable secret out of
+/// URLs entirely.
+async fn create_session(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    // auth_middleware already validated *some* bearer token (durable or
+    // session). This handler additionally requires the durable token: a
+    // session bearer cannot mint sessions.
+    let is_durable = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .is_some_and(|t| ct_eq(t, &state.api_token));
+
+    if !is_durable {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "durable API token required to mint a session"
+            })),
+        )
+            .into_response();
+    }
+
+    let token = state.sessions.issue(Instant::now());
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "session_token": token,
+            "expires_in": SESSION_TOKEN_TTL_SECS,
+        })),
     )
         .into_response()
 }
@@ -2729,6 +2784,88 @@ fn origin_host_without_port(authority: &str) -> Option<&str> {
 
 fn valid_origin_port(port: &str) -> bool {
     !port.is_empty() && port.parse::<u16>().is_ok()
+}
+
+/// Constant-time comparison of two secret token strings.
+///
+/// Both sides are SHA-256 hashed first so the comparison is over fixed-length
+/// 32-byte digests — this avoids any length-timing argument and keeps the
+/// comparison constant-time regardless of the input lengths. Used on every
+/// bearer-token and session-token validation path (#127 / WS1.6).
+fn ct_eq(a: &str, b: &str) -> bool {
+    let ha = Sha256::digest(a.as_bytes());
+    let hb = Sha256::digest(b.as_bytes());
+    use subtle::ConstantTimeEq;
+    ha.ct_eq(&hb).into()
+}
+
+/// Lifetime of a browser session token issued by `POST /auth/session`.
+const SESSION_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
+/// Same value in seconds, surfaced in the `expires_in` JSON field.
+const SESSION_TOKEN_TTL_SECS: u64 = 10 * 60;
+
+/// A single issued browser session token, stored as a SHA-256 digest.
+///
+/// Only the digest is retained so a memory dump cannot recover live tokens;
+/// validation hashes the candidate and scans with [`subtle::ConstantTimeEq`].
+struct AuthSession {
+    token_hash: [u8; 32],
+    expires_at: Instant,
+}
+
+/// In-memory store of short-lived browser session tokens (#127 / WS1.6).
+///
+/// Session tokens are the *only* tokens accepted via `?token=` query strings
+/// on browser endpoints (WS/SSE); the durable API token is never valid in a
+/// query string. The store uses a `std::sync::Mutex` because the critical
+/// sections are trivial (hash + linear scan + prune) and never cross an await.
+struct SessionStore {
+    sessions: StdMutex<Vec<AuthSession>>,
+    ttl: Duration,
+}
+
+impl SessionStore {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            sessions: StdMutex::new(Vec::new()),
+            ttl,
+        }
+    }
+
+    /// Issue a fresh session token, store its digest, and return the raw token
+    /// to hand to the client. `now` is injected so expiry can be unit-tested
+    /// without sleeping.
+    fn issue(&self, now: Instant) -> String {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        let session = AuthSession {
+            token_hash: Sha256::digest(token.as_bytes()).into(),
+            expires_at: now + self.ttl,
+        };
+        if let Ok(mut guard) = self.sessions.lock() {
+            guard.push(session);
+            // Bound the store: lazy-prune expired entries on every issue so a
+            // flood of session mints cannot grow the vector without bound.
+            guard.retain(|s| s.expires_at > now);
+        }
+        token
+    }
+
+    /// Validate a candidate token: constant-time compare against every active
+    /// session digest, pruning expired entries along the way. Returns `true`
+    /// only if an unexpired entry matches.
+    fn is_valid(&self, token: &str, now: Instant) -> bool {
+        use subtle::ConstantTimeEq;
+        let candidate = Sha256::digest(token.as_bytes());
+        let Ok(mut guard) = self.sessions.lock() else {
+            return false;
+        };
+        // Prune expired first (fail-closed: an expired token is never valid).
+        guard.retain(|s| s.expires_at > now);
+        guard.iter().any(|s| candidate.ct_eq(&s.token_hash).into())
+    }
 }
 
 /// Load or generate an API bearer token.
@@ -21956,6 +22093,7 @@ mod tests {
             upgrade_check_cache: Mutex::new(None),
             upgrade_apply_lock: Arc::new(Mutex::new(())),
             api_token: "test-token".to_string(),
+            sessions: SessionStore::new(SESSION_TOKEN_TTL),
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
         });
@@ -25610,8 +25748,12 @@ mod tests {
     // ========================================================================
     use tower::ServiceExt as _;
 
-    /// Token the test shim treats as valid. Mirrors `state.api_token`.
+    /// Token the test shim treats as the durable API token. Mirrors `state.api_token`.
     const TEST_API_TOKEN: &str = "x0x-test-auth-matrix-token";
+    /// Token the test shim treats as a valid session token (#127 / WS1.6).
+    /// Mirrors an entry in `SessionStore`; the shim checks policy (which token
+    /// *kind* is accepted where), not the store mechanics.
+    const TEST_SESSION_TOKEN: &str = "x0x-test-session-token";
 
     /// HTTP method each protected route is registered under, so the accept
     /// tests actually reach the handler (a wrong method would 405, masking a
@@ -25648,21 +25790,24 @@ mod tests {
             return next.run(req).await;
         }
         // (3) Authorization: Bearer header (works everywhere).
+        // Accepts either the durable API token OR a session token (#127).
         if let Some(auth) = req.headers().get(axum::http::header::AUTHORIZATION) {
             if let Ok(auth_str) = auth.to_str() {
                 if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                    if token == TEST_API_TOKEN {
+                    if ct_eq(token, TEST_API_TOKEN) || ct_eq(token, TEST_SESSION_TOKEN) {
                         return next.run(req).await;
                     }
                 }
             }
         }
         // (4) `?token=` query param, only on browser-only endpoints.
+        // ONLY session tokens are valid here (#127 / WS1.6) — the durable
+        // token is never accepted in a query string.
         if accepts_query_token(path) {
             if let Some(query) = req.uri().query() {
                 for pair in query.split('&') {
                     if let Some(token) = pair.strip_prefix("token=") {
-                        if token == TEST_API_TOKEN {
+                        if ct_eq(token, TEST_SESSION_TOKEN) {
                             return next.run(req).await;
                         }
                     }
@@ -25780,6 +25925,22 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn auth_matrix_protected_endpoints_accept_session_bearer() {
+        // #127 / WS1.6: a short-lived session token in the Bearer header is
+        // accepted on protected endpoints too (browser clients use it after
+        // exchange, so REST calls work without the durable secret).
+        for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
+            let resp =
+                matrix_request(matrix_method(path), path, Some(TEST_SESSION_TOKEN), None).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path} with a session bearer must reach the handler (200)"
+            );
+        }
+    }
+
     // -- Auth-exempt public paths: served without any token.
 
     #[tokio::test]
@@ -25798,6 +25959,9 @@ mod tests {
 
     #[tokio::test]
     async fn auth_matrix_browser_endpoints_accept_query_token() {
+        // #127 / WS1.6: only a short-lived SESSION token is accepted via
+        // ?token= on browser endpoints (WS/SSE/GUI). The durable token must
+        // never appear in a URL.
         for path in [
             "/gui",
             "/gui/",
@@ -25808,12 +25972,29 @@ mod tests {
             "/peers/events",
             "/presence/events",
         ] {
-            let uri = format!("{path}?token={TEST_API_TOKEN}");
+            let uri = format!("{path}?token={TEST_SESSION_TOKEN}");
             let resp = matrix_request(axum::http::Method::GET, &uri, None, None).await;
             assert_eq!(
                 resp.status(),
                 StatusCode::OK,
-                "{path}?token= is a browser endpoint and must accept the query token"
+                "{path}?token=<session> is a browser endpoint and must accept the session token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_matrix_browser_endpoints_reject_durable_query_token() {
+        // #127 / WS1.6 — the headline security property: the durable API
+        // token in a query string is REJECTED, even on browser endpoints that
+        // accept ?token=. Only session tokens are valid in URLs. This is what
+        // keeps the long-lived secret out of history/Referer/HAR.
+        for path in ["/gui", "/ws", "/ws/direct", "/events", "/peers/events"] {
+            let uri = format!("{path}?token={TEST_API_TOKEN}");
+            let resp = matrix_request(axum::http::Method::GET, &uri, None, None).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path}?token=<durable> must be 401 — durable tokens are never valid in a query string"
             );
         }
     }
@@ -25888,6 +26069,78 @@ mod tests {
                 .is_none(),
             "CORS must NOT grant a localhost origin (no ACAO header)"
         );
+    }
+
+    // ========================================================================
+    // #127 / WS1.6 — SessionStore + constant-time-compare unit tests.
+    //
+    // The session store is pure over an injected `Instant` (no sleeps, no
+    // daemon), so expiry and pruning are fully deterministic.
+    // ========================================================================
+
+    #[test]
+    fn session_store_issues_and_validates_a_token() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let now = Instant::now();
+        let token = store.issue(now);
+        assert!(token.len() >= 32, "session token must be opaque hex");
+        assert!(
+            store.is_valid(&token, now),
+            "a freshly-issued token must validate"
+        );
+        assert!(
+            !store.is_valid("not-a-real-token", now),
+            "a wrong token must not validate",
+        );
+    }
+
+    #[test]
+    fn session_store_token_expires_after_ttl() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let t0 = Instant::now();
+        let token = store.issue(t0);
+        assert!(store.is_valid(&token, t0));
+        // One nanosecond before expiry: still valid.
+        let just_before = t0 + SESSION_TOKEN_TTL - Duration::from_nanos(1);
+        assert!(
+            store.is_valid(&token, just_before),
+            "token must be valid right up to the TTL boundary",
+        );
+        // One nanosecond after expiry: invalid (fail-closed).
+        let just_after = t0 + SESSION_TOKEN_TTL + Duration::from_nanos(1);
+        assert!(
+            !store.is_valid(&token, just_after),
+            "token must be invalid past the TTL",
+        );
+    }
+
+    #[test]
+    fn session_store_prunes_expired_entries_on_validate() {
+        // Pruning is lazy (on issue/validate) so the Vec cannot grow without
+        // bound even if clients never explicitly revoke.
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let t0 = Instant::now();
+        let dead = store.issue(t0); // expires at t0 + TTL
+        let alive = store.issue(t0); // same expiry, but we validate after pruning
+                                     // Advance well past TTL: both should be pruned.
+        let far_future = t0 + SESSION_TOKEN_TTL * 10;
+        assert!(!store.is_valid(&dead, far_future));
+        assert!(!store.is_valid(&alive, far_future));
+        // A new token issued at far_future must still work.
+        let fresh = store.issue(far_future);
+        assert!(store.is_valid(&fresh, far_future));
+    }
+
+    #[test]
+    fn ct_eq_is_constant_time_and_correct() {
+        // Correctness: equal strings compare equal, different do not.
+        assert!(ct_eq("abc", "abc"));
+        assert!(!ct_eq("abc", "abd"));
+        // Different lengths never panic and compare unequal.
+        assert!(!ct_eq("abc", "ab"));
+        assert!(!ct_eq("", "abc"));
+        // Empty vs empty is equal.
+        assert!(ct_eq("", ""));
     }
 
     // ========================================================================

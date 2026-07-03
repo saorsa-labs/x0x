@@ -34,6 +34,7 @@ Errors use:
 | GET | `/health` | `x0x health` | Health probe |
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
+| POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6) |
 
 ### Example: health
 
