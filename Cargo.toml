@@ -60,6 +60,7 @@ toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 semver = "1.0"
 sha2 = "0.10"
+subtle = "2.6"
 flate2 = "1.0"
 fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-65"] }
 tar = "0.4"

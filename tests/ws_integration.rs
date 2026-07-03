@@ -34,7 +34,7 @@ async fn ws_connect(
     d: &DaemonFixture,
     path: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let (ws, _) = tokio_tungstenite::connect_async(&d.ws_url(path))
+    let (ws, _) = tokio_tungstenite::connect_async(&d.ws_url(path).await)
         .await
         .expect("WS connect failed");
     ws

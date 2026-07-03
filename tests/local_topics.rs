@@ -22,7 +22,7 @@ type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn ws_connect(instance: &cluster::AgentInstance) -> Ws {
-    let (ws, _) = tokio_tungstenite::connect_async(&instance.ws_url("/ws"))
+    let (ws, _) = tokio_tungstenite::connect_async(&instance.ws_url("/ws").await)
         .await
         .expect("WS connect failed");
     ws

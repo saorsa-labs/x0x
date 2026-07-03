@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 134,
+  "endpoint_count": 135,
   "endpoints": [
     {
       "category": "status",
@@ -21,6 +21,13 @@
       "description": "Gracefully stop the daemon",
       "method": "POST",
       "path": "/shutdown"
+    },
+    {
+      "category": "status",
+      "cli_name": "auth session",
+      "description": "Exchange the durable API token for a short-lived browser session token",
+      "method": "POST",
+      "path": "/auth/session"
     },
     {
       "category": "identity",

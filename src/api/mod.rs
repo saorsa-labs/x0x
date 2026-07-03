@@ -71,6 +71,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Gracefully stop the daemon",
         category: "status",
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/auth/session",
+        cli_name: "auth session",
+        description: "Exchange the durable API token for a short-lived browser session token",
+        category: "status",
+    },
     // ── Identity ────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

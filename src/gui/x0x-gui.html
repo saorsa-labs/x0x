@@ -662,29 +662,29 @@ let upgradeCheckInFlight=false;
    JS SECTION 2: API & WEBSOCKET
    ═══════════════════════════════════════════════════════════════════ */
 const BASE=location.origin;
-function readApiToken(){
+function readSessionToken(){
   try{
     const params=new URLSearchParams(location.search);
     const token=params.get('token')||'';
     if(token){
-      sessionStorage.setItem('x0x_api_token',token);
+      sessionStorage.setItem('x0x_session_token',token);
       params.delete('token');
       const qs=params.toString();
       history.replaceState(null,'',location.pathname+(qs?'?'+qs:'')+location.hash);
       return token;
     }
-    return sessionStorage.getItem('x0x_api_token')||'';
+    return sessionStorage.getItem('x0x_session_token')||'';
   }catch(e){return ''}
 }
-const API_TOKEN=readApiToken();
-const WS_URL=BASE.replace(/^http/,'ws')+'/ws/direct'+(API_TOKEN?'?token='+API_TOKEN:'');
+const SESSION_TOKEN=readSessionToken();
+const WS_URL=BASE.replace(/^http/,'ws')+'/ws/direct'+(SESSION_TOKEN?'?token='+SESSION_TOKEN:'');
 let ws=null;
 const wsSubs=new Set();
 
 async function api(path,opt){
   try{
     const hdrs={'Content-Type':'application/json',...(opt||{}).headers};
-    if(API_TOKEN)hdrs['Authorization']='Bearer '+API_TOKEN;
+    if(SESSION_TOKEN)hdrs['Authorization']='Bearer '+SESSION_TOKEN;
     const r=await fetch(BASE+path,{...opt,headers:hdrs});
     const data=await r.json().catch(()=>({ok:false,error:r.statusText||'request failed'}));
     if(data&&typeof data==='object'){
@@ -2943,7 +2943,7 @@ function togglePeerEvents(on){
   const out=document.getElementById('n-peer-events');
   if(!on){if(out)out.innerHTML='';return}
   try{
-    const url=BASE+'/peers/events'+(API_TOKEN?'?token='+encodeURIComponent(API_TOKEN):'');
+    const url=BASE+'/peers/events'+(SESSION_TOKEN?'?token='+encodeURIComponent(SESSION_TOKEN):'');
     peerEventsSse=new EventSource(url);
     peerEventsSse.onmessage=e=>{
       if(!out)return;
@@ -3141,7 +3141,7 @@ function togglePresenceLive(on){
   if(on){
     if(presenceSse)return;
     try{
-      const url=BASE+'/presence/events'+(API_TOKEN?'?token='+encodeURIComponent(API_TOKEN):'');
+      const url=BASE+'/presence/events'+(SESSION_TOKEN?'?token='+encodeURIComponent(SESSION_TOKEN):'');
       presenceSse=new EventSource(url);
       presenceSse.onmessage=e=>{
         try{
@@ -3570,7 +3570,7 @@ async function adminFetchStatus(){
 }
 async function adminFetchConstitution(){
   try{
-    const r=await fetch(BASE+'/constitution',{headers:API_TOKEN?{'Authorization':'Bearer '+API_TOKEN}:{}});
+    const r=await fetch(BASE+'/constitution',{headers:SESSION_TOKEN?{'Authorization':'Bearer '+SESSION_TOKEN}:{}});
     const txt=await r.text();
     adminOut('admin-status-out',txt);
   }catch(e){adminOut('admin-status-out',null,String(e))}

@@ -142,9 +142,30 @@ impl DaemonFixture {
         format!("http://{}{}", self.api_addr, path)
     }
 
-    /// Full WS URL for `path` with `?token=` attached.
-    pub fn ws_url(&self, path: &str) -> String {
-        format!("ws://{}{}?token={}", self.api_addr, path, self.api_token)
+    /// Exchange the durable API token for a short-lived browser session token
+    /// (#127 / WS1.6). Session tokens are the only kind accepted via `?token=`
+    /// query strings on WS/SSE endpoints.
+    pub async fn session_token(&self) -> String {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/auth/session", self.api_addr))
+            .header(AUTHORIZATION, self.auth_header())
+            .send()
+            .await
+            .expect("POST /auth/session failed");
+        let json: serde_json::Value = resp.json().await.expect("/auth/session response json");
+        json["session_token"]
+            .as_str()
+            .expect("session_token field")
+            .to_string()
+    }
+
+    /// Full WS URL for `path` with a short-lived session `?token=` attached
+    /// (#127 / WS1.6). The durable API token is no longer accepted in query
+    /// strings, so the WS handshake must use a session token.
+    pub async fn ws_url(&self, path: &str) -> String {
+        let session = self.session_token().await;
+        format!("ws://{}{}?token={session}", self.api_addr, path)
     }
 
     /// Bearer token header value as a string.

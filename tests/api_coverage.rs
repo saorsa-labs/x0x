@@ -47,6 +47,7 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/health", daemon_api_health),
     covered!(Get, "/status", daemon_api_status),
     covered!(Post, "/shutdown", daemon_api_shutdown_with_sse_client),
+    covered!(Post, "/auth/session", daemon_api_auth_session_exchange),
     // ── Identity ────────────────────────────────────────────────────────
     covered!(Get, "/agent", daemon_api_agent),
     covered!(Post, "/announce", daemon_api_announce),

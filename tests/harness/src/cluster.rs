@@ -92,9 +92,28 @@ impl AgentInstance {
         format!("http://{}{}", self.api_addr, path)
     }
 
-    /// WebSocket URL with token in query parameter.
-    pub fn ws_url(&self, path: &str) -> String {
-        format!("ws://{}{}?token={}", self.api_addr, path, self.api_token)
+    /// Exchange the durable API token for a short-lived browser session token
+    /// (#127 / WS1.6). Session tokens are the only kind accepted via `?token=`
+    /// query strings on WS/SSE endpoints.
+    pub async fn session_token(&self) -> String {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{}/auth/session", self.api_addr))
+            .header("Authorization", format!("Bearer {}", self.api_token))
+            .send()
+            .await
+            .expect("POST /auth/session failed");
+        let json: serde_json::Value = resp.json().await.expect("/auth/session response json");
+        json["session_token"]
+            .as_str()
+            .expect("session_token field")
+            .to_string()
+    }
+
+    /// WebSocket URL with a short-lived session token in the query parameter
+    /// (#127 / WS1.6). The durable token is no longer accepted in query strings.
+    pub async fn ws_url(&self, path: &str) -> String {
+        let session = self.session_token().await;
+        format!("ws://{}{}?token={session}", self.api_addr, path)
     }
 
     /// Authenticated GET request.
