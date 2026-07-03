@@ -8,6 +8,7 @@
 mod contacts;
 mod identity;
 mod machines;
+mod tasks;
 
 pub(super) use contacts::{
     add_contact, delete_contact, list_contacts, list_revocations, quick_trust, revoke_contact,
@@ -24,3 +25,4 @@ pub(super) use machines::{
     add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,
     machines_by_user_handler, pin_machine, unpin_machine,
 };
+pub(super) use tasks::{add_task, create_task_list, list_task_lists, list_tasks, update_task};

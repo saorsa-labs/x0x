@@ -21,12 +21,12 @@ mod ws;
 #[cfg(test)]
 use routes::CardQuery;
 use routes::{
-    add_contact, add_machine, agent_info, agent_sign, agent_user_id_handler, agent_verify,
-    announce_identity, delete_contact, delete_machine, discovered_machine, discovered_machines,
-    get_a2a_agent_card, get_agent_card, import_agent_card, introduction, list_contacts,
-    list_machines, list_revocations, machines_by_user_handler, pin_machine,
-    populate_invite_base_state_from_group_info, quick_trust, revoke_contact, unpin_machine,
-    update_contact,
+    add_contact, add_machine, add_task, agent_info, agent_sign, agent_user_id_handler,
+    agent_verify, announce_identity, create_task_list, delete_contact, delete_machine,
+    discovered_machine, discovered_machines, get_a2a_agent_card, get_agent_card, import_agent_card,
+    introduction, list_contacts, list_machines, list_revocations, list_task_lists, list_tasks,
+    machines_by_user_handler, pin_machine, populate_invite_base_state_from_group_info, quick_trust,
+    revoke_contact, unpin_machine, update_contact, update_task,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -298,27 +298,6 @@ struct SubscribeRequest {
     topic: String,
 }
 
-/// POST /task-lists request body.
-#[derive(Debug, Deserialize)]
-struct CreateTaskListRequest {
-    name: String,
-    topic: String,
-}
-
-/// POST /task-lists/:id/tasks request body.
-#[derive(Debug, Deserialize)]
-struct AddTaskRequest {
-    title: String,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-/// PATCH /task-lists/:id/tasks/:tid request body.
-#[derive(Debug, Deserialize)]
-struct UpdateTaskRequest {
-    action: String, // "claim" or "complete"
-}
-
 /// Generic JSON response wrapper.
 #[derive(Debug, Serialize)]
 struct ApiResponse<T: Serialize> {
@@ -510,24 +489,6 @@ struct DiscoveredMachineEntry {
 #[derive(Debug, Serialize)]
 struct PeerEntry {
     id: String,
-}
-
-/// Task list entry.
-#[derive(Debug, Serialize)]
-struct TaskListEntry {
-    id: String,
-    topic: String,
-}
-
-/// Task snapshot for API response.
-#[derive(Debug, Serialize)]
-struct TaskEntry {
-    id: String,
-    title: String,
-    description: String,
-    state: String,
-    assignee: Option<String>,
-    priority: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -13399,135 +13360,6 @@ async fn secure_open_envelope_adversarial(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Task list handlers
-// ---------------------------------------------------------------------------
-
-/// GET /task-lists
-async fn list_task_lists(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let lists = state.task_lists.read().await;
-    let entries: Vec<TaskListEntry> = lists
-        .keys()
-        .map(|id| TaskListEntry {
-            id: id.clone(),
-            topic: id.clone(), // topic is used as ID
-        })
-        .collect();
-    Json(serde_json::json!({ "ok": true, "task_lists": entries }))
-}
-
-/// POST /task-lists
-async fn create_task_list(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateTaskListRequest>,
-) -> impl IntoResponse {
-    match state.agent.create_task_list(&req.name, &req.topic).await {
-        Ok(handle) => {
-            let id = req.topic.clone();
-            state.task_lists.write().await.insert(id.clone(), handle);
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({ "ok": true, "id": id })),
-            )
-        }
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
-    }
-}
-
-/// GET /task-lists/:id/tasks
-async fn list_tasks(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let lists = state.task_lists.read().await;
-    let Some(handle) = lists.get(&id) else {
-        return not_found("task list not found");
-    };
-
-    match handle.list_tasks().await {
-        Ok(tasks) => {
-            let entries: Vec<TaskEntry> = tasks
-                .into_iter()
-                .map(|t| TaskEntry {
-                    id: format!("{}", t.id),
-                    title: t.title,
-                    description: t.description,
-                    state: format!("{}", t.state),
-                    assignee: t.assignee.map(|a| format!("{a}")),
-                    priority: t.priority,
-                })
-                .collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "tasks": entries })),
-            )
-        }
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
-    }
-}
-
-/// POST /task-lists/:id/tasks
-async fn add_task(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<AddTaskRequest>,
-) -> impl IntoResponse {
-    let lists = state.task_lists.read().await;
-    let Some(handle) = lists.get(&id) else {
-        return not_found("task list not found");
-    };
-
-    match handle
-        .add_task(req.title, req.description.unwrap_or_default())
-        .await
-    {
-        Ok(task_id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({ "ok": true, "task_id": format!("{task_id}") })),
-        ),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
-    }
-}
-
-/// PATCH /task-lists/:id/tasks/:tid
-async fn update_task(
-    State(state): State<Arc<AppState>>,
-    Path((id, tid)): Path<(String, String)>,
-    Json(req): Json<UpdateTaskRequest>,
-) -> impl IntoResponse {
-    let lists = state.task_lists.read().await;
-    let Some(handle) = lists.get(&id) else {
-        return not_found("task list not found");
-    };
-
-    // Parse task ID from hex
-    let task_id_bytes: [u8; 32] = match hex::decode(&tid) {
-        Ok(bytes) if bytes.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            arr
-        }
-        _ => {
-            return bad_request("invalid task ID (expected 64 hex chars)");
-        }
-    };
-    let task_id = x0x::crdt::TaskId::from_bytes(task_id_bytes);
-
-    let result = match req.action.as_str() {
-        "claim" => handle.claim_task(task_id).await,
-        "complete" => handle.complete_task(task_id).await,
-        _ => {
-            return bad_request("action must be 'claim' or 'complete'");
-        }
-    };
-
-    match result {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Embedded GUI
 // ---------------------------------------------------------------------------
