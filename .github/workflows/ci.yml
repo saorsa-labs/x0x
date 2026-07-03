@@ -164,6 +164,11 @@ jobs:
         # instrumentation slowdown — a flake here must not abort the whole
         # coverage computation:
         #   * x0x_0041_synthetic_kill_restart — documented, matches Test Suite.
+        #   * x0x_0041_prefer_newest_test — sibling binary; the
+        #     direct_send_reissues_on_replaced_connection_within_500ms test's 2s
+        #     lifecycle_deadline is exceeded under coverage contention (#148).
+        #     Same class as #139; excluded here only — keeps running in the Test
+        #     Suite + integration tiers (binary()-scoped, not test()-scoped).
         #   * named_group_join_metadata_event — gossip-convergence forgery tests
         #     (e.g. forged_member_joined_*) poll a rejection counter that can
         #     exceed the wait window under coverage; the same code paths are
@@ -183,7 +188,7 @@ jobs:
         #   tranche 3 (#124): 65.6 → 65.7 (storage/identity errors; actual 66.70%)
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info --fail-under-lines 65.7 nextest -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(named_group_join_metadata_event)'
+          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info --fail-under-lines 65.7 nextest -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)'
           python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global
 
       - name: Upload LCOV report
