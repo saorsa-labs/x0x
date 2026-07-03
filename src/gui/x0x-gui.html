@@ -166,6 +166,9 @@ tr:hover td{background:rgba(255,255,255,.01)}
 .chat-input input{flex:1}
 
 /* Kanban */
+.kanban-toolbar{justify-content:space-between;flex-wrap:wrap}
+.board-filter{display:inline-flex;align-items:center;gap:6px;color:var(--tx2);font-size:12px;white-space:nowrap}
+.board-filter input{flex:0;margin:0;accent-color:var(--cy)}
 .kanban{display:flex;gap:var(--sp3);overflow-x:auto;padding-bottom:var(--sp2)}
 .kanban-col{flex:1;min-width:220px;background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r-md)}
 .kanban-hd{padding:var(--sp3);font:600 11px var(--sans);text-transform:uppercase;color:var(--tx3);border-bottom:1px solid var(--bd);letter-spacing:.5px;display:flex;justify-content:space-between}
@@ -175,6 +178,14 @@ tr:hover td{background:rgba(255,255,255,.01)}
 .kanban-card:hover{border-color:var(--cy);transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,.2)}
 .kanban-card .title{font-size:12px;font-weight:500}
 .kanban-card .meta{font-size:10px;color:var(--tx3);margin-top:var(--sp1)}
+.sym-badges{display:flex;flex-wrap:wrap;gap:4px;margin-top:var(--sp2)}
+.sym-badge{display:inline-flex;align-items:center;gap:3px;padding:1px 6px;font:600 9px var(--sans);text-transform:uppercase;letter-spacing:.35px;border:1px solid;border-radius:var(--r-full);white-space:nowrap}
+.sym-badge.info{color:var(--cy);border-color:var(--cy);background:var(--cy-dim)}
+.sym-badge.ok{color:var(--gn);border-color:var(--gn);background:var(--gn-dim)}
+.sym-badge.warn{color:var(--am);border-color:var(--am);background:var(--am-dim)}
+.sym-badge.bad{color:var(--rd);border-color:var(--rd);background:var(--rd-dim)}
+.sym-badge.muted{color:var(--tx3);border-color:var(--bd);background:rgba(74,77,102,.12)}
+.sym-badge.pri{color:var(--lv);border-color:var(--lv);background:var(--lv-dim)}
 
 /* Sub-tabs */
 .sub-tabs{display:flex;gap:0;border-bottom:1px solid var(--bd);margin-bottom:var(--sp4);overflow-x:auto}
@@ -1789,6 +1800,7 @@ function renderIdentityChainLegacy(){
    JS SECTION 7: SPACE VIEW
    ═══════════════════════════════════════════════════════════════════ */
 let spaceChatTopic='',spaceBoardId='',spaceKvId='',currentChannelTopic='';
+let boardSymphonyOnly=LS.get('board_symphony_only',false),boardPollSeq=0;
 // Confidentiality of the currently-mounted space, fetched from
 // `GET /groups/:id`. Used by sendSpaceChat() to route SignedPublic
 // groups through `POST /groups/:id/send` (which produces an
@@ -2156,10 +2168,11 @@ function scrollToMsg(msgId){
 
 // --- Space: Board ---
 function renderSpaceBoard(el,sid){
-  el.innerHTML=`<div class="row mb"><input id="board-in" placeholder="New task…" style="flex:1"><button class="pri" onclick="addBoardTask()">Add</button></div>
+  el.innerHTML=`<div class="row mb kanban-toolbar"><input id="board-in" placeholder="New task…" style="flex:1"><button class="pri" onclick="addBoardTask()">Add</button><label class="board-filter"><input type="checkbox" id="board-symphony-only" onchange="toggleBoardSymphonyFilter(this.checked)" ${boardSymphonyOnly?'checked':''}> Symphony</label></div>
   <div class="kanban">
     <div class="kanban-col"><div class="kanban-hd">To Do <span class="count" id="kb-todo-n">0</span></div><div class="kanban-body" id="kb-todo"></div></div>
     <div class="kanban-col"><div class="kanban-hd">In Progress <span class="count" id="kb-wip-n">0</span></div><div class="kanban-body" id="kb-wip"></div></div>
+    <div class="kanban-col"><div class="kanban-hd">Review <span class="count" id="kb-review-n">0</span></div><div class="kanban-body" id="kb-review"></div></div>
     <div class="kanban-col"><div class="kanban-hd">Done <span class="count" id="kb-done-n">0</span></div><div class="kanban-body" id="kb-done"></div></div>
   </div>`;
   initBoard(sid);
@@ -2181,23 +2194,204 @@ async function addBoardTask(){
   inp.value='';pollBoard();
 }
 
+function toggleBoardSymphonyFilter(on){
+  boardSymphonyOnly=!!on;LS.set('board_symphony_only',boardSymphonyOnly);pollBoard();
+}
+
+function boardMaybeJson(v){
+  if(!v)return null;
+  if(typeof v==='object')return v;
+  if(typeof v!=='string')return null;
+  const s=v.trim();
+  if(!s||s[0]!=='{')return null;
+  try{return JSON.parse(s)}catch(e){return null}
+}
+
+function boardTaskSymphonyMeta(t){
+  const meta={has:false};
+  const absorb=o=>{
+    o=boardMaybeJson(o);if(!o||typeof o!=='object')return;
+    const s=o.symphony||o.issue||o.metadata;
+    if(s&&s!==o)absorb(s);
+    if(o.state!==undefined){meta.state=o.state;meta.has=true}
+    if(o.priority!==undefined){meta.priority=o.priority;meta.has=true}
+    if(o.labels!==undefined){meta.labels=o.labels;meta.has=true}
+    if(o.shard){meta.shard=o.shard;meta.has=true}
+    if(o.shard_role!==undefined){meta.shardRole=o.shard_role;meta.has=true}
+    if(o.shardRole!==undefined){meta.shardRole=o.shardRole;meta.has=true}
+    if(o.claim_ttl_ms!==undefined){meta.claimTtlMs=o.claim_ttl_ms;meta.has=true}
+    if(o.claim){meta.claim=o.claim;meta.has=true}
+    if(o.handoff){meta.handoff=o.handoff;meta.has=true}
+    if(o.validation_status!==undefined){meta.validationStatus=o.validation_status;meta.has=true}
+    if(o.validationStatus!==undefined){meta.validationStatus=o.validationStatus;meta.has=true}
+  };
+  absorb(t.symphony);absorb(t.issue);absorb(t.metadata);absorb(t.description);
+  return meta;
+}
+
+function boardDecodeKvJson(r){
+  if(!r||!r.ok||!r.value)return null;
+  try{return JSON.parse(u8decode(r.value))}catch(e){}
+  try{return JSON.parse(r.value)}catch(e){}
+  return null;
+}
+
+async function boardFetchSymphonySidecars(listId,tasks){
+  const out={};tasks.forEach(t=>{out[t.id]={}});
+  const storeId='symphony-'+listId;
+  const keys=await api('/stores/'+encodeURIComponent(storeId)+'/keys');
+  if(!(keys&&keys.ok&&Array.isArray(keys.keys)))return out;
+  const have=new Set(keys.keys.map(k=>typeof k==='string'?k:k.key).filter(Boolean));
+  const jobs=[];
+  tasks.forEach(t=>{
+    const tid=t.id||'';
+    const claimKey='claim-'+tid,handoffKey='handoff-'+tid;
+    if(have.has(claimKey))jobs.push(api('/stores/'+encodeURIComponent(storeId)+'/'+encodeURIComponent(claimKey)).then(r=>{out[tid].claimBlob=boardDecodeKvJson(r)}));
+    if(have.has(handoffKey))jobs.push(api('/stores/'+encodeURIComponent(storeId)+'/'+encodeURIComponent(handoffKey)).then(r=>{out[tid].handoffBlob=boardDecodeKvJson(r)}));
+  });
+  await Promise.all(jobs);
+  return out;
+}
+
+function boardMergeSymphonyMeta(t,sidecars){
+  const meta=boardTaskSymphonyMeta(t),sc=sidecars[t.id]||{};
+  if(sc.claimBlob){meta.claimBlob=sc.claimBlob;meta.claim=sc.claimBlob.claim||meta.claim;meta.claimStatus=sc.claimBlob.status;meta.has=true}
+  if(sc.handoffBlob){meta.handoffBlob=sc.handoffBlob;meta.handoff=sc.handoffBlob.handoff||meta.handoff;meta.has=true}
+  if(meta.has&&meta.priority===undefined&&t.priority!==undefined)meta.priority=t.priority;
+  return meta;
+}
+
+function boardNormalizeState(s){
+  if(s&&typeof s==='object')s=s.state||s.status||s.name||s.value||'';
+  s=String(s||'').trim().toLowerCase().replace(/[\s-]+/g,'_');
+  if(s==='to_do'||s==='empty')return'todo';
+  if(s==='wip'||s==='claimed'||s.startsWith('claimed_')||s.startsWith('claimed:'))return'in_progress';
+  if(s==='complete'||s==='completed')return'done';
+  if(s==='ready_for_review')return'review';
+  return s;
+}
+
+function boardSymphonyState(meta){
+  if(!meta||!meta.has)return null;
+  if(meta.state!==undefined)return boardNormalizeState(meta.state);
+  if(meta.handoff)return'review';
+  const st=String(meta.claimStatus||'').toLowerCase();
+  if(st==='active')return'in_progress';
+  if(st==='completed')return'review';
+  if(st==='released')return'todo';
+  if(st==='blocked')return'todo';
+  if(meta.claim)return'in_progress';
+  return null;
+}
+
+function boardCheckboxState(t){
+  const s=boardNormalizeState(t.state);
+  if(s==='done')return'done';
+  if(s==='in_progress')return'in_progress';
+  return'todo';
+}
+
+function boardColumnForTask(t,meta){
+  const s=boardSymphonyState(meta);
+  if(s==='todo'||s==='in_progress'||s==='review'||s==='done')return s;
+  return boardCheckboxState(t);
+}
+
+function boardRoleLabel(v){
+  if(!v)return'';
+  if(typeof v==='object'){
+    if(v.backup!==undefined)return'backup'+(v.backup!==null?' '+v.backup:'');
+    v=v.role||v.shard_role||v.shardRole||Object.keys(v)[0]||'';
+  }
+  v=String(v).toLowerCase().replace(/[\s-]+/g,'_');
+  if(v.startsWith('backup'))return'backup';
+  if(v.startsWith('manual'))return'manual';
+  if(v==='primary')return'primary';
+  return v;
+}
+
+function boardShardRole(meta){
+  const c=meta.claim||{};
+  return boardRoleLabel(meta.shardRole||c.shard_role||c.shardRole||(meta.shard&&meta.shard.role));
+}
+
+function boardAge(ms){
+  if(ms<60000)return'now';
+  const m=Math.floor(ms/60000);if(m<60)return m+'m';
+  const h=Math.floor(m/60);if(h<48)return h+'h';
+  return Math.floor(h/24)+'d';
+}
+
+function boardHeartbeatFreshness(meta){
+  const c=meta.claim||{},hb=c.heartbeat_at||c.heartbeatAt||c.at||meta.heartbeat_at;
+  const at=Date.parse(hb||'');
+  if(!Number.isFinite(at))return{state:'unknown',label:'unknown'};
+  const age=Math.max(0,Date.now()-at),ttl=Number(meta.claimTtlMs||(meta.shard&&meta.shard.claim_ttl_ms))||10*60*1000;
+  if(age<=ttl/2)return{state:'fresh',label:'fresh '+boardAge(age)};
+  if(age<=ttl)return{state:'stale',label:'stale '+boardAge(age)};
+  return{state:'expired',label:'expired '+boardAge(age)};
+}
+
+function boardValidationStatus(meta){
+  const h=meta.handoff||{};
+  const direct=meta.validationStatus||meta.validation_status||h.validation_status||h.validationStatus;
+  if(direct)return boardNormalizeState(direct)==='passed'?'passed':boardNormalizeState(direct)==='failed'?'failed':'unknown';
+  const vals=Array.isArray(h.validation)?h.validation:[];
+  if(vals.some(v=>boardNormalizeState(v.status)==='failed'))return'failed';
+  if(vals.length&&vals.every(v=>boardNormalizeState(v.status)==='passed'))return'passed';
+  return meta.has?'unknown':'';
+}
+
+function boardBadge(cls,text){return'<span class="sym-badge '+cls+'">'+esc(text)+'</span>'}
+
+function boardSymphonyBadges(meta){
+  if(!meta||!meta.has)return'';
+  const b=[],role=boardShardRole(meta),status=String(meta.claimStatus||'').toLowerCase();
+  if(role)b.push(boardBadge('info','role '+role));
+  if(meta.claim||status){
+    const hb=boardHeartbeatFreshness(meta),agent=(meta.claim&&(meta.claim.by||meta.claim.agent||meta.claim.agent_id))||'';
+    let cls=hb.state==='fresh'?'ok':hb.state==='stale'?'warn':hb.state==='expired'?'bad':'muted';
+    let text='claimed'+(agent?' '+short(agent,8):'')+' '+hb.label;
+    if(status&&status!=='active'){cls=status==='blocked'?'bad':'muted';text='claim '+status}
+    b.push(boardBadge(cls,text));
+  }
+  const val=boardValidationStatus(meta);
+  if(val)b.push(boardBadge(val==='passed'?'ok':val==='failed'?'bad':'muted','validation '+val));
+  if(meta.priority!==undefined&&meta.priority!==null&&meta.priority!=='')b.push(boardBadge('pri','P'+meta.priority));
+  return b.length?'<div class="sym-badges">'+b.join('')+'</div>':'';
+}
+
 async function pollBoard(){
   if(!spaceBoardId)return;
+  const seq=++boardPollSeq;
   const r=await api('/task-lists/'+spaceBoardId+'/tasks');if(!r||!r.tasks)return;
-  const todo=r.tasks.filter(t=>t.state==='Empty'||t.state==='empty');
-  const wip=r.tasks.filter(t=>t.state&&(t.state.startsWith('Claimed')||t.state.startsWith('claimed')));
-  const done=r.tasks.filter(t=>t.state&&(t.state.startsWith('Done')||t.state.startsWith('done')));
-  const render=(arr,canAct,action)=>arr.map(t=>`<div class="kanban-card" ${canAct?'onclick="boardAction(\''+escJs(t.id)+'\',\''+escJs(action)+'\')"':''}>
-    <div class="title">${esc(t.title)}</div>
-    <div class="meta">${canAct?'click to '+action:''} ${t.claimed_by?trustHtml(getContactTrust(t.claimed_by)):''}</div>
-  </div>`).join('')||'<div style="color:var(--tx3);font-size:11px;padding:8px">Empty</div>';
+  const sidecars=await boardFetchSymphonySidecars(spaceBoardId,r.tasks);
+  if(seq!==boardPollSeq)return;
+  const cols={todo:[],in_progress:[],review:[],done:[]};
+  r.tasks.forEach(t=>{
+    const meta=boardMergeSymphonyMeta(t,sidecars);
+    if(boardSymphonyOnly&&!meta.has)return;
+    const col=boardColumnForTask(t,meta);
+    (cols[col]||cols.todo).push({task:t,meta});
+  });
+  const render=(arr,col)=>arr.map(({task:t,meta})=>{
+    const action=col==='todo'?'claim':col==='in_progress'?'complete':'';
+    const who=t.assignee||t.claimed_by||'';
+    return `<div class="kanban-card" ${action?'onclick="boardAction(\''+escJs(t.id)+'\',\''+escJs(action)+'\')"':''}>
+      <div class="title">${esc(t.title)}</div>
+      <div class="meta">${action?'click to '+action:''} ${who?trustHtml(getContactTrust(who)):''}</div>
+      ${boardSymphonyBadges(meta)}
+    </div>`;
+  }).join('')||'<div style="color:var(--tx3);font-size:11px;padding:8px">Empty</div>';
   const e=id=>document.getElementById(id);
-  if(e('kb-todo'))e('kb-todo').innerHTML=render(todo,true,'claim');
-  if(e('kb-wip'))e('kb-wip').innerHTML=render(wip,true,'complete');
-  if(e('kb-done'))e('kb-done').innerHTML=render(done,false,'');
-  if(e('kb-todo-n'))e('kb-todo-n').textContent=todo.length;
-  if(e('kb-wip-n'))e('kb-wip-n').textContent=wip.length;
-  if(e('kb-done-n'))e('kb-done-n').textContent=done.length;
+  if(e('kb-todo'))e('kb-todo').innerHTML=render(cols.todo,'todo');
+  if(e('kb-wip'))e('kb-wip').innerHTML=render(cols.in_progress,'in_progress');
+  if(e('kb-review'))e('kb-review').innerHTML=render(cols.review,'review');
+  if(e('kb-done'))e('kb-done').innerHTML=render(cols.done,'done');
+  if(e('kb-todo-n'))e('kb-todo-n').textContent=cols.todo.length;
+  if(e('kb-wip-n'))e('kb-wip-n').textContent=cols.in_progress.length;
+  if(e('kb-review-n'))e('kb-review-n').textContent=cols.review.length;
+  if(e('kb-done-n'))e('kb-done-n').textContent=cols.done.length;
 }
 
 async function boardAction(tid,action){
