@@ -35,7 +35,15 @@ fn authed_client(d: &AgentInstance) -> reqwest::Client {
         .expect("authed client")
 }
 
-async fn wait_until<F, Fut>(timeout: Duration, mut check: F) -> bool
+async fn wait_until<F, Fut>(timeout: Duration, check: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    wait_until_every(timeout, Duration::from_millis(250), check).await
+}
+
+async fn wait_until_every<F, Fut>(timeout: Duration, poll: Duration, mut check: F) -> bool
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -48,7 +56,7 @@ where
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(poll).await;
     }
 }
 
@@ -771,16 +779,30 @@ async fn non_creator_admin_invite_e2e_converges_for_preset(
     let creator = &cluster.alice;
     let admin = &cluster.bob;
     let joiner = &cluster.charlie;
+    // Issue #139: this 3-daemon convergence e2e legitimately takes 130–160s
+    // wall clock on a quiet machine (observed 140s+ for the TreeKEM variant)
+    // and far longer under CPU contention, so derive each wait budget from
+    // the mesh size with a generous per-node multiplier instead of asserting
+    // against a fixed sub-120s window. These are upper bounds only — each
+    // wait returns as soon as convergence is observed, so a healthy mesh
+    // finishes long before the ceiling. (An earlier phase can consume near
+    // its full budget before a later phase fails, so the ceilings do not
+    // imply a hard cap on total wall clock.)
+    let node_count: u32 = 3;
     let join_timeout = if expect_treekem {
-        Duration::from_secs(90)
+        Duration::from_secs(90) * node_count // 270s
     } else {
-        Duration::from_secs(45)
+        Duration::from_secs(30) * node_count // 90s
     };
     let final_timeout = if expect_treekem {
-        Duration::from_secs(120)
+        Duration::from_secs(120) * node_count // 360s
     } else {
-        Duration::from_secs(60)
+        Duration::from_secs(40) * node_count // 120s
     };
+    // Back off the poll cadence for these long convergence waits: each probe
+    // issues several REST round-trips against all three daemons, and a hot
+    // 250ms loop adds load to the very mesh it is waiting on.
+    let poll = Duration::from_secs(1);
 
     let creator_id = creator.agent_id().await;
     let admin_id = admin.agent_id().await;
@@ -805,7 +827,7 @@ async fn non_creator_admin_invite_e2e_converges_for_preset(
         .unwrap_or(&group_id)
         .to_string();
 
-    let creator_sees_admin = wait_until(join_timeout, || async {
+    let creator_sees_admin = wait_until_every(join_timeout, poll, || async {
         list_members(creator, &group_id).await.contains(&admin_id)
     })
     .await;
@@ -813,10 +835,17 @@ async fn non_creator_admin_invite_e2e_converges_for_preset(
         creator_sees_admin,
         "creator never observed admin's initial join"
     );
+    // Pin the creator's state hash once admin is observed as a member, then
+    // wait for the admin to reach that captured baseline. This is a fixed
+    // target rather than a live cross-node comparison: a live equality check
+    // would be a stricter moving-target assertion that #139 does not require,
+    // and the later role-convergence and final-convergence waits already
+    // assert live agreement across all peers after the subsequent
+    // role-change and joiner-join operations.
     let creator_hash_after_admin_join = group_state_field(creator, &group_id, "state_hash")
         .await
         .expect("creator state_hash after admin join");
-    let admin_caught_up = wait_until(join_timeout, || async {
+    let admin_caught_up = wait_until_every(join_timeout, poll, || async {
         group_state_field(admin, &admin_group_id, "state_hash")
             .await
             .as_deref()
@@ -826,7 +855,7 @@ async fn non_creator_admin_invite_e2e_converges_for_preset(
     assert!(admin_caught_up, "admin never caught up after initial join");
 
     let _ = set_member_role(creator, &group_id, &admin_id, "admin").await;
-    let role_converged = wait_until(join_timeout, || async {
+    let role_converged = wait_until_every(join_timeout, poll, || async {
         let creator_details = group_details(creator, &group_id).await;
         let admin_details = group_details(admin, &admin_group_id).await;
         let creator_hash = group_state_field(creator, &group_id, "state_hash").await;
@@ -861,7 +890,7 @@ async fn non_creator_admin_invite_e2e_converges_for_preset(
         .unwrap_or(&group_id)
         .to_string();
 
-    let converged = wait_until(final_timeout, || async {
+    let converged = wait_until_every(final_timeout, poll, || async {
         let creator_details = group_details(creator, &group_id).await;
         let admin_details = group_details(admin, &admin_group_id).await;
         let joiner_details = group_details(joiner, &joiner_group_id).await;
