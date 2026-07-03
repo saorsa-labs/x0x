@@ -181,14 +181,26 @@ pub(in crate::server) struct TaskEntry {
 pub(in crate::server) async fn list_task_lists(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let lists = state.task_lists.read().await;
-    let entries: Vec<TaskListEntry> = lists
-        .keys()
-        .map(|id| TaskListEntry {
-            id: id.clone(),
-            topic: id.clone(), // topic is used as ID
-        })
-        .collect();
+    // Snapshot the keys, then release the lock before the per-id membership
+    // check (which takes `named_groups.read()`). Holding both read locks at
+    // once is safe for an RwLock, but collecting first keeps the critical
+    // section short and avoids re-entrancy surprises.
+    let ids: Vec<String> = state.task_lists.read().await.keys().cloned().collect();
+    // #153: filter the collection through the same membership guard as the
+    // per-id read/write handlers, so this endpoint does not leak the existence
+    // or exact topics of group-scoped task lists the local agent is not an
+    // active member of. (The per-id handlers already 403 those; this prevents
+    // the collection from enumerating them.) Red-team review of #166 found
+    // this collection endpoint was the sole unguarded path.
+    let mut entries = Vec::with_capacity(ids.len());
+    for id in ids {
+        if ensure_task_list_access(&state, &id).await.is_ok() {
+            entries.push(TaskListEntry {
+                id: id.clone(),
+                topic: id, // topic is used as ID
+            });
+        }
+    }
     Json(serde_json::json!({ "ok": true, "task_lists": entries }))
 }
 
