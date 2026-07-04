@@ -180,6 +180,41 @@ pub async fn verify(
     Ok(())
 }
 
+/// `x0x identity revoke` — POST /identity/revoke
+///
+/// Issues a signed revocation for an agent-id or machine-id keypair.  The
+/// daemon uses its own agent keypair as the issuer; self-revocations always
+/// succeed.  Revoking a third-party identity requires that the daemon's user
+/// keypair previously signed an `AgentCertificate` for the subject.
+pub async fn revoke(
+    client: &DaemonClient,
+    agent_id: Option<&str>,
+    machine_id: Option<&str>,
+    reason: Option<&str>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let mut body = serde_json::json!({});
+    if let Some(id) = agent_id {
+        body["agent_id"] = serde_json::Value::String(id.to_string());
+    }
+    if let Some(id) = machine_id {
+        body["machine_id"] = serde_json::Value::String(id.to_string());
+    }
+    if let Some(r) = reason {
+        body["reason"] = serde_json::Value::String(r.to_string());
+    }
+    let resp = client.post("/identity/revoke", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x identity revocations` — GET /identity/revocations
+///
+/// Lists all revocation records held by this daemon.
+pub async fn revocations(client: &DaemonClient) -> Result<()> {
+    client.run_get("/identity/revocations").await
+}
+
 /// Resolve the payload for `sign`/`verify` from `--file <PATH>` (with `-`
 /// meaning stdin) or `--payload-b64 <BASE64>`, returning base64 bytes.
 fn payload_b64_from_args(file: Option<&str>, payload_b64: Option<&str>) -> Result<String> {

@@ -311,6 +311,11 @@ enum Commands {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Manage key lifecycle: issue and list revocations.
+    Identity {
+        #[command(subcommand)]
+        sub: IdentitySub,
+    },
 }
 
 // ── Nested subcommands ──────────────────────────────────────────────────
@@ -450,6 +455,30 @@ enum DiagnosticsSub {
 enum AuthSub {
     /// Exchange the durable API token for a short-lived browser session token.
     Session,
+}
+
+/// Key lifecycle sub-actions (`x0x identity revoke`, `x0x identity revocations`).
+#[derive(Subcommand)]
+enum IdentitySub {
+    /// Issue a signed revocation for an agent-id or machine-id keypair.
+    ///
+    /// The daemon uses its own agent keypair as the issuer.  Self-revocations
+    /// (revoking own agent-id or machine-id) always succeed.  Revoking a
+    /// third-party identity requires that the user keypair previously signed
+    /// an AgentCertificate for the subject.
+    Revoke {
+        /// Agent ID to revoke (hex, 64 chars). Exactly one of --agent-id or --machine-id.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Machine ID to revoke (hex, 64 chars). Exactly one of --agent-id or --machine-id.
+        #[arg(long)]
+        machine_id: Option<String>,
+        /// Optional human-readable reason stored in the revocation record.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// List all revocation records held by this daemon.
+    Revocations,
 }
 
 /// Remote exec sub-actions (`x0x exec sessions`, `x0x exec cancel <id>`).
@@ -1770,6 +1799,22 @@ async fn run(
             transfer_id,
             reason,
         } => commands::files::reject_file(&client, &transfer_id, reason.as_deref()).await,
+        Commands::Identity { sub } => match sub {
+            IdentitySub::Revoke {
+                agent_id,
+                machine_id,
+                reason,
+            } => {
+                commands::identity::revoke(
+                    &client,
+                    agent_id.as_deref(),
+                    machine_id.as_deref(),
+                    reason.as_deref(),
+                )
+                .await
+            }
+            IdentitySub::Revocations => commands::identity::revocations(&client).await,
+        },
         Commands::Routes { .. }
         | Commands::Tree
         | Commands::Uninstall

@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 136,
+  "endpoint_count": 138,
   "endpoints": [
     {
       "category": "status",
@@ -84,6 +84,20 @@
       "description": "Verify a detached ML-DSA-65 signature against a caller-supplied public key",
       "method": "POST",
       "path": "/agent/verify"
+    },
+    {
+      "category": "identity",
+      "cli_name": "identity revoke",
+      "description": "Issue a signed revocation for an agent-id or machine-id keypair",
+      "method": "POST",
+      "path": "/identity/revoke"
+    },
+    {
+      "category": "identity",
+      "cli_name": "identity revocations",
+      "description": "List all revocation records held by this daemon",
+      "method": "GET",
+      "path": "/identity/revocations"
     },
     {
       "category": "network",
