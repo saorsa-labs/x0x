@@ -55,6 +55,10 @@ jobs:
       - name: Require a successful CI run for ${{ github.sha }}
         env:
           GH_TOKEN: ${{ github.token }}
+          # `gh run list` needs the repo; without a checkout `gh` cannot infer
+          # it from git and reports the CI run as "missing", failing the gate
+          # even when CI is green. Pin the repo explicitly.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           SHA="${{ github.sha }}"
