@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.28.0] - 2026-07-04
+
+### Upgrade notes
+
+- **Coordinated fleet upgrade for user-certified agents:** the certificate expiry field changes the bincode encoding of gossip announcements that carry a user certificate (agents that have opted into a `user.key`). In a mixed-version fleet, user-certified announcements from a differently-versioned peer may fail to decode until all nodes are upgraded. Agents without a user certificate are unaffected. On-disk `~/.x0x` key and certificate files remain backward-compatible (magic-marker versioning). Upgrade all nodes together, or expect transient announcement-decode failures from user-certified peers during rollout.
+- **New ADRs:** ADR-0018 (key lifecycle) and ADR-0019 (connect ACL).
+
+### Security
+
+- **Key lifecycle: optional certificate expiry, renewal, and gossiped revocation ([#130](https://github.com/saorsa-labs/x0x/pull/130), [ADR-0018](docs/adr/0018-key-lifecycle-expiry-renewal-revocation.md)).** `AgentCertificate` gains an optional `not_after` field (Unix timestamp, signature-covered). Absence of `not_after` means no expiry — existing keys and certificates are valid without any change. When present, a 300-second clock-skew tolerance is applied. Revocation is expressed as signed, grow-only revocation records (self-revocation or issuer-authority revocation) gossiped over the `x0x.revocation.v1` topic with heartbeat rebroadcast, so revocations propagate to peers that were offline when the record was first published. Expiry and revocation checks are enforced fail-closed at five points: announcement ingest, verified-binding check, DM inbox gate, exec ACL gate, and drop-on-receipt. A revoked or expired certificate causes the announcement or message to be silently dropped with a structured log event — no crash, no error response to the sender.
+
+- **Connection ACL: default-deny per-flow connectivity policy engine ([#131](https://github.com/saorsa-labs/x0x/pull/131), [ADR-0019](docs/adr/0019-connect-acl-default-closed.md)).** A connectivity policy engine and gate are wired into the daemon's startup path. The `--connect-acl <path>` flag (plus `--check` validation) loads a TOML policy file describing which peers may initiate or receive connections. `GET /diagnostics/connect` reports the loaded policy and connection counters. **The ACL is dormant in v0.28.0** — no existing connection path is gated until the tailnet forwarder wires it; runtime connection behavior is unchanged from v0.27.0.
+
+- **Group-scoped task lists enforce group membership ([#153](https://github.com/saorsa-labs/x0x/issues/153)).** Requests to group-scoped task-list endpoints by agents who are not members of the enclosing group now return `403 Forbidden`. Previously, group membership was not checked, allowing any peer that knew the task-list topic to read or write tasks in a group they had not joined.
+
+- **Constant-time API token comparison + short-lived session tokens ([#127](https://github.com/saorsa-labs/x0x/issues/127)).** Bearer-token comparison is now constant-time (no early exit on the first differing byte). Long-lived durable tokens are no longer accepted via the `?token=` query-parameter path (query-string tokens appear in server logs and process lists); they must be presented in the `Authorization: Bearer` header. A new short-lived session-token endpoint allows clients to exchange a durable token for a time-bounded session token suitable for URLs.
+
+### Added
+
+- **Bounded per-WebSocket outbound queue + slow-consumer close ([#122](https://github.com/saorsa-labs/x0x/issues/122)).** Each WebSocket connection's outbound send buffer is now capped. A client that stops draining messages causes the buffer to fill; once full the connection is closed with WebSocket close code `1013` (try again later) rather than back-pressuring the entire gossip fan-out path.
+
+- **Domain-separated `POST /agent/sign` with external DST ([#133](https://github.com/saorsa-labs/x0x/issues/133)).** `/agent/sign` now accepts a caller-supplied domain-separation tag (`dst`) that is included in the signed envelope alongside the payload. Applications that need to distinguish signed records by purpose (e.g. "agent-announcement" vs "task-ownership") can supply a stable DST and later verify it via `/agent/verify` without risking cross-protocol signature reuse.
+
+### Changed
+
+- **Server module decomposed into focused files ([#125](https://github.com/saorsa-labs/x0x/issues/125)).** `src/server/mod.rs` was mechanically split into `auth.rs`, `state.rs`, `ws.rs`, `sse.rs`, and `routes/{contacts,identity,machines,tasks}.rs`. All endpoints are preserved byte-for-byte; this is a pure file-layout change with no behavior or API surface change.
+
+- **Release train gated on green CI ([#128](https://github.com/saorsa-labs/x0x/issues/128)).** The `release.yml` workflow now requires all CI checks to pass before the publish step runs, preventing a repeat of releases published from a red-CI state.
+
+### Fixed
+
+- **WebSocket close frame `1013` now reaches the client ([#149](https://github.com/saorsa-labs/x0x/issues/149)).** When the slow-consumer close path writes a `1013` close frame, the writer now flushes and waits for the underlying TCP stream to drain before dropping the connection. Previously the close frame could be lost if the OS write buffer was not flushed before the socket was dropped.
+
+- **Announce loop no longer self-registers the daemon's own agent as a contact ([#145](https://github.com/saorsa-labs/x0x/issues/145)).** The capability-advertisement loop checked inbound announce messages from all peers, including the daemon's own reflections. A daemon's own agent ID was therefore inserted into the contacts store and returned in `GET /contacts`, making the local agent appear as a remote contact. The loop now skips announcements whose agent ID matches the local agent.
+
+- **Relaxed named-group convergence timing budget ([#139](https://github.com/saorsa-labs/x0x/issues/139)).** Integration tests that assert full group-state convergence across multiple daemons were failing intermittently under CI load because the timing budget was too tight for gossip propagation + TreeKEM apply under contention. Budgets are now derived from observed p99 latencies with a safety margin.
+
+- **CRDT/KV sync tasks tracked through `Agent` shutdown ([#126](https://github.com/saorsa-labs/x0x/issues/126)).** The background tasks that drive CRDT delta exchange and KV-store delta exchange were spawned into the runtime but not registered with the `Agent`'s task registry, so `Agent::shutdown()` returned before those tasks flushed their final deltas. They are now registered and awaited as part of orderly shutdown.
+
+- **CLI `unreachable!()` arms replaced with explicit errors ([#129](https://github.com/saorsa-labs/x0x/issues/129)).** Several `match` arms in the CLI command dispatch were guarded with `unreachable!()` — a panic in a production binary if control ever reached them. These are replaced with explicit, logged error returns.
+
+- **Bootstrap dial bounded with a per-attempt timeout ([#123](https://github.com/saorsa-labs/x0x/issues/123)).** Each bootstrap dial attempt now carries an individual timeout. Previously a stalled QUIC handshake with an unreachable bootstrap peer could block the entire 3-round bootstrap sequence for the duration of the OS connection timeout, delaying join-network completion by minutes on flaky paths.
+
 ## [v0.27.0] - 2026-06-28
 
 ### Added
