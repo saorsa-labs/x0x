@@ -19124,6 +19124,126 @@ mod tests {
         Ok(())
     }
 
+    /// Enforcement point 4 crown-jewel property (issue #130): the revocation
+    /// gate MUST precede `bypass_verified`, so a revoked sender is denied even
+    /// for a self-authenticating `GroupDeleted{commit:Some}` /
+    /// `MemberRemoved{commit:Some}` event — the exact events that bypass the
+    /// `verified` cache annotation (#99). This test fails if a future refactor
+    /// moves the revocation check below the `bypass_verified` block.
+    ///
+    /// It asserts BOTH directions in one place:
+    /// - (b) a NON-revoked but UNVERIFIED committer's terminal event STILL
+    ///   applies (bypass_verified is intact — #99 non-regression), and
+    /// - (a) once that same committer is revoked, the identical terminal event
+    ///   for a second live group is DENIED and the group is left untouched.
+    #[tokio::test]
+    async fn metadata_revoked_sender_denied_even_for_bypass_verified_event() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+
+        // Two independent live groups, both committed by this daemon's agent.
+        let group_b = "ep4-nonregression-unverified";
+        let group_a = "ep4-revoked-denied";
+        let (admin_b, _member_b) = install_metadata_terminality_group(&state, group_b).await;
+        let (admin_a, _member_a) = install_metadata_terminality_group(&state, group_a).await;
+
+        let committer = state.agent.agent_id();
+
+        // ── (b) #99 non-regression ──────────────────────────────────────
+        // An UNVERIFIED committer's GroupDeleted{commit:Some} still applies,
+        // because bypass_verified is intact and the signed commit carries its
+        // own authority. We pass verified = FALSE to prove the bypass path.
+        let parent_b = state
+            .named_groups
+            .read()
+            .await
+            .get(group_b)
+            .expect("group_b installed")
+            .clone();
+        let mut scratch_b = parent_b.clone();
+        scratch_b.withdrawn = true;
+        let commit_b = sign_metadata_terminality_commit(&parent_b, &scratch_b, &state, 1_000);
+        let event_b = NamedGroupMetadataEvent::GroupDeleted {
+            group_id: parent_b.stable_group_id().to_string(),
+            revision: 1,
+            actor: admin_b,
+            commit: Some(commit_b),
+        };
+        let applied_b = apply_named_group_metadata_event_inner(
+            &state, event_b, committer, /* verified = */ false, true,
+        )
+        .await;
+        assert!(
+            applied_b,
+            "#99 non-regression: an UNVERIFIED (but not revoked) committer's \
+             self-authenticating GroupDeleted must still apply via bypass_verified"
+        );
+
+        // ── revoke the committer via the real verify_and_insert path ─────
+        // A valid SELF-revocation: the issuer key IS the subject agent-id, so
+        // authority verifies from the record alone (no certificate needed).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(committer),
+            state.agent.identity().agent_keypair().public_key(),
+            state.agent.identity().agent_keypair().secret_key(),
+            now,
+            Some("ep4 test: committer compromised".to_string()),
+        )
+        .expect("sign self-revocation");
+        {
+            let set = state.agent.revocation_set();
+            let mut set = set.write().await;
+            set.verify_and_insert(record, None)
+                .expect("self-revocation must verify and insert");
+        }
+
+        // ── (a) crown jewel: revoked committer is DENIED ────────────────
+        // The SAME terminal event, same committer, verified = FALSE. Because
+        // the revocation gate runs BEFORE bypass_verified, this returns false
+        // and group_a is left completely intact (not withdrawn, key retained).
+        let parent_a = state
+            .named_groups
+            .read()
+            .await
+            .get(group_a)
+            .expect("group_a installed")
+            .clone();
+        let mut scratch_a = parent_a.clone();
+        scratch_a.withdrawn = true;
+        let commit_a = sign_metadata_terminality_commit(&parent_a, &scratch_a, &state, 1_000);
+        let event_a = NamedGroupMetadataEvent::GroupDeleted {
+            group_id: parent_a.stable_group_id().to_string(),
+            revision: 1,
+            actor: admin_a,
+            commit: Some(commit_a),
+        };
+        let applied_a = apply_named_group_metadata_event_inner(
+            &state, event_a, committer, /* verified = */ false, true,
+        )
+        .await;
+        assert!(
+            !applied_a,
+            "crown jewel: a REVOKED committer's GroupDeleted must be denied \
+             BEFORE bypass_verified — otherwise a revoked admin could still \
+             terminate groups via the self-authenticating commit path"
+        );
+        let groups = state.named_groups.read().await;
+        let stored = groups.get(group_a).expect("group_a retained");
+        assert!(
+            !stored.withdrawn,
+            "denied-at-the-gate: group_a must be untouched by the revoked event"
+        );
+        assert_eq!(
+            stored.shared_secret,
+            Some(vec![9; 32]),
+            "denied-at-the-gate: group_a key material must be untouched"
+        );
+        Ok(())
+    }
+
     fn assert_lost_race_conflict_drops_fields(
         status: StatusCode,
         body: &serde_json::Value,

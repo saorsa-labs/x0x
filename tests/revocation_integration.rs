@@ -5,10 +5,10 @@
 //!      and returns the signed record.
 //!   2. `GET /identity/revocations` returns the record in its list.
 //!   3. `POST /identity/revoke` returns 400 when both / neither subject fields
-//!      are supplied.
-//!   4. A second daemon whose agent-id is revoked is denied by
-//!      `is_agent_machine_verified()` — confirmed via the `GET /agents/:id/machine`
-//!      endpoint returning 404 after revocation propagates.
+//!      are supplied, or the id hex is malformed.
+//!   4. A revocation genuinely DENIES a previously-verified (agent, machine)
+//!      binding end-to-end: `GET /agents/:id/machine` goes 200 → 404 after a
+//!      self-revocation is applied (`revocation_denies_verified_binding_end_to_end`).
 //!
 //! All tests are `#[ignore]` — they require `x0xd` to be compiled.
 //! Run with: `cargo nextest run -E 'test(revocation)' --all-features -- --ignored`
@@ -51,7 +51,7 @@ async fn revocation_self_issue_own_agent_id() {
         .json()
         .await
         .unwrap();
-    let agent_id = agent["data"]["agent_id"].as_str().unwrap().to_owned();
+    let agent_id = agent["agent_id"].as_str().unwrap().to_owned();
 
     // Issue self-revocation.
     let resp: Value = c
@@ -92,15 +92,21 @@ async fn revocation_list_contains_issued_record() {
         .json()
         .await
         .unwrap();
-    let agent_id = agent["data"]["agent_id"].as_str().unwrap().to_owned();
+    let agent_id = agent["agent_id"].as_str().unwrap().to_owned();
 
-    // Issue a machine-id revocation so we have something non-trivial to list.
-    let machine_id = agent["data"]["machine_id"].as_str().unwrap().to_owned();
-    c.post(d.url("/identity/revoke"))
-        .json(&serde_json::json!({ "machine_id": machine_id }))
+    // Issue a self-revocation of the daemon's own agent-id (valid authority:
+    // the /identity/revoke handler signs with the agent keypair, so only the
+    // agent-id is self-revocable via the API).
+    let revoke = c
+        .post(d.url("/identity/revoke"))
+        .json(&serde_json::json!({
+            "agent_id": agent_id,
+            "reason": "list test"
+        }))
         .send()
         .await
         .unwrap();
+    assert_eq!(revoke.status(), 200, "self-revocation must succeed");
 
     let list: Value = c
         .get(d.url("/identity/revocations"))
@@ -118,18 +124,10 @@ async fn revocation_list_contains_issued_record() {
     );
     let found = revocations
         .iter()
-        .any(|r| r["subject"] == machine_id && r["subject_kind"] == "machine");
-    assert!(
-        found,
-        "expected machine-id {machine_id} in revocations list; got: {list}"
-    );
-    // agent_id is not in the list (we only revoked machine_id above).
-    let agent_found = revocations
-        .iter()
         .any(|r| r["subject"] == agent_id && r["subject_kind"] == "agent");
     assert!(
-        !agent_found,
-        "agent-id should not appear; only machine-id was revoked"
+        found,
+        "expected agent-id {agent_id} in revocations list; got: {list}"
     );
 }
 
@@ -188,146 +186,112 @@ async fn revocation_rejects_malformed_hex() {
 }
 
 // ---------------------------------------------------------------------------
-// Two-daemon denial test (non-negotiable per Step 8)
+// End-to-end denial through a real daemon (issue #130 acceptance criterion)
 // ---------------------------------------------------------------------------
 
-/// After alice revokes bob's agent-id, the `is_agent_machine_verified` gate
-/// blocks bob's identity at alice's side. We confirm this via
-/// `GET /agents/:id/machine` returning 404 once alice applies the revocation.
+/// A revocation genuinely DENIES a previously-verified (agent, machine)
+/// binding, end-to-end through the real daemon HTTP surface.
 ///
-/// The test injects bob's `DiscoveredAgent` into alice via
-/// `POST /announce` (loopback, alice announces bob's identity so it is cached),
-/// then self-revokes bob's agent-id *at alice* by calling alice's
-/// `/identity/revoke` endpoint with bob's agent-id.
+/// This is the #130 acceptance proof: it does not merely assert an API
+/// contract, it drives the daemon from "this binding is verified and
+/// resolvable" to "this binding is refused" purely by applying a valid
+/// revocation.
 ///
-/// NOTE: alice cannot issue an authoritative revocation for bob (only bob or
-/// bob's issuing user can); what we test here is that alice's own daemon
-/// correctly applies any revocation it holds — including one injected
-/// by alice's own operator — and that this causes the verified gate to return
-/// false (404) rather than the cached entry.
+/// Flow (single daemon, self-revocation = valid authority):
+///  1. The daemon self-announces, seeding its own signed (agent, machine)
+///     binding into the discovery caches.
+///  2. `GET /agents/:id/machine` resolves the machine — the binding is live.
+///  3. `POST /identity/revoke {agent_id}` self-revokes (authority holds).
+///  4. `GET /agents/:id/machine` now returns 404 — the revocation evicted the
+///     binding and the verified gate refuses it. Denial is observable.
 ///
-/// This is a white-box test: real cross-daemon revocation propagation via gossip
-/// is covered by the e2e test scripts.
+/// Cross-daemon gossip propagation of the same record is exercised by the e2e
+/// scripts; the in-daemon enforcement (EP2 verified gate, EP3 DM drop, EP4
+/// group gate) is proven by the unit tests in `src/lib.rs`, `src/dm_inbox.rs`,
+/// and `src/server/mod.rs`.
 #[tokio::test]
 #[ignore]
-async fn two_daemon_denial_after_revocation() {
-    let alice = daemon("alice-deny").await;
-    let bob = daemon("bob-deny").await;
-    let ca_alice = ca(&alice);
-    let ca_bob = ca(&bob);
+async fn revocation_denies_verified_binding_end_to_end() {
+    let d = daemon("revoke-denial").await;
+    let c = ca(&d);
 
-    // Fetch bob's identity.
-    let bob_info: Value = ca_bob
-        .get(bob.url("/agent"))
+    // Own identity.
+    let agent: Value = c
+        .get(d.url("/agent"))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    let bob_agent_id = bob_info["data"]["agent_id"].as_str().unwrap().to_owned();
-    let bob_machine_id = bob_info["data"]["machine_id"].as_str().unwrap().to_owned();
+    let agent_id = agent["agent_id"].as_str().unwrap().to_owned();
 
-    // Confirm alice doesn't know about bob yet — 404 expected.
-    let status_before = ca_alice
-        .get(alice.url(&format!("/agents/{bob_agent_id}/machine")))
-        .send()
-        .await
-        .unwrap()
-        .status();
-    assert_eq!(
-        status_before, 404,
-        "alice should not know bob before any announcement"
-    );
-
-    // Alice revokes bob's agent-id (alice's own operator decision — white-box).
-    // In production this would come via gossip from bob's issuing user.
-    let revoke_resp = ca_alice
-        .post(alice.url("/identity/revoke"))
+    // 1. Self-announce so the daemon holds its own verified binding.
+    c.post(d.url("/announce"))
         .json(&serde_json::json!({
-            "agent_id": bob_agent_id,
-            "reason": "test: deny bob"
+            "include_user_identity": false,
+            "human_consent": false
         }))
         .send()
         .await
         .unwrap();
 
-    // Self-revocation authority check: alice's keypair != bob's keypair → 403.
-    // This is correct — alice cannot authoritatively revoke bob.
-    // What matters for the denial test is that any record alice *holds*
-    // (however it arrived — via gossip from bob's user key) is enforced.
-    // We verify the enforcement path itself via the authority-failure path:
-    // the 403 proves that the revocation gate in the handler is reached.
-    let revoke_status = revoke_resp.status();
-    assert!(
-        revoke_status == 403 || revoke_status == 200,
-        "expected 200 (self) or 403 (non-self authority), got {revoke_status}"
-    );
-
-    // Whether we got 200 or 403, verify the revocations list reflects reality.
-    let list: Value = ca_alice
-        .get(alice.url("/identity/revocations"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let revocations = list["revocations"].as_array().unwrap();
-
-    if revoke_status == 200 {
-        // Self-revocation (e.g. if alice happens to equal bob — unlikely in
-        // practice but guard against it in CI).
-        let found = revocations.iter().any(|r| r["subject"] == bob_agent_id);
-        assert!(found, "revoked agent-id must appear in the list");
-
-        // With the revocation in alice's set, alice's verified gate must
-        // reject bob's identity even if it were in the discovery cache.
-        let status_after = ca_alice
-            .get(alice.url(&format!("/agents/{bob_agent_id}/machine")))
-            .send()
-            .await
-            .unwrap()
-            .status();
-        // 404 = not in cache (was evicted or never cached) — gate closed.
-        // 400/403 would also be acceptable enforcement outcomes.
-        assert!(
-            status_after == 404 || status_after == 403,
-            "after revocation, verified gate must block bob; got {status_after}"
-        );
-    } else {
-        // 403 path: alice correctly rejected the non-self revocation.
-        // Confirm that alice's revocations list does NOT contain bob's id.
-        let found = revocations.iter().any(|r| r["subject"] == bob_agent_id);
-        assert!(
-            !found,
-            "a rejected revocation must not appear in the list; got: {list}"
-        );
-    }
-
-    // Final check: alice knows her own machine (sanity — daemon is still up).
-    let alice_info: Value = ca_alice
-        .get(alice.url("/agent"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(alice_info["data"]["machine_id"].is_string());
-    // bob's machine-id was never revoked by alice, so if we ask for it we
-    // get 404 (not in alice's discovery cache — not 403 auth-gate failure).
-    let machine_status = ca_alice
-        .get(alice.url(&format!("/agents/discovered/{bob_agent_id}")))
+    // 2. The binding resolves — proof it is verified/live BEFORE revocation.
+    let before = c
+        .get(d.url(&format!("/agents/{agent_id}/machine")))
         .send()
         .await
         .unwrap()
         .status();
-    // 404 = never discovered (expected in a no-bootstrap two-daemon test).
-    // 403 would mean the revocation gate fired — also acceptable.
-    assert!(
-        machine_status == 404 || machine_status == 403 || machine_status == 200,
-        "unexpected status {machine_status}"
+    assert_eq!(
+        before, 200,
+        "the self-announced (agent, machine) binding must resolve before revocation"
     );
-    drop(bob_machine_id); // suppress unused warning in 403 path
+
+    // 3. Self-revoke — valid authority (issuer key == subject agent-id).
+    let revoke: Value = c
+        .post(d.url("/identity/revoke"))
+        .json(&serde_json::json!({
+            "agent_id": agent_id,
+            "reason": "e2e denial proof"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(revoke["ok"], true, "self-revocation must succeed: {revoke}");
+
+    // 4. The binding is now DENIED — the revocation evicted it and the gate
+    //    refuses it. This is the genuine denial, not an API-contract check.
+    let after = c
+        .get(d.url(&format!("/agents/{agent_id}/machine")))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(
+        after, 404,
+        "after revocation the binding must be denied (evicted + gate-closed); got {after}"
+    );
+
+    // And the record is durably listed.
+    let list: Value = c
+        .get(d.url("/identity/revocations"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let found = list["revocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["subject"] == agent_id && r["subject_kind"] == "agent");
+    assert!(
+        found,
+        "the applied revocation must appear in the list: {list}"
+    );
 }

@@ -61,11 +61,7 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(Post, "/agent/sign", daemon_api_agent_sign_roundtrip),
     covered!(Post, "/agent/verify", daemon_api_agent_verify_roundtrip),
-    covered!(
-        Post,
-        "/identity/revoke",
-        revocation_self_issue_own_agent_id
-    ),
+    covered!(Post, "/identity/revoke", revocation_self_issue_own_agent_id),
     covered!(
         Get,
         "/identity/revocations",

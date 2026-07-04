@@ -7044,6 +7044,12 @@ impl Agent {
 
     /// Evict a revoked subject from all discovery caches.
     async fn evict_revoked_subject(&self, subject: &revocation::RevokedSubject) {
+        // NOTE: this evicts the identity/machine discovery caches and the
+        // contact store, but does NOT purge the ant-quic bootstrap cache. A
+        // revoked peer's address can therefore linger there; this is a residual
+        // (not a hole) because EP1 re-rejects the peer's announcement on every
+        // ingest, so it can never re-enter the verified path. Bootstrap-cache
+        // purge on eviction is tracked as a follow-up.
         match subject {
             revocation::RevokedSubject::Agent(agent_id) => {
                 // Remove from identity cache, which also starves the verified annotation.
@@ -10201,6 +10207,68 @@ mod tests {
         assert_eq!(entry.agent_id, agent.agent_id());
         assert_eq!(entry.machine_id, agent.machine_id());
         assert_eq!(entry.user_id, agent.user_id());
+    }
+
+    /// Enforcement point 2 (issue #130): a revoked agent MUST fail
+    /// `is_agent_machine_verified` even when its signed identity announcement
+    /// is still sitting verified in the discovery cache. This is the DM/gate
+    /// denial property — a revoked peer is refused everywhere the daemon asks
+    /// "is this (agent, machine) binding trustworthy?". The revocation is
+    /// applied via the real `verify_and_insert` receive path (the same call
+    /// the gossip subscription makes on receipt), and the subject is
+    /// self-revoked (issuer key == subject agent-id, valid authority).
+    #[tokio::test]
+    async fn revoked_agent_fails_machine_verification_even_when_cached() {
+        let user_key = identity::UserKeypair::generate().unwrap();
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .with_user_key(user_key)
+            .build()
+            .await
+            .unwrap();
+
+        // Seed the discovery cache with our own signed announcement so the
+        // (agent, machine) binding verifies true BEFORE revocation.
+        agent.announce_identity(true, true).await.unwrap();
+        let agent_id = agent.agent_id();
+        let machine_id = agent.machine_id();
+        assert!(
+            agent
+                .is_agent_machine_verified(&agent_id, &machine_id)
+                .await,
+            "a cached, signed self-announcement must verify before revocation"
+        );
+
+        // Apply a valid SELF-revocation of our own agent-id via the real
+        // receive path. verify_and_insert re-checks the ML-DSA signature and
+        // the self-revocation authority rule, exactly as on gossip receipt.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Agent(agent_id),
+            agent.identity().agent_keypair().public_key(),
+            agent.identity().agent_keypair().secret_key(),
+            now,
+            Some("ep2 test: key compromised".to_string()),
+        )
+        .unwrap();
+        {
+            let set = agent.revocation_set();
+            let mut set = set.write().await;
+            set.verify_and_insert(record, None)
+                .expect("self-revocation must verify and insert");
+        }
+
+        // Fail-closed: the verified gate must now refuse the revoked agent,
+        // even though its announcement is still cached and otherwise valid.
+        assert!(
+            !agent
+                .is_agent_machine_verified(&agent_id, &machine_id)
+                .await,
+            "a revoked agent must never pass machine verification while cached"
+        );
     }
 
     /// An announcement without NAT fields (as produced by old nodes) should still
