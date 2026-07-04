@@ -153,6 +153,7 @@ pub mod upgrade;
 /// File transfer protocol types and state management.
 pub mod files;
 
+pub mod connect;
 /// Secure Tier-1 remote exec protocol and runtime.
 pub mod exec;
 
