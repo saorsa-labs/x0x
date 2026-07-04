@@ -463,6 +463,20 @@ pub struct AgentCertificate {
     ///
     /// `None` (the default for legacy certificates) means the certificate
     /// never expires. When present it is covered by the signature.
+    ///
+    /// NOTE on `#[serde(default)]`: bincode is a positional (non-self-describing)
+    /// format and IGNORES `serde(default)` — it cannot recover a trailing field
+    /// that is absent from the byte stream. This attribute therefore only aids
+    /// self-describing formats (JSON/TOML). On-disk cert files stay
+    /// backward-compatible via the explicit magic-marker versioning in
+    /// [`to_storage_bytes`](Self::to_storage_bytes) /
+    /// [`from_storage_bytes`](Self::from_storage_bytes), NOT via this attribute.
+    /// For certificates embedded in gossip announcements the extra positional
+    /// bytes ARE a wire-format change: this is the known, coordinated
+    /// fleet-upgrade break documented in the plan (D3) — the "no breaking
+    /// change" guarantee covers on-disk key/cert files only, not the
+    /// announcement wire format in a mixed-version fleet carrying user-certified
+    /// agents.
     #[serde(default)]
     not_after: Option<u64>,
 }

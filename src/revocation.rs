@@ -210,6 +210,20 @@ impl RevocationRecord {
         ))
     }
 
+    /// Whether this is a self-revocation — the issuer key hashes to the subject
+    /// id.
+    ///
+    /// A self-revocation re-verifies from the record alone (no certificate
+    /// needed); an issuer-revocation requires the subject agent's certificate.
+    /// A malformed issuer key yields `false` (it will fail verification anyway).
+    #[must_use]
+    pub fn is_self_revocation(&self) -> bool {
+        match MlDsaPublicKey::from_bytes(&self.issuer_public_key) {
+            Ok(pk) => &derive_peer_id_from_public_key(&pk).0 == self.subject.id_bytes(),
+            Err(_) => false,
+        }
+    }
+
     /// BLAKE3 hash of the canonical (signed) message, used for de-duplication.
     ///
     /// Two records for the same `(subject, issuer, revoked_at, reason)` hash
@@ -226,16 +240,37 @@ impl RevocationRecord {
     }
 }
 
+/// A revocation record plus the subject certificate (if any) that authorizes
+/// it, as stored on disk.
+///
+/// `subject_cert` is `Some` only for **issuer-revocations**, where the record
+/// is authorized by the user key that signed the subject agent's certificate:
+/// that certificate is required to re-verify authority on load. Self-revocations
+/// carry `None` (they re-verify from the record alone). Persisting the cert is
+/// what lets [`RevocationSet::from_bytes`] re-check authority — so a
+/// tampered/forged `revocations.bin` cannot inject an unverified revocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRevocation {
+    record: RevocationRecord,
+    subject_cert: Option<AgentCertificate>,
+}
+
 /// In-memory grow-only set of verified revocations.
 ///
 /// Maintains `HashSet`s of revoked agent/machine ids for O(1) gate checks plus
 /// a hash-keyed map of the full records for rebroadcast. Records are only ever
 /// added; there is no removal (no un-revocation).
+///
+/// Every record in the set has passed [`RevocationRecord::verify_authority`] —
+/// both on first receipt and again when reloaded from disk. Insertion therefore
+/// only happens through [`verify_and_insert`](Self::verify_and_insert); the
+/// crate-internal raw insert performs no crypto and must only ever be handed a
+/// record that was just verified.
 #[derive(Debug, Default, Clone)]
 pub struct RevocationSet {
     revoked_agents: HashSet<AgentId>,
     revoked_machines: HashSet<MachineId>,
-    records_by_hash: HashMap<[u8; 32], RevocationRecord>,
+    records_by_hash: HashMap<[u8; 32], PersistedRevocation>,
 }
 
 impl RevocationSet {
@@ -275,18 +310,48 @@ impl RevocationSet {
         self.records_by_hash.contains_key(hash)
     }
 
-    /// Insert an already-verified record. Returns `true` if it was new.
+    /// Verify a record's authority, then insert it. Returns `true` if it was
+    /// newly added, `false` if already present (idempotent).
     ///
-    /// Callers MUST verify authority via
-    /// [`RevocationRecord::verify_authority`] before inserting; this method
-    /// performs no cryptographic checks so that loading a locally-persisted,
-    /// previously-verified set stays cheap.
-    pub fn insert_verified(&mut self, record: RevocationRecord) -> bool {
-        let hash = record.record_hash();
+    /// This is the ONLY way a record enters the set. `subject_cert` supplies
+    /// the subject agent's certificate for issuer-revocations (pass `None` for
+    /// self-revocations, or when no certificate is known — issuer-revocations
+    /// then fail closed). The validating certificate is retained so the record
+    /// re-verifies on a later [`from_bytes`](Self::from_bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Revocation`] if the record's signature is
+    /// invalid or the issuer lacks authority over the subject.
+    pub fn verify_and_insert(
+        &mut self,
+        record: RevocationRecord,
+        subject_cert: Option<&AgentCertificate>,
+    ) -> Result<bool, IdentityError> {
+        record.verify_authority(subject_cert)?;
+        // Retain the certificate only when it was actually needed to prove
+        // authority (issuer-revocation). Self-revocations re-verify without it.
+        let retained_cert = if record.is_self_revocation() {
+            None
+        } else {
+            subject_cert.cloned()
+        };
+        Ok(self.insert_verified(PersistedRevocation {
+            record,
+            subject_cert: retained_cert,
+        }))
+    }
+
+    /// Raw insert of an already-verified record. Performs NO cryptographic
+    /// checks — it is module-private and reachable ONLY through
+    /// [`verify_and_insert`](Self::verify_and_insert), which is the sole path a
+    /// record can enter the set. Returns `true` if new.
+    fn insert_verified(&mut self, persisted: PersistedRevocation) -> bool {
+        let hash = persisted.record.record_hash();
         if self.records_by_hash.contains_key(&hash) {
             return false;
         }
-        match &record.subject {
+        match &persisted.record.subject {
             RevokedSubject::Agent(id) => {
                 self.revoked_agents.insert(*id);
             }
@@ -294,24 +359,28 @@ impl RevocationSet {
                 self.revoked_machines.insert(*id);
             }
         }
-        self.records_by_hash.insert(hash, record);
+        self.records_by_hash.insert(hash, persisted);
         true
     }
 
     /// All held records (order unspecified), for rebroadcast/anti-entropy.
     #[must_use]
     pub fn all_records(&self) -> Vec<RevocationRecord> {
-        self.records_by_hash.values().cloned().collect()
+        self.records_by_hash
+            .values()
+            .map(|p| p.record.clone())
+            .collect()
     }
 
     /// Encode the set for on-disk persistence: `X0XR` magic + bincode of the
-    /// record list.
+    /// record list (each record carrying the certificate that authorizes it,
+    /// where applicable).
     ///
     /// # Errors
     ///
     /// Returns [`IdentityError::Serialization`] on encode failure.
     pub fn to_bytes(&self) -> Result<Vec<u8>, IdentityError> {
-        let records: Vec<&RevocationRecord> = self.records_by_hash.values().collect();
+        let records: Vec<&PersistedRevocation> = self.records_by_hash.values().collect();
         let body = bincode::serialize(&records)
             .map_err(|e| IdentityError::Serialization(e.to_string()))?;
         let mut out = Vec::with_capacity(REVOCATIONS_FILE_MAGIC.len() + body.len());
@@ -320,16 +389,22 @@ impl RevocationSet {
         Ok(out)
     }
 
-    /// Decode a set previously written by [`to_bytes`](Self::to_bytes).
+    /// Decode a set previously written by [`to_bytes`](Self::to_bytes),
+    /// **re-verifying every record's authority on load**.
     ///
-    /// Records are inserted without re-verifying signatures — they were
-    /// verified before this daemon persisted them. An empty or magic-less
-    /// input yields an empty set (forward-compatible with a missing file).
+    /// The on-disk file is untrusted input: a record that fails re-verification
+    /// (forged signature, or an issuer-revocation whose persisted certificate
+    /// no longer authorizes it) is silently dropped rather than trusted, so a
+    /// tampered `revocations.bin` cannot inject an unverified revocation.
+    /// Legitimately-verified records — including issuer-revocations, whose
+    /// authorizing certificate is persisted alongside them — are preserved.
+    ///
+    /// An empty input yields an empty set (a missing file is not an error).
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::Serialization`] if the body is present but
-    /// malformed.
+    /// Returns [`IdentityError::Serialization`] if the magic is missing or the
+    /// body is malformed.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, IdentityError> {
         if bytes.is_empty() {
             return Ok(Self::new());
@@ -341,12 +416,15 @@ impl RevocationSet {
                 "revocation file missing X0XR magic".to_string(),
             ));
         }
-        let records: Vec<RevocationRecord> =
+        let persisted: Vec<PersistedRevocation> =
             bincode::deserialize(&bytes[REVOCATIONS_FILE_MAGIC.len()..])
                 .map_err(|e| IdentityError::Serialization(e.to_string()))?;
         let mut set = Self::new();
-        for record in records {
-            set.insert_verified(record);
+        for entry in persisted {
+            // Re-verify authority against the persisted certificate. A record
+            // that no longer verifies is dropped (not present in the set) —
+            // this is the load-path enforcement of the authority model.
+            let _ = set.verify_and_insert(entry.record, entry.subject_cert.as_ref());
         }
         Ok(set)
     }
@@ -499,9 +577,12 @@ mod tests {
         )
         .unwrap();
         let mut set = RevocationSet::new();
-        assert!(set.insert_verified(record.clone()), "first insert is new");
         assert!(
-            !set.insert_verified(record.clone()),
+            set.verify_and_insert(record.clone(), None).unwrap(),
+            "first insert is new"
+        );
+        assert!(
+            !set.verify_and_insert(record.clone(), None).unwrap(),
             "re-inserting the same record must be idempotent"
         );
         assert_eq!(set.len(), 1);
@@ -512,11 +593,16 @@ mod tests {
     #[test]
     fn revocation_set_persists_and_reloads() {
         // The on-disk round-trip preserves the gate state — a daemon restart
-        // must not forget revocations it learned.
+        // must not forget revocations it learned. Includes an issuer-revocation
+        // (cert persisted alongside) so the reload re-verifies it via that cert.
         let agent = AgentKeypair::generate().unwrap();
         let machine = MachineKeypair::generate().unwrap();
+        let user = UserKeypair::generate().unwrap();
+        let issued_agent = AgentKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&user, &issued_agent).unwrap();
         let mut set = RevocationSet::new();
-        set.insert_verified(
+        // self-revocation (agent)
+        set.verify_and_insert(
             RevocationRecord::sign(
                 RevokedSubject::Agent(agent.agent_id()),
                 agent.public_key(),
@@ -525,8 +611,11 @@ mod tests {
                 None,
             )
             .unwrap(),
-        );
-        set.insert_verified(
+            None,
+        )
+        .unwrap();
+        // self-revocation (machine)
+        set.verify_and_insert(
             RevocationRecord::sign(
                 RevokedSubject::Machine(machine.machine_id()),
                 machine.public_key(),
@@ -535,12 +624,134 @@ mod tests {
                 None,
             )
             .unwrap(),
-        );
+            None,
+        )
+        .unwrap();
+        // issuer-revocation (user revokes a certified agent)
+        set.verify_and_insert(
+            RevocationRecord::sign(
+                RevokedSubject::Agent(issued_agent.agent_id()),
+                user.public_key(),
+                user.secret_key(),
+                now(),
+                None,
+            )
+            .unwrap(),
+            Some(&cert),
+        )
+        .unwrap();
         let bytes = set.to_bytes().unwrap();
         let reloaded = RevocationSet::from_bytes(&bytes).unwrap();
-        assert_eq!(reloaded.len(), 2);
+        assert_eq!(reloaded.len(), 3, "all three records must survive reload");
         assert!(reloaded.is_agent_revoked(&agent.agent_id()));
         assert!(reloaded.is_machine_revoked(&machine.machine_id()));
+        assert!(
+            reloaded.is_agent_revoked(&issued_agent.agent_id()),
+            "issuer-revocation must re-verify on load via its persisted cert"
+        );
+    }
+
+    #[test]
+    fn revocation_set_from_bytes_rejects_forged_and_unrelated_records() {
+        // SECURITY: revocations.bin is untrusted input. A record whose signature
+        // is forged (tampered after signing) and an issuer-revocation whose
+        // persisted cert does not authorize it must both be DROPPED on load,
+        // while a legitimately-signed self-revocation and a properly-certified
+        // issuer-revocation must survive. This pins load-path authority
+        // enforcement — without it a tampered file would inject revocations.
+        let good_agent = AgentKeypair::generate().unwrap();
+        let user = UserKeypair::generate().unwrap();
+        let issued_agent = AgentKeypair::generate().unwrap();
+        let good_cert = AgentCertificate::issue(&user, &issued_agent).unwrap();
+
+        // Legit self-revocation.
+        let good_self = PersistedRevocation {
+            record: RevocationRecord::sign(
+                RevokedSubject::Agent(good_agent.agent_id()),
+                good_agent.public_key(),
+                good_agent.secret_key(),
+                now(),
+                None,
+            )
+            .unwrap(),
+            subject_cert: None,
+        };
+
+        // Legit issuer-revocation, cert persisted alongside.
+        let good_issuer = PersistedRevocation {
+            record: RevocationRecord::sign(
+                RevokedSubject::Agent(issued_agent.agent_id()),
+                user.public_key(),
+                user.secret_key(),
+                now(),
+                None,
+            )
+            .unwrap(),
+            subject_cert: Some(good_cert.clone()),
+        };
+
+        // Forged: a validly-signed self-revocation tampered after signing.
+        let forged_agent = AgentKeypair::generate().unwrap();
+        let mut forged_record = RevocationRecord::sign(
+            RevokedSubject::Agent(forged_agent.agent_id()),
+            forged_agent.public_key(),
+            forged_agent.secret_key(),
+            now(),
+            None,
+        )
+        .unwrap();
+        forged_record.revoked_at = forged_record.revoked_at.wrapping_add(1);
+        let forged = PersistedRevocation {
+            record: forged_record,
+            subject_cert: None,
+        };
+
+        // Unrelated issuer: a third party's key with a cert that does not bind
+        // them to the subject.
+        let attacker = UserKeypair::generate().unwrap();
+        let victim_agent = AgentKeypair::generate().unwrap();
+        let unrelated = PersistedRevocation {
+            record: RevocationRecord::sign(
+                RevokedSubject::Agent(victim_agent.agent_id()),
+                attacker.public_key(),
+                attacker.secret_key(),
+                now(),
+                None,
+            )
+            .unwrap(),
+            // Attach a real cert, but it certifies issued_agent (not the
+            // victim) and is signed by `user` (not the attacker).
+            subject_cert: Some(good_cert),
+        };
+
+        // Craft the on-disk bytes directly (bypassing verify_and_insert) to
+        // simulate a tampered file.
+        let entries = vec![good_self, good_issuer, forged, unrelated];
+        let mut bytes = REVOCATIONS_FILE_MAGIC.to_vec();
+        bytes.extend_from_slice(&bincode::serialize(&entries).unwrap());
+
+        let loaded = RevocationSet::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "only the two authoritative records may survive load"
+        );
+        assert!(
+            loaded.is_agent_revoked(&good_agent.agent_id()),
+            "legit self-revocation must survive"
+        );
+        assert!(
+            loaded.is_agent_revoked(&issued_agent.agent_id()),
+            "legit issuer-revocation (with cert) must survive"
+        );
+        assert!(
+            !loaded.is_agent_revoked(&forged_agent.agent_id()),
+            "forged record must be rejected on load"
+        );
+        assert!(
+            !loaded.is_agent_revoked(&victim_agent.agent_id()),
+            "unrelated-issuer record must be rejected on load"
+        );
     }
 
     #[test]
