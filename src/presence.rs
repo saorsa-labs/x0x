@@ -162,6 +162,7 @@ pub fn presence_record_to_discovered_agent(
         is_coordinator: None,
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
+        cert_not_after: None,
     })
 }
 
@@ -743,6 +744,7 @@ mod tests {
             is_coordinator: None,
             reachable_via: Vec::new(),
             relay_candidates: Vec::new(),
+            cert_not_after: None,
         }
     }
 

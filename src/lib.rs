@@ -283,6 +283,13 @@ pub struct Agent {
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
     /// Handle for the running DM inbox service.
     dm_inbox_service: tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>,
+    /// In-memory grow-only revocation set.  Gate checks hold only a read lock
+    /// and never await while holding it — write lock is taken only when
+    /// applying a new revocation (rare) and when persisting to disk.
+    revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    /// Identity-scoped directory.  When `Some`, revocations.bin is saved here
+    /// instead of `~/.x0x/`.
+    identity_dir: Option<std::path::PathBuf>,
     /// Cancellation token driving deterministic teardown of all long-lived
     /// Agent background loops (identity/network-event/direct listeners and the
     /// presence broadcast-peer refresh). Cancelling it makes every token-aware
@@ -365,6 +372,14 @@ pub const MACHINE_ANNOUNCE_TOPIC: &str = "x0x.machine.announce.v2";
 /// any individual agent has consented to disclose its user binding.
 /// First introduced in v2 wire format.
 pub const USER_ANNOUNCE_TOPIC: &str = "x0x.user.announce.v2";
+
+/// Reserved gossip topic for signed identity revocation records.
+///
+/// Payload is a `bincode`-encoded `Vec<revocation::RevocationRecord>`.
+/// Records are re-verified on receipt before insertion into the local
+/// [`revocation::RevocationSet`].  The full local set is re-broadcast on each identity
+/// heartbeat for partition-tolerant eventual convergence.
+pub const REVOCATION_TOPIC: &str = "x0x.revocation.v1";
 
 /// Return the shard-specific gossip topic for the given `agent_id`.
 ///
@@ -1266,6 +1281,10 @@ pub struct DiscoveredAgent {
     pub reachable_via: Vec<identity::MachineId>,
     /// Relay machines this agent proposes as fallback paths.
     pub relay_candidates: Vec<identity::MachineId>,
+    /// Expiry timestamp from the agent certificate embedded in the
+    /// identity announcement, if any.  `None` means the cert carries no
+    /// expiry — the agent is considered valid indefinitely.
+    pub cert_not_after: Option<u64>,
 }
 
 /// Cached machine endpoint data derived from signed machine announcements.
@@ -1743,6 +1762,10 @@ pub struct AgentBuilder {
     presence_offline_timeout_secs: Option<u64>,
     /// Custom path for the contacts file.
     contact_store_path: Option<std::path::PathBuf>,
+    /// Directory that scopes all identity-related files (keys, cert,
+    /// revocations.bin).  When set, revocations are loaded/saved there
+    /// instead of the default `~/.x0x/` directory.
+    identity_dir: Option<std::path::PathBuf>,
 }
 
 /// Context captured by the background identity heartbeat task.
@@ -1762,6 +1785,9 @@ struct HeartbeatContext {
     /// erase a consented disclosure.
     user_identity_consented: std::sync::Arc<std::sync::atomic::AtomicBool>,
     allow_local_discovery_addrs: bool,
+    /// Local revocation set — piggybacked on each heartbeat for partition-
+    /// tolerant eventual propagation.
+    revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
 }
 
 impl HeartbeatContext {
@@ -2031,9 +2057,34 @@ impl HeartbeatContext {
             is_coordinator: announcement.is_coordinator,
             reachable_via: announcement.reachable_via.clone(),
             relay_candidates: announcement.relay_candidates.clone(),
+            cert_not_after: None,
         };
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
         upsert_discovered_agent(&self.cache, discovered_agent).await;
+
+        // Piggyback the local revocation set on each heartbeat for partition-
+        // tolerant eventual convergence.  A node that was offline when a
+        // revocation was originally published will learn it from the next
+        // heartbeat it receives from any peer that already holds it.
+        let records = self.revocation_set.read().await.all_records();
+        if !records.is_empty() {
+            match bincode::serialize(&records) {
+                Ok(bytes) => {
+                    if let Err(e) = self
+                        .runtime
+                        .pubsub()
+                        .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .await
+                    {
+                        tracing::debug!("heartbeat: revocation re-broadcast failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("heartbeat: failed to serialize revocation set: {e}");
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -2076,6 +2127,7 @@ impl Agent {
             presence_event_poll_interval_secs: None,
             presence_offline_timeout_secs: None,
             contact_store_path: None,
+            identity_dir: None,
         }
     }
 
@@ -4983,6 +5035,7 @@ impl Agent {
             is_coordinator: announcement.is_coordinator,
             reachable_via: announcement.reachable_via.clone(),
             relay_candidates: announcement.relay_candidates.clone(),
+            cert_not_after: None,
         };
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &discovered_agent)
             .await;
@@ -5400,12 +5453,21 @@ impl Agent {
         let own_user_id = self.user_id();
         let rebroadcast_pubsub = std::sync::Arc::clone(runtime.pubsub());
         let token = self.shutdown_token.clone();
+        // Subscribe to revocation records so they are applied on receipt.
+        let mut sub_revocation = runtime
+            .pubsub()
+            .subscribe(REVOCATION_TOPIC.to_string())
+            .await;
+        let revocation_set = std::sync::Arc::clone(&self.revocation_set);
+        let identity_dir_for_listener = self.identity_dir.clone();
+        let contact_store_for_evict = std::sync::Arc::clone(&self.contact_store);
 
         self.spawn_tracked(async move {
             enum DiscoveryMessage {
                 Identity(crate::gossip::PubSubMessage),
                 Machine(crate::gossip::PubSubMessage),
                 User(crate::gossip::PubSubMessage),
+                Revocation(crate::gossip::PubSubMessage),
             }
 
             // Track agents we've already initiated auto-connect to, preventing
@@ -5473,6 +5535,7 @@ impl Agent {
                             None => std::future::pending().await,
                         }
                     } => DiscoveryMessage::User(m),
+                    Some(m) = sub_revocation.recv() => DiscoveryMessage::Revocation(m),
                     // Required for PROMPT shutdown: without this arm the listener
                     // only exits when every gossip subscription closes (the
                     // `else => break` path), forcing shutdown() to wait out its
@@ -5643,6 +5706,89 @@ impl Agent {
                         continue;
                     }
                     DiscoveryMessage::Identity(msg) => msg,
+                    DiscoveryMessage::Revocation(msg) => {
+                        // Size-limit: max 2 MiB for a revocation batch (records
+                        // are ~5.3 KB each; 2 MiB ≈ 380 records, far beyond
+                        // any realistic fleet size in v1).
+                        const MAX_REVOCATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+                        if msg.payload.len() > MAX_REVOCATION_PAYLOAD_BYTES {
+                            tracing::debug!(
+                                "ignoring oversized revocation payload ({} bytes)",
+                                msg.payload.len()
+                            );
+                            continue;
+                        }
+                        let records: Vec<revocation::RevocationRecord> =
+                            match bincode::deserialize(&msg.payload) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::debug!("ignoring invalid revocation payload: {e}");
+                                    continue;
+                                }
+                            };
+                        let mut newly_inserted = Vec::new();
+                        {
+                            let mut set = revocation_set.write().await;
+                            for record in records {
+                                if set.contains_hash(&record.record_hash()) {
+                                    continue; // already known — skip re-verification
+                                }
+                                match set.verify_and_insert(record.clone(), None) {
+                                    Ok(true) => newly_inserted.push(record),
+                                    Ok(false) => {} // dup
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "revocation record rejected: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if !newly_inserted.is_empty() {
+                            // Persist asynchronously — best-effort; if it fails the
+                            // revocation is still enforced in memory for this run.
+                            let set_snap = revocation_set.read().await.all_records();
+                            let id_dir = identity_dir_for_listener.clone();
+                            tokio::spawn(async move {
+                                let tmp = revocation::RevocationSet::new();
+                                let _ = storage::save_revocation_set(&tmp, id_dir.as_deref()).await;
+                                // Rebuild correctly from snapshot.
+                                drop(tmp);
+                                let mut rebuilding = revocation::RevocationSet::new();
+                                for r in set_snap {
+                                    let _ = rebuilding.verify_and_insert(r, None);
+                                }
+                                if let Err(e) = storage::save_revocation_set(&rebuilding, id_dir.as_deref()).await {
+                                    tracing::warn!("failed to persist revocation set: {e}");
+                                }
+                            });
+                            // Evict revoked subjects from discovery caches.
+                            for record in newly_inserted {
+                                match &record.subject {
+                                    revocation::RevokedSubject::Agent(agent_id) => {
+                                        if let Some(entry) = cache.write().await.remove(agent_id) {
+                                            machine_cache.write().await.remove(&entry.machine_id);
+                                        }
+                                        let mut cs = contact_store_for_evict.write().await;
+                                        cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
+                                        tracing::info!(
+                                            agent = %hex::encode(agent_id.as_bytes()),
+                                            "evicted revoked agent (received via gossip)"
+                                        );
+                                    }
+                                    revocation::RevokedSubject::Machine(machine_id) => {
+                                        machine_cache.write().await.remove(machine_id);
+                                        cache.write().await.retain(|_, a| a.machine_id != *machine_id);
+                                        tracing::info!(
+                                            machine = %hex::encode(machine_id.as_bytes()),
+                                            "evicted revoked machine (received via gossip)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 };
                 let raw_payload = msg.payload.clone();
                 let already_verified =
@@ -5689,6 +5835,43 @@ impl Agent {
                             continue;
                         }
                         _ => {}
+                    }
+                }
+
+                // Enforcement point 1 — revocation gate.
+                // Fail-closed: a revoked agent or machine is silently dropped
+                // even if the trust store says otherwise.  This check must come
+                // BEFORE inserting into the discovery cache so a revoked peer
+                // never gets a `verified` annotation.
+                {
+                    let revoked = revocation_set.read().await;
+                    if revoked.is_agent_revoked(&announcement.agent_id) {
+                        tracing::debug!(
+                            "Dropping identity announcement from revoked agent {:?}",
+                            hex::encode(&announcement.agent_id.0[..8]),
+                        );
+                        continue;
+                    }
+                    if revoked.is_machine_revoked(&announcement.machine_id) {
+                        tracing::debug!(
+                            "Dropping identity announcement from revoked machine {:?}",
+                            hex::encode(&announcement.machine_id.0[..8]),
+                        );
+                        continue;
+                    }
+                }
+
+                // Enforcement point 1b — cert expiry gate.
+                // Drop announcements whose embedded cert is expired (fail-closed).
+                // Announcements without a cert (cert == None) are fail-open:
+                // they just won't carry a user binding and cert_not_after will be None.
+                if let Some(cert) = &announcement.agent_certificate {
+                    if identity::is_expired(cert.not_after(), Agent::unix_timestamp_secs()) {
+                        tracing::debug!(
+                            "Dropping identity announcement with expired cert from agent {:?}",
+                            hex::encode(&announcement.agent_id.0[..8]),
+                        );
+                        continue;
                     }
                 }
 
@@ -5747,6 +5930,10 @@ impl Agent {
                 // Empty address lists are preserved (the `AlreadyConnected`
                 // path in `connect_to_agent` handles gossip peers we only reach
                 // by an existing QUIC connection).
+                let cert_not_after = announcement
+                    .agent_certificate
+                    .as_ref()
+                    .and_then(|c| c.not_after());
                 let discovered_agent = DiscoveredAgent {
                     agent_id: announcement.agent_id,
                     machine_id: announcement.machine_id,
@@ -5761,6 +5948,7 @@ impl Agent {
                     is_coordinator: announcement.is_coordinator,
                     reachable_via: announcement.reachable_via.clone(),
                     relay_candidates: announcement.relay_candidates.clone(),
+                    cert_not_after,
                 };
                 upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
                 upsert_discovered_agent(&cache, discovered_agent).await;
@@ -6316,6 +6504,7 @@ impl Agent {
                 machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
                 user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
                 allow_local_discovery_addrs: allow_local_discovery_addresses(network.config()),
+                revocation_set: std::sync::Arc::clone(&self.revocation_set),
             };
             // Routed through spawn_tracked (issue #116) so a shutdown racing
             // bootstrap refuses to start it once the registry is closed; it is
@@ -6440,6 +6629,7 @@ impl Agent {
             std::sync::Arc::clone(&self.dm_inflight_acks),
             std::sync::Arc::clone(&self.recent_delivery_cache),
             config,
+            std::sync::Arc::clone(&self.revocation_set),
         )
         .await
         .map_err(|e| {
@@ -6714,18 +6904,188 @@ impl Agent {
     /// given `MachineId` in the identity discovery cache.
     ///
     /// Returns `true` if the cache contains a signed identity announcement
-    /// binding this agent to this machine. Returns `false` if the agent is
-    /// unknown or bound to a different machine.
+    /// binding this agent to this machine.  Returns `false` if:
+    /// - the agent is unknown or bound to a different machine, OR
+    /// - the agent or its bound machine has been revoked, OR
+    /// - the cached agent certificate has expired (past `not_after` + 300 s
+    ///   clock skew).
+    ///
+    /// Revocation is fail-closed: a revoked peer is always refused, even if
+    /// a certificate mismatch or race condition has cleared the cache entry.
+    /// Absent expiry (`cert_not_after == None`) is fail-open: treated as
+    /// "never expires" to preserve compatibility with pre-#130 peers.
     pub async fn is_agent_machine_verified(
         &self,
         agent_id: &identity::AgentId,
         machine_id: &identity::MachineId,
     ) -> bool {
+        // Fail-closed on revocation: check before touching the discovery cache
+        // so a racing cache-eviction cannot create a window where a revoked
+        // peer appears verified.
+        {
+            let revoked = self.revocation_set.read().await;
+            if revoked.is_agent_revoked(agent_id) || revoked.is_machine_revoked(machine_id) {
+                return false;
+            }
+        }
+
         let cache = self.identity_discovery_cache.read().await;
-        cache
-            .get(agent_id)
-            .map(|entry| entry.machine_id == *machine_id)
-            .unwrap_or(false)
+        let Some(entry) = cache.get(agent_id) else {
+            return false;
+        };
+        if entry.machine_id != *machine_id {
+            return false;
+        }
+        // Fail-open on absent expiry (pre-#130 peers have no cert / no not_after).
+        if identity::is_expired(entry.cert_not_after, Self::unix_timestamp_secs()) {
+            return false;
+        }
+        true
+    }
+
+    /// Return the shared revocation set.
+    ///
+    /// Callers that need to publish a new revocation record should call
+    /// [`revoke`](Agent::revoke) instead; this accessor is for gate checks
+    /// and diagnostics.
+    pub fn revocation_set(&self) -> std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>> {
+        std::sync::Arc::clone(&self.revocation_set)
+    }
+
+    /// Return a snapshot of all known revocation records.
+    ///
+    /// This is a read-only snapshot; the in-memory set grows only (no un-revocation).
+    pub async fn revocation_records(&self) -> Vec<revocation::RevocationRecord> {
+        self.revocation_set.read().await.all_records()
+    }
+
+    /// Sign and publish a revocation for the given subject, then persist it
+    /// locally and apply it immediately.
+    ///
+    /// The issuer keypair must satisfy one of the two authority rules in
+    /// [`revocation::RevocationRecord::verify_authority`]:
+    /// - **Self-revocation**: the issuer keypair's AgentId equals the subject's AgentId.
+    /// - **Issuer-revocation**: the issuer is the user who signed the subject
+    ///   agent's certificate (the certificate must be passed as `subject_cert`).
+    ///
+    /// On success, the record is inserted into the local revocation set,
+    /// persisted to `revocations.bin`, published on [`REVOCATION_TOPIC`], and
+    /// the subject is evicted from all discovery caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signing fails, the authority check fails, or the
+    /// gossip publish fails.
+    pub async fn revoke(
+        &self,
+        issuer_keypair: &identity::AgentKeypair,
+        subject: revocation::RevokedSubject,
+        reason: Option<String>,
+        subject_cert: Option<&identity::AgentCertificate>,
+    ) -> error::Result<revocation::RevocationRecord> {
+        let now = Self::unix_timestamp_secs();
+        let record = revocation::RevocationRecord::sign(
+            subject,
+            issuer_keypair.public_key(),
+            issuer_keypair.secret_key(),
+            now,
+            reason,
+        )?;
+        self.apply_and_publish_revocation(record.clone(), subject_cert)
+            .await?;
+        Ok(record)
+    }
+
+    /// Apply a revocation record to the local set, persist, publish, and evict.
+    ///
+    /// Used both by [`revoke`](Agent::revoke) (self-issued) and the gossip
+    /// subscription loop (received from a peer).
+    async fn apply_and_publish_revocation(
+        &self,
+        record: revocation::RevocationRecord,
+        subject_cert: Option<&identity::AgentCertificate>,
+    ) -> error::Result<()> {
+        // 1. Verify and insert.
+        {
+            let mut set = self.revocation_set.write().await;
+            if let Err(e) = set.verify_and_insert(record.clone(), subject_cert) {
+                return Err(error::IdentityError::CertificateVerification(format!(
+                    "revocation rejected: {e}"
+                )));
+            }
+        }
+
+        // 2. Persist.
+        storage::save_revocation_set(
+            &*self.revocation_set.read().await,
+            self.identity_dir.as_deref(),
+        )
+        .await?;
+
+        // 3. Evict from caches.
+        self.evict_revoked_subject(&record.subject).await;
+
+        // 4. Publish on gossip (best-effort — local enforcement happens regardless).
+        if let Some(rt) = &self.gossip_runtime {
+            let records = self.revocation_set.read().await.all_records();
+            match bincode::serialize(&records) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let _ = rt
+                        .pubsub()
+                        .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .await;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Evict a revoked subject from all discovery caches.
+    async fn evict_revoked_subject(&self, subject: &revocation::RevokedSubject) {
+        // NOTE: this evicts the identity/machine discovery caches and the
+        // contact store, but does NOT purge the ant-quic bootstrap cache. A
+        // revoked peer's address can therefore linger there; this is a residual
+        // (not a hole) because EP1 re-rejects the peer's announcement on every
+        // ingest, so it can never re-enter the verified path. Bootstrap-cache
+        // purge on eviction is tracked as a follow-up.
+        match subject {
+            revocation::RevokedSubject::Agent(agent_id) => {
+                // Remove from identity cache, which also starves the verified annotation.
+                let mut cache = self.identity_discovery_cache.write().await;
+                if let Some(entry) = cache.remove(agent_id) {
+                    // Also evict the linked machine so it cannot be dialed.
+                    drop(cache);
+                    let mut mcache = self.machine_discovery_cache.write().await;
+                    mcache.remove(&entry.machine_id);
+                } else {
+                    drop(cache);
+                }
+                // Best-effort: mark as Blocked in the contact store so that
+                // trust evaluation also refuses the agent on any late-arriving path.
+                {
+                    let mut cs = self.contact_store.write().await;
+                    cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
+                }
+                tracing::info!(
+                    agent = %hex::encode(agent_id.as_bytes()),
+                    "evicted revoked agent from discovery cache"
+                );
+            }
+            revocation::RevokedSubject::Machine(machine_id) => {
+                let mut mcache = self.machine_discovery_cache.write().await;
+                mcache.remove(machine_id);
+                drop(mcache);
+                // Also evict any agents linked to this machine.
+                let mut cache = self.identity_discovery_cache.write().await;
+                cache.retain(|_, agent| agent.machine_id != *machine_id);
+                tracing::info!(
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    "evicted revoked machine from discovery cache"
+                );
+            }
+        }
     }
 
     /// Discover agents via Friend-of-a-Friend (FOAF) random walk.
@@ -6896,6 +7256,10 @@ impl Agent {
                                 is_coordinator: ann.is_coordinator,
                                 reachable_via: ann.reachable_via.clone(),
                                 relay_candidates: ann.relay_candidates.clone(),
+                                cert_not_after: ann
+                                    .agent_certificate
+                                    .as_ref()
+                                    .and_then(|c| c.not_after()),
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
@@ -6930,6 +7294,7 @@ impl Agent {
                     is_coordinator: None,
                     reachable_via: Vec::new(),
                     relay_candidates: Vec::new(),
+                    cert_not_after: None,
                 },
             )
             .await;
@@ -7449,6 +7814,7 @@ impl Agent {
             machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
             user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
             allow_local_discovery_addrs,
+            revocation_set: std::sync::Arc::clone(&self.revocation_set),
         };
         let handle = tokio::task::spawn(async move {
             let mut ticker =
@@ -8031,6 +8397,23 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the directory used for all identity-scoped files (keys, certificate,
+    /// and the revocation set `revocations.bin`).
+    ///
+    /// When set, the revocation set is loaded from / saved to
+    /// `<identity_dir>/revocations.bin` instead of `~/.x0x/revocations.bin`.
+    /// This mirrors how `with_machine_key`, `with_agent_key_path`, and
+    /// `with_agent_cert_path` scope their respective files.
+    ///
+    /// Callers that already configure all three key paths individually do not
+    /// need to set this — it is primarily a convenience for the x0xd server
+    /// which builds the agent with an explicit identity directory.
+    #[must_use]
+    pub fn with_identity_dir<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+        self.identity_dir = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     /// Build and initialise the agent.
     ///
     /// This performs the following:
@@ -8325,6 +8708,10 @@ impl AgentBuilder {
             None
         };
 
+        // Load the revocation set from disk so enforcement takes effect
+        // immediately on restart, even before the next gossip heartbeat.
+        let revocation_set = storage::load_revocation_set(self.identity_dir.as_deref()).await;
+
         Ok(Agent {
             identity: std::sync::Arc::new(identity),
             network,
@@ -8363,6 +8750,8 @@ impl AgentBuilder {
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
             dm_inbox_service: tokio::sync::Mutex::new(None),
+            revocation_set: std::sync::Arc::new(tokio::sync::RwLock::new(revocation_set)),
+            identity_dir: self.identity_dir,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             tracked_tasks: std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
                 closed: false,
@@ -9820,6 +10209,68 @@ mod tests {
         assert_eq!(entry.user_id, agent.user_id());
     }
 
+    /// Enforcement point 2 (issue #130): a revoked agent MUST fail
+    /// `is_agent_machine_verified` even when its signed identity announcement
+    /// is still sitting verified in the discovery cache. This is the DM/gate
+    /// denial property — a revoked peer is refused everywhere the daemon asks
+    /// "is this (agent, machine) binding trustworthy?". The revocation is
+    /// applied via the real `verify_and_insert` receive path (the same call
+    /// the gossip subscription makes on receipt), and the subject is
+    /// self-revoked (issuer key == subject agent-id, valid authority).
+    #[tokio::test]
+    async fn revoked_agent_fails_machine_verification_even_when_cached() {
+        let user_key = identity::UserKeypair::generate().unwrap();
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .with_user_key(user_key)
+            .build()
+            .await
+            .unwrap();
+
+        // Seed the discovery cache with our own signed announcement so the
+        // (agent, machine) binding verifies true BEFORE revocation.
+        agent.announce_identity(true, true).await.unwrap();
+        let agent_id = agent.agent_id();
+        let machine_id = agent.machine_id();
+        assert!(
+            agent
+                .is_agent_machine_verified(&agent_id, &machine_id)
+                .await,
+            "a cached, signed self-announcement must verify before revocation"
+        );
+
+        // Apply a valid SELF-revocation of our own agent-id via the real
+        // receive path. verify_and_insert re-checks the ML-DSA signature and
+        // the self-revocation authority rule, exactly as on gossip receipt.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Agent(agent_id),
+            agent.identity().agent_keypair().public_key(),
+            agent.identity().agent_keypair().secret_key(),
+            now,
+            Some("ep2 test: key compromised".to_string()),
+        )
+        .unwrap();
+        {
+            let set = agent.revocation_set();
+            let mut set = set.write().await;
+            set.verify_and_insert(record, None)
+                .expect("self-revocation must verify and insert");
+        }
+
+        // Fail-closed: the verified gate must now refuse the revoked agent,
+        // even though its announcement is still cached and otherwise valid.
+        assert!(
+            !agent
+                .is_agent_machine_verified(&agent_id, &machine_id)
+                .await,
+            "a revoked agent must never pass machine verification while cached"
+        );
+    }
+
     /// An announcement without NAT fields (as produced by old nodes) should still
     /// deserialise correctly via bincode — new fields are `Option` so `None` (0x00)
     /// is a valid encoding.
@@ -10393,6 +10844,7 @@ fn discovered_agent_fixture(
         is_coordinator: None,
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
+        cert_not_after: None,
     }
 }
 

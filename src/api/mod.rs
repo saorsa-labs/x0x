@@ -135,6 +135,20 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Verify a detached ML-DSA-65 signature against a caller-supplied public key",
         category: "identity",
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/identity/revoke",
+        cli_name: "identity revoke",
+        description: "Issue a signed revocation for an agent-id or machine-id keypair",
+        category: "identity",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/identity/revocations",
+        cli_name: "identity revocations",
+        description: "List all revocation records held by this daemon",
+        category: "identity",
+    },
     // ── Network ─────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

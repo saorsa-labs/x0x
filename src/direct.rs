@@ -447,6 +447,7 @@ struct DirectDiagnosticsCounters {
     incoming_decode_failed: AtomicU64,
     incoming_signature_failed: AtomicU64,
     incoming_trust_rejected: AtomicU64,
+    incoming_dropped_revoked: AtomicU64,
     incoming_typed_route_dropped: AtomicU64,
     incoming_delivered_to_subscribe: AtomicU64,
     subscriber_channel_lagged: AtomicU64,
@@ -491,6 +492,10 @@ pub struct DmDiagnosticsStats {
     pub incoming_decode_failed: u64,
     pub incoming_signature_failed: u64,
     pub incoming_trust_rejected: u64,
+    /// DMs dropped because the sender's agent identity has been revoked.
+    /// Non-zero means a revoked peer is still attempting to communicate.
+    #[serde(default)]
+    pub incoming_dropped_revoked: u64,
     /// Redundant typed-route gossip-DM fallback hand-offs dropped on a full
     /// route channel (non-zero ⇒ a route consumer is lagging). Safe drops —
     /// the primary per-group/store pubsub path still delivers.
@@ -864,6 +869,13 @@ impl DirectMessaging {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a DM that was dropped because the sender is revoked.
+    pub(crate) fn record_incoming_dropped_revoked(&self) {
+        self.diagnostics
+            .incoming_dropped_revoked
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a DM trust-policy rejection.
     pub(crate) fn record_incoming_trust_rejected(&self, agent_id: AgentId) {
         self.diagnostics
@@ -923,6 +935,10 @@ impl DirectMessaging {
             incoming_trust_rejected: self
                 .diagnostics
                 .incoming_trust_rejected
+                .load(Ordering::Relaxed),
+            incoming_dropped_revoked: self
+                .diagnostics
+                .incoming_dropped_revoked
                 .load(Ordering::Relaxed),
             incoming_typed_route_dropped: self
                 .diagnostics

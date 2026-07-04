@@ -18,8 +18,8 @@ pub(super) use contacts::{
 pub(super) use identity::CardQuery;
 pub(super) use identity::{
     agent_info, agent_sign, agent_user_id_handler, agent_verify, announce_identity,
-    get_a2a_agent_card, get_agent_card, import_agent_card, introduction,
-    populate_invite_base_state_from_group_info,
+    get_a2a_agent_card, get_agent_card, identity_revocations, identity_revoke, import_agent_card,
+    introduction, populate_invite_base_state_from_group_info,
 };
 pub(super) use machines::{
     add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,

@@ -53,6 +53,7 @@ fn fake_discovered(
         is_coordinator,
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
+        cert_not_after: None,
     }
 }
 

@@ -61,6 +61,12 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(Post, "/agent/sign", daemon_api_agent_sign_roundtrip),
     covered!(Post, "/agent/verify", daemon_api_agent_verify_roundtrip),
+    covered!(Post, "/identity/revoke", revocation_self_issue_own_agent_id),
+    covered!(
+        Get,
+        "/identity/revocations",
+        revocation_list_contains_issued_record
+    ),
     // ── Network ─────────────────────────────────────────────────────────
     covered!(Get, "/peers", daemon_api_peers),
     // ── Presence ────────────────────────────────────────────────────────
@@ -472,6 +478,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "tests/e2e_gui_chrome.mjs",
         include_str!("e2e_gui_chrome.mjs"),
+    ),
+    (
+        "tests/revocation_integration.rs",
+        include_str!("revocation_integration.rs"),
     ),
 ];
 

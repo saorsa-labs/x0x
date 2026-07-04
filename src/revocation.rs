@@ -224,6 +224,34 @@ impl RevocationRecord {
         }
     }
 
+    /// Hex-encoded subject identifier (32 bytes → 64 hex chars).
+    ///
+    /// Convenience for REST responses — avoids exposing raw `[u8; 32]` in JSON.
+    #[must_use]
+    pub fn subject_hex(&self) -> String {
+        hex::encode(self.subject.id_bytes())
+    }
+
+    /// Human-readable subject kind: `"agent"` or `"machine"`.
+    #[must_use]
+    pub fn subject_kind(&self) -> &'static str {
+        match &self.subject {
+            RevokedSubject::Agent(_) => "agent",
+            RevokedSubject::Machine(_) => "machine",
+        }
+    }
+
+    /// SHA-256 of the issuer public key bytes, for compact display in REST
+    /// responses.  This is deterministic given the issuer keypair and matches
+    /// the AgentId/MachineId derivation when the issuer is self-revoking.
+    #[must_use]
+    pub fn issuer_public_key_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&self.issuer_public_key);
+        hasher.finalize().into()
+    }
+
     /// BLAKE3 hash of the canonical (signed) message, used for de-duplication.
     ///
     /// Two records for the same `(subject, issuer, revoked_at, reason)` hash

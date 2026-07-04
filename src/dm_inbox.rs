@@ -13,6 +13,7 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
 use crate::groups::kem_envelope::AgentKemKeypair;
 use crate::identity::{AgentId, MachineId};
+use crate::revocation::RevocationSet;
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -106,6 +107,7 @@ impl DmInboxService {
         inflight: Arc<InFlightAcks>,
         cache: Arc<RecentDeliveryCache>,
         config: DmInboxConfig,
+        revocation_set: Arc<RwLock<RevocationSet>>,
     ) -> NetworkResult<Self> {
         let topic = Self::inbox_topic_name(&self_agent_id);
         let subscription = pubsub
@@ -125,6 +127,7 @@ impl DmInboxService {
             cache,
             silent_reject: config.silent_reject,
             typed_payload_routes: config.typed_payload_routes,
+            revocation_set,
         };
 
         let primary_handle =
@@ -188,6 +191,8 @@ struct InboxPipeline {
     cache: Arc<RecentDeliveryCache>,
     silent_reject: bool,
     typed_payload_routes: Vec<DmTypedPayloadRoute>,
+    /// Shared revocation set for enforcement point 3.
+    revocation_set: Arc<RwLock<RevocationSet>>,
 }
 
 impl InboxPipeline {
@@ -273,6 +278,27 @@ impl InboxPipeline {
         if envelope.sender_agent_id != *pubsub_sender.as_bytes() {
             self.dm.record_incoming_signature_failed();
             return;
+        }
+
+        // Enforcement point 3 — revocation gate.
+        // Check after the envelope-signature is verified so we know the
+        // sender_agent_id is authentic.  Never hold the lock across `.await`.
+        // NOTE: this gate checks agent-id revocation only, not machine-id
+        // revocation (unlike EP1/EP2 which check both). Intentional for now —
+        // the DM envelope's authenticated identity is the sender agent-id;
+        // machine-id revocation for the DM path is tracked as a follow-up.
+        {
+            let revoked = self.revocation_set.read().await;
+            let sender_agent_id = AgentId(envelope.sender_agent_id);
+            if drop_if_sender_revoked(&self.dm, &revoked, &sender_agent_id) {
+                tracing::info!(
+                    target: "dm.trace",
+                    stage = "inbound_revoked_sender_dropped",
+                    sender = %hex::encode(envelope.sender_agent_id),
+                    "DM dropped: sender is revoked"
+                );
+                return;
+            }
         }
 
         match envelope.body.clone() {
@@ -506,6 +532,24 @@ impl InboxPipeline {
     }
 }
 
+/// Enforcement point 3 decision (issue #130): if `sender` is revoked, record
+/// the `incoming_dropped_revoked` counter and return `true` (the caller must
+/// drop the DM). Returns `false` for a non-revoked sender without touching the
+/// counter.
+///
+/// Extracted as a pure function of `(DirectMessaging, RevocationSet, AgentId)`
+/// so the revocation gate can be unit-tested without a live inbox pipeline,
+/// and so a future refactor of `handle_incoming` cannot silently drop the
+/// counter side-effect.
+fn drop_if_sender_revoked(dm: &DirectMessaging, revoked: &RevocationSet, sender: &AgentId) -> bool {
+    if revoked.is_agent_revoked(sender) {
+        dm.record_incoming_dropped_revoked();
+        true
+    } else {
+        false
+    }
+}
+
 pub fn verify_envelope_signature(envelope: &DmEnvelope, public_key_bytes: &[u8]) -> bool {
     let signed = match envelope.signed_bytes() {
         Ok(b) => b,
@@ -680,6 +724,60 @@ mod tests {
             &envelope,
             sender_kp.public_key().as_bytes()
         ));
+    }
+
+    // ── Enforcement point 3: revocation gate ──────────────────────────
+
+    /// A DM from a revoked sender MUST be dropped and counted in
+    /// `incoming_dropped_revoked` (issue #130, EP3). The revocation is applied
+    /// via the real `verify_and_insert` receive path with a valid
+    /// self-revocation, and the assertion reads the real production counter —
+    /// so this fails if the drop or the counter side-effect regresses.
+    #[test]
+    fn revoked_sender_dm_is_dropped_and_counted() {
+        let dm = DirectMessaging::new();
+
+        // A foreign sender self-revokes its own agent-id (valid authority).
+        let sender_kp = test_keypair();
+        let sender = sender_kp.agent_id();
+        let now = now_unix_ms() / 1000;
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(sender),
+            sender_kp.public_key(),
+            sender_kp.secret_key(),
+            now,
+            Some("compromised".to_string()),
+        )
+        .expect("sign self-revocation");
+        let mut set = RevocationSet::new();
+        set.verify_and_insert(record, None)
+            .expect("self-revocation verifies and inserts");
+
+        // A revoked sender's DM is dropped and increments the counter.
+        let before = dm.diagnostics_snapshot().stats.incoming_dropped_revoked;
+        assert!(
+            drop_if_sender_revoked(&dm, &set, &sender),
+            "a DM from a revoked sender must be dropped"
+        );
+        let after = dm.diagnostics_snapshot().stats.incoming_dropped_revoked;
+        assert_eq!(
+            after,
+            before + 1,
+            "dropping a revoked DM must increment incoming_dropped_revoked"
+        );
+
+        // A non-revoked sender is NOT dropped and does NOT move the counter —
+        // proving the gate is precise, not a blanket drop.
+        let other = test_keypair().agent_id();
+        assert!(
+            !drop_if_sender_revoked(&dm, &set, &other),
+            "a DM from a non-revoked sender must pass the gate"
+        );
+        assert_eq!(
+            dm.diagnostics_snapshot().stats.incoming_dropped_revoked,
+            after,
+            "a passing DM must not touch incoming_dropped_revoked"
+        );
     }
 
     // ── Envelope size limits ──────────────────────────────────────────
