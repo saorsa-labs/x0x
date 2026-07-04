@@ -51,8 +51,10 @@ scan_pattern() {
 
     # Scan for pattern
     while IFS= read -r match; do
-        # Skip if in tests/ directory or .bak files
-        if echo "$match" | grep -qE "(tests/|\.bak:|\.rs:.*//.*$pattern)"; then
+        # Skip if in tests/ directory, a file named tests.rs (file-level test
+        # submodules declared via `#[cfg(test)] mod tests;` in the parent, e.g.
+        # src/connect/acl/tests.rs), or .bak files.
+        if echo "$match" | grep -qE "(tests/|/tests\.rs:|\.bak:|\.rs:.*//.*$pattern)"; then
             continue
         fi
 
