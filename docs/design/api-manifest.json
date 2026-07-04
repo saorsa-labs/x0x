@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 135,
+  "endpoint_count": 136,
   "endpoints": [
     {
       "category": "status",
@@ -189,6 +189,13 @@
       "description": "Remote exec counters, warnings, active sessions, and ACL summary",
       "method": "GET",
       "path": "/diagnostics/exec"
+    },
+    {
+      "category": "connect",
+      "cli_name": "diagnostics connect",
+      "description": "Connect-ACL policy summary and stream allow/deny counters",
+      "method": "GET",
+      "path": "/diagnostics/connect"
     },
     {
       "category": "network",

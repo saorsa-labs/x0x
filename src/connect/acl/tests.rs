@@ -332,3 +332,75 @@ fn is_allowed_exact_triple_semantics() {
     let other_agent = parse_agent_id(&"99".repeat(32)).unwrap();
     assert!(!acl.is_allowed(&other_agent, &machine, &t22));
 }
+
+// ===========================================================================
+// Matrix D — doc TOML examples parsed correctly
+// ===========================================================================
+
+/// The minimal ACL shown in `docs/connect-acl.md` must load as `Enabled`
+/// with the expected entry and target counts.
+#[test]
+fn docs_minimal_acl_example_parses_correctly() {
+    let agent_hex = "01".repeat(32);
+    let machine_hex = "02".repeat(32);
+    let text = format!(
+        r#"
+[connect]
+enabled = true
+
+[[connect.allow]]
+description = "ops-laptop"
+agent_id = "{agent_hex}"
+machine_id = "{machine_hex}"
+targets = ["127.0.0.1:22", "127.0.0.1:5900", "[::1]:8080"]
+"#
+    );
+    let policy = parse_connect_policy(Path::new("connect-acl.toml"), 0, &text)
+        .expect("docs minimal example must parse");
+    let ConnectPolicy::Enabled(acl) = &policy else {
+        panic!("expected Enabled policy");
+    };
+    assert_eq!(acl.allow.len(), 1, "one allow entry");
+    assert_eq!(acl.allow[0].targets.len(), 3, "three targets");
+    let agent = parse_agent_id(&agent_hex).unwrap();
+    let machine = parse_machine_id(&machine_hex).unwrap();
+    let t22: SocketAddr = "127.0.0.1:22".parse().unwrap();
+    assert!(acl.is_allowed(&agent, &machine, &t22));
+}
+
+/// An unknown field in `[connect]` must be a hard parse error
+/// (`deny_unknown_fields` — ADR-0019).
+#[test]
+fn unknown_field_in_connect_section_is_hard_error() {
+    let text = r#"
+[connect]
+enabled = true
+taregts = []
+"#;
+    let result = parse_connect_policy(Path::new("test.toml"), 0, text);
+    assert!(result.is_err(), "misspelled field must be an error");
+}
+
+/// An unknown field in `[[connect.allow]]` must be a hard parse error.
+#[test]
+fn unknown_field_in_allow_entry_is_hard_error() {
+    let agent_hex = "01".repeat(32);
+    let machine_hex = "02".repeat(32);
+    let text = format!(
+        r#"
+[connect]
+enabled = true
+
+[[connect.allow]]
+agent_id = "{agent_hex}"
+machine_id = "{machine_hex}"
+targets = ["127.0.0.1:22"]
+unknown_key = "surprise"
+"#
+    );
+    let result = parse_connect_policy(Path::new("test.toml"), 0, &text);
+    assert!(
+        result.is_err(),
+        "unknown field in allow entry must be an error"
+    );
+}

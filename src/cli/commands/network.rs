@@ -134,6 +134,15 @@ pub async fn diagnostics_ws(client: &DaemonClient) -> Result<()> {
     client.run_get("/diagnostics/ws").await
 }
 
+/// `x0x diagnostics connect` — GET /diagnostics/connect
+///
+/// Connect-ACL policy summary (enabled flag, loaded-from path, allow-entry
+/// count) and cumulative stream allow/deny counters with per-reason breakdown.
+/// Counters read 0 until the T4 forwarder (issue #132) is wired.
+pub async fn diagnostics_connect(client: &DaemonClient) -> Result<()> {
+    client.run_get("/diagnostics/connect").await
+}
+
 /// `x0x peers probe <peer_id>` — POST /peers/:peer_id/probe
 ///
 /// Active liveness probe (ant-quic 0.27.2 #173). Sends a lightweight probe

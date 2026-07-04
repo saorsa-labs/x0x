@@ -2109,6 +2109,27 @@ async fn daemon_api_diagnostics_exec() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_diagnostics_connect() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/diagnostics/connect"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Connect is Disabled by default (no ACL file at the default path in test env).
+    // The snapshot must always carry an acl_summary with enabled=false.
+    assert!(r["acl_summary"].is_object());
+    assert_eq!(r["acl_summary"]["enabled"], false);
+    assert!(r["streams_allowed"].is_number());
+    assert!(r["streams_denied"].is_number());
+    assert!(r["denial_breakdown"].is_object());
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_exec_sessions() {
     let d = daemon().await;
     let r: Value = ca(&d)

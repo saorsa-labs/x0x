@@ -687,4 +687,41 @@ x0x ws sessions
 x0x gui
 ```
 
+## Diagnostics
+
+All diagnostics endpoints require the normal local daemon bearer token and return counters/snapshots that never expose sensitive content (no ACL allow-entries, no agent secrets).
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS) |
+| GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
+| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) |
+| GET | `/diagnostics/dm` | `x0x diagnostics dm` | Direct-message send/receive counters and per-peer health |
+| GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
+| GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote exec counters, warnings, active sessions, and ACL summary |
+| GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
+| GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
+
+### `GET /diagnostics/connect`
+
+Connect-ACL policy summary and allow/deny counters. Counters read `0` until the T4 forwarder (issue #132) is wired.
+
+```json
+{
+  "streams_allowed": 0,
+  "streams_denied": 0,
+  "denial_breakdown": {},
+  "acl_summary": {
+    "enabled": false,
+    "loaded_from": "/usr/local/etc/x0x/connect-acl.toml",
+    "loaded_at_unix_ms": 0,
+    "allow_entry_count": 0,
+    "target_entry_count": 0,
+    "disabled_reason": "acl_missing"
+  }
+}
+```
+
+See `docs/connect-acl.md` for full documentation including the `denial_breakdown` key reference.
+
 See also: [docs/api.md](api.md), [troubleshooting.md](troubleshooting.md), [patterns.md](patterns.md)

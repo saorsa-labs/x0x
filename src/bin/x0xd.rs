@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         println!("    --no-hard-coded-bootstrap       Skip configured bootstrap peers");
         println!("    --disable-peer-cache            Do not load or save cached peers");
         println!("    --exec-acl <PATH>               Override default exec ACL path");
+        println!("    --connect-acl <PATH>            Override default connect ACL path");
         println!("    --check                         Check configuration and exit");
         println!("    --check-updates       Check for updates and exit");
         println!("    --skip-update-check   Skip update check on startup");
@@ -105,6 +106,21 @@ async fn main() -> anyhow::Result<()> {
         x0x::exec::LoadMode::ExplicitPath
     } else {
         x0x::exec::LoadMode::DefaultPath
+    };
+
+    let connect_acl_override = if let Some(idx) = args.iter().position(|a| a == "--connect-acl") {
+        Some(PathBuf::from(
+            args.get(idx + 1)
+                .context("--connect-acl requires a path argument")?
+                .clone(),
+        ))
+    } else {
+        None
+    };
+    let connect_acl_load_mode = if connect_acl_override.is_some() {
+        x0x::connect::LoadMode::ExplicitPath
+    } else {
+        x0x::connect::LoadMode::DefaultPath
     };
 
     let check_only = args.contains(&"--check".to_string());
@@ -222,6 +238,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to load exec ACL")?;
 
+    let connect_policy =
+        x0x::connect::load_connect_policy(connect_acl_override.as_deref(), connect_acl_load_mode)
+            .await
+            .context("failed to load connect ACL")?;
+
     if doctor_mode {
         return run_doctor(&config).await;
     }
@@ -230,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
         println!("Configuration is valid");
         println!("{:#?}", config);
         println!("Exec ACL summary: {:#?}", exec_policy.summary());
+        println!("Connect ACL summary: {:#?}", connect_policy.summary());
         return Ok(());
     }
 
@@ -249,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         cli_disable_peer_cache,
         instance_name,
         exec_policy,
+        connect_policy,
         self_update_enabled,
     };
     let handle = x0x::server::serve_with_options(config, options).await?;

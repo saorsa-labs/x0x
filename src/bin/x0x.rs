@@ -439,6 +439,8 @@ enum DiagnosticsSub {
     Groups,
     /// Print remote exec counters, warnings, and ACL summary.
     Exec,
+    /// Print connect-ACL policy summary and stream allow/deny counters.
+    Connect,
     /// Print WebSocket outbound-queue health (capacity, drops, slow-consumer closes).
     Ws,
 }
@@ -1353,6 +1355,7 @@ async fn run(
             DiagnosticsSub::Dm => commands::network::diagnostics_dm(&client).await,
             DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
+            DiagnosticsSub::Connect => commands::network::diagnostics_connect(&client).await,
             DiagnosticsSub::Ws => commands::network::diagnostics_ws(&client).await,
         },
         Commands::Auth { sub } => match sub {

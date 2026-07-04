@@ -562,6 +562,7 @@ pub async fn serve_with_options(
         cli_disable_peer_cache,
         instance_name,
         exec_policy,
+        connect_policy,
         self_update_enabled,
     } = options;
     // Ensure data directory exists early so self-update has a working directory.
@@ -866,6 +867,9 @@ pub async fn serve_with_options(
         sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
         exec_service: Arc::clone(&exec_service),
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
+        connect_diagnostics: Arc::new(x0x::connect::ConnectDiagnostics::new(
+            connect_policy.summary(),
+        )),
     });
 
     // Fix A (Issue #110 Phase 2 + #116): the `api.port` advertisement is written
@@ -1537,6 +1541,7 @@ pub async fn serve_with_options(
         .route("/diagnostics/dm", get(dm_diagnostics))
         .route("/diagnostics/groups", get(groups_diagnostics))
         .route("/diagnostics/exec", get(exec_diagnostics))
+        .route("/diagnostics/connect", get(connect_diagnostics_handler))
         .route("/diagnostics/ws", get(ws_diagnostics))
         .route("/exec/run", post(exec_run))
         .route("/exec/cancel", post(exec_cancel))
@@ -13971,6 +13976,16 @@ async fn exec_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoRespon
     Json(state.exec_service.diagnostics_snapshot().await)
 }
 
+/// GET /diagnostics/connect — connect-ACL policy summary and stream counters.
+///
+/// Returns the [`x0x::connect::ConnectDiagnosticsSnapshot`]: enabled flag,
+/// loaded-from path, allow-entry count, cumulative allow/deny counters, and
+/// per-reason denial breakdown. Counters read 0 until the T4 forwarder
+/// (issue #132) is wired; the ACL summary is always populated.
+async fn connect_diagnostics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.connect_diagnostics.snapshot())
+}
+
 /// POST /direct/send — send a direct message to a connected agent.
 async fn direct_send(
     State(state): State<Arc<AppState>>,
@@ -18520,6 +18535,9 @@ mod tests {
             sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
+            connect_diagnostics: Arc::new(x0x::connect::ConnectDiagnostics::new(
+                x0x::connect::ConnectPolicy::default().summary(),
+            )),
         });
         Ok((state, dir))
     }

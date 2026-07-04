@@ -46,6 +46,12 @@ pub struct ServeOptions {
     pub instance_name: Option<String>,
     /// Loaded exec ACL policy.
     pub exec_policy: x0x::exec::ExecPolicy,
+    /// Loaded connect ACL policy.
+    ///
+    /// `Default` is [`x0x::connect::ConnectPolicy::Disabled`], so embedders
+    /// that build `ServeOptions` without supplying a connect ACL get
+    /// default-deny for free.
+    pub connect_policy: x0x::connect::ConnectPolicy,
     /// Whether the self-update install/restart paths are allowed to run.
     ///
     /// AND-ed with `config.update.enabled`. The daemon binary sets this to
@@ -556,6 +562,10 @@ pub(super) struct AppState {
     pub(super) exec_service: Arc<x0x::exec::ExecService>,
     /// Per-group ingest diagnostics surfaced via `/diagnostics/groups`.
     pub(super) groups_diagnostics: Arc<x0x::groups::GroupsDiagnostics>,
+    /// Connect-ACL allow/deny counters + policy summary for
+    /// `/diagnostics/connect`. Counters read 0 until the T4 forwarder
+    /// (issue #132) wires calls to `record_allowed`/`record_denied`.
+    pub(super) connect_diagnostics: Arc<x0x::connect::ConnectDiagnostics>,
 }
 
 #[derive(Clone)]

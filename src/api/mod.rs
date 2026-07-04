@@ -244,6 +244,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Get,
+        path: "/diagnostics/connect",
+        cli_name: "diagnostics connect",
+        description: "Connect-ACL policy summary and stream allow/deny counters",
+        category: "connect",
+    },
+    EndpointDef {
+        method: Method::Get,
         path: "/diagnostics/ws",
         cli_name: "diagnostics ws",
         description: "WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters",

@@ -91,6 +91,7 @@ const COVERED: &[CoveredEndpoint] = &[
         member_joined_event_propagates_to_inviter
     ),
     covered!(Get, "/diagnostics/exec", daemon_api_diagnostics_exec),
+    covered!(Get, "/diagnostics/connect", daemon_api_diagnostics_connect),
     covered!(Get, "/diagnostics/ws", daemon_api_diagnostics_ws),
     covered!(
         Post,
@@ -783,6 +784,7 @@ fn categories_are_valid() {
         "stores",
         "files",
         "exec",
+        "connect",
         "upgrade",
         "websocket",
     ];

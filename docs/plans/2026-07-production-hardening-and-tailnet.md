@@ -183,13 +183,15 @@ Ordered tasks T1–T8. Security invariants apply to ALL of them:
 
 **Design.** Mirror `src/exec/acl.rs` structure and semantics exactly:
 - File: `connect-acl.toml` beside the exec ACL (same default paths per OS); `[connect] enabled = false` default.
-- `[[allow]]` entries: `{agent_id, machine_id, targets = ["127.0.0.1:22", "127.0.0.1:5900", "localhost-port-range:8000-8100"]}` — exact host:port literals and explicit port ranges on loopback only in Phase 1. Any non-loopback target in the file is a validation error (fail-closed, loud).
+- `[[allow]]` entries: `{agent_id, machine_id, targets = ["127.0.0.1:22", "127.0.0.1:5900", "[::1]:8080"]}` — **exact host:port literals only** (no port ranges, no CIDR). Port ranges were considered and rejected: fencepost/overlap ambiguity in the security-critical path; no v1 need; backward-compatibility risk. A dozen ports is a dozen TOML lines. Extension is backward-compatible later (new optional entry key), while removing shipped range syntax would be breaking. (See ADR-0019 risk §3.) Any non-loopback target in the file is a validation error (fail-closed, loud).
 - Load semantics copied from `load_exec_policy` (`acl.rs:55-78`): missing at default path → disabled; missing at explicit `--connect-acl` → hard error; malformed → hard error; missing section → disabled.
 - Enforcement: in the T4 accept path, after verified+trust gates, before local TCP connect. Denials get typed error frames + `connect_denied` diagnostics counter.
-- `x0xd --check` validates it.
+- `x0xd --check` validates it and prints a Connect ACL summary alongside the Exec ACL summary.
 
-**Files.** New `src/connect/acl.rs` (mirror exec), `src/bin/x0xd.rs` (flag + check), tests incl. property tests on target parsing/matching.
-**Acceptance.** Default = all denied (test); fail-closed matrix matches exec ACL's (parameterized tests mirroring exec's); non-loopback target rejected at load; gates green.
+**Status (PR2 complete).** `src/connect/` policy engine (PR1, e3b1dd4) + `x0xd --connect-acl` flag + `--check` summary + `AppState` wiring + `GET /diagnostics/connect` + `x0x diagnostics connect` CLI + proptest matrix E + ADR-0019 + `docs/connect-acl.md` are all shipped in PR2. Only runtime enforcement (T4 forwarder, issue #132) remains.
+
+**Files.** `src/connect/` (policy engine — done), `src/bin/x0xd.rs` (flag + check — done), `src/server/{state,mod}.rs` (wiring — done), `src/api/mod.rs` + `src/bin/x0x.rs` + `src/cli/` (registry + CLI — done), `tests/connect_acl_proptest.rs` (proptest — done), docs (done).
+**Acceptance.** Default = all denied (test); fail-closed matrix matches exec ACL's; non-loopback target rejected at load; proptest soundness proven; gates green. ✓
 **Dependencies.** None to start; blocks T4 enablement.
 
 ### T4 — x0xd forwarder service (size M)

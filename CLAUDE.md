@@ -73,6 +73,7 @@ These are NOT auto-loaded. Read them when the task touches the relevant area.
 - x0x-symphony integration: `docs/symphony-integration.md`
 - CI/CD workflows: `docs/cicd.md`
 - Remote exec design + ACL: `docs/exec.md`, `docs/design/x0x-exec.md`
+- Connect ACL (default-closed connectivity policy, T4 prereq): `docs/connect-acl.md`
 - Non-Rust app integration examples: `docs/local-apps.md`
 - Named-groups full model: `docs/design/named-groups-full-model.md`
 
