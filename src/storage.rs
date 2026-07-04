@@ -13,15 +13,96 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs;
 
-/// Serialized keypair representation for storage.
+/// Serialized keypair representation for storage (legacy v1 format).
 ///
-/// Uses raw bytes for efficiency rather than base64 encoding.
+/// Uses raw bytes for efficiency rather than base64 encoding. This is the
+/// on-disk shape produced by every x0x release to date: a bare
+/// `bincode(public_key, secret_key)` with no version marker. New code keeps
+/// writing exactly these bytes whenever no expiry is recorded, so existing
+/// `~/.x0x/*.key` files stay byte-for-byte compatible.
 #[derive(Serialize, Deserialize)]
 struct SerializedKeypair {
     /// Raw public key bytes
     public_key: Vec<u8>,
-    /// Raw secret key bytes  
+    /// Raw secret key bytes
     secret_key: Vec<u8>,
+}
+
+/// Serialized keypair representation carrying a local expiry (v2 format).
+///
+/// Only written when a `not_after` is recorded. The on-disk encoding is
+/// [`KEYFILE_V2_MAGIC`] followed by `bincode(public_key, secret_key,
+/// not_after)`. The magic marker lets the loader distinguish this from the
+/// legacy format without ambiguity.
+#[derive(Serialize, Deserialize)]
+struct SerializedKeypairV2 {
+    /// Raw public key bytes
+    public_key: Vec<u8>,
+    /// Raw secret key bytes
+    secret_key: Vec<u8>,
+    /// Unix timestamp after which this key material is considered expired.
+    ///
+    /// This is a **local record only** — key-file expiry is never enforced
+    /// over the network (only [`crate::identity::AgentCertificate`] expiry is).
+    not_after: u64,
+}
+
+/// Magic marker prefixing a v2 (expiry-carrying) key file.
+///
+/// A legacy v1 file begins with the bincode length prefix of the ML-DSA-65
+/// public key (`0xA0 0x07 …`), so it can never collide with this marker; a
+/// missing marker therefore unambiguously means "legacy, no expiry".
+const KEYFILE_V2_MAGIC: &[u8; 4] = b"X0K2";
+
+/// Encode raw key material with an optional local expiry.
+///
+/// `None` produces the legacy v1 bytes verbatim (no marker, no extra bytes)
+/// so existing deployments' files are unchanged. `Some` produces the v2
+/// format ([`KEYFILE_V2_MAGIC`] + bincode with the trailing `not_after`).
+fn encode_keypair_bytes(
+    public_key: Vec<u8>,
+    secret_key: Vec<u8>,
+    not_after: Option<u64>,
+) -> Result<Vec<u8>> {
+    match not_after {
+        None => {
+            let data = SerializedKeypair {
+                public_key,
+                secret_key,
+            };
+            bincode::serialize(&data).map_err(|e| IdentityError::Serialization(e.to_string()))
+        }
+        Some(not_after) => {
+            let data = SerializedKeypairV2 {
+                public_key,
+                secret_key,
+                not_after,
+            };
+            let body = bincode::serialize(&data)
+                .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+            let mut out = Vec::with_capacity(KEYFILE_V2_MAGIC.len() + body.len());
+            out.extend_from_slice(KEYFILE_V2_MAGIC);
+            out.extend_from_slice(&body);
+            Ok(out)
+        }
+    }
+}
+
+/// Decode key-file bytes into raw key material plus an optional local expiry.
+///
+/// Detects the v2 magic marker; when absent the bytes are the legacy v1
+/// format and `not_after` is `None` (absence of expiry ⇒ never expires).
+fn decode_keypair_bytes(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Option<u64>)> {
+    if bytes.len() >= KEYFILE_V2_MAGIC.len() && &bytes[..KEYFILE_V2_MAGIC.len()] == KEYFILE_V2_MAGIC
+    {
+        let data: SerializedKeypairV2 = bincode::deserialize(&bytes[KEYFILE_V2_MAGIC.len()..])
+            .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+        Ok((data.public_key, data.secret_key, Some(data.not_after)))
+    } else {
+        let data: SerializedKeypair =
+            bincode::deserialize(bytes).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+        Ok((data.public_key, data.secret_key, None))
+    }
 }
 
 /// Serialize a MachineKeypair to bytes for storage.
@@ -34,11 +115,11 @@ struct SerializedKeypair {
 ///
 /// A vector containing the serialized keypair data
 pub fn serialize_machine_keypair(kp: &MachineKeypair) -> Result<Vec<u8>> {
-    let data = SerializedKeypair {
-        public_key: kp.public_key().as_bytes().to_vec(),
-        secret_key: kp.secret_key().as_bytes().to_vec(),
-    };
-    bincode::serialize(&data).map_err(|e| IdentityError::Serialization(e.to_string()))
+    encode_keypair_bytes(
+        kp.public_key().as_bytes().to_vec(),
+        kp.secret_key().as_bytes().to_vec(),
+        None,
+    )
 }
 
 /// Deserialize a MachineKeypair from bytes.
@@ -51,9 +132,46 @@ pub fn serialize_machine_keypair(kp: &MachineKeypair) -> Result<Vec<u8>> {
 ///
 /// A deserialized MachineKeypair
 pub fn deserialize_machine_keypair(bytes: &[u8]) -> Result<MachineKeypair> {
-    let data: SerializedKeypair =
-        bincode::deserialize(bytes).map_err(|e| IdentityError::Serialization(e.to_string()))?;
-    MachineKeypair::from_bytes(&data.public_key, &data.secret_key)
+    let (public_key, secret_key, _not_after) = decode_keypair_bytes(bytes)?;
+    MachineKeypair::from_bytes(&public_key, &secret_key)
+}
+
+/// Deserialize a MachineKeypair along with its optional local expiry.
+///
+/// Returns `(keypair, not_after)` where `not_after` is `None` for legacy
+/// (v1) key files — absence of expiry means the key never expires.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::Serialization`] if the bytes are not a valid
+/// key file, or a key-material error if the embedded bytes are malformed.
+pub fn deserialize_machine_keypair_with_expiry(
+    bytes: &[u8],
+) -> Result<(MachineKeypair, Option<u64>)> {
+    let (public_key, secret_key, not_after) = decode_keypair_bytes(bytes)?;
+    Ok((
+        MachineKeypair::from_bytes(&public_key, &secret_key)?,
+        not_after,
+    ))
+}
+
+/// Serialize a MachineKeypair recording an optional local expiry.
+///
+/// `None` writes the legacy v1 format byte-for-byte; `Some` writes the v2
+/// format carrying `not_after`.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::Serialization`] if encoding fails.
+pub fn serialize_machine_keypair_with_expiry(
+    kp: &MachineKeypair,
+    not_after: Option<u64>,
+) -> Result<Vec<u8>> {
+    encode_keypair_bytes(
+        kp.public_key().as_bytes().to_vec(),
+        kp.secret_key().as_bytes().to_vec(),
+        not_after,
+    )
 }
 
 /// Serialize an AgentKeypair to bytes for storage.
@@ -66,11 +184,30 @@ pub fn deserialize_machine_keypair(bytes: &[u8]) -> Result<MachineKeypair> {
 ///
 /// A vector containing the serialized keypair data
 pub fn serialize_agent_keypair(kp: &AgentKeypair) -> Result<Vec<u8>> {
-    let data = SerializedKeypair {
-        public_key: kp.public_key().as_bytes().to_vec(),
-        secret_key: kp.secret_key().as_bytes().to_vec(),
-    };
-    bincode::serialize(&data).map_err(|e| IdentityError::Serialization(e.to_string()))
+    encode_keypair_bytes(
+        kp.public_key().as_bytes().to_vec(),
+        kp.secret_key().as_bytes().to_vec(),
+        None,
+    )
+}
+
+/// Serialize an AgentKeypair recording an optional local expiry.
+///
+/// `None` writes the legacy v1 format byte-for-byte; `Some` writes the v2
+/// format carrying `not_after`.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::Serialization`] if encoding fails.
+pub fn serialize_agent_keypair_with_expiry(
+    kp: &AgentKeypair,
+    not_after: Option<u64>,
+) -> Result<Vec<u8>> {
+    encode_keypair_bytes(
+        kp.public_key().as_bytes().to_vec(),
+        kp.secret_key().as_bytes().to_vec(),
+        not_after,
+    )
 }
 
 /// Deserialize an AgentKeypair from bytes.
@@ -83,9 +220,25 @@ pub fn serialize_agent_keypair(kp: &AgentKeypair) -> Result<Vec<u8>> {
 ///
 /// A deserialized AgentKeypair
 pub fn deserialize_agent_keypair(bytes: &[u8]) -> Result<AgentKeypair> {
-    let data: SerializedKeypair =
-        bincode::deserialize(bytes).map_err(|e| IdentityError::Serialization(e.to_string()))?;
-    AgentKeypair::from_bytes(&data.public_key, &data.secret_key)
+    let (public_key, secret_key, _not_after) = decode_keypair_bytes(bytes)?;
+    AgentKeypair::from_bytes(&public_key, &secret_key)
+}
+
+/// Deserialize an AgentKeypair along with its optional local expiry.
+///
+/// Returns `(keypair, not_after)` where `not_after` is `None` for legacy
+/// (v1) key files — absence of expiry means the key never expires.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::Serialization`] if the bytes are not a valid
+/// key file, or a key-material error if the embedded bytes are malformed.
+pub fn deserialize_agent_keypair_with_expiry(bytes: &[u8]) -> Result<(AgentKeypair, Option<u64>)> {
+    let (public_key, secret_key, not_after) = decode_keypair_bytes(bytes)?;
+    Ok((
+        AgentKeypair::from_bytes(&public_key, &secret_key)?,
+        not_after,
+    ))
 }
 
 /// x0x configuration directory path.
@@ -381,11 +534,11 @@ pub async fn load_agent_keypair_from<P: AsRef<Path>>(path: P) -> Result<AgentKey
 ///
 /// A vector containing the serialized keypair data
 pub fn serialize_user_keypair(kp: &UserKeypair) -> Result<Vec<u8>> {
-    let data = SerializedKeypair {
-        public_key: kp.public_key().as_bytes().to_vec(),
-        secret_key: kp.secret_key().as_bytes().to_vec(),
-    };
-    bincode::serialize(&data).map_err(|e| IdentityError::Serialization(e.to_string()))
+    encode_keypair_bytes(
+        kp.public_key().as_bytes().to_vec(),
+        kp.secret_key().as_bytes().to_vec(),
+        None,
+    )
 }
 
 /// Deserialize a UserKeypair from bytes.
@@ -398,9 +551,8 @@ pub fn serialize_user_keypair(kp: &UserKeypair) -> Result<Vec<u8>> {
 ///
 /// A deserialized UserKeypair
 pub fn deserialize_user_keypair(bytes: &[u8]) -> Result<UserKeypair> {
-    let data: SerializedKeypair =
-        bincode::deserialize(bytes).map_err(|e| IdentityError::Serialization(e.to_string()))?;
-    UserKeypair::from_bytes(&data.public_key, &data.secret_key)
+    let (public_key, secret_key, _not_after) = decode_keypair_bytes(bytes)?;
+    UserKeypair::from_bytes(&public_key, &secret_key)
 }
 
 /// Save a UserKeypair to the default storage location (`~/.x0x/user.key`).
@@ -453,8 +605,7 @@ pub async fn load_user_keypair_from<P: AsRef<Path>>(path: P) -> Result<UserKeypa
 pub async fn save_agent_certificate(cert: &AgentCertificate) -> Result<()> {
     let dir = x0x_dir().await?;
     let path = dir.join(AGENT_CERT_FILE);
-    let bytes =
-        bincode::serialize(cert).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+    let bytes = cert.to_storage_bytes()?;
     write_private_file(&path, bytes).await
 }
 
@@ -462,7 +613,7 @@ pub async fn save_agent_certificate(cert: &AgentCertificate) -> Result<()> {
 pub async fn load_agent_certificate() -> Result<AgentCertificate> {
     let path = x0x_dir().await?.join(AGENT_CERT_FILE);
     let bytes = fs::read(&path).await.map_err(IdentityError::from)?;
-    bincode::deserialize(&bytes).map_err(|e| IdentityError::Serialization(e.to_string()))
+    AgentCertificate::from_storage_bytes(&bytes)
 }
 
 /// Check if an agent certificate exists in the default storage location.
@@ -480,15 +631,14 @@ pub async fn save_agent_certificate_to<P: AsRef<Path> + Clone>(
     cert: &AgentCertificate,
     path: P,
 ) -> Result<()> {
-    let bytes =
-        bincode::serialize(cert).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+    let bytes = cert.to_storage_bytes()?;
     write_private_file(path.as_ref(), bytes).await
 }
 
 /// Load an AgentCertificate from the specified file path.
 pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<AgentCertificate> {
     let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
-    bincode::deserialize(&bytes).map_err(|e| IdentityError::Serialization(e.to_string()))
+    AgentCertificate::from_storage_bytes(&bytes)
 }
 
 #[cfg(test)]
@@ -838,6 +988,87 @@ mod tests {
             kp.user_id(),
             loaded.user_id(),
             "user_id must survive a save/load round-trip"
+        );
+    }
+
+    // ── Key-file expiry format versioning (issue #130) ──
+
+    #[test]
+    fn keyfile_without_expiry_writes_legacy_format() {
+        // The no-break guarantee: when no expiry is recorded, the bytes must
+        // be identical to the legacy `bincode(public_key, secret_key)` shape
+        // an older x0x would write and read. A regression here silently
+        // rewrites every user's key file into a format old daemons reject.
+        let kp = MachineKeypair::generate().unwrap();
+        let modern = serialize_machine_keypair(&kp).unwrap();
+        let legacy = bincode::serialize(&SerializedKeypair {
+            public_key: kp.public_key().as_bytes().to_vec(),
+            secret_key: kp.secret_key().as_bytes().to_vec(),
+        })
+        .unwrap();
+        assert_eq!(
+            modern, legacy,
+            "a no-expiry key file must be byte-for-byte the legacy format"
+        );
+        // And must NOT carry the v2 marker.
+        assert_ne!(
+            &modern[..KEYFILE_V2_MAGIC.len()],
+            KEYFILE_V2_MAGIC,
+            "legacy bytes must not begin with the v2 magic marker"
+        );
+    }
+
+    #[test]
+    fn legacy_keyfile_bytes_load_via_new_loader() {
+        // Bytes written by a pre-#130 x0x (bare bincode, no marker) must load
+        // through the new versioned loader unchanged, reporting no expiry.
+        let kp = AgentKeypair::generate().unwrap();
+        let legacy = bincode::serialize(&SerializedKeypair {
+            public_key: kp.public_key().as_bytes().to_vec(),
+            secret_key: kp.secret_key().as_bytes().to_vec(),
+        })
+        .unwrap();
+        let (loaded, not_after) = deserialize_agent_keypair_with_expiry(&legacy).unwrap();
+        assert_eq!(
+            loaded.public_key().as_bytes(),
+            kp.public_key().as_bytes(),
+            "legacy key bytes must decode to the same public key"
+        );
+        assert_eq!(
+            not_after, None,
+            "absence of an expiry field must decode as None (never expires)"
+        );
+    }
+
+    #[test]
+    fn v2_keyfile_roundtrip_preserves_not_after() {
+        // The v2 format must round-trip the recorded expiry exactly, and the
+        // v1 loader must still recover the key material from a v2 file.
+        let kp = MachineKeypair::generate().unwrap();
+        let expiry = 1_900_000_000u64;
+        let bytes = serialize_machine_keypair_with_expiry(&kp, Some(expiry)).unwrap();
+        assert_eq!(
+            &bytes[..KEYFILE_V2_MAGIC.len()],
+            KEYFILE_V2_MAGIC,
+            "a v2 key file must begin with the magic marker"
+        );
+        let (loaded, not_after) = deserialize_machine_keypair_with_expiry(&bytes).unwrap();
+        assert_eq!(
+            not_after,
+            Some(expiry),
+            "the recorded expiry must survive a v2 round-trip"
+        );
+        assert_eq!(
+            loaded.public_key().as_bytes(),
+            kp.public_key().as_bytes(),
+            "v2 key material must survive a round-trip"
+        );
+        // The plain (non-expiry) loader must also cope with a v2 file.
+        let plain = deserialize_machine_keypair(&bytes).unwrap();
+        assert_eq!(
+            plain.public_key().as_bytes(),
+            kp.public_key().as_bytes(),
+            "the plain loader must recover key material from a v2 file"
         );
     }
 }
