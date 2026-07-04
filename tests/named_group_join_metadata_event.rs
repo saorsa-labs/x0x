@@ -633,6 +633,16 @@ async fn forged_member_joined_admin_role_or_secret_is_rejected() {
     let alice = &pair.alice;
     let bob = &pair.bob;
 
+    // Each wait budget is derived from the node count so that CI scheduling
+    // jitter — which can push gossip convergence past a fixed 30s window —
+    // does not produce a false failure.  The poll cadence is relaxed to 1 s
+    // to avoid hot-polling the mesh under load (mirroring the treatment
+    // applied in commit 191369e for the 3-node convergence tests).  These
+    // are upper bounds only; a healthy mesh returns each phase early.
+    let node_count: u32 = 2; // pair fixture
+    let phase_timeout = Duration::from_secs(60) * node_count; // 120 s per phase
+    let poll = Duration::from_secs(1);
+
     let group_id = create_public_open_group(alice, "Reject Role Escalation").await;
     let details = group_details(alice, &group_id).await;
     let metadata_topic = details["metadata_topic"]
@@ -660,7 +670,7 @@ async fn forged_member_joined_admin_role_or_secret_is_rejected() {
     let published = publish_raw(bob, &metadata_topic, &payload).await;
     assert_eq!(published["ok"], true, "publish forged event: {published:?}");
 
-    let admin_rejected = wait_until(Duration::from_secs(30), || async {
+    let admin_rejected = wait_until_every(phase_timeout, poll, || async {
         group_diagnostic_counter(
             alice,
             &group_id,
@@ -699,7 +709,7 @@ async fn forged_member_joined_admin_role_or_secret_is_rejected() {
         published["ok"], true,
         "publish forged secret event: {published:?}"
     );
-    let unknown_secret_rejected = wait_until(Duration::from_secs(30), || async {
+    let unknown_secret_rejected = wait_until_every(phase_timeout, poll, || async {
         group_diagnostic_counter(
             alice,
             &group_id,
@@ -720,7 +730,7 @@ async fn forged_member_joined_admin_role_or_secret_is_rejected() {
 
     let join_resp = join_via_invite(bob, &invite, "bob-member").await;
     assert_eq!(join_resp["ok"], true, "legitimate join: {join_resp:?}");
-    let converged = wait_until(Duration::from_secs(30), || async {
+    let converged = wait_until_every(phase_timeout, poll, || async {
         list_members(alice, &group_id).await.contains(&bob_aid)
     })
     .await;

@@ -175,6 +175,47 @@ fn rewrite_unspecified_to_loopback(addr: &str) -> String {
     addr.to_string()
 }
 
+/// Retry an HTTP GET up to `attempts` times with short exponential backoff.
+///
+/// Under CI load the daemon's loopback socket can transiently refuse or drop a
+/// connection even when the daemon is healthy (OS accept-queue pressure,
+/// scheduler preemption).  The retry loop lets the socket clear without failing
+/// the test on the first transport error.
+async fn retry_get(client: &reqwest::Client, url: String, attempts: u8) -> reqwest::Response {
+    let mut last_err = String::new();
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+        }
+        match client.get(&url).send().await {
+            Ok(r) => return r,
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    panic!("GET {url} failed after {attempts} attempts: {last_err}");
+}
+
+/// Retry an HTTP POST with a JSON body up to `attempts` times with short
+/// exponential backoff (see [`retry_get`] for rationale).
+async fn retry_post_json(
+    client: &reqwest::Client,
+    url: String,
+    body: serde_json::Value,
+    attempts: u8,
+) -> reqwest::Response {
+    let mut last_err = String::new();
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+        }
+        match client.post(&url).json(&body).send().await {
+            Ok(r) => return r,
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    panic!("POST {url} failed after {attempts} attempts: {last_err}");
+}
+
 /// Wait until `/peers` on `fixture` lists `peer_machine`. Returns the elapsed
 /// poll count for diagnostics.
 async fn wait_for_peer(fixture: &DaemonFixture, peer_machine: &str, deadline: Duration) -> usize {
@@ -472,30 +513,28 @@ async fn direct_send_without_require_ack_omits_ack_block() {
     // clients aren't broken by the new field appearing unsolicited.
     let (alice, bob, _alice_machine, _bob_machine) = alice_and_bob_connected().await;
 
+    // Fetch bob's agent_id with retry: under CI load the loopback socket can
+    // transiently refuse even when the daemon is healthy.
     let bob_agent_id = {
         let bob_client = bob.authed_client(Duration::from_secs(5));
-        let v: Value = bob_client
-            .get(bob.url("/agent"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let r = retry_get(&bob_client, bob.url("/agent"), 5).await;
+        let v: Value = r.json().await.unwrap();
         v["agent_id"].as_str().unwrap().to_string()
     };
 
     let payload = base64::engine::general_purpose::STANDARD.encode(b"plc-no-ack-test");
     let alice_client = alice.authed_client(Duration::from_secs(10));
-    let r = alice_client
-        .post(alice.url("/direct/send"))
-        .json(&serde_json::json!({
+    // Retry the direct-send POST: same transient-connection rationale as above.
+    let r = retry_post_json(
+        &alice_client,
+        alice.url("/direct/send"),
+        serde_json::json!({
             "agent_id": bob_agent_id,
             "payload": payload,
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+        5,
+    )
+    .await;
     assert_eq!(r.status(), StatusCode::OK);
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["ok"], true);

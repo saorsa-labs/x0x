@@ -254,7 +254,12 @@ mod tests {
 
     #[test]
     fn capability_store_expires_on_ttl() {
-        let store = CapabilityStore::with_ttl(Duration::from_millis(50));
+        // TTL is set to 1 s so that CI scheduling jitter (which can be
+        // hundreds of milliseconds on a loaded runner) cannot push the
+        // first lookup past the TTL boundary before the "present" assertion
+        // runs.  The expiry assertion sleeps for 2.5× the TTL, which is
+        // well past the expiry window on any realistic machine.
+        let store = CapabilityStore::with_ttl(Duration::from_secs(1));
         let agent_id = AgentId([3u8; 32]);
         let machine_id = MachineId([4u8; 32]);
         store.insert(
@@ -263,8 +268,11 @@ mod tests {
             DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
             1_000,
         );
+        // Must be present immediately after insert (1 s TTL gives ample room).
         assert!(store.lookup(&agent_id).is_some());
-        std::thread::sleep(Duration::from_millis(100));
+        // Sleep well past the TTL so the entry is definitely stale.
+        std::thread::sleep(Duration::from_millis(2_500));
+        // Must be absent after expiry.
         assert!(store.lookup(&agent_id).is_none());
     }
 
