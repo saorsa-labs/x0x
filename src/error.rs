@@ -57,6 +57,14 @@ pub enum IdentityError {
     /// or the certificate data has been tampered with.
     #[error("certificate verification failed: {0}")]
     CertificateVerification(String),
+
+    /// Revocation record signature or authority check failed.
+    ///
+    /// The record's signature is invalid, or the issuer is neither the subject
+    /// (self-revocation) nor the user who certified the subject agent
+    /// (issuer-revocation). Third-party revocation is never accepted.
+    #[error("revocation rejected: {0}")]
+    Revocation(String),
 }
 
 /// Standard Result type for x0x identity operations.

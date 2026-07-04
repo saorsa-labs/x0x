@@ -68,6 +68,13 @@ pub mod identity;
 /// persistent storage of MachineKeypair and AgentKeypair.
 pub mod storage;
 
+/// Signed identity revocation records and the grow-only revocation set.
+///
+/// See [`revocation::RevocationRecord`] for the authority rules (self- and
+/// issuer-revocation only) and [`revocation::RevocationSet`] for the local,
+/// gossip-fed set consulted at every trust gate.
+pub mod revocation;
+
 /// Bootstrap node discovery and connection.
 ///
 /// This module handles initial connection to bootstrap nodes with
