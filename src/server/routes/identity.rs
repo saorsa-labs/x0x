@@ -648,6 +648,7 @@ pub(in crate::server) async fn import_agent_card(
                 is_coordinator: None,
                 reachable_via: Vec::new(),
                 relay_candidates: Vec::new(),
+                cert_not_after: None,
             })
             .await;
     }
@@ -990,4 +991,116 @@ pub(in crate::server) struct ServiceEntryData {
     name: String,
     description: String,
     min_trust: String,
+}
+
+// ── Key lifecycle — revocation ────────────────────────────────────────────────
+
+/// POST /identity/revoke — request body.
+///
+/// The caller identifies the subject to revoke and provides an optional reason.
+/// The daemon uses its own agent keypair as the issuer.  Self-revocation
+/// (revoking own agent-id or own machine-id) always succeeds.  Revoking a
+/// third-party subject requires that a user keypair previously signed an
+/// `AgentCertificate` for that subject (user-authority revocation).
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct RevokeRequest {
+    /// Which subject to revoke. Exactly one field must be present.
+    agent_id: Option<String>,
+    machine_id: Option<String>,
+    /// Optional human-readable reason string (stored in the record).
+    reason: Option<String>,
+}
+
+/// POST /identity/revoke — issue and publish a signed revocation.
+///
+/// Returns `200 OK` with the serialised revocation record on success.
+/// Returns `400` if neither or both subject fields are set, or if the
+/// hex-encoded id is malformed.  Returns `403` if the issuer lacks authority
+/// to revoke the requested subject.
+pub(in crate::server) async fn identity_revoke(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RevokeRequest>,
+) -> impl IntoResponse {
+    use x0x::revocation::RevokedSubject;
+
+    let subject = match (body.agent_id.as_deref(), body.machine_id.as_deref()) {
+        (Some(hex), None) => {
+            let bytes = hex::decode(hex)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .map(x0x::identity::AgentId);
+            match bytes {
+                Some(id) => RevokedSubject::Agent(id),
+                None => return bad_request("agent_id must be 32-byte hex"),
+            }
+        }
+        (None, Some(hex)) => {
+            let bytes = hex::decode(hex)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .map(x0x::identity::MachineId);
+            match bytes {
+                Some(id) => RevokedSubject::Machine(id),
+                None => return bad_request("machine_id must be 32-byte hex"),
+            }
+        }
+        (Some(_), Some(_)) => return bad_request("supply exactly one of agent_id or machine_id"),
+        (None, None) => return bad_request("supply exactly one of agent_id or machine_id"),
+    };
+
+    let issuer_keypair = state.agent.identity().agent_keypair();
+    match state
+        .agent
+        .revoke(issuer_keypair, subject, body.reason, None)
+        .await
+    {
+        Ok(record) => {
+            let resp = serde_json::json!({
+                "ok": true,
+                "subject": record.subject_hex(),
+                "subject_kind": record.subject_kind(),
+                "issuer": hex::encode(record.issuer_public_key_hash()),
+                "revoked_at": record.revoked_at,
+                "reason": record.reason,
+            });
+            (StatusCode::OK, Json(resp))
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("authority") || msg.contains("rejected") {
+                api_error(
+                    StatusCode::FORBIDDEN,
+                    format!("issuer lacks authority to revoke this subject: {e}"),
+                )
+            } else {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("revocation failed: {e}"),
+                )
+            }
+        }
+    }
+}
+
+/// GET /identity/revocations — list all revocation records held by this daemon.
+pub(in crate::server) async fn identity_revocations(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let records = state.agent.revocation_records().await;
+    let items: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "subject": r.subject_hex(),
+                "subject_kind": r.subject_kind(),
+                "issuer": hex::encode(r.issuer_public_key_hash()),
+                "revoked_at": r.revoked_at,
+                "reason": r.reason,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "revocations": items })),
+    )
 }

@@ -23,10 +23,11 @@ use routes::CardQuery;
 use routes::{
     add_contact, add_machine, add_task, agent_info, agent_sign, agent_user_id_handler,
     agent_verify, announce_identity, create_task_list, delete_contact, delete_machine,
-    discovered_machine, discovered_machines, get_a2a_agent_card, get_agent_card, import_agent_card,
-    introduction, list_contacts, list_machines, list_revocations, list_task_lists, list_tasks,
-    machines_by_user_handler, pin_machine, populate_invite_base_state_from_group_info, quick_trust,
-    revoke_contact, unpin_machine, update_contact, update_task,
+    discovered_machine, discovered_machines, get_a2a_agent_card, get_agent_card,
+    identity_revocations, identity_revoke, import_agent_card, introduction, list_contacts,
+    list_machines, list_revocations, list_task_lists, list_tasks, machines_by_user_handler,
+    pin_machine, populate_invite_base_state_from_group_info, quick_trust, revoke_contact,
+    unpin_machine, update_contact, update_task,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -706,7 +707,8 @@ pub async fn serve_with_options(
         builder = builder
             .with_machine_key(id_dir.join("machine.key"))
             .with_agent_key_path(id_dir.join("agent.key"))
-            .with_agent_cert_path(id_dir.join("agent.cert"));
+            .with_agent_cert_path(id_dir.join("agent.cert"))
+            .with_identity_dir(id_dir);
     }
 
     if let Some(ref user_key_path) = config.user_key_path {
@@ -1382,6 +1384,8 @@ pub async fn serve_with_options(
         .route("/agent/card/import", post(import_agent_card))
         .route("/agent/sign", post(agent_sign))
         .route("/agent/verify", post(agent_verify))
+        .route("/identity/revoke", post(identity_revoke))
+        .route("/identity/revocations", get(identity_revocations))
         .route("/announce", post(announce_identity))
         .route("/peers", get(peers))
         .route("/network/status", get(network_status))
@@ -6182,6 +6186,29 @@ async fn apply_named_group_metadata_event_inner(
         verified,
         allow_queue,
     );
+    // Enforcement point 4 — revocation gate.
+    // Must precede bypass_verified so a revoked sender fails closed even for
+    // self-authenticating MemberRemoved{commit:Some}/GroupDeleted events.
+    // bypass_verified exists because ABSENCE of a cache entry is racy;
+    // revocation is POSITIVE knowledge and is exactly what must not be bypassed.
+    // A merely-unverified (not revoked) sender's MemberRemoved{commit:Some}
+    // STILL PASSES through bypass_verified unchanged — #99 non-regression.
+    {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(&sender) {
+            tracing::info!(
+                target: "treekem.trace",
+                stage = "apply_metadata_event_reject",
+                reason = "sender_revoked",
+                event = event_kind,
+                sender = %sender_hex,
+                "group metadata event dropped: sender is revoked"
+            );
+            return false;
+        }
+    }
+
     // The transport `verified` flag asserts the sender's AgentId→MachineId
     // binding is in our identity-discovery cache — a best-effort annotation
     // populated asynchronously from gossip announcements. `MemberRemoved`

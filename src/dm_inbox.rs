@@ -13,6 +13,7 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
 use crate::groups::kem_envelope::AgentKemKeypair;
 use crate::identity::{AgentId, MachineId};
+use crate::revocation::RevocationSet;
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -106,6 +107,7 @@ impl DmInboxService {
         inflight: Arc<InFlightAcks>,
         cache: Arc<RecentDeliveryCache>,
         config: DmInboxConfig,
+        revocation_set: Arc<RwLock<RevocationSet>>,
     ) -> NetworkResult<Self> {
         let topic = Self::inbox_topic_name(&self_agent_id);
         let subscription = pubsub
@@ -125,6 +127,7 @@ impl DmInboxService {
             cache,
             silent_reject: config.silent_reject,
             typed_payload_routes: config.typed_payload_routes,
+            revocation_set,
         };
 
         let primary_handle =
@@ -188,6 +191,8 @@ struct InboxPipeline {
     cache: Arc<RecentDeliveryCache>,
     silent_reject: bool,
     typed_payload_routes: Vec<DmTypedPayloadRoute>,
+    /// Shared revocation set for enforcement point 3.
+    revocation_set: Arc<RwLock<RevocationSet>>,
 }
 
 impl InboxPipeline {
@@ -273,6 +278,24 @@ impl InboxPipeline {
         if envelope.sender_agent_id != *pubsub_sender.as_bytes() {
             self.dm.record_incoming_signature_failed();
             return;
+        }
+
+        // Enforcement point 3 — revocation gate.
+        // Check after the envelope-signature is verified so we know the
+        // sender_agent_id is authentic.  Never hold the lock across `.await`.
+        {
+            let revoked = self.revocation_set.read().await;
+            let sender_agent_id = AgentId(envelope.sender_agent_id);
+            if revoked.is_agent_revoked(&sender_agent_id) {
+                self.dm.record_incoming_dropped_revoked();
+                tracing::info!(
+                    target: "dm.trace",
+                    stage = "inbound_revoked_sender_dropped",
+                    sender = %hex::encode(envelope.sender_agent_id),
+                    "DM dropped: sender is revoked"
+                );
+                return;
+            }
         }
 
         match envelope.body.clone() {

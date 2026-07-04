@@ -6,6 +6,7 @@
 
 use crate::error::{IdentityError, Result};
 use crate::identity::{AgentCertificate, AgentKeypair, MachineKeypair, UserKeypair};
+use crate::revocation::RevocationSet;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -255,6 +256,9 @@ const USER_KEY_FILE: &str = "user.key";
 
 /// Agent certificate file name.
 const AGENT_CERT_FILE: &str = "agent.cert";
+
+/// Revocation set file name.
+const REVOCATION_FILE: &str = "revocations.bin";
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -639,6 +643,61 @@ pub async fn save_agent_certificate_to<P: AsRef<Path> + Clone>(
 pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<AgentCertificate> {
     let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
     AgentCertificate::from_storage_bytes(&bytes)
+}
+
+/// Default path for the revocation set file.
+///
+/// When `identity_dir` is provided (multi-instance daemons), the file is
+/// stored there instead of the global `~/.x0x/` directory.
+fn revocation_path(identity_dir: Option<&Path>) -> Option<std::path::PathBuf> {
+    match identity_dir {
+        Some(dir) => Some(dir.join(REVOCATION_FILE)),
+        None => {
+            let home = dirs::home_dir()?;
+            Some(home.join(X0X_DIR).join(REVOCATION_FILE))
+        }
+    }
+}
+
+/// Load the local revocation set from disk.
+///
+/// Returns an empty `RevocationSet` if the file does not exist or cannot be
+/// read — the caller treats absence as "no revocations known yet" (safe
+/// default).  Corrupt or tampered files are logged and ignored (each record is
+/// re-verified on load, so a forged entry is simply skipped rather than
+/// poisoning the whole set).
+pub async fn load_revocation_set(identity_dir: Option<&Path>) -> RevocationSet {
+    let Some(path) = revocation_path(identity_dir) else {
+        return RevocationSet::new();
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => match RevocationSet::from_bytes(&bytes) {
+            Ok(set) => set,
+            Err(e) => {
+                tracing::warn!("Failed to load revocation set from {}: {e}", path.display());
+                RevocationSet::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RevocationSet::new(),
+        Err(e) => {
+            tracing::warn!("Could not read revocation file {}: {e}", path.display());
+            RevocationSet::new()
+        }
+    }
+}
+
+/// Persist the revocation set to disk.
+///
+/// Uses the same atomic-rename strategy as other private files so a crash
+/// during write never leaves a truncated revocation file.
+pub async fn save_revocation_set(set: &RevocationSet, identity_dir: Option<&Path>) -> Result<()> {
+    let Some(path) = revocation_path(identity_dir) else {
+        return Err(IdentityError::Storage(std::io::Error::other(
+            "no home directory and no identity_dir — cannot persist revocations",
+        )));
+    };
+    let bytes = set.to_bytes()?;
+    write_private_file(&path, bytes).await
 }
 
 #[cfg(test)]
