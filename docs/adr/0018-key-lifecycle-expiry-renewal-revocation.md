@@ -1,13 +1,15 @@
 # ADR-0018 — Key Lifecycle: Expiry, Renewal, and Revocation
 
-| Field       | Value                        |
-|-------------|------------------------------|
-| **Status**  | Accepted                     |
-| **Issue**   | #130                         |
-| **Date**    | 2026-07-04                   |
-| **Authors** | David Irvine, Claude Sonnet  |
+<!-- File name: docs/adr/0018-key-lifecycle-expiry-renewal-revocation.md -->
 
----
+- **Status:** Accepted (2026-07-04)
+- **Date:** 2026-07-04
+- **Decision owners:** David Irvine
+- **Reviewers:** TBD
+- **Supersedes:** none
+- **Superseded by:** none
+- **Related:** [ADR 0012](./0012-treekem-default-secure-groups.md) (TreeKEM group encryption); [ADR 0014](./0014-treekem-self-leave-owner-driven-rekey.md) (self-leave / owner-driven rekey); [ADR 0016](./0016-role-based-group-authority-flat-admin.md) (flat Admin/Member authority); `src/revocation.rs`; `docs/trust-and-connectivity.md`
+- **Follow-up issues:** [#130](https://github.com/saorsa-labs/x0x/issues/130) (implementation ticket); [#127](https://github.com/saorsa-labs/x0x/issues/127) (cryptographic primitives)
 
 ## Context
 
@@ -110,6 +112,35 @@ issuer.  Authority rules (from `RevocationRecord::verify_authority`):
 There is no `/identity/renew` endpoint in this phase.  Key renewal is handled
 at the CLI layer (`x0x agent` key rotation) by issuing a new certificate with
 an updated `not_after`; the implementation is deferred to a follow-up.
+
+---
+
+## Validation
+
+The enforcement is proven by automated tests that exercise genuine denial (not
+just API contracts):
+
+- **EP2 — verified gate** (`src/lib.rs::revoked_agent_fails_machine_verification_even_when_cached`):
+  `is_agent_machine_verified` goes `true → false` after a self-revocation is
+  applied via the real `verify_and_insert` receive path, with the identity
+  still cached.
+- **EP3 — DM inbox** (`src/dm_inbox.rs::revoked_sender_dm_is_dropped_and_counted`):
+  a DM from a revoked sender is dropped and increments
+  `incoming_dropped_revoked`; a non-revoked sender passes and does not move the
+  counter. The gate decision is a pure `drop_if_sender_revoked` helper so the
+  counter side-effect cannot silently regress.
+- **EP4 — group metadata gate**
+  (`src/server/mod.rs::metadata_revoked_sender_denied_even_for_bypass_verified_event`):
+  a revoked committer's self-authenticating `GroupDeleted{commit:Some}` is
+  denied *before* `bypass_verified` (the group is left intact), while a
+  non-revoked but unverified committer's identical event still applies
+  (#99 non-regression).
+- **End-to-end through a real daemon**
+  (`tests/revocation_integration.rs::revocation_denies_verified_binding_end_to_end`):
+  `GET /agents/:id/machine` transitions `200 → 404` purely by applying a
+  self-revocation via `POST /identity/revoke`, plus the REST contract tests for
+  `/identity/revoke` and `/identity/revocations`.
+- Cross-daemon gossip propagation of records is exercised by the e2e scripts.
 
 ---
 
