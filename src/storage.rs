@@ -605,8 +605,7 @@ pub async fn load_user_keypair_from<P: AsRef<Path>>(path: P) -> Result<UserKeypa
 pub async fn save_agent_certificate(cert: &AgentCertificate) -> Result<()> {
     let dir = x0x_dir().await?;
     let path = dir.join(AGENT_CERT_FILE);
-    let bytes =
-        bincode::serialize(cert).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+    let bytes = cert.to_storage_bytes()?;
     write_private_file(&path, bytes).await
 }
 
@@ -614,7 +613,7 @@ pub async fn save_agent_certificate(cert: &AgentCertificate) -> Result<()> {
 pub async fn load_agent_certificate() -> Result<AgentCertificate> {
     let path = x0x_dir().await?.join(AGENT_CERT_FILE);
     let bytes = fs::read(&path).await.map_err(IdentityError::from)?;
-    bincode::deserialize(&bytes).map_err(|e| IdentityError::Serialization(e.to_string()))
+    AgentCertificate::from_storage_bytes(&bytes)
 }
 
 /// Check if an agent certificate exists in the default storage location.
@@ -632,15 +631,14 @@ pub async fn save_agent_certificate_to<P: AsRef<Path> + Clone>(
     cert: &AgentCertificate,
     path: P,
 ) -> Result<()> {
-    let bytes =
-        bincode::serialize(cert).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+    let bytes = cert.to_storage_bytes()?;
     write_private_file(path.as_ref(), bytes).await
 }
 
 /// Load an AgentCertificate from the specified file path.
 pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<AgentCertificate> {
     let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
-    bincode::deserialize(&bytes).map_err(|e| IdentityError::Serialization(e.to_string()))
+    AgentCertificate::from_storage_bytes(&bytes)
 }
 
 #[cfg(test)]
