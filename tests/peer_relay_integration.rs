@@ -9,10 +9,11 @@
 //! `DmEnvelope`, wraps it in a sender-signed `RelayedDm`, and forwards over
 //! `network.send_direct_typed(charlie, RELAYED_DM_STREAM_TYPE=0x11, ...)`.
 //!
-//! The receiver-side demux for `0x11` is the X0X-0070b receiver patch and is
-//! intentionally out of scope here - pre-receiver, Charlie drops the inbound
-//! bytes silently as an unknown stream type, so these tests assert the sender
-//! contract only (receipt path, telemetry, wire send succeeds).
+//! The receiver side is also covered: `relay_round_trip_alice_to_bob_via_charlie`
+//! exercises the full three-party demux + forward, and the PR #177 review tests
+//! at the bottom of this file drive the recipient-side listener directly (via
+//! the `push_relayed_dm_for_testing` seam) to prove the revocation gate, the
+//! disposition ordering, and the wire-layer spoofing backstop.
 //!
 //! Each test ignores itself when the host cannot bind QUIC (e.g. CI sandboxes
 //! where UDP binds return `EPERM`), matching the existing
@@ -23,10 +24,17 @@
 
 use std::time::Duration;
 use tempfile::TempDir;
-use x0x::dm::{DmCapabilities, DmPath, DmSendConfig, DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES};
+use x0x::dm::{
+    now_unix_ms, DmBody, DmCapabilities, DmEnvelope, DmPath, DmPayload, DmSendConfig,
+    DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES,
+};
 use x0x::groups::kem_envelope::AgentKemKeypair;
 use x0x::identity::{AgentId, AgentKeypair, MachineKeypair};
 use x0x::network::{NetworkConfig, PeerRelayConfig};
+use x0x::peer_relay::{
+    PeerRelay, RelayDisposition, RelayHeader, RelayPolicy, RelayRefusal, RelayedDm,
+};
+use x0x::revocation::{RevocationRecord, RevokedSubject};
 use x0x::{Agent, DiscoveredAgent};
 
 fn loopback_network_config_with_relay(relay: PeerRelayConfig) -> NetworkConfig {
@@ -160,6 +168,7 @@ async fn sender_uses_relay_when_direct_path_fails() {
         "alice",
         PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: vec![hex::encode(charlie.agent_id().0)],
@@ -271,6 +280,7 @@ async fn enabled_policy_without_candidates_surfaces_direct_err() {
         "alice",
         PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
@@ -338,6 +348,7 @@ async fn direct_success_after_relay_mode_increments_recovery_counter() {
         "alice",
         PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
@@ -474,6 +485,7 @@ async fn relay_round_trip_alice_to_bob_via_charlie() {
         "charlie",
         PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
@@ -493,6 +505,7 @@ async fn relay_round_trip_alice_to_bob_via_charlie() {
         "bob",
         PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
@@ -512,6 +525,7 @@ async fn relay_round_trip_alice_to_bob_via_charlie() {
         "alice",
         PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: vec![hex::encode(charlie.agent_id().0)],
@@ -708,5 +722,300 @@ async fn relay_round_trip_alice_to_bob_via_charlie() {
     assert_eq!(
         bob_stats.relay_forwarded, 0,
         "bob is not a relay - relay_forwarded must remain at zero"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR #177 review fixes — recipient-side revocation gate, disposition ordering,
+// and the wire-layer spoofing backstop.
+// ---------------------------------------------------------------------------
+
+/// Minimal opaque inner envelope. The relay never inspects `inner`, and the
+/// recipient's raw direct path treats it as an opaque payload, so a
+/// placeholder body is sufficient for these tests.
+fn opaque_inner(
+    sender_agent_id: [u8; 32],
+    sender_machine_id: [u8; 32],
+    signature: Vec<u8>,
+) -> DmEnvelope {
+    let created = now_unix_ms();
+    DmEnvelope {
+        protocol_version: DM_PROTOCOL_VERSION,
+        request_id: [0x9A; 16],
+        sender_agent_id,
+        sender_machine_id,
+        recipient_agent_id: [0x00; 32],
+        created_at_unix_ms: created,
+        expires_at_unix_ms: created.saturating_add(60_000),
+        body: DmBody::Payload(DmPayload {
+            kem_ciphertext: vec![0u8; 8],
+            body_nonce: [0u8; 12],
+            body_ciphertext: vec![0u8; 8],
+        }),
+        signature,
+    }
+}
+
+/// Build a [`RelayedDm`] whose header is correctly signed by `origin` (so it
+/// passes `header.verify()` and reaches the deliver/forward classification),
+/// wrapping `inner` and addressed to `dst`.
+fn signed_relayed(origin: &AgentKeypair, dst: AgentId, inner: DmEnvelope) -> RelayedDm {
+    let (pub_bytes, _sec_bytes) = origin.to_bytes();
+    let originated = now_unix_ms();
+    let signing_bytes = RelayHeader::signing_bytes(
+        RelayHeader::VERSION,
+        &dst.0,
+        &origin.agent_id().0,
+        &pub_bytes,
+        originated,
+    );
+    let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        origin.secret_key(),
+        &signing_bytes,
+    )
+    .expect("ml-dsa sign relay header")
+    .as_bytes()
+    .to_vec();
+    RelayedDm {
+        header: RelayHeader {
+            version: RelayHeader::VERSION,
+            dst_agent_id: dst.0,
+            sender_agent_id: origin.agent_id().0,
+            sender_public_key: pub_bytes,
+            originated_at_unix_ms: originated,
+            signature,
+        },
+        inner,
+    }
+}
+
+/// Fix 2 (PR #177 review): `disposition_for` must check `policy.enabled`
+/// BEFORE running the expensive ML-DSA-65 header verification, so a disabled
+/// relay - the default state of every node - cannot be forced to burn CPU
+/// verifying attacker-supplied headers (a DoS vector). Proof: a header with a
+/// deliberately bad signature fed to a disabled engine must be refused as
+/// `PolicyDisabled` (the cheap path), never `BadSignature` (which would prove
+/// `verify()` ran first). The enabled engine is the contrast control: it does
+/// run `verify()` and catches the same bad signature.
+#[test]
+fn disabled_relay_refuses_before_verifying_signature() {
+    let origin = AgentKeypair::generate().expect("origin keypair");
+    let dst = AgentId([0x55; 32]);
+    let mut relayed = signed_relayed(
+        &origin,
+        dst,
+        opaque_inner(origin.agent_id().0, [0x22; 32], vec![0u8; 8]),
+    );
+    // Corrupt the header signature so verify() would fail IF it ran.
+    relayed.header.signature = vec![0u8; relayed.header.signature.len()];
+    let now = now_unix_ms();
+
+    let disabled = PeerRelay::new();
+    assert!(
+        !disabled.policy().enabled,
+        "PeerRelay::new must be disabled by default"
+    );
+    let disp = disabled.disposition_for(&relayed, &dst, now);
+    assert_eq!(
+        disp,
+        RelayDisposition::Refuse(RelayRefusal::PolicyDisabled),
+        "a disabled relay must refuse on the policy path"
+    );
+    let stats = disabled.stats().snapshot();
+    assert_eq!(stats.relay_refused_policy_disabled, 1);
+    assert_eq!(
+        stats.relay_refused_bad_signature, 0,
+        "verify() must NOT run on a disabled relay — the policy check comes first (DoS guard)"
+    );
+
+    // Contrast: an ENABLED engine runs verify() and rejects the bad signature,
+    // confirming the reorder is the only behavioural change.
+    let enabled = PeerRelay::with_policy(RelayPolicy::enabled());
+    let disp2 = enabled.disposition_for(&relayed, &dst, now);
+    assert_eq!(
+        disp2,
+        RelayDisposition::Refuse(RelayRefusal::BadSignature),
+        "an enabled relay verifies the header and rejects the bad signature"
+    );
+    assert_eq!(enabled.stats().snapshot().relay_refused_bad_signature, 1);
+}
+
+/// Fix 1 (PR #177 review): a relayed DM whose inner-envelope origin is revoked
+/// must be dropped by the relay-DM listener BEFORE it is re-injected onto the
+/// direct channel. The direct listener does not run the `dm_inbox` revocation
+/// gate (#130), so without this check a revoked sender who cannot direct-
+/// connect (e.g. NAT-blocked) could still reach the recipient via a relay,
+/// bypassing revocation. This drives the `DeliverLocally` arm (dst == self).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_origin_relayed_dm_is_dropped_before_local_delivery() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let charlie = match build_agent(
+        &dir,
+        "charlie",
+        PeerRelayConfig {
+            enabled: true,
+            require_contact_to_relay: false,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+        },
+    )
+    .await
+    .expect("build charlie")
+    {
+        Some(agent) => agent,
+        None => {
+            eprintln!("skipping revoked_origin_drop: bind permission unavailable");
+            return;
+        }
+    };
+    // join_network starts the direct-DM listener that DeliverLocally feeds.
+    charlie.join_network().await.expect("charlie join_network");
+
+    // Alice is the revoked origin. She self-revokes; Charlie holds the record.
+    let alice = AgentKeypair::generate().expect("alice keypair");
+    let alice_id = alice.agent_id();
+    let revoked_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = RevocationRecord::sign(
+        RevokedSubject::Agent(alice_id),
+        alice.public_key(),
+        alice.secret_key(),
+        revoked_at,
+        None,
+    )
+    .expect("sign alice self-revocation");
+    let charlie_revocations = charlie.revocation_set();
+    charlie_revocations
+        .write()
+        .await
+        .verify_and_insert(record, None)
+        .expect("charlie inserts alice's revocation");
+    assert!(
+        charlie_revocations.read().await.is_agent_revoked(&alice_id),
+        "charlie's set must report alice revoked"
+    );
+
+    // A RelayedDm addressed to Charlie himself → DeliverLocally arm. The inner
+    // signature is irrelevant: the revocation gate drops it before the direct
+    // listener ever sees it.
+    let relayed = signed_relayed(
+        &alice,
+        charlie.agent_id(),
+        opaque_inner(alice_id.0, [0x22; 32], vec![0u8; 8]),
+    );
+    let pre_drop = charlie
+        .peer_relay()
+        .stats()
+        .snapshot()
+        .relay_dropped_revoked;
+    let mut charlie_sub = charlie.subscribe_direct();
+
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), relayed)
+            .await,
+        "seam must accept the synthetic relayed DM"
+    );
+
+    // The revocation gate must drop it (counter advances)...
+    let start = tokio::time::Instant::now();
+    loop {
+        if charlie
+            .peer_relay()
+            .stats()
+            .snapshot()
+            .relay_dropped_revoked
+            == pre_drop + 1
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "relay_dropped_revoked never advanced — the revoked origin was NOT dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // ...and nothing may reach Charlie's direct subscribers.
+    match tokio::time::timeout(Duration::from_millis(300), charlie_sub.recv()).await {
+        Err(_) => {}
+        Ok(msg) => panic!("revoked origin's relayed DM must NOT be delivered, got {msg:?}"),
+    }
+}
+
+/// Fix 3 backstop (PR #177 review): the inner ML-DSA-65 envelope signature is
+/// the trust anchor. A relay can validly sign its OWN header (anyone can
+/// generate a keypair and sign) and can forge the inner envelope's
+/// `sender_machine_id`, but it can never fabricate a *verified* delivery: the
+/// recipient's AgentId→MachineId binding check does not vouch for an identity
+/// that is not cryptographically bound in its discovery cache.
+///
+/// NOTE ON THE CODE'S ACTUAL SHAPE: the raw direct-DM listener does not verify
+/// the inner envelope signature itself — it annotates each delivery with a
+/// `verified` flag (binding check) and leaves signature/decrypt verification to
+/// the consuming layer. So a forged relayed DM is delivered *unverified*, not
+/// dropped. The security property is therefore "never a trusted delivery":
+/// `verified == false`. The positive control is
+/// `relay_round_trip_alice_to_bob_via_charlie`, where a genuinely-bound
+/// forwarder yields `verified == true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_inner_relayed_dm_is_never_a_verified_delivery() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let charlie = match build_agent(
+        &dir,
+        "charlie",
+        PeerRelayConfig {
+            enabled: true,
+            require_contact_to_relay: false,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+        },
+    )
+    .await
+    .expect("build charlie")
+    {
+        Some(agent) => agent,
+        None => {
+            eprintln!("skipping forged_inner: bind permission unavailable");
+            return;
+        }
+    };
+    charlie.join_network().await.expect("charlie join_network");
+
+    // Attacker self-keys, forges the inner machine id, and gives the inner
+    // envelope a garbage signature. Charlie does NOT know or trust the
+    // attacker (no discovery-cache binding) and has not revoked it.
+    let attacker = AgentKeypair::generate().expect("attacker keypair");
+    let forged_machine = [0xEE_u8; 32];
+    let inner = opaque_inner(attacker.agent_id().0, forged_machine, vec![0xAB_u8; 32]);
+    let relayed = signed_relayed(&attacker, charlie.agent_id(), inner);
+
+    let mut charlie_sub = charlie.subscribe_direct();
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId(forged_machine), relayed)
+            .await,
+        "seam must accept the synthetic relayed DM"
+    );
+
+    let msg = tokio::time::timeout(Duration::from_secs(3), charlie_sub.recv())
+        .await
+        .expect("a relayed local delivery is annotated, not dropped, on the raw path")
+        .expect("subscribe_direct channel must remain open");
+    assert!(
+        !msg.verified,
+        "a spoofed sender_machine_id must NEVER yield a verified delivery — the wire/relay layer cannot forge trust; the inner ML-DSA signature is the anchor a consumer must check"
+    );
+    assert_eq!(
+        msg.machine_id.0, forged_machine,
+        "the forged machine id is surfaced to the consumer, not hidden"
+    );
+    assert_eq!(
+        msg.sender,
+        attacker.agent_id(),
+        "the wire sender is the attacker's self-asserted agent id"
     );
 }

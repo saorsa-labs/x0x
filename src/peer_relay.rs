@@ -226,13 +226,32 @@ pub enum RelayRefusal {
 }
 
 /// Policy knobs for the peer-relay engine.
+///
+/// # Open-relay warning
+///
+/// When `enabled` is `true` this node acts as an **open relay**:
+/// [`PeerRelay::disposition_for`] authenticates only the
+/// [`RelayHeader`] signature, which any peer can produce by generating
+/// its own ML-DSA-65 keypair and signing a fresh header. There is
+/// **no** check on *who* the relaying peer is — an enabled node will
+/// forward a `RelayedDm` to any destination in its discovery cache on
+/// behalf of any self-keyed sender. This is a deliberate MVP
+/// (X0X-0070b) resource-abuse surface: enabling the relay opts this
+/// node into spending bandwidth/CPU forwarding for strangers, exactly
+/// like a Tailscale peer-relay or an iroh DERP node. Do not enable it
+/// on a node whose uplink you are not willing to share. A future
+/// contact-gate (see [`crate::network::PeerRelayConfig`]'s
+/// `require_contact_to_relay`, reserved and not yet enforced) will let
+/// operators restrict forwarding to known contacts; that decision is
+/// left to the maintainer.
 #[derive(Debug, Clone, Copy)]
 pub struct RelayPolicy {
     /// Master gate. **Default `false`** — the MVP relay path only
     /// engages when a runtime explicitly opts in. With this `false`,
     /// [`PeerRelay::needs_relay`] always returns `false` and
     /// [`PeerRelay::disposition_for`] refuses inbound relayed DMs with
-    /// [`RelayRefusal::PolicyDisabled`].
+    /// [`RelayRefusal::PolicyDisabled`]. Enabling it opts this node into
+    /// the open-relay resource-abuse surface described on the type doc.
     pub enabled: bool,
     /// Consecutive direct-DM failures, within `fail_window`, before a
     /// peer is considered to need a relay.
@@ -295,6 +314,7 @@ pub struct RelayStats {
     relay_refused_bad_signature: AtomicU64,
     relay_refused_stale: AtomicU64,
     relay_refused_policy_disabled: AtomicU64,
+    relay_dropped_revoked: AtomicU64,
     direct_recovered_after_relay: AtomicU64,
 }
 
@@ -313,6 +333,11 @@ pub struct RelayStatsSnapshot {
     pub relay_refused_stale: u64,
     /// Inbound relayed DMs refused — relay path disabled by policy.
     pub relay_refused_policy_disabled: u64,
+    /// Inbound relayed DMs dropped because the inner envelope's origin
+    /// agent is in this node's revocation set. Enforces the revocation
+    /// gate on the relay delivery/forward path, which does not otherwise
+    /// traverse the `dm_inbox` gossip-path revocation check.
+    pub relay_dropped_revoked: u64,
     /// Peers that returned to a healthy direct path after having been
     /// in relay mode — proves the fallback is transient, not sticky.
     pub direct_recovered_after_relay: u64,
@@ -331,6 +356,7 @@ impl RelayStats {
             relay_refused_policy_disabled: self
                 .relay_refused_policy_disabled
                 .load(Ordering::Relaxed),
+            relay_dropped_revoked: self.relay_dropped_revoked.load(Ordering::Relaxed),
             direct_recovered_after_relay: self.direct_recovered_after_relay.load(Ordering::Relaxed),
         }
     }
@@ -387,6 +413,17 @@ impl PeerRelay {
     #[must_use]
     pub fn stats(&self) -> &RelayStats {
         &self.stats
+    }
+
+    /// Record that an inbound relayed DM was dropped because its inner
+    /// envelope's origin agent is revoked. Called by the relay-DM
+    /// listener's revocation gate before delivering or forwarding, so a
+    /// revoked origin cannot use the relay path to bypass the revocation
+    /// check that the direct-DM re-injection would otherwise skip.
+    pub fn record_relay_dropped_revoked(&self) {
+        self.stats
+            .relay_dropped_revoked
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], PeerRelayState>> {
@@ -519,10 +556,14 @@ impl PeerRelay {
     /// node, whose agent id is `local_agent_id`, at wall-clock
     /// `now_unix_ms`. Updates the telemetry counters as a side effect.
     ///
+    /// - Policy disabled → `Refuse(PolicyDisabled)`,
+    ///   `relay_refused_policy_disabled` += 1. This check runs
+    ///   **before** the (expensive ML-DSA-65) header verification so an
+    ///   unsolicited relay frame to a node whose relay path is disabled
+    ///   cannot force a signature verification — the cheapest possible
+    ///   rejection for the DoS surface every node exposes by default.
     /// - Header fails verification → [`RelayDisposition::Refuse`]
     ///   (`BadSignature`), `relay_refused_bad_signature` += 1.
-    /// - Policy disabled → `Refuse(PolicyDisabled)`,
-    ///   `relay_refused_policy_disabled` += 1.
     /// - `originated_at` older than `freshness`, or more than
     ///   [`RELAY_CLOCK_SKEW_TOLERANCE_MS`] ahead of `now_unix_ms` →
     ///   `Refuse(Stale)`, `relay_refused_stale` += 1.
@@ -537,17 +578,20 @@ impl PeerRelay {
         local_agent_id: &AgentId,
         now_unix_ms: u64,
     ) -> RelayDisposition {
-        if !relayed.header.verify() {
-            self.stats
-                .relay_refused_bad_signature
-                .fetch_add(1, Ordering::Relaxed);
-            return RelayDisposition::Refuse(RelayRefusal::BadSignature);
-        }
+        // DoS guard: reject on the disabled-policy path before doing any
+        // ML-DSA-65 signature work, so a disabled relay cannot be made to
+        // burn CPU verifying attacker-supplied headers.
         if !self.policy.enabled {
             self.stats
                 .relay_refused_policy_disabled
                 .fetch_add(1, Ordering::Relaxed);
             return RelayDisposition::Refuse(RelayRefusal::PolicyDisabled);
+        }
+        if !relayed.header.verify() {
+            self.stats
+                .relay_refused_bad_signature
+                .fetch_add(1, Ordering::Relaxed);
+            return RelayDisposition::Refuse(RelayRefusal::BadSignature);
         }
         let freshness_ms = self.policy.freshness.as_millis() as u64;
         let originated = relayed.header.originated_at_unix_ms;

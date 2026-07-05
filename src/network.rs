@@ -258,11 +258,37 @@ pub struct NetworkConfig {
 /// marked `needs_relay`; `candidates` seeds the candidate set the
 /// engine picks from when falling back. Gossip-announced relay
 /// candidates (future) are merged on top of `candidates` at runtime.
+///
+/// # Open-relay warning (`enabled = true`)
+///
+/// A node with `[peer_relay] enabled = true` acts as an **open relay**:
+/// it will forward a relayed DM to any destination in its discovery
+/// cache on behalf of **any** peer that signs a valid relay header with
+/// a self-generated ML-DSA-65 key. There is no sender allow-list — the
+/// only authentication is the header signature, which anyone can
+/// produce. Enabling the relay therefore opts this node into spending
+/// its bandwidth and CPU forwarding traffic for strangers (the same
+/// resource-abuse surface as a Tailscale peer-relay / iroh DERP node).
+/// Enable it only on a node whose uplink you are willing to share. See
+/// [`crate::peer_relay::RelayPolicy`] for the engine-side detail.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRelayConfig {
-    /// Master gate. Defaults to `false`.
+    /// Master gate. Defaults to `false`. Enabling it opts this node into
+    /// the open-relay resource-abuse surface described on the type doc.
     #[serde(default)]
     pub enabled: bool,
+
+    /// **Reserved — not yet enforced.** Intended future contact-gate: when
+    /// a maintainer wires this through to the engine, `true` will restrict
+    /// forwarding to senders that are known contacts, closing the
+    /// open-relay surface documented above. Today the field is parsed and
+    /// stored but has **no effect** — an enabled relay forwards for any
+    /// self-keyed peer regardless of this value. It exists so the schema
+    /// is forward-compatible and the open-relay-vs-contact-gate decision
+    /// is explicit rather than silently defaulting to "open". Defaults to
+    /// `false`.
+    #[serde(default)]
+    pub require_contact_to_relay: bool,
 
     /// Direct-DM failures within `fail_window_ms` before a peer is
     /// marked `needs_relay`. Defaults to
@@ -301,6 +327,7 @@ impl Default for PeerRelayConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            require_contact_to_relay: false,
             fail_threshold: default_peer_relay_fail_threshold(),
             fail_window_ms: default_peer_relay_fail_window_ms(),
             candidates: Vec::new(),
@@ -2528,11 +2555,16 @@ impl NetworkNode {
         rx.recv().await
     }
 
-    /// Test-only handle to the inbound RelayedDm channel - lets a unit
-    /// test push a synthetic envelope as if it had arrived from the
-    /// wire demuxer, exercising the [`crate::Agent`]'s relay-DM
-    /// listener loop without a second [`NetworkNode`] over QUIC.
-    #[cfg(test)]
+    /// Test-only handle to the inbound RelayedDm channel - lets a test
+    /// push a synthetic envelope as if it had arrived from the wire
+    /// demuxer, exercising the [`crate::Agent`]'s relay-DM listener loop
+    /// without a second [`NetworkNode`] over QUIC.
+    ///
+    /// Compiled unconditionally (not `#[cfg(test)]`) because the
+    /// out-of-crate integration test seam
+    /// [`crate::Agent::push_relayed_dm_for_testing`] routes through it;
+    /// `#[doc(hidden)]` keeps it out of the public API surface.
+    #[doc(hidden)]
     pub(crate) fn test_relayed_dm_sender(&self) -> mpsc::Sender<RelayedDmEvent> {
         self.relayed_dm_tx.clone()
     }
@@ -3271,6 +3303,7 @@ mod tests {
         // standing between a typo and a wholesale relay fan-out.
         let cfg = PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 0,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
@@ -3290,6 +3323,7 @@ mod tests {
         // operator-set threshold (e.g. 5) survives unchanged.
         let cfg = PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 5,
             fail_window_ms: 120_000,
             candidates: Vec::new(),

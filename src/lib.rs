@@ -8242,6 +8242,42 @@ impl Agent {
         }
     }
 
+    /// Push a synthetic [`peer_relay::RelayedDm`] onto this Agent's inbound
+    /// relay-DM channel, exactly as the wire demuxer would after receiving a
+    /// [`network::RELAYED_DM_STREAM_TYPE`] frame. Drives the
+    /// `spawn_relay_dm_listener` dispatch path (revocation gate →
+    /// deliver-locally / forward / refuse) without a second live QUIC peer.
+    ///
+    /// `#[doc(hidden)]` - tests-only seam. The production inbound path is the
+    /// network receiver task; this exists only because
+    /// [`network::NetworkNode::send_direct_typed`] and the relay-DM channel
+    /// sender are `pub(crate)`, so an out-of-crate integration test cannot
+    /// otherwise exercise the recipient-side listener.
+    ///
+    /// # Arguments
+    ///
+    /// * `from_peer` - the QUIC peer the frame nominally arrived on (the
+    ///   relay hop, or the origin for a self-addressed `RelayedDm`).
+    /// * `relayed` - the fully-formed relayed envelope to dispatch.
+    ///
+    /// Returns `false` when no network is configured (nothing to receive on).
+    #[doc(hidden)]
+    pub async fn push_relayed_dm_for_testing(
+        &self,
+        from_peer: ant_quic::PeerId,
+        relayed: peer_relay::RelayedDm,
+    ) -> bool {
+        let Some(ref network) = self.network else {
+            return false;
+        };
+        let sender_agent_id = relayed.header.sender_agent_id;
+        network
+            .test_relayed_dm_sender()
+            .send((from_peer, sender_agent_id, relayed))
+            .await
+            .is_ok()
+    }
+
     /// Create a new collaborative task list bound to a topic.
     ///
     /// Creates a new `TaskList` and binds it to the specified gossip topic
@@ -8875,6 +8911,14 @@ impl AgentBuilder {
             None
         };
 
+        // Load the local revocation set now (shared Arc) so the relay-DM
+        // listener can enforce revocation on inbound relayed envelopes. The
+        // same Arc is moved into the Agent below, so the listener and the
+        // Agent's `/identity/revoke` writes observe one shared set.
+        let revocation_set = std::sync::Arc::new(tokio::sync::RwLock::new(
+            storage::load_revocation_set(self.identity_dir.as_deref()).await,
+        ));
+
         // X0X-0070b: spawn the inbound RelayedDm listener so this Agent can
         // serve as either the final recipient (DeliverLocally) or the
         // intermediate relay (Forward) for peers that fell back to the
@@ -8886,6 +8930,7 @@ impl AgentBuilder {
                 std::sync::Arc::clone(net),
                 std::sync::Arc::clone(&peer_relay),
                 std::sync::Arc::clone(&identity_discovery_cache),
+                std::sync::Arc::clone(&revocation_set),
                 identity.agent_id(),
             );
         }
@@ -8976,8 +9021,6 @@ impl AgentBuilder {
 
         // Load the revocation set from disk so enforcement takes effect
         // immediately on restart, even before the next gossip heartbeat.
-        let revocation_set = storage::load_revocation_set(self.identity_dir.as_deref()).await;
-
         Ok(Agent {
             identity: std::sync::Arc::new(identity),
             network,
@@ -9014,7 +9057,7 @@ impl AgentBuilder {
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
             dm_inbox_service: tokio::sync::Mutex::new(None),
-            revocation_set: std::sync::Arc::new(tokio::sync::RwLock::new(revocation_set)),
+            revocation_set,
             identity_dir: self.identity_dir,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             tracked_tasks: std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
@@ -9620,12 +9663,25 @@ pub const NAME: &str = "x0x";
 /// * [`peer_relay::RelayDisposition::Refuse`] - `debug!` log only.
 ///   [`peer_relay::PeerRelay::disposition_for`] already incremented the
 ///   appropriate `relay_refused_*` counter as a side effect.
+///
+/// # Revocation gate
+///
+/// Before delivering locally or forwarding, the listener checks the
+/// inner envelope's *origin* `sender_agent_id` against `revocation_set`.
+/// This is required because the local-delivery path re-injects the inner
+/// envelope onto the direct-DM channel
+/// ([`network::NetworkNode::inject_inbound_direct`]), which does **not**
+/// run the `dm_inbox` gossip-path revocation gate (#130). Without this
+/// check a revoked agent that cannot direct-connect (e.g. NAT-blocked)
+/// could still reach the recipient via a relay, bypassing revocation.
+/// A revoked origin is dropped and counted as `relay_dropped_revoked`.
 fn spawn_relay_dm_listener(
     network: std::sync::Arc<network::NetworkNode>,
     peer_relay: std::sync::Arc<peer_relay::PeerRelay>,
     identity_discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
+    revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
     local_agent_id: identity::AgentId,
 ) {
     tokio::spawn(async move {
@@ -9644,6 +9700,31 @@ fn spawn_relay_dm_listener(
 
             let now_ms = dm::now_unix_ms();
             let disposition = peer_relay.disposition_for(&relayed, &local_agent_id, now_ms);
+
+            // Revocation gate (PR #177 review, fix 1): the inner envelope's
+            // ML-DSA-65 origin signature is the trust anchor, but a revoked
+            // origin must be dropped even when it arrives via a relay. The
+            // deliver/forward paths do not traverse the dm_inbox revocation
+            // gate, so enforce it here for both, before any delivery.
+            if matches!(
+                disposition,
+                peer_relay::RelayDisposition::DeliverLocally
+                    | peer_relay::RelayDisposition::Forward { .. }
+            ) {
+                let origin = identity::AgentId(relayed.inner.sender_agent_id);
+                let revoked = { revocation_set.read().await.is_agent_revoked(&origin) };
+                if revoked {
+                    peer_relay.record_relay_dropped_revoked();
+                    tracing::info!(
+                        target: "x0x::relay",
+                        stage = "revoked_drop",
+                        relay_peer = ?relay_peer_id,
+                        origin = %hex::encode(origin.as_bytes()),
+                        "relayed DM dropped: origin agent is revoked"
+                    );
+                    continue;
+                }
+            }
 
             match disposition {
                 peer_relay::RelayDisposition::DeliverLocally => {
@@ -10575,6 +10656,7 @@ mod tests {
         let mut net_cfg = loopback_network_config();
         net_cfg.peer_relay = network::PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 7,
             fail_window_ms: 90_000,
             candidates: vec![hex::encode(candidate_a), hex::encode(candidate_b)],
@@ -10676,6 +10758,7 @@ mod tests {
         let mut net_cfg = loopback_network_config();
         net_cfg.peer_relay = network::PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
@@ -10713,6 +10796,7 @@ mod tests {
         let mut net_cfg = loopback_network_config();
         net_cfg.peer_relay = network::PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: vec![candidate_hex],
@@ -10749,6 +10833,7 @@ mod tests {
         let mut net_cfg = loopback_network_config();
         net_cfg.peer_relay = network::PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 5,
             fail_window_ms: 60_000,
             candidates: vec![hex::encode([0xEE_u8; 32])],
@@ -10786,6 +10871,7 @@ mod tests {
         let mut net_cfg = loopback_network_config();
         net_cfg.peer_relay = network::PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
@@ -10882,6 +10968,7 @@ mod tests {
         let mut net_cfg = loopback_network_config();
         net_cfg.peer_relay = network::PeerRelayConfig {
             enabled: true,
+            require_contact_to_relay: false,
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
