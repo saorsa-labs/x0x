@@ -202,12 +202,23 @@ pub enum AclError {
     Invalid { path: String, reason: String },
 }
 
+// ---------------------------------------------------------------------------
+// TOML schema (deny_unknown_fields — mirroring connect::acl)
+// ---------------------------------------------------------------------------
+
+// NOTE: `deny_unknown_fields` is on the `[exec]` section, the allow entries,
+// and the command entries (the security property — a misspelled `enable` vs
+// `enabled`, `comand` vs `command`, or `taregts` vs `targets` fails loudly),
+// but NOT on the root file envelope, so other top-level sections (`[connect]`,
+// `[logging]`, …) may coexist in a future unified config. This mirrors the
+// decision made for `connect::acl::ConnectFileToml` — see ADR-0019.
 #[derive(Debug, Deserialize)]
 struct AclFileToml {
     exec: Option<ExecSectionToml>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExecSectionToml {
     #[serde(default)]
     enabled: bool,
@@ -240,6 +251,7 @@ struct ExecSectionToml {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AllowEntryToml {
     description: Option<String>,
     agent_id: String,
@@ -250,6 +262,7 @@ struct AllowEntryToml {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommandToml {
     argv: Vec<String>,
 }
@@ -933,5 +946,48 @@ argv = ["journalctl", "-u", "x0xd", "-n", "<INT>"]
         assert!(acl
             .match_command(&agent, &machine, &["https://a/../etc".into()])
             .is_none());
+    }
+
+    // ========================================================================
+    // #170 — deny_unknown_fields: misspelled keys in the exec ACL must be a
+    // hard Parse error, never a silent policy deviation.
+    //
+    // In a security allowlist a misspelled field (e.g. `enable` instead of
+    // `enabled`, `comand` instead of `command`) must be caught at load time.
+    // Silently ignoring an unknown key would mean an operator who types
+    // `enable = true` (instead of `enabled = true`) sees exec remain disabled
+    // with no warning — the exact failure mode these tests pin.
+    // ========================================================================
+
+    #[test]
+    fn unknown_key_in_exec_section_is_hard_error() {
+        // `enable` is a common misspelling of `enabled` — must fail loudly.
+        let err = parse_exec_policy(
+            Path::new("/tmp/x"),
+            0,
+            "[exec]\nenabled = true\nenable = true\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AclError::Parse { .. }),
+            "unknown field in [exec] section must be AclError::Parse: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_in_allow_entry_is_hard_error() {
+        // `comand` is a misspelling of `command` — must fail loudly.
+        let toml = format!(
+            "[exec]\nenabled = true\n\
+             [[exec.allow]]\nagent_id = \"{}\"\nmachine_id = \"{}\"\n\
+             comand = \"typo\"\n",
+            id_hex(1),
+            id_hex(2)
+        );
+        let err = parse_exec_policy(Path::new("/tmp/x"), 0, &toml).unwrap_err();
+        assert!(
+            matches!(err, AclError::Parse { .. }),
+            "unknown field in allow entry must be AclError::Parse: {err}"
+        );
     }
 }
