@@ -672,6 +672,7 @@ pub async fn serve_with_options(
         // CLI flag wins over config TOML so operators can override on a
         // single invocation without editing the config file.
         port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
+        peer_relay: config.peer_relay.clone(),
     };
 
     let contacts_path = config.data_dir.join("contacts.json");
@@ -14067,6 +14068,7 @@ async fn direct_send(
                 x0x::dm::DmPath::GossipInbox => "gossip_inbox",
                 x0x::dm::DmPath::RawQuic => "raw_quic",
                 x0x::dm::DmPath::RawQuicAcked => "raw_quic_acked",
+                x0x::dm::DmPath::Relayed { .. } => "relayed",
             };
             tracing::debug!(
                 target: "dm.trace",
@@ -14162,6 +14164,12 @@ async fn direct_send(
                 }
                 x0x::dm::DmError::PublishFailed(_) => {
                     (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed")
+                }
+                x0x::dm::DmError::NoRelayCandidate => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "no_relay_candidate")
+                }
+                x0x::dm::DmError::RelayBuildFailed(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "relay_build_failed")
                 }
             };
             tracing::error!("direct_send failed ({err_kind}): {e}");

@@ -245,6 +245,7 @@ fn dm_path_label(path: DmPath) -> &'static str {
         DmPath::GossipInbox => "gossip_inbox",
         DmPath::RawQuic => "raw_quic",
         DmPath::RawQuicAcked => "raw_quic_acked",
+        DmPath::Relayed { .. } => "relayed",
     }
 }
 
@@ -443,6 +444,7 @@ struct DirectDiagnosticsCounters {
     outgoing_path_loopback: AtomicU64,
     outgoing_path_raw_quic: AtomicU64,
     outgoing_path_gossip_inbox: AtomicU64,
+    outgoing_path_relayed: AtomicU64,
     incoming_envelopes_total: AtomicU64,
     incoming_decode_failed: AtomicU64,
     incoming_signature_failed: AtomicU64,
@@ -488,6 +490,8 @@ pub struct DmDiagnosticsStats {
     pub outgoing_path_loopback: u64,
     pub outgoing_path_raw_quic: u64,
     pub outgoing_path_gossip_inbox: u64,
+    /// X0X-0070b: outgoing DMs delivered via the application-level peer relay.
+    pub outgoing_path_relayed: u64,
     pub incoming_envelopes_total: u64,
     pub incoming_decode_failed: u64,
     pub incoming_signature_failed: u64,
@@ -837,6 +841,11 @@ impl DirectMessaging {
                     .outgoing_path_gossip_inbox
                     .fetch_add(1, Ordering::Relaxed);
             }
+            DmPath::Relayed { .. } => {
+                self.diagnostics
+                    .outgoing_path_relayed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         let path_label = dm_path_label(path);
         self.with_peer_diagnostics(agent_id, |peer| {
@@ -919,6 +928,10 @@ impl DirectMessaging {
             outgoing_path_gossip_inbox: self
                 .diagnostics
                 .outgoing_path_gossip_inbox
+                .load(Ordering::Relaxed),
+            outgoing_path_relayed: self
+                .diagnostics
+                .outgoing_path_relayed
                 .load(Ordering::Relaxed),
             incoming_envelopes_total: self
                 .diagnostics

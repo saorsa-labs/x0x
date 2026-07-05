@@ -175,6 +175,15 @@ pub struct DaemonConfig {
     #[serde(default = "default_port_mapping_enabled")]
     pub(super) port_mapping_enabled: bool,
 
+    /// X0X-0070b: peer-relay fallback configuration (TOML `[peer_relay]`).
+    /// Defaults to disabled — opt in by setting `peer_relay.enabled = true`
+    /// and listing relay-candidate hex agent IDs under
+    /// `peer_relay.candidates`. The relay path only activates when a direct
+    /// DM crosses the failure threshold; the happy path allocates nothing
+    /// extra.
+    #[serde(default)]
+    pub(super) peer_relay: x0x::network::PeerRelayConfig,
+
     /// Update configuration.
     #[serde(default)]
     pub(super) update: DaemonUpdateConfig,
@@ -411,6 +420,7 @@ impl Default for DaemonConfig {
                 .filter_map(|s| s.parse().ok())
                 .collect(),
             port_mapping_enabled: default_port_mapping_enabled(),
+            peer_relay: x0x::network::PeerRelayConfig::default(),
             update: DaemonUpdateConfig::default(),
             gossip: x0x::gossip::GossipConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),

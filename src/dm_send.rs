@@ -1,8 +1,8 @@
 //! Sender-side gossip DM path (phase 4 of `docs/design/dm-over-gossip.md`).
 
 use crate::dm::{
-    dm_inbox_topic, now_unix_ms, DmAckOutcome, DmEnvelope, DmError, DmPath, DmReceipt,
-    DmSendConfig, EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_VERSION, MAX_PAYLOAD_BYTES,
+    dm_inbox_topic, now_unix_ms, DmAckOutcome, DmError, DmPath, DmReceipt, DmSendConfig,
+    EnvelopeBuilder, InFlightAcks, MAX_PAYLOAD_BYTES,
 };
 use crate::dm_inbox::{DmInboxService, DM_BUS_TOPIC};
 use crate::error::IdentityError;
@@ -86,31 +86,17 @@ pub async fn send_via_gossip(
 
     let created = now_unix_ms();
     let expires = created.saturating_add(DEFAULT_ENVELOPE_LIFETIME_MS);
-    let body = EnvelopeBuilder::build_payload_body(
-        &request_id,
-        self_agent_id.as_bytes(),
-        recipient_agent_id.as_bytes(),
-        created,
-        payload,
-        None,
-        recipient_kem_public_key,
-    )
-    .map_err(map_identity_err)?;
-    let mut envelope = DmEnvelope {
-        protocol_version: DM_PROTOCOL_VERSION,
+    let envelope = EnvelopeBuilder::build_payload_envelope(
         request_id,
-        sender_agent_id: *self_agent_id.as_bytes(),
-        sender_machine_id: *self_machine_id.as_bytes(),
-        recipient_agent_id: *recipient_agent_id.as_bytes(),
-        created_at_unix_ms: created,
-        expires_at_unix_ms: expires,
-        body,
-        signature: Vec::new(),
-    };
-    let signed = envelope.signed_bytes().map_err(map_identity_err)?;
-    envelope.signature = signing
-        .sign(&signed)
-        .map_err(|e| DmError::EnvelopeConstruction(format!("sign: {e}")))?;
+        &self_agent_id,
+        &self_machine_id,
+        &recipient_agent_id,
+        recipient_kem_public_key,
+        created,
+        expires,
+        payload,
+        |bytes| signing.sign(bytes).map_err(|e| e.to_string()),
+    )?;
     let wire = envelope.to_wire_bytes().map_err(map_identity_err)?;
     let topic = DmInboxService::inbox_topic_name(&recipient_agent_id);
     let topic_id = dm_inbox_topic(&recipient_agent_id);
@@ -497,7 +483,7 @@ impl Drop for InFlightGuard {
     }
 }
 
-fn fresh_request_id() -> [u8; 16] {
+pub(crate) fn fresh_request_id() -> [u8; 16] {
     use rand::RngCore;
     let mut rid = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut rid);
