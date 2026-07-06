@@ -38,8 +38,18 @@
 //! **Trust annotations.** Each message also carries a `trust_decision` field
 //! from [`TrustEvaluator`](crate::trust::TrustEvaluator), reflecting the
 //! full trust evaluation including contact store trust level and machine
-//! pinning. Messages are never dropped — applications inspect these fields
-//! to decide how to handle each message.
+//! pinning. Messages are never dropped on *trust* grounds — applications
+//! inspect these fields to decide how to handle each message.
+//!
+//! **Revocation is the single exception** (issue #179). A valid revocation is
+//! positive knowledge of a compromised key, and the project fails closed on it
+//! everywhere (EP3 in `dm_inbox`, EP4 in `server/mod`, the relay gate in
+//! `peer_relay`). The raw-QUIC direct listener mirrors that: a DM whose sender
+//! agent or originating machine is revoked is dropped before delivery by
+//! [`inbound_peer_revoked`]. EP5 (`Agent::evict_revoked_subject`) purges caches
+//! and sets trust `Blocked`, but does not close the live QUIC connection — so
+//! without this per-message gate a revoked peer on an established connection
+//! would keep delivering (annotated unverified, but delivered).
 //!
 //! ## Example
 //!
@@ -94,6 +104,29 @@ const DIRECT_DIAGNOSTICS_MIN_RETAIN: usize = 1024;
 /// reconcile against the lifecycle table by calling
 /// [`DirectMessaging::current_generation`] after a lag.
 const LIFECYCLE_REPLACED_BROADCAST_CAPACITY: usize = 256;
+
+/// Direct-path inbound revocation gate (issue #179).
+///
+/// Mirrors EP3 (`dm_inbox::drop_if_sender_revoked`) and the relay gate
+/// (`peer_relay`): a DM arriving over a LIVE direct QUIC connection is
+/// dropped when EITHER the sender agent OR the originating machine is in
+/// the local revocation set. The originating `machine_id` is the
+/// transport-authenticated QUIC peer; `sender` is the agent id parsed from
+/// the envelope prefix.
+///
+/// EP5 (`Agent::evict_revoked_subject`) purges caches and sets trust
+/// `Blocked` but does NOT close the live connection, so without this
+/// per-message check a revoked peer on an established connection keeps
+/// delivering (annotated unverified, but delivered). Revocation is positive
+/// knowledge of compromise — the project fails closed on it everywhere.
+#[must_use]
+pub(crate) fn inbound_peer_revoked(
+    revoked: &crate::revocation::RevocationSet,
+    sender: &AgentId,
+    machine_id: &MachineId,
+) -> bool {
+    revoked.is_agent_revoked(sender) || revoked.is_machine_revoked(machine_id)
+}
 
 #[doc(hidden)]
 pub struct RawQuicAckRaceTestHook {
@@ -1335,6 +1368,67 @@ mod tests {
 
         let other = dm_payload_digest_hex(b"different");
         assert_ne!(other, digest);
+    }
+
+    #[test]
+    fn inbound_peer_revoked_fails_closed_for_agent_or_machine() {
+        // Issue #179: the direct-path gate must drop a DM whose sender agent
+        // OR originating machine is revoked (mirrors EP3 + the relay gate).
+        // Self-revocations verify from the record alone (issuer == subject),
+        // so no certificate is needed.
+        use crate::identity::{AgentKeypair, MachineKeypair};
+        use crate::revocation::{RevocationRecord, RevocationSet, RevokedSubject};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let revoked_agent = AgentKeypair::generate().unwrap();
+        let revoked_machine = MachineKeypair::generate().unwrap();
+        let clean_agent = AgentId([7u8; 32]);
+        let clean_machine = MachineId([8u8; 32]);
+
+        let mut set = RevocationSet::new();
+        set.verify_and_insert(
+            RevocationRecord::sign(
+                RevokedSubject::Agent(revoked_agent.agent_id()),
+                revoked_agent.public_key(),
+                revoked_agent.secret_key(),
+                now,
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        set.verify_and_insert(
+            RevocationRecord::sign(
+                RevokedSubject::Machine(revoked_machine.machine_id()),
+                revoked_machine.public_key(),
+                revoked_machine.secret_key(),
+                now,
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+        // Revoked agent ⇒ drop regardless of machine.
+        assert!(
+            inbound_peer_revoked(&set, &revoked_agent.agent_id(), &clean_machine),
+            "revoked agent must be dropped on the direct path"
+        );
+        // Revoked machine ⇒ drop regardless of agent.
+        assert!(
+            inbound_peer_revoked(&set, &clean_agent, &revoked_machine.machine_id()),
+            "revoked machine must be dropped on the direct path"
+        );
+        // Neither revoked ⇒ allow.
+        assert!(
+            !inbound_peer_revoked(&set, &clean_agent, &clean_machine),
+            "a clean (agent, machine) pair must not be dropped"
+        );
     }
 
     #[test]

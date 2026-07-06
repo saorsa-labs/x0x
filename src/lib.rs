@@ -7829,6 +7829,7 @@ impl Agent {
         let dm = std::sync::Arc::clone(&self.direct_messaging);
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
+        let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let token = self.shutdown_token.clone();
 
         self.spawn_tracked(async move {
@@ -7926,6 +7927,32 @@ impl Agent {
                     trust_decision = ?trust_decision,
                     "direct message received; dispatching to subscribers"
                 );
+
+                // Enforcement point — direct path revocation gate (issue #179).
+                // Mirrors EP3 (dm_inbox) + the relay gate (peer_relay). EP5
+                // (evict_revoked_subject) purges caches + sets trust=Blocked
+                // but does NOT close the live QUIC connection, so without this
+                // per-message check a revoked peer on an established direct
+                // connection would keep delivering (annotated unverified, but
+                // delivered). Fail closed: drop + count, never reach
+                // mark_connected/handle_incoming. Read lock is held only for
+                // the boolean — no await under it (same contract as EP4).
+                let peer_revoked = {
+                    let revoked = revocation_set.read().await;
+                    direct::inbound_peer_revoked(&revoked, &sender, &machine_id)
+                };
+                if peer_revoked {
+                    dm.record_incoming_dropped_revoked();
+                    tracing::info!(
+                        target: "x0x::direct",
+                        stage = "recv",
+                        sender_prefix = %network::hex_prefix(&sender.0, 4),
+                        machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                        outcome = "drop_revoked",
+                        "direct message from revoked sender dropped (direct-path revocation gate, mirrors EP3)"
+                    );
+                    continue;
+                }
 
                 // Register and mark the sender as connected for future reverse direct sends.
                 dm.mark_connected(sender, machine_id).await;
