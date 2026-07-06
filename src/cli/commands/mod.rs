@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod exec;
 pub mod files;
 pub mod find;
+pub mod forward;
 pub mod group;
 pub mod groups;
 pub mod identity;

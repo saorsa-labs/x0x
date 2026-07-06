@@ -316,6 +316,13 @@ enum Commands {
         #[command(subcommand)]
         sub: IdentitySub,
     },
+    /// Tailnet port-forwarding (`ssh -L` over x0x byte-streams).
+    Forward {
+        #[command(subcommand)]
+        sub: ForwardSub,
+    },
+    /// Active byte-stream + connect-ACL diagnostics.
+    Streams,
 }
 
 // ── Nested subcommands ──────────────────────────────────────────────────
@@ -479,6 +486,33 @@ enum IdentitySub {
     },
     /// List all revocation records held by this daemon.
     Revocations,
+}
+
+/// `x0x forward` sub-actions.
+#[derive(Subcommand)]
+enum ForwardSub {
+    /// Add a local port forward to a peer's loopback service.
+    Add {
+        /// Local bind address, e.g. `127.0.0.1:8022`.
+        #[arg(long)]
+        local: String,
+        /// Peer agent id (hex).
+        #[arg(long)]
+        peer: String,
+        /// Loopback target host on the peer (numeric IP). Default `127.0.0.1`.
+        #[arg(long)]
+        target: Option<String>,
+        /// Loopback target port on the peer.
+        #[arg(long)]
+        target_port: u16,
+    },
+    /// List registered forwards.
+    List,
+    /// Remove a forward by its local bind address.
+    Remove {
+        /// Local bind address, e.g. `127.0.0.1:8022`.
+        local_addr: String,
+    },
 }
 
 /// Remote exec sub-actions (`x0x exec sessions`, `x0x exec cancel <id>`).
@@ -1815,6 +1849,28 @@ async fn run(
             }
             IdentitySub::Revocations => commands::identity::revocations(&client).await,
         },
+        Commands::Forward { sub } => match sub {
+            ForwardSub::Add {
+                local,
+                peer,
+                target,
+                target_port,
+            } => {
+                commands::forward::add(
+                    &client,
+                    &local,
+                    &peer,
+                    target.as_deref().unwrap_or("127.0.0.1"),
+                    target_port,
+                )
+                .await
+            }
+            ForwardSub::List => commands::forward::list(&client).await,
+            ForwardSub::Remove { local_addr } => {
+                commands::forward::remove(&client, &local_addr).await
+            }
+        },
+        Commands::Streams => commands::forward::streams(&client).await,
         Commands::Routes { .. }
         | Commands::Tree
         | Commands::Uninstall

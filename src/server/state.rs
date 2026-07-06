@@ -576,6 +576,10 @@ pub(super) struct AppState {
     /// `/diagnostics/connect`. Counters read 0 until the T4 forwarder
     /// (issue #132) wires calls to `record_allowed`/`record_denied`.
     pub(super) connect_diagnostics: Arc<x0x::connect::ConnectDiagnostics>,
+    /// Tailnet forwarder service (#132 T4/T6): owns the inbound connect-gated
+    /// consumer + outbound local-port listeners. `None` when connect is
+    /// disabled (no policy) so the daemon runs zero forwarder tasks.
+    pub(super) forward_service: Option<Arc<x0x::forward::ForwardService>>,
 }
 
 #[derive(Clone)]

@@ -409,16 +409,30 @@ async fn write_header<W: tokio::io::AsyncWrite + Unpin>(
 // ===========================================================================
 
 /// A registered local forward (`forward add`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ForwardSpec {
     /// Local loopback address the daemon binds (`127.0.0.1:PORT`).
     pub local_addr: SocketAddr,
-    /// Peer agent to tunnel to.
+    /// Peer agent to tunnel to (hex).
     pub peer_agent: AgentId,
     /// Loopback target host on the peer's machine (numeric IP).
     pub target_host: String,
     /// Loopback target port.
     pub target_port: u16,
+}
+
+impl ForwardSpec {
+    /// The peer agent id as a hex string (for REST/CLI display).
+    #[must_use]
+    pub fn peer_agent_hex(&self) -> String {
+        hex::encode(self.peer_agent.as_bytes())
+    }
+}
+
+/// A registered forward + its cancellation token (internal).
+struct ForwardEntry {
+    spec: ForwardSpec,
+    cancel: CancellationToken,
 }
 
 /// Owns the inbound forward consumer + the outbound local listeners.
@@ -433,8 +447,9 @@ pub struct ForwardService {
     policy: Arc<ConnectPolicy>,
     connect_diag: Arc<ConnectDiagnostics>,
     fwd_diag: Arc<ForwardDiagnostics>,
-    /// Per-forward cancellation tokens so `shutdown` tears down listeners.
-    forwards: std::sync::Mutex<Vec<(SocketAddr, CancellationToken)>>,
+    /// Registered forwards (spec + cancellation) so `shutdown` / `remove` can
+    /// tear down individual listeners and `list` can return them.
+    forwards: std::sync::Mutex<Vec<ForwardEntry>>,
     inbound_token: CancellationToken,
 }
 
@@ -515,7 +530,10 @@ impl ForwardService {
             .map_err(|e| NetworkError::ConnectionFailed(format!("local_addr: {e}")))?;
         let cancel = CancellationToken::new();
         if let Ok(mut forwards) = self.forwards.lock() {
-            forwards.push((bound, cancel.clone()));
+            forwards.push(ForwardEntry {
+                spec: spec.clone(),
+                cancel: cancel.clone(),
+            });
         }
 
         let agent = Arc::clone(&self.agent);
@@ -561,12 +579,38 @@ impl ForwardService {
         Ok(bound)
     }
 
+    /// Snapshot of registered forwards (for `GET /forwards` / `x0x forward list`).
+    #[must_use]
+    pub fn list_forwards(&self) -> Vec<ForwardSpec> {
+        self.forwards
+            .lock()
+            .map(|f| f.iter().map(|e| e.spec.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove a forward by its bound local address. Cancels the listener.
+    /// Returns `true` if a forward was removed.
+    pub fn remove_forward(&self, local_addr: SocketAddr) -> bool {
+        let mut removed = false;
+        if let Ok(mut forwards) = self.forwards.lock() {
+            if let Some(pos) = forwards
+                .iter()
+                .position(|e| e.spec.local_addr == local_addr)
+            {
+                forwards[pos].cancel.cancel();
+                forwards.remove(pos);
+                removed = true;
+            }
+        }
+        removed
+    }
+
     /// Tear down every listener + the inbound consumer.
     pub fn shutdown(&self) {
         self.inbound_token.cancel();
         if let Ok(forwards) = self.forwards.lock() {
-            for (_, cancel) in forwards.iter() {
-                cancel.cancel();
+            for entry in forwards.iter() {
+                entry.cancel.cancel();
             }
         }
     }
