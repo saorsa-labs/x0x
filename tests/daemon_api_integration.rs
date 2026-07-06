@@ -2354,3 +2354,80 @@ async fn daemon_api_invalid_json() {
         r.status() == StatusCode::BAD_REQUEST || r.status() == StatusCode::UNPROCESSABLE_ENTITY
     );
 }
+
+// ===========================================================================
+// Tailnet forwarding (#132 T6) — endpoints exist + respond correctly under
+// the default (connect-disabled) daemon. The full forward round-trip is
+// proven by tests/tailnet_streams_integration.rs + the VPS harness; these
+// cover the REST contract the API parity gate requires.
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_forwards_add_disabled() {
+    // Default daemon has no connect ACL → connect disabled → POST /forwards
+    // must fail closed with 409, never silently accept.
+    let d = daemon().await;
+    let body = serde_json::json!({
+        "local_addr": "127.0.0.1:18022",
+        "peer_agent": "00".repeat(32),
+        "target_host": "127.0.0.1",
+        "target_port": 22,
+    });
+    let r = ca(&d)
+        .post(d.url("/forwards"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::CONFLICT,
+        "forward add must 409 when connect is disabled"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_forwards_list() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/forwards"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["forwards"].as_array().map(|a| a.len()), Some(0));
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_forwards_remove_disabled() {
+    // connect disabled → DELETE /forwards/:addr returns 409 (no forwarder).
+    let d = daemon().await;
+    let r = ca(&d)
+        .delete(d.url("/forwards/127.0.0.1:18022"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_streams() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/streams"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["active_streams"], 0);
+    assert_eq!(r["connect_failed"], 0);
+    assert!(r["connect"].is_object(), "connect-ACL snapshot present");
+}

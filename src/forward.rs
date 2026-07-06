@@ -9,7 +9,7 @@
 //! - **Outbound (the local listener side):** each accepted local TCP
 //!   connection opens a `ForwardV1` stream to the peer
 //!   ([`crate::Agent::open_peer_stream`], which already enforces the
-//!   identity gate), writes the [`ForwardHeader`], waits for the peer's
+//!   identity gate), writes the `ForwardHeader`, waits for the peer's
 //!   response, and on `connected` bridges the two with `tokio::io::copy`.
 //! - **Inbound (the peer's accept side — security-critical):** consumes
 //!   `ForwardV1` streams from [`crate::Agent::next_incoming_stream`], reads
@@ -107,7 +107,7 @@ impl ForwardHeader {
     /// - [`ForwardError::Truncated`] — not enough bytes for the length prefix
     ///   or the announced body.
     /// - [`ForwardError::Oversize`] — announced length exceeds
-    ///   [`MAX_HEADER_BYTES`].
+    ///   `MAX_HEADER_BYTES`.
     /// - [`ForwardError::Decode`] — bincode deserialization failed.
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), ForwardError> {
         if buf.len() < 4 {
@@ -238,7 +238,7 @@ pub struct ForwardDiagnostics {
     /// and the forwarder's header read (FIX 4, stale-authorization window).
     revoked_mid_flight: AtomicU64,
     /// Streams reset because the forward header did not arrive within
-    /// [`HEADER_READ_TIMEOUT`] (FIX 2).
+    /// `HEADER_READ_TIMEOUT` (FIX 2).
     header_timeout: AtomicU64,
 }
 
@@ -459,7 +459,7 @@ async fn bridge(tcp: TcpStream, mut send: HighLevelSendStream, mut recv: HighLev
     let _ = tokio::join!(to_stream, from_stream);
 }
 
-/// Read a length-prefixed [`ForwardHeader`] from an async reader.
+/// Read a length-prefixed `ForwardHeader` from an async reader.
 async fn read_header<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<ForwardHeader, ForwardError> {
@@ -479,7 +479,7 @@ async fn read_header<R: tokio::io::AsyncRead + Unpin>(
     bincode::deserialize(&body).map_err(|e| ForwardError::Decode(e.to_string()))
 }
 
-/// Write a length-prefixed [`ForwardHeader`] to an async writer.
+/// Write a length-prefixed `ForwardHeader` to an async writer.
 async fn write_header<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     header: &ForwardHeader,
@@ -525,10 +525,10 @@ struct ForwardEntry {
 /// Owns the inbound forward consumer + the outbound local listeners.
 ///
 /// The inbound loop is the sole consumer of `ForwardV1` streams surfaced by
-/// [`crate::Agent::next_incoming_stream`]; each is gated by [`handle_inbound`]
+/// [`crate::Agent::next_incoming_stream`]; each is gated by `handle_inbound`
 /// (resolve → `evaluate_connect_gate` → connect loopback → bridge). Outbound
 /// listeners (`add_forward`) accept local TCP, open a peer stream, write the
-/// [`ForwardHeader`], and bridge on `connected`.
+/// `ForwardHeader`, and bridge on `connected`.
 pub struct ForwardService {
     agent: Arc<crate::Agent>,
     policy: Arc<ConnectPolicy>,
@@ -656,7 +656,7 @@ impl ForwardService {
     }
 
     /// Start the inbound consumer loop. Spawns a task that surfaces
-    /// `ForwardV1` streams to [`handle_inbound`]. Returns immediately.
+    /// `ForwardV1` streams to `handle_inbound`. Returns immediately.
     pub fn spawn_inbound(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let token = self.inbound_token.clone();
@@ -716,7 +716,7 @@ impl ForwardService {
     /// `connected`. Returns the bound local address (useful when port = 0).
     ///
     /// # Errors
-    /// [`NetworkError`] if the local listener cannot be bound.
+    /// `NetworkError` if the local listener cannot be bound.
     pub async fn add_forward(&self, spec: ForwardSpec) -> NetworkResult<SocketAddr> {
         let listener = TcpListener::bind(spec.local_addr).await.map_err(|e| {
             NetworkError::ConnectionFailed(format!("bind {}: {e}", spec.local_addr))

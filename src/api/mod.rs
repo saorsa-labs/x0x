@@ -1042,6 +1042,35 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Open the embedded GUI",
         category: "websocket",
     },
+    // ── Tailnet forwarding (#132 T6) ────────────────────────────────────
+    EndpointDef {
+        method: Method::Post,
+        path: "/forwards",
+        cli_name: "forward add",
+        description: "Add a local port forward to a peer's loopback service",
+        category: "connect",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/forwards",
+        cli_name: "forward list",
+        description: "List registered port forwards",
+        category: "connect",
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/forwards/:local_addr",
+        cli_name: "forward rm",
+        description: "Remove a port forward by its local bind address",
+        category: "connect",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/streams",
+        cli_name: "streams",
+        description: "Active forward-stream count + connect-ACL counters",
+        category: "connect",
+    },
 ];
 
 /// Find an endpoint by its CLI name.

@@ -18,7 +18,7 @@
 //! [protocol: u8][protocol-specific bytes...]
 //! ```
 //!
-//! `0x00` is reserved (treated as unknown → reset). See [`StreamProtocol`].
+//! `0x00` is reserved (treated as unknown → reset). See `StreamProtocol`.
 //!
 //! ## Identity gate — fail closed, in fixed order
 //!
@@ -38,7 +38,7 @@
 //!    revocation set (positive knowledge of compromise fails closed, mirroring
 //!    EP3 / EP4 / the relay and direct-DM gates).
 //!
-//! Any failure produces a typed [`NetworkError`] (`PeerNotVerified` /
+//! Any failure produces a typed `NetworkError` (`PeerNotVerified` /
 //! `PeerTrustRejected` / `PeerRevoked`) and the stream is refused or reset
 //! with zero application bytes exchanged. This chokepoint is what makes the
 //! T4 inbound forwarder safe by construction: it receives only streams that

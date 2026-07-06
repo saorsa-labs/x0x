@@ -509,6 +509,7 @@ enum ForwardSub {
     /// List registered forwards.
     List,
     /// Remove a forward by its local bind address.
+    #[command(alias = "rm")]
     Remove {
         /// Local bind address, e.g. `127.0.0.1:8022`.
         local_addr: String,

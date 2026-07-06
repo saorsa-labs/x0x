@@ -429,6 +429,15 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/ws/direct", ws_direct_endpoint),
     covered!(Get, "/ws/sessions", daemon_api_ws_sessions),
     covered!(Get, "/gui", gui_html_contains_brand),
+    // ── Tailnet forwarding (#132 T6) ────────────────────────────────────
+    covered!(Post, "/forwards", daemon_api_forwards_add_disabled),
+    covered!(Get, "/forwards", daemon_api_forwards_list),
+    covered!(
+        Delete,
+        "/forwards/:local_addr",
+        daemon_api_forwards_remove_disabled
+    ),
+    covered!(Get, "/streams", daemon_api_streams),
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
