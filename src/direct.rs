@@ -46,7 +46,7 @@
 //! everywhere (EP3 in `dm_inbox`, EP4 in `server/mod`, the relay gate in
 //! `peer_relay`). The raw-QUIC direct listener mirrors that: a DM whose sender
 //! agent or originating machine is revoked is dropped before delivery by
-//! [`inbound_peer_revoked`]. EP5 (`Agent::evict_revoked_subject`) purges caches
+//! `inbound_peer_revoked`. EP5 (`Agent::evict_revoked_subject`) purges caches
 //! and sets trust `Blocked`, but does not close the live QUIC connection — so
 //! without this per-message gate a revoked peer on an established connection
 //! would keep delivering (annotated unverified, but delivered).
