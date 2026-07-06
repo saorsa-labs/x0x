@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.28.0
+version: 0.29.0
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -87,7 +87,7 @@ For security details (algorithms, RFCs, key pinning), see [docs/security.md](htt
 x0x is a foundation you build on:
 
 - **Agent work orchestration (Symphony)** — replicated **TaskList CRDTs** (`/task-lists`, `/stores`), MLS group encryption, and a built-in **GUI board view** (state columns, badges, approve/deny actions) make x0x the decentralized backbone for agent work orchestration. The [x0x-symphony](https://github.com/saorsa-labs) runner rides these existing primitives over x0xd's local REST/WebSocket API — no extra services, no new crates. See [docs/symphony-integration.md](https://github.com/saorsa-labs/x0x/blob/main/docs/symphony-integration.md).
-- **Direct machine-to-machine connectivity (Tailnet)** — _in active development, shipping in an upcoming release:_ connect your own computers over any network (home, mobile, hotel) and forward a local TCP port or SOCKS5 to a service on a peer machine, Tailscale-style, over the same post-quantum QUIC transport. Default-deny and loopback-scoped, gated by a per-connection access policy plus the identity key-lifecycle (expiry + revocation). Tracked in [#132](https://github.com/saorsa-labs/x0x/issues/132).
+- **Direct machine-to-machine connectivity (Tailnet)** — _available (Phase 1):_ connect your own computers over any network (home, mobile, hotel) and forward a local TCP port to a loopback service on a peer machine, Tailscale-style, over the same post-quantum QUIC transport. Default-deny and loopback-scoped, gated by a per-connection access policy plus the identity key-lifecycle (expiry + revocation). SOCKS5 forwarding is planned for a later phase. Manage forwards via `/forwards` (`x0x forward add|list|rm`). Tracked in [#132](https://github.com/saorsa-labs/x0x/issues/132).
 
 ## Identity: Three Layers
 

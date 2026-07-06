@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.29.0] - 2026-07-07
+
+### Added
+
+- **Tailnet Phase 1: per-peer byte streams + connect-gated port forwarding ([#132](https://github.com/saorsa-labs/x0x/issues/132), [#183](https://github.com/saorsa-labs/x0x/pull/183), [ADR-0020](docs/adr/0020-tailnet-phase-1-byte-streams-and-forwarding.md)).** A per-peer byte-stream API over ant-quic's `open_bi`/`accept_bi`, plus a local TCP port-forwarder (`/forwards`, `x0x forward add|list|rm`) that tunnels a loopback port to a loopback service on a trusted peer — Tailscale-style machine-to-machine connectivity over the same post-quantum QUIC transport. This wires the previously-dormant connect ACL ([#131](https://github.com/saorsa-labs/x0x/issues/131), shipped in v0.28.0) as its first runtime caller: every inbound forward is gated fail-closed through the full chain (sender verified → not revoked → trust `Accept` → connect enabled → target loopback → `(agent, machine)` pair in the ACL → target in the entry). Denials reach zero bytes to the target. SOCKS5 forwarding is deferred to a later phase.
+
+### Security
+
+- **DoS hardening on the byte-stream accept + forward paths ([#183](https://github.com/saorsa-labs/x0x/pull/183)).** The inbound accept loop dispatches each stream to a per-stream task (no head-of-line blocking) with a bounded protocol-prefix read; the forwarder bounds its header read with a timeout and a fixed maximum header size; inbound and outbound concurrency are capped globally and per-peer (RAII admission slots released on drop); and `handle_inbound` re-checks the revocation set before reading any peer bytes, closing the accept-to-header stale-authorization window. The fail-closed properties were confirmed by two independent adversarial reviews and a full-ring VPS soak (real-WAN forward round-trip plus `target_not_allowed` and `target_not_loopback` deny proofs observed firing at the gate).
+
 ## [v0.28.0] - 2026-07-04
 
 ### Upgrade notes
