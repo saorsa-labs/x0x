@@ -131,10 +131,20 @@ impl CapabilityStore {
 
     /// Look up a peer's capability. Returns `None` if unknown or expired.
     pub fn lookup(&self, agent_id: &AgentId) -> Option<DmCapabilities> {
+        self.lookup_at(agent_id, Instant::now())
+    }
+
+    /// Look up a peer's capability as of `now`.
+    ///
+    /// Test seam over [`lookup`](Self::lookup): production callers always go
+    /// through [`lookup`](Self::lookup), which passes `Instant::now()`.
+    /// Exposing the clock lets the TTL-expiry unit test advance time
+    /// deterministically instead of sleeping past a wall-clock boundary —
+    /// the documented CI flake for that assertion (issue: CI de-flake).
+    pub fn lookup_at(&self, agent_id: &AgentId, now: Instant) -> Option<DmCapabilities> {
         let Ok(mut inner) = self.inner.lock() else {
             return None;
         };
-        let now = Instant::now();
         let entry = inner.get(agent_id.as_bytes())?;
         if now.duration_since(entry.seen_at) > self.ttl {
             inner.remove(agent_id.as_bytes());
@@ -254,12 +264,12 @@ mod tests {
 
     #[test]
     fn capability_store_expires_on_ttl() {
-        // TTL is set to 1 s so that CI scheduling jitter (which can be
-        // hundreds of milliseconds on a loaded runner) cannot push the
-        // first lookup past the TTL boundary before the "present" assertion
-        // runs.  The expiry assertion sleeps for 2.5× the TTL, which is
-        // well past the expiry window on any realistic machine.
-        let store = CapabilityStore::with_ttl(Duration::from_secs(1));
+        // Deterministic: insert records `seen_at ≈ now`, then the test
+        // queries `lookup_at` at a synthetic future instant past the TTL.
+        // No wall-clock sleep is involved, so CI scheduling jitter can never
+        // push the "present" lookup past the TTL boundary — the prior flake.
+        let ttl = Duration::from_secs(60);
+        let store = CapabilityStore::with_ttl(ttl);
         let agent_id = AgentId([3u8; 32]);
         let machine_id = MachineId([4u8; 32]);
         store.insert(
@@ -268,12 +278,19 @@ mod tests {
             DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
             1_000,
         );
-        // Must be present immediately after insert (1 s TTL gives ample room).
-        assert!(store.lookup(&agent_id).is_some());
-        // Sleep well past the TTL so the entry is definitely stale.
-        std::thread::sleep(Duration::from_millis(2_500));
-        // Must be absent after expiry.
-        assert!(store.lookup(&agent_id).is_none());
+        // `seen_at` was captured inside `insert` just before this point, so a
+        // lookup at "now" is well within the TTL.
+        let now = Instant::now();
+        assert!(
+            store.lookup_at(&agent_id, now).is_some(),
+            "entry must be present within the TTL"
+        );
+        // Advance a deterministic span past the TTL and re-query.
+        let after_ttl = now + ttl + Duration::from_millis(1);
+        assert!(
+            store.lookup_at(&agent_id, after_ttl).is_none(),
+            "entry must be evicted once the TTL elapses"
+        );
     }
 
     #[test]

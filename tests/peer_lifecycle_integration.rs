@@ -291,6 +291,7 @@ async fn peer_probe_returns_400_on_invalid_peer_id() {
 // /peers/:peer_id/health — connection health snapshot
 // ---------------------------------------------------------------------------
 
+#[ignore = "daemon-backed + wait_for_peer convergence (15s budget) flakes under CI scheduling load; runs in the integration tier"]
 #[tokio::test]
 async fn peer_health_snapshot_observable_for_live_peer() {
     let _guard = peer_lifecycle_lock();
@@ -506,6 +507,7 @@ async fn direct_send_with_require_ack_round_trips_to_live_peer() {
     );
 }
 
+#[ignore = "daemon-backed direct-send over a live peer; transient connection/convergence under CI load flakes the always-on Test Suite; runs in the integration tier"]
 #[tokio::test]
 async fn direct_send_without_require_ack_omits_ack_block() {
     let _guard = peer_lifecycle_lock();
