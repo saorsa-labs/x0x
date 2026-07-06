@@ -724,4 +724,29 @@ Connect-ACL policy summary and allow/deny counters. Counters read `0` until the 
 
 See `docs/connect-acl.md` for full documentation including the `denial_breakdown` key reference.
 
+
+## Tailnet port-forwarding (#132)
+
+Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs only when a connect ACL is loaded (see `docs/connect-acl.md`); a peer's inbound forward is gated by the connect ACL + the key lifecycle before any local `TcpStream::connect`. Phase 1 targets are loopback-only numeric IPs.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/forwards` | `x0x forward add` | Register a local loopback listener that tunnels to a peer's loopback service |
+| GET | `/forwards` | `x0x forward list` | List registered forwards |
+| DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address |
+| GET | `/streams` | `x0x streams` | Active forward-stream count + connect-failed counter + connect-ACL snapshot |
+
+### `POST /forwards` request body
+
+```json
+{
+  "local_addr": "127.0.0.1:8022",
+  "peer_agent": "<peer agent id hex>",
+  "target_host": "127.0.0.1",
+  "target_port": 22
+}
+```
+
+`local_addr` must be loopback; `target_host` must be a numeric loopback IP (no DNS). Returns `409` when connect is disabled (no ACL loaded). The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
+
 See also: [docs/api.md](api.md), [troubleshooting.md](troubleshooting.md), [patterns.md](patterns.md)
