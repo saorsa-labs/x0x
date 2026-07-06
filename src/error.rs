@@ -231,6 +231,38 @@ pub enum NetworkError {
     /// Stream operation failed.
     #[error("stream error: {0}")]
     StreamError(String),
+    /// Tailnet byte-stream: the requested stream protocol prefix is unknown.
+    /// Returned by the accept path when the opener's first byte is not a
+    /// recognised [`crate::streams::StreamProtocol`]; the stream is reset.
+    #[error("unknown stream protocol byte: 0x{protocol_byte:02x}")]
+    StreamProtocolUnknown {
+        /// The rejected protocol prefix byte.
+        protocol_byte: u8,
+    },
+    /// Tailnet byte-stream identity gate: the peer's AgentId→MachineId binding
+    /// is not verified (absent from the discovery cache, or a mismatch). The
+    /// stream is refused before any application byte is sent or read.
+    #[error("stream peer not verified: agent {agent_id:?}")]
+    PeerNotVerified {
+        /// The agent id that failed verification.
+        agent_id: [u8; 32],
+    },
+    /// Tailnet byte-stream identity gate: the peer's trust decision was not
+    /// [`crate::trust::TrustDecision::Accept`] (mirrors exec + the connect
+    /// gate: absence of an accept decision denies). Stream refused.
+    #[error("stream peer trust rejected: agent {agent_id:?}")]
+    PeerTrustRejected {
+        /// The agent id whose trust decision was not Accept.
+        agent_id: [u8; 32],
+    },
+    /// Tailnet byte-stream identity gate: the peer's agent or machine is in
+    /// the local revocation set (positive knowledge of compromise → fail
+    /// closed, mirroring EP3/EP4 and the relay/direct-DM gates). Refused.
+    #[error("stream peer revoked: agent {agent_id:?}")]
+    PeerRevoked {
+        /// The revoked agent id.
+        agent_id: [u8; 32],
+    },
 
     /// Event broadcasting failed.
     #[error("event broadcast error: {0}")]

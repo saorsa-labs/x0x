@@ -83,6 +83,9 @@ pub mod bootstrap;
 /// Network transport layer for x0x.
 pub mod network;
 
+/// Per-peer bidirectional byte-streams over ant-quic (tailnet Phase 1, #132).
+pub mod streams;
+
 /// Contact store with trust levels for message filtering.
 pub mod contacts;
 
@@ -314,6 +317,10 @@ pub struct Agent {
     /// at build time; future revisions merge in gossip-announced candidates
     /// at runtime, hence the `RwLock` for mutable runtime state.
     relay_candidates: std::sync::Arc<tokio::sync::RwLock<Vec<identity::AgentId>>>,
+    /// Tailnet byte-stream accept loop state (#132 T1): a bounded channel
+    /// surfacing inbound [`streams::PeerStream`]s that have cleared the
+    /// identity gate, plus an idempotent started-flag for the accept loop.
+    stream_accept: std::sync::Arc<streams::StreamAccept>,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -6404,6 +6411,7 @@ impl Agent {
         self.start_identity_listener().await?;
         self.start_network_event_listener();
         self.start_direct_listener();
+        self.start_stream_accept_loop();
 
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
 
@@ -7985,6 +7993,192 @@ impl Agent {
         });
     }
 
+    // === Tailnet byte-streams (#132 T1) ===
+
+    /// Open a bidirectional byte-stream to a verified, trusted peer.
+    ///
+    /// Resolves `agent_id` → machine via the identity discovery cache, then
+    /// enforces the identity gate (verified binding → not revoked → trust
+    /// `Accept`) before asking ant-quic to open the stream. The protocol
+    /// prefix is written immediately after `open_bi` so the accept side can
+    /// demux. Returns a [`streams::PeerStream`] ready for application I/O.
+    pub async fn open_peer_stream(
+        &self,
+        agent_id: &identity::AgentId,
+        protocol: streams::StreamProtocol,
+    ) -> error::NetworkResult<streams::PeerStream> {
+        let machine_id = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache.get(agent_id).map(|entry| entry.machine_id)
+        };
+        let machine_id = machine_id.ok_or(error::NetworkError::PeerNotVerified {
+            agent_id: agent_id.0,
+        })?;
+
+        let trust_decision = {
+            let contacts = self.contact_store.read().await;
+            let evaluator = trust::TrustEvaluator::new(&contacts);
+            Some(evaluator.evaluate(&trust::TrustContext {
+                agent_id,
+                machine_id: &machine_id,
+            }))
+        };
+        let (revoked_agent, revoked_machine) = {
+            let revoked = self.revocation_set.read().await;
+            (
+                revoked.is_agent_revoked(agent_id),
+                revoked.is_machine_revoked(&machine_id),
+            )
+        };
+        streams::stream_gate(agent_id, trust_decision, revoked_agent, revoked_machine)?;
+
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| error::NetworkError::NodeError("network not initialized".to_string()))?;
+        let peer = ant_quic::PeerId(machine_id.0);
+        let (mut send, recv) = network.open_bi(&peer).await?;
+        streams::write_protocol_prefix(&mut send, protocol).await?;
+        tracing::info!(
+            target: "x0x::streams",
+            agent = %hex::encode(agent_id.as_bytes()),
+            machine = %hex::encode(machine_id.as_bytes()),
+            protocol = ?protocol,
+            "outbound peer stream opened (identity gate cleared)"
+        );
+        Ok(streams::PeerStream::new(machine_id, protocol, send, recv))
+    }
+
+    /// Await the next inbound byte-stream that has cleared the identity gate.
+    ///
+    /// Returns `None` when the accept loop has stopped (e.g. after shutdown).
+    /// The T4 forwarder consumes accepted streams through this method.
+    pub async fn next_incoming_stream(&self) -> Option<streams::PeerStream> {
+        let mut rx = self.stream_accept.receiver().lock().await;
+        rx.recv().await
+    }
+
+    /// Start the inbound byte-stream accept loop (idempotent).
+    ///
+    /// Called automatically by [`Agent::join_network`]. The loop is the SOLE
+    /// consumer of [`network::NetworkNode::accept_bi`]; every inbound stream
+    /// clears the identity gate (machine has a known agent → not revoked →
+    /// trust `Accept`) and the protocol handshake before being surfaced via
+    /// [`Self::next_incoming_stream`]. A stream that fails the gate is reset
+    /// (its halves are dropped) with zero application bytes exchanged.
+    fn start_stream_accept_loop(&self) {
+        if !self.stream_accept.start_once() {
+            return;
+        }
+        let Some(network) = self.network.as_ref().map(std::sync::Arc::clone) else {
+            return;
+        };
+        let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let contact_store = std::sync::Arc::clone(&self.contact_store);
+        let revocation_set = std::sync::Arc::clone(&self.revocation_set);
+        let incoming = std::sync::Arc::clone(&self.stream_accept);
+        let token = self.shutdown_token.clone();
+
+        self.spawn_tracked(async move {
+            tracing::info!(target: "x0x::streams", "byte-stream accept loop started");
+            loop {
+                let accepted = tokio::select! {
+                    _ = token.cancelled() => break,
+                    r = network.accept_bi() => r,
+                };
+                let (ant_peer_id, send, mut recv) = match accepted {
+                    Ok(triple) => triple,
+                    Err(e) => {
+                        tracing::warn!(target: "x0x::streams", error=%e, "accept_bi failed; continuing");
+                        continue;
+                    }
+                };
+                let machine_id = identity::MachineId(ant_peer_id.0);
+
+                // Identity gate — resolve the agent on this machine from the
+                // discovery cache, then revoked → trust. Each lock is taken
+                // in its own scope so no two identity locks are held at once
+                // (evict_revoked_subject takes them in a different order).
+                let agent_id = {
+                    let cache = discovery_cache.read().await;
+                    cache
+                        .values()
+                        .find(|a| a.machine_id == machine_id)
+                        .map(|a| a.agent_id)
+                };
+                let Some(agent_id) = agent_id else {
+                    tracing::info!(
+                        target: "x0x::streams",
+                        machine = %hex::encode(machine_id.as_bytes()),
+                        outcome = "deny_not_verified",
+                        "inbound stream from machine with no known agent — denied"
+ );
+                    continue;
+                };
+                let trust_decision = {
+                    let contacts = contact_store.read().await;
+                    let evaluator = trust::TrustEvaluator::new(&contacts);
+                    Some(evaluator.evaluate(&trust::TrustContext {
+                        agent_id: &agent_id,
+                        machine_id: &machine_id,
+                    }))
+                };
+                let (revoked_agent, revoked_machine) = {
+                    let revoked = revocation_set.read().await;
+                    (
+                        revoked.is_agent_revoked(&agent_id),
+                        revoked.is_machine_revoked(&machine_id),
+                    )
+                };
+                if let Err(e) = streams::stream_gate(
+                    &agent_id,
+                    trust_decision,
+                    revoked_agent,
+                    revoked_machine,
+                ) {
+                    tracing::info!(
+                        target: "x0x::streams",
+                        agent = %hex::encode(agent_id.as_bytes()),
+                        outcome = "deny_gate",
+                        error = %e,
+                        "inbound stream denied at identity gate"
+                    );
+                    continue;
+                }
+
+                // Protocol handshake — read + validate the prefix byte.
+                let protocol = match streams::read_protocol_prefix(&mut recv).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::info!(
+                            target: "x0x::streams",
+                            machine = %hex::encode(machine_id.as_bytes()),
+                            outcome = "deny_protocol",
+                            error = %e,
+                            "inbound stream protocol prefix rejected"
+                        );
+                        continue;
+                    }
+                };
+
+                let peer_stream = streams::PeerStream::new(machine_id, protocol, send, recv);
+                tracing::info!(
+                    target: "x0x::streams",
+                    agent = %hex::encode(agent_id.as_bytes()),
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    protocol = ?protocol,
+                    "inbound peer stream accepted (identity gate cleared)"
+                );
+                if incoming.sender().send(peer_stream).await.is_err() {
+                    tracing::debug!(
+                        target: "x0x::streams",
+                        "no incoming-stream consumer; dropping accepted stream"
+                    );
+                }
+            }
+        });
+    }
+
     /// new announcement.
     ///
     /// Called automatically by [`Agent::join_network`].
@@ -8267,6 +8461,27 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// Test-only: mark `agent_id` as a `Trusted` contact so
+    /// [`TrustEvaluator`] returns [`trust::TrustDecision::Accept`] for it.
+    /// Used by the tailnet stream tests to clear the outbound/inbound trust
+    /// gate without driving the full contact-import REST flow. The
+    /// AgentId→MachineId *binding* still has to come from the discovery cache
+    /// (see [`Self::insert_discovered_agent_for_testing`]).
+    #[doc(hidden)]
+    pub async fn set_contact_trusted_for_testing(&self, agent_id: identity::AgentId) {
+        let mut store = self.contact_store.write().await;
+        store.add(contacts::Contact {
+            agent_id,
+            trust_level: contacts::TrustLevel::Trusted,
+            label: None,
+            added_at: 0,
+            last_seen: None,
+            identity_type: contacts::IdentityType::Anonymous,
+            machines: Vec::new(),
+            dm_capabilities: None,
+        });
     }
 
     /// Push a synthetic [`peer_relay::RelayedDm`] onto this Agent's inbound
@@ -9093,6 +9308,7 @@ impl AgentBuilder {
             })),
             peer_relay,
             relay_candidates,
+            stream_accept: std::sync::Arc::new(streams::StreamAccept::new(256)),
         })
     }
 }

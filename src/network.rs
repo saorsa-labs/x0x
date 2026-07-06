@@ -2443,6 +2443,57 @@ impl NetworkNode {
         self.peer_id
     }
 
+    // === Tailnet byte-streams (#132 T1) ===
+
+    /// Open a bidirectional application byte-stream to a connected peer.
+    ///
+    /// Thin transport wrapper over [`ant_quic::Node::open_bi`]. The identity
+    /// gate (verified + trust-accepted + not-revoked) lives in
+    /// [`crate::Agent::open_peer_stream`], which is the sole caller —
+    /// application code never reaches this without clearing the gate.
+    pub(crate) async fn open_bi(
+        &self,
+        peer_id: &AntPeerId,
+    ) -> NetworkResult<(ant_quic::HighLevelSendStream, ant_quic::HighLevelRecvStream)> {
+        let node = self
+            .node
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| NetworkError::NodeError("node not initialized".to_string()))?;
+        node.open_bi(peer_id)
+            .await
+            .map_err(|e| NetworkError::NodeError(format!("open_bi: {e}")))
+    }
+
+    /// Accept the next inbound application byte-stream from any peer.
+    ///
+    /// Thin transport wrapper over [`ant_quic::Node::accept_bi`]. Yields ONLY
+    /// application streams — ant-quic demuxes internal ACK-v2 / MASQUE-relay /
+    /// message-transport streams via a reserved prefix before this point, so
+    /// the accept loop never surfaces an internal stream. The identity gate +
+    /// protocol handshake run in the Agent's single accept loop, the sole
+    /// consumer of this method.
+    pub(crate) async fn accept_bi(
+        &self,
+    ) -> NetworkResult<(
+        AntPeerId,
+        ant_quic::HighLevelSendStream,
+        ant_quic::HighLevelRecvStream,
+    )> {
+        let node = self
+            .node
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| NetworkError::NodeError("node not initialized".to_string()))?;
+        node.accept_bi()
+            .await
+            .map_err(|e| NetworkError::NodeError(format!("accept_bi: {e}")))
+    }
+
     // === Direct Messaging ===
 
     /// Send a direct message to a connected peer.
