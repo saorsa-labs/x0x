@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 138,
+  "endpoint_count": 142,
   "endpoints": [
     {
       "category": "status",
@@ -966,6 +966,34 @@
       "description": "Open the embedded GUI",
       "method": "GET",
       "path": "/gui"
+    },
+    {
+      "category": "connect",
+      "cli_name": "forward add",
+      "description": "Add a local port forward to a peer's loopback service",
+      "method": "POST",
+      "path": "/forwards"
+    },
+    {
+      "category": "connect",
+      "cli_name": "forward list",
+      "description": "List registered port forwards",
+      "method": "GET",
+      "path": "/forwards"
+    },
+    {
+      "category": "connect",
+      "cli_name": "forward rm",
+      "description": "Remove a port forward by its local bind address",
+      "method": "DELETE",
+      "path": "/forwards/:local_addr"
+    },
+    {
+      "category": "connect",
+      "cli_name": "streams",
+      "description": "Active forward-stream count + connect-ACL counters",
+      "method": "GET",
+      "path": "/streams"
     }
   ],
   "generator": "tests/api_manifest.rs",

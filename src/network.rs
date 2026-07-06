@@ -2467,6 +2467,19 @@ impl NetworkNode {
             .map_err(|e| NetworkError::NodeError(format!("open_bi: {e}")))
     }
 
+    /// Test-only: open a raw application byte-stream WITHOUT writing the
+    /// protocol prefix. Used by the FIX 1 regression to simulate a peer that
+    /// opens a QUIC stream and never sends the prefix (the accept-loop
+    /// must not stall on it). Production code uses [`Agent::open_peer_stream`],
+    /// which writes the prefix after the identity gate.
+    #[doc(hidden)]
+    pub async fn open_bi_raw_for_testing(
+        &self,
+        peer_id: &AntPeerId,
+    ) -> NetworkResult<(ant_quic::HighLevelSendStream, ant_quic::HighLevelRecvStream)> {
+        self.open_bi(peer_id).await
+    }
+
     /// Accept the next inbound application byte-stream from any peer.
     ///
     /// Thin transport wrapper over [`ant_quic::Node::accept_bi`]. Yields ONLY

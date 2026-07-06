@@ -214,3 +214,93 @@ async fn peer_stream_echoes_1mib_both_directions() {
     r_b.expect("alice read 1MiB from bob");
     assert_eq!(buf_b, payload_b, "bob→alice integrity");
 }
+
+/// FIX 1 regression (#132): a peer that opens a QUIC stream and never sends
+/// the protocol-prefix byte must NOT stall the accept loop — another stream
+/// (with its prefix) is still accepted. Before FIX 1 the prefix read was
+/// awaited inline in the loop, so the silent stream blocked every other
+/// peer's inbound service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback; binds UDP. Integration tier. Proves FIX 1 (accept-loop no-stall)."]
+async fn accept_loop_not_stalled_by_missing_prefix() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some(alice) = build_agent(&dir, "alice").await else {
+        return;
+    };
+    let Some(bob) = build_agent(&dir, "bob").await else {
+        return;
+    };
+    let alice = Arc::new(alice);
+    let bob = Arc::new(bob);
+
+    alice.join_network().await.expect("alice joins");
+    bob.join_network().await.expect("bob joins");
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let bob_addr = normalize_loopback(bob_network.bound_addr().await.expect("bob bound"));
+    let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+
+    let connected = alice_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("alice connects to bob");
+    assert_eq!(connected.0, bob.machine_id().0);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if alice_network.is_connected(&bob_peer).await
+            && bob_network
+                .is_connected(&ant_quic::PeerId(alice.machine_id().0))
+                .await
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        bob_network
+            .is_connected(&ant_quic::PeerId(alice.machine_id().0))
+            .await
+    );
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_secs();
+    let alice_addr = normalize_loopback(alice_network.bound_addr().await.expect("alice bound"));
+    alice
+        .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr, now_secs))
+        .await;
+    alice.set_contact_trusted_for_testing(bob.agent_id()).await;
+    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr, now_secs))
+        .await;
+    bob.set_contact_trusted_for_testing(alice.agent_id()).await;
+
+    // (1) alice opens a RAW stream and NEVER sends the prefix — the stall
+    //     vector. The halves are deliberately held (not dropped) so the
+    //     stream stays open and silent.
+    let _silent = alice_network
+        .open_bi_raw_for_testing(&bob_peer)
+        .await
+        .expect("open raw stream");
+
+    // (2) alice then opens a normal ForwardV1 stream (writes its prefix).
+    let bob_agent_id = bob.agent_id();
+    let alice_for_open = Arc::clone(&alice);
+    let normal = tokio::spawn(async move {
+        alice_for_open
+            .open_peer_stream(&bob_agent_id, StreamProtocol::ForwardV1)
+            .await
+            .expect("open normal stream")
+    });
+
+    // (3) bob must surface the NORMAL stream promptly despite the silent one.
+    //     Before FIX 1 the accept loop would be blocked on the silent prefix
+    //     read and this would time out.
+    let surfaced = take_incoming(&bob, Duration::from_secs(8))
+        .await
+        .expect("accept loop was stalled by the missing-prefix stream");
+    let _ = normal.await;
+    assert_eq!(surfaced.protocol(), StreamProtocol::ForwardV1);
+}
