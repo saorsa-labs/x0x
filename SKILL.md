@@ -13,6 +13,7 @@ keywords:
   - post-quantum
   - crdt
   - collaboration
+  - task-orchestration
   - nat-traversal
   - direct-messaging
   - identity
@@ -80,6 +81,13 @@ Two communication modes:
 6 bootstrap nodes (NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo) provide initial discovery and NAT traversal — they never see your data.
 
 For security details (algorithms, RFCs, key pinning), see [docs/security.md](https://github.com/saorsa-labs/x0x/blob/main/docs/security.md).
+
+## Beyond Messaging
+
+x0x is a foundation you build on:
+
+- **Agent work orchestration (Symphony)** — replicated **TaskList CRDTs** (`/task-lists`, `/stores`), MLS group encryption, and a built-in **GUI board view** (state columns, badges, approve/deny actions) make x0x the decentralized backbone for agent work orchestration. The [x0x-symphony](https://github.com/saorsa-labs) runner rides these existing primitives over x0xd's local REST/WebSocket API — no extra services, no new crates. See [docs/symphony-integration.md](https://github.com/saorsa-labs/x0x/blob/main/docs/symphony-integration.md).
+- **Direct machine-to-machine connectivity (Tailnet)** — _in active development, shipping in an upcoming release:_ connect your own computers over any network (home, mobile, hotel) and forward a local TCP port or SOCKS5 to a service on a peer machine, Tailscale-style, over the same post-quantum QUIC transport. Default-deny and loopback-scoped, gated by a per-connection access policy plus the identity key-lifecycle (expiry + revocation). Tracked in [#132](https://github.com/saorsa-labs/x0x/issues/132).
 
 ## Identity: Three Layers
 
