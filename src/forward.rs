@@ -33,6 +33,7 @@
 //! testable without a live QUIC pair (the real stream wiring is proven by
 //! `tests/tailnet_streams_integration.rs` + T7).
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -62,6 +63,19 @@ const MAX_HEADER_BYTES: u32 = 256;
 
 /// Local connect timeout for the inbound side's `TcpStream::connect`.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Maximum time to read the full forward header (length prefix + body) from a
+/// peer before resetting the stream (DoS bound — FIX 2).
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Global cap on concurrently-active INBOUND forward streams (FIX 3). A peer
+/// cannot exhaust task/memory beyond this; the (N+1)th is reset + counted.
+const MAX_INBOUND_STREAMS: usize = 256;
+/// Global cap on concurrently-active OUTBOUND driven connections (FIX 3).
+const MAX_OUTBOUND_STREAMS: usize = 256;
+/// Per-peer cap on concurrently-active forward streams, inbound + outbound
+/// combined (FIX 3). Matches the issue #132 plan's "32 streams/peer" default.
+const MAX_STREAMS_PER_PEER: u32 = 32;
 
 /// Forward header — the first framed message on a `ForwardV1` stream.
 ///
@@ -217,6 +231,15 @@ pub struct ForwardDiagnostics {
     connect_failed: AtomicU64,
     /// Currently active forward streams (inbound + outbound).
     active_streams: AtomicU64,
+    /// Streams refused because the global or per-peer concurrency cap was hit
+    /// (FIX 3, DoS bound).
+    streams_over_cap: AtomicU64,
+    /// Streams dropped because the peer was revoked between the T1 accept gate
+    /// and the forwarder's header read (FIX 4, stale-authorization window).
+    revoked_mid_flight: AtomicU64,
+    /// Streams reset because the forward header did not arrive within
+    /// [`HEADER_READ_TIMEOUT`] (FIX 2).
+    header_timeout: AtomicU64,
 }
 
 impl ForwardDiagnostics {
@@ -232,6 +255,18 @@ impl ForwardDiagnostics {
     pub fn leave_stream(&self) {
         self.active_streams.fetch_sub(1, Ordering::Relaxed);
     }
+    /// Record a stream refused at the concurrency cap (FIX 3).
+    pub fn record_over_cap(&self) {
+        self.streams_over_cap.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record a stream dropped for mid-flight revocation (FIX 4).
+    pub fn record_revoked_mid_flight(&self) {
+        self.revoked_mid_flight.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record a header-read timeout (FIX 2).
+    pub fn record_header_timeout(&self) {
+        self.header_timeout.fetch_add(1, Ordering::Relaxed);
+    }
     /// Current connect-failure count.
     #[must_use]
     pub fn connect_failed(&self) -> u64 {
@@ -241,6 +276,21 @@ impl ForwardDiagnostics {
     #[must_use]
     pub fn active_streams(&self) -> u64 {
         self.active_streams.load(Ordering::Relaxed)
+    }
+    /// Streams refused at the concurrency cap.
+    #[must_use]
+    pub fn streams_over_cap(&self) -> u64 {
+        self.streams_over_cap.load(Ordering::Relaxed)
+    }
+    /// Streams dropped for mid-flight revocation.
+    #[must_use]
+    pub fn revoked_mid_flight(&self) -> u64 {
+        self.revoked_mid_flight.load(Ordering::Relaxed)
+    }
+    /// Streams reset for a header-read timeout.
+    #[must_use]
+    pub fn header_timeout(&self) -> u64 {
+        self.header_timeout.load(Ordering::Relaxed)
     }
 }
 
@@ -256,23 +306,60 @@ pub(crate) async fn handle_inbound(
     policy: Arc<ConnectPolicy>,
     connect_diag: Arc<ConnectDiagnostics>,
     fwd_diag: Arc<ForwardDiagnostics>,
+    revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
 ) {
     let agent_id = stream.agent();
     let machine_id = stream.peer();
     let peer = machine_id;
-    // Read the framed header off the stream.
-    let header = match read_header(stream.recv_mut()).await {
-        Ok(h) => h,
-        Err(e) => {
+
+    // FIX 4 (stale-authorization window): the T1 accept-loop identity gate
+    // cleared before this stream was surfaced. A peer revoked in that window
+    // must not consume a header read or reach the connect gate. Re-check the
+    // shared revocation set BEFORE reading any peer bytes; drop on
+    // revocation. (The connect gate would still deny by policy, so this is
+    // not a bypass — it closes the per-flow stale-authz window. Full
+    // mid-stream teardown is a documented Phase-2 item.)
+    {
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(&agent_id) || revoked.is_machine_revoked(&machine_id) {
+            fwd_diag.record_revoked_mid_flight();
             tracing::info!(
                 target: "x0x::forward",
-                peer = %hex::encode(peer.as_bytes()),
-                error = %e,
-                "inbound forward: header read failed — closing stream"
+                agent = %hex::encode(agent_id.as_bytes()),
+                machine = %hex::encode(peer.as_bytes()),
+                outcome = "drop_revoked_mid_flight",
+                "inbound forward: peer revoked after accept — dropping before header read"
             );
             return;
         }
-    };
+    }
+
+    // FIX 2: bound the header read so a peer that opens a forward stream and
+    // then stalls cannot hold a forwarder task (and its concurrency permit).
+    // Reset + count on timeout. The declared length prefix is already capped
+    // at MAX_HEADER_BYTES inside read_header, so no huge pre-allocation.
+    let header =
+        match tokio::time::timeout(HEADER_READ_TIMEOUT, read_header(stream.recv_mut())).await {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => {
+                tracing::info!(
+                    target: "x0x::forward",
+                    peer = %hex::encode(peer.as_bytes()),
+                    error = %e,
+                    "inbound forward: header read failed — closing stream"
+                );
+                return;
+            }
+            Err(_) => {
+                fwd_diag.record_header_timeout();
+                tracing::info!(
+                    target: "x0x::forward",
+                    peer = %hex::encode(peer.as_bytes()),
+                    "inbound forward: header read timed out — resetting stream"
+                );
+                return;
+            }
+        };
 
     // Gate: resolve + ACL. On deny, write a typed frame + record, then close.
     let target = match decide_inbound(&header, &policy, &agent_id, &machine_id) {
@@ -451,6 +538,78 @@ pub struct ForwardService {
     /// tear down individual listeners and `list` can return them.
     forwards: std::sync::Mutex<Vec<ForwardEntry>>,
     inbound_token: CancellationToken,
+    /// FIX 3: global + per-peer concurrency caps. Admission requires a global
+    /// permit (held for the stream's lifetime) AND a per-peer slot; a stream
+    /// beyond either cap is reset + counted rather than spawned unbounded.
+    inbound_permits: Arc<tokio::sync::Semaphore>,
+    outbound_permits: Arc<tokio::sync::Semaphore>,
+    per_peer: Arc<std::sync::Mutex<HashMap<AgentId, u32>>>,
+    /// Shared revocation set for the FIX 4 pre-header re-check.
+    revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+}
+
+/// RAII per-peer slot: decrements the per-peer counter (and prunes the entry
+/// at zero) when dropped, so a forwarder task ending releases the slot.
+struct PeerSlot {
+    peer: AgentId,
+    map: Arc<std::sync::Mutex<HashMap<AgentId, u32>>>,
+}
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.lock() {
+            if let Some(count) = m.get_mut(&self.peer) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    m.remove(&self.peer);
+                }
+            }
+        }
+    }
+}
+
+/// Holds the global semaphore permit + per-peer slot for the lifetime of one
+/// forward stream task. Dropping it (when the task ends) releases both, so the
+/// concurrency caps stay accurate even on error/panic paths.
+struct Admission {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _slot: PeerSlot,
+}
+
+/// FIX 3: try to admit a forward stream against a global permit pool + the
+/// shared per-peer map. Free function so both the inbound consumer and the
+/// outbound listener (which owns cloned caps) share one admission path.
+/// Global cap first (leaves per-peer untouched on failure), then per-peer.
+fn admit_to(
+    permits: &Arc<tokio::sync::Semaphore>,
+    per_peer: &Arc<std::sync::Mutex<HashMap<AgentId, u32>>>,
+    peer: AgentId,
+) -> Option<Admission> {
+    let permit = permits.clone().try_acquire_owned().ok()?;
+    let slot = try_peer_slot(per_peer, peer)?;
+    Some(Admission {
+        _permit: permit,
+        _slot: slot,
+    })
+}
+
+/// Increment the per-peer counter if under [`MAX_STREAMS_PER_PEER`]; returns a
+/// [`PeerSlot`] whose Drop decrements it. Fails closed on poison.
+fn try_peer_slot(
+    map: &Arc<std::sync::Mutex<HashMap<AgentId, u32>>>,
+    peer: AgentId,
+) -> Option<PeerSlot> {
+    let Ok(mut m) = map.lock() else {
+        return None;
+    };
+    let count = m.entry(peer).or_insert(0);
+    if *count >= MAX_STREAMS_PER_PEER {
+        return None;
+    }
+    *count += 1;
+    Some(PeerSlot {
+        peer,
+        map: Arc::clone(map),
+    })
 }
 
 impl ForwardService {
@@ -461,6 +620,7 @@ impl ForwardService {
         policy: Arc<ConnectPolicy>,
         connect_diag: Arc<ConnectDiagnostics>,
     ) -> Self {
+        let revocation_set = agent.revocation_set();
         Self {
             agent,
             policy,
@@ -468,6 +628,10 @@ impl ForwardService {
             fwd_diag: Arc::new(ForwardDiagnostics::default()),
             forwards: std::sync::Mutex::new(Vec::new()),
             inbound_token: CancellationToken::new(),
+            inbound_permits: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_STREAMS)),
+            outbound_permits: Arc::new(tokio::sync::Semaphore::new(MAX_OUTBOUND_STREAMS)),
+            per_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            revocation_set,
         }
     }
 
@@ -475,6 +639,20 @@ impl ForwardService {
     #[must_use]
     pub fn diagnostics(&self) -> &ForwardDiagnostics {
         &self.fwd_diag
+    }
+
+    /// FIX 3: try to admit a forward stream against the global + per-peer
+    /// concurrency caps. On success returns an [`Admission`] whose lifetime
+    /// bounds the stream's task (it releases both slots on drop). On a cap
+    /// hit returns `None` — the caller resets the stream + counts it. `inbound`
+    /// selects the global permit pool (separate inbound/outbound caps).
+    fn admit(&self, peer: AgentId, inbound: bool) -> Option<Admission> {
+        let permits = if inbound {
+            &self.inbound_permits
+        } else {
+            &self.outbound_permits
+        };
+        admit_to(permits, &self.per_peer, peer)
     }
 
     /// Start the inbound consumer loop. Spawns a task that surfaces
@@ -501,20 +679,38 @@ impl ForwardService {
                     );
                     continue;
                 }
+                // FIX 3: cap admission before spawning. Over-cap streams are
+                // reset (dropped) + counted rather than spawning unbounded.
+                let peer_agent = stream.agent();
+                let admission = match this.admit(peer_agent, true) {
+                    Some(a) => a,
+                    None => {
+                        this.fwd_diag.record_over_cap();
+                        tracing::info!(
+                            target: "x0x::forward",
+                            agent = %hex::encode(peer_agent.as_bytes()),
+                            "inbound forward refused: concurrency cap reached — resetting"
+                        );
+                        continue;
+                    }
+                };
                 let this = Arc::clone(&this);
                 tokio::spawn(async move {
+                    let _admission = admission;
+                    this.fwd_diag.enter_stream();
+                    let _leave = StreamLeaveGuard(Arc::clone(&this.fwd_diag));
                     handle_inbound(
                         stream,
                         Arc::clone(&this.policy),
                         Arc::clone(&this.connect_diag),
                         Arc::clone(&this.fwd_diag),
+                        Arc::clone(&this.revocation_set),
                     )
                     .await;
                 });
             }
         });
     }
-
     /// Register a local forward: bind `local_addr`, and for each accepted TCP
     /// connection open a peer stream, write the header, and bridge on
     /// `connected`. Returns the bound local address (useful when port = 0).
@@ -538,6 +734,8 @@ impl ForwardService {
 
         let agent = Arc::clone(&self.agent);
         let fwd_diag = Arc::clone(&self.fwd_diag);
+        let outbound_permits = Arc::clone(&self.outbound_permits);
+        let per_peer = Arc::clone(&self.per_peer);
         let peer_agent = spec.peer_agent;
         let header = ForwardHeader {
             target_host: spec.target_host,
@@ -566,10 +764,26 @@ impl ForwardService {
                         }
                     },
                 };
+                // FIX 3: cap outbound driven connections. Over-cap TCP
+                // accepts are dropped (the client sees a refused connection)
+                // + counted rather than spawning unbounded.
+                let admission = match admit_to(&outbound_permits, &per_peer, peer_agent) {
+                    Some(a) => a,
+                    None => {
+                        fwd_diag.record_over_cap();
+                        tracing::info!(
+                            target: "x0x::forward",
+                            local = %bound,
+                            "outbound forward refused: concurrency cap reached — closing local TCP"
+                        );
+                        continue;
+                    }
+                };
                 let agent = Arc::clone(&agent);
                 let fwd_diag = Arc::clone(&fwd_diag);
                 let header = header.clone();
                 tokio::spawn(async move {
+                    let _admission = admission;
                     fwd_diag.enter_stream();
                     let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
                     drive_outbound(agent, peer_agent, header, tcp).await;
@@ -809,5 +1023,57 @@ mod tests {
         assert!(len > 0, "a serialized ConnectDenialReason is non-empty");
         assert_eq!(response_connected(RESP_DENIED), Some(false));
         assert_eq!(response_connected(0xFF), None);
+    }
+
+    #[test]
+    fn admit_enforces_global_and_per_peer_caps() {
+        // FIX 3: admission must bound both global concurrency and per-peer
+        // concurrency, releasing the global permit when the per-peer check
+        // fails so the global pool is not leaked.
+        let global = Arc::new(tokio::sync::Semaphore::new(2));
+        let per_peer: Arc<std::sync::Mutex<HashMap<AgentId, u32>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let peer_a = AgentId([1u8; 32]);
+        let peer_b = AgentId([2u8; 32]);
+
+        // Global cap of 2: two admits across any peers succeed.
+        let a1 = admit_to(&global, &per_peer, peer_a).expect("first admit");
+        let a2 = admit_to(&global, &per_peer, peer_b).expect("second admit");
+        // Third admit fails on the global cap; per_peer must be unchanged for
+        // the not-yet-admitted peer (no leak of a partial admission).
+        assert!(
+            admit_to(&global, &per_peer, peer_a).is_none(),
+            "global cap must refuse the third admit"
+        );
+        // Releasing one global permit re-admits admission.
+        drop(a2);
+        let a3 = admit_to(&global, &per_peer, peer_b).expect("readmit after release");
+        drop(a1);
+        drop(a3);
+
+        // Per-peer cap: a fresh large global pool so only the per-peer limit
+        // binds. Admit MAX_STREAMS_PER_PEER for one peer, then the next fails.
+        let big = Arc::new(tokio::sync::Semaphore::new(1024));
+        let pp: Arc<std::sync::Mutex<HashMap<AgentId, u32>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut held = Vec::new();
+        for _ in 0..MAX_STREAMS_PER_PEER {
+            held.push(admit_to(&big, &pp, peer_a).expect("under per-peer cap"));
+        }
+        assert!(
+            admit_to(&big, &pp, peer_a).is_none(),
+            "per-peer cap must refuse the (N+1)th admit for the same peer"
+        );
+        // A different peer is unaffected (per-peer, not global, is the limit).
+        assert!(
+            admit_to(&big, &pp, peer_b).is_some(),
+            "a second peer must still be admitted under its own per-peer cap"
+        );
+        // Releasing one slot for peer_a re-opens its cap.
+        held.pop();
+        assert!(
+            admit_to(&big, &pp, peer_a).is_some(),
+            "per-peer cap must re-admit after a slot is released"
+        );
     }
 }

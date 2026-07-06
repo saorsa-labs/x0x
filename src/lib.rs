@@ -8151,35 +8151,54 @@ impl Agent {
                     continue;
                 }
 
-                // Protocol handshake — read + validate the prefix byte.
-                let protocol = match streams::read_protocol_prefix(&mut recv).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::info!(
+                // DISPATCH (DoS hardening, issue #132): the protocol-prefix
+                // read + surfacing run in a per-stream task so a peer that
+                // opens a stream and never sends the prefix cannot block this
+                // accept loop (and thus every other peer's inbound streams).
+                // The identity gate above already cleared; this task owns the
+                // stream halves and drops them (→ QUIC reset) on any failure.
+                let incoming_for_task = std::sync::Arc::clone(&incoming);
+                tokio::spawn(async move {
+                    // Belt-and-braces: bound the prefix read so a silent peer
+                    // holds the task/stream for at most PREFIX_READ_TIMEOUT.
+                    let protocol = match tokio::time::timeout(
+                        streams::PREFIX_READ_TIMEOUT,
+                        streams::read_protocol_prefix(&mut recv),
+                    )
+                    .await
+                    {
+                        Ok(Ok(p)) => p,
+                        Ok(Err(e)) => {
+                            tracing::info!(
+                                target: "x0x::streams",
+                                machine = %hex::encode(machine_id.as_bytes()),
+                                outcome = "deny_protocol",
+                                error = %e,
+                                "inbound stream protocol prefix rejected"
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::info!(
+                                target: "x0x::streams",
+                                machine = %hex::encode(machine_id.as_bytes()),
+                                outcome = "deny_prefix_timeout",
+                                "inbound stream prefix byte timed out — resetting"
+                            );
+                            return;
+                        }
+                    };
+                    let peer_stream =
+                        streams::PeerStream::new(agent_id, machine_id, protocol, send, recv);
+                    // try_send so a slow consumer cannot pile up accepted
+                    // streams in memory; a full channel drops the stream.
+                    if incoming_for_task.sender().try_send(peer_stream).is_err() {
+                        tracing::debug!(
                             target: "x0x::streams",
-                            machine = %hex::encode(machine_id.as_bytes()),
-                            outcome = "deny_protocol",
-                            error = %e,
-                            "inbound stream protocol prefix rejected"
+                            "incoming-stream channel full; dropping accepted stream"
                         );
-                        continue;
                     }
-                };
-
-                let peer_stream = streams::PeerStream::new(agent_id, machine_id, protocol, send, recv);
-                tracing::info!(
-                    target: "x0x::streams",
-                    agent = %hex::encode(agent_id.as_bytes()),
-                    machine = %hex::encode(machine_id.as_bytes()),
-                    protocol = ?protocol,
-                    "inbound peer stream accepted (identity gate cleared)"
-                );
-                if incoming.sender().send(peer_stream).await.is_err() {
-                    tracing::debug!(
-                        target: "x0x::streams",
-                        "no incoming-stream consumer; dropping accepted stream"
-                    );
-                }
+                });
             }
         });
     }

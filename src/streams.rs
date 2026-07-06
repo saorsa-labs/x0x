@@ -124,6 +124,12 @@ pub(crate) fn stream_gate(
     Ok(())
 }
 
+/// Maximum time to wait for a stream's protocol-prefix byte before resetting
+/// it. Belt-and-braces behind the per-stream spawn: a peer that opens a QUIC
+/// stream and never sends the prefix cannot hold an accept-loop slot — the
+/// read runs in the per-stream task and times out here, resetting the stream.
+pub const PREFIX_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Protocol-prefix byte carried as the first byte of an application stream.
 ///
 /// `0x00` is deliberately reserved and rejected as unknown so a zeroed/truncated
