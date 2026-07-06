@@ -110,6 +110,16 @@ jobs:
         run: cargo nextest run --all-features --test kv_first_join_bootstrap --test-threads 1 -- --ignored
       - name: Run local-topic routing tests (issue 89)
         run: cargo nextest run --all-features --test local_topics --test-threads 1 -- --ignored
+      # ── Daemon-backed timing tests de-flaked out of the always-on Test
+      #    Suite (ci.yml). They run here so coverage is preserved without
+      #    gating every PR on convergence/jitter-prone budgets. None of
+      #    these is a required status check.
+      - name: Run peer-lifecycle daemon tests (de-flaked, ignored-only)
+        run: cargo nextest run --all-features --test peer_lifecycle_integration --run-ignored ignored-only
+      - name: Run x0x_0041 reissue timing test (de-flaked, ignored-only)
+        run: cargo nextest run --all-features --test x0x_0041_prefer_newest_test --run-ignored ignored-only
+      - name: Run named-group join-metadata convergence tests (de-flaked, ignored-only)
+        run: cargo nextest run --all-features --test named_group_join_metadata_event --run-ignored ignored-only
 
   # ── Soak test (weekly, ~90min) ────────────────────────────────────────
   soak:

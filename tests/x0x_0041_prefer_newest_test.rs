@@ -152,6 +152,7 @@ async fn supersede_propagates_within_500ms_acceptance_budget() {
 /// produce a false failure.  The tighter in-process timing guarantee is
 /// validated by `supersede_propagates_within_500ms_acceptance_budget`, which
 /// exercises the same mechanism without the daemon round-trips.
+#[ignore = "daemon-backed replace/reissue within a 5s budget flakes under CI contention (#148); the deterministic in-process variant covers the SLO. Runs in the integration tier"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn direct_send_reissues_on_replaced_connection_within_500ms(
 ) -> Result<(), Box<dyn std::error::Error>> {
