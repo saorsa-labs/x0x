@@ -167,9 +167,11 @@ impl StreamProtocol {
 /// provides native flow-control / backpressure — no intermediate unbounded
 /// buffers are introduced.
 ///
-/// The `protocol` and `peer` fields are fixed at open/accept time after the
-/// identity gate has cleared; consumers can rely on them without re-checking.
+/// The `agent`, `peer`, and `protocol` fields are fixed at open/accept time
+/// after the identity gate has cleared; consumers can rely on them without
+/// re-checking.
 pub struct PeerStream {
+    agent: crate::identity::AgentId,
     peer: MachineId,
     protocol: StreamProtocol,
     send: ant_quic::HighLevelSendStream,
@@ -181,17 +183,27 @@ impl PeerStream {
     /// protocol. Called by the Agent open/accept paths after the identity gate
     /// and protocol handshake have succeeded.
     pub(crate) fn new(
+        agent: crate::identity::AgentId,
         peer: MachineId,
         protocol: StreamProtocol,
         send: ant_quic::HighLevelSendStream,
         recv: ant_quic::HighLevelRecvStream,
     ) -> Self {
         Self {
+            agent,
             peer,
             protocol,
             send,
             recv,
         }
+    }
+
+    /// The peer's agent identity (resolved from the machine at the identity
+    /// gate on the inbound path; the caller-supplied target on the outbound
+    /// path). The connect gate (`evaluate_connect_gate`) matches on this.
+    #[must_use]
+    pub fn agent(&self) -> crate::identity::AgentId {
+        self.agent
     }
 
     /// The peer's transport-authenticated machine identity.

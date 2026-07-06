@@ -86,6 +86,9 @@ pub mod network;
 /// Per-peer bidirectional byte-streams over ant-quic (tailnet Phase 1, #132).
 pub mod streams;
 
+/// Local port-forwarder over tailnet byte-streams (tailnet Phase 1, #132 T4).
+pub mod forward;
+
 /// Contact store with trust levels for message filtering.
 pub mod contacts;
 
@@ -8046,7 +8049,9 @@ impl Agent {
             protocol = ?protocol,
             "outbound peer stream opened (identity gate cleared)"
         );
-        Ok(streams::PeerStream::new(machine_id, protocol, send, recv))
+        Ok(streams::PeerStream::new(
+            *agent_id, machine_id, protocol, send, recv,
+        ))
     }
 
     /// Await the next inbound byte-stream that has cleared the identity gate.
@@ -8161,7 +8166,7 @@ impl Agent {
                     }
                 };
 
-                let peer_stream = streams::PeerStream::new(machine_id, protocol, send, recv);
+                let peer_stream = streams::PeerStream::new(agent_id, machine_id, protocol, send, recv);
                 tracing::info!(
                     target: "x0x::streams",
                     agent = %hex::encode(agent_id.as_bytes()),
