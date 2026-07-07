@@ -404,3 +404,57 @@ unknown_key = "surprise"
         "unknown field in allow entry must be an error"
     );
 }
+
+// ===========================================================================
+// Plane-specific default path (#189)
+// ===========================================================================
+
+#[test]
+fn default_connect_acl_path_for_is_plane_scoped_and_safe() {
+    // A named instance gets its own default path in the same directory as the
+    // base default, named connect-acl-<name>.toml.
+    let testnet = default_connect_acl_path_for("testnet");
+    let base = default_connect_acl_path();
+    let base_dir = base
+        .parent()
+        .expect("base default connect-ACL path has a parent dir");
+    assert_eq!(
+        testnet.parent(),
+        Some(base_dir),
+        "named-instance default lives in the same dir as the base default"
+    );
+    assert!(
+        testnet
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "connect-acl-testnet.toml"),
+        "named-instance default must be connect-acl-<name>.toml, got {testnet:?}"
+    );
+
+    // The base default is unchanged for unnamed daemons.
+    assert_ne!(base, testnet, "named and base defaults must differ");
+    assert!(
+        base.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "connect-acl.toml"),
+        "base default must stay connect-acl.toml, got {base:?}"
+    );
+}
+
+#[tokio::test]
+async fn load_policy_missing_plane_specific_default_is_disabled() {
+    // #189: a named instance's plane-specific default, when missing, must be
+    // Disabled (NOT a hard error) — matching the base default's fail-closed
+    // behaviour so an unconfigured plane stays disabled.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("connect-acl-testnet.toml");
+    let policy = load_connect_policy(Some(&path), LoadMode::DefaultPath)
+        .await
+        .unwrap();
+    assert!(!policy.enabled());
+    if let ConnectPolicy::Disabled { reason, .. } = &policy {
+        assert_eq!(reason, "acl_missing");
+    } else {
+        panic!("expected Disabled for a missing plane-specific default");
+    }
+}

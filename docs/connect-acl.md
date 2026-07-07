@@ -15,7 +15,7 @@ Default path:
 - Linux: `/etc/x0x/connect-acl.toml`
 - macOS: `/usr/local/etc/x0x/connect-acl.toml`
 
-> **Co-located daemons share the default path.** If more than one `x0xd` runs on a host (for example a prod instance plus a `--name testnet` instance), they all resolve the same default `/etc/x0x/connect-acl.toml` unless each is given its own `--connect-acl`. Creating the file to configure one plane silently arms every other plane on its next restart / self-upgrade — a latent way for a test/dev policy to activate on prod. Give each plane an explicit `--connect-acl` path. See issue #189.
+> **Named instances get their own default ACL path.** A daemon started with `--name <plane>` (for example `--name testnet`) resolves its default connect ACL from `connect-acl-<plane>.toml` (e.g. `/etc/x0x/connect-acl-testnet.toml`), not the shared `/etc/x0x/connect-acl.toml`, so co-located prod / testnet / `:443` daemons no longer silently arm each other from one policy file (#189). An unnamed daemon still uses the shared default — give it an explicit `--connect-acl` if you run more than one unnamed instance. `x0xd` logs the resolved connect-ACL path at startup.
 
 Override for tests or non-default installs:
 

@@ -238,10 +238,33 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to load exec ACL")?;
 
-    let connect_policy =
-        x0x::connect::load_connect_policy(connect_acl_override.as_deref(), connect_acl_load_mode)
-            .await
-            .context("failed to load connect ACL")?;
+    // #189: give each named network plane its own default connect-ACL path so
+    // co-located daemons (prod / testnet / :443) no longer silently share
+    // /etc/x0x/connect-acl.toml. An explicit --connect-acl always wins; a named
+    // instance with no override falls back to connect-acl-<name>.toml (missing
+    // ⇒ disabled, same fail-closed behaviour as the base default); an unnamed
+    // daemon keeps the base default.
+    let effective_connect_acl_path: Option<PathBuf> = match (&connect_acl_override, &instance_name)
+    {
+        (Some(p), _) => Some(p.clone()),
+        (None, Some(name)) => Some(x0x::connect::default_connect_acl_path_for(name)),
+        (None, None) => None,
+    };
+    let connect_policy = x0x::connect::load_connect_policy(
+        effective_connect_acl_path.as_deref(),
+        connect_acl_load_mode,
+    )
+    .await
+    .context("failed to load connect ACL")?;
+    tracing::info!(
+        target: "x0x::startup",
+        path = %effective_connect_acl_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| x0x::connect::default_connect_acl_path().display().to_string()),
+        explicit = connect_acl_override.is_some(),
+        "Resolved connect-ACL policy path"
+    );
 
     if doctor_mode {
         return run_doctor(&config).await;

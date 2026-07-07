@@ -50,6 +50,28 @@ pub fn default_connect_acl_path() -> PathBuf {
     }
 }
 
+/// Default connect-ACL file location for a named instance.
+///
+/// Named instances get a plane-specific default — the same directory as
+/// [`default_connect_acl_path`] but named `connect-acl-<name>.toml` — so
+/// co-located daemons (prod / testnet / `:443`) do not silently share one
+/// connect-ACL file (issue #189). An explicit `--connect-acl` always wins; a
+/// missing plane-specific file disables connect with the same fail-closed
+/// behaviour as the base default. `server::validate_instance_name` restricts
+/// the name to `[a-zA-Z0-9-]`, so the derived filename is path-traversal-safe.
+#[must_use]
+pub fn default_connect_acl_path_for(name: &str) -> PathBuf {
+    debug_assert!(
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        "instance name must be validated before deriving a connect-ACL path"
+    );
+    let file = format!("connect-acl-{name}.toml");
+    default_connect_acl_path()
+        .parent()
+        .map(|dir| dir.join(&file))
+        .unwrap_or_else(|| PathBuf::from(file))
+}
+
 // ---------------------------------------------------------------------------
 // Policy + ACL types
 // ---------------------------------------------------------------------------
