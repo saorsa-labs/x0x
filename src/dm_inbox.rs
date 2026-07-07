@@ -283,14 +283,15 @@ impl InboxPipeline {
         // Enforcement point 3 — revocation gate.
         // Check after the envelope-signature is verified so we know the
         // sender_agent_id is authentic.  Never hold the lock across `.await`.
-        // NOTE: this gate checks agent-id revocation only, not machine-id
-        // revocation (unlike EP1/EP2 which check both). Intentional for now —
-        // the DM envelope's authenticated identity is the sender agent-id;
-        // machine-id revocation for the DM path is tracked as a follow-up.
+        // Checks BOTH agent-id and machine-id revocation, matching EP1/EP2 and
+        // the raw-QUIC direct path (`direct::inbound_peer_revoked`) — a DM whose
+        // originating machine is revoked is dropped even when the agent-id is
+        // clean (issue #184).
         {
             let revoked = self.revocation_set.read().await;
             let sender_agent_id = AgentId(envelope.sender_agent_id);
-            if drop_if_sender_revoked(&self.dm, &revoked, &sender_agent_id) {
+            let sender_machine_id = MachineId(envelope.sender_machine_id);
+            if drop_if_sender_revoked(&self.dm, &revoked, &sender_agent_id, &sender_machine_id) {
                 tracing::info!(
                     target: "dm.trace",
                     stage = "inbound_revoked_sender_dropped",
@@ -537,12 +538,23 @@ impl InboxPipeline {
 /// drop the DM). Returns `false` for a non-revoked sender without touching the
 /// counter.
 ///
-/// Extracted as a pure function of `(DirectMessaging, RevocationSet, AgentId)`
-/// so the revocation gate can be unit-tested without a live inbox pipeline,
-/// and so a future refactor of `handle_incoming` cannot silently drop the
-/// counter side-effect.
-fn drop_if_sender_revoked(dm: &DirectMessaging, revoked: &RevocationSet, sender: &AgentId) -> bool {
-    if revoked.is_agent_revoked(sender) {
+/// Pure revocation-gate predicate for the gossip DM path (EP3).
+///
+/// Drops (and counts) a DM whose sender agent OR originating machine is in
+/// the local revocation set — matching the raw-QUIC direct path
+/// (`direct::inbound_peer_revoked`) and EP1/EP2, so both DM paths are
+/// fail-closed on a machine revocation even when the agent-id is clean
+/// (issue #184). Extracted as a pure function of
+/// `(DirectMessaging, RevocationSet, AgentId, MachineId)` so the gate can be
+/// unit-tested without a live inbox pipeline, and so a future refactor of
+/// `handle_incoming` cannot silently drop the counter side-effect.
+fn drop_if_sender_revoked(
+    dm: &DirectMessaging,
+    revoked: &RevocationSet,
+    sender: &AgentId,
+    machine: &MachineId,
+) -> bool {
+    if revoked.is_agent_revoked(sender) || revoked.is_machine_revoked(machine) {
         dm.record_incoming_dropped_revoked();
         true
     } else {
@@ -577,7 +589,7 @@ pub fn verify_envelope_signature(envelope: &DmEnvelope, public_key_bytes: &[u8])
 mod tests {
     use super::*;
     use crate::dm::MAX_ENVELOPE_BYTES;
-    use crate::identity::AgentKeypair;
+    use crate::identity::{AgentKeypair, MachineKeypair};
 
     fn test_keypair() -> AgentKeypair {
         AgentKeypair::generate().expect("keygen")
@@ -736,6 +748,8 @@ mod tests {
     #[test]
     fn revoked_sender_dm_is_dropped_and_counted() {
         let dm = DirectMessaging::new();
+        // A machine that is NOT revoked — isolates the drop to the agent revocation.
+        let clean_machine = MachineId([0xAB; 32]);
 
         // A foreign sender self-revokes its own agent-id (valid authority).
         let sender_kp = test_keypair();
@@ -756,7 +770,7 @@ mod tests {
         // A revoked sender's DM is dropped and increments the counter.
         let before = dm.diagnostics_snapshot().stats.incoming_dropped_revoked;
         assert!(
-            drop_if_sender_revoked(&dm, &set, &sender),
+            drop_if_sender_revoked(&dm, &set, &sender, &clean_machine),
             "a DM from a revoked sender must be dropped"
         );
         let after = dm.diagnostics_snapshot().stats.incoming_dropped_revoked;
@@ -770,13 +784,55 @@ mod tests {
         // proving the gate is precise, not a blanket drop.
         let other = test_keypair().agent_id();
         assert!(
-            !drop_if_sender_revoked(&dm, &set, &other),
+            !drop_if_sender_revoked(&dm, &set, &other, &clean_machine),
             "a DM from a non-revoked sender must pass the gate"
         );
         assert_eq!(
             dm.diagnostics_snapshot().stats.incoming_dropped_revoked,
             after,
             "a passing DM must not touch incoming_dropped_revoked"
+        );
+    }
+
+    /// A DM whose originating MACHINE is revoked (but whose agent-id is clean)
+    /// MUST be dropped and counted — issue #184, bringing EP3 to machine-id
+    /// parity with the raw-QUIC direct path (`direct::inbound_peer_revoked`)
+    /// and EP1/EP2. The revocation is applied via the real `verify_and_insert`
+    /// receive path with a valid machine self-revocation, so this fails if the
+    /// machine-revocation half of the EP3 gate regresses.
+    #[test]
+    fn machine_revoked_sender_dm_is_dropped_and_counted() {
+        let dm = DirectMessaging::new();
+
+        // A foreign machine self-revokes its own machine-id (valid authority).
+        let machine_kp = MachineKeypair::generate().expect("machine keygen");
+        let revoked_machine = machine_kp.machine_id();
+        let now = now_unix_ms() / 1000;
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(revoked_machine),
+            machine_kp.public_key(),
+            machine_kp.secret_key(),
+            now,
+            Some("compromised hardware".to_string()),
+        )
+        .expect("sign machine self-revocation");
+        let mut set = RevocationSet::new();
+        set.verify_and_insert(record, None)
+            .expect("machine self-revocation verifies and inserts");
+
+        // A clean (non-revoked) agent on the revoked machine is still dropped —
+        // the machine revocation is decisive, not the agent revocation.
+        let clean_agent = test_keypair().agent_id();
+        let before = dm.diagnostics_snapshot().stats.incoming_dropped_revoked;
+        assert!(
+            drop_if_sender_revoked(&dm, &set, &clean_agent, &revoked_machine),
+            "a DM from a machine-revoked (agent-clean) sender must be dropped (#184)"
+        );
+        let after = dm.diagnostics_snapshot().stats.incoming_dropped_revoked;
+        assert_eq!(
+            after,
+            before + 1,
+            "dropping a machine-revoked DM must increment incoming_dropped_revoked"
         );
     }
 
