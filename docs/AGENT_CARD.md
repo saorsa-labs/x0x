@@ -99,8 +99,8 @@ x0x provides 6 global bootstrap nodes:
 | SFO, US | `quic://147.182.234.192:5483` | QUIC |
 | Helsinki, FI | `quic://65.21.157.229:5483` | QUIC |
 | Nuremberg, DE | `quic://116.203.101.172:5483` | QUIC |
-| Singapore, SG | `quic://149.28.156.231:5483` | QUIC |
-| Tokyo, JP | `quic://45.77.176.184:5483` | QUIC |
+| Singapore, SG | `quic://152.42.210.67:5483` | QUIC |
+| Sydney, AU | `quic://170.64.176.102:5483` | QUIC |
 
 Agents can connect to any bootstrap node to join the network. Once connected, they discover peers via gossip.
 

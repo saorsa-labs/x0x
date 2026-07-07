@@ -4,13 +4,13 @@
 //! on the exec ACL ([`crate::exec::acl`]); see ADR-0019 and
 //! `docs/plans/2026-07-issue-131-connect-acl-plan.md`.
 //!
-//! ## v1 scope (important)
-//! v1 is a **policy engine + validation surface only** — there is no runtime
-//! enforcement caller yet. The T4 forwarder (issue #132) will call
-//! [`crate::connect::gate::evaluate_connect_gate`] at its accept seam; until then this module
-//! provides a fail-closed policy loader, a loopback-only target validator,
-//! and a pure gate function that are fully tested but unwired. See §1.3 of
-//! the plan and ADR-0019.
+//! ## Scope
+//!
+//! Fail-closed policy loader, loopback-only target validator, and a pure
+//! gate function ([`crate::connect::gate::evaluate_connect_gate`]). The
+//! forwarder shipped in v0.29.0 (#183) and calls the gate at its inbound
+//! accept seam — after the peer is verified + trusted and before
+//! `TcpStream::connect`. See ADR-0019.
 //!
 //! ## Security invariants
 //! - **Default = disabled.** [`ConnectPolicy::default()`] is `Disabled`, so an

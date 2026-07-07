@@ -14035,8 +14035,9 @@ async fn exec_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoRespon
 ///
 /// Returns the [`x0x::connect::ConnectDiagnosticsSnapshot`]: enabled flag,
 /// loaded-from path, allow-entry count, cumulative allow/deny counters, and
-/// per-reason denial breakdown. Counters read 0 until the T4 forwarder
-/// (issue #132) is wired; the ACL summary is always populated.
+/// per-reason denial breakdown. Counters reflect live forwards when connect
+/// is enabled (forwarder shipped in #183) and read 0 when it is disabled; the
+/// ACL summary is always populated.
 async fn connect_diagnostics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.connect_diagnostics.snapshot())
 }

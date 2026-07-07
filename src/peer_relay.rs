@@ -37,17 +37,16 @@
 //!   `dst` / `originated_at` is rejected.
 //! - One hop only — structurally enforced by the type system.
 //!
-//! ## MVP scope
+//! ## Status
 //!
-//! This ships the **primitives + telemetry**: the `RelayedDm` /
-//! `RelayHeader` wire types, signed-bytes construction + verification,
-//! the `PeerRelay` engine (per-peer failure tracking, `needs_relay`
-//! decision, relay-candidate selection), and the `RelayStats`
-//! counters. The `RelayPolicy` is **disabled by default** — the relay
-//! path only engages when a runtime explicitly enables it. Wiring the
-//! engine into `Agent::send_direct_with_config`'s fallback path and
-//! `NetworkNode`'s inbound handler is X0X-0070b (same MVP-split
-//! pattern as X0X-0073 → X0X-0073b).
+//! The primitives, telemetry, **and** runtime wiring all ship here: the
+//! `RelayedDm` / `RelayHeader` wire types, signed-bytes construction +
+//! verification, the `PeerRelay` engine (per-peer failure tracking,
+//! `needs_relay` decision, relay-candidate selection), the `RelayStats`
+//! counters, and the fallback path in `Agent::send_direct_with_config`
+//! plus the inbound receiver in `NetworkNode` (X0X-0070b, shipped). The
+//! `RelayPolicy` is **disabled by default** — the relay path only engages
+//! when a runtime explicitly enables it.
 //!
 //! Reference: Tailscale Peer Relays beta
 //! <https://tailscale.com/blog/peer-relays-beta>; iroh DERP

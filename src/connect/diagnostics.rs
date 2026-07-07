@@ -1,10 +1,12 @@
 //! Connect diagnostics — counter surface for connect allow/deny decisions.
 //!
-//! Minimal-scope mirror of `exec/diagnostics.rs`. Counters read `0` until T4
-//! (issue #132) wires calls to [`ConnectDiagnostics::record_allowed`] /
-//! [`record_denied`](ConnectDiagnostics::record_denied); that is the intended
-//! "counter surface for future connect denials". v1 has no warnings/sessions
-//! machinery — that is T4.
+//! Minimal-scope mirror of `exec/diagnostics.rs`. The forwarder (shipped in
+//! #183) calls [`ConnectDiagnostics::record_allowed`] /
+//! [`record_denied`](ConnectDiagnostics::record_denied) on each authorized or
+//! denied forward when connect is enabled, so the counters reflect live
+//! traffic; they read `0` when connect is disabled (the default). Intentionally
+//! no warnings/sessions machinery (connect diagnostics is counters + summary
+//! only).
 
 use std::collections::HashMap;
 use std::sync::Mutex;

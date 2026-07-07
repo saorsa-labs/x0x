@@ -22,7 +22,7 @@ There is no transport barrier. We verified that `saorsa-transport` and `ant-quic
 
 | Capability | Status | Detail |
 |-----------|--------|--------|
-| Global bootstrap network | **Live** | 6 nodes: NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo |
+| Global bootstrap network | **Live** | 6 nodes: NYC, SFO, Helsinki, Nuremberg, Singapore, Sydney |
 | Post-quantum transport | **Live** | ML-KEM-768 key exchange, ML-DSA-65 signatures (ant-quic) |
 | NAT traversal | **Live** | Native QUIC extension frames, no STUN/ICE/TURN |
 | MASQUE relay | **Live** | CONNECT-UDP Bind fallback for symmetric NAT |

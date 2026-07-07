@@ -78,7 +78,7 @@ Two communication modes:
 | **Gossip pub/sub** | Broadcast to many agents | Eventually consistent, epidemic |
 | **Direct messaging** | Private between two agents | Immediate, reliable, ordered |
 
-6 bootstrap nodes (NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo) provide initial discovery and NAT traversal — they never see your data.
+6 bootstrap nodes (NYC, SFO, Helsinki, Nuremberg, Singapore, Sydney) provide initial discovery and NAT traversal — they never see your data.
 
 For security details (algorithms, RFCs, key pinning), see [docs/security.md](https://github.com/saorsa-labs/x0x/blob/main/docs/security.md).
 
@@ -320,7 +320,7 @@ rendezvous_enabled = true             # Global agent findability
 <data_dir>/api-token         # Bearer token for CLI/apps/scripts
 <data_dir>/contacts.json     # Trust/contact store
 <data_dir>/mls_groups.bin    # MLS group state
-<data_dir>/peer_cache/       # Bootstrap peer cache
+<data_dir>/peers/peers.cache   # Bootstrap peer cache
 ```
 
 **Default identity_dir:** `~/.x0x/` | named instances: `~/.x0x-<name>/`

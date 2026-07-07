@@ -181,7 +181,7 @@ saorsa-pqc ◄── saorsa-mls
 
 **Surfaces**: Rust crate (`use x0x::Agent`), CLI (`x0x`), daemon with REST/WS API (`x0xd`), embedded GUI. Non-Rust applications integrate by talking to `x0xd` over HTTP; there are no first-party Node.js or Python FFI bindings.
 
-**6 global bootstrap nodes**: NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo.
+**6 global bootstrap nodes**: NYC, SFO, Helsinki, Nuremberg, Singapore, Sydney.
 
 ### communitas — The Example Application
 
@@ -237,7 +237,7 @@ saorsa-pqc ◄── saorsa-mls
 | saorsa-3 | 147.182.234.192 | SFO, US | DigitalOcean |
 | saorsa-6 | 65.21.157.229 | Helsinki, FI | Hetzner |
 | saorsa-7 | 116.203.101.172 | Nuremberg, DE | Hetzner |
-| saorsa-8 | 149.28.156.231 | Singapore, SG | Vultr |
-| saorsa-9 | 45.77.176.184 | Tokyo, JP | Vultr |
+| saorsa-8 | 152.42.210.67 | Singapore, SG | DigitalOcean |
+| saorsa-9 | 170.64.176.102 | Sydney, AU | DigitalOcean |
 
 These nodes are critical infrastructure — every x0x user worldwide connects to them on first join.

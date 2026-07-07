@@ -1,8 +1,8 @@
 # x0x connect ACL — default-closed connectivity policy
 
-The connect ACL controls which remote agents may request an outbound TCP connection through the local `x0xd` daemon. It is the policy engine for the Tailnet T4 forwarder (issue #132); the forwarder wires up runtime enforcement but the policy engine, validation surface, and diagnostics endpoint are delivered ahead of it in v1.
+The connect ACL controls which remote agents may request an outbound TCP connection through the local `x0xd` daemon. It is the policy engine for the Tailnet forwarder — the forwarder shipped in v0.29.0 (#183), so an enabled ACL authorizes live TCP forwards at runtime (inbound loopback targets only).
 
-**v1 scope:** policy engine, startup validation, diagnostics. There is no runtime forwarder yet. All connection-forwarding requests are denied at the gate until T4 ships.
+**Scope:** policy engine, startup validation, diagnostics, and runtime enforcement. An enabled ACL authorizes per-flow TCP forwards; a disabled or absent ACL denies every forward request at the gate.
 
 ## Default behaviour
 
@@ -14,6 +14,8 @@ Default path:
 
 - Linux: `/etc/x0x/connect-acl.toml`
 - macOS: `/usr/local/etc/x0x/connect-acl.toml`
+
+> **Co-located daemons share the default path.** If more than one `x0xd` runs on a host (for example a prod instance plus a `--name testnet` instance), they all resolve the same default `/etc/x0x/connect-acl.toml` unless each is given its own `--connect-acl`. Creating the file to configure one plane silently arms every other plane on its next restart / self-upgrade — a latent way for a test/dev policy to activate on prod. Give each plane an explicit `--connect-acl` path. See issue #189.
 
 Override for tests or non-default installs:
 
@@ -92,7 +94,7 @@ Returns the [`ConnectDiagnosticsSnapshot`](../src/connect/diagnostics.rs):
 }
 ```
 
-When connect is enabled, `acl_summary.enabled` is `true`, the entry counts are populated, and `disabled_reason` is absent. Counters read `0` until the T4 forwarder (issue #132) is wired.
+When connect is enabled, `acl_summary.enabled` is `true`, the entry counts are populated, and `disabled_reason` is absent. The `streams_allowed` / `streams_denied` counters increment on each authorized or denied forward.
 
 The `denial_breakdown` map is keyed by `ConnectDenialReason` in `snake_case`:
 
