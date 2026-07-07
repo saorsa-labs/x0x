@@ -138,7 +138,9 @@ pub async fn diagnostics_ws(client: &DaemonClient) -> Result<()> {
 ///
 /// Connect-ACL policy summary (enabled flag, loaded-from path, allow-entry
 /// count) and cumulative stream allow/deny counters with per-reason breakdown.
-/// Counters read 0 until the T4 forwarder (issue #132) is wired.
+/// Counters increment on each authorized/denied forward when connect is
+/// enabled (the forwarder, shipped in #183, calls the diagnostics); they
+/// read 0 when connect is disabled (the default).
 pub async fn diagnostics_connect(client: &DaemonClient) -> Result<()> {
     client.run_get("/diagnostics/connect").await
 }

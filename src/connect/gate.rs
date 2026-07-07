@@ -1,4 +1,4 @@
-//! Connect gate — the enforcement seam the T4 forwarder will call.
+//! Connect gate — the enforcement seam the forwarder calls.
 //!
 //! Pure and synchronous (no service, no I/O) so the whole #141-style denial
 //! matrix ports as fast unit tests. The T4 forwarder (issue #132) calls

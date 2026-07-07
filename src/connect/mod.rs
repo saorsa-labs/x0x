@@ -1,11 +1,9 @@
 //! Connection ACL (default-closed connectivity policy).
 //!
-//! v1 delivers a fail-closed policy engine, loopback-only target validation,
-//! and a pure gate function — fully tested but **not yet wired** to a runtime
-//! forwarder. The T4 forwarder (issue #132) will call
+//! Fail-closed policy engine, loopback-only target validation, and a pure
+//! gate function. The forwarder (shipped in v0.29.0, #183) calls
 //! [`gate::evaluate_connect_gate`] at its inbound-accept seam after the peer
-//! is verified + trusted and before `TcpStream::connect`. No stream code in
-//! `network.rs` changes in v1.
+//! is verified + trusted and before `TcpStream::connect`.
 //!
 //! See ADR-0019 (`docs/adr/0019-connect-acl-default-closed.md`) and the
 //! implementation plan

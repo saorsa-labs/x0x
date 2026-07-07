@@ -573,8 +573,9 @@ pub(super) struct AppState {
     /// Per-group ingest diagnostics surfaced via `/diagnostics/groups`.
     pub(super) groups_diagnostics: Arc<x0x::groups::GroupsDiagnostics>,
     /// Connect-ACL allow/deny counters + policy summary for
-    /// `/diagnostics/connect`. Counters read 0 until the T4 forwarder
-    /// (issue #132) wires calls to `record_allowed`/`record_denied`.
+    /// `/diagnostics/connect`. Counters reflect live forwards when connect is
+    /// enabled (the forwarder calls `record_allowed`/`record_denied`) and read
+    /// 0 when it is disabled (the default).
     pub(super) connect_diagnostics: Arc<x0x::connect::ConnectDiagnostics>,
     /// Tailnet forwarder service (#132 T4/T6): owns the inbound connect-gated
     /// consumer + outbound local-port listeners. `None` when connect is
