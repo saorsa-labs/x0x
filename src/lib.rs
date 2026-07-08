@@ -9226,6 +9226,19 @@ impl AgentBuilder {
             storage::load_revocation_set(self.identity_dir.as_deref()).await,
         ));
 
+        // Initialise contact store now (hoisted before the relay-DM
+        // listener spawn so the listener can resolve the #193 contact
+        // gate against the same shared store the Agent mutates).
+        let contacts_path = self.contact_store_path.unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".x0x")
+                .join("contacts.json")
+        });
+        let contact_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            contacts::ContactStore::new(contacts_path),
+        ));
+
         // X0X-0070b: spawn the inbound RelayedDm listener so this Agent can
         // serve as either the final recipient (DeliverLocally) or the
         // intermediate relay (Forward) for peers that fell back to the
@@ -9238,6 +9251,7 @@ impl AgentBuilder {
                 std::sync::Arc::clone(&peer_relay),
                 std::sync::Arc::clone(&identity_discovery_cache),
                 std::sync::Arc::clone(&revocation_set),
+                std::sync::Arc::clone(&contact_store),
                 identity.agent_id(),
             );
         }
@@ -9265,17 +9279,6 @@ impl AgentBuilder {
         } else {
             None
         };
-
-        // Initialise contact store
-        let contacts_path = self.contact_store_path.unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".x0x")
-                .join("contacts.json")
-        });
-        let contact_store = std::sync::Arc::new(tokio::sync::RwLock::new(
-            contacts::ContactStore::new(contacts_path),
-        ));
 
         // Wrap bootstrap cache with gossip coordinator adapter (zero duplication).
         let gossip_cache_adapter = bootstrap_cache.as_ref().map(|cache| {
@@ -9990,6 +9993,7 @@ fn spawn_relay_dm_listener(
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
     local_agent_id: identity::AgentId,
 ) {
     tokio::spawn(async move {
@@ -10005,9 +10009,47 @@ fn spawn_relay_dm_listener(
                 );
                 break;
             };
-
             let now_ms = dm::now_unix_ms();
-            let disposition = peer_relay.disposition_for(&relayed, &local_agent_id, now_ms);
+            // #193 contact gate: resolve the relay header's authenticated
+            // sender against the contact store before classifying. The
+            // gate itself is enforced inside `disposition_for`; this async
+            // resolution belongs here (the contact store is an async
+            // RwLock, and `disposition_for` is sync).
+            //
+            // Trust semantics: only *explicitly-trusted* contacts
+            // (Known/Trusted) pass the gate — a merely-discovered
+            // `Unknown` entry (auto-created by `register_announced_machine`
+            // → `add_machine`, lib.rs ~576) does NOT, so the gate means
+            // "my contacts", not "anyone I've seen". A `Blocked` entry is
+            // refused unconditionally (see RelayRefusal::Blocked).
+            //
+            // TOCTOU: membership is snapshotted per message here and passed
+            // as bools, so a contact removed/blocked mid-flight can have one
+            // forward slip through before the next relay frame re-snapshots.
+            // Acceptable — the inner DmEnvelope is end-to-end encrypted and
+            // origin-signed, and the per-frame snapshot bounds the window to
+            // a single hop.
+            let sender_agent_id = identity::AgentId(relayed.header.sender_agent_id);
+            let (is_sender_contact, is_sender_blocked) = {
+                let store = contact_store.read().await;
+                match store.get(&sender_agent_id) {
+                    Some(c) => (
+                        matches!(
+                            c.trust_level,
+                            contacts::TrustLevel::Known | contacts::TrustLevel::Trusted
+                        ),
+                        c.trust_level == contacts::TrustLevel::Blocked,
+                    ),
+                    None => (false, false),
+                }
+            };
+            let disposition = peer_relay.disposition_for(
+                &relayed,
+                &local_agent_id,
+                now_ms,
+                is_sender_contact,
+                is_sender_blocked,
+            );
 
             // Revocation gate (PR #177 review, fix 1): the inner envelope's
             // ML-DSA-65 origin signature is the trust anchor, but a revoked
@@ -10968,6 +11010,7 @@ mod tests {
             fail_threshold: 7,
             fail_window_ms: 90_000,
             candidates: vec![hex::encode(candidate_a), hex::encode(candidate_b)],
+            ..Default::default()
         };
         let agent = Agent::builder()
             .with_machine_key(dir.path().join("machine.key"))
@@ -11070,6 +11113,7 @@ mod tests {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
+            ..Default::default()
         };
         let agent = Agent::builder()
             .with_machine_key(dir.path().join("machine.key"))
@@ -11108,6 +11152,7 @@ mod tests {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: vec![candidate_hex],
+            ..Default::default()
         };
         let agent = Agent::builder()
             .with_machine_key(dir.path().join("machine.key"))
@@ -11145,6 +11190,7 @@ mod tests {
             fail_threshold: 5,
             fail_window_ms: 60_000,
             candidates: vec![hex::encode([0xEE_u8; 32])],
+            ..Default::default()
         };
         let agent = Agent::builder()
             .with_machine_key(dir.path().join("machine.key"))
@@ -11183,6 +11229,7 @@ mod tests {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
+            ..Default::default()
         };
         let agent = Agent::builder()
             .with_machine_key(dir.path().join("machine.key"))
@@ -11280,6 +11327,7 @@ mod tests {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
+            ..Default::default()
         };
         let agent = Agent::builder()
             .with_machine_key(dir.path().join("machine.key"))

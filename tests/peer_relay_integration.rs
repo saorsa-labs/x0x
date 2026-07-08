@@ -172,6 +172,7 @@ async fn sender_uses_relay_when_direct_path_fails() {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: vec![hex::encode(charlie.agent_id().0)],
+            ..Default::default()
         },
     )
     .await
@@ -284,6 +285,7 @@ async fn enabled_policy_without_candidates_surfaces_direct_err() {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
+            ..Default::default()
         },
     )
     .await
@@ -352,6 +354,7 @@ async fn direct_success_after_relay_mode_increments_recovery_counter() {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
+            ..Default::default()
         },
     )
     .await
@@ -489,6 +492,7 @@ async fn relay_round_trip_alice_to_bob_via_charlie() {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
+            ..Default::default()
         },
     )
     .await
@@ -509,6 +513,7 @@ async fn relay_round_trip_alice_to_bob_via_charlie() {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
+            ..Default::default()
         },
     )
     .await
@@ -529,6 +534,7 @@ async fn relay_round_trip_alice_to_bob_via_charlie() {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: vec![hex::encode(charlie.agent_id().0)],
+            ..Default::default()
         },
     )
     .await
@@ -815,7 +821,7 @@ fn disabled_relay_refuses_before_verifying_signature() {
         !disabled.policy().enabled,
         "PeerRelay::new must be disabled by default"
     );
-    let disp = disabled.disposition_for(&relayed, &dst, now);
+    let disp = disabled.disposition_for(&relayed, &dst, now, false, false);
     assert_eq!(
         disp,
         RelayDisposition::Refuse(RelayRefusal::PolicyDisabled),
@@ -831,7 +837,7 @@ fn disabled_relay_refuses_before_verifying_signature() {
     // Contrast: an ENABLED engine runs verify() and rejects the bad signature,
     // confirming the reorder is the only behavioural change.
     let enabled = PeerRelay::with_policy(RelayPolicy::enabled());
-    let disp2 = enabled.disposition_for(&relayed, &dst, now);
+    let disp2 = enabled.disposition_for(&relayed, &dst, now, false, false);
     assert_eq!(
         disp2,
         RelayDisposition::Refuse(RelayRefusal::BadSignature),
@@ -858,6 +864,7 @@ async fn revoked_origin_relayed_dm_is_dropped_before_local_delivery() {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
+            ..Default::default()
         },
     )
     .await
@@ -972,6 +979,7 @@ async fn forged_inner_relayed_dm_is_never_a_verified_delivery() {
             fail_threshold: 3,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
+            ..Default::default()
         },
     )
     .await
