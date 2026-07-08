@@ -591,7 +591,19 @@ async fn handle_ws_command(
                 session.subscribed_topics.clone()
             };
             let mut requested_topics = HashSet::new();
+            const MAX_WS_TOPICS_PER_SESSION: usize = 64;
             for topic in &topics {
+                // #195: per-session topic cap — an authenticated client could
+                // otherwise spawn an unbounded number of per-topic forwarder
+                // tasks (one gossip sub + broadcast + forward task each).
+                if already_subscribed.len() + requested_topics.len() >= MAX_WS_TOPICS_PER_SESSION {
+                    tracing::warn!(
+                        target: "x0x::ws",
+                        cap = MAX_WS_TOPICS_PER_SESSION,
+                        "WS Subscribe per-session topic cap reached — ignoring further topics"
+                    );
+                    break;
+                }
                 if !requested_topics.insert(topic.clone()) || already_subscribed.contains(topic) {
                     continue;
                 }

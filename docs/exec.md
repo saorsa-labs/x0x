@@ -24,6 +24,8 @@ Remote execution is processed only when all of the following are true:
 5. the argv vector matches an allowed command;
 6. stdin, timeout, concurrency, and output caps pass.
 
+**Caller-authentication trust anchor.** Exec authorization rests on the `(agent_id, machine_id)` pair being *cryptographically* authenticated, not merely claimed: both fields are mandatory in every ACL entry, and the `machine_id` is the QUIC peer identity established by the post-quantum (ML-DSA-65) transport handshake — an attacker cannot present a forged `machine_id` without the peer's machine keypair. So an exec request is honored only from hardware the operator explicitly pinned in the ACL. This invariant must survive refactors (issue #195).
+
 ## ACL location
 
 Default path:

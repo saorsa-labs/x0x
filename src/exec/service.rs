@@ -718,6 +718,35 @@ impl ExecService {
         timeout_ms: u32,
         cwd: Option<String>,
     ) {
+        // #195 item 4: cheap pre-spawn verified/trust peek. Deny unverified or
+        // non-Accept senders WITHOUT spawning a handler task, so a peer flooding
+        // ExecFrame::Request can't force unbounded short-lived task spawns (each
+        // of these denies anyway, before any child process is considered).
+        // `handle_request` re-checks the same gates defensively.
+        if !inbound.verified {
+            self.diagnostics.record_request_received();
+            self.deny(
+                inbound.sender,
+                inbound.machine_id,
+                request_id,
+                &argv,
+                DenialReason::UnverifiedSender,
+            )
+            .await;
+            return;
+        }
+        if inbound.trust_decision != Some(TrustDecision::Accept) {
+            self.diagnostics.record_request_received();
+            self.deny(
+                inbound.sender,
+                inbound.machine_id,
+                request_id,
+                &argv,
+                DenialReason::TrustRejected,
+            )
+            .await;
+            return;
+        }
         // Hold the lock across spawn + insert so `shutdown()` draining the map
         // observes a consistent set: either this handle is present (and will be
         // awaited/aborted) or the token was already cancelled and we decline.
@@ -2466,6 +2495,53 @@ mod tests {
             .await;
 
         assert_single_denial(&service, DenialReason::TrustRejected).await;
+    }
+
+    // ── #195 item 4: pre-spawn verified/trust peek (no task spawned) ─────────
+
+    #[tokio::test]
+    async fn spawn_request_handler_denies_unverified_without_spawning() {
+        // #195 item 4: an unverified sender is denied at the pre-spawn peek, so
+        // NO handler task is created (request_task_handles stays empty) — a peer
+        // flooding ExecFrame::Request can't force unbounded task spawns.
+        let service = test_service().await;
+        Arc::clone(&service)
+            .spawn_request_handler(
+                inbound_payload(false, Some(TrustDecision::Accept)),
+                ExecRequestId([78; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                60_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::UnverifiedSender).await;
+        assert!(
+            service.request_task_handles.lock().await.is_empty(),
+            "unverified request must not spawn a handler task"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_request_handler_denies_non_accept_trust_without_spawning() {
+        // #195 item 4: a trust-rejected sender is likewise denied pre-spawn —
+        // no handler task, no child-process path reached.
+        let service = test_service().await;
+        Arc::clone(&service)
+            .spawn_request_handler(
+                inbound_payload(true, Some(TrustDecision::AcceptWithFlag)),
+                ExecRequestId([79; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                60_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::TrustRejected).await;
+        assert!(
+            service.request_task_handles.lock().await.is_empty(),
+            "trust-rejected request must not spawn a handler task"
+        );
     }
 
     #[tokio::test]

@@ -2546,6 +2546,25 @@ impl Agent {
             }
         };
 
+        // #195 item 5: consult the revocation set inline so a known-revoked-but-
+        // not-yet-evicted agent can't be the target of an outbound connect —
+        // closes the race between a revocation arriving and the eviction loop
+        // purging the discovery cache. Pairs with #191 item 5.
+        {
+            let revoked = self.revocation_set.read().await;
+            if revoked.is_agent_revoked(agent_id) || revoked.is_machine_revoked(&agent.machine_id) {
+                tracing::info!(
+                    target: "x0x::connect",
+                    stage = "connect_to_agent",
+                    %agent_prefix,
+                    outcome = "revoked",
+                    dur_ms = call_start.elapsed().as_millis() as u64,
+                    "connect target is revoked — refusing before any dial"
+                );
+                return Ok(connectivity::ConnectOutcome::NotFound);
+            }
+        }
+
         let info = connectivity::ReachabilityInfo::from_discovered(&agent);
         let v4_addrs = info.addresses.iter().filter(|a| a.is_ipv4()).count();
         let v6_addrs = info.addresses.len() - v4_addrs;
