@@ -201,12 +201,14 @@ fn resolve_loopback_target(
 /// NOT call `TcpStream::connect` on `Err`.
 ///
 /// **Multi-agent fail-closed (#192):** `agents` holds every agent known to
-/// run on the transport-authenticated peer machine. The gate must pass for
-/// **every** agent — if any is unauthorized the forward is denied. When the
-/// machine hosts a single agent (the common case) this reduces to the
+/// run on the transport-authenticated peer machine (from the discovery
+/// cache — see docs/connect-acl.md "Limitations: announced agents only"
+/// for the residual unannounced-agent window). The gate must pass for
+/// **every** agent — if any is unauthorized the forward is denied. When
+/// the machine hosts a single agent (the common case) this reduces to the
 /// existing exact-pair check. When it hosts multiple the QUIC transport
-/// cannot prove which agent opened the stream, so an unauthorized agent
-/// cannot piggyback on an authorized one's ACL entry.
+/// cannot prove which agent opened the stream, so every announced agent
+/// must be authorized.
 ///
 /// Extracted pure so the full deny/allow matrix is unit-testable without a
 /// live QUIC pair.

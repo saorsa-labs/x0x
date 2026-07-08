@@ -184,16 +184,17 @@ impl StreamProtocol {
 /// after the identity gate has cleared; consumers can rely on them without
 /// re-checking.
 pub struct PeerStream {
-    /// All agent identities known to run on the peer machine (≥1). On the
-    /// inbound path these are resolved from the transport-authenticated
-    /// `MachineId` via the identity discovery cache; on the outbound path
-    /// this is the single target agent the opener selected.
+    /// All agent identities known (announced) to run on the peer machine
+    /// (≥1). On the inbound path these are resolved from the transport-
+    /// authenticated `MachineId` via the identity discovery cache; on the
+    /// outbound path this is the single target agent the opener selected.
     ///
     /// When the list holds more than one agent the QUIC transport cannot
     /// prove which one opened the stream — only the machine is
     /// authenticated. Downstream authorization (the connect ACL) must
     /// therefore check **every** agent and fail-closed if any is
-    /// unauthorized (issue #192).
+    /// unauthorized (issue #192). The list reflects announced agents only;
+    /// see `docs/connect-acl.md` "Limitations: announced agents only".
     agents: Vec<crate::identity::AgentId>,
     peer: MachineId,
     protocol: StreamProtocol,
