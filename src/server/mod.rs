@@ -9307,14 +9307,14 @@ async fn create_group_invite(
         let link = match invite.encode_link() {
             Ok(link) => link,
             Err(e) => {
-                tracing::error!(
+                tracing::warn!(
                     group_id = %LogHexId::group(&id),
                     actual = e.actual,
                     limit = e.limit,
                     "refusing to mint oversized invite link: {e}"
                 );
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::PAYLOAD_TOO_LARGE,
                     Json(serde_json::json!({
                         "ok": false,
                         "error": "invite_too_large",
@@ -23254,6 +23254,180 @@ mod tests {
         assert_eq!(body["error"], "member_key_package_pending");
         assert_eq!(body["retry"], true);
         Ok(())
+    }
+
+    /// Issue #205 review nit: a `MemberJoined` validly signed for member X in
+    /// group A must be REFUSED for group B. `canonical_member_joined_bytes`
+    /// binds `group_id` (and `stable_group_id`) into the signed payload, so a
+    /// replay against a different group fails signature verification even when
+    /// the target member exists there. This pins the cross-group forgery guard.
+    #[tokio::test]
+    async fn recovered_member_key_package_refuses_cross_group_forgery() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x75, 0x76).await?;
+        let state = &fixture.state;
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let member_hex = fixture.member_hex.clone();
+
+        // Install a SECOND, independent TreeKEM group B in the same state and
+        // make the fixture's member a roster member of B (no key package).
+        let group_b = "77".repeat(32);
+        let stable_b = "78".repeat(32);
+        let info_b = treekem_metadata_group_info(state.agent.agent_id(), &group_b, &stable_b);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_b.clone(), info_b);
+        insert_active_member_without_kp(state, &group_b, &member_hex, &inviter_hex).await;
+
+        // Take the member's validly-signed event for group A and tamper only the
+        // group id fields to claim group B. The signature stays valid-for-A.
+        let cross_group_event = match fixture.event.clone() {
+            NamedGroupMetadataEvent::MemberJoined {
+                member_agent_id,
+                member_public_key_b64,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                signature_b64,
+                ..
+            } => NamedGroupMetadataEvent::MemberJoined {
+                group_id: group_b.clone(),
+                stable_group_id: Some(stable_b.clone()),
+                member_agent_id,
+                member_public_key_b64,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                signature_b64,
+            },
+            _ => unreachable!("fixture is MemberJoined"),
+        };
+        assert!(
+            !apply_recovered_member_key_package(state, &cross_group_event).await,
+            "cross-group forgery refused — group_id is bound into the signed canonical bytes"
+        );
+        assert!(
+            member_treekem_kp(state, &group_b, &member_hex)
+                .await
+                .is_none(),
+            "group B roster untouched by group A's signed event"
+        );
+        Ok(())
+    }
+
+    /// Issue #205 review nit: remove → re-add lifecycle. A cached, self-signed
+    /// `MemberJoined` must NOT silently re-key a Removed member, and after a
+    /// re-add it may only re-install the SAME package the member would produce
+    /// afresh. Safety rests on a load-bearing invariant: `agent_treekem_seed`
+    /// derives the TreeKEM seed deterministically from the agent's static
+    /// keypair secret + group id, and `prepare_member` is deterministic in that
+    /// seed — so for an unchanged AgentId the cached package is byte-identical
+    /// to a fresh `prepare_member` output and matches the re-added ratchet leaf.
+    /// A re-keyed member has a different AgentId (it is derived from the
+    /// ML-DSA public key) and therefore a different cache key, so a stale
+    /// package can never cross-contaminate a re-keyed member. If
+    /// `prepare_member` ever becomes non-deterministic, a staleness guard must
+    /// be added here.
+    #[tokio::test]
+    async fn recovered_member_key_package_remove_then_readd_reinstalls_same_package() -> Result<()>
+    {
+        let fixture = member_joined_treekem_fixture(0x79, 0x7a).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let original_kp = match &fixture.event {
+            NamedGroupMetadataEvent::MemberJoined {
+                treekem_key_package_b64: Some(kp),
+                ..
+            } => kp.clone(),
+            _ => unreachable!("fixture carries a key package"),
+        };
+
+        // Join: roster member (Active, no kp) + cached self-signed event.
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        state.treekem_member_key_packages.write().await.insert(
+            join_result_key(&group_id, &member_hex),
+            fixture.event.clone(),
+        );
+        assert!(
+            recover_member_treekem_key_package(state, &group_id, &member_hex).await,
+            "first recovery installs"
+        );
+        assert_eq!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .as_deref(),
+            Some(original_kp.as_str()),
+            "installed package matches the signed event"
+        );
+
+        // Remove: the member is no longer Active. The stale cache must NOT
+        // silently re-key a removed member.
+        set_member_state(
+            state,
+            &group_id,
+            &member_hex,
+            x0x::groups::GroupMemberState::Removed,
+        )
+        .await;
+        assert!(
+            !recover_member_treekem_key_package(state, &group_id, &member_hex).await,
+            "removed member is not re-keyable from the stale cache"
+        );
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "removed member keeps no package"
+        );
+
+        // Re-add: fresh Active entry, no package, cache unchanged. Recovery may
+        // re-install — and because the seed is deterministic for the same
+        // AgentId, the re-installed package is byte-identical to the original
+        // (i.e. what a fresh join would publish), so it matches the new leaf.
+        set_member_state(
+            state,
+            &group_id,
+            &member_hex,
+            x0x::groups::GroupMemberState::Active,
+        )
+        .await;
+        assert!(
+            recover_member_treekem_key_package(state, &group_id, &member_hex).await,
+            "re-added member recovers the cached package"
+        );
+        assert_eq!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .as_deref(),
+            Some(original_kp.as_str()),
+            "re-installed package is the deterministic (same-key) package, not a stale leaf"
+        );
+        Ok(())
+    }
+
+    async fn set_member_state(
+        state: &Arc<AppState>,
+        group_id: &str,
+        member: &str,
+        new_state: x0x::groups::GroupMemberState,
+    ) {
+        let mut groups = state.named_groups.write().await;
+        if let Some(info) = groups.get_mut(group_id) {
+            if let Some(m) = info.members_v2.get_mut(member) {
+                m.state = new_state;
+                m.treekem_key_package_b64 = None;
+                m.updated_at = 2;
+            }
+        }
     }
 
     async fn member_treekem_kp(
