@@ -70,24 +70,34 @@ before any byte is forwarded:
 
 | Knob (`[peer_relay]`) | Default | Refusal | Effect |
 |---|---|---|---|
-| `require_contact_to_relay` | `true` | `NotAContact` | Refuse to forward on behalf of any sender whose authenticated `sender_agent_id` is not in the local `ContactStore`. Set `false` only for an explicitly-open relay (e.g. a public DERP). |
+| `require_contact_to_relay` | `true` | `NotAContact` | Refuse to forward on behalf of any sender that is not an **explicitly-trusted** contact (`Known`/`Trusted`). A merely-discovered `Unknown` entry does **not** pass, so the gate means "my contacts", not "anyone I've seen". Set `false` only for an explicitly-open relay. |
+| — (always on) | — | `Blocked` | A `Blocked` contact is refused on the forward arm **unconditionally** — even on an open relay and before rate/bandwidth caps. The operator's blocklist always wins. |
 | `max_forwards_per_sender` | `10` | `RateLimited` | Per-sender forward cap over `limit_window_ms`. |
 | `max_total_forwards` | `100` | `RateLimited` | Global forward cap (all senders) over `limit_window_ms` — the concurrent-forward budget. |
 | `max_forward_bytes_per_window` | `1048576` (~1 MiB) | `BandwidthExceeded` | Total forwarded bytes per window. |
 | `limit_window_ms` | `60000` (60 s) | — | Sliding window for the three caps above. |
 
-The contact gate applies **only to the forward arm** — a relayed DM addressed to
-this node (`DeliverLocally`) is still received; receiving is not relaying. The
-rate/bandwidth caps still apply when the contact gate is off, so an explicitly
-open relay is never unbounded.
+The listener resolves the sender's trust level from `ContactStore` (async) per
+relay frame and passes it to the sync `disposition_for`. Membership is
+snapshotted per message: a contact removed/blocked mid-flight can have one
+forward slip through before the next frame re-snapshots — acceptable, since the
+inner `DmEnvelope` is end-to-end encrypted and origin-signed. The origin
+revocation gate (PR #177) still runs after classification for both arms.
 
-The listener resolves the contact membership from `ContactStore` (async) before
-calling the sync `disposition_for`; the origin revocation gate (PR #177) still
-runs after classification for both the deliver and forward arms.
+### `DeliverLocally` is not rate-limited
+
+A relayed DM addressed to this node (`DeliverLocally`, i.e. `dst == local`) is
+**receiving**, not relaying — it spends no uplink. It therefore intentionally
+**bypasses** the contact gate, the Blocked gate, and all rate/bandwidth caps. It
+still requires `enabled = true`, a valid `RelayHeader` signature, and freshness
+(within `freshness` / clock-skew bounds), and the origin revocation gate still
+applies. Inbound local-delivery is consequently **not** bounded by the knobs
+above; operators who want to suppress a specific inbound sender should block or
+revoke that agent.
 
 ### Observability
 
 `RelayStatsSnapshot` exposes per-refusal-reason counters
-(`relay_refused_not_a_contact`, `relay_refused_rate_limited`,
+(`relay_refused_not_a_contact`, `relay_refused_blocked`, `relay_refused_rate_limited`,
 `relay_refused_bandwidth_exceeded`) plus `relay_forward_bytes` (total bytes
 committed to forward) so operators can see and alert on refusals.

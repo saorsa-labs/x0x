@@ -821,7 +821,7 @@ fn disabled_relay_refuses_before_verifying_signature() {
         !disabled.policy().enabled,
         "PeerRelay::new must be disabled by default"
     );
-    let disp = disabled.disposition_for(&relayed, &dst, now, false);
+    let disp = disabled.disposition_for(&relayed, &dst, now, false, false);
     assert_eq!(
         disp,
         RelayDisposition::Refuse(RelayRefusal::PolicyDisabled),
@@ -837,7 +837,7 @@ fn disabled_relay_refuses_before_verifying_signature() {
     // Contrast: an ENABLED engine runs verify() and rejects the bad signature,
     // confirming the reorder is the only behavioural change.
     let enabled = PeerRelay::with_policy(RelayPolicy::enabled());
-    let disp2 = enabled.disposition_for(&relayed, &dst, now, false);
+    let disp2 = enabled.disposition_for(&relayed, &dst, now, false, false);
     assert_eq!(
         disp2,
         RelayDisposition::Refuse(RelayRefusal::BadSignature),

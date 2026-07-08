@@ -9988,15 +9988,46 @@ fn spawn_relay_dm_listener(
                 break;
             };
             let now_ms = dm::now_unix_ms();
-            // #193 contact gate: resolve whether the relay header's
-            // authenticated sender is a local contact before classifying.
-            // The gate itself is enforced inside `disposition_for`; this
-            // async resolution belongs here (the contact store is an async
+            // #193 contact gate: resolve the relay header's authenticated
+            // sender against the contact store before classifying. The
+            // gate itself is enforced inside `disposition_for`; this async
+            // resolution belongs here (the contact store is an async
             // RwLock, and `disposition_for` is sync).
+            //
+            // Trust semantics: only *explicitly-trusted* contacts
+            // (Known/Trusted) pass the gate — a merely-discovered
+            // `Unknown` entry (auto-created by `register_announced_machine`
+            // → `add_machine`, lib.rs ~576) does NOT, so the gate means
+            // "my contacts", not "anyone I've seen". A `Blocked` entry is
+            // refused unconditionally (see RelayRefusal::Blocked).
+            //
+            // TOCTOU: membership is snapshotted per message here and passed
+            // as bools, so a contact removed/blocked mid-flight can have one
+            // forward slip through before the next relay frame re-snapshots.
+            // Acceptable — the inner DmEnvelope is end-to-end encrypted and
+            // origin-signed, and the per-frame snapshot bounds the window to
+            // a single hop.
             let sender_agent_id = identity::AgentId(relayed.header.sender_agent_id);
-            let is_sender_contact = { contact_store.read().await.get(&sender_agent_id).is_some() };
-            let disposition =
-                peer_relay.disposition_for(&relayed, &local_agent_id, now_ms, is_sender_contact);
+            let (is_sender_contact, is_sender_blocked) = {
+                let store = contact_store.read().await;
+                match store.get(&sender_agent_id) {
+                    Some(c) => (
+                        matches!(
+                            c.trust_level,
+                            contacts::TrustLevel::Known | contacts::TrustLevel::Trusted
+                        ),
+                        c.trust_level == contacts::TrustLevel::Blocked,
+                    ),
+                    None => (false, false),
+                }
+            };
+            let disposition = peer_relay.disposition_for(
+                &relayed,
+                &local_agent_id,
+                now_ms,
+                is_sender_contact,
+                is_sender_blocked,
+            );
 
             // Revocation gate (PR #177 review, fix 1): the inner envelope's
             // ML-DSA-65 origin signature is the trust anchor, but a revoked

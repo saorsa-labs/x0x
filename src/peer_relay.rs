@@ -264,10 +264,19 @@ pub enum RelayRefusal {
     Stale,
     /// This node's relay path is disabled by policy.
     PolicyDisabled,
-    /// `require_contact_to_relay` is set and the relay header's
-    /// authenticated `sender_agent_id` is not in this node's contact
-    /// store (#193). Stops a stranger from spending the relay's uplink.
+    /// The relay header's authenticated `sender_agent_id` is not an
+    /// *explicitly-trusted* contact — i.e. no entry, or only an
+    /// auto-discovered `Unknown` entry (#193). Only `Known`/`Trusted`
+    /// contacts pass the gate, so a peer merely seen during discovery
+    /// cannot spend the relay's uplink. Stops a stranger (or a
+    /// discovery-only acquaintance) from being forwarded.
     NotAContact,
+    /// The sender is an explicitly **blocked** contact (#193). A blocked
+    /// peer is refused on the forward arm **unconditionally** — even when
+    /// `require_contact_to_relay` is `false` (open relay) and even before
+    /// the rate/bandwidth caps are consulted. The operator's blocklist
+    /// always wins.
+    Blocked,
     /// The sender (or the relay globally) has exceeded its per-window
     /// forward-rate budget (#193). Throttles a burst of relay requests.
     RateLimited,
@@ -419,6 +428,7 @@ pub struct RelayStats {
     direct_recovered_after_relay: AtomicU64,
     // #193 forward-path hardening counters:
     relay_refused_not_a_contact: AtomicU64,
+    relay_refused_blocked: AtomicU64,
     relay_refused_rate_limited: AtomicU64,
     relay_refused_bandwidth_exceeded: AtomicU64,
     /// Total bytes committed to forward on the relay path (the
@@ -453,6 +463,9 @@ pub struct RelayStatsSnapshot {
     /// Inbound relayed DMs refused — sender is not a contact
     /// (`require_contact_to_relay`, #193).
     pub relay_refused_not_a_contact: u64,
+    /// Inbound relayed DMs refused — sender is an explicitly blocked
+    /// contact (#193). Refused unconditionally on the forward arm.
+    pub relay_refused_blocked: u64,
     /// Inbound relayed DMs refused — per-sender/global forward rate
     /// exceeded (#193).
     pub relay_refused_rate_limited: u64,
@@ -480,6 +493,7 @@ impl RelayStats {
             relay_dropped_revoked: self.relay_dropped_revoked.load(Ordering::Relaxed),
             direct_recovered_after_relay: self.direct_recovered_after_relay.load(Ordering::Relaxed),
             relay_refused_not_a_contact: self.relay_refused_not_a_contact.load(Ordering::Relaxed),
+            relay_refused_blocked: self.relay_refused_blocked.load(Ordering::Relaxed),
             relay_refused_rate_limited: self.relay_refused_rate_limited.load(Ordering::Relaxed),
             relay_refused_bandwidth_exceeded: self
                 .relay_refused_bandwidth_exceeded
@@ -740,9 +754,11 @@ impl PeerRelay {
     /// Classify an inbound [`RelayedDm`] from the perspective of *this*
     /// node, whose agent id is `local_agent_id`, at wall-clock
     /// `now_unix_ms`. `is_sender_contact` is the caller's resolution of
-    /// whether the header's authenticated `sender_agent_id` is in this
-    /// node's contact store (the listener resolves this from
-    /// `ContactStore` before calling). Updates the telemetry counters as
+    /// whether the header's authenticated `sender_agent_id` is an
+    /// *explicitly-trusted* contact (Known/Trusted — NOT a merely-
+    /// discovered `Unknown` entry); `is_sender_blocked` is whether it is
+    /// an explicitly-blocked contact. The listener resolves both from
+    /// `ContactStore` before calling. Updates the telemetry counters as
     /// a side effect.
     ///
     /// Classification order (each refusal is fail-closed and counted):
@@ -757,14 +773,20 @@ impl PeerRelay {
     ///   `relay_received` += 1. Receiving is not relaying, so the
     ///   contact gate and resource caps below do NOT apply here.
     /// - otherwise (forward arm, #193 hardening):
-    ///   1. `require_contact_to_relay && !is_sender_contact` →
+    ///   1. `is_sender_blocked` → `Refuse(Blocked)`,
+    ///      `relay_refused_blocked` += 1. **Unconditional** — the
+    ///      operator's blocklist wins even on an open relay
+    ///      (`require_contact_to_relay = false`) and before rate caps.
+    ///   2. `require_contact_to_relay && !is_sender_contact` →
     ///      `Refuse(NotAContact)`, `relay_refused_not_a_contact` += 1.
-    ///   2. per-sender or global forward-rate cap exceeded →
+    ///      Only Known/Trusted pass; a discovery-only `Unknown` entry
+    ///      does not.
+    ///   3. per-sender or global forward-rate cap exceeded →
     ///      `Refuse(RateLimited)`, `relay_refused_rate_limited` += 1.
-    ///   3. bandwidth cap would be exceeded →
+    ///   4. bandwidth cap would be exceeded →
     ///      `Refuse(BandwidthExceeded)`, `relay_refused_bandwidth_exceeded`
     ///      += 1.
-    ///   4. all pass → record the forward, `relay_forwarded` += 1,
+    ///   5. all pass → record the forward, `relay_forwarded` += 1,
     ///      `relay_forward_bytes` += predicted inner wire size, return
     ///      [`RelayDisposition::Forward`].
     #[must_use]
@@ -774,6 +796,7 @@ impl PeerRelay {
         local_agent_id: &AgentId,
         now_unix_ms: u64,
         is_sender_contact: bool,
+        is_sender_blocked: bool,
     ) -> RelayDisposition {
         // DoS guard: reject on the disabled-policy path before doing any
         // ML-DSA-65 signature work, so a disabled relay cannot be made to
@@ -810,7 +833,19 @@ impl PeerRelay {
             self.stats.relay_received.fetch_add(1, Ordering::Relaxed);
             return RelayDisposition::DeliverLocally;
         }
-        // Forward arm — #193 hardening. Cheapest gate first (no lock).
+        // Forward arm — #193 hardening. Cheapest gates first (no lock).
+        // A blocked contact is refused unconditionally — the operator's
+        // blocklist wins even on an explicitly-open relay
+        // (require_contact_to_relay = false) and before rate/bandwidth.
+        if is_sender_blocked {
+            self.stats
+                .relay_refused_blocked
+                .fetch_add(1, Ordering::Relaxed);
+            return RelayDisposition::Refuse(RelayRefusal::Blocked);
+        }
+        // Contact gate: only explicitly-trusted contacts (Known/Trusted)
+        // pass — a merely-discovered Unknown entry does NOT, so the gate
+        // means "my contacts", not "anyone I've seen".
         if self.policy.require_contact_to_relay && !is_sender_contact {
             self.stats
                 .relay_refused_not_a_contact
@@ -1166,7 +1201,7 @@ mod tests {
             .expect("build");
 
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms + 100, false),
+            relay.disposition_for(&relayed, &local, now_ms + 100, false, false),
             RelayDisposition::DeliverLocally
         );
         assert_eq!(relay.stats().snapshot().relay_received, 1);
@@ -1195,7 +1230,7 @@ mod tests {
             .expect("build");
 
         assert_eq!(
-            relay.disposition_for(&relayed, &we_are_the_relay, now_ms + 100, true),
+            relay.disposition_for(&relayed, &we_are_the_relay, now_ms + 100, true, false),
             RelayDisposition::Forward {
                 dst_agent_id: dst.0
             }
@@ -1233,7 +1268,7 @@ mod tests {
         // "now" is 31 s past origination — beyond the 30 s freshness.
         let now_ms = originated_ms + 31_000;
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms, false),
+            relay.disposition_for(&relayed, &local, now_ms, false, false),
             RelayDisposition::Refuse(RelayRefusal::Stale)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_stale, 1);
@@ -1271,7 +1306,7 @@ mod tests {
             .expect("build");
 
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms, false),
+            relay.disposition_for(&relayed, &local, now_ms, false, false),
             RelayDisposition::Refuse(RelayRefusal::Stale)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_stale, 1);
@@ -1292,7 +1327,7 @@ mod tests {
             )
             .expect("build");
         assert_eq!(
-            relay.disposition_for(&fresh, &local, now_ms, false),
+            relay.disposition_for(&fresh, &local, now_ms, false, false),
             RelayDisposition::DeliverLocally
         );
     }
@@ -1322,7 +1357,7 @@ mod tests {
 
         let disabled = PeerRelay::new();
         assert_eq!(
-            disabled.disposition_for(&relayed, &local, now_ms + 100, false),
+            disabled.disposition_for(&relayed, &local, now_ms + 100, false, false),
             RelayDisposition::Refuse(RelayRefusal::PolicyDisabled)
         );
         assert_eq!(disabled.stats().snapshot().relay_refused_policy_disabled, 1);
@@ -1369,7 +1404,7 @@ mod tests {
 
         let relay = PeerRelay::with_policy(RelayPolicy::enabled()); // require_contact defaults true
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, false),
+            relay.disposition_for(&relayed, &we, now_ms + 100, false, false),
             RelayDisposition::Refuse(RelayRefusal::NotAContact)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_not_a_contact, 1);
@@ -1388,7 +1423,7 @@ mod tests {
 
         let relay = PeerRelay::with_policy(RelayPolicy::enabled());
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, true),
+            relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
             RelayDisposition::Forward {
                 dst_agent_id: dst.0
             }
@@ -1416,7 +1451,7 @@ mod tests {
         policy.require_contact_to_relay = false;
         let relay = PeerRelay::with_policy(policy);
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, false),
+            relay.disposition_for(&relayed, &we, now_ms + 100, false, false),
             RelayDisposition::Forward {
                 dst_agent_id: dst.0
             }
@@ -1443,7 +1478,7 @@ mod tests {
             })
             .expect("build");
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms + 100, false),
+            relay.disposition_for(&relayed, &local, now_ms + 100, false, false),
             RelayDisposition::DeliverLocally
         );
     }
@@ -1471,7 +1506,7 @@ mod tests {
         // First two forwards from this sender succeed.
         for _ in 0..2 {
             assert_eq!(
-                relay.disposition_for(&relayed, &we, now_ms + 100, true),
+                relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
                 RelayDisposition::Forward {
                     dst_agent_id: dst.0
                 }
@@ -1479,7 +1514,7 @@ mod tests {
         }
         // Third forward from the SAME sender is refused.
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, true),
+            relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
             RelayDisposition::Refuse(RelayRefusal::RateLimited)
         );
         let snap = relay.stats().snapshot();
@@ -1507,14 +1542,14 @@ mod tests {
         let relay = PeerRelay::with_policy(policy);
 
         assert_eq!(
-            relay.disposition_for(&first, &we, now_ms + 100, true),
+            relay.disposition_for(&first, &we, now_ms + 100, true, false),
             RelayDisposition::Forward {
                 dst_agent_id: dst.0
             }
         );
         // Different sender, but the global budget is exhausted.
         assert_eq!(
-            relay.disposition_for(&second, &we, now_ms + 100, true),
+            relay.disposition_for(&second, &we, now_ms + 100, true, false),
             RelayDisposition::Refuse(RelayRefusal::RateLimited)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_rate_limited, 1);
@@ -1542,7 +1577,7 @@ mod tests {
         let relay = PeerRelay::with_policy(policy);
 
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, true),
+            relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
             RelayDisposition::Refuse(RelayRefusal::BandwidthExceeded)
         );
         let snap = relay.stats().snapshot();
@@ -1551,6 +1586,100 @@ mod tests {
         assert_eq!(
             snap.relay_forward_bytes, 0,
             "no bytes committed on a refused forward"
+        );
+    }
+    #[test]
+    fn disposition_refuses_blocked_sender_unconditionally() {
+        // Why (#193 followup): a blocked contact is refused on the forward
+        // arm EVEN on an explicitly-open relay (require_contact_to_relay =
+        // false). The operator's blocklist always wins — it is not a rate
+        // limit that a blocked peer can spend budget against.
+        let dst = aid(70);
+        let we = aid(71);
+        let now_ms = 1_700_000_000_000u64;
+        let relayed = signed_forward_envelope(dst, now_ms);
+
+        let mut policy = RelayPolicy::enabled();
+        policy.require_contact_to_relay = false; // open relay
+        let relay = PeerRelay::with_policy(policy);
+
+        // Blocked + not-a-contact → still Blocked (gate is unconditional +
+        // checked before the contact gate).
+        assert_eq!(
+            relay.disposition_for(&relayed, &we, now_ms + 100, false, true),
+            RelayDisposition::Refuse(RelayRefusal::Blocked)
+        );
+        // Even if the sender were (impossibly) both "a contact" and blocked,
+        // the Blocked gate runs first.
+        assert_eq!(
+            relay.disposition_for(&relayed, &we, now_ms + 100, true, true),
+            RelayDisposition::Refuse(RelayRefusal::Blocked)
+        );
+        let snap = relay.stats().snapshot();
+        assert_eq!(snap.relay_refused_blocked, 2);
+        assert_eq!(snap.relay_forwarded, 0);
+    }
+
+    #[test]
+    fn disposition_refuses_blocked_before_rate_limit() {
+        // Why (#193 followup): the Blocked gate runs before the rate caps,
+        // so a blocked sender bursting past max_forwards_per_sender is
+        // refused with Blocked, not RateLimited.
+        let dst = aid(72);
+        let we = aid(73);
+        let now_ms = 1_700_000_000_000u64;
+        let relayed = signed_forward_envelope(dst, now_ms);
+
+        // Open relay (require_contact=false) with a tight per-sender cap:
+        // without the Blocked gate the first forward would succeed (it is
+        // under the cap). is_sender_blocked=true must short-circuit to
+        // Blocked, proving the gate runs before the rate caps.
+        let mut policy = RelayPolicy::enabled().with_forward_limits(
+            1,
+            1_000_000,
+            u64::MAX,
+            Duration::from_secs(60),
+        );
+        policy.require_contact_to_relay = false;
+        let relay = PeerRelay::with_policy(policy);
+        assert_eq!(
+            relay.disposition_for(&relayed, &we, now_ms + 100, false, true),
+            RelayDisposition::Refuse(RelayRefusal::Blocked)
+        );
+        let snap = relay.stats().snapshot();
+        assert_eq!(snap.relay_refused_blocked, 1);
+        assert_eq!(snap.relay_forwarded, 0, "a blocked sender never forwards");
+        assert_eq!(
+            snap.relay_refused_rate_limited, 0,
+            "Blocked must be reported, not RateLimited"
+        );
+    }
+
+    #[test]
+    fn unknown_contact_does_not_pass_contact_gate() {
+        // Why (#193 followup): the contact gate means "my contacts", not
+        // "anyone I've discovered". An auto-discovered `Unknown` entry (from
+        // register_announced_machine → add_machine) must NOT pass — the
+        // listener resolves Unknown to is_sender_contact=false, which the
+        // engine then refuses as NotAContact when require_contact_to_relay
+        // is set. This test pins the engine half of that contract.
+        let dst = aid(74);
+        let we = aid(75);
+        let now_ms = 1_700_000_000_000u64;
+        let relayed = signed_forward_envelope(dst, now_ms);
+
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled()); // require_contact default true
+                                                                    // is_sender_contact=false models an Unknown (or absent) sender.
+        assert_eq!(
+            relay.disposition_for(&relayed, &we, now_ms + 100, false, false),
+            RelayDisposition::Refuse(RelayRefusal::NotAContact)
+        );
+        // A Known/Trusted contact (is_sender_contact=true) does pass.
+        assert_eq!(
+            relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
+            RelayDisposition::Forward {
+                dst_agent_id: dst.0
+            }
         );
     }
 }
