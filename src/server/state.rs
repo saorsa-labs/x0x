@@ -501,6 +501,14 @@ pub(super) struct AppState {
     /// Bounded per-group log of locally authored/applied TreeKEM membership
     /// events used to satisfy explicit catch-up requests.
     pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,
+    /// Member-keyed cache of verified TreeKEM key-package-bearing
+    /// `MemberJoined` events (`join_result_key(group_id, member_id)` → event).
+    /// Populated when a node applies a joiner's self-signed `MemberJoined`
+    /// (inviter side) and served to promoted admins that never saw the join via
+    /// the member-keyed catch-up protocol (issue #205). The ML-DSA-65 signature
+    /// over `canonical_member_joined_bytes` authenticates the embedded key
+    /// package, so a recovering admin installs it without the inviter-only gate.
+    pub(super) treekem_member_key_packages: RwLock<HashMap<String, NamedGroupMetadataEvent>>,
     /// Anti-spam throttle for outbound catch-up requests.
     pub(super) treekem_catchup_throttle: RwLock<HashMap<String, Instant>>,
     /// Per-group serialization for authoritative membership mutations. The

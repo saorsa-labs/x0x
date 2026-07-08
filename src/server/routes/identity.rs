@@ -366,7 +366,25 @@ pub(in crate::server) fn populate_invite_base_state_from_group_info(
     invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
     invite.base_state_revision = Some(info.state_revision);
     invite.base_state_hash = Some(info.state_hash.clone());
-    invite.base_members_v2 = Some(info.members_v2.clone());
+    // Issue #205: strip per-member crypto material that contributes nothing to
+    // invite validation. `roster_root` commits only to `(id, role, state)`
+    // triples (state_commit.rs), the link is unsigned, and admission is the
+    // `invite_secret` handshake + authority-signed `MemberAdded`. Each member's
+    // ~15.7 KiB TreeKEM KeyPackage + ~1.2 KiB ML-KEM pubkey would otherwise be
+    // copy-pasted into the join cmd-DM, crossing the 49 152-byte gossip cap at
+    // the 3rd roster member (issue #188). Joiners learn both keys out-of-band
+    // (MemberAdded / Welcome / GET /agent), so the slim roster is sufficient.
+    let slim_roster = info
+        .members_v2
+        .iter()
+        .map(|(agent_id, member)| {
+            let mut slim = member.clone();
+            slim.treekem_key_package_b64 = None;
+            slim.kem_public_key_b64 = None;
+            (agent_id.clone(), slim)
+        })
+        .collect();
+    invite.base_members_v2 = Some(slim_roster);
     invite.base_prev_state_hash = info.prev_state_hash.clone();
     invite.secure_plane = Some(info.secure_plane);
     invite.base_secret_epoch = Some(info.secret_epoch);
@@ -433,9 +451,24 @@ pub(in crate::server) async fn get_agent_card(
                 x0x::groups::invite::DEFAULT_EXPIRY_SECS,
             );
             populate_invite_base_state_from_group_info(&mut invite, info);
+            // Enforce the DM-safe budget at mint; an oversized link would 400
+            // later when the card consumer DMs the join. Skip rather than poison
+            // the whole agent card (issue #205).
+            let invite_link = match invite.encode_link() {
+                Ok(link) => link,
+                Err(e) => {
+                    tracing::warn!(
+                        group_id = %info.mls_group_id,
+                        actual = e.actual,
+                        limit = e.limit,
+                        "skipping oversized group invite in agent card: {e}"
+                    );
+                    continue;
+                }
+            };
             card.groups.push(x0x::groups::card::CardGroup {
                 name: info.name.clone(),
-                invite_link: invite.to_link(),
+                invite_link,
             });
         }
     }

@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Strip TreeKEM KeyPackages from invite links + on-demand key-package catch-up ([#205](https://github.com/saorsa-labs/x0x/issues/205), fixes [#188](https://github.com/saorsa-labs/x0x/issues/188)).** `private_secure` invite links embedded the full roster including each member's ~15.7 KiB TreeKEM KeyPackage + ~1.2 KiB ML-KEM public key. The join cmd-DM crossed the 49 152-byte gossip cap at the 3rd roster member, so every later joiner's invite was rejected at the sender with `envelope_construction` and the joiner never joined (issue #188 root cause). Key packages commit nothing to invite validation — `roster_root` covers only `(id, role, state)` triples and the link is unsigned — so they are now stripped at mint in `populate_invite_base_state_from_group_info`, dropping the failing 3-member cmd-DM from ~63 KiB to ~6.5 KiB (the cap is not crossed until ~140 members). A mint-time budget (`INVITE_LINK_MAX_BYTES` = 40 KiB, enforced by `SignedInvite::encode_link`) fails loudly at `/groups/:id/invite` instead of as a later cross-node 400. The `signable_bytes` domain tag bumps `v2`→`v3`. Backward compatible both directions: the fields are `#[serde(default)]`, so old kp-bearing links still parse and old daemons reading stripped links see `None`.
+
+  Closes a regression the stripping introduces: a joiner later promoted to Admin cannot remove/ban a member whose key package it never learned (the `MemberJoined` apply is inviter-only and the authority-signed `MemberAdded` carries no package). On the `FAILED_DEPENDENCY` path, `remove`/`ban` now recover the target's package from a member-keyed cache of self-signed `MemberJoined` events, authenticated by re-verifying the joiner's ML-DSA-65 signature; on a local miss they fire a member-keyed TreeKEM catch-up request (extending `handle_treekem_catchup_request` with a `target_member_id`, reusing the existing verified-DM / active-member / 5 s-throttle gates) and return a retryable `member_key_package_pending`. The TreeKEM-join dogfood assertion is required again (all runners must join).
+
 ## [v0.29.0] - 2026-07-07
 
 ### Added

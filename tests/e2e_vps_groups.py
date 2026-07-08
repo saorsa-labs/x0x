@@ -920,6 +920,18 @@ class FleetHarness:
                     f"outcome={resp.get('outcome')}",
                 )
 
+        # Issue #205: the TreeKEM-join dogfood assertion is required again.
+        # Invites no longer embed per-member TreeKEM KeyPackages, so every
+        # joiner's cmd-DM fits the 49 152-byte gossip cap and all runners join
+        # (previously only the first two could, then the roster crossed the cap
+        # at the 3rd member — issue #188). allow_skips still tolerates an
+        # unreachable subset for partial-fleet runs.
+        if not self.allow_skips:
+            self.assert_pass(
+                "all runners joined the TreeKEM group (issue #205)",
+                len(joined) == len(members),
+                f"joined={joined} expected={members}",
+            )
         self.assert_pass(
             "TreeKEM group has >=2 joiners (needed to exercise applied path)",
             len(joined) >= 2,

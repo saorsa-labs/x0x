@@ -18,6 +18,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Default invite expiry: 7 days in seconds.
 pub const DEFAULT_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Safe upper bound on an encoded invite link.
+///
+/// The gossip-inbox DM path caps user payloads at
+/// [`crate::dm::MAX_PAYLOAD_BYTES`] (49 152). Invite links travel as the bulk
+/// of the `group_join` cmd-DM, so a link near that cap guarantees the DM is
+/// rejected at the sender with `envelope_construction` (issue #188). 40 KiB
+/// leaves room for the cmd-DM envelope wrapper while flagging roster growth at
+/// the mint site instead of as a mysterious cross-node 400. See issues #188 /
+/// #205.
+pub const INVITE_LINK_MAX_BYTES: usize = 40 * 1024;
+
 /// A signed invite token for joining a group.
 ///
 /// Tokens are serialized to base64url for sharing via email, chat, QR codes, etc.
@@ -85,6 +96,31 @@ pub struct SignedInvite {
     /// (hex-encoded). Currently not validated by the join flow.
     pub signature: String,
 }
+/// Error returned when an encoded invite link exceeds the safe DM budget.
+///
+/// Carries the measured and limit sizes so callers can surface a structured
+/// error at the mint site (issue #205) instead of letting the link 400 later
+/// at `/direct/send` with an opaque `envelope_construction`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteLinkTooLarge {
+    /// Measured encoded link length in bytes.
+    pub actual: usize,
+    /// Budget enforced by [`INVITE_LINK_MAX_BYTES`].
+    pub limit: usize,
+}
+
+impl std::fmt::Display for InviteLinkTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "encoded invite link ({} B) exceeds safe DM budget ({} B); \
+             strip key packages or slim the roster before minting",
+            self.actual, self.limit
+        )
+    }
+}
+
+impl std::error::Error for InviteLinkTooLarge {}
 
 impl SignedInvite {
     /// Create a new invite (without signature — call `sign()` separately).
@@ -141,7 +177,7 @@ impl SignedInvite {
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
         let mut data = Vec::new();
-        data.extend_from_slice(b"x0x.invite.v2|");
+        data.extend_from_slice(b"x0x.invite.v3|");
         data.extend_from_slice(self.group_id.as_bytes());
         data.extend_from_slice(self.stable_group_id.as_deref().unwrap_or("").as_bytes());
         data.extend_from_slice(&self.group_created_at.unwrap_or_default().to_le_bytes());
@@ -277,6 +313,26 @@ impl SignedInvite {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
         format!("x0x://invite/{b64}")
+    }
+
+    /// Encode this invite as a shareable link, rejecting oversized payloads.
+    ///
+    /// Wraps [`Self::to_link`] with the [`INVITE_LINK_MAX_BYTES`] budget check
+    /// so a roster that would blow the gossip-DM cap fails loudly at the mint
+    /// site (issue #205) rather than 400-ing later at `/direct/send`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InviteLinkTooLarge`] when the encoded link exceeds the budget.
+    pub fn encode_link(&self) -> Result<String, InviteLinkTooLarge> {
+        let link = self.to_link();
+        if link.len() > INVITE_LINK_MAX_BYTES {
+            return Err(InviteLinkTooLarge {
+                actual: link.len(),
+                limit: INVITE_LINK_MAX_BYTES,
+            });
+        }
+        Ok(link)
     }
 
     /// Parse an invite from a link string.

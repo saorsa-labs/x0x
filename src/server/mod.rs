@@ -878,6 +878,7 @@ pub async fn serve_with_options(
         pending_welcome_acks: RwLock::new(HashMap::new()),
         treekem_pending_events: RwLock::new(HashMap::new()),
         treekem_event_log: RwLock::new(HashMap::new()),
+        treekem_member_key_packages: RwLock::new(HashMap::new()),
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
@@ -3798,6 +3799,13 @@ struct TreeKemCatchupRequest {
     from_treekem_epoch: u64,
     current_state_hash: String,
     missing_prev_state_hash: Option<String>,
+    /// Issue #205: when set, this is a member-keyed key-package fetch — the
+    /// responder returns the cached, self-signed `MemberJoined` for this member
+    /// (carrying its TreeKEM KeyPackage) instead of the revision-gap frontier.
+    /// Backward compatible: old daemons ignore the field and serve the normal
+    /// frontier; `#[serde(default)]` lets new daemons parse old requests.
+    #[serde(default)]
+    target_member_id: Option<String>,
     limit: usize,
 }
 
@@ -5823,6 +5831,240 @@ async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupM
     }
 }
 
+/// Extract the member-keyed cache entry (`join_result_key`, event) from a
+/// key-package-bearing `MemberJoined`. Returns `None` for non-`MemberJoined`
+/// events or those without an embedded key package. Used by
+/// [`apply_named_group_metadata_event`] to populate
+/// [`AppState::treekem_member_key_packages`] on the inviter side (issue #205).
+fn member_joined_kp_cache_entry(
+    event: &NamedGroupMetadataEvent,
+) -> Option<(String, NamedGroupMetadataEvent)> {
+    if let NamedGroupMetadataEvent::MemberJoined {
+        group_id,
+        member_agent_id,
+        treekem_key_package_b64: Some(_),
+        ..
+    } = event
+    {
+        Some((join_result_key(group_id, member_agent_id), event.clone()))
+    } else {
+        None
+    }
+}
+
+/// Install a TreeKEM KeyPackage recovered from a cached, self-signed
+/// `MemberJoined` event. The normal `MemberJoined` apply is inviter-only, so a
+/// promoted admin that never witnessed the join learns the target's key package
+/// here. The package is authenticated by re-verifying the joiner's ML-DSA-65
+/// signature over `canonical_member_joined_bytes` (independent of the inviter
+/// gate); the roster/state-commit chain is untouched. Returns `true` only when
+/// a previously-absent package was installed (issue #205).
+async fn apply_recovered_member_key_package(
+    state: &Arc<AppState>,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    use base64::Engine as _;
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id,
+        stable_group_id,
+        member_agent_id,
+        member_public_key_b64,
+        role,
+        display_name,
+        inviter_agent_id,
+        invite_secret,
+        ts_ms,
+        treekem_key_package_b64,
+        signature_b64,
+    } = event
+    else {
+        return false;
+    };
+    let Some(kp_b64) = treekem_key_package_b64.clone() else {
+        return false;
+    };
+    let pubkey_bytes = match BASE64.decode(member_public_key_b64) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let pubkey = match ant_quic::MlDsaPublicKey::from_bytes(&pubkey_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let sig_bytes = match BASE64.decode(signature_b64) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let sig = match ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let canonical = canonical_member_joined_bytes(
+        group_id,
+        stable_group_id.as_deref(),
+        member_agent_id,
+        member_public_key_b64,
+        *role,
+        display_name.as_deref(),
+        inviter_agent_id,
+        invite_secret,
+        *ts_ms,
+        treekem_key_package_b64.as_deref(),
+    );
+    if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pubkey, &canonical, &sig)
+        .is_err()
+    {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_agent_id),
+            "recovered MemberJoined key package: signature did not verify — refusing to install"
+        );
+        return false;
+    }
+    // Derived AgentId must match the claimed member.
+    let derived = hex::encode(ant_quic::derive_peer_id_from_public_key(&pubkey).0);
+    if !derived.eq_ignore_ascii_case(member_agent_id) {
+        return false;
+    }
+    // Resolve the local group by storage key (mls_group_id) or stable alias.
+    let storage_key = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get_key_value(group_id)
+            .map(|(k, _)| k.clone())
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == group_id)
+                    .map(|(k, _)| k.clone())
+            })
+    };
+    let Some(storage_key) = storage_key else {
+        return false;
+    };
+    let installed = {
+        let mut groups = state.named_groups.write().await;
+        let Some(info) = groups.get_mut(&storage_key) else {
+            return false;
+        };
+        if !info.has_member(member_agent_id) {
+            return false;
+        }
+        // Never clobber a package we already hold.
+        if info
+            .members_v2
+            .get(member_agent_id)
+            .and_then(|m| m.treekem_key_package_b64.clone())
+            .is_some()
+        {
+            return false;
+        }
+        info.set_member_treekem_key_package(member_agent_id, kp_b64.clone());
+        true
+    };
+    if installed {
+        save_named_groups(state).await;
+        let mut cache = state.treekem_member_key_packages.write().await;
+        cache.insert(join_result_key(group_id, member_agent_id), event.clone());
+    }
+    installed
+}
+
+/// On-demand TreeKEM KeyPackage recovery for a promoted admin missing a
+/// member's package (issue #205). If the roster already carries it, this is a
+/// no-op success; otherwise it looks up this node's cached, self-signed
+/// `MemberJoined` for the member and installs its (signature-verified) package.
+/// Returns `true` when the roster now carries the package.
+async fn recover_member_treekem_key_package(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_agent_id: &str,
+) -> bool {
+    {
+        let groups = state.named_groups.read().await;
+        if let Some(info) = groups.get(group_id) {
+            if info
+                .members_v2
+                .get(member_agent_id)
+                .and_then(|m| m.treekem_key_package_b64.clone())
+                .is_some()
+            {
+                return true;
+            }
+        }
+    }
+    let key = join_result_key(group_id, member_agent_id);
+    let cached = {
+        let cache = state.treekem_member_key_packages.read().await;
+        cache.get(&key).cloned()
+    };
+    let Some(event) = cached else {
+        return false;
+    };
+    apply_recovered_member_key_package(state, &event).await
+}
+
+/// Resolve a target member's TreeKEM KeyPackage (base64) for a verified
+/// removal/ban, recovering it on demand (issue #205) when the local roster
+/// lacks it. Caller must have already enforced admin authority. On a local
+/// recovery miss it fires an async member-keyed catch-up so a client retry
+/// succeeds after delivery, and returns `FAILED_DEPENDENCY` with `retry: true`.
+async fn resolve_member_treekem_kp_for_removal(
+    state: &Arc<AppState>,
+    group_id: &str,
+    agent_id_hex: &str,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let existing = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id)
+            .or_else(|| {
+                groups
+                    .values()
+                    .find(|info| info.stable_group_id() == group_id)
+            })
+            .and_then(|info| info.members_v2.get(agent_id_hex))
+            .and_then(|m| m.treekem_key_package_b64.clone())
+    };
+    if let Some(kp_b64) = existing {
+        return Ok(kp_b64);
+    }
+    if recover_member_treekem_key_package(state, group_id, agent_id_hex).await {
+        let recovered = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(group_id)
+                .or_else(|| {
+                    groups
+                        .values()
+                        .find(|info| info.stable_group_id() == group_id)
+                })
+                .and_then(|info| info.members_v2.get(agent_id_hex))
+                .and_then(|m| m.treekem_key_package_b64.clone())
+        };
+        if let Some(kp_b64) = recovered {
+            return Ok(kp_b64);
+        }
+    }
+    // Local recovery miss — request the package from peers that witnessed the
+    // join (fire-and-forget) and tell the client to retry once it lands.
+    let bg_state = Arc::clone(state);
+    let bg_group = group_id.to_string();
+    let bg_member = agent_id_hex.to_string();
+    tokio::spawn(async move {
+        request_member_key_package_catchup(&bg_state, &bg_group, &bg_member).await;
+    });
+    Err((
+        StatusCode::FAILED_DEPENDENCY,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "member_key_package_pending",
+            "detail": "member is missing TreeKEM KeyPackage; on-demand catch-up requested — retry shortly",
+            "retry": true,
+        })),
+    ))
+}
+
 async fn queue_treekem_membership_event(
     state: &Arc<AppState>,
     group_id: &str,
@@ -5927,6 +6169,7 @@ async fn request_treekem_catchup_for_gap(
             from_treekem_epoch: from_epoch,
             current_state_hash: current_state_hash.clone(),
             missing_prev_state_hash: frontier.commit.prev_state_hash.clone(),
+            target_member_id: None,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
         };
         let payload = match serde_json::to_vec(&request) {
@@ -6056,6 +6299,42 @@ async fn handle_treekem_catchup_request(
         tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
         return;
     }
+    // Issue #205: member-keyed TreeKEM KeyPackage fetch. The requester is a
+    // promoted admin missing a member's key package; serve this node's cached,
+    // self-signed `MemberJoined` for the target (this node witnessed the join).
+    // The same gates apply (verified DM, sender == requester, active member or
+    // target-of-cached-add). The requester authenticates the package via the
+    // embedded ML-DSA-65 signature in `apply_recovered_member_key_package`.
+    if let Some(target_member_id) = request.target_member_id.clone() {
+        let event = {
+            let cache = state.treekem_member_key_packages.read().await;
+            log_keys
+                .iter()
+                .find_map(|g| cache.get(&join_result_key(g, &target_member_id)))
+                .cloned()
+        };
+        let response = TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: request.group_id.clone(),
+            events: event.into_iter().collect(),
+            truncated: false,
+        };
+        let payload = match serde_json::to_vec(&response) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to serialize member-keyed TreeKEM catch-up response: {e}");
+                return;
+            }
+        };
+        if let Err(e) = state
+            .agent
+            .send_direct_with_config(sender, payload, direct_message_send_config())
+            .await
+        {
+            tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send member-keyed TreeKEM catch-up response: {e}");
+        }
+        return;
+    }
     let mut events = {
         let logs = state.treekem_event_log.read().await;
         let mut events = Vec::new();
@@ -6112,7 +6391,15 @@ async fn handle_treekem_catchup_response(
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
     for event in events {
+        // Issue #205: a kp-bearing `MemberJoined` delivered by a member-keyed
+        // catch-up won't apply on a non-inviter (the normal apply is
+        // inviter-only). Clone it before the move so we can signature-verify +
+        // install the target's key package for a promoted admin that lacks it.
+        let recovery_event = member_joined_kp_cache_entry(&event).map(|(_, ev)| ev);
         apply_named_group_metadata_event(state, event, *sender, true).await;
+        if let Some(ev) = recovery_event {
+            apply_recovered_member_key_package(state, &ev).await;
+        }
     }
     replay_pending_treekem_events(state, &response.group_id).await;
     if was_truncated {
@@ -6151,6 +6438,7 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
         from_treekem_epoch: from_epoch,
         current_state_hash,
         missing_prev_state_hash: None,
+        target_member_id: None,
         limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
     };
     let payload = match serde_json::to_vec(&request) {
@@ -6166,6 +6454,100 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
         .await
     {
         tracing::debug!(group_id = %group_id, peer = %hex::encode(peer.as_bytes()), "paged TreeKEM catch-up request failed: {e}");
+    }
+}
+
+/// Issue #205: ask peers that witnessed a member's join for that member's
+/// cached, self-signed `MemberJoined` (carrying the TreeKEM KeyPackage) so a
+/// promoted admin missing the package can recover it. Candidates are the
+/// member's recorded inviter (`added_by`) and the group's other active
+/// members; the request is throttled per `{group}:member:{member}:{peer}` with
+/// the same 5 s window as the revision-gap catch-up.
+async fn request_member_key_package_catchup(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_agent_id: &str,
+) {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (from_revision, from_epoch, current_state_hash, candidates) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_id)
+        }) else {
+            return;
+        };
+        if info.withdrawn {
+            return;
+        }
+        // Prefer the inviter (it authored the join), then fall back to every
+        // other active member — any node that applied the MemberJoined has the
+        // cached package.
+        let mut candidate_hexes: Vec<String> = info
+            .members_v2
+            .get(member_agent_id)
+            .and_then(|m| m.added_by.clone())
+            .into_iter()
+            .collect();
+        for (aid, m) in &info.members_v2 {
+            if !aid.eq_ignore_ascii_case(&local_agent_hex)
+                && !candidate_hexes.iter().any(|c| c.eq_ignore_ascii_case(aid))
+                && m.state == x0x::groups::GroupMemberState::Active
+            {
+                candidate_hexes.push(aid.clone());
+            }
+        }
+        (
+            info.state_revision,
+            info.secret_epoch,
+            info.state_hash.clone(),
+            candidate_hexes,
+        )
+    };
+    for candidate_hex in candidates {
+        if candidate_hex.eq_ignore_ascii_case(&local_agent_hex) {
+            continue;
+        }
+        let Ok(peer) = parse_agent_id_hex(&candidate_hex) else {
+            continue;
+        };
+        let throttle_key = format!("{group_id}:member:{member_agent_id}:{candidate_hex}");
+        {
+            let mut throttle = state.treekem_catchup_throttle.write().await;
+            if throttle
+                .get(&throttle_key)
+                .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+            {
+                continue;
+            }
+            throttle.insert(throttle_key, Instant::now());
+        }
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: group_id.to_string(),
+            requester_agent_id: local_agent_hex.clone(),
+            from_revision,
+            from_treekem_epoch: from_epoch,
+            current_state_hash: current_state_hash.clone(),
+            missing_prev_state_hash: None,
+            target_member_id: Some(member_agent_id.to_string()),
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        let payload = match serde_json::to_vec(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "failed to serialize member-keyed TreeKEM catch-up request: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = state
+            .agent
+            .send_direct_with_config(&peer, payload, direct_message_send_config())
+            .await
+        {
+            tracing::debug!(group_id = %group_id, member = %LogHexId::agent(&member_agent_id), peer = %candidate_hex, "member-keyed TreeKEM catch-up request failed: {e}");
+        }
     }
 }
 
@@ -6208,7 +6590,21 @@ async fn apply_named_group_metadata_event(
     sender: AgentId,
     verified: bool,
 ) -> bool {
-    apply_named_group_metadata_event_inner(state, event, sender, verified, true).await
+    // Issue #205: a node that authoritatively applies a joiner's self-signed
+    // `MemberJoined` (the inviter) caches the key-package-bearing event so a
+    // later promoted admin — which never sees the join, since `MemberJoined`
+    // apply is inviter-only — can recover the target's TreeKEM KeyPackage via
+    // the member-keyed catch-up protocol. Clone before the move into `inner`.
+    let kp_cache_entry = member_joined_kp_cache_entry(&event);
+    let applied =
+        apply_named_group_metadata_event_inner(state, event, sender, verified, true).await;
+    if applied {
+        if let Some((key, cached)) = kp_cache_entry {
+            let mut cache = state.treekem_member_key_packages.write().await;
+            cache.insert(key, cached);
+        }
+    }
+    applied
 }
 
 async fn apply_named_group_metadata_event_inner(
@@ -8905,7 +9301,31 @@ async fn create_group_invite(
             x0x::groups::GroupRole::Member,
         );
 
-        let link = invite.to_link();
+        // Issue #205: enforce the DM-safe budget at mint so a roster that
+        // would blow the gossip-DM cap fails loudly here, not as an opaque
+        // `envelope_construction` 400 at /direct/send later (issue #188).
+        let link = match invite.encode_link() {
+            Ok(link) => link,
+            Err(e) => {
+                tracing::error!(
+                    group_id = %LogHexId::group(&id),
+                    actual = e.actual,
+                    limit = e.limit,
+                    "refusing to mint oversized invite link: {e}"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "invite_too_large",
+                        "detail": e.to_string(),
+                        "actual_bytes": e.actual,
+                        "limit_bytes": e.limit,
+                    })),
+                )
+                    .into_response();
+            }
+        };
         let mls_group_id = info.mls_group_id.clone();
         let group_name = info.name.clone();
         let expires_at = invite.expires_at;
@@ -10368,7 +10788,7 @@ async fn remove_treekem_named_group_member(
         }
     };
 
-    let (mut next, metadata_topic, event_group_id, target_kp_bytes) = {
+    let (mut next, metadata_topic, event_group_id) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return (
@@ -10392,37 +10812,33 @@ async fn remove_treekem_named_group_member(
         if let Some(resp) = last_admin_precheck(info, |g| g.remove_member(&agent_id_hex, None)) {
             return resp;
         }
-        let Some(kp_b64) = info
-            .members_v2
-            .get(&agent_id_hex)
-            .and_then(|m| m.treekem_key_package_b64.clone())
-        else {
-            return (
-                StatusCode::FAILED_DEPENDENCY,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "member is missing TreeKEM KeyPackage"
-                })),
-            );
-        };
-        let target_kp_bytes = match base64::engine::general_purpose::STANDARD.decode(kp_b64) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "member TreeKEM KeyPackage is not valid base64"
-                    })),
-                );
-            }
-        };
         (
             info.clone(),
             info.metadata_topic.clone(),
             info.stable_group_id().to_string(),
-            target_kp_bytes,
         )
+    };
+    // Issue #205: resolve the target's TreeKEM KeyPackage, recovering it on
+    // demand (local cache, then async member-keyed catch-up) when the roster
+    // lacks it. Mirror it onto the cloned snapshot so a later write-back never
+    // clobbers a recovered package.
+    let target_kp_b64 =
+        match resolve_member_treekem_kp_for_removal(&state, &id, &agent_id_hex).await {
+            Ok(kp_b64) => kp_b64,
+            Err(resp) => return resp,
+        };
+    next.set_member_treekem_key_package(&agent_id_hex, target_kp_b64.clone());
+    let target_kp_bytes = match base64::engine::general_purpose::STANDARD.decode(&target_kp_b64) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "member TreeKEM KeyPackage is not valid base64"
+                })),
+            );
+        }
     };
 
     let group = {
@@ -11596,7 +12012,7 @@ async fn ban_treekem_group_member(
             );
         }
     };
-    let (mut next, metadata_topic, event_group_id, target_kp_bytes) = {
+    let (mut next, metadata_topic, event_group_id) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return (
@@ -11614,37 +12030,32 @@ async fn ban_treekem_group_member(
         if let Some(resp) = last_admin_precheck(info, |g| g.ban_member(&agent_id_hex, None)) {
             return resp;
         }
-        let Some(kp_b64) = info
-            .members_v2
-            .get(&agent_id_hex)
-            .and_then(|m| m.treekem_key_package_b64.clone())
-        else {
-            return (
-                StatusCode::FAILED_DEPENDENCY,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "member is missing TreeKEM KeyPackage"
-                })),
-            );
-        };
-        let target_kp_bytes = match base64::engine::general_purpose::STANDARD.decode(kp_b64) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "member TreeKEM KeyPackage is not valid base64"
-                    })),
-                );
-            }
-        };
         (
             info.clone(),
             info.metadata_topic.clone(),
             info.stable_group_id().to_string(),
-            target_kp_bytes,
         )
+    };
+    // Issue #205: resolve the target's TreeKEM KeyPackage with on-demand
+    // recovery, mirroring it onto the cloned snapshot so the banned member's
+    // package survives the write-back.
+    let target_kp_b64 =
+        match resolve_member_treekem_kp_for_removal(&state, &id, &agent_id_hex).await {
+            Ok(kp_b64) => kp_b64,
+            Err(resp) => return resp,
+        };
+    next.set_member_treekem_key_package(&agent_id_hex, target_kp_b64.clone());
+    let target_kp_bytes = match base64::engine::general_purpose::STANDARD.decode(&target_kp_b64) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "member TreeKEM KeyPackage is not valid base64"
+                })),
+            );
+        }
     };
     let group = {
         let map = state.treekem_groups.read().await;
@@ -18730,6 +19141,7 @@ mod tests {
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
             treekem_pending_events: RwLock::new(HashMap::new()),
+            treekem_member_key_packages: RwLock::new(HashMap::new()),
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
@@ -22267,6 +22679,7 @@ mod tests {
             from_treekem_epoch: 1,
             current_state_hash: "state-1".to_string(),
             missing_prev_state_hash: Some("state-2".to_string()),
+            target_member_id: None,
             limit: 8,
         };
         let encoded = serde_json::to_value(&request).expect("catch-up request serializes");
@@ -22511,5 +22924,367 @@ mod tests {
         assert_eq!(decoded.store_id, "store-1");
         assert_eq!(decoded.peer_id, peer_id);
         assert_eq!(decoded.delta.version, delta.version);
+    }
+    /// Issue #205: minting a `private_secure` invite must strip per-member
+    /// TreeKEM KeyPackages + ML-KEM keys (each ~15.7 KiB / ~1.2 KiB) so the
+    /// join cmd-DM stays under the 49 152-byte gossip cap. Covers the
+    /// growth-curve regression (1/3/10 members), the mint-time budget
+    /// assertion, backward compat both directions, and that stripping does not
+    /// change `roster_root` (the only thing a joiner validates).
+    #[test]
+    fn invite_link_strips_key_packages_and_stays_under_dm_budget() {
+        use x0x::groups::invite::{SignedInvite, INVITE_LINK_MAX_BYTES};
+        use x0x::groups::state_commit::compute_roster_root;
+        use x0x::groups::{GroupInfo, GroupMember, GroupPolicyPreset};
+
+        let authority = x0x::identity::AgentKeypair::generate().expect("authority keypair");
+        let agent_id = authority.agent_id();
+        let owner_hex = hex::encode(agent_id.as_bytes());
+        let group_id = "7e".repeat(16);
+        // Measured testnet sizes (issue #188): ~15 688 B TreeKEM KeyPackage,
+        // ~1 184 B ML-KEM-768 public key.
+        let kp_blob = BASE64.encode(vec![0xaau8; 15_688]);
+        let kem_blob = BASE64.encode(vec![0xbbu8; 1_184]);
+
+        let build_info = |n_joiners: usize| -> GroupInfo {
+            let mut info = GroupInfo::with_policy(
+                "growth".to_string(),
+                "growth-curve".to_string(),
+                agent_id,
+                group_id.clone(),
+                GroupPolicyPreset::PrivateSecure.to_policy(),
+            );
+            info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+            info.members_v2.insert(
+                owner_hex.clone(),
+                GroupMember::new_admin(owner_hex.clone(), None, 1),
+            );
+            for i in 0..n_joiners {
+                let m_hex = format!("{:064x}", i + 1);
+                let mut m = GroupMember::new_member(
+                    m_hex.clone(),
+                    Some(format!("m{i}")),
+                    Some(owner_hex.clone()),
+                    1,
+                );
+                m.treekem_key_package_b64 = Some(kp_blob.clone());
+                m.kem_public_key_b64 = Some(kem_blob.clone());
+                info.members_v2.insert(m_hex, m);
+            }
+            info.recompute_state_hash();
+            info
+        };
+
+        for &n_joiners in &[1usize, 3, 10] {
+            let info = build_info(n_joiners);
+            let full_root = compute_roster_root(&info.members_v2);
+            let mut invite =
+                SignedInvite::new(group_id.clone(), "growth".to_string(), &agent_id, 3600);
+            populate_invite_base_state_from_group_info(&mut invite, &info);
+
+            let roster = invite
+                .base_members_v2
+                .as_ref()
+                .expect("base roster embedded");
+            for m in roster.values() {
+                assert!(m.treekem_key_package_b64.is_none(), "kp stripped at mint");
+                assert!(m.kem_public_key_b64.is_none(), "kem key stripped at mint");
+            }
+            // Stripping must not change the committed roster root.
+            assert_eq!(
+                compute_roster_root(roster),
+                full_root,
+                "roster_root unchanged by strip"
+            );
+
+            let link = invite
+                .encode_link()
+                .expect("stripped invite is under the DM budget")
+                .len();
+            assert!(
+                link <= INVITE_LINK_MAX_BYTES,
+                "{n_joiners}-joiner stripped invite too large: {link} B"
+            );
+            assert!(
+                link <= x0x::dm::MAX_PAYLOAD_BYTES,
+                "{n_joiners}-joiner stripped invite exceeds DM payload cap: {link} B"
+            );
+        }
+
+        // Pre-fix regression proof (issue #188 root cause): a 3-joiner invite
+        // that EMBEDS key packages crosses both the budget and the DM cap.
+        let info3 = build_info(3);
+        let mut fat_invite =
+            SignedInvite::new(group_id.clone(), "growth".to_string(), &agent_id, 3600);
+        fat_invite.base_members_v2 = Some(info3.members_v2.clone());
+        let fat_len = fat_invite.to_link().len();
+        assert!(
+            fat_len > INVITE_LINK_MAX_BYTES,
+            "pre-fix 3-joiner invite should exceed budget: {fat_len} B"
+        );
+        assert!(
+            fat_len > x0x::dm::MAX_PAYLOAD_BYTES,
+            "pre-fix 3-joiner invite should exceed DM cap: {fat_len} B"
+        );
+        assert!(
+            fat_invite.encode_link().is_err(),
+            "budget assertion rejects fat invite"
+        );
+
+        // Backward compat both directions: fields are `#[serde(default)]`, so an
+        // old (kp-bearing) link still parses and a new (stripped) link degrades
+        // gracefully on an old daemon (kp reads as None).
+        let mut slim_invite =
+            SignedInvite::new(group_id.clone(), "growth".to_string(), &agent_id, 3600);
+        populate_invite_base_state_from_group_info(&mut slim_invite, &info3);
+        let slim_link = slim_invite.encode_link().expect("slim under budget");
+        let parsed_slim = SignedInvite::from_link(&slim_link).expect("slim link round-trips");
+        assert!(parsed_slim
+            .base_members_v2
+            .as_ref()
+            .expect("roster")
+            .values()
+            .all(|m| m.treekem_key_package_b64.is_none()));
+        let parsed_fat =
+            SignedInvite::from_link(&fat_invite.to_link()).expect("fat link round-trips");
+        assert!(parsed_fat
+            .base_members_v2
+            .as_ref()
+            .expect("roster")
+            .values()
+            .any(|m| m.treekem_key_package_b64.is_some()));
+        assert_eq!(
+            compute_roster_root(parsed_slim.base_members_v2.as_ref().expect("roster")),
+            compute_roster_root(parsed_fat.base_members_v2.as_ref().expect("roster")),
+            "roster_root identical across formats"
+        );
+    }
+
+    /// `member_joined_kp_cache_entry` extracts only key-package-bearing
+    /// `MemberJoined` events, keyed by `join_result_key`. This is the helper
+    /// the inviter-side apply wrapper uses to populate the recovery cache.
+    #[test]
+    fn member_joined_kp_cache_entry_extracts_package_bearing_events() {
+        let group_id = "71".repeat(32);
+        let member = "8a".repeat(32);
+        let with_kp = NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.clone(),
+            stable_group_id: Some(group_id.clone()),
+            member_agent_id: member.clone(),
+            member_public_key_b64: "k".to_string(),
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: "ff".repeat(32),
+            invite_secret: "s".to_string(),
+            ts_ms: 1,
+            treekem_key_package_b64: Some("kp".to_string()),
+            signature_b64: "sig".to_string(),
+        };
+        let (key, _) = member_joined_kp_cache_entry(&with_kp).expect("kp-bearing event extracted");
+        assert_eq!(key, join_result_key(&group_id, &member));
+
+        let mut no_kp = with_kp.clone();
+        if let NamedGroupMetadataEvent::MemberJoined {
+            treekem_key_package_b64,
+            ..
+        } = &mut no_kp
+        {
+            *treekem_key_package_b64 = None;
+        }
+        assert!(
+            member_joined_kp_cache_entry(&no_kp).is_none(),
+            "no package → no cache entry"
+        );
+        assert!(
+            member_joined_kp_cache_entry(&NamedGroupMetadataEvent::GroupDeleted {
+                group_id: group_id.clone(),
+                revision: 1,
+                actor: member.clone(),
+                commit: None,
+            })
+            .is_none(),
+            "non-MemberJoined event ignored"
+        );
+    }
+
+    /// Issue #205: a promoted admin missing a member's TreeKEM KeyPackage
+    /// recovers it from this node's cached, self-signed `MemberJoined` and the
+    /// removal-path resolver returns it. The cache mirrors what a node holds
+    /// after applying the join (inviter) or receiving a member-keyed catch-up.
+    #[tokio::test]
+    async fn recovered_member_key_package_installs_from_cache() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x71, 0x72).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        // Roster carries the member (Active) WITHOUT a key package — the
+        // promoted-admin regression. Seed the recovery cache with the member's
+        // self-signed MemberJoined (what the inviter / catch-up would supply).
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        state.treekem_member_key_packages.write().await.insert(
+            join_result_key(&group_id, &member_hex),
+            fixture.event.clone(),
+        );
+        assert!(member_treekem_kp(state, &group_id, &member_hex)
+            .await
+            .is_none());
+
+        // On-demand recovery signature-verifies the cached event + installs.
+        let recovered = recover_member_treekem_key_package(state, &group_id, &member_hex).await;
+        assert!(recovered, "kp recovered from cache");
+        assert!(member_treekem_kp(state, &group_id, &member_hex)
+            .await
+            .is_some());
+
+        // The removal-path resolver returns it (fast path: roster now carries it).
+        let resolved = resolve_member_treekem_kp_for_removal(state, &group_id, &member_hex).await;
+        assert!(resolved.is_ok(), "resolver returns kp after recovery");
+        Ok(())
+    }
+
+    /// Issue #205: the recovered key-package install is fail-closed — a forged
+    /// signature, an unknown member, or an already-present package is refused,
+    /// and a member with no cached event surfaces a retryable pending error.
+    #[tokio::test]
+    async fn recovered_member_key_package_refuses_forgery_and_gates() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x73, 0x74).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let valid_event = fixture.event.clone();
+
+        // Roster carries the member (Active) WITHOUT a key package.
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+
+        // Forged signature → refused, roster unchanged.
+        let forged = match valid_event.clone() {
+            NamedGroupMetadataEvent::MemberJoined {
+                group_id,
+                stable_group_id,
+                member_agent_id,
+                member_public_key_b64,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                ..
+            } => NamedGroupMetadataEvent::MemberJoined {
+                group_id,
+                stable_group_id,
+                member_agent_id,
+                member_public_key_b64,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                signature_b64: BASE64.encode(vec![0xcdu8; 64]),
+            },
+            _ => unreachable!("fixture is MemberJoined"),
+        };
+        assert!(
+            !apply_recovered_member_key_package(state, &forged).await,
+            "forged signature refused"
+        );
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "forged event did not install a package"
+        );
+
+        // Valid cached event → installs.
+        assert!(
+            apply_recovered_member_key_package(state, &valid_event).await,
+            "valid signature installs"
+        );
+        // Already-present package → no-op refusal (no clobber).
+        assert!(
+            !apply_recovered_member_key_package(state, &valid_event).await,
+            "already-present package not re-installed"
+        );
+
+        // Unknown member (not in roster) → refused even with an otherwise-valid
+        // signature for a different agent_id.
+        let stranger = format!("{:064x}", 0x9999u64);
+        let stranger_event = match valid_event.clone() {
+            NamedGroupMetadataEvent::MemberJoined {
+                group_id,
+                stable_group_id,
+                member_public_key_b64,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                signature_b64,
+                ..
+            } => NamedGroupMetadataEvent::MemberJoined {
+                group_id,
+                stable_group_id,
+                member_agent_id: stranger.clone(),
+                member_public_key_b64,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                signature_b64,
+            },
+            _ => unreachable!("fixture is MemberJoined"),
+        };
+        assert!(
+            !apply_recovered_member_key_package(state, &stranger_event).await,
+            "unknown member refused"
+        );
+
+        // No cached event for a member → resolver returns a retryable pending error.
+        let resolved = resolve_member_treekem_kp_for_removal(state, &group_id, &stranger).await;
+        assert!(resolved.is_err(), "missing kp with no cache is pending");
+        let (status, body) = resolved.expect_err("pending error");
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY);
+        assert_eq!(body["error"], "member_key_package_pending");
+        assert_eq!(body["retry"], true);
+        Ok(())
+    }
+
+    async fn member_treekem_kp(
+        state: &Arc<AppState>,
+        group_id: &str,
+        member: &str,
+    ) -> Option<String> {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id)
+            .and_then(|info| info.members_v2.get(member))
+            .and_then(|m| m.treekem_key_package_b64.clone())
+    }
+
+    async fn insert_active_member_without_kp(
+        state: &Arc<AppState>,
+        group_id: &str,
+        member: &str,
+        added_by: &str,
+    ) {
+        let mut groups = state.named_groups.write().await;
+        if let Some(info) = groups.get_mut(group_id) {
+            info.members_v2.insert(
+                member.to_string(),
+                x0x::groups::GroupMember::new_member(
+                    member.to_string(),
+                    None,
+                    Some(added_by.to_string()),
+                    1,
+                ),
+            );
+        }
     }
 }
