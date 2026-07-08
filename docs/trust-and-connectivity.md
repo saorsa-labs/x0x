@@ -50,3 +50,44 @@ Successful connections enrich the bootstrap cache via `add_from_connection()`.
 The sync `build_announcement()` leaves these as `None` (no network access). The async heartbeat queries `NetworkNode::node_status()` to populate them.
 
 **Protocol note**: These fields use bincode 1.x serialization. Old→new messages will fail to decode because bincode 1.x treats every field as required. This is a deliberate protocol version bump.
+
+## Peer Relay (`peer_relay.rs`, X0X-0070b + #193)
+
+When a direct DM to peer `P` fails `fail_threshold` times within `fail_window`,
+`P` is marked `needs_relay` and the sender wraps the (end-to-end encrypted,
+origin-signed) `DmEnvelope` inside a `RelayedDm`. A relay candidate `R` verifies
+the `RelayHeader` signature and forwards `inner` directly to `dst` — one hop
+only, no re-wrapping.
+
+**Default-off.** `enabled = false` ships in code; the relay path only engages
+when a runtime explicitly opts in via `[peer_relay] enabled = true`.
+
+### Forward-path hardening (#193)
+
+Enabling the relay no longer opens an unbounded relay. The forward arm is
+gated and bounded — all enforced in `PeerRelay::disposition_for`, fail-closed,
+before any byte is forwarded:
+
+| Knob (`[peer_relay]`) | Default | Refusal | Effect |
+|---|---|---|---|
+| `require_contact_to_relay` | `true` | `NotAContact` | Refuse to forward on behalf of any sender whose authenticated `sender_agent_id` is not in the local `ContactStore`. Set `false` only for an explicitly-open relay (e.g. a public DERP). |
+| `max_forwards_per_sender` | `10` | `RateLimited` | Per-sender forward cap over `limit_window_ms`. |
+| `max_total_forwards` | `100` | `RateLimited` | Global forward cap (all senders) over `limit_window_ms` — the concurrent-forward budget. |
+| `max_forward_bytes_per_window` | `1048576` (~1 MiB) | `BandwidthExceeded` | Total forwarded bytes per window. |
+| `limit_window_ms` | `60000` (60 s) | — | Sliding window for the three caps above. |
+
+The contact gate applies **only to the forward arm** — a relayed DM addressed to
+this node (`DeliverLocally`) is still received; receiving is not relaying. The
+rate/bandwidth caps still apply when the contact gate is off, so an explicitly
+open relay is never unbounded.
+
+The listener resolves the contact membership from `ContactStore` (async) before
+calling the sync `disposition_for`; the origin revocation gate (PR #177) still
+runs after classification for both the deliver and forward arms.
+
+### Observability
+
+`RelayStatsSnapshot` exposes per-refusal-reason counters
+(`relay_refused_not_a_contact`, `relay_refused_rate_limited`,
+`relay_refused_bandwidth_exceeded`) plus `relay_forward_bytes` (total bytes
+committed to forward) so operators can see and alert on refusals.

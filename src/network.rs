@@ -259,35 +259,32 @@ pub struct NetworkConfig {
 /// engine picks from when falling back. Gossip-announced relay
 /// candidates (future) are merged on top of `candidates` at runtime.
 ///
-/// # Open-relay warning (`enabled = true`)
+/// # Forward-path hardening (#193, default-on)
 ///
-/// A node with `[peer_relay] enabled = true` acts as an **open relay**:
-/// it will forward a relayed DM to any destination in its discovery
-/// cache on behalf of **any** peer that signs a valid relay header with
-/// a self-generated ML-DSA-65 key. There is no sender allow-list — the
-/// only authentication is the header signature, which anyone can
-/// produce. Enabling the relay therefore opts this node into spending
-/// its bandwidth and CPU forwarding traffic for strangers (the same
-/// resource-abuse surface as a Tailscale peer-relay / iroh DERP node).
-/// Enable it only on a node whose uplink you are willing to share. See
-/// [`crate::peer_relay::RelayPolicy`] for the engine-side detail.
+/// Enabling the relay no longer opens an unbounded relay. The forward
+/// arm is gated + bounded by (all enforced in
+/// [`crate::peer_relay::PeerRelay::disposition_for`]):
+/// - `require_contact_to_relay` (**default `true`**) — refuse to forward
+///   on behalf of any sender not in the local contact store. Set `false`
+///   only for an explicitly-open relay (e.g. a public DERP).
+/// - `max_forwards_per_sender` / `max_total_forwards` over
+///   `limit_window_ms` — per-sender + global forward-rate caps.
+/// - `max_forward_bytes_per_window` — total forwarded bytes per window.
+///
+/// These still apply when the contact gate is off, so an explicitly-open
+/// relay is never unbounded. See [`crate::peer_relay::RelayPolicy`] for
+/// the engine-side detail and [`crate::peer_relay::RelayRefusal`] for the
+/// refusal reasons.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRelayConfig {
-    /// Master gate. Defaults to `false`. Enabling it opts this node into
-    /// the open-relay resource-abuse surface described on the type doc.
+    /// Master gate. Defaults to `false`.
     #[serde(default)]
     pub enabled: bool,
 
-    /// **Reserved — not yet enforced.** Intended future contact-gate: when
-    /// a maintainer wires this through to the engine, `true` will restrict
-    /// forwarding to senders that are known contacts, closing the
-    /// open-relay surface documented above. Today the field is parsed and
-    /// stored but has **no effect** — an enabled relay forwards for any
-    /// self-keyed peer regardless of this value. It exists so the schema
-    /// is forward-compatible and the open-relay-vs-contact-gate decision
-    /// is explicit rather than silently defaulting to "open". Defaults to
-    /// `false`.
-    #[serde(default)]
+    /// When `true` (the **secure default**), the forward arm refuses any
+    /// relay request whose authenticated `sender_agent_id` is not a local
+    /// contact (#193). Set `false` only for an explicitly-open relay.
+    #[serde(default = "default_peer_relay_require_contact")]
     pub require_contact_to_relay: bool,
 
     /// Direct-DM failures within `fail_window_ms` before a peer is
@@ -304,6 +301,30 @@ pub struct PeerRelayConfig {
     #[serde(default = "default_peer_relay_fail_window_ms")]
     pub fail_window_ms: u64,
 
+    /// Max forwards a single sender may request within `limit_window_ms`
+    /// before being throttled (#193). Defaults to
+    /// [`crate::peer_relay::DEFAULT_MAX_FORWARDS_PER_SENDER`].
+    #[serde(default = "default_peer_relay_max_forwards_per_sender")]
+    pub max_forwards_per_sender: u32,
+
+    /// Max total forwards (all senders combined) within `limit_window_ms`
+    /// — the global concurrent-forward cap (#193). Defaults to
+    /// [`crate::peer_relay::DEFAULT_MAX_TOTAL_FORWARDS`].
+    #[serde(default = "default_peer_relay_max_total_forwards")]
+    pub max_total_forwards: u32,
+
+    /// Sliding window (milliseconds) for the rate + bandwidth caps above
+    /// (#193). Defaults to
+    /// [`crate::peer_relay::DEFAULT_RELAY_LIMIT_WINDOW`] in milliseconds.
+    #[serde(default = "default_peer_relay_limit_window_ms")]
+    pub limit_window_ms: u64,
+
+    /// Max total forwarded bytes within `limit_window_ms` before
+    /// refusals (#193). Defaults to
+    /// [`crate::peer_relay::DEFAULT_MAX_FORWARD_BYTES_PER_WINDOW`].
+    #[serde(default = "default_peer_relay_max_forward_bytes")]
+    pub max_forward_bytes_per_window: u64,
+
     /// Hex-encoded `AgentId`s that act as relay candidates. The MVP
     /// (X0X-0070b) loads these from TOML; future revisions merge in
     /// gossip-announced candidates at runtime. Each candidate MUST
@@ -315,6 +336,10 @@ pub struct PeerRelayConfig {
     pub candidates: Vec<String>,
 }
 
+fn default_peer_relay_require_contact() -> bool {
+    true
+}
+
 fn default_peer_relay_fail_threshold() -> u32 {
     crate::peer_relay::DEFAULT_FAIL_THRESHOLD
 }
@@ -323,13 +348,33 @@ fn default_peer_relay_fail_window_ms() -> u64 {
     u64::try_from(crate::peer_relay::DEFAULT_FAIL_WINDOW.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn default_peer_relay_max_forwards_per_sender() -> u32 {
+    crate::peer_relay::DEFAULT_MAX_FORWARDS_PER_SENDER
+}
+
+fn default_peer_relay_max_total_forwards() -> u32 {
+    crate::peer_relay::DEFAULT_MAX_TOTAL_FORWARDS
+}
+
+fn default_peer_relay_limit_window_ms() -> u64 {
+    u64::try_from(crate::peer_relay::DEFAULT_RELAY_LIMIT_WINDOW.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn default_peer_relay_max_forward_bytes() -> u64 {
+    crate::peer_relay::DEFAULT_MAX_FORWARD_BYTES_PER_WINDOW
+}
+
 impl Default for PeerRelayConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            require_contact_to_relay: false,
+            require_contact_to_relay: default_peer_relay_require_contact(),
             fail_threshold: default_peer_relay_fail_threshold(),
             fail_window_ms: default_peer_relay_fail_window_ms(),
+            max_forwards_per_sender: default_peer_relay_max_forwards_per_sender(),
+            max_total_forwards: default_peer_relay_max_total_forwards(),
+            limit_window_ms: default_peer_relay_limit_window_ms(),
+            max_forward_bytes_per_window: default_peer_relay_max_forward_bytes(),
             candidates: Vec::new(),
         }
     }
@@ -353,6 +398,11 @@ impl PeerRelayConfig {
             fail_threshold: self.fail_threshold.max(1),
             fail_window: Duration::from_millis(self.fail_window_ms),
             freshness: defaults.freshness,
+            require_contact_to_relay: self.require_contact_to_relay,
+            max_forwards_per_sender: self.max_forwards_per_sender,
+            max_total_forwards: self.max_total_forwards,
+            limit_window: Duration::from_millis(self.limit_window_ms),
+            max_forward_bytes_per_window: self.max_forward_bytes_per_window,
         }
     }
 }
@@ -3371,6 +3421,7 @@ mod tests {
             fail_threshold: 0,
             fail_window_ms: 60_000,
             candidates: Vec::new(),
+            ..Default::default()
         };
         let policy = cfg.to_policy();
         assert_eq!(
@@ -3378,6 +3429,10 @@ mod tests {
             "fail_threshold = 0 must clamp to 1"
         );
         assert!(policy.enabled);
+        assert!(
+            !policy.require_contact_to_relay,
+            "require_contact_to_relay must carry through to_policy"
+        );
         assert_eq!(policy.fail_window, Duration::from_millis(60_000));
     }
 
@@ -3391,6 +3446,7 @@ mod tests {
             fail_threshold: 5,
             fail_window_ms: 120_000,
             candidates: Vec::new(),
+            ..Default::default()
         };
         let policy = cfg.to_policy();
         assert_eq!(policy.fail_threshold, 5);

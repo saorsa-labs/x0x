@@ -36,6 +36,14 @@
 //!   tricked into relaying for a forged origin, and a tampered
 //!   `dst` / `originated_at` is rejected.
 //! - One hop only — structurally enforced by the type system.
+//! - **Forward-path hardening (#193).** Even with `enabled = true`, the
+//!   forward arm is not an open relay by default: `require_contact_to_relay`
+//!   (default `true`) refuses to forward on behalf of any sender not in
+//!   the local contact store, and per-sender / global forward-rate and
+//!   bandwidth caps bound the uplink an opted-in relay will spend. The
+//!   contact gate applies only to the forward arm — a relayed DM
+//!   addressed to this node is still received. See `RelayPolicy` and
+//!   `RelayRefusal` for the knobs and refusal reasons.
 //!
 //! ## Status
 //!
@@ -43,10 +51,12 @@
 //! `RelayedDm` / `RelayHeader` wire types, signed-bytes construction +
 //! verification, the `PeerRelay` engine (per-peer failure tracking,
 //! `needs_relay` decision, relay-candidate selection), the `RelayStats`
-//! counters, and the fallback path in `Agent::send_direct_with_config`
-//! plus the inbound receiver in `NetworkNode` (X0X-0070b, shipped). The
-//! `RelayPolicy` is **disabled by default** — the relay path only engages
-//! when a runtime explicitly enables it.
+//! counters, the fallback path in `Agent::send_direct_with_config`, and
+//! the inbound receiver in `NetworkNode` (X0X-0070b, shipped). The #193
+//! contact gate + rate/bandwidth limits are enforced in
+//! `PeerRelay::disposition_for`. The `RelayPolicy` is **disabled by
+//! default** — the relay path only engages when a runtime explicitly
+//! enables it.
 //!
 //! Reference: Tailscale Peer Relays beta
 //! <https://tailscale.com/blog/peer-relays-beta>; iroh DERP
@@ -81,6 +91,27 @@ pub const DEFAULT_RELAY_FRESHNESS: Duration = Duration::from_secs(30);
 /// timestamp would read as age 0 forever (replayable until the local
 /// clock catches up). Mirrors `dm::CLOCK_SKEW_TOLERANCE_MS`.
 pub const RELAY_CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
+
+/// Default sliding window for per-sender / global relay-forward rate and
+/// bandwidth accounting (#193). Mirrors the failure-tracking window's
+/// order of magnitude so an operator's mental model of "one minute" is
+/// consistent across the engine.
+pub const DEFAULT_RELAY_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Default cap on forwards a single sender may request within
+/// [`DEFAULT_RELAY_LIMIT_WINDOW`] before being throttled. Generous for a
+/// legitimate fallback path (which fires rarely) but stops a single
+/// stranger from saturating an opted-in relay.
+pub const DEFAULT_MAX_FORWARDS_PER_SENDER: u32 = 10;
+
+/// Default cap on *total* forwards (all senders combined) within
+/// [`DEFAULT_RELAY_LIMIT_WINDOW`] — the global concurrent-forward budget.
+pub const DEFAULT_MAX_TOTAL_FORWARDS: u32 = 100;
+
+/// Default cap on total forwarded bytes within
+/// [`DEFAULT_RELAY_LIMIT_WINDOW`] (~1 MiB/min). Bounds the relay's uplink
+/// spend so an opted-in relay cannot be drained for amplification.
+pub const DEFAULT_MAX_FORWARD_BYTES_PER_WINDOW: u64 = 1024 * 1024;
 
 /// Routing header for a relayed DM — the **only** part a relay node
 /// sees in cleartext. Independently signed by the sender so the relay
@@ -197,6 +228,17 @@ pub struct RelayedDm {
     pub inner: DmEnvelope,
 }
 
+/// Predicted postcard wire size of a [`DmEnvelope`] — the bandwidth unit
+/// for the #193 forward-path cap. Postcard encoding is deterministic, so
+/// this equals the bytes the relay listener actually sends on a
+/// successful forward. Returns `0` only if serialization itself fails
+/// (treated as zero-cost rather than blocking the forward).
+fn inner_wire_bytes(inner: &DmEnvelope) -> u64 {
+    postcard::to_allocvec(inner)
+        .map(|b| b.len() as u64)
+        .unwrap_or(0)
+}
+
 /// What a relay node should do with an inbound [`RelayedDm`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayDisposition {
@@ -222,35 +264,55 @@ pub enum RelayRefusal {
     Stale,
     /// This node's relay path is disabled by policy.
     PolicyDisabled,
+    /// `require_contact_to_relay` is set and the relay header's
+    /// authenticated `sender_agent_id` is not in this node's contact
+    /// store (#193). Stops a stranger from spending the relay's uplink.
+    NotAContact,
+    /// The sender (or the relay globally) has exceeded its per-window
+    /// forward-rate budget (#193). Throttles a burst of relay requests.
+    RateLimited,
+    /// Forwarding this envelope would exceed the per-window bandwidth
+    /// cap (#193). Bounds total uplink spend on the relay path.
+    BandwidthExceeded,
 }
 
 /// Policy knobs for the peer-relay engine.
 ///
-/// # Open-relay warning
+/// # Contact gate (`require_contact_to_relay`, default `true`)
 ///
-/// When `enabled` is `true` this node acts as an **open relay**:
-/// [`PeerRelay::disposition_for`] authenticates only the
-/// [`RelayHeader`] signature, which any peer can produce by generating
-/// its own ML-DSA-65 keypair and signing a fresh header. There is
-/// **no** check on *who* the relaying peer is — an enabled node will
-/// forward a `RelayedDm` to any destination in its discovery cache on
-/// behalf of any self-keyed sender. This is a deliberate MVP
-/// (X0X-0070b) resource-abuse surface: enabling the relay opts this
-/// node into spending bandwidth/CPU forwarding for strangers, exactly
-/// like a Tailscale peer-relay or an iroh DERP node. Do not enable it
-/// on a node whose uplink you are not willing to share. A future
-/// contact-gate (see [`crate::network::PeerRelayConfig`]'s
-/// `require_contact_to_relay`, reserved and not yet enforced) will let
-/// operators restrict forwarding to known contacts; that decision is
-/// left to the maintainer.
+/// When `enabled` is `true` **and** `require_contact_to_relay` is `true`
+/// (the secure default), [`PeerRelay::disposition_for`] refuses to
+/// *forward* on behalf of any sender whose authenticated
+/// `sender_agent_id` is not in the local contact store —
+/// [`RelayRefusal::NotAContact`]. This closes the open-relay surface
+/// from issue #193: a stranger can no longer spend the relay's uplink by
+/// self-keying a fresh header. The gate applies to the **forward** arm
+/// only; a relayed DM addressed to this node (`DeliverLocally`) is still
+/// received — receiving is not relaying. An operator who explicitly
+/// wants an open relay (e.g. a public DERP) sets
+/// `require_contact_to_relay = false`.
+///
+/// # Rate + bandwidth limits (default-on, #193)
+///
+/// Even with the contact gate on, a compromised contact could attempt to
+/// drain the relay. The forward path is therefore bounded by three
+/// per-`limit_window` caps, all enforced in `disposition_for` before
+/// any byte is forwarded:
+/// - `max_forwards_per_sender` — per-sender forward rate
+///   ([`RelayRefusal::RateLimited`]),
+/// - `max_total_forwards` — global forward rate across all senders,
+/// - `max_forward_bytes_per_window` — total forwarded bytes
+///   ([`RelayRefusal::BandwidthExceeded`]).
+///
+/// These still apply when the contact gate is off, so an explicitly-open
+/// relay is not unbounded.
 #[derive(Debug, Clone, Copy)]
 pub struct RelayPolicy {
-    /// Master gate. **Default `false`** — the MVP relay path only
-    /// engages when a runtime explicitly opts in. With this `false`,
+    /// Master gate. **Default `false`** — the relay path only engages
+    /// when a runtime explicitly opts in. With this `false`,
     /// [`PeerRelay::needs_relay`] always returns `false` and
     /// [`PeerRelay::disposition_for`] refuses inbound relayed DMs with
-    /// [`RelayRefusal::PolicyDisabled`]. Enabling it opts this node into
-    /// the open-relay resource-abuse surface described on the type doc.
+    /// [`RelayRefusal::PolicyDisabled`].
     pub enabled: bool,
     /// Consecutive direct-DM failures, within `fail_window`, before a
     /// peer is considered to need a relay.
@@ -260,6 +322,20 @@ pub struct RelayPolicy {
     /// A relayed envelope older than this is refused as a likely
     /// replay.
     pub freshness: Duration,
+    /// When `true` (the **secure default**), the forward arm refuses any
+    /// relay request whose authenticated `sender_agent_id` is not a
+    /// local contact. Set `false` only for an explicitly-open relay.
+    pub require_contact_to_relay: bool,
+    /// Max forwards a single sender may request within `limit_window`
+    /// before being throttled with [`RelayRefusal::RateLimited`].
+    pub max_forwards_per_sender: u32,
+    /// Max *total* forwards (all senders combined) within `limit_window`.
+    pub max_total_forwards: u32,
+    /// Sliding window for the rate + bandwidth caps above.
+    pub limit_window: Duration,
+    /// Max total forwarded bytes within `limit_window` before refusals
+    /// with [`RelayRefusal::BandwidthExceeded`].
+    pub max_forward_bytes_per_window: u64,
 }
 
 impl Default for RelayPolicy {
@@ -269,13 +345,22 @@ impl Default for RelayPolicy {
             fail_threshold: DEFAULT_FAIL_THRESHOLD,
             fail_window: DEFAULT_FAIL_WINDOW,
             freshness: DEFAULT_RELAY_FRESHNESS,
+            // Secure defaults (#193): the contact gate is ON and the
+            // rate/bandwidth caps are populated. They are inert while
+            // `enabled` is false.
+            require_contact_to_relay: true,
+            max_forwards_per_sender: DEFAULT_MAX_FORWARDS_PER_SENDER,
+            max_total_forwards: DEFAULT_MAX_TOTAL_FORWARDS,
+            limit_window: DEFAULT_RELAY_LIMIT_WINDOW,
+            max_forward_bytes_per_window: DEFAULT_MAX_FORWARD_BYTES_PER_WINDOW,
         }
     }
 }
 
 impl RelayPolicy {
-    /// Enable the relay path. Runtimes call this to opt the MVP engine
-    /// into active use.
+    /// Enable the relay path. Runtimes call this to opt the engine into
+    /// active use. Inherits the secure defaults (contact gate on,
+    /// rate/bandwidth caps populated).
     #[must_use]
     pub fn enabled() -> Self {
         Self {
@@ -289,6 +374,23 @@ impl RelayPolicy {
     pub fn with_failure_trigger(mut self, threshold: u32, window: Duration) -> Self {
         self.fail_threshold = threshold.max(1);
         self.fail_window = window;
+        self
+    }
+
+    /// Override the forward-path resource caps (#193). All windows share
+    /// `window`; `0` for a rate field means "block all forwards".
+    #[must_use]
+    pub fn with_forward_limits(
+        mut self,
+        max_per_sender: u32,
+        max_total: u32,
+        max_bytes: u64,
+        window: Duration,
+    ) -> Self {
+        self.max_forwards_per_sender = max_per_sender;
+        self.max_total_forwards = max_total;
+        self.max_forward_bytes_per_window = max_bytes;
+        self.limit_window = window;
         self
     }
 }
@@ -315,6 +417,14 @@ pub struct RelayStats {
     relay_refused_policy_disabled: AtomicU64,
     relay_dropped_revoked: AtomicU64,
     direct_recovered_after_relay: AtomicU64,
+    // #193 forward-path hardening counters:
+    relay_refused_not_a_contact: AtomicU64,
+    relay_refused_rate_limited: AtomicU64,
+    relay_refused_bandwidth_exceeded: AtomicU64,
+    /// Total bytes committed to forward on the relay path (the
+    /// observable bandwidth metric). Incremented on each accepted
+    /// forward by the predicted inner-envelope wire size.
+    relay_forward_bytes: AtomicU64,
 }
 
 /// JSON-friendly snapshot of [`RelayStats`].
@@ -340,6 +450,18 @@ pub struct RelayStatsSnapshot {
     /// Peers that returned to a healthy direct path after having been
     /// in relay mode — proves the fallback is transient, not sticky.
     pub direct_recovered_after_relay: u64,
+    /// Inbound relayed DMs refused — sender is not a contact
+    /// (`require_contact_to_relay`, #193).
+    pub relay_refused_not_a_contact: u64,
+    /// Inbound relayed DMs refused — per-sender/global forward rate
+    /// exceeded (#193).
+    pub relay_refused_rate_limited: u64,
+    /// Inbound relayed DMs refused — per-window bandwidth cap exceeded
+    /// (#193).
+    pub relay_refused_bandwidth_exceeded: u64,
+    /// Total bytes committed to forward on the relay path (#193) — the
+    /// observable bandwidth metric for the cap above.
+    pub relay_forward_bytes: u64,
 }
 
 impl RelayStats {
@@ -357,6 +479,58 @@ impl RelayStats {
                 .load(Ordering::Relaxed),
             relay_dropped_revoked: self.relay_dropped_revoked.load(Ordering::Relaxed),
             direct_recovered_after_relay: self.direct_recovered_after_relay.load(Ordering::Relaxed),
+            relay_refused_not_a_contact: self.relay_refused_not_a_contact.load(Ordering::Relaxed),
+            relay_refused_rate_limited: self.relay_refused_rate_limited.load(Ordering::Relaxed),
+            relay_refused_bandwidth_exceeded: self
+                .relay_refused_bandwidth_exceeded
+                .load(Ordering::Relaxed),
+            relay_forward_bytes: self.relay_forward_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// #193 forward-path resource state: per-sender + global forward-rate
+/// timestamps and a global bandwidth ledger, all over a shared sliding
+/// `limit_window`. Held under a single mutex so a forward decision is
+/// atomic across all three caps.
+#[derive(Debug, Default)]
+struct RelayLimiter {
+    /// Per-sender forward-request timestamps within the window.
+    per_sender_forwards: HashMap<[u8; 32], Vec<Instant>>,
+    /// Global forward-request timestamps within the window (all senders).
+    total_forward_times: Vec<Instant>,
+    /// `(timestamp, bytes)` for each accepted forward within the window —
+    /// the bandwidth ledger. Pruned by `limit_window` on every check.
+    forward_bytes: Vec<(Instant, u64)>,
+}
+
+impl RelayLimiter {
+    /// Drop entries older than `window` from all three ledgers.
+    fn prune(&mut self, now: Instant, window: Duration) {
+        self.per_sender_forwards.retain(|_, times| {
+            times.retain(|t| now.saturating_duration_since(*t) < window);
+            !times.is_empty()
+        });
+        self.total_forward_times
+            .retain(|t| now.saturating_duration_since(*t) < window);
+        self.forward_bytes
+            .retain(|(t, _)| now.saturating_duration_since(*t) < window);
+    }
+
+    /// Total bytes recorded in the current window.
+    fn bytes_in_window(&self) -> u64 {
+        self.forward_bytes.iter().map(|(_, b)| b).sum()
+    }
+
+    /// Record an accepted forward of `bytes` for `sender`.
+    fn record(&mut self, sender: [u8; 32], now: Instant, bytes: u64) {
+        self.per_sender_forwards
+            .entry(sender)
+            .or_default()
+            .push(now);
+        self.total_forward_times.push(now);
+        if bytes > 0 {
+            self.forward_bytes.push((now, bytes));
         }
     }
 }
@@ -366,13 +540,16 @@ impl RelayStats {
 /// Tracks per-peer direct-DM failures, decides when a peer
 /// [`needs_relay`](PeerRelay::needs_relay), selects a relay candidate,
 /// builds + verifies [`RelayHeader`]s, and classifies inbound
-/// [`RelayedDm`]s. All state is behind a single `Mutex` — the hot paths
-/// are sync, no awaits.
+/// [`RelayedDm`]s. The failure/state map is behind `per_peer`; the
+/// #193 forward-path resource caps (per-sender + global forward rate and
+/// bandwidth) are behind a separate `limiter` mutex so the two concerns
+/// never contend on the same lock.
 #[derive(Debug)]
 pub struct PeerRelay {
     policy: RelayPolicy,
     stats: RelayStats,
     per_peer: Mutex<HashMap<[u8; 32], PeerRelayState>>,
+    limiter: Mutex<RelayLimiter>,
 }
 
 impl Default for PeerRelay {
@@ -389,6 +566,7 @@ impl PeerRelay {
             policy: RelayPolicy::default(),
             stats: RelayStats::default(),
             per_peer: Mutex::new(HashMap::new()),
+            limiter: Mutex::new(RelayLimiter::default()),
         }
     }
 
@@ -399,6 +577,7 @@ impl PeerRelay {
             policy,
             stats: RelayStats::default(),
             per_peer: Mutex::new(HashMap::new()),
+            limiter: Mutex::new(RelayLimiter::default()),
         }
     }
 
@@ -427,6 +606,13 @@ impl PeerRelay {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], PeerRelayState>> {
         match self.per_peer.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn limiter_lock(&self) -> std::sync::MutexGuard<'_, RelayLimiter> {
+        match self.limiter.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -553,29 +739,41 @@ impl PeerRelay {
 
     /// Classify an inbound [`RelayedDm`] from the perspective of *this*
     /// node, whose agent id is `local_agent_id`, at wall-clock
-    /// `now_unix_ms`. Updates the telemetry counters as a side effect.
+    /// `now_unix_ms`. `is_sender_contact` is the caller's resolution of
+    /// whether the header's authenticated `sender_agent_id` is in this
+    /// node's contact store (the listener resolves this from
+    /// `ContactStore` before calling). Updates the telemetry counters as
+    /// a side effect.
     ///
-    /// - Policy disabled → `Refuse(PolicyDisabled)`,
-    ///   `relay_refused_policy_disabled` += 1. This check runs
-    ///   **before** the (expensive ML-DSA-65) header verification so an
-    ///   unsolicited relay frame to a node whose relay path is disabled
-    ///   cannot force a signature verification — the cheapest possible
-    ///   rejection for the DoS surface every node exposes by default.
-    /// - Header fails verification → [`RelayDisposition::Refuse`]
-    ///   (`BadSignature`), `relay_refused_bad_signature` += 1.
+    /// Classification order (each refusal is fail-closed and counted):
+    /// - Policy disabled → `Refuse(PolicyDisabled)`. Runs **before** the
+    ///   (expensive ML-DSA-65) header verification so an unsolicited
+    ///   relay frame to a disabled node cannot force a signature check.
+    /// - Header fails verification → `Refuse(BadSignature)`.
     /// - `originated_at` older than `freshness`, or more than
     ///   [`RELAY_CLOCK_SKEW_TOLERANCE_MS`] ahead of `now_unix_ms` →
-    ///   `Refuse(Stale)`, `relay_refused_stale` += 1.
+    ///   `Refuse(Stale)`.
     /// - `dst == local` → [`RelayDisposition::DeliverLocally`],
-    ///   `relay_received` += 1.
-    /// - otherwise → [`RelayDisposition::Forward`],
-    ///   `relay_forwarded` += 1.
+    ///   `relay_received` += 1. Receiving is not relaying, so the
+    ///   contact gate and resource caps below do NOT apply here.
+    /// - otherwise (forward arm, #193 hardening):
+    ///   1. `require_contact_to_relay && !is_sender_contact` →
+    ///      `Refuse(NotAContact)`, `relay_refused_not_a_contact` += 1.
+    ///   2. per-sender or global forward-rate cap exceeded →
+    ///      `Refuse(RateLimited)`, `relay_refused_rate_limited` += 1.
+    ///   3. bandwidth cap would be exceeded →
+    ///      `Refuse(BandwidthExceeded)`, `relay_refused_bandwidth_exceeded`
+    ///      += 1.
+    ///   4. all pass → record the forward, `relay_forwarded` += 1,
+    ///      `relay_forward_bytes` += predicted inner wire size, return
+    ///      [`RelayDisposition::Forward`].
     #[must_use]
     pub fn disposition_for(
         &self,
         relayed: &RelayedDm,
         local_agent_id: &AgentId,
         now_unix_ms: u64,
+        is_sender_contact: bool,
     ) -> RelayDisposition {
         // DoS guard: reject on the disabled-policy path before doing any
         // ML-DSA-65 signature work, so a disabled relay cannot be made to
@@ -605,14 +803,66 @@ impl PeerRelay {
                 .fetch_add(1, Ordering::Relaxed);
             return RelayDisposition::Refuse(RelayRefusal::Stale);
         }
+        // Final recipient: receiving a relayed DM addressed to us is not
+        // relaying — the contact gate and resource caps target the forward
+        // arm where this node spends its own uplink.
         if relayed.header.dst_agent_id == local_agent_id.0 {
             self.stats.relay_received.fetch_add(1, Ordering::Relaxed);
-            RelayDisposition::DeliverLocally
-        } else {
-            self.stats.relay_forwarded.fetch_add(1, Ordering::Relaxed);
-            RelayDisposition::Forward {
-                dst_agent_id: relayed.header.dst_agent_id,
-            }
+            return RelayDisposition::DeliverLocally;
+        }
+        // Forward arm — #193 hardening. Cheapest gate first (no lock).
+        if self.policy.require_contact_to_relay && !is_sender_contact {
+            self.stats
+                .relay_refused_not_a_contact
+                .fetch_add(1, Ordering::Relaxed);
+            return RelayDisposition::Refuse(RelayRefusal::NotAContact);
+        }
+        // Predicted wire size of the inner envelope — the bandwidth unit.
+        // Postcard is deterministic, so this equals the bytes the listener
+        // will actually send on a successful forward. Computed only on the
+        // (cold) relay path after crypto verification.
+        let predicted_bytes = inner_wire_bytes(&relayed.inner);
+        let now = Instant::now();
+        let window = self.policy.limit_window;
+        let mut limiter = self.limiter_lock();
+        limiter.prune(now, window);
+        // Per-sender forward rate.
+        let sender_count = limiter
+            .per_sender_forwards
+            .get(&relayed.header.sender_agent_id)
+            .map(Vec::len)
+            .unwrap_or(0);
+        if sender_count >= self.policy.max_forwards_per_sender as usize {
+            self.stats
+                .relay_refused_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            return RelayDisposition::Refuse(RelayRefusal::RateLimited);
+        }
+        // Global forward rate (all senders combined).
+        if limiter.total_forward_times.len() >= self.policy.max_total_forwards as usize {
+            self.stats
+                .relay_refused_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            return RelayDisposition::Refuse(RelayRefusal::RateLimited);
+        }
+        // Bandwidth cap (fail-closed: would-exceed → refuse).
+        if limiter.bytes_in_window().saturating_add(predicted_bytes)
+            > self.policy.max_forward_bytes_per_window
+        {
+            self.stats
+                .relay_refused_bandwidth_exceeded
+                .fetch_add(1, Ordering::Relaxed);
+            return RelayDisposition::Refuse(RelayRefusal::BandwidthExceeded);
+        }
+        // All caps pass — commit the forward.
+        limiter.record(relayed.header.sender_agent_id, now, predicted_bytes);
+        drop(limiter);
+        self.stats.relay_forwarded.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .relay_forward_bytes
+            .fetch_add(predicted_bytes, Ordering::Relaxed);
+        RelayDisposition::Forward {
+            dst_agent_id: relayed.header.dst_agent_id,
         }
     }
 
@@ -916,7 +1166,7 @@ mod tests {
             .expect("build");
 
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms + 100),
+            relay.disposition_for(&relayed, &local, now_ms + 100, false),
             RelayDisposition::DeliverLocally
         );
         assert_eq!(relay.stats().snapshot().relay_received, 1);
@@ -945,7 +1195,7 @@ mod tests {
             .expect("build");
 
         assert_eq!(
-            relay.disposition_for(&relayed, &we_are_the_relay, now_ms + 100),
+            relay.disposition_for(&relayed, &we_are_the_relay, now_ms + 100, true),
             RelayDisposition::Forward {
                 dst_agent_id: dst.0
             }
@@ -983,7 +1233,7 @@ mod tests {
         // "now" is 31 s past origination — beyond the 30 s freshness.
         let now_ms = originated_ms + 31_000;
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms),
+            relay.disposition_for(&relayed, &local, now_ms, false),
             RelayDisposition::Refuse(RelayRefusal::Stale)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_stale, 1);
@@ -1021,7 +1271,7 @@ mod tests {
             .expect("build");
 
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms),
+            relay.disposition_for(&relayed, &local, now_ms, false),
             RelayDisposition::Refuse(RelayRefusal::Stale)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_stale, 1);
@@ -1042,7 +1292,7 @@ mod tests {
             )
             .expect("build");
         assert_eq!(
-            relay.disposition_for(&fresh, &local, now_ms),
+            relay.disposition_for(&fresh, &local, now_ms, false),
             RelayDisposition::DeliverLocally
         );
     }
@@ -1072,7 +1322,7 @@ mod tests {
 
         let disabled = PeerRelay::new();
         assert_eq!(
-            disabled.disposition_for(&relayed, &local, now_ms + 100),
+            disabled.disposition_for(&relayed, &local, now_ms + 100, false),
             RelayDisposition::Refuse(RelayRefusal::PolicyDisabled)
         );
         assert_eq!(disabled.stats().snapshot().relay_refused_policy_disabled, 1);
@@ -1086,5 +1336,221 @@ mod tests {
         assert_eq!(relay.tracked_peer_count(), 1);
         relay.forget_peer(&peer);
         assert_eq!(relay.tracked_peer_count(), 0);
+    }
+    /// Build a fresh, verifiable `RelayedDm` addressed to `dst` (a forward
+    /// request from the receiver's perspective), signed by a freshly
+    /// generated sender keypair. The throwaway builder only exists so the
+    /// header is valid; each test classifies with its own engine.
+    fn signed_forward_envelope(dst: AgentId, now_ms: u64) -> RelayedDm {
+        let kp = AgentKeypair::generate().expect("keypair");
+        let sender = kp.agent_id();
+        let (pub_bytes, sec_bytes) = kp.to_bytes();
+        let secret = ant_quic::MlDsaSecretKey::from_bytes(&sec_bytes).expect("secret");
+        let builder = PeerRelay::with_policy(RelayPolicy::enabled());
+        builder
+            .build_relayed_dm(&dst, &sender, pub_bytes, now_ms, dummy_inner(), |bytes| {
+                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, bytes)
+                    .map(|s| s.as_bytes().to_vec())
+                    .map_err(|e| format!("{e:?}"))
+            })
+            .expect("build")
+    }
+
+    #[test]
+    fn disposition_refuses_non_contact_when_require_contact_set() {
+        // Why (#193): with require_contact_to_relay = true (the secure
+        // default), a forward request from a sender NOT in the contact
+        // store must be refused — a stranger can no longer spend the
+        // relay's uplink by self-keying a valid header.
+        let dst = aid(40);
+        let we = aid(41);
+        let now_ms = 1_700_000_000_000u64;
+        let relayed = signed_forward_envelope(dst, now_ms);
+
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled()); // require_contact defaults true
+        assert_eq!(
+            relay.disposition_for(&relayed, &we, now_ms + 100, false),
+            RelayDisposition::Refuse(RelayRefusal::NotAContact)
+        );
+        assert_eq!(relay.stats().snapshot().relay_refused_not_a_contact, 1);
+        assert_eq!(relay.stats().snapshot().relay_forwarded, 0);
+    }
+
+    #[test]
+    fn disposition_forwards_for_contact_when_require_contact_set() {
+        // Why (#193): the contact gate is a gate, not a block — a known
+        // contact's forward request still succeeds (subject to the
+        // rate/bandwidth caps), and the committed bytes are observable.
+        let dst = aid(42);
+        let we = aid(43);
+        let now_ms = 1_700_000_000_000u64;
+        let relayed = signed_forward_envelope(dst, now_ms);
+
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled());
+        assert_eq!(
+            relay.disposition_for(&relayed, &we, now_ms + 100, true),
+            RelayDisposition::Forward {
+                dst_agent_id: dst.0
+            }
+        );
+        let snap = relay.stats().snapshot();
+        assert_eq!(snap.relay_forwarded, 1);
+        assert!(
+            snap.relay_forward_bytes > 0,
+            "a successful forward must account its predicted wire bytes"
+        );
+    }
+
+    #[test]
+    fn open_relay_forwards_for_stranger_when_contact_gate_off() {
+        // Why (#193): an operator who explicitly opts into an open relay
+        // (require_contact_to_relay = false) still forwards for
+        // strangers — the gate is opt-out, and rate/bandwidth caps still
+        // apply underneath.
+        let dst = aid(44);
+        let we = aid(45);
+        let now_ms = 1_700_000_000_000u64;
+        let relayed = signed_forward_envelope(dst, now_ms);
+
+        let mut policy = RelayPolicy::enabled();
+        policy.require_contact_to_relay = false;
+        let relay = PeerRelay::with_policy(policy);
+        assert_eq!(
+            relay.disposition_for(&relayed, &we, now_ms + 100, false),
+            RelayDisposition::Forward {
+                dst_agent_id: dst.0
+            }
+        );
+    }
+
+    #[test]
+    fn deliver_locally_not_gated_by_contact_check() {
+        // Why (#193): receiving a relayed DM addressed to us is not
+        // relaying. A non-contact sender can still reach us via relay —
+        // the contact gate targets only the forward arm.
+        let kp = AgentKeypair::generate().expect("keypair");
+        let sender = kp.agent_id();
+        let (pub_bytes, sec_bytes) = kp.to_bytes();
+        let secret = ant_quic::MlDsaSecretKey::from_bytes(&sec_bytes).expect("secret");
+        let local = aid(46);
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled());
+        let now_ms = 1_700_000_000_000u64;
+        let relayed = relay
+            .build_relayed_dm(&local, &sender, pub_bytes, now_ms, dummy_inner(), |b| {
+                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, b)
+                    .map(|s| s.as_bytes().to_vec())
+                    .map_err(|e| format!("{e:?}"))
+            })
+            .expect("build");
+        assert_eq!(
+            relay.disposition_for(&relayed, &local, now_ms + 100, false),
+            RelayDisposition::DeliverLocally
+        );
+    }
+
+    #[test]
+    fn disposition_refuses_when_sender_rate_limit_exceeded() {
+        // Why (#193): a sender that bursts more than
+        // max_forwards_per_sender within the window is throttled. Tested
+        // under burst: the (cap+1)-th forward from the same sender is
+        // refused with RateLimited. Global + bandwidth caps are loosened
+        // so only the per-sender gate fires.
+        let dst = aid(50);
+        let we = aid(51);
+        let now_ms = 1_700_000_000_000u64;
+        let relayed = signed_forward_envelope(dst, now_ms);
+
+        let policy = RelayPolicy::enabled().with_forward_limits(
+            2,
+            1_000_000,
+            u64::MAX,
+            Duration::from_secs(60),
+        );
+        let relay = PeerRelay::with_policy(policy);
+
+        // First two forwards from this sender succeed.
+        for _ in 0..2 {
+            assert_eq!(
+                relay.disposition_for(&relayed, &we, now_ms + 100, true),
+                RelayDisposition::Forward {
+                    dst_agent_id: dst.0
+                }
+            );
+        }
+        // Third forward from the SAME sender is refused.
+        assert_eq!(
+            relay.disposition_for(&relayed, &we, now_ms + 100, true),
+            RelayDisposition::Refuse(RelayRefusal::RateLimited)
+        );
+        let snap = relay.stats().snapshot();
+        assert_eq!(snap.relay_refused_rate_limited, 1);
+        assert_eq!(snap.relay_forwarded, 2);
+    }
+
+    #[test]
+    fn disposition_refuses_when_global_rate_limit_exceeded() {
+        // Why (#193): the global concurrent-forward cap bounds total
+        // forwards across ALL senders. With max_total_forwards = 1, a
+        // second forward from a *different* sender is still refused.
+        let dst = aid(60);
+        let we = aid(61);
+        let now_ms = 1_700_000_000_000u64;
+        let first = signed_forward_envelope(dst, now_ms);
+        let second = signed_forward_envelope(dst, now_ms);
+
+        let policy = RelayPolicy::enabled().with_forward_limits(
+            1_000_000,
+            1,
+            u64::MAX,
+            Duration::from_secs(60),
+        );
+        let relay = PeerRelay::with_policy(policy);
+
+        assert_eq!(
+            relay.disposition_for(&first, &we, now_ms + 100, true),
+            RelayDisposition::Forward {
+                dst_agent_id: dst.0
+            }
+        );
+        // Different sender, but the global budget is exhausted.
+        assert_eq!(
+            relay.disposition_for(&second, &we, now_ms + 100, true),
+            RelayDisposition::Refuse(RelayRefusal::RateLimited)
+        );
+        assert_eq!(relay.stats().snapshot().relay_refused_rate_limited, 1);
+    }
+
+    #[test]
+    fn disposition_refuses_when_bandwidth_cap_exceeded() {
+        // Why (#193): once cumulative forwarded bytes in the window
+        // would exceed max_forward_bytes_per_window, further forwards
+        // are refused with BandwidthExceeded — and the refusal + zero
+        // committed bytes are observable in the stats snapshot.
+        let dst = aid(52);
+        let we = aid(53);
+        let now_ms = 1_700_000_000_000u64;
+        let relayed = signed_forward_envelope(dst, now_ms);
+
+        // Cap at 1 byte: the first forward's predicted wire size (~tens
+        // of bytes) already exceeds it → fail-closed refusal.
+        let policy = RelayPolicy::enabled().with_forward_limits(
+            1_000_000,
+            1_000_000,
+            1,
+            Duration::from_secs(60),
+        );
+        let relay = PeerRelay::with_policy(policy);
+
+        assert_eq!(
+            relay.disposition_for(&relayed, &we, now_ms + 100, true),
+            RelayDisposition::Refuse(RelayRefusal::BandwidthExceeded)
+        );
+        let snap = relay.stats().snapshot();
+        assert_eq!(snap.relay_refused_bandwidth_exceeded, 1);
+        assert_eq!(snap.relay_forwarded, 0);
+        assert_eq!(
+            snap.relay_forward_bytes, 0,
+            "no bytes committed on a refused forward"
+        );
     }
 }
