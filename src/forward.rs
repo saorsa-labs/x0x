@@ -17,9 +17,12 @@
 //!   any `TcpStream::connect`. The stream already cleared the T1 identity
 //!   gate (verified + trust `Accept` + not revoked), so the connect gate is
 //!   passed `verified=true, trust=Some(Accept)`; its job is the ACL
-//!   target-match + loopback re-check. A denial produces a typed
-//!   [`crate::connect::ConnectDenialReason`] frame back to the opener and a
-//!   `record_denied` counter; zero bytes reach the target.
+//!   target-match + loopback re-check. The gate checks **every** agent on
+//!   the peer machine (the QUIC transport authenticates the machine, not
+//!   the specific opener) and fails-closed if any is unauthorized (#192).
+//!   A denial produces a typed [`crate::connect::ConnectDenialReason`] frame
+//!   back to the opener and a `record_denied` counter; zero bytes reach the
+//!   target.
 //!
 //! ## Loopback-only (Phase 1)
 //!
@@ -197,12 +200,20 @@ fn resolve_loopback_target(
 /// deny. The caller writes the denial frame + records the counter and must
 /// NOT call `TcpStream::connect` on `Err`.
 ///
+/// **Multi-agent fail-closed (#192):** `agents` holds every agent known to
+/// run on the transport-authenticated peer machine. The gate must pass for
+/// **every** agent — if any is unauthorized the forward is denied. When the
+/// machine hosts a single agent (the common case) this reduces to the
+/// existing exact-pair check. When it hosts multiple the QUIC transport
+/// cannot prove which agent opened the stream, so an unauthorized agent
+/// cannot piggyback on an authorized one's ACL entry.
+///
 /// Extracted pure so the full deny/allow matrix is unit-testable without a
 /// live QUIC pair.
 fn decide_inbound(
     header: &ForwardHeader,
     policy: &ConnectPolicy,
-    agent_id: &AgentId,
+    agents: &[AgentId],
     machine_id: &MachineId,
 ) -> Result<SocketAddr, ConnectDenialReason> {
     // Resolve first: a non-loopback/hostname target is refused before the
@@ -210,14 +221,17 @@ fn decide_inbound(
     // reason and avoids handing an attacker-resolved address to the ACL).
     let target = resolve_loopback_target(&header.target_host, header.target_port)
         .map_err(|_| ConnectDenialReason::TargetNotLoopback)?;
-    evaluate_connect_gate(
-        /* verified */ true,
-        Some(TrustDecision::Accept),
-        policy,
-        agent_id,
-        machine_id,
-        &target,
-    )?;
+    // Fail-closed: every agent on the peer machine must be authorized.
+    for agent_id in agents {
+        evaluate_connect_gate(
+            /* verified */ true,
+            Some(TrustDecision::Accept),
+            policy,
+            agent_id,
+            machine_id,
+            &target,
+        )?;
+    }
     Ok(target)
 }
 
@@ -308,7 +322,7 @@ pub(crate) async fn handle_inbound(
     fwd_diag: Arc<ForwardDiagnostics>,
     revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
 ) {
-    let agent_id = stream.agent();
+    let agents: Vec<AgentId> = stream.peer_agents().to_vec();
     let machine_id = stream.peer();
     let peer = machine_id;
 
@@ -316,16 +330,19 @@ pub(crate) async fn handle_inbound(
     // cleared before this stream was surfaced. A peer revoked in that window
     // must not consume a header read or reach the connect gate. Re-check the
     // shared revocation set BEFORE reading any peer bytes; drop on
-    // revocation. (The connect gate would still deny by policy, so this is
+    // revocation of ANY agent on the peer machine (#192 multi-agent
+    // fail-closed). (The connect gate would still deny by policy, so this is
     // not a bypass — it closes the per-flow stale-authz window. Full
     // mid-stream teardown is a documented Phase-2 item.)
     {
         let revoked = revocation_set.read().await;
-        if revoked.is_agent_revoked(&agent_id) || revoked.is_machine_revoked(&machine_id) {
+        let any_agent_revoked = agents.iter().any(|a| revoked.is_agent_revoked(a));
+        if any_agent_revoked || revoked.is_machine_revoked(&machine_id) {
             fwd_diag.record_revoked_mid_flight();
             tracing::info!(
                 target: "x0x::forward",
-                agent = %hex::encode(agent_id.as_bytes()),
+                agent = %hex::encode(agents[0].as_bytes()),
+                agent_count = agents.len(),
                 machine = %hex::encode(peer.as_bytes()),
                 outcome = "drop_revoked_mid_flight",
                 "inbound forward: peer revoked after accept — dropping before header read"
@@ -362,7 +379,7 @@ pub(crate) async fn handle_inbound(
         };
 
     // Gate: resolve + ACL. On deny, write a typed frame + record, then close.
-    let target = match decide_inbound(&header, &policy, &agent_id, &machine_id) {
+    let target = match decide_inbound(&header, &policy, &agents, &machine_id) {
         Ok(addr) => addr,
         Err(reason) => {
             connect_diag.record_denied(reason);
@@ -969,7 +986,7 @@ mod tests {
         // Disabled policy ⇒ ConnectDisabled (default-deny).
         let disabled = ConnectPolicy::default();
         assert_eq!(
-            decide_inbound(&header("127.0.0.1", 22), &disabled, &agent, &machine).unwrap_err(),
+            decide_inbound(&header("127.0.0.1", 22), &disabled, &[agent], &machine).unwrap_err(),
             ConnectDenialReason::ConnectDisabled
         );
 
@@ -977,29 +994,134 @@ mod tests {
         let other_agent = AgentId([9u8; 32]);
         let policy = policy_with_allow(other_agent, machine, target);
         assert_eq!(
-            decide_inbound(&header("127.0.0.1", 22), &policy, &agent, &machine).unwrap_err(),
+            decide_inbound(&header("127.0.0.1", 22), &policy, &[agent], &machine).unwrap_err(),
             ConnectDenialReason::AgentMachineNotInAcl
         );
 
         // Pair in ACL but target not in its entry ⇒ TargetNotAllowed.
         let policy = policy_with_allow(agent, machine, "127.0.0.1:2222".parse().unwrap());
         assert_eq!(
-            decide_inbound(&header("127.0.0.1", 22), &policy, &agent, &machine).unwrap_err(),
+            decide_inbound(&header("127.0.0.1", 22), &policy, &[agent], &machine).unwrap_err(),
             ConnectDenialReason::TargetNotAllowed
         );
 
         // Happy path: exact (agent, machine, target) ⇒ allow.
         let policy = policy_with_allow(agent, machine, target);
         assert_eq!(
-            decide_inbound(&header("127.0.0.1", 22), &policy, &agent, &machine).unwrap(),
+            decide_inbound(&header("127.0.0.1", 22), &policy, &[agent], &machine).unwrap(),
             target
         );
 
         // Non-loopback target ⇒ TargetNotLoopback (refused before the ACL).
         let policy = policy_with_allow(agent, machine, target);
         assert_eq!(
-            decide_inbound(&header("10.0.0.1", 22), &policy, &agent, &machine).unwrap_err(),
+            decide_inbound(&header("10.0.0.1", 22), &policy, &[agent], &machine).unwrap_err(),
             ConnectDenialReason::TargetNotLoopback
+        );
+    }
+
+    /// Build a policy from explicit allow entries (multi-agent scenarios).
+    fn policy_multi(entries: Vec<ConnectAllowEntry>) -> ConnectPolicy {
+        ConnectPolicy::Enabled(ConnectAcl {
+            loaded_from: "test".into(),
+            loaded_at_unix_ms: 0,
+            allow: entries,
+        })
+    }
+
+    fn allow_entry(
+        agent: AgentId,
+        machine: MachineId,
+        targets: &[SocketAddr],
+    ) -> ConnectAllowEntry {
+        ConnectAllowEntry {
+            description: None,
+            agent_id: agent,
+            machine_id: machine,
+            targets: targets.to_vec(),
+        }
+    }
+
+    #[test]
+    fn decide_inbound_multi_agent_fail_closed() {
+        // Issue #192: when a machine hosts multiple agents the QUIC transport
+        // authenticates only the machine — not which agent opened the stream.
+        // The ACL must check EVERY agent and fail-closed if any is
+        // unauthorized, so one agent cannot piggyback on another's entry.
+        let machine = MachineId([2u8; 32]);
+        let agent_a = AgentId([1u8; 32]);
+        let agent_b = AgentId([3u8; 32]);
+        let ssh: SocketAddr = "127.0.0.1:22".parse().unwrap();
+        let vnc: SocketAddr = "127.0.0.1:5900".parse().unwrap();
+
+        // Both agents authorized for the same target ⇒ allow.
+        let policy = policy_multi(vec![
+            allow_entry(agent_a, machine, &[ssh]),
+            allow_entry(agent_b, machine, &[ssh]),
+        ]);
+        assert_eq!(
+            decide_inbound(
+                &header("127.0.0.1", 22),
+                &policy,
+                &[agent_a, agent_b],
+                &machine
+            )
+            .unwrap(),
+            ssh,
+        );
+
+        // Agent A authorized for :22 but agent B is not in the ACL at all ⇒
+        // DENIED — B cannot piggyback on A's entry.
+        let policy = policy_multi(vec![allow_entry(agent_a, machine, &[ssh])]);
+        assert_eq!(
+            decide_inbound(
+                &header("127.0.0.1", 22),
+                &policy,
+                &[agent_a, agent_b],
+                &machine
+            )
+            .unwrap_err(),
+            ConnectDenialReason::AgentMachineNotInAcl,
+        );
+
+        // Both agents in the ACL but for different targets ⇒ DENIED for a
+        // target only one of them has.
+        let policy = policy_multi(vec![
+            allow_entry(agent_a, machine, &[ssh]),
+            allow_entry(agent_b, machine, &[vnc]),
+        ]);
+        assert_eq!(
+            decide_inbound(
+                &header("127.0.0.1", 22),
+                &policy,
+                &[agent_a, agent_b],
+                &machine
+            )
+            .unwrap_err(),
+            ConnectDenialReason::TargetNotAllowed,
+        );
+
+        // Agent order in the slice is irrelevant: [B, A] ≡ [A, B].
+        let policy = policy_multi(vec![
+            allow_entry(agent_a, machine, &[ssh]),
+            allow_entry(agent_b, machine, &[ssh]),
+        ]);
+        assert_eq!(
+            decide_inbound(
+                &header("127.0.0.1", 22),
+                &policy,
+                &[agent_b, agent_a],
+                &machine
+            )
+            .unwrap(),
+            ssh,
+        );
+
+        // Single-agent list (the common case) behaves like the legacy check.
+        let policy = policy_multi(vec![allow_entry(agent_a, machine, &[ssh])]);
+        assert_eq!(
+            decide_inbound(&header("127.0.0.1", 22), &policy, &[agent_a], &machine).unwrap(),
+            ssh,
         );
     }
 

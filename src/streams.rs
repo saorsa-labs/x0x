@@ -30,13 +30,20 @@
 //!    at the QUIC/TLS layer; an unauthenticated connection can never yield a
 //!    stream. Outbound additionally requires the `AgentId → MachineId` binding
 //!    to be present in the identity discovery cache (the same `verified`
-//!    annotation the direct-DM path uses).
+//!    annotation the direct-DM path uses). On the inbound path the accept
+//!    loop resolves **all** agents whose `MachineId` matches the transport-
+//!    authenticated peer — the specific opener cannot be distinguished at
+//!    this layer (the QUIC session proves the machine, not the agent), so
+//!    every resolved agent must clear the remaining gate checks (#192).
 //! 2. **trust-accepted** — the local [`TrustDecision`](crate::trust::TrustDecision)
-//!    for the `(AgentId, MachineId)` pair must be `Accept` (`AcceptWithFlag`
-//!    is rejected, mirroring exec + the connect gate).
-//! 3. **not revoked** — neither the agent nor the machine may be in the local
-//!    revocation set (positive knowledge of compromise fails closed, mirroring
-//!    EP3 / EP4 / the relay and direct-DM gates).
+//!    for every `(AgentId, MachineId)` pair on the peer machine must be
+//!    `Accept` (`AcceptWithFlag` is rejected, mirroring exec + the connect
+//!    gate). Fail-closed for multi-agent machines: a single non-Accept agent
+//!    denies the stream.
+//! 3. **not revoked** — neither any agent on the machine nor the machine
+//!    itself may be in the local revocation set (positive knowledge of
+//!    compromise fails closed, mirroring EP3 / EP4 / the relay and direct-DM
+//!    gates).
 //!
 //! Any failure produces a typed `NetworkError` (`PeerNotVerified` /
 //! `PeerTrustRejected` / `PeerRevoked`) and the stream is refused or reset
@@ -173,11 +180,21 @@ impl StreamProtocol {
 /// provides native flow-control / backpressure — no intermediate unbounded
 /// buffers are introduced.
 ///
-/// The `agent`, `peer`, and `protocol` fields are fixed at open/accept time
+/// The `agents`, `peer`, and `protocol` fields are fixed at open/accept time
 /// after the identity gate has cleared; consumers can rely on them without
 /// re-checking.
 pub struct PeerStream {
-    agent: crate::identity::AgentId,
+    /// All agent identities known to run on the peer machine (≥1). On the
+    /// inbound path these are resolved from the transport-authenticated
+    /// `MachineId` via the identity discovery cache; on the outbound path
+    /// this is the single target agent the opener selected.
+    ///
+    /// When the list holds more than one agent the QUIC transport cannot
+    /// prove which one opened the stream — only the machine is
+    /// authenticated. Downstream authorization (the connect ACL) must
+    /// therefore check **every** agent and fail-closed if any is
+    /// unauthorized (issue #192).
+    agents: Vec<crate::identity::AgentId>,
     peer: MachineId,
     protocol: StreamProtocol,
     send: ant_quic::HighLevelSendStream,
@@ -189,14 +206,14 @@ impl PeerStream {
     /// protocol. Called by the Agent open/accept paths after the identity gate
     /// and protocol handshake have succeeded.
     pub(crate) fn new(
-        agent: crate::identity::AgentId,
+        agents: Vec<crate::identity::AgentId>,
         peer: MachineId,
         protocol: StreamProtocol,
         send: ant_quic::HighLevelSendStream,
         recv: ant_quic::HighLevelRecvStream,
     ) -> Self {
         Self {
-            agent,
+            agents,
             peer,
             protocol,
             send,
@@ -204,12 +221,23 @@ impl PeerStream {
         }
     }
 
-    /// The peer's agent identity (resolved from the machine at the identity
-    /// gate on the inbound path; the caller-supplied target on the outbound
-    /// path). The connect gate (`evaluate_connect_gate`) matches on this.
+    /// The first agent identity on the peer machine. For the common
+    /// single-agent-per-machine case this is that agent. When multiple
+    /// agents share the peer machine the specific opener cannot be
+    /// determined — use [`PeerStream::peer_agents`] for authorization
+    /// decisions so the connect ACL checks every agent.
     #[must_use]
     pub fn agent(&self) -> crate::identity::AgentId {
-        self.agent
+        self.agents[0]
+    }
+
+    /// All agent identities known to run on the peer machine. The connect
+    /// ACL (`evaluate_connect_gate`) must pass for **every** agent in this
+    /// list — fail-closed for multi-agent machines where the transport
+    /// authenticates only the machine, not the individual agent (#192).
+    #[must_use]
+    pub fn peer_agents(&self) -> &[crate::identity::AgentId] {
+        &self.agents
     }
 
     /// The peer's transport-authenticated machine identity.

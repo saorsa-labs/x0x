@@ -62,6 +62,17 @@ Every target is validated at **load time** — a bad target is a hard error that
 - `deny_unknown_fields` is applied to `[connect]` and `[[connect.allow]]`: a misspelled key (`taregts`, `enable`) fails loudly rather than silently yielding a permissive policy.
 - The `[connect]` section lives **inside the ACL file**, not in the daemon config TOML. The daemon config knows nothing about connect. This mirrors the exec ACL design.
 
+## Agent identity granularity (#192)
+
+The ACL is keyed on the exact `(agent_id, machine_id)` pair, but the inbound forward path receives the stream over a QUIC connection that cryptographically authenticates only the **machine** (the ant-quic `PeerId` == `MachineId`). The opener's `agent_id` is **not** transmitted on the wire — the `ForwardHeader` carries only `target_host` and `target_port`.
+
+The inbound accept loop resolves the opener's agent identity from the identity discovery cache: it collects **every** `AgentId` whose `machine_id` matches the transport-authenticated peer. The connect gate then checks the ACL for **all** resolved agents and fails-closed if any is unauthorized:
+
+- **Single agent on the machine (the common case):** the resolved set has one agent; the ACL enforces agent-granular authorization exactly as written.
+- **Multiple agents on the machine:** the QUIC transport cannot prove which agent opened the stream, so the gate requires **every** agent on the machine to be authorized for the target. If any agent lacks authorization the forward is **denied** — an unauthorized agent cannot piggyback on another agent's ACL entry.
+
+This is fail-closed by design. If you co-locate multiple agents on one machine and need forwards to work, authorize every agent for the same targets, or do not co-locate agents with different ACL requirements. Full per-agent cryptographic authentication (signed agent attestation in the forward header) is a documented future enhancement that would lift the multi-agent restriction without changing the ACL model.
+
 ## CLI
 
 ```bash

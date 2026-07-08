@@ -8069,7 +8069,11 @@ impl Agent {
             "outbound peer stream opened (identity gate cleared)"
         );
         Ok(streams::PeerStream::new(
-            *agent_id, machine_id, protocol, send, recv,
+            vec![*agent_id],
+            machine_id,
+            protocol,
+            send,
+            recv,
         ))
     }
 
@@ -8119,53 +8123,71 @@ impl Agent {
                 };
                 let machine_id = identity::MachineId(ant_peer_id.0);
 
-                // Identity gate — resolve the agent on this machine from the
-                // discovery cache, then revoked → trust. Each lock is taken
-                // in its own scope so no two identity locks are held at once
+                // Identity gate — resolve ALL agents on this machine from
+                // the discovery cache, then check each (revoked → trust).
+                // The QUIC transport authenticates the machine, not the
+                // specific agent, so every agent on the machine must clear
+                // the gate — a single revoked or untrusted agent denies the
+                // stream (fail-closed, #192). Each lock is taken in its own
+                // scope so no two identity locks are held at once
                 // (evict_revoked_subject takes them in a different order).
-                let agent_id = {
+                let agents: Vec<identity::AgentId> = {
                     let cache = discovery_cache.read().await;
-                    cache
+                    let mut found: Vec<identity::AgentId> = cache
                         .values()
-                        .find(|a| a.machine_id == machine_id)
+                        .filter(|a| a.machine_id == machine_id)
                         .map(|a| a.agent_id)
+                        .collect();
+                    // Deterministic order so logging / per-peer concurrency
+                    // keying are stable across HashMap iteration orders.
+                    found.sort_by_key(|a| a.0);
+                    found
                 };
-                let Some(agent_id) = agent_id else {
+                if agents.is_empty() {
                     tracing::info!(
                         target: "x0x::streams",
                         machine = %hex::encode(machine_id.as_bytes()),
                         outcome = "deny_not_verified",
                         "inbound stream from machine with no known agent — denied"
- );
+                    );
                     continue;
-                };
-                let trust_decision = {
-                    let contacts = contact_store.read().await;
-                    let evaluator = trust::TrustEvaluator::new(&contacts);
-                    Some(evaluator.evaluate(&trust::TrustContext {
-                        agent_id: &agent_id,
-                        machine_id: &machine_id,
-                    }))
-                };
-                let (revoked_agent, revoked_machine) = {
-                    let revoked = revocation_set.read().await;
-                    (
-                        revoked.is_agent_revoked(&agent_id),
-                        revoked.is_machine_revoked(&machine_id),
-                    )
-                };
-                if let Err(e) = streams::stream_gate(
-                    &agent_id,
-                    trust_decision,
-                    revoked_agent,
-                    revoked_machine,
-                ) {
+                }
+                let mut gate_denied: Option<(identity::AgentId, error::NetworkError)> = None;
+                for agent_id in &agents {
+                    let trust_decision = {
+                        let contacts = contact_store.read().await;
+                        let evaluator = trust::TrustEvaluator::new(&contacts);
+                        Some(evaluator.evaluate(&trust::TrustContext {
+                            agent_id,
+                            machine_id: &machine_id,
+                        }))
+                    };
+                    let (revoked_agent, revoked_machine) = {
+                        let revoked = revocation_set.read().await;
+                        (
+                            revoked.is_agent_revoked(agent_id),
+                            revoked.is_machine_revoked(&machine_id),
+                        )
+                    };
+                    if let Err(e) = streams::stream_gate(
+                        agent_id,
+                        trust_decision,
+                        revoked_agent,
+                        revoked_machine,
+                    ) {
+                        gate_denied = Some((*agent_id, e));
+                        break;
+                    }
+                }
+                if let Some((agent_id, e)) = gate_denied {
                     tracing::info!(
                         target: "x0x::streams",
                         agent = %hex::encode(agent_id.as_bytes()),
+                        machine = %hex::encode(machine_id.as_bytes()),
+                        agent_count = agents.len(),
                         outcome = "deny_gate",
                         error = %e,
-                        "inbound stream denied at identity gate"
+                        "inbound stream denied at identity gate (one agent on the machine failed)"
                     );
                     continue;
                 }
@@ -8208,7 +8230,7 @@ impl Agent {
                         }
                     };
                     let peer_stream =
-                        streams::PeerStream::new(agent_id, machine_id, protocol, send, recv);
+                        streams::PeerStream::new(agents, machine_id, protocol, send, recv);
                     // try_send so a slow consumer cannot pile up accepted
                     // streams in memory; a full channel drops the stream.
                     if incoming_for_task.sender().try_send(peer_stream).is_err() {
