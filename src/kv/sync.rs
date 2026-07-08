@@ -251,6 +251,8 @@ mod tests {
     use crate::identity::AgentId;
     use crate::kv::store::AccessPolicy;
     use crate::kv::{KvEntry, KvStoreId};
+    use crate::network::{NetworkConfig, NetworkNode};
+    use std::time::Duration;
 
     fn agent(n: u8) -> AgentId {
         AgentId([n; 32])
@@ -262,6 +264,40 @@ mod tests {
 
     fn store_id(n: u8) -> KvStoreId {
         KvStoreId::new([n; 32])
+    }
+
+    /// Construct an isolated network node (mirrors the helper in
+    /// `src/gossip/pubsub.rs` tests). `PubSubManager` is fully constructable
+    /// in tests, so `KvStoreSync` is testable end-to-end without a live mesh.
+    async fn make_node() -> Arc<NetworkNode> {
+        Arc::new(
+            NetworkNode::new(NetworkConfig::default(), None, None)
+                .await
+                .expect("network node"),
+        )
+    }
+
+    /// Build a `KvStoreSync` around a fresh node + pubsub, with
+    /// `owner = agent(1)` and `local_peer_id = peer(1)`.
+    async fn make_sync(topic: &str, policy: AccessPolicy) -> KvStoreSync {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let store = KvStore::new(store_id(1), "Test".to_string(), agent(1), policy);
+        KvStoreSync::new(store, pubsub, topic.to_string(), peer(1)).expect("kv sync")
+    }
+
+    /// Build a `KvStoreSync` that shares its pubsub with the caller (so the
+    /// caller can subscribe before the sync publishes).
+    async fn make_sync_with_pubsub(
+        topic: &str,
+        policy: AccessPolicy,
+    ) -> (KvStoreSync, Arc<PubSubManager>) {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let store = KvStore::new(store_id(1), "Test".to_string(), agent(1), policy);
+        let sync = KvStoreSync::new(store, Arc::clone(&pubsub), topic.to_string(), peer(1))
+            .expect("kv sync");
+        (sync, pubsub)
     }
 
     #[tokio::test]
@@ -316,5 +352,203 @@ mod tests {
 
         assert_eq!(s1.name(), "Test");
         assert_eq!(s2.name(), "Test");
+    }
+
+    // ------------------------------------------------------------------
+    // new() / topic() / read() / write()
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn new_sets_topic_and_yields_accessible_guards() {
+        let sync = make_sync("store/A", AccessPolicy::Signed).await;
+
+        // topic() reports exactly the topic handed to new().
+        assert_eq!(sync.topic(), "store/A");
+
+        // read() exposes the underlying store unchanged.
+        {
+            let s = sync.read().await;
+            assert_eq!(s.name(), "Test");
+            assert!(s.is_empty());
+        }
+
+        // write() returns a mutable guard; verify it is usable by merging
+        // an owner-authored delta into the Signed store, then observe it via
+        // read(). This also exercises the read/write guard pair end-to-end.
+        let owner = agent(1);
+        let entry = KvEntry::new(
+            "owner-key".to_string(),
+            b"v".to_vec(),
+            "text/plain".to_string(),
+        );
+        let mut delta = KvStoreDelta::new(1);
+        delta
+            .added
+            .insert("owner-key".to_string(), (entry, (peer(1), 1)));
+        {
+            let mut s = sync.write().await;
+            s.merge_delta(&delta, peer(1), Some(&owner))
+                .expect("owner merge");
+        }
+
+        let s = sync.read().await;
+        assert!(s.get("owner-key").is_some(), "owner write must be visible");
+    }
+
+    // ------------------------------------------------------------------
+    // state_sync_topic() (private helper exercised from the test module)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn state_sync_topic_appends_side_channel_suffix() {
+        let sync = make_sync("store/B", AccessPolicy::Signed).await;
+        // The private helper forms the side channel by appending the suffix.
+        assert_eq!(sync.state_sync_topic(), "store/B/state-sync");
+
+        // Suffix is appended exactly once, regardless of slashes in topic.
+        let sync2 = make_sync("store/B/nested", AccessPolicy::Signed).await;
+        assert_eq!(sync2.state_sync_topic(), "store/B/nested/state-sync");
+    }
+
+    // ------------------------------------------------------------------
+    // publish_delta(): wire round-trip observed by a subscriber
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_delta_delivers_encoded_pair_to_subscriber() {
+        let (sync, pubsub) = make_sync_with_pubsub("store/C", AccessPolicy::Signed).await;
+
+        // Subscribe to the main topic BEFORE publishing so we observe the
+        // exact bytes KvStoreSync places on the wire.
+        let mut sub = pubsub.subscribe("store/C".to_string()).await;
+
+        let sender = peer(7);
+        let entry = KvEntry::new(
+            "remote".to_string(),
+            b"payload".to_vec(),
+            "application/octet-stream".to_string(),
+        );
+        let mut delta = KvStoreDelta::new(9);
+        delta
+            .added
+            .insert("remote".to_string(), (entry, (sender, 3)));
+
+        sync.publish_delta(sender, delta)
+            .await
+            .expect("publish_delta");
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("timed out waiting for published delta")
+            .expect("subscriber stream closed");
+
+        // The published payload must decode back to the (sender, delta) pair
+        // that publish_delta encoded — proving the wire format is correct.
+        let (observed_sender, observed_delta) =
+            decode_delta::<KvStoreDelta>(&msg.payload).expect("wire decode");
+        assert_eq!(observed_sender, sender);
+        assert_eq!(observed_delta.version, 9);
+        assert!(observed_delta.added.contains_key("remote"));
+        assert_eq!(msg.topic, "store/C");
+        // Sanity: the same delta also round-trips through encode_delta alone.
+        let reencoded = encode_delta(sender, &observed_delta).expect("re-encode");
+        let (s2, d2) = decode_delta::<KvStoreDelta>(&reencoded).expect("re-decode");
+        assert_eq!(s2, sender);
+        assert_eq!(d2.version, 9);
+    }
+
+    // ------------------------------------------------------------------
+    // start_with_spawner(): subscribes + returns Ok with a drop-spawner
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn start_with_spawner_subscribes_and_returns_ok() {
+        // Unique value vs `start_default_spawner_merges_remote_delta`: this
+        // routes the background futures through a *custom* (non-`tokio::spawn`)
+        // spawner closure — a drop-spawner — exercising that generic code path
+        // and asserting `start_with_spawner` returns `Ok` without panicking.
+        //
+        // It deliberately does NOT assert that a subscription or merge
+        // occurred: a drop-spawner makes subscription unobservable, so this
+        // would still pass against a no-op `Ok(())` impl. The real
+        // subscribe->merge behaviour is asserted end-to-end by
+        // `start_default_spawner_merges_remote_delta`, which drives
+        // `start_with_spawner(tokio::spawn)` and verifies the key lands.
+        let sync = make_sync("store/D", AccessPolicy::Signed).await;
+        sync.start_with_spawner(|_fut| {
+            // intentionally drop the future
+        })
+        .await
+        .expect("start_with_spawner");
+    }
+
+    // ------------------------------------------------------------------
+    // start(): default spawner merges a remotely-published delta
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn start_default_spawner_merges_remote_delta() {
+        // End-to-end exercise of the delta-merge listener: a delta published
+        // on the topic is received by the background loop spawned by start()
+        // and merged into the local store. We use an Encrypted policy so an
+        // unsigned (anonymous-sender) delta is accepted by the store's
+        // access control — matching what the wire delivers for an unsigned
+        // publish via a PubSubManager with no signing context.
+        let sync = make_sync(
+            "store/E",
+            AccessPolicy::Encrypted {
+                group_id: vec![1, 2, 3],
+            },
+        )
+        .await;
+
+        sync.start().await.expect("start");
+
+        // Let the spawned subscribe-forwarder register before we publish.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let entry = KvEntry::new(
+            "merged-key".to_string(),
+            b"hello".to_vec(),
+            "text/plain".to_string(),
+        );
+        let mut delta = KvStoreDelta::new(1);
+        delta
+            .added
+            .insert("merged-key".to_string(), (entry, (peer(2), 1)));
+        sync.publish_delta(peer(2), delta).await.expect("publish");
+
+        // The merge is asynchronous; poll the store until it lands.
+        let landed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let present = {
+                    let s = sync.read().await;
+                    s.get("merged-key").is_some()
+                };
+                if present {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            landed.is_ok(),
+            "remote delta was not merged by start() loop"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // stop(): returns Ok and is idempotent
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stop_returns_ok_and_is_idempotent() {
+        let sync = make_sync("store/F", AccessPolicy::Signed).await;
+        sync.stop().await.expect("first stop");
+        // stop() unsubscribes both the main and the state-sync topic;
+        // unsubscribe is infallible and tolerant of already-removed topics,
+        // so a second stop() must remain Ok.
+        sync.stop().await.expect("second stop (idempotent)");
     }
 }

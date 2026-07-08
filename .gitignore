@@ -45,3 +45,4 @@ test.txt
 NETWORK_TEST_REPORT.txt
 *_TEST_REPORT.txt
 .worktrees/
+.pi/messenger/
