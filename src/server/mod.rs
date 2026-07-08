@@ -761,6 +761,20 @@ pub async fn serve_with_options(
         .context("failed to bind API address")?;
     let actual_api_addr = listener.local_addr()?;
 
+    // #195: warn loudly when the control plane is bound off-loopback — the
+    // API is bearer-token-only with no auth rate-limiting, so a non-loopback
+    // bind exposes it off-host. --api-port only changes the port and stays
+    // loopback-safe; only a TOML `api_address = "0.0.0.0:…"` reaches here.
+    if !actual_api_addr.ip().is_loopback() {
+        tracing::warn!(
+            target: "x0x::startup",
+            api_address = %actual_api_addr,
+            "API listener bound on a NON-LOOPBACK address — the control plane is reachable \
+             off-host, protected only by the bearer token (no auth rate-limiting). Bind \
+             127.0.0.1 (the default) unless you intentionally want remote control-plane access."
+        );
+    }
+
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
     // Load or generate the per-daemon ML-KEM-768 keypair. Persisted under
     // `<data_dir>/agent_kem.key` with mode 0600. This keypair is the root of

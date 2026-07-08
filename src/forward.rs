@@ -434,8 +434,6 @@ pub(crate) async fn handle_inbound(
         return;
     }
     let (send, recv) = stream.into_split();
-    fwd_diag.enter_stream();
-    let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
     bridge(local, send, recv).await;
 }
 
