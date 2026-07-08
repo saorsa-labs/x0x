@@ -483,6 +483,7 @@ struct DirectDiagnosticsCounters {
     incoming_signature_failed: AtomicU64,
     incoming_trust_rejected: AtomicU64,
     incoming_dropped_revoked: AtomicU64,
+    incoming_dropped_expired: AtomicU64,
     incoming_typed_route_dropped: AtomicU64,
     incoming_delivered_to_subscribe: AtomicU64,
     subscriber_channel_lagged: AtomicU64,
@@ -533,6 +534,11 @@ pub struct DmDiagnosticsStats {
     /// Non-zero means a revoked peer is still attempting to communicate.
     #[serde(default)]
     pub incoming_dropped_revoked: u64,
+    /// DMs dropped because the sender's cached agent certificate has expired
+    /// past `not_after` (issue #191 runtime expiry gate). Non-zero means an
+    /// expired peer is still attempting to communicate on a live connection.
+    #[serde(default)]
+    pub incoming_dropped_expired: u64,
     /// Redundant typed-route gossip-DM fallback hand-offs dropped on a full
     /// route channel (non-zero ⇒ a route consumer is lagging). Safe drops —
     /// the primary per-group/store pubsub path still delivers.
@@ -917,6 +923,13 @@ impl DirectMessaging {
             .incoming_dropped_revoked
             .fetch_add(1, Ordering::Relaxed);
     }
+    /// Record a DM dropped because the sender's cached cert has expired
+    /// (issue #191 runtime expiry gate).
+    pub(crate) fn record_incoming_dropped_expired(&self) {
+        self.diagnostics
+            .incoming_dropped_expired
+            .fetch_add(1, Ordering::Relaxed);
+    }
 
     /// Record a DM trust-policy rejection.
     pub(crate) fn record_incoming_trust_rejected(&self, agent_id: AgentId) {
@@ -985,6 +998,10 @@ impl DirectMessaging {
             incoming_dropped_revoked: self
                 .diagnostics
                 .incoming_dropped_revoked
+                .load(Ordering::Relaxed),
+            incoming_dropped_expired: self
+                .diagnostics
+                .incoming_dropped_expired
                 .load(Ordering::Relaxed),
             incoming_typed_route_dropped: self
                 .diagnostics

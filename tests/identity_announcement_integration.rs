@@ -413,6 +413,7 @@ fn fake_agent_with_timestamps(announced_at: u64, last_seen: u64) -> DiscoveredAg
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
         cert_not_after: None,
+        agent_certificate: None,
     }
 }
 

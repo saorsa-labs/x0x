@@ -254,6 +254,12 @@ pub struct PubSubManager {
     /// Contact store for trust-based message filtering.
     /// Set via `set_contacts()` after construction.
     contacts: std::sync::OnceLock<Arc<tokio::sync::RwLock<ContactStore>>>,
+    /// Authoritative gossiped revocation set (issue #130 / #191). Runtime-
+    /// injected via `set_revocation_set()` after construction (mirrors
+    /// `contacts`). Delivery consults this BEFORE the operator-local
+    /// ContactStore so a gossiped issuer/agent revocation closes the path
+    /// even before the eviction loop sets `trust = Blocked`.
+    revocation_set: std::sync::OnceLock<Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>,
     /// Drop-detection counters exposed at `GET /diagnostics/gossip`.
     stats: Arc<PubSubStats>,
     /// Subscriber channels for `local:` topics (issue #89). These topics
@@ -342,6 +348,7 @@ impl PubSubManager {
             topic_ref_counts: Arc::new(RwLock::new(HashMap::new())),
             signing,
             contacts: std::sync::OnceLock::new(),
+            revocation_set: std::sync::OnceLock::new(),
             stats: Arc::new(PubSubStats::default()),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -373,6 +380,19 @@ impl PubSubManager {
     /// Calling more than once is a no-op (first caller wins).
     pub fn set_contacts(&self, store: Arc<tokio::sync::RwLock<ContactStore>>) {
         let _ = self.contacts.set(store);
+    }
+    /// Attach the authoritative gossiped revocation set (issue #191).
+    ///
+    /// When set, payloads delivered via the subscribe path whose sender is in
+    /// the revocation set are dropped before reaching subscribers — closing
+    /// the window between a gossiped revocation arriving and the eviction
+    /// loop setting `trust = Blocked`. Call once after construction; a second
+    /// call is a no-op (first caller wins), matching `set_contacts`.
+    pub fn set_revocation_set(
+        &self,
+        set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    ) {
+        let _ = self.revocation_set.set(set);
     }
 
     /// Subscribe to a topic.
@@ -422,6 +442,7 @@ impl PubSubManager {
         tokio::task::yield_now().await;
         let (tx, rx) = mpsc::channel(10_000);
         let contacts = self.contacts.get().cloned();
+        let revocation_set = self.revocation_set.get().cloned();
 
         {
             let mut counts = self.topic_ref_counts.write().await;
@@ -438,7 +459,12 @@ impl PubSubManager {
                     payload_len = encoded_payload.len(),
                     "[4/6 pubsub] received from PlumTree, decoding"
                 );
-                let Some(message) = decode_for_delivery(encoded_payload, contacts.as_ref()).await
+                let Some(message) = decode_for_delivery(
+                    encoded_payload,
+                    contacts.as_ref(),
+                    revocation_set.as_ref(),
+                )
+                .await
                 else {
                     stats.incoming_decode_failed.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
@@ -709,9 +735,15 @@ impl PubSubManager {
 }
 
 /// Decode and filter a delivered payload before exposing it to x0x subscribers.
+///
+/// Revocation is checked against the authoritative gossiped `RevocationSet`
+/// (issue #191) before the operator-local `ContactStore`, so a gossiped
+/// issuer/agent revocation closes delivery even before the eviction loop sets
+/// `trust = Blocked`.
 async fn decode_for_delivery(
     encoded_payload: Bytes,
-    contacts: Option<&Arc<tokio::sync::RwLock<ContactStore>>>,
+    contacts: Option<&Arc<RwLock<ContactStore>>>,
+    revocation_set: Option<&Arc<RwLock<crate::revocation::RevocationSet>>>,
 ) -> Option<PubSubMessage> {
     let mut message = match decode_auto(encoded_payload) {
         Ok(msg) => msg,
@@ -728,6 +760,19 @@ async fn decode_for_delivery(
             message.sender
         );
         return None;
+    }
+    // Authoritative gossiped revocation set (issue #191). Checked before the
+    // ContactStore below, which is operator-local only — without this a
+    // gossiped revocation reaches delivery only once the eviction loop has
+    // set trust = Blocked (a race reopens it).
+    if let (Some(rev_set), Some(sender)) = (revocation_set, message.sender) {
+        if rev_set.read().await.is_agent_revoked(&sender) {
+            tracing::debug!(
+                "Dropping delivered payload from revoked sender {} (RevocationSet)",
+                sender
+            );
+            return None;
+        }
     }
 
     if let (Some(store), Some(sender)) = (contacts, message.sender) {
@@ -1371,6 +1416,82 @@ mod tests {
         assert_eq!(msg.payload, payload);
         assert_eq!(msg.sender, Some(ctx.agent_id));
         assert!(msg.verified);
+    }
+
+    /// Issue #191 gap 3: pubsub delivery must consult the authoritative
+    /// gossiped `RevocationSet`, not just the operator-local ContactStore.
+    /// Pre-fix `decode_for_delivery` never checked `RevocationSet`, so a
+    /// gossiped revocation reached delivery only once the eviction loop had
+    /// set `trust = Blocked` — a race (revocation received, eviction not yet
+    /// run) or a later `set_trust` off Blocked reopened delivery from the
+    /// revoked sender. Here a verified v2 payload from a RevocationSet-
+    /// revoked sender is dropped; a non-revoked sender is delivered.
+    #[tokio::test]
+    async fn decode_for_delivery_drops_revoked_sender_via_revocation_set() {
+        // Build a RevocationSet holding a self-revoked agent (the sender).
+        let kp = AgentKeypair::generate().expect("keygen");
+        let ctx = SigningContext::from_keypair(&kp);
+        let revoked_agent = ctx.agent_id;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(revoked_agent),
+            kp.public_key(),
+            kp.secret_key(),
+            now,
+            None,
+        )
+        .expect("sign revocation");
+        let mut set = crate::revocation::RevocationSet::new();
+        set.verify_and_insert(record, None)
+            .expect("self-revocation verifies without a cert");
+        let rev_set = std::sync::Arc::new(tokio::sync::RwLock::new(set));
+
+        let topic = "chat";
+        let payload = Bytes::from("hello");
+        // A verified v2 payload signed by the (now-revoked) sender.
+        let signing_payload =
+            build_signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload);
+        let signature = ctx.sign(&signing_payload).expect("sign message");
+        let encoded = encode_v2(
+            &ctx.agent_id,
+            &ctx.public_key_bytes,
+            &signature,
+            topic,
+            &payload,
+        )
+        .expect("encode");
+
+        // contacts = None isolates the RevocationSet check. The payload's
+        // signature verifies, but the sender is revoked → dropped.
+        assert!(
+            decode_for_delivery(encoded.clone(), None, Some(&rev_set))
+                .await
+                .is_none(),
+            "payload from a RevocationSet-revoked sender must be dropped"
+        );
+
+        // A non-revoked sender (different agent) is delivered.
+        let other = AgentKeypair::generate().expect("keygen2");
+        let other_ctx = SigningContext::from_keypair(&other);
+        let sp2 = build_signing_payload(other_ctx.agent_id.as_bytes(), topic.as_bytes(), &payload);
+        let sig2 = other_ctx.sign(&sp2).expect("sign2");
+        let encoded2 = encode_v2(
+            &other_ctx.agent_id,
+            &other_ctx.public_key_bytes,
+            &sig2,
+            topic,
+            &payload,
+        )
+        .expect("encode2");
+        assert!(
+            decode_for_delivery(encoded2, None, Some(&rev_set))
+                .await
+                .is_some(),
+            "payload from a non-revoked sender must be delivered"
+        );
     }
 
     #[test]

@@ -1307,6 +1307,14 @@ pub struct DiscoveredAgent {
     /// identity announcement, if any.  `None` means the cert carries no
     /// expiry — the agent is considered valid indefinitely.
     pub cert_not_after: Option<u64>,
+    /// The agent certificate embedded in the identity announcement, if any.
+    ///
+    /// Retained so a gossiped **issuer-revocation** (a user un-vouching this
+    /// agent) can be authority-verified on receipt: `verify_authority` for an
+    /// issuer-revocation requires the subject cert (issue #191). `None` for
+    /// pre-#130 peers that announce no cert, and for machine/rendezvous-only
+    /// cache entries.
+    pub agent_certificate: Option<identity::AgentCertificate>,
 }
 
 /// Cached machine endpoint data derived from signed machine announcements.
@@ -1340,6 +1348,29 @@ pub struct DiscoveredMachine {
     /// Human identities currently linked to this machine by consented agent
     /// announcements.
     pub user_ids: Vec<identity::UserId>,
+}
+
+/// Build a `subject AgentId → AgentCertificate` lookup from the discovery
+/// cache, used to authority-verify gossiped **issuer-revocations** (a user
+/// un-vouching a certified agent) on receipt (issue #191).
+///
+/// `verify_authority` for an issuer-revocation requires the subject agent's
+/// certificate; self-revocations and machine-revocations need none. Only
+/// entries that actually carry a cert contribute; entries without one
+/// (pre-#130 peers, machine/rendezvous-only entries) are absent, so an
+/// issuer-revocation for such a subject is rejected fail-closed by the
+/// caller — the cert must have been announced first (EP1).
+fn collect_subject_certs(
+    cache: &std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+) -> std::collections::HashMap<identity::AgentId, identity::AgentCertificate> {
+    cache
+        .values()
+        .filter_map(|a| {
+            a.agent_certificate
+                .as_ref()
+                .map(|c| (a.agent_id, c.clone()))
+        })
+        .collect()
 }
 
 impl DiscoveredMachine {
@@ -2080,6 +2111,7 @@ impl HeartbeatContext {
             reachable_via: announcement.reachable_via.clone(),
             relay_candidates: announcement.relay_candidates.clone(),
             cert_not_after: None,
+            agent_certificate: None,
         };
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
         upsert_discovered_agent(&self.cache, discovered_agent).await;
@@ -4997,7 +5029,13 @@ impl Agent {
     /// Without a contact store, all messages pass through (open relay mode).
     pub fn set_contacts(&self, store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>) {
         if let Some(runtime) = &self.gossip_runtime {
-            runtime.pubsub().set_contacts(store);
+            let pubsub = runtime.pubsub();
+            pubsub.set_contacts(store);
+            // Thread the authoritative gossiped RevocationSet into pub/sub
+            // delivery so a gossiped revocation closes the subscribe path
+            // (issue #191 gap 3). Wired here so every runtime that sets
+            // contacts also sets revocation — they share the same lifecycle.
+            pubsub.set_revocation_set(self.revocation_set());
         }
     }
 
@@ -5249,6 +5287,7 @@ impl Agent {
             reachable_via: announcement.reachable_via.clone(),
             relay_candidates: announcement.relay_candidates.clone(),
             cert_not_after: None,
+            agent_certificate: None,
         };
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &discovered_agent)
             .await;
@@ -5940,13 +5979,30 @@ impl Agent {
                                 }
                             };
                         let mut newly_inserted = Vec::new();
+                        // Resolve subject certificates from the discovery cache
+                        // so gossiped issuer-revocations (a user un-vouching a
+                        // certified agent) can be authority-verified on receipt
+                        // (issue #191). `verify_authority` for an issuer-
+                        // revocation requires the subject cert; self/machine
+                        // revocations need none. A cert not in the local cache
+                        // means the issuer-revocation is rejected fail-closed
+                        // — the cert must have been announced first (EP1).
+                        // Built before taking the revocation-set write lock so
+                        // no two identity locks are held at once.
+                        let subject_certs = collect_subject_certs(&*cache.read().await);
                         {
                             let mut set = revocation_set.write().await;
                             for record in records {
                                 if set.contains_hash(&record.record_hash()) {
                                     continue; // already known — skip re-verification
                                 }
-                                match set.verify_and_insert(record.clone(), None) {
+                                let subject_cert = match &record.subject {
+                                    revocation::RevokedSubject::Agent(agent_id) => {
+                                        subject_certs.get(agent_id)
+                                    }
+                                    _ => None,
+                                };
+                                match set.verify_and_insert(record.clone(), subject_cert) {
                                     Ok(true) => newly_inserted.push(record),
                                     Ok(false) => {} // dup
                                     Err(e) => {
@@ -5958,21 +6014,34 @@ impl Agent {
                             }
                         }
                         if !newly_inserted.is_empty() {
-                            // Persist asynchronously — best-effort; if it fails the
-                            // revocation is still enforced in memory for this run.
-                            let set_snap = revocation_set.read().await.all_records();
+                            // Persist asynchronously — best-effort; if it fails
+                            // the revocation is still enforced in memory for this
+                            // run. Snapshot the live set's encoded bytes under a
+                            // brief read lock (issuer-revocations carry their
+                            // authorizing cert in PersistedRevocation, which the
+                            // encoder preserves); the disk write runs off-lock.
+                            // The previous rebuild re-inserted records with
+                            // `None` cert, silently dropping every issuer-
+                            // revocation on save (issue #191).
+                            let persisted_bytes = revocation_set.read().await.to_bytes();
                             let id_dir = identity_dir_for_listener.clone();
                             tokio::spawn(async move {
-                                let tmp = revocation::RevocationSet::new();
-                                let _ = storage::save_revocation_set(&tmp, id_dir.as_deref()).await;
-                                // Rebuild correctly from snapshot.
-                                drop(tmp);
-                                let mut rebuilding = revocation::RevocationSet::new();
-                                for r in set_snap {
-                                    let _ = rebuilding.verify_and_insert(r, None);
-                                }
-                                if let Err(e) = storage::save_revocation_set(&rebuilding, id_dir.as_deref()).await {
-                                    tracing::warn!("failed to persist revocation set: {e}");
+                                match persisted_bytes {
+                                    Ok(bytes) => {
+                                        if let Err(e) = storage::save_revocation_set_bytes(
+                                            bytes,
+                                            id_dir.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                "failed to persist revocation set: {e}"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        "failed to encode revocation set for persistence: {e}"
+                                    ),
                                 }
                             });
                             // Evict revoked subjects from discovery caches.
@@ -6162,6 +6231,7 @@ impl Agent {
                     reachable_via: announcement.reachable_via.clone(),
                     relay_candidates: announcement.relay_candidates.clone(),
                     cert_not_after,
+                    agent_certificate: announcement.agent_certificate.clone(),
                 };
                 upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
                 upsert_discovered_agent(&cache, discovered_agent).await;
@@ -7474,6 +7544,7 @@ impl Agent {
                                     .agent_certificate
                                     .as_ref()
                                     .and_then(|c| c.not_after()),
+                                agent_certificate: ann.agent_certificate.clone(),
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
@@ -7509,6 +7580,7 @@ impl Agent {
                     reachable_via: Vec::new(),
                     relay_candidates: Vec::new(),
                     cert_not_after: None,
+                    agent_certificate: None,
                 },
             )
             .await;
@@ -7916,12 +7988,12 @@ impl Agent {
                 );
 
                 // Verify AgentId→MachineId binding against identity discovery cache.
-                let verified = {
+                let (verified, cert_not_after) = {
                     let cache = discovery_cache.read().await;
                     cache
                         .get(&sender)
-                        .map(|entry| entry.machine_id == machine_id)
-                        .unwrap_or(false)
+                        .map(|entry| (entry.machine_id == machine_id, entry.cert_not_after))
+                        .unwrap_or((false, None))
                 };
 
                 // Evaluate trust for the (AgentId, MachineId) pair.
@@ -7983,6 +8055,25 @@ impl Agent {
                     );
                     continue;
                 }
+                // Enforcement — runtime cert-expiry gate (issue #191). EP1
+                // drops expired announcements at ingest, but a previously
+                // cached entry is never re-checked on the live path; without
+                // this an expired peer stays trusted until TTL eviction. Fail
+                // closed: drop + count, mirroring the revoked EP above.
+                // Absent expiry (None) is fail-open — is_expired returns false
+                // for pre-#130 peers that carry no not_after.
+                if identity::is_expired(cert_not_after, Agent::unix_timestamp_secs()) {
+                    dm.record_incoming_dropped_expired();
+                    tracing::info!(
+                        target: "x0x::direct",
+                        stage = "recv",
+                        sender_prefix = %network::hex_prefix(&sender.0, 4),
+                        machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                        outcome = "drop_expired",
+                        "direct message from sender with expired cert dropped (runtime expiry gate, issue #191)"
+                    );
+                    continue;
+                }
 
                 // Register and mark the sender as connected for future reverse direct sends.
                 dm.mark_connected(sender, machine_id).await;
@@ -8029,13 +8120,20 @@ impl Agent {
         agent_id: &identity::AgentId,
         protocol: streams::StreamProtocol,
     ) -> error::NetworkResult<streams::PeerStream> {
-        let machine_id = {
+        let (machine_id, cert_not_after) = {
             let cache = self.identity_discovery_cache.read().await;
-            cache.get(agent_id).map(|entry| entry.machine_id)
+            cache
+                .get(agent_id)
+                .map(|entry| (entry.machine_id, entry.cert_not_after))
+                .ok_or(error::NetworkError::PeerNotVerified {
+                    agent_id: agent_id.0,
+                })?
         };
-        let machine_id = machine_id.ok_or(error::NetworkError::PeerNotVerified {
-            agent_id: agent_id.0,
-        })?;
+        // Runtime cert-expiry gate (issue #191): EP1 drops expired
+        // announcements at ingest but never re-checks a cached entry on the
+        // live path. Absent expiry (None) is fail-open — is_expired returns
+        // false, preserving compatibility with pre-#130 peers.
+        let expired = identity::is_expired(cert_not_after, Self::unix_timestamp_secs());
 
         let trust_decision = {
             let contacts = self.contact_store.read().await;
@@ -8052,7 +8150,13 @@ impl Agent {
                 revoked.is_machine_revoked(&machine_id),
             )
         };
-        streams::stream_gate(agent_id, trust_decision, revoked_agent, revoked_machine)?;
+        streams::stream_gate(
+            agent_id,
+            trust_decision,
+            revoked_agent,
+            revoked_machine,
+            expired,
+        )?;
 
         let network = self
             .network
@@ -8131,16 +8235,16 @@ impl Agent {
                 // stream (fail-closed, #192). Each lock is taken in its own
                 // scope so no two identity locks are held at once
                 // (evict_revoked_subject takes them in a different order).
-                let agents: Vec<identity::AgentId> = {
+                let agents: Vec<(identity::AgentId, Option<u64>)> = {
                     let cache = discovery_cache.read().await;
-                    let mut found: Vec<identity::AgentId> = cache
+                    let mut found: Vec<(identity::AgentId, Option<u64>)> = cache
                         .values()
                         .filter(|a| a.machine_id == machine_id)
-                        .map(|a| a.agent_id)
+                        .map(|a| (a.agent_id, a.cert_not_after))
                         .collect();
                     // Deterministic order so logging / per-peer concurrency
                     // keying are stable across HashMap iteration orders.
-                    found.sort_by_key(|a| a.0);
+                    found.sort_by_key(|(a, _)| a.0);
                     found
                 };
                 if agents.is_empty() {
@@ -8152,8 +8256,12 @@ impl Agent {
                     );
                     continue;
                 }
+                let now_secs = Agent::unix_timestamp_secs();
                 let mut gate_denied: Option<(identity::AgentId, error::NetworkError)> = None;
-                for agent_id in &agents {
+                for (agent_id, cert_not_after) in &agents {
+                    // Runtime cert-expiry gate (issue #191): a cached entry
+                    // whose cert has expired must be refused on the live path.
+                    let expired = identity::is_expired(*cert_not_after, now_secs);
                     let trust_decision = {
                         let contacts = contact_store.read().await;
                         let evaluator = trust::TrustEvaluator::new(&contacts);
@@ -8174,6 +8282,7 @@ impl Agent {
                         trust_decision,
                         revoked_agent,
                         revoked_machine,
+                        expired,
                     ) {
                         gate_denied = Some((*agent_id, e));
                         break;
@@ -8191,6 +8300,11 @@ impl Agent {
                     );
                     continue;
                 }
+
+                // Gate cleared for every agent — drop the expiry metadata and
+                // keep the ordered agent list for the stream handle.
+                let agents: Vec<identity::AgentId> =
+                    agents.into_iter().map(|(a, _)| a).collect();
 
                 // DISPATCH (DoS hardening, issue #132): the protocol-prefix
                 // read + surfacing run in a per-stream task so a peer that
@@ -11548,6 +11662,93 @@ mod tests {
         );
     }
 
+    /// Issue #191 gap 2: a gossiped **issuer-revocation** (a user un-vouching
+    /// a certified agent) MUST propagate over gossip. The gossip wire carries
+    /// bare `RevocationRecord`s (no certs), so the receiver resolves the
+    /// subject cert from its discovery cache — via `collect_subject_certs`,
+    /// the exact lookup the gossip-receive loop now performs — and passes it
+    /// to `verify_and_insert`. Pre-fix the loop passed `None`, and
+    /// `verify_authority` rejects an issuer-revocation without a cert, so only
+    /// self-revocations ever propagated network-wide.
+    #[test]
+    fn issuer_revocation_propagates_over_gossip_via_cache_cert_lookup() {
+        let user = identity::UserKeypair::generate().unwrap();
+        let issued_agent = identity::AgentKeypair::generate().unwrap();
+        let agent_id = issued_agent.agent_id();
+        // The user vouches for the agent — this cert is what authorizes a
+        // later issuer-revocation (verify_authority checks the issuer key is
+        // the certifying user).
+        let cert = identity::AgentCertificate::issue(&user, &issued_agent).unwrap();
+
+        // Seed the discovery cache exactly as EP1 does on a real announcement:
+        // the cert is retained so a gossiped issuer-revocation can be verified.
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            agent_id,
+            DiscoveredAgent {
+                agent_id,
+                machine_id: identity::MachineId([0u8; 32]),
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: 0,
+                last_seen: 0,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: cert.not_after(),
+                agent_certificate: Some(cert.clone()),
+            },
+        );
+
+        // The gossip-receive path resolves subject certs from the cache.
+        let subject_certs = collect_subject_certs(&cache);
+        let looked_up = subject_certs
+            .get(&agent_id)
+            .expect("the cache lookup must find the subject cert");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // The user revokes the agent it vouched for (issuer-revocation).
+        let record = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Agent(agent_id),
+            user.public_key(),
+            user.secret_key(),
+            now,
+            Some("issuer revokes compromised agent".to_string()),
+        )
+        .unwrap();
+
+        // With the cache-resolved cert, the issuer-revocation verifies +
+        // inserts (the post-fix gossip behavior).
+        let mut set = revocation::RevocationSet::new();
+        assert!(
+            set.verify_and_insert(record.clone(), Some(looked_up))
+                .unwrap(),
+            "issuer-revocation must verify and insert with the cache-resolved cert"
+        );
+        assert!(
+            set.is_agent_revoked(&agent_id),
+            "the agent must now be revoked network-wide"
+        );
+
+        // Pre-fix proof: without the cert (the old `None` gossip path), an
+        // issuer-revocation is REJECTED by verify_authority — which is exactly
+        // why issuer-revocations were inert over gossip before this fix.
+        assert!(
+            revocation::RevocationSet::new()
+                .verify_and_insert(record, None)
+                .is_err(),
+            "an issuer-revocation must be rejected without the subject cert \
+             (the pre-fix gossip behavior this closes)"
+        );
+    }
+
     /// An announcement without NAT fields (as produced by old nodes) should still
     /// deserialise correctly via bincode — new fields are `Option` so `None` (0x00)
     /// is a valid encoding.
@@ -12122,6 +12323,7 @@ fn discovered_agent_fixture(
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
         cert_not_after: None,
+        agent_certificate: None,
     }
 }
 

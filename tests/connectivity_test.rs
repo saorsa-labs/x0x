@@ -54,6 +54,7 @@ fn fake_discovered(
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
         cert_not_after: None,
+        agent_certificate: None,
     }
 }
 

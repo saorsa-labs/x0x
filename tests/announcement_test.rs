@@ -409,6 +409,7 @@ async fn discovery_cache_insert_and_retrieve() {
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
         cert_not_after: None,
+        agent_certificate: None,
     };
 
     agent
@@ -457,6 +458,7 @@ async fn reachability_info_from_discovery_cache() {
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
         cert_not_after: None,
+        agent_certificate: None,
     };
 
     agent.insert_discovered_agent_for_testing(fake).await;

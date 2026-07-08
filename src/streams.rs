@@ -98,28 +98,41 @@ impl StreamAccept {
 
 /// Identity gate decision shared by the outbound open and inbound accept
 /// paths (issue #132 T1). Pure function of the resolved inputs so the whole
-/// verified/trust/revoked matrix is fast unit-testable without a network.
+/// verified/trust/revoked/expired matrix is fast unit-testable without a
+/// network.
 ///
-/// Callers resolve `(trust_decision, revoked_agent, revoked_machine)` from the
-/// discovery cache / contact store / revocation set first; a missing identity
-/// (unknown agent or machine) is surfaced as [`NetworkError::PeerNotVerified`]
+/// Callers resolve `(trust_decision, revoked_agent, revoked_machine, expired)`
+/// from the discovery cache / contact store / revocation set first; a missing
+/// identity (unknown agent or machine) is surfaced as [`NetworkError::PeerNotVerified`]
 /// by the caller before reaching this helper.
 ///
 /// # Gate order (do not reorder — security property)
 /// 1. revoked (agent OR machine) ⇒ [`NetworkError::PeerRevoked`]. Revocation
 ///    is positive knowledge of compromise and supersedes trust; checking it
 ///    first also avoids revealing trust state to a revoked peer.
-/// 2. `trust_decision != Some(Accept)` ⇒ [`NetworkError::PeerTrustRejected`].
+/// 2. `expired` (cached `cert_not_after` past expiry + skew) ⇒
+///    [`NetworkError::PeerNotVerified`]. EP1 drops expired announcements at
+///    ingest, but a previously-cached entry is never re-checked on the live
+///    path; without this an expired peer stays trusted until TTL eviction
+///    (issue #191). Absent expiry (`cert_not_after == None`, pre-#130 peers)
+///    is fail-open — callers pass `expired == false`.
+/// 3. `trust_decision != Some(Accept)` ⇒ [`NetworkError::PeerTrustRejected`].
 ///    Mirrors exec + the connect gate: `AcceptWithFlag` and `None` both deny.
 pub(crate) fn stream_gate(
     agent_id: &crate::identity::AgentId,
     trust_decision: Option<crate::trust::TrustDecision>,
     revoked_agent: bool,
     revoked_machine: bool,
+    expired: bool,
 ) -> NetworkResult<()> {
     use crate::trust::TrustDecision;
     if revoked_agent || revoked_machine {
         return Err(NetworkError::PeerRevoked {
+            agent_id: agent_id.0,
+        });
+    }
+    if expired {
+        return Err(NetworkError::PeerNotVerified {
             agent_id: agent_id.0,
         });
     }
@@ -338,22 +351,22 @@ mod tests {
         let reject = Some(TrustDecision::RejectBlocked);
 
         // Happy path: trusted + clean.
-        assert!(stream_gate(&agent, accept, false, false).is_ok());
+        assert!(stream_gate(&agent, accept, false, false, false).is_ok());
 
         // Revocation supersedes trust — even an Accept+trusted peer is refused,
         // and the error is PeerRevoked regardless of trust.
         assert!(matches!(
-            stream_gate(&agent, accept, true, false),
+            stream_gate(&agent, accept, true, false, false),
             Err(NetworkError::PeerRevoked { agent_id }) if agent_id == agent.0
         ));
         assert!(matches!(
-            stream_gate(&agent, accept, false, true),
+            stream_gate(&agent, accept, false, true, false),
             Err(NetworkError::PeerRevoked { .. })
         ));
         // A revoked + untrusted peer surfaces PeerRevoked, NOT the trust
         // reason (no trust-state leak to a compromised key).
         assert!(matches!(
-            stream_gate(&agent, reject, true, false),
+            stream_gate(&agent, reject, true, false, false),
             Err(NetworkError::PeerRevoked { .. })
         ));
 
@@ -361,11 +374,44 @@ mod tests {
         for decision in [accept_with_flag, reject, None] {
             assert!(
                 matches!(
-                    stream_gate(&agent, decision, false, false),
+                    stream_gate(&agent, decision, false, false, false),
                     Err(NetworkError::PeerTrustRejected { agent_id }) if agent_id == agent.0
                 ),
                 "decision {decision:?} must deny (only plain Accept passes)"
             );
         }
+    }
+    // Issue #191 gap 1: a cached peer whose agent certificate has expired
+    // past `not_after` MUST be refused at the runtime stream gate, even when
+    // it is trusted (Accept) and not revoked. Pre-fix `stream_gate` took no
+    // expiry input and returned `Ok` for this case — an expired peer stayed
+    // trusted until TTL eviction. Absent expiry (None → caller passes
+    // `expired == false`) stays fail-open for pre-#130 peers.
+    #[test]
+    fn stream_gate_rejects_expired_cert() {
+        use crate::error::NetworkError;
+        use crate::identity::AgentId;
+        use crate::trust::TrustDecision;
+
+        let agent = AgentId([9u8; 32]);
+        let accept = Some(TrustDecision::Accept);
+
+        // Expired + trusted + clean ⇒ denied as PeerNotVerified (the binding
+        // is no longer trustworthy once its cert has expired).
+        assert!(matches!(
+            stream_gate(&agent, accept, false, false, true),
+            Err(NetworkError::PeerNotVerified { agent_id }) if agent_id == agent.0
+        ));
+
+        // Not expired (present-and-valid, or absent) ⇒ the gate passes for a
+        // trusted, clean peer — fail-open on absent expiry is preserved.
+        assert!(stream_gate(&agent, accept, false, false, false).is_ok());
+
+        // Revocation still supersedes expiry: a revoked-and-expired peer is
+        // reported as PeerRevoked (no trust-state leak, consistent order).
+        assert!(matches!(
+            stream_gate(&agent, accept, true, false, true),
+            Err(NetworkError::PeerRevoked { agent_id }) if agent_id == agent.0
+        ));
     }
 }

@@ -85,6 +85,7 @@ fn discovered_agent(agent: &Agent, addr: std::net::SocketAddr, now_secs: u64) ->
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
         cert_not_after: None,
+        agent_certificate: None,
     }
 }
 

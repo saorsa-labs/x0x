@@ -700,6 +700,23 @@ pub async fn save_revocation_set(set: &RevocationSet, identity_dir: Option<&Path
     write_private_file(&path, bytes).await
 }
 
+/// Persist pre-encoded revocation-set bytes to disk (issue #191).
+///
+/// Companion to [`save_revocation_set`] for the gossip-receive path, which
+/// snapshots the live set's [`to_bytes`](RevocationSet::to_bytes) output under
+/// a brief read lock and writes it off-lock. This preserves issuer-
+/// revocations' authorizing certificates (carried in `PersistedRevocation`)
+/// — the previous rebuild re-inserted records with `None` cert and silently
+/// dropped every issuer-revocation on save.
+pub async fn save_revocation_set_bytes(bytes: Vec<u8>, identity_dir: Option<&Path>) -> Result<()> {
+    let Some(path) = revocation_path(identity_dir) else {
+        return Err(IdentityError::Storage(std::io::Error::other(
+            "no home directory and no identity_dir — cannot persist revocations",
+        )));
+    };
+    write_private_file(&path, bytes).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

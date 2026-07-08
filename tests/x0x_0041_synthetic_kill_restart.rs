@@ -254,6 +254,7 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
         cert_not_after: None,
+        agent_certificate: None,
     };
     alice.insert_discovered_agent_for_testing(bob_card).await;
     alice
@@ -278,6 +279,7 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
         cert_not_after: None,
+        agent_certificate: None,
     };
     bob.insert_discovered_agent_for_testing(alice_card).await;
 
