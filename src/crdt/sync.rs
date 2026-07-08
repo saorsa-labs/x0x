@@ -345,6 +345,8 @@ mod tests {
     use super::*;
     use crate::crdt::{TaskId, TaskItem, TaskListId, TaskMetadata};
     use crate::identity::AgentId;
+    use crate::network::{NetworkConfig, NetworkNode};
+    use std::time::Duration;
 
     fn agent(n: u8) -> AgentId {
         AgentId([n; 32])
@@ -369,6 +371,37 @@ mod tests {
             1000,
         );
         TaskItem::new(task_id, metadata, peer)
+    }
+
+    /// Construct an isolated network node (mirrors the helper in
+    /// `src/gossip/pubsub.rs` tests). `PubSubManager` is fully constructable
+    /// in tests, so `TaskListSync` is testable end-to-end without a live mesh.
+    async fn make_node() -> Arc<NetworkNode> {
+        Arc::new(
+            NetworkNode::new(NetworkConfig::default(), None, None)
+                .await
+                .expect("network node"),
+        )
+    }
+
+    /// Build a `TaskListSync` around a fresh node + pubsub, with
+    /// `local_peer_id = peer(1)` and list id `list_id(1)`.
+    async fn make_sync(topic: &str) -> TaskListSync {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        TaskListSync::new(list, pubsub, topic.to_string(), peer(1)).expect("task list sync")
+    }
+
+    /// Build a `TaskListSync` that shares its pubsub with the caller (so the
+    /// caller can subscribe before the sync publishes).
+    async fn make_sync_with_pubsub(topic: &str) -> (TaskListSync, Arc<PubSubManager>) {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        let sync = TaskListSync::new(list, Arc::clone(&pubsub), topic.to_string(), peer(1))
+            .expect("task list sync");
+        (sync, pubsub)
     }
 
     #[tokio::test]
@@ -441,5 +474,206 @@ mod tests {
         // Verify update
         let list = task_list_arc.read().await;
         assert_eq!(list.name(), "Updated");
+    }
+
+    // ------------------------------------------------------------------
+    // new() / topic() / read() / write()
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn new_sets_topic_and_yields_accessible_guards() {
+        let sync = make_sync("tasks/A").await;
+
+        // topic() reports exactly the topic handed to new().
+        assert_eq!(sync.topic(), "tasks/A");
+
+        // read() exposes the underlying list unchanged.
+        {
+            let list = sync.read().await;
+            assert_eq!(list.name(), "Test List");
+            assert_eq!(list.task_count(), 0);
+        }
+
+        // write() returns a mutable guard; verify it is usable by renaming
+        // the list, then observe the rename via read().
+        {
+            let mut list = sync.write().await;
+            list.update_name("Renamed".to_string(), peer(1));
+        }
+        let list = sync.read().await;
+        assert_eq!(list.name(), "Renamed", "write-guard rename must be visible");
+    }
+
+    // ------------------------------------------------------------------
+    // state_sync_topic() (private helper exercised from the test module)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn state_sync_topic_appends_side_channel_suffix() {
+        let sync = make_sync("tasks/B").await;
+        // The private helper forms the side channel by appending the suffix.
+        assert_eq!(sync.state_sync_topic(), "tasks/B/state-sync");
+
+        // Suffix is appended exactly once, regardless of slashes in topic.
+        let sync2 = make_sync("tasks/B/nested").await;
+        assert_eq!(sync2.state_sync_topic(), "tasks/B/nested/state-sync");
+    }
+
+    // ------------------------------------------------------------------
+    // apply_remote_delta(): direct (off-wire) merge into the local list
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn apply_remote_delta_merges_task_into_list() {
+        let sync = make_sync("tasks/C").await;
+
+        // Start empty.
+        assert_eq!(sync.read().await.task_count(), 0);
+
+        // Build a delta carrying one task authored by peer(2).
+        let remote = peer(2);
+        let task = make_task(7, remote);
+        let task_id = *task.id();
+        let mut delta = TaskListDelta::new(1);
+        delta.added_tasks.insert(task_id, (task, (remote, 1)));
+
+        sync.apply_remote_delta(remote, delta)
+            .await
+            .expect("apply_remote_delta");
+
+        // The task must be present and retrievable by id.
+        let list = sync.read().await;
+        assert_eq!(list.task_count(), 1, "merged task must bump the count");
+        assert!(
+            list.get_task(&task_id).is_some(),
+            "merged task must be retrievable by id"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // publish_delta(): wire round-trip observed by a subscriber
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_delta_delivers_encoded_pair_to_subscriber() {
+        let (sync, pubsub) = make_sync_with_pubsub("tasks/D").await;
+
+        // Subscribe to the main topic BEFORE publishing so we observe the
+        // exact bytes TaskListSync places on the wire.
+        let mut sub = pubsub.subscribe("tasks/D".to_string()).await;
+
+        let sender = peer(7);
+        let task = make_task(3, sender);
+        let task_id = *task.id();
+        let mut delta = TaskListDelta::new(9);
+        delta.added_tasks.insert(task_id, (task, (sender, 3)));
+
+        sync.publish_delta(sender, delta)
+            .await
+            .expect("publish_delta");
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("timed out waiting for published delta")
+            .expect("subscriber stream closed");
+
+        // The published payload must decode back to the (sender, delta) pair
+        // that publish_delta encoded — proving the wire format is correct.
+        let (observed_sender, observed_delta) =
+            decode_delta::<TaskListDelta>(&msg.payload).expect("wire decode");
+        assert_eq!(observed_sender, sender);
+        assert_eq!(observed_delta.version, 9);
+        assert!(
+            observed_delta.added_tasks.contains_key(&task_id),
+            "published delta must carry the task"
+        );
+        assert_eq!(msg.topic, "tasks/D");
+    }
+
+    // ------------------------------------------------------------------
+    // start_with_spawner(): custom spawner path (documented smoke test)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn start_with_spawner_accepts_custom_spawner_and_returns_ok() {
+        // Unique value vs `start_default_spawner_merges_remote_delta`: this
+        // routes the background futures through a *custom* (non-`tokio::spawn`)
+        // spawner closure — a drop-spawner — exercising that generic code path
+        // and asserting `start_with_spawner` returns `Ok` without panicking.
+        //
+        // It deliberately does NOT assert that a subscription or merge
+        // occurred: a drop-spawner makes subscription unobservable, so this
+        // would still pass against a no-op `Ok(())` impl. The real
+        // subscribe->merge behaviour is asserted end-to-end by
+        // `start_default_spawner_merges_remote_delta`, which drives
+        // `start_with_spawner(tokio::spawn)` and verifies the task lands.
+        let sync = make_sync("tasks/E").await;
+        sync.start_with_spawner(|_fut| {
+            // intentionally drop the future
+        })
+        .await
+        .expect("start_with_spawner");
+    }
+
+    // ------------------------------------------------------------------
+    // start(): default spawner merges a remotely-published delta
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn start_default_spawner_merges_remote_delta() {
+        // End-to-end exercise of the delta-merge listener: a delta published
+        // on the topic is received by the background loop spawned by start()
+        // and merged into the local list. TaskList::merge_delta takes no
+        // writer identity, so an unsigned (anonymous-sender) publish — what
+        // the wire delivers via a PubSubManager with no signing context —
+        // merges without any access-control consideration.
+        let sync = make_sync("tasks/F").await;
+
+        sync.start().await.expect("start");
+
+        // Let the spawned subscribe-forwarder register before we publish.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let remote = peer(2);
+        let task = make_task(5, remote);
+        let task_id = *task.id();
+        let mut delta = TaskListDelta::new(1);
+        delta.added_tasks.insert(task_id, (task, (remote, 1)));
+        sync.publish_delta(remote, delta).await.expect("publish");
+
+        // The merge is asynchronous; poll the list until the task lands.
+        let landed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let count = sync.read().await.task_count();
+                if count == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            landed.is_ok(),
+            "remote delta was not merged by start() loop"
+        );
+        // Confirm it's the right task, not just any count bump.
+        assert!(
+            sync.read().await.get_task(&task_id).is_some(),
+            "merged task must be retrievable by id"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // stop(): returns Ok and is idempotent
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stop_returns_ok_and_is_idempotent() {
+        let sync = make_sync("tasks/G").await;
+        sync.stop().await.expect("first stop");
+        // stop() unsubscribes both the main and the state-sync topic;
+        // unsubscribe is infallible and tolerant of already-removed topics,
+        // so a second stop() must remain Ok.
+        sync.stop().await.expect("second stop (idempotent)");
     }
 }
