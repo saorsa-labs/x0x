@@ -1357,7 +1357,7 @@ pub struct NetworkNode {
     /// Handles to the background tasks spawned at construction (receiver, accept
     /// loop, connection-pool eviction).
     ///
-    /// Tracked so [`shutdown`] can abort them: the receiver and accept loops park
+    /// Tracked so `shutdown` can abort them: the receiver and accept loops park
     /// in `node.recv()/accept().await` while holding a *read* guard on `node`, so
     /// they must be aborted before `shutdown` can take the *write* lock to drop
     /// the node. Without this, `shutdown` would deadlock on an idle node that
