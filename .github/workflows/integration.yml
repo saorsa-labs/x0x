@@ -75,9 +75,24 @@ jobs:
             --test proptest_presence --test proptest_trust \
             -E 'binary(proptest_connectivity) | binary(proptest_crdt) | binary(proptest_files) | binary(proptest_groups) | binary(proptest_kv) | binary(proptest_mls) | binary(proptest_presence) | binary(proptest_trust) | test(/^proptest_/) | test(/proptest/)'
 
-  # ── Integration tests (every PR, ~10min) ──────────────────────────────
-  integration:
-    name: Multi-Agent Integration
+  # ── Integration tests — split into parallel jobs (issue #197) ──────────
+  #    The old monolithic `integration` job ran ~10 suites sequentially
+  #    under a single 20-min ceiling and was structurally canceled at the
+  #    wall-clock limit on every PR, despite all tests passing. It is now
+  #    four jobs: three run in parallel on every PR (core + groups + net),
+  #    and the de-flaked timing suites run only on the weekly schedule
+  #    (mirroring the soak job's gating). Budgets assume a COLD rust-cache
+  #    — new job names get fresh cache keys, so the first run pays the full
+  #    release build; each PR job is capped at timeout-minutes: 20 and kept
+  #    light enough to clear it with headroom. No suite is dropped —
+  #    coverage is redistributed, not removed.
+  #    --build-jobs 2 is intentionally omitted here: each nextest call
+  #    targets a single test binary, so there's no parallel-linking OOM
+  #    risk (unlike the proptest job, which links 8 binaries in one call).
+
+  # Core: daemon API + D4 signed-commit suites (light load).
+  integration-core:
+    name: Integration (core)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -94,14 +109,61 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: Build release binaries
+      - name: Build release binaries (shared across suites)
         run: cargo build --release --bin x0xd --bin x0x
       - name: Run daemon API integration tests
         run: cargo nextest run --all-features --test daemon_api_integration -- --ignored
-      - name: Run named group integration tests
-        run: cargo nextest run --all-features --test named_group_integration --run-ignored ignored-only
       - name: Run named group D4 signed commit integration tests
         run: cargo nextest run --all-features --test named_group_d4_apply -- --ignored
+
+  # Groups: the heavy named-group daemon suite (28 daemon-backed tests),
+  # isolated on its own runner so it cannot stack on core's cold build.
+  # See issue #197: core was cancelled at its budget when this suite rode
+  # the same job as the release build on a cold rust-cache.
+  integration-groups:
+    name: Integration (groups)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Build release binaries (shared across suites)
+        run: cargo build --release --bin x0xd --bin x0x
+      - name: Run named group integration tests
+        run: cargo nextest run --all-features --test named_group_integration --run-ignored ignored-only
+
+  # Net: GUI smoke + WebSocket + kv bootstrap + local-topic routing.
+  integration-net:
+    name: Integration (net)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Build release binaries (shared across suites)
+        run: cargo build --release --bin x0xd --bin x0x
       - name: Run GUI smoke tests
         run: cargo nextest run --all-features --test gui_smoke
       - name: Run WebSocket tests
@@ -110,10 +172,35 @@ jobs:
         run: cargo nextest run --all-features --test kv_first_join_bootstrap --test-threads 1 -- --ignored
       - name: Run local-topic routing tests (issue 89)
         run: cargo nextest run --all-features --test local_topics --test-threads 1 -- --ignored
-      # ── Daemon-backed timing tests de-flaked out of the always-on Test
-      #    Suite (ci.yml). They run here so coverage is preserved without
-      #    gating every PR on convergence/jitter-prone budgets. None of
-      #    these is a required status check.
+
+  # ── De-flaked timing suites moved off the PR path (issue #197).
+  #    These are convergence/jitter-prone budgets (the join-metadata suite
+  #    alone is ~20-25 s ×7 ≈ 3 min) that previously inflated the
+  #    monolithic integration job past its 20-min PR ceiling. Coverage is
+  #    preserved by running them on the weekly schedule, mirroring the
+  #    soak job's `if: github.event_name == 'schedule'` gating. None is a
+  #    required status check, so this stays advisory.
+  integration-timing:
+    name: Integration Timing Suites (weekly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Build release binaries (shared across suites)
+        run: cargo build --release --bin x0xd --bin x0x
       - name: Run peer-lifecycle daemon tests (de-flaked, ignored-only)
         run: cargo nextest run --all-features --test peer_lifecycle_integration --run-ignored ignored-only
       - name: Run x0x_0041 reissue timing test (de-flaked, ignored-only)
