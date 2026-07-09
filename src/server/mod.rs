@@ -932,6 +932,7 @@ pub async fn serve_with_options(
             Arc::clone(&agent),
             Arc::new(connect_policy.clone()),
             Arc::clone(&connect_diagnostics),
+            config.forward.require_attestation,
         ));
         fs.spawn_inbound();
         Some(fs)

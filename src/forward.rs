@@ -140,11 +140,20 @@ impl ForwardHeader {
 
 /// Domain separator for ForwardV2 attestation signatures (#204).
 ///
-/// Prevents a signature from being replayed across protocol contexts — the
-/// signed bytes always begin with this prefix so a signature over a forward
-/// header can never be confused with (or substituted for) an agent-card or
-/// certificate signature.
-const FORWARD_V2_ATTESTATION_DOMAIN: &[u8] = b"x0x-forward-v2-attestation";
+/// Version `.v2` binds `recipient_machine_id` and `issued_at_ms` into the
+/// signed bytes so a captured header cannot be replayed to a different
+/// recipient or after the TTL window. The version suffix ensures old `.v1`
+/// signatures (domain-only, no recipient/timestamp) cannot validate against
+/// the new scope.
+const FORWARD_V2_ATTESTATION_DOMAIN: &[u8] = b"x0x-forward-v2-attestation.v2";
+
+/// Maximum age (milliseconds) of a ForwardV2 attestation before it is
+/// rejected as stale. Bounds the replay window to the same recipient +
+/// target pair within this interval.
+const FORWARD_V2_ATTESTATION_TTL_MS: u64 = 60_000;
+/// Clock-skew allowance (milliseconds): an attestation dated slightly in
+/// the future is accepted to absorb NTP drift between peers.
+const FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS: u64 = 5_000;
 
 /// Forward header with agent attestation (`ForwardV2`, #204).
 ///
@@ -163,6 +172,14 @@ pub struct ForwardV2Header {
     pub target_port: u16,
     /// The opener's agent identity (proves which agent opened the stream).
     pub opener_agent_id: AgentId,
+    /// The recipient's machine identity — binds the attestation to the
+    /// specific peer the opener dialled so a captured header cannot be
+    /// replayed to a different machine.
+    pub recipient_machine_id: MachineId,
+    /// Unix-millisecond timestamp at which the opener created the header.
+    /// The inbound side rejects headers older than `FORWARD_V2_ATTESTATION_TTL_MS`
+    /// or more than `FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS` in the future.
+    pub issued_at_ms: u64,
     /// ML-DSA-65 signature over [`ForwardV2Header::signable_bytes`].
     pub signature: Vec<u8>,
 }
@@ -170,11 +187,18 @@ pub struct ForwardV2Header {
 impl ForwardV2Header {
     /// Build an unsigned V2 header (signature empty — call `sign` to attest).
     #[must_use]
-    pub fn new(target_host: String, target_port: u16, opener_agent_id: AgentId) -> Self {
+    pub fn new(
+        target_host: String,
+        target_port: u16,
+        opener_agent_id: AgentId,
+        recipient_machine_id: MachineId,
+    ) -> Self {
         Self {
             target_host,
             target_port,
             opener_agent_id,
+            recipient_machine_id,
+            issued_at_ms: 0,
             signature: Vec::new(),
         }
     }
@@ -182,11 +206,13 @@ impl ForwardV2Header {
     /// Canonical bytes signed by the opener to produce `signature`.
     ///
     /// Deterministic, domain-prefixed, length-prefixed encoding of every
-    /// semantic field. Excludes `signature` itself. Mirrors the `AgentCard`
-    /// signing scheme (`src/groups/card.rs`) for consistency.
+    /// semantic field **except `signature` itself**. Binds the recipient
+    /// machine and a freshness timestamp so a captured header cannot be
+    /// replayed to a different peer or after the TTL window. Mirrors the
+    /// `AgentCard` signing scheme (`src/groups/card.rs`).
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(128);
+        let mut buf = Vec::with_capacity(160);
         buf.extend_from_slice(FORWARD_V2_ATTESTATION_DOMAIN);
         // length-prefixed target_host
         buf.extend_from_slice(&(self.target_host.len() as u32).to_le_bytes());
@@ -195,6 +221,10 @@ impl ForwardV2Header {
         buf.extend_from_slice(&self.target_port.to_le_bytes());
         // opener_agent_id (fixed 32 bytes)
         buf.extend_from_slice(&self.opener_agent_id.0);
+        // recipient_machine_id (fixed 32 bytes) — scope binding (#204 replay)
+        buf.extend_from_slice(&self.recipient_machine_id.0);
+        // issued_at_ms (u64 LE) — freshness binding (#204 replay)
+        buf.extend_from_slice(&self.issued_at_ms.to_le_bytes());
         buf
     }
 
@@ -207,6 +237,12 @@ impl ForwardV2Header {
     /// # Errors
     /// Returns `ForwardError::AttestationSign` if ML-DSA-65 signing fails.
     pub fn sign(&mut self, keypair: &AgentKeypair) -> Result<(), ForwardError> {
+        // Stamp the freshness timestamp just before signing so it is covered
+        // by the signature.
+        self.issued_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let sig = sign_with_ml_dsa(keypair.secret_key(), &self.signable_bytes())
             .map_err(|e| ForwardError::AttestationSign(format!("{e:?}")))?;
         self.signature = sig.as_bytes().to_vec();
@@ -405,6 +441,16 @@ fn decide_inbound(
     Ok(target)
 }
 
+/// Verification context bundled to keep `decide_inbound_attested` arg-count
+/// under the clippy threshold (#204).
+struct AttestationVerifyCtx {
+    discovery_cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
+    >,
+    contact_store: std::sync::Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
+    now_ms: u64,
+}
+
 /// Inbound gate decision for a `ForwardV2` attested stream (#204).
 ///
 /// The opener has cryptographically proven its identity (the ML-DSA-65
@@ -415,16 +461,24 @@ fn decide_inbound(
 /// its announcement, its key is absent from the cache and the attestation
 /// fails-closed.
 ///
-/// Fail-closed on: agent not in the discovery cache, no cached public key,
-/// agent's cached machine ≠ transport peer, signature/key binding failure,
-/// signature verification failure, or ACL denial.
+/// **Replay protection (#204 must-fix 2):** the signature binds
+/// `recipient_machine_id` and `issued_at_ms`. The verifier checks:
+/// - recipient matches the local (transport-authenticated) machine;
+/// - `issued_at_ms` is within `[now − TTL, now + future-skew]`.
+///
+/// **Trust evaluation (#204 must-fix 3):** the attested agent's real trust
+/// decision is evaluated via `TrustEvaluator` against the contact
+/// store (same pattern as the stream gate). A Blocked-but-announced agent is
+/// denied here.
+///
+/// Fail-closed on: agent not in cache, no cached key, wrong machine,
+/// recipient mismatch, stale/future timestamp, signature failure, trust
+/// rejection, or ACL denial.
 async fn decide_inbound_attested(
     header: &ForwardV2Header,
     policy: &ConnectPolicy,
     peer_machine: &MachineId,
-    discovery_cache: &std::sync::Arc<
-        tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
-    >,
+    ctx: &AttestationVerifyCtx,
 ) -> Result<SocketAddr, ConnectDenialReason> {
     // Resolve the target first (same as V1 — a non-loopback target is
     // refused before the attestation check, so an unverified peer learns
@@ -432,10 +486,38 @@ async fn decide_inbound_attested(
     let target = resolve_loopback_target(&header.target_host, header.target_port)
         .map_err(|_| ConnectDenialReason::TargetNotLoopback)?;
 
+    // ── Replay: recipient scope binding ──────────────────────────────
+    // The header must name THIS machine as the recipient — a header captured
+    // on machine A cannot be replayed to machine B.
+    if header.recipient_machine_id != *peer_machine {
+        return Err(ConnectDenialReason::AttestationFailed);
+    }
+
+    // ── Replay: freshness / TTL ──────────────────────────────────────
+    if header.issued_at_ms == 0 {
+        return Err(ConnectDenialReason::AttestationFailed);
+    }
+    // Stale: older than the TTL window.
+    if ctx.now_ms
+        > header
+            .issued_at_ms
+            .saturating_add(FORWARD_V2_ATTESTATION_TTL_MS)
+    {
+        return Err(ConnectDenialReason::AttestationFailed);
+    }
+    // Future: more than the skew allowance ahead of our clock.
+    if header.issued_at_ms
+        > ctx
+            .now_ms
+            .saturating_add(FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS)
+    {
+        return Err(ConnectDenialReason::AttestationFailed);
+    }
+
     // Look up the opener in the discovery cache. An agent absent from the
     // cache (unannounced or revoked-and-evicted) cannot be attested.
     let cached = {
-        let cache = discovery_cache.read().await;
+        let cache = ctx.discovery_cache.read().await;
         cache.get(&header.opener_agent_id).cloned()
     };
     let agent = cached.ok_or(ConnectDenialReason::AttestationFailed)?;
@@ -456,11 +538,23 @@ async fn decide_inbound_attested(
         .verify_attestation(&agent.agent_public_key)
         .map_err(|_| ConnectDenialReason::AttestationFailed)?;
 
+    // ── Trust evaluation (#204 must-fix 3): evaluate the attested agent's
+    // real trust — NOT a hard-coded Accept. A Blocked-but-announced agent
+    // must be denied here (same pattern as the stream gate).
+    let trust_decision = {
+        let contacts = ctx.contact_store.read().await;
+        let evaluator = crate::trust::TrustEvaluator::new(&contacts);
+        evaluator.evaluate(&crate::trust::TrustContext {
+            agent_id: &header.opener_agent_id,
+            machine_id: peer_machine,
+        })
+    };
+
     // The opener is now cryptographically authenticated: ACL-check that
-    // specific agent (not every agent on the machine).
+    // specific agent with its REAL trust decision.
     evaluate_connect_gate(
         /* verified */ true,
-        Some(TrustDecision::Accept),
+        Some(trust_decision),
         policy,
         &header.opener_agent_id,
         peer_machine,
@@ -543,6 +637,19 @@ impl ForwardDiagnostics {
     }
 }
 
+/// Shared context for the inbound forward handler (#204 must-fix 1: bundles
+/// the service-level Arcs so `handle_inbound` stays under clippy's arg limit).
+pub(crate) struct InboundCtx {
+    pub policy: Arc<ConnectPolicy>,
+    pub connect_diag: Arc<ConnectDiagnostics>,
+    pub fwd_diag: Arc<ForwardDiagnostics>,
+    pub revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    pub discovery_cache:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>>,
+    pub contact_store: Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
+    pub require_attestation: bool,
+}
+
 /// Drive the inbound half of a forward: read the header, run the connect
 /// gate, connect the local loopback target, and bridge the stream to it.
 ///
@@ -550,16 +657,7 @@ impl ForwardDiagnostics {
 /// identity gate). Records allow/deny into `connect_diag` and connect
 /// failures into `fwd_diag`. On any failure the stream is closed (the halves
 /// are dropped) — zero bytes reach the target on a denial.
-pub(crate) async fn handle_inbound(
-    mut stream: PeerStream,
-    policy: Arc<ConnectPolicy>,
-    connect_diag: Arc<ConnectDiagnostics>,
-    fwd_diag: Arc<ForwardDiagnostics>,
-    revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
-    discovery_cache: Arc<
-        tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
-    >,
-) {
+pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
     let agents: Vec<AgentId> = stream.peer_agents().to_vec();
     let machine_id = stream.peer();
     let peer = machine_id;
@@ -573,10 +671,10 @@ pub(crate) async fn handle_inbound(
     // not a bypass — it closes the per-flow stale-authz window. Full
     // mid-stream teardown is a documented Phase-2 item.)
     {
-        let revoked = revocation_set.read().await;
+        let revoked = ctx.revocation_set.read().await;
         let any_agent_revoked = agents.iter().any(|a| revoked.is_agent_revoked(a));
         if any_agent_revoked || revoked.is_machine_revoked(&machine_id) {
-            fwd_diag.record_revoked_mid_flight();
+            ctx.fwd_diag.record_revoked_mid_flight();
             tracing::info!(
                 target: "x0x::forward",
                 agent = %hex::encode(agents[0].as_bytes()),
@@ -613,7 +711,7 @@ pub(crate) async fn handle_inbound(
                         return;
                     }
                     Err(_) => {
-                        fwd_diag.record_header_timeout();
+                        ctx.fwd_diag.record_header_timeout();
                         tracing::info!(
                             target: "x0x::forward",
                             peer = %hex::encode(peer.as_bytes()),
@@ -622,10 +720,19 @@ pub(crate) async fn handle_inbound(
                         return;
                     }
                 };
-            match decide_inbound_attested(&header, &policy, &machine_id, &discovery_cache).await {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let verify_ctx = AttestationVerifyCtx {
+                discovery_cache: Arc::clone(&ctx.discovery_cache),
+                contact_store: Arc::clone(&ctx.contact_store),
+                now_ms,
+            };
+            match decide_inbound_attested(&header, &ctx.policy, &machine_id, &verify_ctx).await {
                 Ok(addr) => addr,
                 Err(reason) => {
-                    connect_diag.record_denied(reason);
+                    ctx.connect_diag.record_denied(reason);
                     let _ = stream
                         .send_mut()
                         .write_all(&encode_response_denied(reason))
@@ -643,7 +750,22 @@ pub(crate) async fn handle_inbound(
             }
         }
         _ => {
-            // ForwardV1: legacy path (#192 multi-agent fail-closed).
+            // ForwardV1: legacy path. When `ctx.require_attestation` is true
+            // (the default), V1 streams are DENIED — the unannounced-agent
+            // window (#204) stays closed. Set `[forward]
+            // ctx.require_attestation = false` to allow V1 for mixed-version
+            // deployments.
+            if ctx.require_attestation {
+                ctx.connect_diag
+                    .record_denied(ConnectDenialReason::AttestationFailed);
+                tracing::info!(
+                    target: "x0x::forward",
+                    peer = %hex::encode(peer.as_bytes()),
+                    "inbound forward v1 denied: attestation required (ctx.require_attestation=true)"
+                );
+                return;
+            }
+            // ctx.require_attestation=false: legacy multi-agent fail-closed (#192).
             let header =
                 match tokio::time::timeout(HEADER_READ_TIMEOUT, read_header(stream.recv_mut()))
                     .await
@@ -659,7 +781,7 @@ pub(crate) async fn handle_inbound(
                         return;
                     }
                     Err(_) => {
-                        fwd_diag.record_header_timeout();
+                        ctx.fwd_diag.record_header_timeout();
                         tracing::info!(
                             target: "x0x::forward",
                             peer = %hex::encode(peer.as_bytes()),
@@ -668,10 +790,10 @@ pub(crate) async fn handle_inbound(
                         return;
                     }
                 };
-            match decide_inbound(&header, &policy, &agents, &machine_id) {
+            match decide_inbound(&header, &ctx.policy, &agents, &machine_id) {
                 Ok(addr) => addr,
                 Err(reason) => {
-                    connect_diag.record_denied(reason);
+                    ctx.connect_diag.record_denied(reason);
                     let _ = stream
                         .send_mut()
                         .write_all(&encode_response_denied(reason))
@@ -694,7 +816,8 @@ pub(crate) async fn handle_inbound(
     // connecting (the gate already enforces it; this keeps the invariant
     // local to the connect call site).
     if !target.ip().is_loopback() {
-        connect_diag.record_denied(ConnectDenialReason::TargetNotLoopback);
+        ctx.connect_diag
+            .record_denied(ConnectDenialReason::TargetNotLoopback);
         let _ = stream
             .send_mut()
             .write_all(&encode_response_denied(
@@ -708,7 +831,7 @@ pub(crate) async fn handle_inbound(
     let local = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
         Ok(Ok(tcp)) => tcp,
         Ok(Err(e)) => {
-            fwd_diag.record_connect_failed();
+            ctx.fwd_diag.record_connect_failed();
             tracing::info!(
                 target: "x0x::forward",
                 peer = %hex::encode(peer.as_bytes()),
@@ -719,7 +842,7 @@ pub(crate) async fn handle_inbound(
             return;
         }
         Err(_) => {
-            fwd_diag.record_connect_failed();
+            ctx.fwd_diag.record_connect_failed();
             tracing::info!(
                 target: "x0x::forward",
                 peer = %hex::encode(peer.as_bytes()),
@@ -732,7 +855,7 @@ pub(crate) async fn handle_inbound(
 
     // Signal connected, then bridge. The connect-allow counter records that
     // the gate admitted this flow.
-    connect_diag.record_allowed();
+    ctx.connect_diag.record_allowed();
     if stream
         .send_mut()
         .write_all(&encode_response_connected())
@@ -829,6 +952,39 @@ async fn write_header_v2<W: tokio::io::AsyncWrite + Unpin>(
         .map_err(|e| NetworkError::StreamError(format!("write forward v2 header: {e}")))
 }
 
+/// Forward (tailnet) configuration, loaded from `[forward]` in the daemon TOML.
+///
+/// `require_attestation` defaults to `true` — inbound ForwardV1 streams are
+/// denied (closes the V1 downgrade path, #204 must-fix 1). Set to `false`
+/// for mixed-version deployments where pre-v0.30 peers must open inbound
+/// forwards.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ForwardConfig {
+    /// When `true` (the default), inbound ForwardV1 streams are denied and
+    /// the outbound path does not fall back to V1. Set `false` to allow V1.
+    #[serde(default = "default_require_attestation")]
+    pub require_attestation: bool,
+}
+
+fn default_require_attestation() -> bool {
+    true
+}
+
+impl Default for ForwardConfig {
+    fn default() -> Self {
+        Self {
+            require_attestation: true,
+        }
+    }
+}
+
+impl ForwardConfig {
+    /// Shorthand for the default-secure config (attestation required).
+    #[must_use]
+    pub fn secure() -> Self {
+        Self::default()
+    }
+}
 // ===========================================================================
 // ForwardService — owns the inbound consumer + outbound local listeners.
 // ===========================================================================
@@ -888,6 +1044,14 @@ pub struct ForwardService {
     /// lookups (#204).
     discovery_cache:
         Arc<tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>>,
+    /// Shared contact store — for trust evaluation of attested agents
+    /// (#204 must-fix 3).
+    contact_store: Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
+    /// When true (the default) inbound ForwardV1 streams are denied and the
+    /// outbound path does not fall back to V1 — closes the V1 downgrade path
+    /// (#204 must-fix 1). Set `[forward] require_attestation = false` in the
+    /// daemon TOML to allow V1 for mixed-version deployments.
+    require_attestation: bool,
 }
 
 /// RAII per-peer slot: decrements the per-peer counter (and prunes the entry
@@ -956,14 +1120,20 @@ fn try_peer_slot(
 
 impl ForwardService {
     /// Construct a forwarder over a loaded connect policy + its diagnostics.
+    ///
+    /// `require_attestation` (default `true`) denies inbound ForwardV1 streams
+    /// and gates the outbound V1 fallback — set `false` for mixed-version
+    /// deployments (#204 must-fix 1).
     #[must_use]
     pub fn new(
         agent: Arc<crate::Agent>,
         policy: Arc<ConnectPolicy>,
         connect_diag: Arc<ConnectDiagnostics>,
+        require_attestation: bool,
     ) -> Self {
         let revocation_set = agent.revocation_set();
         let discovery_cache = agent.identity_discovery_cache();
+        let contact_store = agent.contact_store();
         Self {
             agent,
             policy,
@@ -976,6 +1146,8 @@ impl ForwardService {
             per_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             revocation_set,
             discovery_cache,
+            contact_store,
+            require_attestation,
         }
     }
 
@@ -1047,15 +1219,16 @@ impl ForwardService {
                     let _admission = admission;
                     this.fwd_diag.enter_stream();
                     let _leave = StreamLeaveGuard(Arc::clone(&this.fwd_diag));
-                    handle_inbound(
-                        stream,
-                        Arc::clone(&this.policy),
-                        Arc::clone(&this.connect_diag),
-                        Arc::clone(&this.fwd_diag),
-                        Arc::clone(&this.revocation_set),
-                        Arc::clone(&this.discovery_cache),
-                    )
-                    .await;
+                    let inbound_ctx = InboundCtx {
+                        policy: Arc::clone(&this.policy),
+                        connect_diag: Arc::clone(&this.connect_diag),
+                        fwd_diag: Arc::clone(&this.fwd_diag),
+                        revocation_set: Arc::clone(&this.revocation_set),
+                        discovery_cache: Arc::clone(&this.discovery_cache),
+                        contact_store: Arc::clone(&this.contact_store),
+                        require_attestation: this.require_attestation,
+                    };
+                    handle_inbound(stream, &inbound_ctx).await;
                 });
             }
         });
@@ -1088,6 +1261,7 @@ impl ForwardService {
         let peer_agent = spec.peer_agent;
         let target_host = spec.target_host;
         let target_port = spec.target_port;
+        let require_attestation = self.require_attestation;
         tokio::spawn(async move {
             tracing::info!(
                 target: "x0x::forward",
@@ -1133,7 +1307,15 @@ impl ForwardService {
                     let _admission = admission;
                     fwd_diag.enter_stream();
                     let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
-                    drive_outbound(agent, peer_agent, target_host, target_port, tcp).await;
+                    drive_outbound(
+                        agent,
+                        peer_agent,
+                        target_host,
+                        target_port,
+                        tcp,
+                        require_attestation,
+                    )
+                    .await;
                 });
             }
         });
@@ -1190,18 +1372,29 @@ async fn drive_outbound(
     target_host: String,
     target_port: u16,
     tcp: TcpStream,
+    require_attestation: bool,
 ) {
     // Try ForwardV2 (attestation). On peer rejection (old software), fall
-    // back to ForwardV1 with the same TCP connection.
+    // back to ForwardV1 — but ONLY when require_attestation is false. When
+    // true (the default) there is no fallback: a peer that cannot handle V2
+    // simply cannot forward (#204 must-fix 1).
     match try_outbound_v2(&agent, &peer_agent, &target_host, target_port, tcp).await {
         OutboundOutcome::Done => (),
         OutboundOutcome::PeerRejectedV2(tcp) => {
-            tracing::info!(
-                target: "x0x::forward",
-                peer = %hex::encode(peer_agent.as_bytes()),
-                "outbound forward: peer does not support ForwardV2 — falling back to V1"
-            );
-            drive_outbound_v1(&agent, &peer_agent, &target_host, target_port, tcp).await;
+            if require_attestation {
+                tracing::info!(
+                    target: "x0x::forward",
+                    peer = %hex::encode(peer_agent.as_bytes()),
+                    "outbound forward: peer rejected V2 and require_attestation=true — closing local TCP"
+                );
+            } else {
+                tracing::info!(
+                    target: "x0x::forward",
+                    peer = %hex::encode(peer_agent.as_bytes()),
+                    "outbound forward: peer does not support ForwardV2 — falling back to V1"
+                );
+                drive_outbound_v1(&agent, &peer_agent, &target_host, target_port, tcp).await;
+            }
         }
     }
 }
@@ -1241,7 +1434,12 @@ async fn try_outbound_v2(
         }
     };
     // Build + sign the V2 header with the local agent keypair.
-    let mut header = ForwardV2Header::new(target_host.to_string(), target_port, agent.agent_id());
+    let mut header = ForwardV2Header::new(
+        target_host.to_string(),
+        target_port,
+        agent.agent_id(),
+        stream.peer(),
+    );
     if let Err(e) = header.sign(agent.identity().agent_keypair()) {
         tracing::warn!(
             target: "x0x::forward",
@@ -1625,8 +1823,17 @@ mod tests {
 
     // ── ForwardV2 attestation tests (#204) ─────────────────────────────────
 
+    use crate::contacts::{ContactStore, IdentityType, TrustLevel};
     use crate::identity::AgentKeypair;
     use std::collections::HashMap;
+
+    /// Current Unix-millisecond timestamp (for TTL tests).
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 
     /// Build a discovery cache with one agent entry (key + machine binding).
     fn cache_with_agent(
@@ -1659,9 +1866,32 @@ mod tests {
         Arc::new(tokio::sync::RwLock::new(cache))
     }
 
-    /// Build a signed V2 header for `(target, port)` from the given keypair.
-    fn signed_v2_header(target: &str, port: u16, keypair: &AgentKeypair) -> ForwardV2Header {
-        let mut h = ForwardV2Header::new(target.to_string(), port, keypair.agent_id());
+    /// Build a contact store with the agent at Trusted (Accept).
+    fn trusted_store(agent: AgentId) -> Arc<tokio::sync::RwLock<ContactStore>> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+        store.set_identity_type(&agent, IdentityType::Anonymous);
+        store.set_trust(&agent, TrustLevel::Trusted);
+        std::mem::forget(dir);
+        Arc::new(tokio::sync::RwLock::new(store))
+    }
+
+    /// Build a contact store with the agent Blocked.
+    fn blocked_store(agent: AgentId) -> Arc<tokio::sync::RwLock<ContactStore>> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+        store.set_trust(&agent, TrustLevel::Blocked);
+        std::mem::forget(dir);
+        Arc::new(tokio::sync::RwLock::new(store))
+    }
+
+    fn signed_v2_header(
+        target: &str,
+        port: u16,
+        keypair: &AgentKeypair,
+        recipient: MachineId,
+    ) -> ForwardV2Header {
+        let mut h = ForwardV2Header::new(target.to_string(), port, keypair.agent_id(), recipient);
         h.sign(keypair).expect("sign");
         h
     }
@@ -1669,7 +1899,8 @@ mod tests {
     #[test]
     fn v2_header_frame_round_trips() {
         let kp = AgentKeypair::generate().unwrap();
-        let h = signed_v2_header("127.0.0.1", 22, &kp);
+        let machine = MachineId([2u8; 32]);
+        let h = signed_v2_header("127.0.0.1", 22, &kp, machine);
         let bytes = h.encode();
         let (decoded, n) = ForwardV2Header::decode(&bytes).expect("decode");
         assert_eq!(decoded, h);
@@ -1679,9 +1910,9 @@ mod tests {
     #[test]
     fn v2_header_decode_rejects_oversize() {
         let kp = AgentKeypair::generate().unwrap();
-        let h = signed_v2_header("127.0.0.1", 22, &kp);
+        let machine = MachineId([2u8; 32]);
+        let h = signed_v2_header("127.0.0.1", 22, &kp, machine);
         let bytes = h.encode();
-        // Tamper the length prefix to exceed the cap.
         let mut bad = bytes.clone();
         let len = (MAX_HEADER_V2_BYTES + 1).to_be_bytes();
         bad[..4].copy_from_slice(&len);
@@ -1694,8 +1925,8 @@ mod tests {
     #[test]
     fn v2_attestation_sign_and_verify() {
         let kp = AgentKeypair::generate().unwrap();
-        let h = signed_v2_header("127.0.0.1", 22, &kp);
-        // Valid attestation: the key hashes to the agent_id and the sig verifies.
+        let machine = MachineId([2u8; 32]);
+        let h = signed_v2_header("127.0.0.1", 22, &kp, machine);
         h.verify_attestation(kp.public_key().as_bytes())
             .expect("valid attestation must verify");
     }
@@ -1703,8 +1934,8 @@ mod tests {
     #[test]
     fn v2_attestation_rejects_missing_signature() {
         let kp = AgentKeypair::generate().unwrap();
-        let h = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id());
-        // Empty signature → AttestationMissing.
+        let machine = MachineId([2u8; 32]);
+        let h = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id(), machine);
         assert_eq!(
             h.verify_attestation(kp.public_key().as_bytes())
                 .unwrap_err(),
@@ -1715,8 +1946,8 @@ mod tests {
     #[test]
     fn v2_attestation_rejects_forged_signature() {
         let kp = AgentKeypair::generate().unwrap();
-        let mut h = signed_v2_header("127.0.0.1", 22, &kp);
-        // Flip a byte in the signature → verification must fail.
+        let machine = MachineId([2u8; 32]);
+        let mut h = signed_v2_header("127.0.0.1", 22, &kp, machine);
         let sig_len = h.signature.len();
         h.signature[sig_len / 2] ^= 0xFF;
         assert!(matches!(
@@ -1729,8 +1960,8 @@ mod tests {
     #[test]
     fn v2_attestation_rejects_wrong_key() {
         let kp = AgentKeypair::generate().unwrap();
-        let h = signed_v2_header("127.0.0.1", 22, &kp);
-        // A different agent's key does not hash to the same agent_id.
+        let machine = MachineId([2u8; 32]);
+        let h = signed_v2_header("127.0.0.1", 22, &kp, machine);
         let other = AgentKeypair::generate().unwrap();
         assert!(matches!(
             h.verify_attestation(other.public_key().as_bytes())
@@ -1740,134 +1971,319 @@ mod tests {
     }
 
     #[test]
+    fn v2_signable_bytes_bind_target_port_and_recipient() {
+        // Must-fix 2: port/host/recipient mutation invalidates the signature.
+        let kp = AgentKeypair::generate().unwrap();
+        let machine = MachineId([2u8; 32]);
+        let mut h = signed_v2_header("127.0.0.1", 22, &kp, machine);
+        let pubkey = kp.public_key().as_bytes().to_vec();
+        assert!(h.verify_attestation(&pubkey).is_ok());
+        h.target_port = 2222;
+        assert!(h.verify_attestation(&pubkey).is_err());
+        h.target_port = 22;
+        h.target_host = "::1".to_string();
+        assert!(h.verify_attestation(&pubkey).is_err());
+        h.target_host = "127.0.0.1".to_string();
+        h.recipient_machine_id = MachineId([9u8; 32]);
+        assert!(h.verify_attestation(&pubkey).is_err());
+    }
+
+    #[test]
     fn v2_signable_bytes_are_deterministic_and_domain_separated() {
         let kp = AgentKeypair::generate().unwrap();
-        let h1 = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id());
-        let h2 = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id());
+        let machine = MachineId([2u8; 32]);
+        let h1 = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id(), machine);
+        let h2 = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id(), machine);
         assert_eq!(h1.signable_bytes(), h2.signable_bytes());
-        // A different target changes the bytes.
-        let h3 = ForwardV2Header::new("::1".to_string(), 22, kp.agent_id());
+        let h3 = ForwardV2Header::new("::1".to_string(), 22, kp.agent_id(), machine);
         assert_ne!(h1.signable_bytes(), h3.signable_bytes());
-        // Domain prefix is present.
         assert!(h1
             .signable_bytes()
             .starts_with(FORWARD_V2_ATTESTATION_DOMAIN));
     }
 
+    #[test]
+    fn forward_config_defaults_to_require_attestation() {
+        // Must-fix 1: default config must deny V1.
+        assert!(ForwardConfig::default().require_attestation);
+        assert!(ForwardConfig::secure().require_attestation);
+    }
+
     #[tokio::test]
     async fn decide_inbound_attested_matrix() {
-        // #204: the attested gate verifies the opener's signature against the
-        // cached agent key, confirms machine binding, then ACL-checks that
-        // single agent.
         let kp = AgentKeypair::generate().unwrap();
         let agent = kp.agent_id();
         let machine = MachineId([2u8; 32]);
         let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
         let cache = cache_with_agent(&kp, machine);
-
-        // Happy path: valid attestation + agent in ACL + correct machine.
+        let contacts = trusted_store(agent);
+        let ts = now_ms();
         let policy = policy_with_allow(agent, machine, target);
-        let header = signed_v2_header("127.0.0.1", 22, &kp);
+
+        // Happy path.
+        let hdr = signed_v2_header("127.0.0.1", 22, &kp, machine);
         assert_eq!(
-            decide_inbound_attested(&header, &policy, &machine, &cache)
-                .await
-                .unwrap(),
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: ts
+                }
+            )
+            .await
+            .unwrap(),
             target,
         );
-
-        // Missing attestation (empty sig) → AttestationFailed.
-        let header = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent);
+        // Missing attestation.
+        let hdr = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent, machine);
         assert_eq!(
-            decide_inbound_attested(&header, &policy, &machine, &cache)
-                .await
-                .unwrap_err(),
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: ts
+                }
+            )
+            .await
+            .unwrap_err(),
             ConnectDenialReason::AttestationFailed,
         );
-
-        // Forged signature → AttestationFailed.
-        let mut header = signed_v2_header("127.0.0.1", 22, &kp);
-        let mid = header.signature.len() / 2;
-        header.signature[mid] ^= 0xFF;
+        // Forged signature.
+        let mut hdr = signed_v2_header("127.0.0.1", 22, &kp, machine);
+        let _mid = hdr.signature.len() / 2;
+        hdr.signature[_mid] ^= 0xFF;
         assert_eq!(
-            decide_inbound_attested(&header, &policy, &machine, &cache)
-                .await
-                .unwrap_err(),
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: ts
+                }
+            )
+            .await
+            .unwrap_err(),
             ConnectDenialReason::AttestationFailed,
         );
-
-        // Agent unknown to cache → AttestationFailed.
+        // Unknown agent.
         let stranger = AgentKeypair::generate().unwrap();
-        let header = signed_v2_header("127.0.0.1", 22, &stranger);
+        let hdr = signed_v2_header("127.0.0.1", 22, &stranger, machine);
         assert_eq!(
-            decide_inbound_attested(&header, &policy, &machine, &cache)
-                .await
-                .unwrap_err(),
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: ts
+                }
+            )
+            .await
+            .unwrap_err(),
             ConnectDenialReason::AttestationFailed,
         );
-
-        // ACL denial (target not in entry) → TargetNotAllowed.
+        // ACL: target not in entry.
         let policy = policy_with_allow(agent, machine, "127.0.0.1:9999".parse().unwrap());
-        let header = signed_v2_header("127.0.0.1", 22, &kp);
+        let hdr = signed_v2_header("127.0.0.1", 22, &kp, machine);
         assert_eq!(
-            decide_inbound_attested(&header, &policy, &machine, &cache)
-                .await
-                .unwrap_err(),
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: ts
+                }
+            )
+            .await
+            .unwrap_err(),
             ConnectDenialReason::TargetNotAllowed,
         );
-
-        // Non-loopback target → TargetNotLoopback.
+        // Non-loopback.
         let policy = policy_with_allow(agent, machine, target);
-        let header = signed_v2_header("10.0.0.1", 22, &kp);
+        let hdr = signed_v2_header("10.0.0.1", 22, &kp, machine);
         assert_eq!(
-            decide_inbound_attested(&header, &policy, &machine, &cache)
-                .await
-                .unwrap_err(),
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: ts
+                }
+            )
+            .await
+            .unwrap_err(),
             ConnectDenialReason::TargetNotLoopback,
         );
     }
 
     #[tokio::test]
-    async fn decide_inbound_attested_wrong_machine_denied() {
-        // Signature is valid and the agent is in the cache, but the cached
-        // machine_id ≠ transport peer machine. This is a cross-machine
-        // impersonation attempt — must be denied.
+    async fn decide_inbound_attested_wrong_recipient_denied() {
+        // Replay: header for machine A replayed to B.
+        let kp = AgentKeypair::generate().unwrap();
+        let agent = kp.agent_id();
+        let machine_a = MachineId([2u8; 32]);
+        let machine_b = MachineId([3u8; 32]);
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+        let cache = cache_with_agent(&kp, machine_b);
+        let contacts = trusted_store(agent);
+        let policy = policy_with_allow(agent, machine_b, target);
+        let hdr = signed_v2_header("127.0.0.1", 22, &kp, machine_a);
+        assert_eq!(
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine_b,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: now_ms()
+                }
+            )
+            .await
+            .unwrap_err(),
+            ConnectDenialReason::AttestationFailed,
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_inbound_attested_wrong_cached_machine_denied() {
         let kp = AgentKeypair::generate().unwrap();
         let agent = kp.agent_id();
         let real_machine = MachineId([2u8; 32]);
         let other_machine = MachineId([9u8; 32]);
         let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
         let cache = cache_with_agent(&kp, real_machine);
+        let contacts = trusted_store(agent);
         let policy = policy_with_allow(agent, real_machine, target);
-
-        let header = signed_v2_header("127.0.0.1", 22, &kp);
-        // Transport peer is `other_machine` but the agent is cached on
-        // `real_machine` → AgentNotOnMachine.
+        let hdr = signed_v2_header("127.0.0.1", 22, &kp, other_machine);
         assert_eq!(
-            decide_inbound_attested(&header, &policy, &other_machine, &cache)
-                .await
-                .unwrap_err(),
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &other_machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: now_ms()
+                }
+            )
+            .await
+            .unwrap_err(),
             ConnectDenialReason::AgentNotOnMachine,
         );
     }
 
     #[tokio::test]
-    async fn decide_inbound_attested_multi_agent_checks_only_attested() {
-        // #204: on a multi-agent machine the attested gate checks ONLY the
-        // authenticated opener — not every agent on the machine. A second
-        // agent that is NOT in the ACL (and would cause a V1 multi-agent
-        // fail-closed) does not affect the V2 path.
+    async fn decide_inbound_attested_replay_expired() {
+        let kp = AgentKeypair::generate().unwrap();
+        let agent = kp.agent_id();
         let machine = MachineId([2u8; 32]);
         let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+        let cache = cache_with_agent(&kp, machine);
+        let contacts = trusted_store(agent);
+        let policy = policy_with_allow(agent, machine, target);
+        let ts = now_ms();
+        let mut hdr = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent, machine);
+        hdr.issued_at_ms = ts.saturating_sub(FORWARD_V2_ATTESTATION_TTL_MS + 1000);
+        let _sig = sign_with_ml_dsa(kp.secret_key(), &hdr.signable_bytes()).unwrap();
+        hdr.signature = _sig.as_bytes().to_vec();
+        assert_eq!(
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: ts
+                }
+            )
+            .await
+            .unwrap_err(),
+            ConnectDenialReason::AttestationFailed,
+        );
+    }
 
-        // Agent A (the opener) — authorized.
+    #[tokio::test]
+    async fn decide_inbound_attested_replay_future() {
+        let kp = AgentKeypair::generate().unwrap();
+        let agent = kp.agent_id();
+        let machine = MachineId([2u8; 32]);
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+        let cache = cache_with_agent(&kp, machine);
+        let contacts = trusted_store(agent);
+        let policy = policy_with_allow(agent, machine, target);
+        let ts = now_ms();
+        let mut hdr = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent, machine);
+        hdr.issued_at_ms = ts + FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS + 1000;
+        let _sig = sign_with_ml_dsa(kp.secret_key(), &hdr.signable_bytes()).unwrap();
+        hdr.signature = _sig.as_bytes().to_vec();
+        assert_eq!(
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: ts
+                }
+            )
+            .await
+            .unwrap_err(),
+            ConnectDenialReason::AttestationFailed,
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_inbound_attested_blocked_agent_denied() {
+        // Must-fix 3: Blocked-but-announced agent denied.
+        let kp = AgentKeypair::generate().unwrap();
+        let agent = kp.agent_id();
+        let machine = MachineId([2u8; 32]);
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+        let cache = cache_with_agent(&kp, machine);
+        let contacts = blocked_store(agent);
+        let policy = policy_with_allow(agent, machine, target);
+        let hdr = signed_v2_header("127.0.0.1", 22, &kp, machine);
+        assert_eq!(
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: now_ms()
+                }
+            )
+            .await
+            .unwrap_err(),
+            ConnectDenialReason::TrustRejected,
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_inbound_attested_multi_agent_checks_only_attested() {
+        let machine = MachineId([2u8; 32]);
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
         let kp_a = AgentKeypair::generate().unwrap();
         let agent_a = kp_a.agent_id();
-
-        // Agent B (also on the machine, NOT authorized for the target).
         let kp_b = AgentKeypair::generate().unwrap();
         let agent_b = kp_b.agent_id();
-
-        // Cache holds both agents on the same machine.
         let mut cache_map = HashMap::new();
         for kp in [&kp_a, &kp_b] {
             let id = kp.agent_id();
@@ -1894,32 +2310,47 @@ mod tests {
             );
         }
         let cache = Arc::new(tokio::sync::RwLock::new(cache_map));
-
-        // Policy: only agent_a is authorized. Agent B is absent from the ACL.
+        let contacts = trusted_store(agent_a);
+        // Also trust agent_b so the trust check passes and we isolate the
+        // ACL denial (agent_b is in the cache + trusted but NOT in the ACL).
+        {
+            let mut cs = contacts.write().await;
+            cs.set_identity_type(&agent_b, IdentityType::Anonymous);
+            cs.set_trust(&agent_b, TrustLevel::Trusted);
+        }
         let policy = policy_multi(vec![allow_entry(agent_a, machine, &[target])]);
-
-        // V2 attestation from agent_a succeeds even though agent_b is
-        // unauthorized — the gate checks ONLY the authenticated opener.
-        let header_a = signed_v2_header("127.0.0.1", 22, &kp_a);
+        let hdr_a = signed_v2_header("127.0.0.1", 22, &kp_a, machine);
         assert_eq!(
-            decide_inbound_attested(&header_a, &policy, &machine, &cache)
-                .await
-                .unwrap(),
+            decide_inbound_attested(
+                &hdr_a,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: now_ms()
+                }
+            )
+            .await
+            .unwrap(),
             target,
         );
-
-        // V2 attestation from agent_b is denied (not in ACL).
-        let header_b = signed_v2_header("127.0.0.1", 22, &kp_b);
+        let hdr_b = signed_v2_header("127.0.0.1", 22, &kp_b, machine);
         assert_eq!(
-            decide_inbound_attested(&header_b, &policy, &machine, &cache)
-                .await
-                .unwrap_err(),
+            decide_inbound_attested(
+                &hdr_b,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: now_ms()
+                }
+            )
+            .await
+            .unwrap_err(),
             ConnectDenialReason::AgentMachineNotInAcl,
         );
-
-        // Sanity: the V1 multi-agent path WOULD fail-closed here (both
-        // agents checked, B is unauthorized). This confirms V2 lifts the
-        // restriction for the authenticated opener.
         assert_eq!(
             decide_inbound(
                 &header("127.0.0.1", 22),
@@ -1934,13 +2365,10 @@ mod tests {
 
     #[tokio::test]
     async fn decide_inbound_attested_no_cached_key_denied() {
-        // Agent is in the cache but has no public key (pre-v2 announcement
-        // without a cert) → cannot be attested → fail-closed.
         let kp = AgentKeypair::generate().unwrap();
         let agent = kp.agent_id();
         let machine = MachineId([2u8; 32]);
         let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
-
         let mut cache_map = HashMap::new();
         cache_map.insert(
             agent,
@@ -1960,17 +2388,26 @@ mod tests {
                 relay_candidates: Vec::new(),
                 cert_not_after: None,
                 agent_certificate: None,
-                agent_public_key: Vec::new(), // no key!
+                agent_public_key: Vec::new(),
             },
         );
         let cache = Arc::new(tokio::sync::RwLock::new(cache_map));
+        let contacts = trusted_store(agent);
         let policy = policy_with_allow(agent, machine, target);
-
-        let header = signed_v2_header("127.0.0.1", 22, &kp);
+        let hdr = signed_v2_header("127.0.0.1", 22, &kp, machine);
         assert_eq!(
-            decide_inbound_attested(&header, &policy, &machine, &cache)
-                .await
-                .unwrap_err(),
+            decide_inbound_attested(
+                &hdr,
+                &policy,
+                &machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache.clone(),
+                    contact_store: contacts.clone(),
+                    now_ms: now_ms()
+                }
+            )
+            .await
+            .unwrap_err(),
             ConnectDenialReason::AttestationFailed,
         );
     }

@@ -312,6 +312,13 @@ pub struct DaemonConfig {
     /// for restart-persistence tests.
     #[serde(default)]
     pub(super) directory_resubscribe_jitter_ms: Option<u64>,
+
+    /// Forward (tailnet) configuration (TOML: `[forward]`).
+    /// Default: `require_attestation = true` — inbound ForwardV1 streams are
+    /// denied. Set `require_attestation = false` for mixed-version deployments
+    /// (#204 must-fix 1).
+    #[serde(default)]
+    pub(super) forward: x0x::forward::ForwardConfig,
 }
 
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
@@ -492,6 +499,7 @@ impl Default for DaemonConfig {
             directory_digest_interval_secs: None,
             group_card_republish_interval_secs: None,
             directory_resubscribe_jitter_ms: None,
+            forward: x0x::forward::ForwardConfig::default(),
         }
     }
 }
