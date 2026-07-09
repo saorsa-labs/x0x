@@ -84,6 +84,7 @@ fn discovered_agent(
         relay_candidates: Vec::new(),
         cert_not_after: None,
         agent_certificate: None,
+        agent_public_key: Vec::new(),
     }
 }
 

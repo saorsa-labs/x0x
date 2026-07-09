@@ -116,6 +116,7 @@ fn signed_identity_announcement_with_nat_fields() -> IdentityAnnouncement {
         is_coordinator: unsigned.is_coordinator,
         reachable_via: unsigned.reachable_via,
         relay_candidates: unsigned.relay_candidates,
+        agent_public_key: Vec::new(),
     }
 }
 
@@ -296,6 +297,7 @@ fn announcement_nat_fields_round_trip() {
         is_coordinator: Some(true),
         reachable_via: vec![coord],
         relay_candidates: vec![coord],
+        agent_public_key: Vec::new(),
     };
 
     let bytes = bincode::serialize(&ann).unwrap();
@@ -410,6 +412,7 @@ async fn discovery_cache_insert_and_retrieve() {
         relay_candidates: Vec::new(),
         cert_not_after: None,
         agent_certificate: None,
+        agent_public_key: Vec::new(),
     };
 
     agent
@@ -459,6 +462,7 @@ async fn reachability_info_from_discovery_cache() {
         relay_candidates: Vec::new(),
         cert_not_after: None,
         agent_certificate: None,
+        agent_public_key: Vec::new(),
     };
 
     agent.insert_discovered_agent_for_testing(fake).await;

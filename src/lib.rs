@@ -862,6 +862,16 @@ pub struct IdentityAnnouncement {
     /// Used when hole-punching is not viable (e.g. endpoint-dependent
     /// mapping). Empty by default.
     pub relay_candidates: Vec<identity::MachineId>,
+    /// Raw ML-DSA-65 agent public key bytes.
+    ///
+    /// Carried so peers can verify signed forward-header attestations (#204)
+    /// without requiring the agent to carry a user→agent certificate. The key
+    /// is **not** covered by `machine_signature` (it lives outside
+    /// [`IdentityAnnouncementUnsigned`]); instead it is self-certifying — the
+    /// signed `agent_id` is `SHA-256(agent_public_key)`, so a recipient that
+    /// checks the binding rejects a swapped key. Introduced in the v2 gossip
+    /// envelope (`X0A2` magic prefix).
+    pub agent_public_key: Vec<u8>,
 }
 
 impl IdentityAnnouncement {
@@ -1315,6 +1325,17 @@ pub struct DiscoveredAgent {
     /// pre-#130 peers that announce no cert, and for machine/rendezvous-only
     /// cache entries.
     pub agent_certificate: Option<identity::AgentCertificate>,
+    /// Raw ML-DSA-65 agent public key bytes from the v2 gossip envelope
+    /// (or recovered from the cert on legacy announcements).
+    ///
+    /// Used by the forward-attestation path (#204) to verify the inbound
+    /// `ForwardV2` header signature: the opener signs with its agent secret
+    /// key, the verifier looks up this cached key, confirms the agent is on
+    /// the transport-authenticated machine, and checks the binding
+    /// (`agent_id == SHA-256(agent_public_key)`). Empty when no key has
+    /// propagated — the agent cannot be attested and a `ForwardV2` stream
+    /// is denied fail-closed.
+    pub agent_public_key: Vec<u8>,
 }
 
 /// Cached machine endpoint data derived from signed machine announcements.
@@ -1519,6 +1540,11 @@ async fn upsert_discovered_agent(
                 }
                 existing.reachable_via = incoming.reachable_via;
                 existing.relay_candidates = incoming.relay_candidates;
+                // LWW the agent public key — a v2 announcement always
+                // carries it; a legacy/rendezvous entry may not (#204).
+                if !incoming.agent_public_key.is_empty() {
+                    existing.agent_public_key = incoming.agent_public_key;
+                }
             }
             existing.last_seen = incoming.last_seen;
         }
@@ -1606,15 +1632,103 @@ async fn upsert_discovered_machine_from_agent(
 
 const MAX_MACHINE_ANNOUNCEMENT_DECODE_BYTES: u64 = 64 * 1024;
 
+/// Magic prefix marking an identity announcement that carries the agent
+/// public key (the v2 gossip envelope, #204). A legacy announcement begins
+/// with the bincode bytes of `agent_id` (a 32-byte fixed array) — the first
+/// four bytes are a hash prefix, so `b"X0A2"` is collision-resistant in the
+/// same way the on-disk cert `X0C2` marker is.
+const IDENTITY_ANNOUNCEMENT_V2_MAGIC: &[u8; 4] = b"X0A2";
+
+/// Serialize an identity announcement in the v2 envelope (magic prefix +
+/// bincode). The magic lets a new peer distinguish v2 (carries
+/// `agent_public_key`) from legacy payloads.
+fn serialize_identity_announcement(
+    announcement: &IdentityAnnouncement,
+) -> Result<Vec<u8>, Box<bincode::ErrorKind>> {
+    use bincode::Options;
+    let body = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .serialize(announcement)?;
+    let mut out = Vec::with_capacity(IDENTITY_ANNOUNCEMENT_V2_MAGIC.len() + body.len());
+    out.extend_from_slice(IDENTITY_ANNOUNCEMENT_V2_MAGIC);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Legacy identity-announcement wire shape (pre-#204): identical to
+/// [`IdentityAnnouncement`] minus the trailing `agent_public_key` field.
+/// Used only to deserialize payloads from old peers so they still populate
+/// the discovery cache (the key is recovered from the embedded certificate
+/// when present).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IdentityAnnouncementLegacy {
+    agent_id: identity::AgentId,
+    machine_id: identity::MachineId,
+    user_id: Option<identity::UserId>,
+    agent_certificate: Option<identity::AgentCertificate>,
+    machine_public_key: Vec<u8>,
+    machine_signature: Vec<u8>,
+    addresses: Vec<std::net::SocketAddr>,
+    announced_at: u64,
+    nat_type: Option<String>,
+    can_receive_direct: Option<bool>,
+    is_relay: Option<bool>,
+    is_coordinator: Option<bool>,
+    reachable_via: Vec<identity::MachineId>,
+    relay_candidates: Vec<identity::MachineId>,
+}
+
+impl IdentityAnnouncementLegacy {
+    /// Convert a legacy payload into the current announcement shape,
+    /// recovering the agent public key from the embedded certificate when
+    /// one is present (empty when not — the agent simply cannot be
+    /// attested until a v2 announcement propagates).
+    fn into_announcement(self) -> IdentityAnnouncement {
+        let agent_public_key = self
+            .agent_certificate
+            .as_ref()
+            .map(|c| c.agent_public_key().to_vec())
+            .unwrap_or_default();
+        IdentityAnnouncement {
+            agent_id: self.agent_id,
+            machine_id: self.machine_id,
+            user_id: self.user_id,
+            agent_certificate: self.agent_certificate,
+            machine_public_key: self.machine_public_key,
+            machine_signature: self.machine_signature,
+            addresses: self.addresses,
+            announced_at: self.announced_at,
+            nat_type: self.nat_type,
+            can_receive_direct: self.can_receive_direct,
+            is_relay: self.is_relay,
+            is_coordinator: self.is_coordinator,
+            reachable_via: self.reachable_via,
+            relay_candidates: self.relay_candidates,
+            agent_public_key,
+        }
+    }
+}
+
 fn deserialize_identity_announcement(
     payload: &[u8],
 ) -> std::result::Result<IdentityAnnouncement, Box<bincode::ErrorKind>> {
     use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-        .reject_trailing_bytes()
-        .deserialize(payload)
+    let opts = || {
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+            .reject_trailing_bytes()
+    };
+    // v2 envelope: magic prefix + bincode(IdentityAnnouncement).
+    if payload.len() >= IDENTITY_ANNOUNCEMENT_V2_MAGIC.len()
+        && &payload[..IDENTITY_ANNOUNCEMENT_V2_MAGIC.len()] == IDENTITY_ANNOUNCEMENT_V2_MAGIC
+    {
+        return opts().deserialize(&payload[IDENTITY_ANNOUNCEMENT_V2_MAGIC.len()..]);
+    }
+    // Legacy envelope: bincode(IdentityAnnouncementLegacy) — recover the key
+    // from the cert when present.
+    let legacy: IdentityAnnouncementLegacy = opts().deserialize(payload)?;
+    Ok(legacy.into_announcement())
 }
 
 fn deserialize_user_announcement(
@@ -1989,6 +2103,12 @@ impl HeartbeatContext {
         .as_bytes()
         .to_vec();
 
+        let agent_public_key = self
+            .identity
+            .agent_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec();
         let announcement = IdentityAnnouncement {
             agent_id: unsigned.agent_id,
             machine_id: unsigned.machine_id,
@@ -2004,6 +2124,7 @@ impl HeartbeatContext {
             is_coordinator: coordinator_capable,
             reachable_via: reachable_via.clone(),
             relay_candidates: relay_candidates.clone(),
+            agent_public_key,
         };
         tracing::debug!(
             target: "x0x::discovery",
@@ -2069,7 +2190,7 @@ impl HeartbeatContext {
                 )))
             })?;
 
-        let encoded = bincode::serialize(&announcement).map_err(|e| {
+        let encoded = serialize_identity_announcement(&announcement).map_err(|e| {
             error::IdentityError::Serialization(format!(
                 "heartbeat: failed to serialize announcement: {e}"
             ))
@@ -2112,6 +2233,7 @@ impl HeartbeatContext {
             relay_candidates: announcement.relay_candidates.clone(),
             cert_not_after: None,
             agent_certificate: None,
+            agent_public_key: announcement.agent_public_key.clone(),
         };
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
         upsert_discovered_agent(&self.cache, discovered_agent).await;
@@ -5231,7 +5353,7 @@ impl Agent {
                 )))
             })?;
 
-        let encoded = bincode::serialize(&announcement).map_err(|e| {
+        let encoded = serialize_identity_announcement(&announcement).map_err(|e| {
             error::IdentityError::Serialization(format!(
                 "failed to serialize identity announcement: {e}"
             ))
@@ -5288,6 +5410,7 @@ impl Agent {
             relay_candidates: announcement.relay_candidates.clone(),
             cert_not_after: None,
             agent_certificate: None,
+            agent_public_key: announcement.agent_public_key.clone(),
         };
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &discovered_agent)
             .await;
@@ -6232,6 +6355,7 @@ impl Agent {
                     relay_candidates: announcement.relay_candidates.clone(),
                     cert_not_after,
                     agent_certificate: announcement.agent_certificate.clone(),
+                    agent_public_key: announcement.agent_public_key.clone(),
                 };
                 upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
                 upsert_discovered_agent(&cache, discovered_agent).await;
@@ -6468,6 +6592,12 @@ impl Agent {
             is_coordinator: unsigned.is_coordinator,
             reachable_via: unsigned.reachable_via,
             relay_candidates: unsigned.relay_candidates,
+            agent_public_key: self
+                .identity
+                .agent_keypair()
+                .public_key()
+                .as_bytes()
+                .to_vec(),
         })
     }
 
@@ -7236,6 +7366,17 @@ impl Agent {
         std::sync::Arc::clone(&self.revocation_set)
     }
 
+    /// Return the shared identity discovery cache (`pub(crate)` — used by the
+    /// forwarder to look up cached agent public keys for `ForwardV2`
+    /// attestation verification, #204).
+    pub(crate) fn identity_discovery_cache(
+        &self,
+    ) -> std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    > {
+        std::sync::Arc::clone(&self.identity_discovery_cache)
+    }
+
     /// Return a snapshot of all known revocation records.
     ///
     /// This is a read-only snapshot; the in-memory set grows only (no un-revocation).
@@ -7545,6 +7686,7 @@ impl Agent {
                                     .as_ref()
                                     .and_then(|c| c.not_after()),
                                 agent_certificate: ann.agent_certificate.clone(),
+                                agent_public_key: ann.agent_public_key.clone(),
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
@@ -7581,6 +7723,7 @@ impl Agent {
                     relay_candidates: Vec::new(),
                     cert_not_after: None,
                     agent_certificate: None,
+                    agent_public_key: Vec::new(),
                 },
             )
             .await;
@@ -11701,6 +11844,7 @@ mod tests {
                 relay_candidates: Vec::new(),
                 cert_not_after: cert.not_after(),
                 agent_certificate: Some(cert.clone()),
+                agent_public_key: cert.agent_public_key().to_vec(),
             },
         );
 
@@ -11928,11 +12072,16 @@ mod tests {
             .unwrap();
 
         let identity = agent.build_identity_announcement(false, false).unwrap();
-        let identity_bytes = bincode::serialize(&identity).unwrap();
+        let identity_bytes = serialize_identity_announcement(&identity).unwrap();
         let decoded_identity = deserialize_identity_announcement(&identity_bytes).unwrap();
         assert_eq!(decoded_identity.agent_id, identity.agent_id);
         assert_eq!(decoded_identity.machine_id, identity.machine_id);
-
+        // The v2 envelope must carry the agent public key (#204).
+        assert_eq!(decoded_identity.agent_public_key, identity.agent_public_key);
+        assert!(
+            !decoded_identity.agent_public_key.is_empty(),
+            "v2 announcement must carry the agent public key"
+        );
         let machine = agent.build_machine_announcement().unwrap();
         let machine_bytes = bincode::serialize(&machine).unwrap();
         let decoded_machine = deserialize_machine_announcement(&machine_bytes).unwrap();
@@ -12324,6 +12473,7 @@ fn discovered_agent_fixture(
         relay_candidates: Vec::new(),
         cert_not_after: None,
         agent_certificate: None,
+        agent_public_key: Vec::new(),
     }
 }
 

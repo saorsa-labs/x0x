@@ -71,13 +71,24 @@ The inbound accept loop resolves the opener's agent identity from the identity d
 - **Single agent on the machine (the common case):** the resolved set has one agent; the ACL enforces agent-granular authorization exactly as written.
 - **Multiple agents on the machine:** the QUIC transport cannot prove which agent opened the stream, so the gate requires **every announced agent** on the machine to be authorized for the target. If any announced agent lacks authorization the forward is **denied** — see [Limitations](#limitations-announced-agents-only) for the residual window this leaves.
 
-This is fail-closed by design. If you co-locate multiple agents on one machine and need forwards to work, authorize every agent for the same targets, or do not co-locate agents with different ACL requirements. Full per-agent cryptographic authentication (signed agent attestation in the forward header) is a documented future enhancement that would lift the multi-agent restriction without changing the ACL model.
+This is fail-closed by design. If you co-locate multiple agents on one machine and need forwards to work, authorize every agent for the same targets, or do not co-locate agents with different ACL requirements. **ForwardV2 attestation** (#204) lifts this restriction for V2-capable peers — see below.
 
-### Limitations: announced agents only
+### ForwardV2 agent attestation (#204)
 
-The agent set checked by the gate comes from the identity **discovery cache**, which is populated from machine-signed `IdentityAnnouncement`s propagated via gossip. An agent that has started but whose announcement has not yet propagated (gossip lag after `join_network`, before the first heartbeat re-announce reaches this peer) is **absent** from the cache and therefore **not checked**. Threat scenario: a hostile agent starts on a machine, and an inbound forward arrives before its announcement propagates — the gate runs only against the benign, already-announced agents and may authorize the forward.
+ForwardV2 carries the opener's `agent_id` plus an ML-DSA-65 signature over the header bytes. At stream accept the inbound side:
 
-The QUIC transport authenticates the **machine**, not the agent; the discovery cache is best-effort, not a real-time membership oracle. Eliminating this residual window requires cryptographic agent attestation in the forward header — the deferred option discussed in PR #201's design note. Until then, the guarantee is: *every agent known to this peer at accept time must be authorized*, not *every agent on the machine*.
+1. Looks up the opener's `agent_id` in the discovery cache and retrieves the cached agent public key (populated from the v2 gossip envelope or the agent certificate).
+2. Confirms the agent is on the transport-authenticated machine (`machine_id` match).
+3. Verifies the signature against the cached key, checking that the key hashes to the claimed `agent_id` (binding).
+4. ACL-checks **that specific authenticated agent** — not every agent on the machine.
+
+This eliminates **both** the multi-agent ambiguity **and** the unannounced-agent window: the opener proves its identity cryptographically, independent of whether its announcement has propagated. An agent absent from the cache, or whose cached key does not match the signature, is denied fail-closed. New peers open ForwardV2 streams and fall back to ForwardV1 for pre-#204 peers.
+
+### Limitations: announced agents only (ForwardV1 path)
+
+The ForwardV1 path (pre-#204) resolves the opener from the identity **discovery cache**, which is populated from machine-signed `IdentityAnnouncement`s propagated via gossip. An agent that has started but whose announcement has not yet propagated (gossip lag after `join_network`, before the first heartbeat re-announce reaches this peer) is **absent** from the cache and therefore **not checked**. Threat scenario: a hostile agent starts on a machine, and an inbound forward arrives before its announcement propagates — the gate runs only against the benign, already-announced agents and may authorize the forward.
+
+The QUIC transport authenticates the **machine**, not the agent; the discovery cache is best-effort, not a real-time membership oracle. **ForwardV2 attestation (#204) eliminates this residual window** for V2-capable peers. On the V1 path the guarantee remains: *every agent known to this peer at accept time must be authorized*, not *every agent on the machine*.
 
 ## CLI
 
@@ -123,6 +134,8 @@ The `denial_breakdown` map is keyed by `ConnectDenialReason` in `snake_case`:
 | `target_not_loopback` | Requested target is not loopback (runtime defense-in-depth) |
 | `agent_machine_not_in_acl` | (agent, machine) pair not in the ACL |
 | `target_not_allowed` | Pair is in the ACL but target is not in its entry |
+| `attestation_failed` | ForwardV2: missing/invalid signature, unknown agent key, or key↔id mismatch (#204) |
+| `agent_not_on_machine` | ForwardV2: signature valid but the agent is not on the transport-authenticated machine (#204) |
 
 ## Pre-flight validation
 

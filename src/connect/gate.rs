@@ -42,6 +42,13 @@ pub enum ConnectDenialReason {
     AgentMachineNotInAcl,
     /// The pair is in the ACL but the requested target is not in its entry.
     TargetNotAllowed,
+    /// ForwardV2 attestation: no valid agent signature / key binding (#204).
+    /// Covers missing signature, unknown agent key, key↔id mismatch, and
+    /// signature verification failure.
+    AttestationFailed,
+    /// ForwardV2 attestation: the agent's signature is valid but the agent is
+    /// not on the transport-authenticated machine (#204).
+    AgentNotOnMachine,
 }
 
 /// Pure gate evaluation. The thing v1 must get perfect.
