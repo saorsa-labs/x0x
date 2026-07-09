@@ -866,8 +866,8 @@ pub struct IdentityAnnouncement {
     ///
     /// Carried so peers can verify signed forward-header attestations (#204)
     /// without requiring the agent to carry a user→agent certificate. The key
-    /// is **not** covered by `machine_signature` (it lives outside
-    /// [`IdentityAnnouncementUnsigned`]); instead it is self-certifying — the
+    /// is **not** covered by `machine_signature` (it lives outside the
+    /// unsigned announcement struct); instead it is self-certifying — the
     /// signed `agent_id` is `SHA-256(agent_public_key)`, so a recipient that
     /// checks the binding rejects a swapped key. Introduced in the v2 gossip
     /// envelope (`X0A2` magic prefix).
