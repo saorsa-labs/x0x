@@ -157,12 +157,20 @@ pub const PREFIX_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamProtocol {
-    /// Local port-forwarding (`src/forward/`). Header is a length-prefixed
-    /// bincode `{target_host, target_port}`, gated by the connect ACL at the
-    /// inbound accept seam.
+    /// Local port-forwarding — legacy header (`ForwardV1`, no attestation).
+    /// The opener's identity is resolved from the discovery cache by machine
+    /// and the ACL checks every announced agent (multi-agent fail-closed,
+    /// #192). Kept for backward compatibility with pre-#204 peers.
     ForwardV1 = 0x01,
     /// SOCKS5 dynamic listener (`src/socks/`, T5). Carries the CONNECT target.
     SocksV1 = 0x02,
+    /// Local port-forwarding with **agent attestation** (`ForwardV2`, #204).
+    /// The header carries the opener's `agent_id` plus an ML-DSA-65 signature
+    /// over the header bytes; the inbound side verifies the signature against
+    /// the cached agent public key, confirms the agent is on the authenticated
+    /// machine, then ACL-checks that specific agent. Closes the unannounced-
+    /// agent window documented in `docs/connect-acl.md`.
+    ForwardV2 = 0x03,
 }
 
 impl StreamProtocol {
@@ -173,6 +181,7 @@ impl StreamProtocol {
         match byte {
             0x01 => Some(Self::ForwardV1),
             0x02 => Some(Self::SocksV1),
+            0x03 => Some(Self::ForwardV2),
             _ => None,
         }
     }
@@ -318,7 +327,11 @@ mod tests {
 
     #[test]
     fn protocol_prefix_round_trips() {
-        for p in [StreamProtocol::ForwardV1, StreamProtocol::SocksV1] {
+        for p in [
+            StreamProtocol::ForwardV1,
+            StreamProtocol::SocksV1,
+            StreamProtocol::ForwardV2,
+        ] {
             assert_eq!(StreamProtocol::from_u8(p.as_u8()), Some(p));
         }
     }
@@ -329,7 +342,9 @@ mod tests {
         for byte in 0x00u8..=0xFF {
             let parsed = StreamProtocol::from_u8(byte);
             match byte {
-                0x01 | 0x02 => assert!(parsed.is_some(), "byte {byte:#x} should parse"),
+                0x01..=0x03 => {
+                    assert!(parsed.is_some(), "byte {byte:#x} should parse")
+                }
                 _ => assert_eq!(parsed, None, "byte {byte:#x} must be unknown"),
             }
         }

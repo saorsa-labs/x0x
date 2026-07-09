@@ -48,12 +48,16 @@ use tokio_util::sync::CancellationToken;
 use crate::connect::gate::ConnectDenialReason;
 use crate::connect::{evaluate_connect_gate, ConnectDiagnostics, ConnectPolicy};
 use crate::error::{NetworkError, NetworkResult};
-use crate::identity::{AgentId, MachineId};
-use crate::streams::PeerStream;
+use crate::identity::{AgentId, AgentKeypair, MachineId};
+use crate::streams::{PeerStream, StreamProtocol};
 use crate::trust::TrustDecision;
 
-// Import the ant-quic stream halves under stable names for the bridge helper.
-use ant_quic::{HighLevelRecvStream, HighLevelSendStream};
+// Import the ant-quic stream halves under stable names for the bridge helper,
+// plus the ML-DSA-65 sign/verify primitives for ForwardV2 attestation.
+use ant_quic::crypto::raw_public_keys::pqc::{
+    sign_with_ml_dsa, verify_with_ml_dsa, MlDsaSignature,
+};
+use ant_quic::{HighLevelRecvStream, HighLevelSendStream, MlDsaPublicKey};
 
 /// Response byte: the inbound side accepted the target and connected.
 const RESP_CONNECTED: u8 = 0x01;
@@ -63,6 +67,10 @@ const RESP_DENIED: u8 = 0x00;
 /// Hard cap on the encoded header size. A loopback `host:port` is tiny; a
 /// larger frame is either malformed or an attack — reject rather than read.
 const MAX_HEADER_BYTES: u32 = 256;
+
+/// Hard cap on the encoded V2 header size. The ML-DSA-65 signature is ~3.3 KB;
+/// a V2 frame larger than this is malformed or an attack.
+const MAX_HEADER_V2_BYTES: u32 = 4096;
 
 /// Local connect timeout for the inbound side's `TcpStream::connect`.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -130,6 +138,151 @@ impl ForwardHeader {
     }
 }
 
+/// Domain separator for ForwardV2 attestation signatures (#204).
+///
+/// Prevents a signature from being replayed across protocol contexts — the
+/// signed bytes always begin with this prefix so a signature over a forward
+/// header can never be confused with (or substituted for) an agent-card or
+/// certificate signature.
+const FORWARD_V2_ATTESTATION_DOMAIN: &[u8] = b"x0x-forward-v2-attestation";
+
+/// Forward header with agent attestation (`ForwardV2`, #204).
+///
+/// Carries the opener's `agent_id` plus an ML-DSA-65 signature over the
+/// header's signable bytes. The inbound side verifies the signature against
+/// the **cached** agent public key (from the discovery cache), confirms the
+/// agent is on the transport-authenticated machine, then ACL-checks that
+/// specific agent. This closes the unannounced-agent window: the opener
+/// proves its identity cryptographically, independent of whether its
+/// announcement has propagated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardV2Header {
+    /// Numeric loopback IP the peer wants to reach (e.g. `127.0.0.1`, `::1`).
+    pub target_host: String,
+    /// TCP port on the loopback target.
+    pub target_port: u16,
+    /// The opener's agent identity (proves which agent opened the stream).
+    pub opener_agent_id: AgentId,
+    /// ML-DSA-65 signature over [`ForwardV2Header::signable_bytes`].
+    pub signature: Vec<u8>,
+}
+
+impl ForwardV2Header {
+    /// Build an unsigned V2 header (signature empty — call `sign` to attest).
+    #[must_use]
+    pub fn new(target_host: String, target_port: u16, opener_agent_id: AgentId) -> Self {
+        Self {
+            target_host,
+            target_port,
+            opener_agent_id,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Canonical bytes signed by the opener to produce `signature`.
+    ///
+    /// Deterministic, domain-prefixed, length-prefixed encoding of every
+    /// semantic field. Excludes `signature` itself. Mirrors the `AgentCard`
+    /// signing scheme (`src/groups/card.rs`) for consistency.
+    #[must_use]
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        buf.extend_from_slice(FORWARD_V2_ATTESTATION_DOMAIN);
+        // length-prefixed target_host
+        buf.extend_from_slice(&(self.target_host.len() as u32).to_le_bytes());
+        buf.extend_from_slice(self.target_host.as_bytes());
+        // target_port
+        buf.extend_from_slice(&self.target_port.to_le_bytes());
+        // opener_agent_id (fixed 32 bytes)
+        buf.extend_from_slice(&self.opener_agent_id.0);
+        buf
+    }
+
+    /// Sign this header with the opener's agent keypair.
+    ///
+    /// Populates `signature`. The signed bytes commit to the opener's
+    /// `agent_id` (which is `SHA-256` of the signing key) so the recipient
+    /// can verify the binding.
+    ///
+    /// # Errors
+    /// Returns `ForwardError::AttestationSign` if ML-DSA-65 signing fails.
+    pub fn sign(&mut self, keypair: &AgentKeypair) -> Result<(), ForwardError> {
+        let sig = sign_with_ml_dsa(keypair.secret_key(), &self.signable_bytes())
+            .map_err(|e| ForwardError::AttestationSign(format!("{e:?}")))?;
+        self.signature = sig.as_bytes().to_vec();
+        Ok(())
+    }
+
+    /// Verify the attestation signature against a cached agent public key.
+    ///
+    /// Checks that the provided `agent_public_key` hashes to the header's
+    /// `opener_agent_id` (binding — a recipient cannot be fooled by a swapped
+    /// key), then verifies the ML-DSA-65 signature over `signable_bytes`.
+    ///
+    /// # Errors
+    /// - [`ForwardError::AttestationMissing`] — `signature` is empty.
+    /// - [`ForwardError::AttestationKeyMismatch`] — the key does not hash to
+    ///   `opener_agent_id`.
+    /// - [`ForwardError::AttestationInvalid`] — signature verification failed.
+    pub fn verify_attestation(&self, agent_public_key: &[u8]) -> Result<(), ForwardError> {
+        if self.signature.is_empty() {
+            return Err(ForwardError::AttestationMissing);
+        }
+        let pubkey = MlDsaPublicKey::from_bytes(agent_public_key)
+            .map_err(|e| ForwardError::AttestationKeyMismatch(format!("bad pubkey: {e:?}")))?;
+        // Binding: the key must hash to the claimed agent_id.
+        let derived = AgentId::from_public_key(&pubkey);
+        if derived != self.opener_agent_id {
+            return Err(ForwardError::AttestationKeyMismatch(format!(
+                "agent_id {} does not match key-derived id {}",
+                hex::encode(self.opener_agent_id.as_bytes()),
+                hex::encode(derived.as_bytes()),
+            )));
+        }
+        let sig = MlDsaSignature::from_bytes(&self.signature)
+            .map_err(|e| ForwardError::AttestationInvalid(format!("bad sig: {e:?}")))?;
+        verify_with_ml_dsa(&pubkey, &self.signable_bytes(), &sig)
+            .map_err(|e| ForwardError::AttestationInvalid(format!("verify: {e:?}")))?;
+        Ok(())
+    }
+
+    /// Encode as a length-prefixed bincode frame: `u32 BE len || bincode`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let body = bincode::serialize(self).unwrap_or_default();
+        let mut out = Vec::with_capacity(4 + body.len());
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Decode a length-prefixed V2 frame from a complete buffer. Returns the
+    /// consumed byte count alongside the header on success.
+    ///
+    /// # Errors
+    /// - [`ForwardError::Truncated`] — not enough bytes for the length prefix
+    ///   or the announced body.
+    /// - [`ForwardError::Oversize`] — announced length exceeds
+    ///   `MAX_HEADER_V2_BYTES`.
+    /// - [`ForwardError::Decode`] — bincode deserialization failed.
+    pub fn decode(buf: &[u8]) -> Result<(Self, usize), ForwardError> {
+        if buf.len() < 4 {
+            return Err(ForwardError::Truncated);
+        }
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if len > MAX_HEADER_V2_BYTES {
+            return Err(ForwardError::Oversize(len));
+        }
+        let end = 4 + len as usize;
+        if buf.len() < end {
+            return Err(ForwardError::Truncated);
+        }
+        let header: Self =
+            bincode::deserialize(&buf[4..end]).map_err(|e| ForwardError::Decode(e.to_string()))?;
+        Ok((header, end))
+    }
+}
+
 /// Encode the inbound side's `connected` response (1 byte — copy begins).
 #[must_use]
 fn encode_response_connected() -> [u8; 1] {
@@ -173,6 +326,21 @@ pub enum ForwardError {
     /// `target_host` is not a numeric loopback IP.
     #[error("target host is not a numeric loopback IP: {0}")]
     NotLoopbackTarget(String),
+    /// ForwardV2 attestation: the header carries no signature.
+    #[error("forward v2 attestation missing")]
+    AttestationMissing,
+    /// ForwardV2 attestation: the agent public key does not hash to the
+    /// claimed `opener_agent_id` (binding failure), or the key bytes are
+    /// unparseable.
+    #[error("forward v2 attestation key mismatch: {0}")]
+    AttestationKeyMismatch(String),
+    /// ForwardV2 attestation: the ML-DSA-65 signature is invalid or
+    /// unparseable.
+    #[error("forward v2 attestation invalid: {0}")]
+    AttestationInvalid(String),
+    /// ForwardV2 attestation: signing failed (internal crypto error).
+    #[error("forward v2 attestation sign failed: {0}")]
+    AttestationSign(String),
 }
 
 /// Resolve a `(host, port)` to a loopback `SocketAddr`. Numeric IP only — a
@@ -234,6 +402,71 @@ fn decide_inbound(
             &target,
         )?;
     }
+    Ok(target)
+}
+
+/// Inbound gate decision for a `ForwardV2` attested stream (#204).
+///
+/// The opener has cryptographically proven its identity (the ML-DSA-65
+/// signature verifies against the cached agent public key), so — unlike the
+/// [`decide_inbound`] multi-agent path — the ACL is checked for the **single
+/// attested agent**, not every agent on the machine. This closes the
+/// unannounced-agent window: even if a hostile agent has not yet propagated
+/// its announcement, its key is absent from the cache and the attestation
+/// fails-closed.
+///
+/// Fail-closed on: agent not in the discovery cache, no cached public key,
+/// agent's cached machine ≠ transport peer, signature/key binding failure,
+/// signature verification failure, or ACL denial.
+async fn decide_inbound_attested(
+    header: &ForwardV2Header,
+    policy: &ConnectPolicy,
+    peer_machine: &MachineId,
+    discovery_cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
+    >,
+) -> Result<SocketAddr, ConnectDenialReason> {
+    // Resolve the target first (same as V1 — a non-loopback target is
+    // refused before the attestation check, so an unverified peer learns
+    // nothing about which agents exist).
+    let target = resolve_loopback_target(&header.target_host, header.target_port)
+        .map_err(|_| ConnectDenialReason::TargetNotLoopback)?;
+
+    // Look up the opener in the discovery cache. An agent absent from the
+    // cache (unannounced or revoked-and-evicted) cannot be attested.
+    let cached = {
+        let cache = discovery_cache.read().await;
+        cache.get(&header.opener_agent_id).cloned()
+    };
+    let agent = cached.ok_or(ConnectDenialReason::AttestationFailed)?;
+
+    // Confirm the agent is on the transport-authenticated machine. A valid
+    // signature from an agent on a *different* machine is still a
+    // cross-machine impersonation attempt.
+    if agent.machine_id != *peer_machine {
+        return Err(ConnectDenialReason::AgentNotOnMachine);
+    }
+
+    // Verify the attestation against the cached key. An empty key (pre-v2
+    // announcement without a cert) means the agent cannot be attested.
+    if agent.agent_public_key.is_empty() {
+        return Err(ConnectDenialReason::AttestationFailed);
+    }
+    header
+        .verify_attestation(&agent.agent_public_key)
+        .map_err(|_| ConnectDenialReason::AttestationFailed)?;
+
+    // The opener is now cryptographically authenticated: ACL-check that
+    // specific agent (not every agent on the machine).
+    evaluate_connect_gate(
+        /* verified */ true,
+        Some(TrustDecision::Accept),
+        policy,
+        &header.opener_agent_id,
+        peer_machine,
+        &target,
+    )?;
+
     Ok(target)
 }
 
@@ -323,6 +556,9 @@ pub(crate) async fn handle_inbound(
     connect_diag: Arc<ConnectDiagnostics>,
     fwd_diag: Arc<ForwardDiagnostics>,
     revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    discovery_cache: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
+    >,
 ) {
     let agents: Vec<AgentId> = stream.peer_agents().to_vec();
     let machine_id = stream.peer();
@@ -353,51 +589,104 @@ pub(crate) async fn handle_inbound(
         }
     }
 
-    // FIX 2: bound the header read so a peer that opens a forward stream and
-    // then stalls cannot hold a forwarder task (and its concurrency permit).
-    // Reset + count on timeout. The declared length prefix is already capped
-    // at MAX_HEADER_BYTES inside read_header, so no huge pre-allocation.
-    let header =
-        match tokio::time::timeout(HEADER_READ_TIMEOUT, read_header(stream.recv_mut())).await {
-            Ok(Ok(h)) => h,
-            Ok(Err(e)) => {
-                tracing::info!(
-                    target: "x0x::forward",
-                    peer = %hex::encode(peer.as_bytes()),
-                    error = %e,
-                    "inbound forward: header read failed — closing stream"
-                );
-                return;
+    // Read header + run the connect gate, branching on the stream protocol.
+    // ForwardV2: attestation path — verify the opener's signature against the
+    // cached agent key, confirm machine binding, ACL-check the single
+    // authenticated agent (#204). ForwardV1: legacy multi-agent fail-closed
+    // (#192), kept for backward compatibility with pre-#204 peers.
+    let target = match stream.protocol() {
+        StreamProtocol::ForwardV2 => {
+            // FIX 2: bound the header read (larger budget for the ~3.3 KB
+            // ML-DSA-65 signature). Reset + count on timeout.
+            let header =
+                match tokio::time::timeout(HEADER_READ_TIMEOUT, read_header_v2(stream.recv_mut()))
+                    .await
+                {
+                    Ok(Ok(h)) => h,
+                    Ok(Err(e)) => {
+                        tracing::info!(
+                            target: "x0x::forward",
+                            peer = %hex::encode(peer.as_bytes()),
+                            error = %e,
+                            "inbound forward v2: header read failed — closing stream"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        fwd_diag.record_header_timeout();
+                        tracing::info!(
+                            target: "x0x::forward",
+                            peer = %hex::encode(peer.as_bytes()),
+                            "inbound forward v2: header read timed out — resetting stream"
+                        );
+                        return;
+                    }
+                };
+            match decide_inbound_attested(&header, &policy, &machine_id, &discovery_cache).await {
+                Ok(addr) => addr,
+                Err(reason) => {
+                    connect_diag.record_denied(reason);
+                    let _ = stream
+                        .send_mut()
+                        .write_all(&encode_response_denied(reason))
+                        .await;
+                    tracing::info!(
+                        target: "x0x::forward",
+                        peer = %hex::encode(peer.as_bytes()),
+                        ?reason,
+                        target = %header.target_host,
+                        port = header.target_port,
+                        "inbound forward v2 denied at attestation/connect gate"
+                    );
+                    return;
+                }
             }
-            Err(_) => {
-                fwd_diag.record_header_timeout();
-                tracing::info!(
-                    target: "x0x::forward",
-                    peer = %hex::encode(peer.as_bytes()),
-                    "inbound forward: header read timed out — resetting stream"
-                );
-                return;
+        }
+        _ => {
+            // ForwardV1: legacy path (#192 multi-agent fail-closed).
+            let header =
+                match tokio::time::timeout(HEADER_READ_TIMEOUT, read_header(stream.recv_mut()))
+                    .await
+                {
+                    Ok(Ok(h)) => h,
+                    Ok(Err(e)) => {
+                        tracing::info!(
+                            target: "x0x::forward",
+                            peer = %hex::encode(peer.as_bytes()),
+                            error = %e,
+                            "inbound forward: header read failed — closing stream"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        fwd_diag.record_header_timeout();
+                        tracing::info!(
+                            target: "x0x::forward",
+                            peer = %hex::encode(peer.as_bytes()),
+                            "inbound forward: header read timed out — resetting stream"
+                        );
+                        return;
+                    }
+                };
+            match decide_inbound(&header, &policy, &agents, &machine_id) {
+                Ok(addr) => addr,
+                Err(reason) => {
+                    connect_diag.record_denied(reason);
+                    let _ = stream
+                        .send_mut()
+                        .write_all(&encode_response_denied(reason))
+                        .await;
+                    tracing::info!(
+                        target: "x0x::forward",
+                        peer = %hex::encode(peer.as_bytes()),
+                        ?reason,
+                        target = %header.target_host,
+                        port = header.target_port,
+                        "inbound forward denied at connect gate"
+                    );
+                    return;
+                }
             }
-        };
-
-    // Gate: resolve + ACL. On deny, write a typed frame + record, then close.
-    let target = match decide_inbound(&header, &policy, &agents, &machine_id) {
-        Ok(addr) => addr,
-        Err(reason) => {
-            connect_diag.record_denied(reason);
-            let _ = stream
-                .send_mut()
-                .write_all(&encode_response_denied(reason))
-                .await;
-            tracing::info!(
-                target: "x0x::forward",
-                peer = %hex::encode(peer.as_bytes()),
-                ?reason,
-                target = %header.target_host,
-                port = header.target_port,
-                "inbound forward denied at connect gate"
-            );
-            return;
         }
     };
 
@@ -508,6 +797,38 @@ async fn write_header<W: tokio::io::AsyncWrite + Unpin>(
         .map_err(|e| NetworkError::StreamError(format!("write forward header: {e}")))
 }
 
+/// Read a length-prefixed `ForwardV2Header` from an async reader.
+async fn read_header_v2<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+) -> Result<ForwardV2Header, ForwardError> {
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)
+        .await
+        .map_err(|_| ForwardError::Truncated)?;
+    let len = u32::from_be_bytes(len_buf);
+    if len > MAX_HEADER_V2_BYTES {
+        return Err(ForwardError::Oversize(len));
+    }
+    let mut body = vec![0u8; len as usize];
+    r.read_exact(&mut body)
+        .await
+        .map_err(|_| ForwardError::Truncated)?;
+    bincode::deserialize(&body).map_err(|e| ForwardError::Decode(e.to_string()))
+}
+
+/// Write a length-prefixed `ForwardV2Header` to an async writer.
+async fn write_header_v2<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    header: &ForwardV2Header,
+) -> Result<(), NetworkError> {
+    use tokio::io::AsyncWriteExt;
+    let frame = header.encode();
+    w.write_all(&frame)
+        .await
+        .map_err(|e| NetworkError::StreamError(format!("write forward v2 header: {e}")))
+}
+
 // ===========================================================================
 // ForwardService — owns the inbound consumer + outbound local listeners.
 // ===========================================================================
@@ -563,6 +884,10 @@ pub struct ForwardService {
     per_peer: Arc<std::sync::Mutex<HashMap<AgentId, u32>>>,
     /// Shared revocation set for the FIX 4 pre-header re-check.
     revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    /// Shared identity discovery cache — for ForwardV2 attestation key
+    /// lookups (#204).
+    discovery_cache:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>>,
 }
 
 /// RAII per-peer slot: decrements the per-peer counter (and prunes the entry
@@ -638,6 +963,7 @@ impl ForwardService {
         connect_diag: Arc<ConnectDiagnostics>,
     ) -> Self {
         let revocation_set = agent.revocation_set();
+        let discovery_cache = agent.identity_discovery_cache();
         Self {
             agent,
             policy,
@@ -649,6 +975,7 @@ impl ForwardService {
             outbound_permits: Arc::new(tokio::sync::Semaphore::new(MAX_OUTBOUND_STREAMS)),
             per_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             revocation_set,
+            discovery_cache,
         }
     }
 
@@ -687,8 +1014,12 @@ impl ForwardService {
                         None => break,
                     },
                 };
-                if stream.protocol() != crate::streams::StreamProtocol::ForwardV1 {
-                    // T5 (SOCKS5) owns 0x02; until then drop non-forward streams.
+                if !matches!(
+                    stream.protocol(),
+                    crate::streams::StreamProtocol::ForwardV1
+                        | crate::streams::StreamProtocol::ForwardV2
+                ) {
+                    // T5 (SOCKS5) owns 0x02; drop non-forward streams.
                     tracing::debug!(
                         target: "x0x::forward",
                         protocol = ?stream.protocol(),
@@ -722,6 +1053,7 @@ impl ForwardService {
                         Arc::clone(&this.connect_diag),
                         Arc::clone(&this.fwd_diag),
                         Arc::clone(&this.revocation_set),
+                        Arc::clone(&this.discovery_cache),
                     )
                     .await;
                 });
@@ -754,10 +1086,8 @@ impl ForwardService {
         let outbound_permits = Arc::clone(&self.outbound_permits);
         let per_peer = Arc::clone(&self.per_peer);
         let peer_agent = spec.peer_agent;
-        let header = ForwardHeader {
-            target_host: spec.target_host,
-            target_port: spec.target_port,
-        };
+        let target_host = spec.target_host;
+        let target_port = spec.target_port;
         tokio::spawn(async move {
             tracing::info!(
                 target: "x0x::forward",
@@ -798,12 +1128,12 @@ impl ForwardService {
                 };
                 let agent = Arc::clone(&agent);
                 let fwd_diag = Arc::clone(&fwd_diag);
-                let header = header.clone();
+                let target_host = target_host.clone();
                 tokio::spawn(async move {
                     let _admission = admission;
                     fwd_diag.enter_stream();
                     let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
-                    drive_outbound(agent, peer_agent, header, tcp).await;
+                    drive_outbound(agent, peer_agent, target_host, target_port, tcp).await;
                 });
             }
         });
@@ -848,16 +1178,55 @@ impl ForwardService {
 }
 
 /// Outbound driver: open the peer stream, write the header, read the peer's
-/// connect response, and bridge on `connected`. On any failure the local TCP
+/// connect response, and bridge on `connected'. On any failure the local TCP
 /// connection is simply closed (the client sees a reset/refused).
+///
+/// Tries `ForwardV2` (agent attestation, #204) first. If the peer rejects V2
+/// (pre-#204 software — the stream is reset after the unknown protocol byte),
+/// falls back to `ForwardV1` so mixed-fleet upgrades degrade gracefully.
 async fn drive_outbound(
     agent: Arc<crate::Agent>,
     peer_agent: AgentId,
-    header: ForwardHeader,
+    target_host: String,
+    target_port: u16,
     tcp: TcpStream,
 ) {
+    // Try ForwardV2 (attestation). On peer rejection (old software), fall
+    // back to ForwardV1 with the same TCP connection.
+    match try_outbound_v2(&agent, &peer_agent, &target_host, target_port, tcp).await {
+        OutboundOutcome::Done => (),
+        OutboundOutcome::PeerRejectedV2(tcp) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                "outbound forward: peer does not support ForwardV2 — falling back to V1"
+            );
+            drive_outbound_v1(&agent, &peer_agent, &target_host, target_port, tcp).await;
+        }
+    }
+}
+
+/// Outcome of a V2 outbound attempt.
+enum OutboundOutcome {
+    /// The V2 forward completed (connected, denied, or failed permanently).
+    Done,
+    /// The peer rejected ForwardV2 (old software); the TCP is returned so the
+    /// caller can retry with V1.
+    PeerRejectedV2(TcpStream),
+}
+
+/// Attempt a `ForwardV2` outbound forward. Returns `PeerRejectedV2` only when
+/// the failure is specifically the peer not understanding the V2 protocol
+/// byte (the write to the opened stream fails immediately).
+async fn try_outbound_v2(
+    agent: &Arc<crate::Agent>,
+    peer_agent: &AgentId,
+    target_host: &str,
+    target_port: u16,
+    tcp: TcpStream,
+) -> OutboundOutcome {
     let mut stream = match agent
-        .open_peer_stream(&peer_agent, crate::streams::StreamProtocol::ForwardV1)
+        .open_peer_stream(peer_agent, StreamProtocol::ForwardV2)
         .await
     {
         Ok(s) => s,
@@ -866,19 +1235,75 @@ async fn drive_outbound(
                 target: "x0x::forward",
                 peer = %hex::encode(peer_agent.as_bytes()),
                 error = %e,
-                "outbound forward: could not open peer stream"
+                "outbound forward v2: could not open peer stream"
             );
-            return;
+            return OutboundOutcome::PeerRejectedV2(tcp);
         }
     };
-    if write_header(stream.send_mut(), &header).await.is_err() {
-        return;
+    // Build + sign the V2 header with the local agent keypair.
+    let mut header = ForwardV2Header::new(target_host.to_string(), target_port, agent.agent_id());
+    if let Err(e) = header.sign(agent.identity().agent_keypair()) {
+        tracing::warn!(
+            target: "x0x::forward",
+            error = %e,
+            "outbound forward v2: failed to sign attestation — falling back to V1"
+        );
+        return OutboundOutcome::PeerRejectedV2(tcp);
+    }
+    // Write the V2 header. If this fails the peer likely reset the stream
+    // after reading the unknown V2 protocol byte (old software) — fall back.
+    if write_header_v2(stream.send_mut(), &header).await.is_err() {
+        return OutboundOutcome::PeerRejectedV2(tcp);
     }
     // Read the peer's connect-response byte.
     let mut resp = [0u8; 1];
     if stream.recv_mut().read_exact(&mut resp).await.is_err() {
+        return OutboundOutcome::Done;
+    }
+    finish_outbound(stream, resp, peer_agent, tcp).await;
+    OutboundOutcome::Done
+}
+
+/// Legacy `ForwardV1` outbound forward (no attestation). Used for pre-#204
+/// peers and as a last-resort fallback.
+async fn drive_outbound_v1(
+    agent: &Arc<crate::Agent>,
+    peer_agent: &AgentId,
+    target_host: &str,
+    target_port: u16,
+    tcp: TcpStream,
+) {
+    let mut stream = match agent
+        .open_peer_stream(peer_agent, StreamProtocol::ForwardV1)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                error = %e,
+                "outbound forward v1: could not open peer stream"
+            );
+            return;
+        }
+    };
+    let header = ForwardHeader {
+        target_host: target_host.to_string(),
+        target_port,
+    };
+    if write_header(stream.send_mut(), &header).await.is_err() {
         return;
     }
+    let mut resp = [0u8; 1];
+    if stream.recv_mut().read_exact(&mut resp).await.is_err() {
+        return;
+    }
+    finish_outbound(stream, resp, peer_agent, tcp).await;
+}
+
+/// Shared tail: interpret the connect-response byte and bridge on `connected`.
+async fn finish_outbound(stream: PeerStream, resp: [u8; 1], peer_agent: &AgentId, tcp: TcpStream) {
     match response_connected(resp[0]) {
         Some(true) => {
             let (send, recv) = stream.into_split();
@@ -899,7 +1324,6 @@ async fn drive_outbound(
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,6 +1620,358 @@ mod tests {
         assert!(
             admit_to(&big, &pp, peer_a).is_some(),
             "per-peer cap must re-admit after a slot is released"
+        );
+    }
+
+    // ── ForwardV2 attestation tests (#204) ─────────────────────────────────
+
+    use crate::identity::AgentKeypair;
+    use std::collections::HashMap;
+
+    /// Build a discovery cache with one agent entry (key + machine binding).
+    fn cache_with_agent(
+        keypair: &AgentKeypair,
+        machine: MachineId,
+    ) -> Arc<tokio::sync::RwLock<HashMap<AgentId, crate::DiscoveredAgent>>> {
+        let agent_id = keypair.agent_id();
+        let mut cache = HashMap::new();
+        cache.insert(
+            agent_id,
+            crate::DiscoveredAgent {
+                agent_id,
+                machine_id: machine,
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: 0,
+                last_seen: 0,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                agent_public_key: keypair.public_key().as_bytes().to_vec(),
+            },
+        );
+        Arc::new(tokio::sync::RwLock::new(cache))
+    }
+
+    /// Build a signed V2 header for `(target, port)` from the given keypair.
+    fn signed_v2_header(target: &str, port: u16, keypair: &AgentKeypair) -> ForwardV2Header {
+        let mut h = ForwardV2Header::new(target.to_string(), port, keypair.agent_id());
+        h.sign(keypair).expect("sign");
+        h
+    }
+
+    #[test]
+    fn v2_header_frame_round_trips() {
+        let kp = AgentKeypair::generate().unwrap();
+        let h = signed_v2_header("127.0.0.1", 22, &kp);
+        let bytes = h.encode();
+        let (decoded, n) = ForwardV2Header::decode(&bytes).expect("decode");
+        assert_eq!(decoded, h);
+        assert_eq!(n, bytes.len());
+    }
+
+    #[test]
+    fn v2_header_decode_rejects_oversize() {
+        let kp = AgentKeypair::generate().unwrap();
+        let h = signed_v2_header("127.0.0.1", 22, &kp);
+        let bytes = h.encode();
+        // Tamper the length prefix to exceed the cap.
+        let mut bad = bytes.clone();
+        let len = (MAX_HEADER_V2_BYTES + 1).to_be_bytes();
+        bad[..4].copy_from_slice(&len);
+        assert_eq!(
+            ForwardV2Header::decode(&bad).unwrap_err(),
+            ForwardError::Oversize(MAX_HEADER_V2_BYTES + 1)
+        );
+    }
+
+    #[test]
+    fn v2_attestation_sign_and_verify() {
+        let kp = AgentKeypair::generate().unwrap();
+        let h = signed_v2_header("127.0.0.1", 22, &kp);
+        // Valid attestation: the key hashes to the agent_id and the sig verifies.
+        h.verify_attestation(kp.public_key().as_bytes())
+            .expect("valid attestation must verify");
+    }
+
+    #[test]
+    fn v2_attestation_rejects_missing_signature() {
+        let kp = AgentKeypair::generate().unwrap();
+        let h = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id());
+        // Empty signature → AttestationMissing.
+        assert_eq!(
+            h.verify_attestation(kp.public_key().as_bytes())
+                .unwrap_err(),
+            ForwardError::AttestationMissing
+        );
+    }
+
+    #[test]
+    fn v2_attestation_rejects_forged_signature() {
+        let kp = AgentKeypair::generate().unwrap();
+        let mut h = signed_v2_header("127.0.0.1", 22, &kp);
+        // Flip a byte in the signature → verification must fail.
+        let sig_len = h.signature.len();
+        h.signature[sig_len / 2] ^= 0xFF;
+        assert!(matches!(
+            h.verify_attestation(kp.public_key().as_bytes())
+                .unwrap_err(),
+            ForwardError::AttestationInvalid(_)
+        ));
+    }
+
+    #[test]
+    fn v2_attestation_rejects_wrong_key() {
+        let kp = AgentKeypair::generate().unwrap();
+        let h = signed_v2_header("127.0.0.1", 22, &kp);
+        // A different agent's key does not hash to the same agent_id.
+        let other = AgentKeypair::generate().unwrap();
+        assert!(matches!(
+            h.verify_attestation(other.public_key().as_bytes())
+                .unwrap_err(),
+            ForwardError::AttestationKeyMismatch(_)
+        ));
+    }
+
+    #[test]
+    fn v2_signable_bytes_are_deterministic_and_domain_separated() {
+        let kp = AgentKeypair::generate().unwrap();
+        let h1 = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id());
+        let h2 = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id());
+        assert_eq!(h1.signable_bytes(), h2.signable_bytes());
+        // A different target changes the bytes.
+        let h3 = ForwardV2Header::new("::1".to_string(), 22, kp.agent_id());
+        assert_ne!(h1.signable_bytes(), h3.signable_bytes());
+        // Domain prefix is present.
+        assert!(h1
+            .signable_bytes()
+            .starts_with(FORWARD_V2_ATTESTATION_DOMAIN));
+    }
+
+    #[tokio::test]
+    async fn decide_inbound_attested_matrix() {
+        // #204: the attested gate verifies the opener's signature against the
+        // cached agent key, confirms machine binding, then ACL-checks that
+        // single agent.
+        let kp = AgentKeypair::generate().unwrap();
+        let agent = kp.agent_id();
+        let machine = MachineId([2u8; 32]);
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+        let cache = cache_with_agent(&kp, machine);
+
+        // Happy path: valid attestation + agent in ACL + correct machine.
+        let policy = policy_with_allow(agent, machine, target);
+        let header = signed_v2_header("127.0.0.1", 22, &kp);
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &machine, &cache)
+                .await
+                .unwrap(),
+            target,
+        );
+
+        // Missing attestation (empty sig) → AttestationFailed.
+        let header = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent);
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &machine, &cache)
+                .await
+                .unwrap_err(),
+            ConnectDenialReason::AttestationFailed,
+        );
+
+        // Forged signature → AttestationFailed.
+        let mut header = signed_v2_header("127.0.0.1", 22, &kp);
+        let mid = header.signature.len() / 2;
+        header.signature[mid] ^= 0xFF;
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &machine, &cache)
+                .await
+                .unwrap_err(),
+            ConnectDenialReason::AttestationFailed,
+        );
+
+        // Agent unknown to cache → AttestationFailed.
+        let stranger = AgentKeypair::generate().unwrap();
+        let header = signed_v2_header("127.0.0.1", 22, &stranger);
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &machine, &cache)
+                .await
+                .unwrap_err(),
+            ConnectDenialReason::AttestationFailed,
+        );
+
+        // ACL denial (target not in entry) → TargetNotAllowed.
+        let policy = policy_with_allow(agent, machine, "127.0.0.1:9999".parse().unwrap());
+        let header = signed_v2_header("127.0.0.1", 22, &kp);
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &machine, &cache)
+                .await
+                .unwrap_err(),
+            ConnectDenialReason::TargetNotAllowed,
+        );
+
+        // Non-loopback target → TargetNotLoopback.
+        let policy = policy_with_allow(agent, machine, target);
+        let header = signed_v2_header("10.0.0.1", 22, &kp);
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &machine, &cache)
+                .await
+                .unwrap_err(),
+            ConnectDenialReason::TargetNotLoopback,
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_inbound_attested_wrong_machine_denied() {
+        // Signature is valid and the agent is in the cache, but the cached
+        // machine_id ≠ transport peer machine. This is a cross-machine
+        // impersonation attempt — must be denied.
+        let kp = AgentKeypair::generate().unwrap();
+        let agent = kp.agent_id();
+        let real_machine = MachineId([2u8; 32]);
+        let other_machine = MachineId([9u8; 32]);
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+        let cache = cache_with_agent(&kp, real_machine);
+        let policy = policy_with_allow(agent, real_machine, target);
+
+        let header = signed_v2_header("127.0.0.1", 22, &kp);
+        // Transport peer is `other_machine` but the agent is cached on
+        // `real_machine` → AgentNotOnMachine.
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &other_machine, &cache)
+                .await
+                .unwrap_err(),
+            ConnectDenialReason::AgentNotOnMachine,
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_inbound_attested_multi_agent_checks_only_attested() {
+        // #204: on a multi-agent machine the attested gate checks ONLY the
+        // authenticated opener — not every agent on the machine. A second
+        // agent that is NOT in the ACL (and would cause a V1 multi-agent
+        // fail-closed) does not affect the V2 path.
+        let machine = MachineId([2u8; 32]);
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+
+        // Agent A (the opener) — authorized.
+        let kp_a = AgentKeypair::generate().unwrap();
+        let agent_a = kp_a.agent_id();
+
+        // Agent B (also on the machine, NOT authorized for the target).
+        let kp_b = AgentKeypair::generate().unwrap();
+        let agent_b = kp_b.agent_id();
+
+        // Cache holds both agents on the same machine.
+        let mut cache_map = HashMap::new();
+        for kp in [&kp_a, &kp_b] {
+            let id = kp.agent_id();
+            cache_map.insert(
+                id,
+                crate::DiscoveredAgent {
+                    agent_id: id,
+                    machine_id: machine,
+                    user_id: None,
+                    addresses: Vec::new(),
+                    announced_at: 0,
+                    last_seen: 0,
+                    machine_public_key: Vec::new(),
+                    nat_type: None,
+                    can_receive_direct: None,
+                    is_relay: None,
+                    is_coordinator: None,
+                    reachable_via: Vec::new(),
+                    relay_candidates: Vec::new(),
+                    cert_not_after: None,
+                    agent_certificate: None,
+                    agent_public_key: kp.public_key().as_bytes().to_vec(),
+                },
+            );
+        }
+        let cache = Arc::new(tokio::sync::RwLock::new(cache_map));
+
+        // Policy: only agent_a is authorized. Agent B is absent from the ACL.
+        let policy = policy_multi(vec![allow_entry(agent_a, machine, &[target])]);
+
+        // V2 attestation from agent_a succeeds even though agent_b is
+        // unauthorized — the gate checks ONLY the authenticated opener.
+        let header_a = signed_v2_header("127.0.0.1", 22, &kp_a);
+        assert_eq!(
+            decide_inbound_attested(&header_a, &policy, &machine, &cache)
+                .await
+                .unwrap(),
+            target,
+        );
+
+        // V2 attestation from agent_b is denied (not in ACL).
+        let header_b = signed_v2_header("127.0.0.1", 22, &kp_b);
+        assert_eq!(
+            decide_inbound_attested(&header_b, &policy, &machine, &cache)
+                .await
+                .unwrap_err(),
+            ConnectDenialReason::AgentMachineNotInAcl,
+        );
+
+        // Sanity: the V1 multi-agent path WOULD fail-closed here (both
+        // agents checked, B is unauthorized). This confirms V2 lifts the
+        // restriction for the authenticated opener.
+        assert_eq!(
+            decide_inbound(
+                &header("127.0.0.1", 22),
+                &policy,
+                &[agent_a, agent_b],
+                &machine
+            )
+            .unwrap_err(),
+            ConnectDenialReason::AgentMachineNotInAcl,
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_inbound_attested_no_cached_key_denied() {
+        // Agent is in the cache but has no public key (pre-v2 announcement
+        // without a cert) → cannot be attested → fail-closed.
+        let kp = AgentKeypair::generate().unwrap();
+        let agent = kp.agent_id();
+        let machine = MachineId([2u8; 32]);
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+
+        let mut cache_map = HashMap::new();
+        cache_map.insert(
+            agent,
+            crate::DiscoveredAgent {
+                agent_id: agent,
+                machine_id: machine,
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: 0,
+                last_seen: 0,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                agent_public_key: Vec::new(), // no key!
+            },
+        );
+        let cache = Arc::new(tokio::sync::RwLock::new(cache_map));
+        let policy = policy_with_allow(agent, machine, target);
+
+        let header = signed_v2_header("127.0.0.1", 22, &kp);
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &machine, &cache)
+                .await
+                .unwrap_err(),
+            ConnectDenialReason::AttestationFailed,
         );
     }
 }

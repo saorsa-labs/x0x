@@ -626,6 +626,15 @@ impl AgentCertificate {
         Ok(AgentId::from_public_key(&pubkey))
     }
 
+    /// Get the raw ML-DSA-65 agent public key bytes stored in this certificate.
+    ///
+    /// Used by the forward-attestation path to look up the cached agent key
+    /// for verifying an inbound `ForwardV2` header signature (#204).
+    #[must_use]
+    pub fn agent_public_key(&self) -> &[u8] {
+        &self.agent_public_key
+    }
+
     /// Get the issuance timestamp.
     #[must_use]
     pub fn issued_at(&self) -> u64 {
