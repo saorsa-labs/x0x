@@ -7377,6 +7377,14 @@ impl Agent {
         std::sync::Arc::clone(&self.identity_discovery_cache)
     }
 
+    /// Return the shared contact store (`pub(crate)` — used by the forwarder
+    /// to evaluate trust for ForwardV2 attestation, #204 must-fix 3).
+    pub(crate) fn contact_store(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>> {
+        std::sync::Arc::clone(&self.contact_store)
+    }
+
     /// Return a snapshot of all known revocation records.
     ///
     /// This is a read-only snapshot; the in-memory set grows only (no un-revocation).
