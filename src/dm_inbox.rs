@@ -41,6 +41,7 @@ struct AuthenticatedMachineBinding {
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
     capacity: usize,
+    recency: std::collections::BTreeSet<(u64, [u8; 32])>,
     clock: u64,
 }
 
@@ -48,6 +49,7 @@ impl Default for AuthenticatedMachineBindingCache {
     fn default() -> Self {
         Self {
             entries: std::collections::HashMap::new(),
+            recency: std::collections::BTreeSet::new(),
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
         }
@@ -59,6 +61,7 @@ impl AuthenticatedMachineBindingCache {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: std::collections::HashMap::new(),
+            recency: std::collections::BTreeSet::new(),
             capacity: capacity.max(1),
             clock: 0,
         }
@@ -75,6 +78,12 @@ impl AuthenticatedMachineBindingCache {
             for binding in self.entries.values_mut() {
                 binding.last_used = binding.last_used.saturating_sub(oldest);
             }
+            self.recency.clear();
+            self.recency.extend(
+                self.entries
+                    .iter()
+                    .map(|(agent_id, binding)| (binding.last_used, agent_id.0)),
+            );
             self.clock = self.clock.saturating_sub(oldest);
         }
         self.clock = self.clock.saturating_add(1);
@@ -83,29 +92,31 @@ impl AuthenticatedMachineBindingCache {
 
     fn record(&mut self, agent_id: AgentId, machine_id: MachineId, announced_at: u64) {
         let tick = self.next_tick();
-        if let Some(existing) = self.entries.get_mut(&agent_id) {
+        if let Some(mut existing) = self.entries.get(&agent_id).copied() {
+            self.recency.remove(&(existing.last_used, agent_id.0));
             existing.last_used = tick;
             if announced_at >= existing.announced_at {
                 existing.machine_id = machine_id;
                 existing.announced_at = announced_at;
             }
+            self.entries.insert(agent_id, existing);
+            self.recency.insert((tick, agent_id.0));
             return;
         }
 
         if self.entries.len() >= self.capacity {
-            let evicted = self
-                .entries
-                .iter()
-                .min_by_key(|(_, binding)| binding.last_used)
-                .map(|(id, binding)| (*id, *binding));
-            if let Some((evicted_agent, evicted_binding)) = evicted {
-                self.entries.remove(&evicted_agent);
-                tracing::warn!(
-                    agent = %hex::encode(evicted_agent.as_bytes()),
-                    machine = %hex::encode(evicted_binding.machine_id.as_bytes()),
-                    capacity = self.capacity,
-                    "authenticated machine binding evicted; future DMs degrade to claimed-machine fallback"
-                );
+            let oldest = self.recency.first().copied();
+            if let Some(oldest_key) = oldest {
+                self.recency.remove(&oldest_key);
+                let evicted_agent = AgentId(oldest_key.1);
+                if let Some(evicted_binding) = self.entries.remove(&evicted_agent) {
+                    tracing::warn!(
+                        agent = %hex::encode(evicted_agent.as_bytes()),
+                        machine = %hex::encode(evicted_binding.machine_id.as_bytes()),
+                        capacity = self.capacity,
+                        "authenticated machine binding evicted; future DMs degrade to claimed-machine fallback"
+                    );
+                }
             }
         }
 
@@ -117,12 +128,16 @@ impl AuthenticatedMachineBindingCache {
                 last_used: tick,
             },
         );
+        self.recency.insert((tick, agent_id.0));
     }
 
     fn resolve(&mut self, agent_id: &AgentId) -> Option<MachineId> {
         let tick = self.next_tick();
-        let binding = self.entries.get_mut(agent_id)?;
+        let mut binding = self.entries.get(agent_id).copied()?;
+        self.recency.remove(&(binding.last_used, agent_id.0));
         binding.last_used = tick;
+        self.entries.insert(*agent_id, binding);
+        self.recency.insert((tick, agent_id.0));
         Some(binding.machine_id)
     }
 }
@@ -145,6 +160,14 @@ pub(crate) async fn record_authenticated_machine_binding(
         .write()
         .await
         .record(agent_id, machine_id, announced_at);
+}
+
+#[cfg(test)]
+pub(crate) async fn authenticated_machine_binding_for_testing(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: &AgentId,
+) -> Option<MachineId> {
+    bindings.write().await.resolve(agent_id)
 }
 
 #[derive(Clone, Default)]
