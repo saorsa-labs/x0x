@@ -233,6 +233,14 @@ pub struct Agent {
     identity_discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
+    /// Latest authenticated agent→machine bindings accepted from verified
+    /// identity announcements. Unlike reachability caches, these bindings
+    /// survive revocation eviction so relayed DMs cannot replace a revoked
+    /// origin machine with an envelope-controlled claim.
+    /// The bounded LRU is intentionally in-memory: restart and eviction degrade
+    /// to the observable claimed-machine fallback until a verified announcement
+    /// repopulates the binding. Protocol-level closure is tracked in issue #213.
+    authenticated_machine_bindings: dm_inbox::AuthenticatedMachineBindings,
     /// Cache of discovered machine endpoints from machine announcements and
     /// agent→machine identity links.
     machine_discovery_cache: std::sync::Arc<
@@ -5691,6 +5699,8 @@ impl Agent {
             None => None,
         };
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let authenticated_machine_bindings =
+            std::sync::Arc::clone(&self.authenticated_machine_bindings);
         let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
         let user_cache = std::sync::Arc::clone(&self.user_discovery_cache);
         let bootstrap_cache = self.bootstrap_cache.clone();
@@ -6233,6 +6243,13 @@ impl Agent {
                     cert_not_after,
                     agent_certificate: announcement.agent_certificate.clone(),
                 };
+                dm_inbox::record_authenticated_machine_binding(
+                    &authenticated_machine_bindings,
+                    announcement.agent_id,
+                    announcement.machine_id,
+                    announcement.announced_at,
+                )
+                .await;
                 upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
                 upsert_discovered_agent(&cache, discovered_agent).await;
                 tracing::debug!(
@@ -6914,6 +6931,7 @@ impl Agent {
             std::sync::Arc::clone(&self.recent_delivery_cache),
             config,
             std::sync::Arc::clone(&self.revocation_set),
+            std::sync::Arc::clone(&self.authenticated_machine_bindings),
         )
         .await
         .map_err(|e| {
@@ -9452,6 +9470,9 @@ impl AgentBuilder {
             bootstrap_cache,
             gossip_cache_adapter,
             identity_discovery_cache,
+            authenticated_machine_bindings: std::sync::Arc::new(tokio::sync::RwLock::new(
+                dm_inbox::AuthenticatedMachineBindingCache::default(),
+            )),
             machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
