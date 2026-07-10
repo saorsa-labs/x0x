@@ -67,10 +67,9 @@ const RESP_DENIED: u8 = 0x00;
 /// Hard cap on the encoded header size. A loopback `host:port` is tiny; a
 /// larger frame is either malformed or an attack — reject rather than read.
 const MAX_HEADER_BYTES: u32 = 256;
-
-/// Hard cap on the encoded V2 header size. The ML-DSA-65 signature is ~3.3 KB;
-/// a V2 frame larger than this is malformed or an attack.
-const MAX_HEADER_V2_BYTES: u32 = 4096;
+/// Hard cap on the encoded V2 header size. The ML-DSA-65 signature (~3.3 KB)
+/// + the agent public key (~2 KB) + overhead; 8 KB gives headroom.
+pub const MAX_HEADER_V2_BYTES: u32 = 8192;
 
 /// Local connect timeout for the inbound side's `TcpStream::connect`.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -157,13 +156,14 @@ const FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS: u64 = 5_000;
 
 /// Forward header with agent attestation (`ForwardV2`, #204).
 ///
-/// Carries the opener's `agent_id` plus an ML-DSA-65 signature over the
-/// header's signable bytes. The inbound side verifies the signature against
-/// the **cached** agent public key (from the discovery cache), confirms the
-/// agent is on the transport-authenticated machine, then ACL-checks that
-/// specific agent. This closes the unannounced-agent window: the opener
-/// proves its identity cryptographically, independent of whether its
-/// announcement has propagated.
+/// Carries the opener's `agent_id` + **public key** plus an ML-DSA-65
+/// signature over the header's signable bytes. The inbound side verifies
+/// the signature against the **header's** key (after checking the binding
+/// `SHA-256(key) == agent_id`), confirms the agent is on the transport-
+/// authenticated machine via the discovery cache, then ACL-checks that
+/// specific agent. The key travels in the header (not just the cache) so
+/// the verifier never depends on announce-propagation timing — the soak
+/// NO-GO root cause.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardV2Header {
     /// Numeric loopback IP the peer wants to reach (e.g. `127.0.0.1`, `::1`).
@@ -172,6 +172,12 @@ pub struct ForwardV2Header {
     pub target_port: u16,
     /// The opener's agent identity (proves which agent opened the stream).
     pub opener_agent_id: AgentId,
+    /// The opener's raw ML-DSA-65 public key bytes. Bound to
+    /// `opener_agent_id` via `SHA-256(key) == agent_id`; the verifier checks
+    /// this binding before trusting the key. Carrying the key in the header
+    /// (rather than relying on the discovery cache) eliminates the announce-
+    /// propagation gap that blocked the V2 happy path in the soak (#204).
+    pub opener_agent_public_key: Vec<u8>,
     /// The recipient's machine identity — binds the attestation to the
     /// specific peer the opener dialled so a captured header cannot be
     /// replayed to a different machine.
@@ -191,18 +197,19 @@ impl ForwardV2Header {
         target_host: String,
         target_port: u16,
         opener_agent_id: AgentId,
+        opener_agent_public_key: Vec<u8>,
         recipient_machine_id: MachineId,
     ) -> Self {
         Self {
             target_host,
             target_port,
             opener_agent_id,
+            opener_agent_public_key,
             recipient_machine_id,
             issued_at_ms: 0,
             signature: Vec::new(),
         }
     }
-
     /// Canonical bytes signed by the opener to produce `signature`.
     ///
     /// Deterministic, domain-prefixed, length-prefixed encoding of every
@@ -221,6 +228,10 @@ impl ForwardV2Header {
         buf.extend_from_slice(&self.target_port.to_le_bytes());
         // opener_agent_id (fixed 32 bytes)
         buf.extend_from_slice(&self.opener_agent_id.0);
+        // opener_agent_public_key (length-prefixed) — bound to agent_id via
+        // hash; committed to the signature so it cannot be swapped (#204).
+        buf.extend_from_slice(&(self.opener_agent_public_key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.opener_agent_public_key);
         // recipient_machine_id (fixed 32 bytes) — scope binding (#204 replay)
         buf.extend_from_slice(&self.recipient_machine_id.0);
         // issued_at_ms (u64 LE) — freshness binding (#204 replay)
@@ -515,28 +526,38 @@ async fn decide_inbound_attested(
     }
 
     // Look up the opener in the discovery cache. An agent absent from the
-    // cache (unannounced or revoked-and-evicted) cannot be attested.
+    // cache (unannounced or revoked-and-evicted) cannot be attested. The cache
+    // is used for EXISTENCE + machine binding only — the public key travels
+    // in the header (bound via hash → agent_id), so the verifier never depends
+    // on announce-propagation timing (#204 soak NO-GO fix).
     let cached = {
         let cache = ctx.discovery_cache.read().await;
         cache.get(&header.opener_agent_id).cloned()
     };
     let agent = cached.ok_or(ConnectDenialReason::AttestationFailed)?;
 
-    // Confirm the agent is on the transport-authenticated machine. A valid
-    // signature from an agent on a *different* machine is still a
-    // cross-machine impersonation attempt.
+    // Confirm the agent is on the transport-authenticated machine.
     if agent.machine_id != *peer_machine {
         return Err(ConnectDenialReason::AgentNotOnMachine);
     }
 
-    // Verify the attestation against the cached key. An empty key (pre-v2
-    // announcement without a cert) means the agent cannot be attested.
-    if agent.agent_public_key.is_empty() {
-        return Err(ConnectDenialReason::AttestationFailed);
-    }
+    // Verify the attestation against the HEADER's public key. The
+    // `verify_attestation` method checks `SHA-256(key) == opener_agent_id`
+    // (binding) and the ML-DSA-65 signature. This eliminates the dependency
+    // on the discovery cache having a non-empty `agent_public_key` — the soak
+    // NO-GO root cause.
     header
-        .verify_attestation(&agent.agent_public_key)
+        .verify_attestation(&header.opener_agent_public_key)
         .map_err(|_| ConnectDenialReason::AttestationFailed)?;
+
+    // Opportunistically upgrade the cache entry with the header's key so
+    // subsequent forwards (and other subsystems) benefit.
+    if agent.agent_public_key.is_empty() && !header.opener_agent_public_key.is_empty() {
+        let mut cache = ctx.discovery_cache.write().await;
+        if let Some(entry) = cache.get_mut(&header.opener_agent_id) {
+            entry.agent_public_key = header.opener_agent_public_key.clone();
+        }
+    }
 
     // ── Trust evaluation (#204 must-fix 3): evaluate the attested agent's
     // real trust — NOT a hard-coded Accept. A Blocked-but-announced agent
@@ -1433,11 +1454,19 @@ async fn try_outbound_v2(
             return OutboundOutcome::PeerRejectedV2(tcp);
         }
     };
-    // Build + sign the V2 header with the local agent keypair.
+    // Build + sign the V2 header with the local agent keypair. The header
+    // carries the opener's public key so the verifier doesn't depend on
+    // announce propagation (#204 soak fix).
     let mut header = ForwardV2Header::new(
         target_host.to_string(),
         target_port,
         agent.agent_id(),
+        agent
+            .identity()
+            .agent_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec(),
         stream.peer(),
     );
     if let Err(e) = header.sign(agent.identity().agent_keypair()) {
@@ -1891,7 +1920,13 @@ mod tests {
         keypair: &AgentKeypair,
         recipient: MachineId,
     ) -> ForwardV2Header {
-        let mut h = ForwardV2Header::new(target.to_string(), port, keypair.agent_id(), recipient);
+        let mut h = ForwardV2Header::new(
+            target.to_string(),
+            port,
+            keypair.agent_id(),
+            keypair.public_key().as_bytes().to_vec(),
+            recipient,
+        );
         h.sign(keypair).expect("sign");
         h
     }
@@ -1935,7 +1970,13 @@ mod tests {
     fn v2_attestation_rejects_missing_signature() {
         let kp = AgentKeypair::generate().unwrap();
         let machine = MachineId([2u8; 32]);
-        let h = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id(), machine);
+        let h = ForwardV2Header::new(
+            "127.0.0.1".to_string(),
+            22,
+            kp.agent_id(),
+            kp.public_key().as_bytes().to_vec(),
+            machine,
+        );
         assert_eq!(
             h.verify_attestation(kp.public_key().as_bytes())
                 .unwrap_err(),
@@ -1992,10 +2033,28 @@ mod tests {
     fn v2_signable_bytes_are_deterministic_and_domain_separated() {
         let kp = AgentKeypair::generate().unwrap();
         let machine = MachineId([2u8; 32]);
-        let h1 = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id(), machine);
-        let h2 = ForwardV2Header::new("127.0.0.1".to_string(), 22, kp.agent_id(), machine);
+        let h1 = ForwardV2Header::new(
+            "127.0.0.1".to_string(),
+            22,
+            kp.agent_id(),
+            kp.public_key().as_bytes().to_vec(),
+            machine,
+        );
+        let h2 = ForwardV2Header::new(
+            "127.0.0.1".to_string(),
+            22,
+            kp.agent_id(),
+            kp.public_key().as_bytes().to_vec(),
+            machine,
+        );
         assert_eq!(h1.signable_bytes(), h2.signable_bytes());
-        let h3 = ForwardV2Header::new("::1".to_string(), 22, kp.agent_id(), machine);
+        let h3 = ForwardV2Header::new(
+            "::1".to_string(),
+            22,
+            kp.agent_id(),
+            kp.public_key().as_bytes().to_vec(),
+            machine,
+        );
         assert_ne!(h1.signable_bytes(), h3.signable_bytes());
         assert!(h1
             .signable_bytes()
@@ -2038,7 +2097,7 @@ mod tests {
             target,
         );
         // Missing attestation.
-        let hdr = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent, machine);
+        let hdr = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent, Vec::new(), machine);
         assert_eq!(
             decide_inbound_attested(
                 &hdr,
@@ -2196,7 +2255,7 @@ mod tests {
         let contacts = trusted_store(agent);
         let policy = policy_with_allow(agent, machine, target);
         let ts = now_ms();
-        let mut hdr = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent, machine);
+        let mut hdr = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent, Vec::new(), machine);
         hdr.issued_at_ms = ts.saturating_sub(FORWARD_V2_ATTESTATION_TTL_MS + 1000);
         let _sig = sign_with_ml_dsa(kp.secret_key(), &hdr.signable_bytes()).unwrap();
         hdr.signature = _sig.as_bytes().to_vec();
@@ -2227,7 +2286,7 @@ mod tests {
         let contacts = trusted_store(agent);
         let policy = policy_with_allow(agent, machine, target);
         let ts = now_ms();
-        let mut hdr = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent, machine);
+        let mut hdr = ForwardV2Header::new("127.0.0.1".to_string(), 22, agent, Vec::new(), machine);
         hdr.issued_at_ms = ts + FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS + 1000;
         let _sig = sign_with_ml_dsa(kp.secret_key(), &hdr.signable_bytes()).unwrap();
         hdr.signature = _sig.as_bytes().to_vec();
@@ -2364,7 +2423,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decide_inbound_attested_no_cached_key_denied() {
+    async fn decide_inbound_attested_empty_cache_key_allowed_via_header() {
+        // Soak NO-GO fix: even when the discovery cache has an EMPTY
+        // agent_public_key (the presence-beacon case), the V2 forward
+        // succeeds because the public key travels in the header itself.
         let kp = AgentKeypair::generate().unwrap();
         let agent = kp.agent_id();
         let machine = MachineId([2u8; 32]);
@@ -2388,7 +2450,7 @@ mod tests {
                 relay_candidates: Vec::new(),
                 cert_not_after: None,
                 agent_certificate: None,
-                agent_public_key: Vec::new(),
+                agent_public_key: Vec::new(), // empty — beacon case
             },
         );
         let cache = Arc::new(tokio::sync::RwLock::new(cache_map));
@@ -2403,12 +2465,12 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
-                    now_ms: now_ms()
+                    now_ms: now_ms(),
                 }
             )
             .await
-            .unwrap_err(),
-            ConnectDenialReason::AttestationFailed,
+            .unwrap(),
+            target,
         );
     }
 }
