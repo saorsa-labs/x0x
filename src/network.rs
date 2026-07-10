@@ -36,6 +36,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
+// --- Transport payload-hash tracing (X0X_TRANSPORT_TRACE env flag) ---
+// Off by default, zero overhead when unset (single LazyLock bool read).
+// Logs blake3(payload)[..8] at send, recv, and sig-fail to pinpoint whether
+// signed-payload drops are byte corruption (transport), misrouting (recv
+// pump), or a signing/domain bug (decode_v2).
+pub(crate) static TRANSPORT_TRACE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("X0X_TRANSPORT_TRACE").is_ok());
+static TRANSPORT_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Ant-quic PeerId type alias
 type AntPeerId = ant_quic::PeerId;
 /// Saorsa gossip PeerId type alias
@@ -2802,6 +2811,15 @@ impl NetworkNode {
                             continue;
                         }
 
+                        if *TRANSPORT_TRACE && data.len() > 1 {
+                            let h = blake3::hash(&data[1..]);
+                            info!(
+                                target: "x0x_transport_trace",
+                                "RX_TRACE peer={:?} hash={} len={} st={}",
+                                peer_id, &h.to_hex()[..16], data.len(), data[0]
+                            );
+                        }
+
                         // Parse stream type from first byte (safe: data is non-empty)
                         let type_byte = data[0];
 
@@ -3223,6 +3241,15 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // Prepare message: [stream_type_byte | data]
         let mut buf = Vec::with_capacity(1 + data.len());
         buf.push(stream_type.to_byte());
+        if *TRANSPORT_TRACE {
+            let msg_id = TRANSPORT_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let h = blake3::hash(&data);
+            info!(
+                target: "x0x_transport_trace",
+                "TX_TRACE msg_id={msg_id} hash={} len={} st={} peer={:?}",
+                &h.to_hex()[..16], data.len(), stream_type.to_byte(), ant_peer
+            );
+        }
         buf.extend_from_slice(&data);
 
         // Send via ant-quic Node

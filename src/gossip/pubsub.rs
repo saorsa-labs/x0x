@@ -1095,6 +1095,14 @@ fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
     );
 
     if !verified {
+        if *crate::network::TRANSPORT_TRACE {
+            let h = blake3::hash(data);
+            tracing::warn!(
+                target: "x0x_transport_trace",
+                "SIG_FAIL hash={} len={} agent={}",
+                &h.to_hex()[..16], data.len(), agent_id
+            );
+        }
         tracing::warn!(
             "ML-DSA-65 signature verification failed for sender {}",
             agent_id
