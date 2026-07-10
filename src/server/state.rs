@@ -509,6 +509,8 @@ pub(super) struct AppState {
     /// over `canonical_member_joined_bytes` authenticates the embedded key
     /// package, so a recovering admin installs it without the inviter-only gate.
     pub(super) treekem_member_key_packages: RwLock<HashMap<String, NamedGroupMetadataEvent>>,
+    /// Disk location for the signed member key-package recovery cache.
+    pub(super) treekem_member_key_packages_path: PathBuf,
     /// Anti-spam throttle for outbound catch-up requests.
     pub(super) treekem_catchup_throttle: RwLock<HashMap<String, Instant>>,
     /// Per-group serialization for authoritative membership mutations. The

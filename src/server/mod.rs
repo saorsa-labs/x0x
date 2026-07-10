@@ -749,6 +749,9 @@ pub async fn serve_with_options(
         .await
         .map_err(|e| anyhow::anyhow!("failed to recover TreeKEM persistence journal: {e}"))?;
     let named_groups = load_named_groups(&named_groups_path).await?;
+    let treekem_member_key_packages_path = treekem_dir.join("member-key-packages.json");
+    let treekem_member_key_packages =
+        load_treekem_member_key_packages(&treekem_member_key_packages_path).await?;
 
     // Load or generate API bearer token for local authentication.
     let api_token = auth::load_or_generate_api_token(&config.data_dir).await?;
@@ -878,7 +881,8 @@ pub async fn serve_with_options(
         pending_welcome_acks: RwLock::new(HashMap::new()),
         treekem_pending_events: RwLock::new(HashMap::new()),
         treekem_event_log: RwLock::new(HashMap::new()),
-        treekem_member_key_packages: RwLock::new(HashMap::new()),
+        treekem_member_key_packages: RwLock::new(treekem_member_key_packages),
+        treekem_member_key_packages_path,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
@@ -5852,18 +5856,41 @@ fn member_joined_kp_cache_entry(
     }
 }
 
-/// Install a TreeKEM KeyPackage recovered from a cached, self-signed
-/// `MemberJoined` event. The normal `MemberJoined` apply is inviter-only, so a
-/// promoted admin that never witnessed the join learns the target's key package
-/// here. The package is authenticated by re-verifying the joiner's ML-DSA-65
-/// signature over `canonical_member_joined_bytes` (independent of the inviter
-/// gate); the roster/state-commit chain is untouched. Returns `true` only when
-/// a previously-absent package was installed (issue #205).
-async fn apply_recovered_member_key_package(
-    state: &Arc<AppState>,
+async fn member_joined_key_package_matches_roster(
+    state: &AppState,
     event: &NamedGroupMetadataEvent,
 ) -> bool {
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id,
+        member_agent_id,
+        treekem_key_package_b64: Some(event_key_package),
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(group_id).or_else(|| {
+        groups
+            .values()
+            .find(|info| info.stable_group_id() == group_id)
+    }) else {
+        return false;
+    };
+    info.has_active_member(member_agent_id)
+        && info
+            .members_v2
+            .get(member_agent_id)
+            .and_then(|member| member.treekem_key_package_b64.as_ref())
+            == Some(event_key_package)
+}
+
+/// Verify that a key-package-bearing `MemberJoined` is self-authenticated by
+/// the claimed member. This is intentionally independent of inviter and roster
+/// state so persisted recovery records can be authenticated during startup.
+fn verify_member_joined_key_package_event(event: &NamedGroupMetadataEvent) -> bool {
     use base64::Engine as _;
+
     let NamedGroupMetadataEvent::MemberJoined {
         group_id,
         stable_group_id,
@@ -5874,30 +5901,24 @@ async fn apply_recovered_member_key_package(
         inviter_agent_id,
         invite_secret,
         ts_ms,
-        treekem_key_package_b64,
+        treekem_key_package_b64: Some(treekem_key_package_b64),
         signature_b64,
     } = event
     else {
         return false;
     };
-    let Some(kp_b64) = treekem_key_package_b64.clone() else {
+    let Ok(pubkey_bytes) = BASE64.decode(member_public_key_b64) else {
         return false;
     };
-    let pubkey_bytes = match BASE64.decode(member_public_key_b64) {
-        Ok(b) => b,
-        Err(_) => return false,
+    let Ok(pubkey) = ant_quic::MlDsaPublicKey::from_bytes(&pubkey_bytes) else {
+        return false;
     };
-    let pubkey = match ant_quic::MlDsaPublicKey::from_bytes(&pubkey_bytes) {
-        Ok(p) => p,
-        Err(_) => return false,
+    let Ok(sig_bytes) = BASE64.decode(signature_b64) else {
+        return false;
     };
-    let sig_bytes = match BASE64.decode(signature_b64) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
-    let sig = match ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes) {
-        Ok(s) => s,
-        Err(_) => return false,
+    let Ok(sig) = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+    else {
+        return false;
     };
     let canonical = canonical_member_joined_bytes(
         group_id,
@@ -5909,21 +5930,61 @@ async fn apply_recovered_member_key_package(
         inviter_agent_id,
         invite_secret,
         *ts_ms,
-        treekem_key_package_b64.as_deref(),
+        Some(treekem_key_package_b64.as_str()),
     );
-    if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pubkey, &canonical, &sig)
-        .is_err()
-    {
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pubkey, &canonical, &sig).is_ok()
+        && hex::encode(ant_quic::derive_peer_id_from_public_key(&pubkey).0)
+            .eq_ignore_ascii_case(member_agent_id)
+}
+
+async fn cache_treekem_member_key_package(
+    state: &AppState,
+    key: String,
+    event: NamedGroupMetadataEvent,
+) {
+    let mut cache = state.treekem_member_key_packages.write().await;
+    cache.insert(key, event);
+    match serde_json::to_string(&*cache) {
+        Ok(json) => {
+            if let Err(e) =
+                write_named_groups_json_atomic(&state.treekem_member_key_packages_path, &json).await
+            {
+                tracing::error!("Failed to save TreeKEM member key-package cache: {e}");
+            }
+        }
+        Err(e) => tracing::error!("Failed to serialize TreeKEM member key-package cache: {e}"),
+    }
+}
+
+/// Install a TreeKEM KeyPackage recovered from a cached, self-signed
+/// `MemberJoined` event. The normal `MemberJoined` apply is inviter-only, so a
+/// promoted admin that never witnessed the join learns the target's key package
+/// here. The package is authenticated by re-verifying the joiner's ML-DSA-65
+/// signature over `canonical_member_joined_bytes` (independent of the inviter
+/// gate); the roster/state-commit chain is untouched. Returns `true` only when
+/// a previously-absent package was installed (issue #205).
+async fn apply_recovered_member_key_package(
+    state: &Arc<AppState>,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id,
+        member_agent_id,
+        treekem_key_package_b64,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let Some(kp_b64) = treekem_key_package_b64.clone() else {
+        return false;
+    };
+    if !verify_member_joined_key_package_event(event) {
         tracing::warn!(
             group_id = %LogHexId::group(group_id),
             member = %LogHexId::agent(member_agent_id),
             "recovered MemberJoined key package: signature did not verify — refusing to install"
         );
-        return false;
-    }
-    // Derived AgentId must match the claimed member.
-    let derived = hex::encode(ant_quic::derive_peer_id_from_public_key(&pubkey).0);
-    if !derived.eq_ignore_ascii_case(member_agent_id) {
         return false;
     }
     // Resolve the local group by storage key (mls_group_id) or stable alias.
@@ -5964,8 +6025,12 @@ async fn apply_recovered_member_key_package(
     };
     if installed {
         save_named_groups(state).await;
-        let mut cache = state.treekem_member_key_packages.write().await;
-        cache.insert(join_result_key(group_id, member_agent_id), event.clone());
+        cache_treekem_member_key_package(
+            state,
+            join_result_key(group_id, member_agent_id),
+            event.clone(),
+        )
+        .await;
     }
     installed
 }
@@ -6244,6 +6309,27 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
     }
 }
 
+async fn member_keyed_treekem_catchup_response(
+    state: &AppState,
+    log_keys: &[String],
+    request: &TreeKemCatchupRequest,
+) -> Option<TreeKemCatchupResponse> {
+    let target_member_id = request.target_member_id.as_ref()?;
+    let event = {
+        let cache = state.treekem_member_key_packages.read().await;
+        log_keys
+            .iter()
+            .find_map(|group_id| cache.get(&join_result_key(group_id, target_member_id)))
+            .cloned()
+    };
+    Some(TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: request.group_id.clone(),
+        events: event.into_iter().collect(),
+        truncated: false,
+    })
+}
+
 async fn handle_treekem_catchup_request(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -6305,20 +6391,8 @@ async fn handle_treekem_catchup_request(
     // The same gates apply (verified DM, sender == requester, active member or
     // target-of-cached-add). The requester authenticates the package via the
     // embedded ML-DSA-65 signature in `apply_recovered_member_key_package`.
-    if let Some(target_member_id) = request.target_member_id.clone() {
-        let event = {
-            let cache = state.treekem_member_key_packages.read().await;
-            log_keys
-                .iter()
-                .find_map(|g| cache.get(&join_result_key(g, &target_member_id)))
-                .cloned()
-        };
-        let response = TreeKemCatchupResponse {
-            message_type: "treekem_catchup_response".to_string(),
-            group_id: request.group_id.clone(),
-            events: event.into_iter().collect(),
-            truncated: false,
-        };
+    if let Some(response) = member_keyed_treekem_catchup_response(state, &log_keys, &request).await
+    {
         let payload = match serde_json::to_vec(&response) {
             Ok(payload) => payload,
             Err(e) => {
@@ -6596,15 +6670,14 @@ async fn apply_named_group_metadata_event(
     // apply is inviter-only — can recover the target's TreeKEM KeyPackage via
     // the member-keyed catch-up protocol. Clone before the move into `inner`.
     let kp_cache_entry = member_joined_kp_cache_entry(&event);
-    let applied =
+    let should_exit =
         apply_named_group_metadata_event_inner(state, event, sender, verified, true).await;
-    if applied {
-        if let Some((key, cached)) = kp_cache_entry {
-            let mut cache = state.treekem_member_key_packages.write().await;
-            cache.insert(key, cached);
+    if let Some((key, cached)) = kp_cache_entry {
+        if member_joined_key_package_matches_roster(state, &cached).await {
+            cache_treekem_member_key_package(state, key, cached).await;
         }
     }
-    applied
+    should_exit
 }
 
 async fn apply_named_group_metadata_event_inner(
@@ -16630,6 +16703,49 @@ async fn restore_treekem_groups(
     restored
 }
 
+async fn load_treekem_member_key_packages(
+    path: &FsPath,
+) -> Result<HashMap<String, NamedGroupMetadataEvent>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(json) => {
+            let mut cache = serde_json::from_str::<HashMap<String, NamedGroupMetadataEvent>>(&json)
+                .with_context(|| {
+                    format!(
+                        "failed to parse TreeKEM member key-package cache {}",
+                        path.display()
+                    )
+                })?;
+            let persisted_count = cache.len();
+            cache.retain(|key, event| {
+                member_joined_kp_cache_entry(event)
+                    .is_some_and(|(expected_key, _)| expected_key == *key)
+                    && verify_member_joined_key_package_event(event)
+            });
+            let rejected_count = persisted_count.saturating_sub(cache.len());
+            if rejected_count > 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    rejected_count,
+                    "discarded invalid persisted TreeKEM member key-package recovery records"
+                );
+            }
+            tracing::info!(
+                path = %path.display(),
+                records = cache.len(),
+                "loaded TreeKEM member key-package recovery cache"
+            );
+            Ok(cache)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to read TreeKEM member key-package cache {}",
+                path.display()
+            )
+        }),
+    }
+}
+
 async fn load_named_groups(
     named_groups_path: &FsPath,
 ) -> Result<HashMap<String, x0x::groups::GroupInfo>> {
@@ -19085,9 +19201,6 @@ mod tests {
     async fn secure_endpoint_test_state() -> Result<(Arc<AppState>, tempfile::TempDir)> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path();
-        let treekem_dir = data_dir.join("treekem");
-        tokio::fs::create_dir_all(&treekem_dir).await?;
-
         let agent = Arc::new(
             Agent::builder()
                 .with_machine_key(data_dir.join("machine.key"))
@@ -19098,6 +19211,21 @@ mod tests {
                 .build()
                 .await?,
         );
+        let state = secure_endpoint_test_state_at(data_dir, agent).await?;
+        Ok((state, dir))
+    }
+
+    async fn secure_endpoint_test_state_at(
+        data_dir: &FsPath,
+        agent: Arc<Agent>,
+    ) -> Result<Arc<AppState>> {
+        let treekem_dir = data_dir.join("treekem");
+        tokio::fs::create_dir_all(&treekem_dir).await?;
+        let named_groups_path = data_dir.join("named_groups.json");
+        let named_groups = load_named_groups(&named_groups_path).await?;
+        let treekem_member_key_packages_path = treekem_dir.join("member-key-packages.json");
+        let treekem_member_key_packages =
+            load_treekem_member_key_packages(&treekem_member_key_packages_path).await?;
         let contacts = Arc::clone(agent.contacts());
         agent.set_contacts(Arc::clone(&contacts));
 
@@ -19113,13 +19241,13 @@ mod tests {
         let exec_service =
             x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
-        let state = Arc::new(AppState {
+        Ok(Arc::new(AppState {
             agent,
             subscriptions: RwLock::new(HashMap::new()),
             task_lists: RwLock::new(HashMap::new()),
             kv_stores: RwLock::new(HashMap::new()),
-            named_groups: RwLock::new(HashMap::new()),
-            named_groups_path: data_dir.join("named_groups.json"),
+            named_groups: RwLock::new(named_groups),
+            named_groups_path,
             group_metadata_tasks: RwLock::new(HashMap::new()),
             group_card_cache: RwLock::new(HashMap::new()),
             directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),
@@ -19141,7 +19269,8 @@ mod tests {
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
             treekem_pending_events: RwLock::new(HashMap::new()),
-            treekem_member_key_packages: RwLock::new(HashMap::new()),
+            treekem_member_key_packages: RwLock::new(treekem_member_key_packages),
+            treekem_member_key_packages_path,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
@@ -19172,8 +19301,7 @@ mod tests {
                 x0x::connect::ConnectPolicy::default().summary(),
             )),
             forward_service: None,
-        });
-        Ok((state, dir))
+        }))
     }
 
     async fn response_json(response: Response) -> Result<(StatusCode, serde_json::Value)> {
@@ -23105,6 +23233,51 @@ mod tests {
             .is_none(),
             "non-MemberJoined event ignored"
         );
+    }
+
+    /// A verified key-package-bearing `MemberJoined` must remain available to
+    /// member-keyed catch-up after the inviter's process-local cache is lost.
+    #[tokio::test]
+    async fn member_keyed_catchup_restores_signed_event_after_restart() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x8b, 0x8c).await?;
+        let state = &fixture.state;
+        let _ =
+            apply_named_group_metadata_event(state, fixture.event.clone(), fixture.member_id, true)
+                .await;
+        assert_eq!(state.treekem_member_key_packages.read().await.len(), 1);
+        tokio::fs::metadata(&state.treekem_member_key_packages_path).await?;
+
+        // Model process loss explicitly, then construct a distinct AppState on
+        // the same durable directory. Startup must repopulate the empty runtime
+        // cache from the authenticated signed-event file.
+        state.treekem_member_key_packages.write().await.clear();
+        let restarted =
+            secure_endpoint_test_state_at(fixture._dir.path(), Arc::clone(&state.agent)).await?;
+        assert!(!Arc::ptr_eq(state, &restarted));
+
+        let requester_agent_id = hex::encode(restarted.agent.agent_id().as_bytes());
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: fixture.stable_group_id.clone(),
+            requester_agent_id,
+            from_revision: 0,
+            from_treekem_epoch: 0,
+            current_state_hash: String::new(),
+            missing_prev_state_hash: None,
+            target_member_id: Some(fixture.member_hex.clone()),
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        let log_keys = vec![fixture.group_id.clone(), fixture.stable_group_id.clone()];
+        let response = member_keyed_treekem_catchup_response(&restarted, &log_keys, &request)
+            .await
+            .expect("member-keyed request produces a response");
+
+        assert_eq!(response.events.len(), 1, "persisted event is returned");
+        assert!(
+            verify_member_joined_key_package_event(&response.events[0]),
+            "returned key package retains a valid member signature"
+        );
+        Ok(())
     }
 
     /// Issue #205: a promoted admin missing a member's TreeKEM KeyPackage
