@@ -2807,6 +2807,16 @@ impl NetworkNode {
 
                 match recv_result {
                     Ok((peer_id, data)) => {
+                        // ── DEFENSIVE COPY (recv-boundary aliasing mitigation) ──
+                        // node.recv() may return bytes that alias an ant-quic
+                        // internal reassembly buffer. Under concurrent stream
+                        // load (WAN churn) that buffer can be reused/overwritten
+                        // by another stream reader before we finish processing.
+                        // Snapshot to owned memory IMMEDIATELY — before RX_TRACE,
+                        // type parsing, or anything else touches the bytes.
+                        // Root fix belongs in ant-quic (recv must return owned
+                        // bytes); this is the interim x0x-side mitigation.
+                        let data: Vec<u8> = data.to_vec();
                         if data.is_empty() {
                             continue;
                         }
