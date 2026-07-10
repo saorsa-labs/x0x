@@ -28,7 +28,7 @@ const AUTHENTICATED_MACHINE_BINDING_CAPACITY: usize = 65_536;
 struct AuthenticatedMachineBinding {
     machine_id: MachineId,
     announced_at: u64,
-    last_used: u64,
+    last_used: (std::time::Instant, u64),
 }
 
 /// Bounded LRU cache of authenticated agent→machine bindings.
@@ -41,7 +41,7 @@ struct AuthenticatedMachineBinding {
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
     capacity: usize,
-    recency: std::collections::BTreeSet<(u64, [u8; 32])>,
+    recency: std::collections::BTreeSet<(std::time::Instant, u64, [u8; 32])>,
     clock: u64,
 }
 
@@ -67,40 +67,23 @@ impl AuthenticatedMachineBindingCache {
         }
     }
 
-    fn next_tick(&mut self) -> u64 {
-        if self.clock == u64::MAX {
-            let oldest = self
-                .entries
-                .values()
-                .map(|binding| binding.last_used)
-                .min()
-                .unwrap_or(0);
-            for binding in self.entries.values_mut() {
-                binding.last_used = binding.last_used.saturating_sub(oldest);
-            }
-            self.recency.clear();
-            self.recency.extend(
-                self.entries
-                    .iter()
-                    .map(|(agent_id, binding)| (binding.last_used, agent_id.0)),
-            );
-            self.clock = self.clock.saturating_sub(oldest);
-        }
-        self.clock = self.clock.saturating_add(1);
-        self.clock
+    fn next_tick(&mut self) -> (std::time::Instant, u64) {
+        self.clock = self.clock.wrapping_add(1);
+        (std::time::Instant::now(), self.clock)
     }
 
     fn record(&mut self, agent_id: AgentId, machine_id: MachineId, announced_at: u64) {
         let tick = self.next_tick();
         if let Some(mut existing) = self.entries.get(&agent_id).copied() {
-            self.recency.remove(&(existing.last_used, agent_id.0));
+            self.recency
+                .remove(&(existing.last_used.0, existing.last_used.1, agent_id.0));
             existing.last_used = tick;
             if announced_at >= existing.announced_at {
                 existing.machine_id = machine_id;
                 existing.announced_at = announced_at;
             }
             self.entries.insert(agent_id, existing);
-            self.recency.insert((tick, agent_id.0));
+            self.recency.insert((tick.0, tick.1, agent_id.0));
             return;
         }
 
@@ -108,7 +91,7 @@ impl AuthenticatedMachineBindingCache {
             let oldest = self.recency.first().copied();
             if let Some(oldest_key) = oldest {
                 self.recency.remove(&oldest_key);
-                let evicted_agent = AgentId(oldest_key.1);
+                let evicted_agent = AgentId(oldest_key.2);
                 if let Some(evicted_binding) = self.entries.remove(&evicted_agent) {
                     tracing::warn!(
                         agent = %hex::encode(evicted_agent.as_bytes()),
@@ -128,16 +111,17 @@ impl AuthenticatedMachineBindingCache {
                 last_used: tick,
             },
         );
-        self.recency.insert((tick, agent_id.0));
+        self.recency.insert((tick.0, tick.1, agent_id.0));
     }
 
     fn resolve(&mut self, agent_id: &AgentId) -> Option<MachineId> {
         let tick = self.next_tick();
         let mut binding = self.entries.get(agent_id).copied()?;
-        self.recency.remove(&(binding.last_used, agent_id.0));
+        self.recency
+            .remove(&(binding.last_used.0, binding.last_used.1, agent_id.0));
         binding.last_used = tick;
         self.entries.insert(*agent_id, binding);
-        self.recency.insert((tick, agent_id.0));
+        self.recency.insert((tick.0, tick.1, agent_id.0));
         Some(binding.machine_id)
     }
 }
