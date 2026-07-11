@@ -920,6 +920,7 @@ impl GroupInfo {
                 removed_by: None,
                 kem_public_key_b64,
                 treekem_key_package_b64: None,
+                treekem_key_package_hash: None,
             });
     }
 
@@ -942,8 +943,28 @@ impl GroupInfo {
         treekem_key_package_b64: String,
     ) {
         if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
+            m.treekem_key_package_hash = Some(
+                blake3::hash(treekem_key_package_b64.as_bytes())
+                    .to_hex()
+                    .to_string(),
+            );
             m.treekem_key_package_b64 = Some(treekem_key_package_b64);
             m.updated_at = now_millis();
+        }
+    }
+    /// Record only the committed KeyPackage hash when the package bytes are
+    /// intentionally absent from an invite-derived roster.
+    pub fn set_member_treekem_key_package_hash(
+        &mut self,
+        agent_id_hex: &str,
+        treekem_key_package_hash: String,
+    ) {
+        if let Some(member) = self.members_v2.get_mut(agent_id_hex) {
+            if member.treekem_key_package_hash.as_deref() != Some(&treekem_key_package_hash) {
+                member.treekem_key_package_b64 = None;
+            }
+            member.treekem_key_package_hash = Some(treekem_key_package_hash);
+            member.updated_at = now_millis();
         }
     }
 
@@ -978,6 +999,7 @@ impl GroupInfo {
                 removed_by: banned_by,
                 kem_public_key_b64: None,
                 treekem_key_package_b64: None,
+                treekem_key_package_hash: None,
             });
     }
 
