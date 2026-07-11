@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.30.0
+version: 0.30.1
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -185,7 +185,9 @@ x0x agent
 x0x subscribe hello-world
 x0x publish hello-world "Hello!"
 
-# REST API (all but /health and /gui require bearer auth)
+# REST API auth: /health and /constitution* are public; /gui, /ws, /events
+# accept the token via ?token=; every other route requires the
+# Authorization: Bearer header shown below.
 DATA_DIR="$HOME/Library/Application Support/x0x"   # macOS
 # DATA_DIR="$HOME/.local/share/x0x"                # Linux
 API=$(cat "$DATA_DIR/api.port")
@@ -295,6 +297,10 @@ x0x agents list               List discovered agents
 x0x presence online           Online agents (network view)
 x0x direct send <id> <msg>    Send a direct message
 x0x send-file <id> <path>     Send a file
+x0x forward add|list|rm       Manage tailnet TCP port-forwards
+x0x group ...                 Named groups (create, invite, join)
+x0x tasks ...                 Task lists   ·   x0x store ...   Replicated KV stores
+x0x exec <id> -- <argv...>    Run a command on a peer (trust + ACL gated)
 x0x constitution              Display the x0x Constitution
 x0x upgrade --check           Check for updates
 ```
@@ -334,6 +340,176 @@ rendezvous_enabled = true             # Global agent findability
 403 Forbidden      {"ok":false,"error":"agent is blocked"}     # Trust check failed
 404 Not Found      {"ok":false,"error":"group not found"}      # Resource missing
 500 Internal Error {"ok":false,"error":"internal error"}       # Server-side failure
+```
+
+## Agent Orchestration (REST)
+
+The endpoints below are the high-value surface for building agents on x0x. All use `$API` and `$TOKEN` from Step 4 and require the `Authorization: Bearer $TOKEN` header. Each example is verified against the v0.30.x daemon. For the complete surface (128 routes), see the [Full API Reference](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md).
+
+### Task Lists (replicated CRDT)
+
+Shared, conflict-free task lists — the backbone for multi-agent work orchestration.
+
+```bash
+# Create a task list
+curl -X POST "http://$API/task-lists" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Sprint Backlog", "topic": "team-sprint-42"}'
+# -> {"ok":true,"id":"team-sprint-42"}
+
+curl -H "Authorization: Bearer $TOKEN" "http://$API/task-lists"                 # list task lists
+
+# Add a task
+curl -X POST "http://$API/task-lists/team-sprint-42/tasks" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Write integration tests", "description": "Cover the KV delta path"}'
+# -> {"ok":true,"task_id":"<64-hex>"}
+
+curl -H "Authorization: Bearer $TOKEN" "http://$API/task-lists/team-sprint-42/tasks"  # list tasks
+
+# Claim or complete a task (action = "claim" | "complete"; tid = the 64-hex task_id)
+curl -X PATCH "http://$API/task-lists/team-sprint-42/tasks/<task_id>" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"action": "claim"}'
+```
+
+### Stores (replicated key–value CRDT)
+
+```bash
+# Create a store
+curl -X POST "http://$API/stores" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "shared-config", "topic": "team-config-store"}'
+# -> {"ok":true,"id":"team-config-store"}
+
+# Put a value — value is BASE64-encoded bytes
+curl -X PUT "http://$API/stores/team-config-store/greeting" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"value": "'$(echo -n "hello" | base64)'", "content_type": "text/plain"}'
+
+curl -H "Authorization: Bearer $TOKEN" "http://$API/stores/team-config-store/keys"     # list keys
+curl -H "Authorization: Bearer $TOKEN" "http://$API/stores/team-config-store/greeting" # get (value is base64)
+curl -X DELETE "http://$API/stores/team-config-store/greeting" -H "Authorization: Bearer $TOKEN"
+
+# Join a store another agent created (replicate it locally)
+curl -X POST "http://$API/stores/team-config-store/join" -H "Authorization: Bearer $TOKEN"
+```
+
+### Named Groups
+
+**`/groups` = policy-driven named groups** (presets, discovery, invites, roster, public messaging, TreeKEM/MLS encryption). **`/mls/groups` = bare MLS primitives** (raw group/key ops, no policy or discovery) — shown earlier under *MLS Group Encryption*. Prefer `/groups` for real applications.
+
+A group's `preset` decides its messaging model: `private_secure` (default, end-to-end encrypted → use `secure/encrypt`) or a public preset (`public_open`, `public_request_secure`, `public_announce` → use public `send`/`messages`).
+
+```bash
+# Encrypted group (default preset private_secure)
+curl -X POST "http://$API/groups" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"name": "my-group"}'
+# -> {"ok":true,"group_id":"<64-hex>", ...}
+
+# Public group for open messaging
+curl -X POST "http://$API/groups" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"name": "townsquare", "preset": "public_open"}'
+
+# Members
+curl -H "Authorization: Bearer $TOKEN" "http://$API/groups/<group_id>/members"
+curl -X POST "http://$API/groups/<group_id>/members" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "<64-hex>"}'   # TreeKEM groups also need "treekem_key_package_b64"
+
+# Public messaging (public presets only)
+curl -X POST "http://$API/groups/<group_id>/send" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"body": "hello group"}'   # optional "kind": "chat" | "announcement"
+curl -H "Authorization: Bearer $TOKEN" "http://$API/groups/<group_id>/messages"
+
+# Encrypted messaging (encrypted presets) — payload is base64
+curl -X POST "http://$API/groups/<group_id>/secure/encrypt" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"payload_b64": "'$(echo -n "secret" | base64)'"}'
+
+# Create an invite link (on a group you admin), then share it out-of-band
+curl -X POST "http://$API/groups/<group_id>/invite" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{}'
+# -> {"ok":true,"invite_link":"x0x://invite/<...>"}
+
+# Join via that invite link (on the other agent)
+curl -X POST "http://$API/groups/join" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"invite": "x0x://invite/<...>"}'
+```
+
+### Presence & Discovery
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" "http://$API/presence/online"       # online agents (network view)
+curl -H "Authorization: Bearer $TOKEN" "http://$API/presence/foaf?ttl=3"   # friends-of-friends walk (ttl hops)
+curl -H "Authorization: Bearer $TOKEN" "http://$API/agents/discovered"     # discovery cache
+curl -H "Authorization: Bearer $TOKEN" "http://$API/agents/reachability/<agent_id>"
+```
+
+### Files
+
+Send a file to another agent (the recipient must be a reachable, known peer). `sha256` is the hex digest of the bytes; supply content inline as base64 (`data_b64`) or reference a local `path`.
+
+```bash
+DATA=$(echo -n "hello" | base64)
+SHA=$(printf "hello" | shasum -a 256 | cut -d' ' -f1)
+curl -X POST "http://$API/files/send" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"agent_id\":\"<64-hex>\",\"filename\":\"note.txt\",\"size\":5,\"sha256\":\"$SHA\",\"data_b64\":\"$DATA\"}"
+# -> {"ok":true,"transfer_id":"..."}
+
+curl -H "Authorization: Bearer $TOKEN" "http://$API/files/transfers"            # incoming/outgoing transfers
+curl -X POST "http://$API/files/accept/<transfer_id>" -H "Authorization: Bearer $TOKEN"   # accept a pending incoming transfer
+```
+
+### Agent Card / A2A
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" "http://$API/agent/card"                 # signed x0x agent card + shareable link
+curl -H "Authorization: Bearer $TOKEN" "http://$API/.well-known/agent-card.json" # Google A2A-format card
+curl -X POST "http://$API/agent/card/import" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"card": "x0x://agent/<...>", "trust_level": "known"}'                    # import a peer's card
+```
+
+### Remote Exec (⚠️ high-risk, trust + ACL gated)
+
+Runs a command on **another** agent's machine. Disabled by default and **fully gated on the responder**: the target runs it only if exec is enabled there, the sender is a verified `Accept`-trust contact, and the `(agent, machine)` + exact argv are allow-listed in its exec ACL. A denied request returns `200` with a `denial_reason` (e.g. `exec_disabled`, `trust_rejected`, `argv_not_allowed`) — the refusal is in the body, not the status. argv is never shell-interpreted. See [docs/exec.md](https://github.com/saorsa-labs/x0x/blob/main/docs/exec.md).
+
+```bash
+curl -X POST "http://$API/exec/run" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "<64-hex>", "argv": ["echo", "hi"]}'   # optional "stdin_b64", "timeout_ms"
+curl -X POST "http://$API/exec/cancel" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"request_id": "<32-hex>"}'
+curl -H "Authorization: Bearer $TOKEN" "http://$API/exec/sessions"
+```
+
+### Contacts
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" "http://$API/contacts"                   # list
+curl -X POST "http://$API/contacts" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "<64-hex>", "trust_level": "known", "label": "peer-a"}'
+curl -X PATCH "http://$API/contacts/<agent_id>" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"trust_level": "trusted"}'
+curl -X DELETE "http://$API/contacts/<agent_id>" -H "Authorization: Bearer $TOKEN"
+```
+
+Trust levels: `blocked` | `unknown` | `known` | `trusted`. (The `/contacts/trust` quick-set under *Trust Management* is a shortcut for the same store.)
+
+### Tailnet Forwards (v0.30.0)
+
+Tunnel a local loopback TCP port to a loopback service on a trusted peer machine (Tailscale-style). Requires connect forwarding enabled (a connect ACL) and the peer to be a trusted contact — otherwise returns `409`. Agent attestation rides relayed forwards automatically; there is nothing extra to call.
+
+```bash
+# Add a forward: local 127.0.0.1:15432 -> peer's 127.0.0.1:22
+curl -X POST "http://$API/forwards" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"local_addr":"127.0.0.1:15432","peer_agent":"<64-hex>","target_host":"127.0.0.1","target_port":22}'
+
+curl -H "Authorization: Bearer $TOKEN" "http://$API/forwards"                   # list
+curl -X DELETE "http://$API/forwards/127.0.0.1:15432" -H "Authorization: Bearer $TOKEN"   # remove
 ```
 
 ## Architecture

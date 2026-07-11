@@ -177,6 +177,9 @@ Notes:
 |---|---|---|---|
 | GET | `/peers` | `x0x peers` | Connected gossip peers |
 | GET | `/presence` | `x0x presence` | Presence view of online agents |
+| GET | `/presence/online` | `x0x presence online` | Online agents (network-view trust filter) |
+| GET | `/presence/foaf` | `x0x presence foaf` | Friends-of-friends discovery walk (`?ttl=<hops>`, default 3; social-view trust filter) |
+| GET | `/presence/status/:id` · `/presence/find/:id` | `x0x presence status/find` | One agent's presence status / lookup |
 | GET | `/network/status` | `x0x network status` | NAT and connectivity diagnostics |
 | GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
 
@@ -602,6 +605,37 @@ or
 ```json
 {"reason":"rejected by user"}
 ```
+
+## Remote exec
+
+Run a command on **another** agent's machine. Disabled by default; every request is authorized on the **responder** (target) daemon, not the caller. The target runs `argv` only if remote exec is enabled there, the sender is a verified `Accept`-trust contact, and the `(agent_id, machine_id)` pair + exact argv are allow-listed in its exec ACL (`docs/exec.md`). `argv` is never shell-interpreted. A denied request still returns `200` with a non-null `denial_reason` (e.g. `exec_disabled`, `unverified_sender`, `trust_rejected`, `agent_machine_not_in_acl`, `argv_not_allowed`, `cwd_not_allowed`, `shell_metachar_in_argv`) — the refusal is carried in the body, not the HTTP status.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/exec/run` | `x0x exec <agent_id> -- <argv...>` | Run a command on a peer |
+| POST | `/exec/cancel` | `x0x exec cancel <request_id>` | Cancel an in-flight request |
+| GET | `/exec/sessions` | `x0x exec sessions` | List pending client + active server sessions |
+
+### Run request body
+
+```json
+{
+  "agent_id": "8a3f...",
+  "argv": ["echo", "hi"],
+  "stdin_b64": "aGVsbG8=",
+  "timeout_ms": 30000
+}
+```
+
+`argv` must be non-empty; `stdin_b64` and `timeout_ms` are optional. Any `cwd` is rejected by the v1 ACL. The response carries `code`, `signal`, `duration_ms`, `stdout_b64`, `stderr_b64`, `truncated`, and `denial_reason` (null on success).
+
+### Cancel request body
+
+```json
+{"request_id":"<32-hex>","agent_id":"8a3f..."}
+```
+
+`agent_id` is optional; when omitted the local pending-session table resolves the target.
 
 ## Upgrade
 

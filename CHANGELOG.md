@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.30.1] - 2026-07-11
+
+### Documentation
+
+- **docs(skill): correct auth-exempt paths, add REST examples for forwards/task-lists/stores/groups/exec/files/presence.** `SKILL.md` now documents the full agent-orchestration surface instead of ~16 of 128 routes. Fixed the auth statement — `/health` and `/constitution*` are the only public paths (not `/gui`); `/gui`, `/ws`, `/events` also accept the token via `?token=`; every other route requires the `Authorization: Bearer` header. Added a verified REST-example section covering task-lists, stores, named groups (with the `/groups` vs low-level `/mls/groups` distinction and preset-driven public-vs-encrypted messaging), presence/discovery, files, agent-card/A2A, remote exec (flagged high-risk, trust + ACL gated), contacts CRUD, and the new v0.30.0 tailnet `/forwards`. Every new example was smoke-tested against a live v0.30.1 daemon (single-node plus a two-node run for the peer-dependent flows). `docs/api-reference.md` gains a Remote Exec section and the `/presence/online`+`/presence/foaf` views.
+
 ## [v0.30.0] - 2026-07-11
 
 ### Added
