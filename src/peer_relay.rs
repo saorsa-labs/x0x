@@ -53,11 +53,12 @@
 //! `needs_relay` decision, relay-candidate selection), the `RelayStats`
 //! counters, the fallback path in `Agent::send_direct_with_config`, and
 //! the inbound receiver in `NetworkNode` (X0X-0070b, shipped). The #193
-//! contact gate is enforced in [`PeerRelay::disposition_for`]; rate and
-//! bandwidth admission is enforced by [`PeerRelay::reserve_forward`]. A
+//! contact gate is enforced in [`crate::peer_relay::PeerRelay::disposition_for`];
+//! rate and bandwidth admission is enforced by
+//! [`crate::peer_relay::PeerRelay::reserve_forward`]. A
 //! reservation charges quotas only when its send succeeds and releases its
 //! capacity automatically on every failed or abandoned forward. The
-//! [`RelayPolicy`] is **disabled by default** — the relay path only engages
+//! [`crate::peer_relay::RelayPolicy`] is **disabled by default** — the relay path only engages
 //! when a runtime explicitly enables it.
 //!
 //! Reference: Tailscale Peer Relays beta
