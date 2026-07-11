@@ -106,6 +106,7 @@ const TREEKEM_EVENT_LOG_PER_GROUP_CAP: usize = 128;
 // response exceed the direct-message payload cap, so paginate one event at a
 // time and rely on the existing `truncated` next-page loop.
 const TREEKEM_CATCHUP_RESPONSE_EVENT_CAP: usize = 1;
+const TREEKEM_PROVISIONAL_RECOVERY_PER_GROUP_CAP: usize = 64;
 const TREEKEM_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
 const DM_INBOX_START_MAX_ATTEMPTS: u32 = 120;
 const DM_INBOX_START_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -117,6 +118,16 @@ static NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST: StdMutex<Vec<(String, Str
 #[cfg(test)]
 static TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY: StdMutex<
     Option<(String, Arc<tokio::sync::Notify>)>,
+> = StdMutex::new(None);
+
+#[cfg(test)]
+static RECOVERED_KP_BEFORE_MEMBERSHIP_LOCK_NOTIFY: StdMutex<
+    Option<(String, Arc<tokio::sync::Notify>)>,
+> = StdMutex::new(None);
+
+#[cfg(test)]
+static NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY: StdMutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 > = StdMutex::new(None);
 
 // ---------------------------------------------------------------------------
@@ -855,6 +866,7 @@ pub async fn serve_with_options(
         kv_stores: RwLock::new(HashMap::new()),
         named_groups: RwLock::new(named_groups),
         named_groups_path,
+        named_groups_persistence_lock: Mutex::new(()),
         group_metadata_tasks: RwLock::new(HashMap::new()),
         group_card_cache: RwLock::new(HashMap::new()),
         directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),
@@ -3968,6 +3980,19 @@ enum NamedGroupMetadataEvent {
         /// TreeKEM epoch after applying `treekem_commit_b64`.
         #[serde(default)]
         treekem_epoch: Option<u64>,
+        /// Hash of the admitted KeyPackage committed in the roster root.
+        #[serde(default)]
+        treekem_key_package_hash: Option<String>,
+        /// Original member-signed join event, countersigned by the inviter
+        /// after the TreeKEM add succeeds. This binds recovery to the accepted
+        /// leaf instead of any later package the member can self-sign.
+        #[serde(default)]
+        member_joined_recovery: Option<Box<NamedGroupMetadataEvent>>,
+        /// Authority-attested records for members already in the roster. A
+        /// later joiner receives these with its own MemberAdded/Welcome, so a
+        /// future removal does not depend on the original inviter or target.
+        #[serde(default)]
+        member_recovery_history: Vec<NamedGroupMetadataEvent>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -4073,6 +4098,9 @@ enum NamedGroupMetadataEvent {
         /// Content-addressed pull reference for the requester's TreeKEM Welcome.
         #[serde(default)]
         welcome_ref: Option<WelcomeRef>,
+        /// Hash of the KeyPackage accepted by the approving authority.
+        #[serde(default)]
+        treekem_key_package_hash: Option<String>,
         /// TreeKEM epoch after applying `treekem_commit_b64`.
         #[serde(default)]
         treekem_epoch: Option<u64>,
@@ -4114,9 +4142,10 @@ enum NamedGroupMetadataEvent {
     /// `apply_named_group_metadata_event` verifies the joiner's ML-DSA-65
     /// signature, consumes the locally-issued one-time invite record,
     /// rejects any role other than `Member`, then publishes an
-    /// authority-signed `MemberAdded` commit. Third-party receivers ignore
-    /// this request and apply only the signed commit, keeping durable roster
-    /// and `state_hash` mutations inside the D.3 commit chain. This is the
+    /// authority-signed `MemberAdded` commit. Third-party receivers retain the
+    /// validated signed event as recovery evidence but apply only the signed
+    /// commit, keeping durable roster and `state_hash` mutations inside the D.3
+    /// commit chain. This is the
     /// gossip-layer fix for the `WritePolicyViolation { policy:
     /// MembersOnly }` cascade documented in
     /// `docs/design/groups-join-roster-propagation.md`.
@@ -4150,6 +4179,18 @@ enum NamedGroupMetadataEvent {
         /// Base64 postcard-encoded TreeKEM KeyPackage for invite joins.
         #[serde(default)]
         treekem_key_package_b64: Option<String>,
+        /// Inviter countersignature added only after authoritative acceptance.
+        #[serde(default)]
+        recovery_authority_agent_id: Option<String>,
+        #[serde(default)]
+        recovery_authority_public_key_b64: Option<String>,
+        #[serde(default)]
+        recovery_authority_signature_b64: Option<String>,
+        /// The accepted MemberAdded state commit that established historical
+        /// inviter authority; its structural signature remains verifiable even
+        /// if the inviter is later demoted or removed.
+        #[serde(default)]
+        recovery_authority_commit: Option<x0x::groups::GroupStateCommit>,
         /// Base64 ML-DSA-65 signature over `canonical_member_joined_bytes`.
         signature_b64: String,
     },
@@ -4327,6 +4368,8 @@ async fn publish_group_card_with_reseal(
     state: &AppState,
     group_id: &str,
 ) -> Option<x0x::groups::GroupStateCommit> {
+    let membership_lock = group_membership_lock(state, group_id).await;
+    let _membership_guard = membership_lock.lock().await;
     publish_group_card_to_discovery_inner(state, group_id, true).await
 }
 
@@ -5856,35 +5899,6 @@ fn member_joined_kp_cache_entry(
     }
 }
 
-async fn member_joined_key_package_matches_roster(
-    state: &AppState,
-    event: &NamedGroupMetadataEvent,
-) -> bool {
-    let NamedGroupMetadataEvent::MemberJoined {
-        group_id,
-        member_agent_id,
-        treekem_key_package_b64: Some(event_key_package),
-        ..
-    } = event
-    else {
-        return false;
-    };
-    let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(group_id).or_else(|| {
-        groups
-            .values()
-            .find(|info| info.stable_group_id() == group_id)
-    }) else {
-        return false;
-    };
-    info.has_active_member(member_agent_id)
-        && info
-            .members_v2
-            .get(member_agent_id)
-            .and_then(|member| member.treekem_key_package_b64.as_ref())
-            == Some(event_key_package)
-}
-
 /// Verify that a key-package-bearing `MemberJoined` is self-authenticated by
 /// the claimed member. This is intentionally independent of inviter and roster
 /// state so persisted recovery records can be authenticated during startup.
@@ -5903,6 +5917,7 @@ fn verify_member_joined_key_package_event(event: &NamedGroupMetadataEvent) -> bo
         ts_ms,
         treekem_key_package_b64: Some(treekem_key_package_b64),
         signature_b64,
+        ..
     } = event
     else {
         return false;
@@ -5936,14 +5951,360 @@ fn verify_member_joined_key_package_event(event: &NamedGroupMetadataEvent) -> bo
         && hex::encode(ant_quic::derive_peer_id_from_public_key(&pubkey).0)
             .eq_ignore_ascii_case(member_agent_id)
 }
+const MEMBER_JOINED_RECOVERY_DOMAIN: &[u8] = b"x0x.named_group.member_joined.recovery.v1";
+const MEMBER_JOINED_RECOVERY_BINDING_PREFIX: &str = "member-recovery=";
+
+fn member_joined_recovery_record_hash(event: &NamedGroupMetadataEvent) -> Option<String> {
+    let NamedGroupMetadataEvent::MemberJoined { signature_b64, .. } = event else {
+        return None;
+    };
+    let member_bytes = canonical_member_joined_recovery_bytes_without_commit(event)?;
+    let mut hasher = blake3::Hasher::new_derive_key("x0x MemberJoined recovery record v1");
+    hasher.update(&(member_bytes.len() as u64).to_be_bytes());
+    hasher.update(&member_bytes);
+    hasher.update(&(signature_b64.len() as u64).to_be_bytes());
+    hasher.update(signature_b64.as_bytes());
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+fn canonical_member_joined_recovery_bytes_without_commit(
+    event: &NamedGroupMetadataEvent,
+) -> Option<Vec<u8>> {
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id,
+        stable_group_id,
+        member_agent_id,
+        member_public_key_b64,
+        role,
+        display_name,
+        inviter_agent_id,
+        invite_secret,
+        ts_ms,
+        treekem_key_package_b64: Some(treekem_key_package_b64),
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some(canonical_member_joined_bytes(
+        group_id,
+        stable_group_id.as_deref(),
+        member_agent_id,
+        member_public_key_b64,
+        *role,
+        display_name.as_deref(),
+        inviter_agent_id,
+        invite_secret,
+        *ts_ms,
+        Some(treekem_key_package_b64),
+    ))
+}
+
+fn treekem_recovery_security_binding(
+    epoch: u64,
+    event: &NamedGroupMetadataEvent,
+) -> Option<String> {
+    let hash = member_joined_recovery_record_hash(event)?;
+    Some(format!(
+        "treekem:epoch={epoch};{MEMBER_JOINED_RECOVERY_BINDING_PREFIX}{hash}"
+    ))
+}
+
+fn canonical_member_joined_recovery_bytes(
+    event: &NamedGroupMetadataEvent,
+    authority_agent_id: &str,
+    authority_commit: &x0x::groups::GroupStateCommit,
+) -> Option<Vec<u8>> {
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id,
+        stable_group_id,
+        member_agent_id,
+        member_public_key_b64,
+        role,
+        display_name,
+        inviter_agent_id,
+        invite_secret,
+        ts_ms,
+        treekem_key_package_b64: Some(treekem_key_package_b64),
+        signature_b64,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let member_bytes = canonical_member_joined_bytes(
+        group_id,
+        stable_group_id.as_deref(),
+        member_agent_id,
+        member_public_key_b64,
+        *role,
+        display_name.as_deref(),
+        inviter_agent_id,
+        invite_secret,
+        *ts_ms,
+        Some(treekem_key_package_b64),
+    );
+    let commit_bytes = serde_json::to_vec(authority_commit).ok()?;
+    let mut bytes = Vec::with_capacity(
+        MEMBER_JOINED_RECOVERY_DOMAIN.len() + member_bytes.len() + commit_bytes.len() + 128,
+    );
+    bytes.extend_from_slice(MEMBER_JOINED_RECOVERY_DOMAIN);
+    for value in [
+        member_bytes.as_slice(),
+        signature_b64.as_bytes(),
+        authority_agent_id.as_bytes(),
+        commit_bytes.as_slice(),
+    ] {
+        bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(value);
+    }
+    Some(bytes)
+}
+
+fn attest_member_joined_recovery_event(
+    event: &NamedGroupMetadataEvent,
+    authority: &x0x::identity::AgentKeypair,
+    authority_commit: &x0x::groups::GroupStateCommit,
+) -> anyhow::Result<NamedGroupMetadataEvent> {
+    use base64::Engine as _;
+
+    let authority_agent_id = hex::encode(authority.agent_id().as_bytes());
+    let canonical =
+        canonical_member_joined_recovery_bytes(event, &authority_agent_id, authority_commit)
+            .ok_or_else(|| {
+                anyhow::anyhow!("MemberJoined recovery event is missing a KeyPackage")
+            })?;
+    let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        authority.secret_key(),
+        &canonical,
+    )
+    .map_err(|e| anyhow::anyhow!("sign MemberJoined recovery attestation: {e:?}"))?;
+    let mut attested = event.clone();
+    let NamedGroupMetadataEvent::MemberJoined {
+        recovery_authority_agent_id,
+        recovery_authority_public_key_b64,
+        recovery_authority_signature_b64,
+        recovery_authority_commit,
+        ..
+    } = &mut attested
+    else {
+        return Err(anyhow::anyhow!(
+            "recovery attestation requires MemberJoined"
+        ));
+    };
+    *recovery_authority_agent_id = Some(authority_agent_id);
+    *recovery_authority_public_key_b64 = Some(BASE64.encode(authority.public_key().as_bytes()));
+    *recovery_authority_signature_b64 = Some(BASE64.encode(signature.as_bytes()));
+    *recovery_authority_commit = Some(authority_commit.clone());
+    Ok(attested)
+}
+
+fn verify_recovery_attestation_structure(event: &NamedGroupMetadataEvent) -> bool {
+    use base64::Engine as _;
+
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id,
+        stable_group_id,
+        inviter_agent_id,
+        recovery_authority_agent_id: Some(authority_agent_id),
+        recovery_authority_public_key_b64: Some(authority_public_key_b64),
+        recovery_authority_signature_b64: Some(authority_signature_b64),
+        recovery_authority_commit: Some(authority_commit),
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let Some(recovery_hash) = member_joined_recovery_record_hash(event) else {
+        return false;
+    };
+    let expected_binding = format!("{MEMBER_JOINED_RECOVERY_BINDING_PREFIX}{recovery_hash}");
+    if !authority_agent_id.eq_ignore_ascii_case(inviter_agent_id)
+        || authority_commit.verify_structure().is_err()
+        || !authority_commit
+            .committed_by
+            .eq_ignore_ascii_case(authority_agent_id)
+        || !authority_commit
+            .security_binding
+            .as_deref()
+            .is_some_and(|binding| binding.split(';').any(|part| part == expected_binding))
+        || !(authority_commit.group_id == *group_id
+            || stable_group_id.as_deref() == Some(authority_commit.group_id.as_str()))
+    {
+        return false;
+    }
+    let Ok(public_key_bytes) = BASE64.decode(authority_public_key_b64) else {
+        return false;
+    };
+    let Ok(public_key) = ant_quic::MlDsaPublicKey::from_bytes(&public_key_bytes) else {
+        return false;
+    };
+    if !hex::encode(ant_quic::derive_peer_id_from_public_key(&public_key).0)
+        .eq_ignore_ascii_case(authority_agent_id)
+    {
+        return false;
+    }
+    let Ok(signature_bytes) = BASE64.decode(authority_signature_b64) else {
+        return false;
+    };
+    let Ok(signature) =
+        ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&signature_bytes)
+    else {
+        return false;
+    };
+    let Some(canonical) =
+        canonical_member_joined_recovery_bytes(event, authority_agent_id, authority_commit)
+    else {
+        return false;
+    };
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&public_key, &canonical, &signature)
+        .is_ok()
+}
+
+fn verify_authority_attested_member_joined_recovery(
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    use base64::Engine as _;
+
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id,
+        stable_group_id,
+        member_agent_id,
+        role,
+        inviter_agent_id,
+        treekem_key_package_b64: Some(treekem_key_package_b64),
+        recovery_authority_agent_id: Some(authority_agent_id),
+        recovery_authority_public_key_b64: Some(authority_public_key_b64),
+        recovery_authority_signature_b64: Some(authority_signature_b64),
+        recovery_authority_commit: Some(authority_commit),
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let Some(recovery_hash) = member_joined_recovery_record_hash(event) else {
+        return false;
+    };
+    let expected_binding = format!("{MEMBER_JOINED_RECOVERY_BINDING_PREFIX}{recovery_hash}");
+    let member_authenticated = verify_member_joined_key_package_event(event);
+    let authority_only_attestation = matches!(
+        event,
+        NamedGroupMetadataEvent::MemberJoined {
+            member_public_key_b64,
+            signature_b64,
+            ..
+        } if member_public_key_b64.is_empty() && signature_b64.is_empty()
+    );
+    let package_hash = blake3::hash(treekem_key_package_b64.as_bytes())
+        .to_hex()
+        .to_string();
+    let package_matches_current_incarnation = info
+        .members_v2
+        .get(member_agent_id)
+        .and_then(|member| member.treekem_key_package_hash.as_deref())
+        == Some(package_hash.as_str());
+    let creator_authority = role.at_least(x0x::groups::GroupRole::Admin)
+        && member_agent_id.eq_ignore_ascii_case(authority_agent_id)
+        && info.genesis.as_ref().is_some_and(|genesis| {
+            genesis
+                .creator_agent_id
+                .eq_ignore_ascii_case(member_agent_id)
+        })
+        && info
+            .members_v2
+            .get(member_agent_id)
+            .is_some_and(|member| member.added_by.is_none());
+    let invited_member_authority = *role == x0x::groups::GroupRole::Member
+        && info
+            .members_v2
+            .get(member_agent_id)
+            .and_then(|member| member.added_by.as_deref())
+            == Some(authority_agent_id.as_str());
+    if (!creator_authority && !invited_member_authority)
+        || (!member_authenticated && !authority_only_attestation)
+        || !package_matches_current_incarnation
+        || !authority_agent_id.eq_ignore_ascii_case(inviter_agent_id)
+        || authority_commit.verify_structure().is_err()
+        || !authority_commit
+            .committed_by
+            .eq_ignore_ascii_case(authority_agent_id)
+        || !authority_commit
+            .security_binding
+            .as_deref()
+            .is_some_and(|binding| binding.split(';').any(|part| part == expected_binding))
+        || authority_commit.group_id != info.stable_group_id()
+        || !(group_id == &info.mls_group_id
+            || group_id == info.stable_group_id()
+            || stable_group_id.as_deref() == Some(info.stable_group_id()))
+        || !info.has_active_member(member_agent_id)
+    {
+        return false;
+    }
+    let Ok(public_key_bytes) = BASE64.decode(authority_public_key_b64) else {
+        return false;
+    };
+    let Ok(public_key) = ant_quic::MlDsaPublicKey::from_bytes(&public_key_bytes) else {
+        return false;
+    };
+    if !hex::encode(ant_quic::derive_peer_id_from_public_key(&public_key).0)
+        .eq_ignore_ascii_case(authority_agent_id)
+    {
+        return false;
+    }
+    let Ok(signature_bytes) = BASE64.decode(authority_signature_b64) else {
+        return false;
+    };
+    let Ok(signature) =
+        ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&signature_bytes)
+    else {
+        return false;
+    };
+    let Some(canonical) =
+        canonical_member_joined_recovery_bytes(event, authority_agent_id, authority_commit)
+    else {
+        return false;
+    };
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&public_key, &canonical, &signature)
+        .is_ok()
+}
 
 async fn cache_treekem_member_key_package(
     state: &AppState,
     key: String,
     event: NamedGroupMetadataEvent,
+    overwrite: bool,
 ) {
     let mut cache = state.treekem_member_key_packages.write().await;
-    cache.insert(key, event);
+    if overwrite {
+        cache.insert(key, event);
+    } else {
+        if !cache.contains_key(&key) {
+            let event_group = named_group_metadata_event_group_id(&event);
+            let provisional_keys = cache
+                .iter()
+                .filter_map(|(cached_key, cached)| {
+                    let NamedGroupMetadataEvent::MemberJoined {
+                        recovery_authority_signature_b64,
+                        ts_ms,
+                        ..
+                    } = cached
+                    else {
+                        return None;
+                    };
+                    (recovery_authority_signature_b64.is_none()
+                        && named_group_metadata_event_group_id(cached) == event_group)
+                        .then_some((cached_key.clone(), *ts_ms))
+                })
+                .collect::<Vec<_>>();
+            if provisional_keys.len() >= TREEKEM_PROVISIONAL_RECOVERY_PER_GROUP_CAP {
+                if let Some((oldest, _)) = provisional_keys.into_iter().min_by_key(|(_, ts)| *ts) {
+                    cache.remove(&oldest);
+                }
+            }
+        }
+        cache.entry(key).or_insert(event);
+    }
     match serde_json::to_string(&*cache) {
         Ok(json) => {
             if let Err(e) =
@@ -5956,14 +6317,47 @@ async fn cache_treekem_member_key_package(
     }
 }
 
-/// Install a TreeKEM KeyPackage recovered from a cached, self-signed
-/// `MemberJoined` event. The normal `MemberJoined` apply is inviter-only, so a
-/// promoted admin that never witnessed the join learns the target's key package
-/// here. The package is authenticated by re-verifying the joiner's ML-DSA-65
-/// signature over `canonical_member_joined_bytes` (independent of the inviter
-/// gate); the roster/state-commit chain is untouched. Returns `true` only when
-/// a previously-absent package was installed (issue #205).
+/// Install a TreeKEM KeyPackage recovered from a member-signed `MemberJoined`
+/// that the inviter countersigned after accepting the join. The countersignature
+/// binds recovery to the package actually admitted into the TreeKEM tree; a
+/// compromised member cannot replace it with a newly self-signed package.
 async fn apply_recovered_member_key_package(
+    state: &Arc<AppState>,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    let NamedGroupMetadataEvent::MemberJoined { group_id, .. } = event else {
+        return false;
+    };
+    let membership_lock = group_membership_lock(state, group_id).await;
+    #[cfg(test)]
+    {
+        let notify = RECOVERED_KP_BEFORE_MEMBERSHIP_LOCK_NOTIFY
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .filter(|(target_group_id, _)| target_group_id == group_id)
+                    .map(|(_, notify)| Arc::clone(notify))
+            });
+        if let Some(notify) = notify {
+            notify.notify_one();
+        }
+    }
+    let _membership_guard = membership_lock.lock().await;
+    apply_recovered_member_key_package_locked(state, event).await
+}
+
+fn current_member_treekem_key_package(member: &x0x::groups::GroupMember) -> Option<String> {
+    let package = member.treekem_key_package_b64.as_ref()?;
+    let expected_hash = member.treekem_key_package_hash.as_deref()?;
+    (blake3::hash(package.as_bytes()).to_hex().as_str() == expected_hash).then(|| package.clone())
+}
+
+/// Install a recovered KeyPackage while the caller holds this group's
+/// [`group_membership_lock`]. Keeping resolution and mutation under the same
+/// guard prevents a stale full-`GroupInfo` write-back from erasing the package.
+async fn apply_recovered_member_key_package_locked(
     state: &Arc<AppState>,
     event: &NamedGroupMetadataEvent,
 ) -> bool {
@@ -5979,15 +6373,8 @@ async fn apply_recovered_member_key_package(
     let Some(kp_b64) = treekem_key_package_b64.clone() else {
         return false;
     };
-    if !verify_member_joined_key_package_event(event) {
-        tracing::warn!(
-            group_id = %LogHexId::group(group_id),
-            member = %LogHexId::agent(member_agent_id),
-            "recovered MemberJoined key package: signature did not verify — refusing to install"
-        );
-        return false;
-    }
-    // Resolve the local group by storage key (mls_group_id) or stable alias.
+    // Resolve the live group only after acquiring the membership guard. A
+    // pre-lock resolution would recreate the stale-clone race this guard fixes.
     let storage_key = {
         let groups = state.named_groups.read().await;
         groups
@@ -6008,6 +6395,14 @@ async fn apply_recovered_member_key_package(
         let Some(info) = groups.get_mut(&storage_key) else {
             return false;
         };
+        if !verify_authority_attested_member_joined_recovery(info, event) {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                member = %LogHexId::agent(member_agent_id),
+                "recovered MemberJoined key package: inviter attestation did not verify"
+            );
+            return false;
+        }
         if !info.has_member(member_agent_id) {
             return false;
         }
@@ -6015,7 +6410,7 @@ async fn apply_recovered_member_key_package(
         if info
             .members_v2
             .get(member_agent_id)
-            .and_then(|m| m.treekem_key_package_b64.clone())
+            .and_then(current_member_treekem_key_package)
             .is_some()
         {
             return false;
@@ -6029,6 +6424,7 @@ async fn apply_recovered_member_key_package(
             state,
             join_result_key(group_id, member_agent_id),
             event.clone(),
+            true,
         )
         .await;
     }
@@ -6040,7 +6436,18 @@ async fn apply_recovered_member_key_package(
 /// no-op success; otherwise it looks up this node's cached, self-signed
 /// `MemberJoined` for the member and installs its (signature-verified) package.
 /// Returns `true` when the roster now carries the package.
+#[cfg(test)]
 async fn recover_member_treekem_key_package(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_agent_id: &str,
+) -> bool {
+    let membership_lock = group_membership_lock(state, group_id).await;
+    let _membership_guard = membership_lock.lock().await;
+    recover_member_treekem_key_package_locked(state, group_id, member_agent_id).await
+}
+
+async fn recover_member_treekem_key_package_locked(
     state: &Arc<AppState>,
     group_id: &str,
     member_agent_id: &str,
@@ -6051,7 +6458,7 @@ async fn recover_member_treekem_key_package(
             if info
                 .members_v2
                 .get(member_agent_id)
-                .and_then(|m| m.treekem_key_package_b64.clone())
+                .and_then(current_member_treekem_key_package)
                 .is_some()
             {
                 return true;
@@ -6066,7 +6473,7 @@ async fn recover_member_treekem_key_package(
     let Some(event) = cached else {
         return false;
     };
-    apply_recovered_member_key_package(state, &event).await
+    apply_recovered_member_key_package_locked(state, &event).await
 }
 
 /// Resolve a target member's TreeKEM KeyPackage (base64) for a verified
@@ -6074,7 +6481,20 @@ async fn recover_member_treekem_key_package(
 /// lacks it. Caller must have already enforced admin authority. On a local
 /// recovery miss it fires an async member-keyed catch-up so a client retry
 /// succeeds after delivery, and returns `FAILED_DEPENDENCY` with `retry: true`.
+#[cfg(test)]
 async fn resolve_member_treekem_kp_for_removal(
+    state: &Arc<AppState>,
+    group_id: &str,
+    agent_id_hex: &str,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let membership_lock = group_membership_lock(state, group_id).await;
+    let _membership_guard = membership_lock.lock().await;
+    resolve_member_treekem_kp_for_removal_locked(state, group_id, agent_id_hex).await
+}
+
+/// Resolve a removal KeyPackage while the caller holds this group's
+/// [`group_membership_lock`].
+async fn resolve_member_treekem_kp_for_removal_locked(
     state: &Arc<AppState>,
     group_id: &str,
     agent_id_hex: &str,
@@ -6089,12 +6509,12 @@ async fn resolve_member_treekem_kp_for_removal(
                     .find(|info| info.stable_group_id() == group_id)
             })
             .and_then(|info| info.members_v2.get(agent_id_hex))
-            .and_then(|m| m.treekem_key_package_b64.clone())
+            .and_then(current_member_treekem_key_package)
     };
     if let Some(kp_b64) = existing {
         return Ok(kp_b64);
     }
-    if recover_member_treekem_key_package(state, group_id, agent_id_hex).await {
+    if recover_member_treekem_key_package_locked(state, group_id, agent_id_hex).await {
         let recovered = {
             let groups = state.named_groups.read().await;
             groups
@@ -6105,7 +6525,7 @@ async fn resolve_member_treekem_kp_for_removal(
                         .find(|info| info.stable_group_id() == group_id)
                 })
                 .and_then(|info| info.members_v2.get(agent_id_hex))
-                .and_then(|m| m.treekem_key_package_b64.clone())
+                .and_then(current_member_treekem_key_package)
         };
         if let Some(kp_b64) = recovered {
             return Ok(kp_b64);
@@ -6315,11 +6735,23 @@ async fn member_keyed_treekem_catchup_response(
     request: &TreeKemCatchupRequest,
 ) -> Option<TreeKemCatchupResponse> {
     let target_member_id = request.target_member_id.as_ref()?;
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(&request.group_id)
+            .or_else(|| {
+                groups
+                    .values()
+                    .find(|info| info.stable_group_id() == request.group_id)
+            })
+            .cloned()
+    }?;
     let event = {
         let cache = state.treekem_member_key_packages.read().await;
         log_keys
             .iter()
             .find_map(|group_id| cache.get(&join_result_key(group_id, target_member_id)))
+            .filter(|event| verify_authority_attested_member_joined_recovery(&info, event))
             .cloned()
     };
     Some(TreeKemCatchupResponse {
@@ -6461,15 +6893,41 @@ async fn handle_treekem_catchup_response(
     if !verified || response.message_type != "treekem_catchup_response" {
         return;
     }
+    let sender_hex = hex::encode(sender.as_bytes());
+    {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(sender) {
+            return;
+        }
+    }
+    let response_info = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(&response.group_id)
+            .or_else(|| {
+                groups
+                    .values()
+                    .find(|info| info.stable_group_id() == response.group_id)
+            })
+            .filter(|info| !info.withdrawn && info.has_active_member(&sender_hex))
+            .cloned()
+    };
+    let Some(response_info) = response_info else {
+        tracing::warn!(
+            group_id = %LogHexId::group(&response.group_id),
+            sender = %LogHexId::agent(&sender_hex),
+            "rejecting TreeKEM catch-up response from a non-member or withdrawn group"
+        );
+        return;
+    };
     let was_truncated = response.truncated;
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
     for event in events {
-        // Issue #205: a kp-bearing `MemberJoined` delivered by a member-keyed
-        // catch-up won't apply on a non-inviter (the normal apply is
-        // inviter-only). Clone it before the move so we can signature-verify +
-        // install the target's key package for a promoted admin that lacks it.
-        let recovery_event = member_joined_kp_cache_entry(&event).map(|(_, ev)| ev);
+        let recovery_event = member_joined_kp_cache_entry(&event)
+            .map(|(_, ev)| ev)
+            .filter(|ev| verify_authority_attested_member_joined_recovery(&response_info, ev));
         apply_named_group_metadata_event(state, event, *sender, true).await;
         if let Some(ev) = recovery_event {
             apply_recovered_member_key_package(state, &ev).await;
@@ -6664,17 +7122,24 @@ async fn apply_named_group_metadata_event(
     sender: AgentId,
     verified: bool,
 ) -> bool {
-    // Issue #205: a node that authoritatively applies a joiner's self-signed
-    // `MemberJoined` (the inviter) caches the key-package-bearing event so a
-    // later promoted admin — which never sees the join, since `MemberJoined`
-    // apply is inviter-only — can recover the target's TreeKEM KeyPackage via
-    // the member-keyed catch-up protocol. Clone before the move into `inner`.
+    // A non-inviter may retain the first fully member-authenticated join event
+    // as provisional evidence, but it cannot replace an existing entry. The
+    // inviter's post-acceptance countersigned event (distributed in MemberAdded)
+    // upgrades this cache authoritatively after the roster mutation succeeds.
     let kp_cache_entry = member_joined_kp_cache_entry(&event);
-    let should_exit =
-        apply_named_group_metadata_event_inner(state, event, sender, verified, true).await;
-    if let Some((key, cached)) = kp_cache_entry {
-        if member_joined_key_package_matches_roster(state, &cached).await {
-            cache_treekem_member_key_package(state, key, cached).await;
+    let mut retained_non_inviter_witness = false;
+    let should_exit = apply_named_group_metadata_event_inner_with_witness(
+        state,
+        event,
+        sender,
+        verified,
+        true,
+        Some(&mut retained_non_inviter_witness),
+    )
+    .await;
+    if retained_non_inviter_witness {
+        if let Some((key, cached)) = kp_cache_entry {
+            cache_treekem_member_key_package(state, key, cached, false).await;
         }
     }
     should_exit
@@ -6686,6 +7151,25 @@ async fn apply_named_group_metadata_event_inner(
     sender: AgentId,
     verified: bool,
     allow_queue: bool,
+) -> bool {
+    apply_named_group_metadata_event_inner_with_witness(
+        state,
+        event,
+        sender,
+        verified,
+        allow_queue,
+        None,
+    )
+    .await
+}
+
+async fn apply_named_group_metadata_event_inner_with_witness(
+    state: &Arc<AppState>,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    verified: bool,
+    allow_queue: bool,
+    non_inviter_recovery_witness: Option<&mut bool>,
 ) -> bool {
     let event_kind = named_group_metadata_event_kind(&event);
     let sender_hex = hex::encode(sender.as_bytes());
@@ -6891,6 +7375,9 @@ async fn apply_named_group_metadata_event_inner(
             treekem_welcome_b64,
             welcome_ref,
             treekem_epoch,
+            treekem_key_package_hash,
+            member_joined_recovery,
+            member_recovery_history,
             commit,
             ..
         } => {
@@ -6918,7 +7405,7 @@ async fn apply_named_group_metadata_event_inner(
                 None
             };
             let current = info.clone();
-            let next = match apply_stateful_event_to_group(
+            let mut next = match apply_stateful_event_to_group(
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -6930,12 +7417,15 @@ async fn apply_named_group_metadata_event_inner(
                         Some(actor.clone()),
                         display_name.clone(),
                     );
+                    if let Some(package_hash) = treekem_key_package_hash.clone() {
+                        next.set_member_treekem_key_package_hash(&agent_id, package_hash);
+                    }
                     if let Some(name) = display_name.clone() {
                         next.set_display_name(&agent_id, name);
                     }
                     if let Some((_, _, _, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
-                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                        next.security_binding = commit.security_binding.clone();
                     }
                 },
             ) {
@@ -6959,6 +7449,51 @@ async fn apply_named_group_metadata_event_inner(
                     return false;
                 }
             };
+            let mut recovery_cache_entries = Vec::new();
+            if let Some(recovery) = member_joined_recovery.as_deref() {
+                if !verify_authority_attested_member_joined_recovery(&next, recovery) {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        member = %LogHexId::agent(&agent_id),
+                        "MemberAdded carried an invalid inviter recovery attestation"
+                    );
+                    return false;
+                }
+                let Some((key, cached)) = member_joined_kp_cache_entry(recovery) else {
+                    return false;
+                };
+                let NamedGroupMetadataEvent::MemberJoined {
+                    treekem_key_package_b64: Some(kp_b64),
+                    ..
+                } = recovery
+                else {
+                    return false;
+                };
+                next.set_member_treekem_key_package(&agent_id, kp_b64.clone());
+                recovery_cache_entries.push((key, cached));
+            }
+            for recovery in &member_recovery_history {
+                if !verify_authority_attested_member_joined_recovery(&next, recovery) {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        "MemberAdded carried invalid historical recovery evidence"
+                    );
+                    return false;
+                }
+                let Some((key, cached)) = member_joined_kp_cache_entry(recovery) else {
+                    return false;
+                };
+                let NamedGroupMetadataEvent::MemberJoined {
+                    member_agent_id: recovered_member,
+                    treekem_key_package_b64: Some(kp_b64),
+                    ..
+                } = recovery
+                else {
+                    return false;
+                };
+                next.set_member_treekem_key_package(recovered_member, kp_b64.clone());
+                recovery_cache_entries.push((key, cached));
+            }
             if let Some((commit_b64, welcome_b64, welcome_ref, epoch)) = treekem_payload {
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
@@ -7088,6 +7623,9 @@ async fn apply_named_group_metadata_event_inner(
             }
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return false;
+            }
+            for (key, cached) in recovery_cache_entries {
+                cache_treekem_member_key_package(state, key, cached, true).await;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
@@ -7583,6 +8121,7 @@ async fn apply_named_group_metadata_event_inner(
                                 removed_by: None,
                                 kem_public_key_b64: Some(kem_b64),
                                 treekem_key_package_b64: treekem_key_package_b64.clone(),
+                                treekem_key_package_hash: None,
                             });
                     }
                     if let Some(kp_b64) = treekem_key_package_b64.clone() {
@@ -7607,6 +8146,7 @@ async fn apply_named_group_metadata_event_inner(
             treekem_welcome_b64,
             welcome_ref,
             treekem_epoch,
+            treekem_key_package_hash,
             commit,
             ..
         } => {
@@ -7641,7 +8181,16 @@ async fn apply_named_group_metadata_event_inner(
                 let Some(epoch) = treekem_epoch else {
                     return false;
                 };
-                Some((commit_b64, treekem_welcome_b64, welcome_ref, epoch))
+                let Some(package_hash) = treekem_key_package_hash else {
+                    return false;
+                };
+                Some((
+                    commit_b64,
+                    treekem_welcome_b64,
+                    welcome_ref,
+                    epoch,
+                    package_hash,
+                ))
             } else {
                 None
             };
@@ -7665,18 +8214,28 @@ async fn apply_named_group_metadata_event_inner(
                         Some(actor.clone()),
                         None,
                     );
-                    if let Some(kp_b64) = request_key_package_b64.clone() {
-                        next.set_member_treekem_key_package(&requester_agent_id, kp_b64);
+                    if let Some((_, _, _, _, package_hash)) = treekem_payload.as_ref() {
+                        next.set_member_treekem_key_package_hash(
+                            &requester_agent_id,
+                            package_hash.clone(),
+                        );
+                        if let Some(kp_b64) = request_key_package_b64.clone().filter(|package| {
+                            blake3::hash(package.as_bytes()).to_hex().as_str() == package_hash
+                        }) {
+                            next.set_member_treekem_key_package(&requester_agent_id, kp_b64);
+                        }
                     }
-                    if let Some((_, _, _, epoch)) = treekem_payload.as_ref() {
+                    if let Some((_, _, _, epoch, _)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
-                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                        next.security_binding = commit.security_binding.clone();
                     }
                 },
             ) else {
                 return false;
             };
-            if let Some((commit_b64, welcome_b64, welcome_ref, _epoch)) = treekem_payload {
+            if let Some((commit_b64, welcome_b64, welcome_ref, _epoch, _package_hash)) =
+                treekem_payload
+            {
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
                     Ok(bytes) => bytes,
@@ -8033,18 +8592,33 @@ async fn apply_named_group_metadata_event_inner(
             invite_secret,
             ts_ms,
             treekem_key_package_b64,
+            recovery_authority_signature_b64,
             signature_b64,
             ..
         } => {
-            // 1. The gossip layer's `verified` gate already enforced that
-            //    `sender` produced this payload; check sender == member.
-            if !sender_hex.eq_ignore_ascii_case(&member_agent_id) {
+            // Original joins are self-delivered. Authority-attested recovery
+            // records may be relayed by any active member; package bytes are
+            // still checked against the committed roster hash before install.
+            let self_delivered = sender_hex.eq_ignore_ascii_case(&member_agent_id);
+            let active_recovery_courier =
+                recovery_authority_signature_b64.is_some() && info.has_active_member(&sender_hex);
+            if !self_delivered && !active_recovery_courier {
                 tracing::debug!(
                     group_id = %resolved_group_key,
                     sender = %sender_hex,
                     member = %member_agent_id,
-                    "MemberJoined: rejecting — sender != member_agent_id"
+                    "MemberJoined: rejecting unauthorised recovery courier"
                 );
+                return false;
+            }
+
+            if recovery_authority_signature_b64.is_some() {
+                if !verify_authority_attested_member_joined_recovery(&info, &event_for_log) {
+                    return false;
+                }
+                if let Some((key, cached)) = member_joined_kp_cache_entry(&event_for_log) {
+                    cache_treekem_member_key_package(state, key, cached, true).await;
+                }
                 return false;
             }
 
@@ -8155,11 +8729,16 @@ async fn apply_named_group_metadata_event_inner(
             //    state-commit chain.
             let local_is_inviter = local_agent_hex.eq_ignore_ascii_case(&inviter_agent_id);
             if !local_is_inviter {
+                if treekem_key_package_b64.is_some() {
+                    if let Some(witnessed) = non_inviter_recovery_witness {
+                        *witnessed = true;
+                    }
+                }
                 tracing::debug!(
                     group_id = %resolved_group_key,
                     inviter = %inviter_agent_id,
                     local = %local_agent_hex,
-                    "MemberJoined: ignoring on non-inviter receiver"
+                    "MemberJoined: retained authenticated recovery event without applying on non-inviter receiver"
                 );
                 return false;
             }
@@ -8222,6 +8801,26 @@ async fn apply_named_group_metadata_event_inner(
                 } else {
                     None
                 };
+            let recovery_original =
+                treekem_key_package_b64
+                    .as_ref()
+                    .map(|_| NamedGroupMetadataEvent::MemberJoined {
+                        group_id: group_id.clone(),
+                        stable_group_id: stable_group_id.clone(),
+                        member_agent_id: member_agent_id.clone(),
+                        member_public_key_b64: member_public_key_b64.clone(),
+                        role,
+                        display_name: display_name.clone(),
+                        inviter_agent_id: inviter_agent_id.clone(),
+                        invite_secret: invite_secret.clone(),
+                        ts_ms,
+                        treekem_key_package_b64: treekem_key_package_b64.clone(),
+                        recovery_authority_agent_id: None,
+                        recovery_authority_public_key_b64: None,
+                        recovery_authority_signature_b64: None,
+                        recovery_authority_commit: None,
+                        signature_b64: signature_b64.clone(),
+                    });
             let mut treekem_epoch = None;
             let mut treekem_commit = None;
             let mut treekem_welcome = None;
@@ -8254,8 +8853,14 @@ async fn apply_named_group_metadata_event_inner(
                 };
                 let mut guard = group.lock().await;
                 let expected_epoch = guard.epoch().saturating_add(1);
+                let Some(binding) = recovery_original
+                    .as_ref()
+                    .and_then(|event| treekem_recovery_security_binding(expected_epoch, event))
+                else {
+                    return false;
+                };
+                next.security_binding = Some(binding);
                 next.secret_epoch = expected_epoch;
-                next.security_binding = Some(format!("treekem:epoch={expected_epoch}"));
                 let commit = match next.seal_commit(signing_kp, now_ms) {
                     Ok(commit) => commit,
                     Err(e) => {
@@ -8359,6 +8964,49 @@ async fn apply_named_group_metadata_event_inner(
             } else {
                 None
             };
+            let member_joined_recovery = if let Some(original) = recovery_original.as_ref() {
+                match attest_member_joined_recovery_event(original, signing_kp, &commit) {
+                    Ok(attested) => Some(Box::new(attested)),
+                    Err(e) => {
+                        tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to attest accepted MemberJoined recovery record: {e}");
+                        return false;
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(recovery) = member_joined_recovery.as_deref() {
+                cache_treekem_member_key_package(
+                    state,
+                    join_result_key(&group_id, &member_agent_id),
+                    recovery.clone(),
+                    true,
+                )
+                .await;
+            }
+            let member_recovery_deliveries = {
+                let cache = state.treekem_member_key_packages.read().await;
+                let mut seen = HashSet::new();
+                cache
+                    .values()
+                    .filter_map(|recovery| {
+                        let NamedGroupMetadataEvent::MemberJoined {
+                            member_agent_id: recovered_member,
+                            ..
+                        } = recovery
+                        else {
+                            return None;
+                        };
+                        if recovered_member == &member_agent_id
+                            || !seen.insert(recovered_member.clone())
+                            || !verify_authority_attested_member_joined_recovery(&next, recovery)
+                        {
+                            return None;
+                        }
+                        Some(recovery.clone())
+                    })
+                    .collect::<Vec<_>>()
+            };
             let event = NamedGroupMetadataEvent::MemberAdded {
                 group_id: event_group_id.clone(),
                 revision,
@@ -8369,6 +9017,12 @@ async fn apply_named_group_metadata_event_inner(
                 treekem_welcome_b64: None,
                 welcome_ref,
                 treekem_epoch,
+                treekem_key_package_hash: next
+                    .members_v2
+                    .get(&member_agent_id)
+                    .and_then(|member| member.treekem_key_package_hash.clone()),
+                member_joined_recovery: None,
+                member_recovery_history: Vec::new(),
                 commit: Some(commit),
             };
             stage_join_result(state, &event_group_id, &member_agent_id, event.clone()).await;
@@ -8380,6 +9034,20 @@ async fn apply_named_group_metadata_event_inner(
                 &event,
                 std::slice::from_ref(&member_agent_id),
             );
+            if let Some(recovery) = member_joined_recovery.as_deref() {
+                spawn_named_group_event_delivery_to_active_members(state, &next, recovery, &[]);
+            }
+            // Deliver each prior recovery record independently. Every payload stays
+            // below the DM limit; group size cannot make the Welcome event oversized.
+            for recovery in member_recovery_deliveries {
+                spawn_named_group_event_delivery(state, &member_agent_id, &recovery);
+                spawn_named_group_event_delivery_after(
+                    state,
+                    &member_agent_id,
+                    &recovery,
+                    GROUP_BACKGROUND_PUBLISH_DELAY,
+                );
+            }
             maybe_publish_group_card_after_state_change(state, &resolved_group_key).await;
             tracing::info!(
                 group_id = %resolved_group_key,
@@ -8570,11 +9238,88 @@ async fn create_named_group(
                         );
                     }
                 };
+                let creator_package = match x0x::mls::TreeKemMlsGroup::prepare_member(
+                    agent_id, &seed,
+                ) {
+                    Ok(prepared) => BASE64.encode(prepared.key_package_bytes()),
+                    Err(e) => {
+                        tracing::error!(group_id = %group_id_hex, "failed to prepare creator recovery package: {e}");
+                        return api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to prepare creator recovery package: {e}"),
+                        );
+                    }
+                };
+                let creator_hex = hex::encode(agent_id.as_bytes());
                 info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
                 info.shared_secret = None;
                 info.secret_epoch = tk.epoch();
-                info.security_binding = Some(format!("treekem:epoch={}", tk.epoch()));
-                info.recompute_state_hash();
+                info.set_member_treekem_key_package(&creator_hex, creator_package.clone());
+                let creator_recovery_original = NamedGroupMetadataEvent::MemberJoined {
+                    group_id: group_id_hex.clone(),
+                    stable_group_id: Some(info.stable_group_id().to_string()),
+                    member_agent_id: creator_hex.clone(),
+                    member_public_key_b64: String::new(),
+                    role: info
+                        .caller_role(&creator_hex)
+                        .unwrap_or(x0x::groups::GroupRole::Admin),
+                    display_name: info
+                        .members_v2
+                        .get(&creator_hex)
+                        .and_then(|member| member.display_name.clone()),
+                    inviter_agent_id: creator_hex.clone(),
+                    invite_secret: String::new(),
+                    ts_ms: info
+                        .genesis
+                        .as_ref()
+                        .map_or(info.created_at, |genesis| genesis.created_at),
+                    treekem_key_package_b64: Some(creator_package),
+                    recovery_authority_agent_id: None,
+                    recovery_authority_public_key_b64: None,
+                    recovery_authority_signature_b64: None,
+                    recovery_authority_commit: None,
+                    signature_b64: String::new(),
+                };
+                let Some(binding) =
+                    treekem_recovery_security_binding(tk.epoch(), &creator_recovery_original)
+                else {
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to bind creator recovery record",
+                    );
+                };
+                info.security_binding = Some(binding);
+                let creator_commit = match info
+                    .seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())
+                {
+                    Ok(commit) => commit,
+                    Err(e) => {
+                        return api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to seal creator recovery commit: {e}"),
+                        );
+                    }
+                };
+                let creator_recovery = match attest_member_joined_recovery_event(
+                    &creator_recovery_original,
+                    state.agent.identity().agent_keypair(),
+                    &creator_commit,
+                ) {
+                    Ok(recovery) => recovery,
+                    Err(e) => {
+                        return api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to attest creator recovery package: {e}"),
+                        );
+                    }
+                };
+                cache_treekem_member_key_package(
+                    &state,
+                    join_result_key(&group_id_hex, &creator_hex),
+                    creator_recovery,
+                    true,
+                )
+                .await;
                 state
                     .treekem_groups
                     .write()
@@ -9535,12 +10280,21 @@ async fn join_group_via_invite(
     let agent_id = state.agent.agent_id();
     let group_id_hex = invite.group_id.clone();
     let invite_stable_group_id = invite.stable_group_id.as_deref().unwrap_or(&group_id_hex);
+    let membership_lock = group_membership_lock(&state, &group_id_hex).await;
+    let membership_guard = membership_lock.lock().await;
     {
         let groups = state.named_groups.read().await;
         if has_withdrawn_group_record(&groups, &group_id_hex)
             || has_withdrawn_group_record(&groups, invite_stable_group_id)
         {
             return api_error(StatusCode::CONFLICT, "group is withdrawn");
+        }
+        if groups.contains_key(&group_id_hex)
+            || groups
+                .values()
+                .any(|info| info.mls_group_id == group_id_hex)
+        {
+            return api_error(StatusCode::CONFLICT, "group already joined");
         }
     }
     let inviter = match parse_agent_id_hex(&invite.inviter) {
@@ -9621,6 +10375,7 @@ async fn join_group_via_invite(
                 .await
                 .insert(group_id_hex.clone(), info.clone());
             save_named_groups(&state).await;
+            drop(membership_guard);
             ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
 
             // Publish a signed MemberJoined request on the metadata topic so
@@ -9677,6 +10432,10 @@ async fn join_group_via_invite(
                         invite_secret: invite.invite_secret.clone(),
                         ts_ms: now_ms,
                         treekem_key_package_b64: treekem_key_package_b64.clone(),
+                        recovery_authority_agent_id: None,
+                        recovery_authority_public_key_b64: None,
+                        recovery_authority_signature_b64: None,
+                        recovery_authority_commit: None,
                         signature_b64,
                     };
                     tracing::info!(
@@ -9802,6 +10561,8 @@ async fn set_group_display_name(
     Path(id): Path<String>,
     Json(req): Json<SetDisplayNameRequest>,
 ) -> impl IntoResponse {
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let membership_guard = membership_lock.lock().await;
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return not_found("group not found");
@@ -9814,6 +10575,7 @@ async fn set_group_display_name(
     info.set_display_name(&agent_hex, req.name.clone());
     drop(groups); // release write lock before saving
     save_named_groups(&state).await;
+    drop(membership_guard);
 
     (
         StatusCode::OK,
@@ -9921,6 +10683,9 @@ async fn add_named_group_member(
             treekem_welcome_b64: None,
             welcome_ref: None,
             treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
             commit: Some(commit),
         };
         (metadata_topic, event, members, epoch)
@@ -10027,15 +10792,54 @@ async fn add_treekem_named_group_member(
     if let Some(display_name) = req.display_name.clone() {
         next.set_display_name(&agent_hex, display_name);
     }
-    next.set_member_treekem_key_package(&agent_hex, kp_b64);
+    let direct_recovery_original = NamedGroupMetadataEvent::MemberJoined {
+        group_id: id.clone(),
+        stable_group_id: Some(event_group_id.clone()),
+        member_agent_id: agent_hex.clone(),
+        member_public_key_b64: String::new(),
+        role: x0x::groups::GroupRole::Member,
+        display_name: req.display_name.clone(),
+        inviter_agent_id: actor_hex.clone(),
+        invite_secret: String::new(),
+        ts_ms: now_ms,
+        treekem_key_package_b64: Some(kp_b64.clone()),
+        recovery_authority_agent_id: None,
+        recovery_authority_public_key_b64: None,
+        recovery_authority_signature_b64: None,
+        recovery_authority_commit: None,
+        signature_b64: String::new(),
+    };
+    next.set_member_treekem_key_package(&agent_hex, kp_b64.clone());
     next.secret_epoch = treekem_epoch;
-    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    let Some(binding) = treekem_recovery_security_binding(treekem_epoch, &direct_recovery_original)
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": "failed to bind recovery record" })),
+        );
+    };
+    next.security_binding = Some(binding);
     let commit = match next.seal_commit(signing_kp, now_ms) {
         Ok(c) => c,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
+    let member_joined_recovery = match attest_member_joined_recovery_event(
+        &direct_recovery_original,
+        signing_kp,
+        &commit,
+    ) {
+        Ok(attested) => attested,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("recovery attestation failed: {e}") }),
+                ),
             );
         }
     };
@@ -10087,8 +10891,21 @@ async fn add_treekem_named_group_member(
         treekem_welcome_b64: None,
         welcome_ref: Some(welcome_ref),
         treekem_epoch: Some(treekem_epoch),
+        treekem_key_package_hash: next
+            .members_v2
+            .get(&agent_hex)
+            .and_then(|member| member.treekem_key_package_hash.clone()),
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
         commit: Some(commit),
     };
+    cache_treekem_member_key_package(
+        &state,
+        join_result_key(&id, &agent_hex),
+        member_joined_recovery.clone(),
+        true,
+    )
+    .await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     remember_treekem_membership_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(
@@ -10097,6 +10914,30 @@ async fn add_treekem_named_group_member(
         &event,
         std::slice::from_ref(&agent_hex),
     );
+    spawn_named_group_event_delivery_to_active_members(&state, &next, &member_joined_recovery, &[]);
+    let recovery_deliveries = {
+        let cache = state.treekem_member_key_packages.read().await;
+        cache
+            .values()
+            .filter(|recovery| {
+                matches!(
+                    recovery,
+                    NamedGroupMetadataEvent::MemberJoined { member_agent_id, .. }
+                        if member_agent_id != &agent_hex
+                ) && verify_authority_attested_member_joined_recovery(&next, recovery)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for recovery in recovery_deliveries {
+        spawn_named_group_event_delivery(&state, &agent_hex, &recovery);
+        spawn_named_group_event_delivery_after(
+            &state,
+            &agent_hex,
+            &recovery,
+            GROUP_BACKGROUND_PUBLISH_DELAY,
+        );
+    }
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     let members = named_group_member_values(&next);
@@ -10427,6 +11268,22 @@ async fn ensure_named_group_key_material_install_allowed(
 }
 
 async fn repair_withdrawn_named_groups_json_and_wipe_key_material(
+    state: &AppState,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
+        state,
+        group_id,
+        stable_group_id,
+        reason,
+    )
+    .await
+}
+
+async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
     state: &AppState,
     group_id: &str,
     stable_group_id: Option<&str>,
@@ -10896,7 +11753,7 @@ async fn remove_treekem_named_group_member(
     // lacks it. Mirror it onto the cloned snapshot so a later write-back never
     // clobbers a recovered package.
     let target_kp_b64 =
-        match resolve_member_treekem_kp_for_removal(&state, &id, &agent_id_hex).await {
+        match resolve_member_treekem_kp_for_removal_locked(&state, &id, &agent_id_hex).await {
             Ok(kp_b64) => kp_b64,
             Err(resp) => return resp,
         };
@@ -11741,6 +12598,8 @@ async fn update_group_policy(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let membership_guard = membership_lock.lock().await;
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return not_found("group not found");
@@ -11807,6 +12666,7 @@ async fn update_group_policy(
     let delivery_roster = info.clone();
     drop(groups);
     save_named_groups(&state).await;
+    drop(membership_guard);
 
     let event = NamedGroupMetadataEvent::PolicyUpdated {
         group_id: event_group_id,
@@ -11838,6 +12698,8 @@ async fn update_member_role(
         Ok(role) => role,
         Err(error) => return bad_request(error),
     };
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let membership_guard = membership_lock.lock().await;
 
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
@@ -11898,6 +12760,7 @@ async fn update_member_role(
     let delivery_roster = info.clone();
     drop(groups);
     save_named_groups(&state).await;
+    drop(membership_guard);
 
     let event = NamedGroupMetadataEvent::MemberRoleUpdated {
         group_id: event_group_id,
@@ -12113,7 +12976,7 @@ async fn ban_treekem_group_member(
     // recovery, mirroring it onto the cloned snapshot so the banned member's
     // package survives the write-back.
     let target_kp_b64 =
-        match resolve_member_treekem_kp_for_removal(&state, &id, &agent_id_hex).await {
+        match resolve_member_treekem_kp_for_removal_locked(&state, &id, &agent_id_hex).await {
             Ok(kp_b64) => kp_b64,
             Err(resp) => return resp,
         };
@@ -12228,6 +13091,8 @@ async fn unban_group_member(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let membership_guard = membership_lock.lock().await;
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
         return not_found("group not found");
@@ -12265,6 +13130,7 @@ async fn unban_group_member(
     let event_group_id = info.stable_group_id().to_string();
     drop(groups);
     save_named_groups(&state).await;
+    drop(membership_guard);
 
     let event = NamedGroupMetadataEvent::MemberUnbanned {
         group_id: event_group_id,
@@ -12317,6 +13183,8 @@ async fn create_join_request(
     let signing_kp = state.agent.identity().agent_keypair();
     let req_body = body.map(|b| b.0).unwrap_or_default();
     let now_ms = now_millis_u64();
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let membership_guard = membership_lock.lock().await;
 
     let (metadata_topic, event_group_id, request, creator_hex, commit) = {
         let mut groups = state.named_groups.write().await;
@@ -12392,6 +13260,7 @@ async fn create_join_request(
     };
 
     save_named_groups(&state).await;
+    drop(membership_guard);
 
     // Include our ML-KEM-768 public key so the approver can seal the group
     // shared secret directly to us on approval.
@@ -12596,6 +13465,7 @@ async fn approve_join_request(
         treekem_welcome_b64: None,
         welcome_ref: None,
         treekem_epoch: None,
+        treekem_key_package_hash: None,
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -12694,9 +13564,34 @@ async fn approve_treekem_join_request(
         Some(caller_hex.clone()),
         None,
     );
+    let approval_recovery_original = NamedGroupMetadataEvent::MemberJoined {
+        group_id: id.clone(),
+        stable_group_id: Some(event_group_id.clone()),
+        member_agent_id: requester_hex.clone(),
+        member_public_key_b64: String::new(),
+        role: x0x::groups::GroupRole::Member,
+        display_name: None,
+        inviter_agent_id: caller_hex.clone(),
+        invite_secret: String::new(),
+        ts_ms: now_ms,
+        treekem_key_package_b64: Some(BASE64.encode(&kp_bytes)),
+        recovery_authority_agent_id: None,
+        recovery_authority_public_key_b64: None,
+        recovery_authority_signature_b64: None,
+        recovery_authority_commit: None,
+        signature_b64: String::new(),
+    };
     next.set_member_treekem_key_package(&requester_hex, BASE64.encode(&kp_bytes));
     next.secret_epoch = treekem_epoch;
-    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    let Some(binding) =
+        treekem_recovery_security_binding(treekem_epoch, &approval_recovery_original)
+    else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to bind recovery record",
+        );
+    };
+    next.security_binding = Some(binding);
     let revision = next.roster_revision;
     let commit = match next.seal_commit(signing_kp, now_ms) {
         Ok(c) => c,
@@ -12707,6 +13602,17 @@ async fn approve_treekem_join_request(
             );
         }
     };
+    let approval_recovery =
+        match attest_member_joined_recovery_event(&approval_recovery_original, signing_kp, &commit)
+        {
+            Ok(recovery) => recovery,
+            Err(e) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("recovery attestation failed: {e}"),
+                );
+            }
+        };
     let out = match guard.add_member(requester_id, &kp_bytes) {
         Ok(out) => out,
         Err(e) => {
@@ -12752,6 +13658,10 @@ async fn approve_treekem_join_request(
         treekem_welcome_b64: None,
         welcome_ref: Some(welcome_ref),
         treekem_epoch: Some(treekem_epoch),
+        treekem_key_package_hash: next
+            .members_v2
+            .get(&requester_hex)
+            .and_then(|member| member.treekem_key_package_hash.clone()),
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -12762,6 +13672,37 @@ async fn approve_treekem_join_request(
         &event,
         std::slice::from_ref(&requester_hex),
     );
+    cache_treekem_member_key_package(
+        &state,
+        join_result_key(&id, &requester_hex),
+        approval_recovery.clone(),
+        true,
+    )
+    .await;
+    spawn_named_group_event_delivery_to_active_members(&state, &next, &approval_recovery, &[]);
+    let prior_recovery = {
+        let cache = state.treekem_member_key_packages.read().await;
+        cache
+            .values()
+            .filter(|recovery| {
+                matches!(
+                    recovery,
+                    NamedGroupMetadataEvent::MemberJoined { member_agent_id, .. }
+                        if member_agent_id != &requester_hex
+                ) && verify_authority_attested_member_joined_recovery(&next, recovery)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for recovery in prior_recovery {
+        spawn_named_group_event_delivery(&state, &requester_hex, &recovery);
+        spawn_named_group_event_delivery_after(
+            &state,
+            &requester_hex,
+            &recovery,
+            GROUP_BACKGROUND_PUBLISH_DELAY,
+        );
+    }
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -12778,6 +13719,8 @@ async fn reject_join_request(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let membership_guard = membership_lock.lock().await;
 
     let (metadata_topic, event_group_id, requester_hex, commit) = {
         let mut groups = state.named_groups.write().await;
@@ -12816,6 +13759,7 @@ async fn reject_join_request(
     };
 
     save_named_groups(&state).await;
+    drop(membership_guard);
 
     let event = NamedGroupMetadataEvent::JoinRequestRejected {
         group_id: event_group_id,
@@ -12839,6 +13783,8 @@ async fn cancel_join_request(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let membership_guard = membership_lock.lock().await;
 
     let (metadata_topic, event_group_id, requester_hex, commit) = {
         let mut groups = state.named_groups.write().await;
@@ -12875,6 +13821,7 @@ async fn cancel_join_request(
     };
 
     save_named_groups(&state).await;
+    drop(membership_guard);
 
     let event = NamedGroupMetadataEvent::JoinRequestCancelled {
         group_id: event_group_id,
@@ -16413,21 +17360,29 @@ async fn ensure_treekem_persistence_allowed(
 }
 
 /// Persist a supplied named-group state and matching TreeKEM snapshot with a
-/// replay journal. The in-memory map is updated only after this returns.
+/// replay journal. The matching live map entry is installed before the journal
+/// is removed and while the persistence mutex is still held.
 async fn persist_treekem_and_named_groups_atomic_with_info(
     state: &AppState,
     group_id_hex: &str,
     info: x0x::groups::GroupInfo,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> anyhow::Result<()> {
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     let stable_group_id = info.stable_group_id().to_string();
-    ensure_treekem_persistence_allowed(
+    #[cfg(test)]
+    maybe_force_post_crypto_withdrawn_group_for_test(state, group_id_hex, Some(&stable_group_id))
+        .await;
+    if repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
         state,
         group_id_hex,
         Some(&stable_group_id),
         "withdrawn_atomic_persist",
     )
-    .await?;
+    .await?
+    {
+        anyhow::bail!("refusing to persist key material for withdrawn group");
+    }
     let named_groups_json = {
         let groups = state.named_groups.read().await;
         let mut next_groups = groups.clone();
@@ -16458,7 +17413,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         .await
         .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
     persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, snapshot_envelope).await?;
-    if repair_withdrawn_named_groups_json_and_wipe_key_material(
+    if repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
         state,
         group_id_hex,
         Some(&stable_group_id),
@@ -16471,6 +17426,11 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
         .await
         .map_err(|e| anyhow::anyhow!("named groups write: {e}"))?;
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id_hex.to_string(), info);
     if let Err(e) = tokio::fs::remove_file(&journal_path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(anyhow::anyhow!("TreeKEM journal cleanup: {e}"));
@@ -16719,7 +17679,8 @@ async fn load_treekem_member_key_packages(
             cache.retain(|key, event| {
                 member_joined_kp_cache_entry(event)
                     .is_some_and(|(expected_key, _)| expected_key == *key)
-                    && verify_member_joined_key_package_event(event)
+                    && (verify_member_joined_key_package_event(event)
+                        || verify_recovery_attestation_structure(event))
             });
             let rejected_count = persisted_count.saturating_sub(cache.len());
             if rejected_count > 0 {
@@ -16782,10 +17743,22 @@ async fn load_named_groups(
 }
 
 async fn save_named_groups(state: &AppState) {
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     let json = {
         let groups = state.named_groups.read().await;
         serde_json::to_string(&*groups)
     };
+    #[cfg(test)]
+    {
+        let hook = NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        if let Some((reached, release)) = hook {
+            reached.notify_one();
+            release.notified().await;
+        }
+    }
     match json {
         Ok(json) => {
             if let Err(e) = write_named_groups_json_atomic(&state.named_groups_path, &json).await {
@@ -19248,6 +20221,7 @@ mod tests {
             kv_stores: RwLock::new(HashMap::new()),
             named_groups: RwLock::new(named_groups),
             named_groups_path,
+            named_groups_persistence_lock: Mutex::new(()),
             group_metadata_tasks: RwLock::new(HashMap::new()),
             group_card_cache: RwLock::new(HashMap::new()),
             directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),
@@ -20305,8 +21279,76 @@ mod tests {
             invite_secret,
             ts_ms: now_ms,
             treekem_key_package_b64: Some(treekem_key_package_b64),
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
         };
+        let (recovery_commit, retained_commit) = {
+            let groups = state.named_groups.read().await;
+            let mut accepted = groups.get(&group_id).expect("fixture group exists").clone();
+            accepted.roster_revision = accepted.roster_revision.saturating_add(1);
+            accepted.add_member(
+                member_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(state.agent.agent_id().as_bytes())),
+                None,
+            );
+            if let NamedGroupMetadataEvent::MemberJoined {
+                treekem_key_package_b64: Some(kp_b64),
+                ..
+            } = &event
+            {
+                accepted.set_member_treekem_key_package(&member_hex, kp_b64.clone());
+            }
+            accepted.secret_epoch = initial_epoch.saturating_add(1);
+            accepted.security_binding =
+                treekem_recovery_security_binding(accepted.secret_epoch, &event);
+            let commit = accepted.seal_commit(state.agent.identity().agent_keypair(), now_ms)?;
+            let retained = accepted
+                .commit_log
+                .last()
+                .cloned()
+                .expect("sealed fixture commit retained");
+            (commit, retained)
+        };
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&group_id)
+            .expect("fixture group exists")
+            .commit_log
+            .push(retained_commit);
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("fixture group exists");
+            info.add_member(
+                member_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(state.agent.agent_id().as_bytes())),
+                None,
+            );
+            if let NamedGroupMetadataEvent::MemberJoined {
+                treekem_key_package_b64: Some(kp_b64),
+                ..
+            } = &event
+            {
+                info.set_member_treekem_key_package(&member_hex, kp_b64.clone());
+                info.members_v2
+                    .get_mut(&member_hex)
+                    .expect("fixture member exists")
+                    .treekem_key_package_b64 = None;
+            }
+            info.remove_member(&member_hex, None);
+            info.recompute_state_hash();
+        }
+        let event = attest_member_joined_recovery_event(
+            &event,
+            state.agent.identity().agent_keypair(),
+            &recovery_commit,
+        )?;
 
         Ok(MemberJoinedTreeKemFixture {
             state,
@@ -20319,6 +21361,49 @@ mod tests {
             group,
             initial_epoch,
         })
+    }
+
+    async fn add_active_witness_to_treekem_fixture(
+        fixture: &MemberJoinedTreeKemFixture,
+        witness: &Arc<AppState>,
+    ) -> Result<()> {
+        let group_id_bytes = hex::decode(&fixture.group_id)?;
+        let witness_id = witness.agent.agent_id();
+        let witness_hex = hex::encode(witness_id.as_bytes());
+        let witness_seed = agent_treekem_seed(witness.agent.as_ref(), &group_id_bytes);
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(witness_id, &witness_seed)?;
+        let (welcome, epoch) = {
+            let mut owner_group = fixture.group.lock().await;
+            let add = owner_group.add_member(witness_id, prepared.key_package_bytes())?;
+            (add.welcome, owner_group.epoch())
+        };
+        let witness_group = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &welcome)?;
+        let info = {
+            let mut groups = fixture.state.named_groups.write().await;
+            let info = groups
+                .get_mut(&fixture.group_id)
+                .expect("owner fixture retains group");
+            info.add_member(
+                witness_hex,
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(fixture.state.agent.agent_id().as_bytes())),
+                None,
+            );
+            info.secret_epoch = epoch;
+            info.security_binding = Some(format!("treekem:epoch={epoch}"));
+            info.recompute_state_hash();
+            info.clone()
+        };
+        witness
+            .named_groups
+            .write()
+            .await
+            .insert(fixture.group_id.clone(), info);
+        witness.treekem_groups.write().await.insert(
+            fixture.group_id.clone(),
+            Arc::new(Mutex::new(witness_group)),
+        );
+        Ok(())
     }
 
     fn signed_member_joined_event_for_test(
@@ -20360,6 +21445,10 @@ mod tests {
             invite_secret: invite_secret.to_string(),
             ts_ms,
             treekem_key_package_b64: None,
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
         };
         Ok((member_id, member_hex, member_public_key_b64, event))
@@ -20832,7 +21921,7 @@ mod tests {
 
         let should_exit = apply_named_group_metadata_event_inner(
             &fixture.state,
-            fixture.event.clone(),
+            without_recovery_attestation(fixture.event.clone()),
             fixture.member_id,
             true,
             true,
@@ -20870,7 +21959,7 @@ mod tests {
 
         let should_exit = apply_named_group_metadata_event_inner(
             &fixture.state,
-            fixture.event.clone(),
+            without_recovery_attestation(fixture.event.clone()),
             fixture.member_id,
             true,
             true,
@@ -21755,6 +22844,7 @@ mod tests {
             treekem_welcome_b64: Some("d2VsY29tZQ==".to_string()),
             welcome_ref: None,
             treekem_epoch: Some(1),
+            treekem_key_package_hash: None,
             commit: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&event));
@@ -21820,6 +22910,9 @@ mod tests {
             treekem_welcome_b64: Some("dw==".to_string()),
             welcome_ref: None,
             treekem_epoch: Some(2),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
             commit: Some(fake_group_state_commit(&group_id, 2, &admin_hex)),
         };
         assert!(authorized_treekem_membership_event_for_queue(
@@ -21940,6 +23033,9 @@ mod tests {
             treekem_welcome_b64: Some("dw==".to_string()),
             welcome_ref: None,
             treekem_epoch: Some(3),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
             commit: Some(fake_group_state_commit(&group_id, 3, &creator_hex)),
         };
 
@@ -22317,6 +23413,7 @@ mod tests {
                 source: "11".repeat(32),
             }),
             treekem_epoch: Some(3),
+            treekem_key_package_hash: None,
             commit: Some(x0x::groups::GroupStateCommit {
                 group_id: info.stable_group_id().to_string(),
                 revision: 3,
@@ -22332,6 +23429,8 @@ mod tests {
                 signer_public_key: String::new(),
                 signature: String::new(),
             }),
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
         };
 
         assert_eq!(
@@ -22368,6 +23467,9 @@ mod tests {
                 treekem_welcome_b64: None,
                 welcome_ref: None,
                 treekem_epoch: Some(1),
+                treekem_key_package_hash: None,
+                member_joined_recovery: None,
+                member_recovery_history: Vec::new(),
                 commit: None,
             }),
         };
@@ -22481,6 +23583,9 @@ mod tests {
                 source: "11".repeat(32),
             }),
             treekem_epoch: Some(1),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
             commit: None,
         };
         let json = serde_json::to_value(event);
@@ -22668,6 +23773,9 @@ mod tests {
             treekem_welcome_b64: Some("dw==".to_string()),
             welcome_ref: None,
             treekem_epoch: Some(1),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
             commit: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&member_added));
@@ -22724,6 +23832,9 @@ mod tests {
             treekem_welcome_b64: Some("dw==".to_string()),
             welcome_ref: None,
             treekem_epoch: Some(2),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
             commit: Some(fake_commit(2, "state-1")),
         };
         let ban_epoch_3 = NamedGroupMetadataEvent::MemberBanned {
@@ -22788,6 +23899,9 @@ mod tests {
             treekem_welcome_b64: Some("dw==".to_string()),
             welcome_ref: None,
             treekem_epoch: Some(10),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
             commit: Some(commit),
         };
 
@@ -23206,6 +24320,10 @@ mod tests {
             invite_secret: "s".to_string(),
             ts_ms: 1,
             treekem_key_package_b64: Some("kp".to_string()),
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
             signature_b64: "sig".to_string(),
         };
         let (key, _) = member_joined_kp_cache_entry(&with_kp).expect("kp-bearing event extracted");
@@ -23241,9 +24359,13 @@ mod tests {
     async fn member_keyed_catchup_restores_signed_event_after_restart() -> Result<()> {
         let fixture = member_joined_treekem_fixture(0x8b, 0x8c).await?;
         let state = &fixture.state;
-        let _ =
-            apply_named_group_metadata_event(state, fixture.event.clone(), fixture.member_id, true)
-                .await;
+        let _ = apply_named_group_metadata_event(
+            state,
+            without_recovery_attestation(fixture.event.clone()),
+            fixture.member_id,
+            true,
+        )
+        .await;
         assert_eq!(state.treekem_member_key_packages.read().await.len(), 1);
         tokio::fs::metadata(&state.treekem_member_key_packages_path).await?;
 
@@ -23357,6 +24479,10 @@ mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                recovery_authority_agent_id: None,
+                recovery_authority_public_key_b64: None,
+                recovery_authority_signature_b64: None,
+                recovery_authority_commit: None,
                 signature_b64: BASE64.encode(vec![0xcdu8; 64]),
             },
             _ => unreachable!("fixture is MemberJoined"),
@@ -23410,6 +24536,10 @@ mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                recovery_authority_agent_id: None,
+                recovery_authority_public_key_b64: None,
+                recovery_authority_signature_b64: None,
+                recovery_authority_commit: None,
                 signature_b64,
             },
             _ => unreachable!("fixture is MemberJoined"),
@@ -23478,6 +24608,10 @@ mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                recovery_authority_agent_id: None,
+                recovery_authority_public_key_b64: None,
+                recovery_authority_signature_b64: None,
+                recovery_authority_commit: None,
                 signature_b64,
             },
             _ => unreachable!("fixture is MemberJoined"),
@@ -23587,6 +24721,1657 @@ mod tests {
         Ok(())
     }
 
+    /// WP-TK1 CRITICAL — TreeKEM witness recovery (issue #205): a non-inviter
+    /// third party that independently receives a member's self-signed
+    /// `MemberJoined` must NOT mutate the durable roster/state-commit chain
+    /// (only the inviter may consume the one-time invite and author the D.3
+    /// commit), but it MUST durably cache the authenticated key-package event so
+    /// a future admin can recover it when the inviter AND the joiner are both
+    /// unavailable. This decouples recovery *availability* from inviter/joiner
+    /// liveness without weakening the signed-commit *authoring* invariant: the
+    /// witness never admits the member, yet it cannot later deny the
+    /// self-authenticated package.
+    #[tokio::test]
+    async fn non_inviter_witness_caches_signed_member_joined_without_roster_mutation() -> Result<()>
+    {
+        // O = owner/inviter; B = joining member; the event is signed by B over
+        // canonical bytes binding group_id, B's AgentId, and B's TreeKEM
+        // KeyPackage.
+        let fixture = member_joined_treekem_fixture(0x91, 0x92).await?;
+        let group_id = fixture.group_id.clone();
+        let stable_group_id = fixture.stable_group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+
+        // W = independent witness: a distinct node (different AgentId) that
+        // holds the same group membership view (card shared) but is NOT the
+        // inviter — so it must take the non-inviter recovery-witness path.
+        let (w_state, w_dir) = secure_endpoint_test_state().await?;
+        assert_ne!(
+            w_state.agent.agent_id(),
+            fixture.state.agent.agent_id(),
+            "witness W must be a distinct agent from inviter O"
+        );
+        add_active_witness_to_treekem_fixture(&fixture, &w_state).await?;
+
+        let raw_join_event = without_recovery_attestation(fixture.event.clone());
+        // W receives B's signed MemberJoined (sender = B, self-issued, verified).
+        let applied = apply_named_group_metadata_event(
+            &w_state,
+            raw_join_event.clone(),
+            fixture.member_id,
+            true,
+        )
+        .await;
+
+        // (1) Non-inviter never consumes the invite nor authors a roster
+        // mutation — the durable state-commit chain is untouched.
+        assert!(
+            !applied,
+            "non-inviter witness must not apply — no roster/state-commit mutation"
+        );
+        {
+            let groups = w_state.named_groups.read().await;
+            let info = groups.get(&group_id).expect("group retained on witness");
+            assert!(
+                !info.has_active_member(&member_hex),
+                "witness roster must not admit B — only the inviter commits the add"
+            );
+        }
+
+        // (2) Yet the self-authenticated event is durably cached and survives a
+        // process restart on W's directory (recovery availability does not
+        // depend on inviter/joiner liveness).
+        let cache_key = join_result_key(&group_id, &member_hex);
+        assert!(
+            w_state
+                .treekem_member_key_packages
+                .read()
+                .await
+                .contains_key(&cache_key),
+            "witness caches the signed MemberJoined in-memory"
+        );
+        assert!(
+            tokio::fs::try_exists(&w_state.treekem_member_key_packages_path).await?,
+            "witness persisted the key-package cache to disk"
+        );
+
+        // O accepts B and publishes MemberAdded containing the original event
+        // countersigned after the TreeKEM add. W applies that production event:
+        // only now does the provisional cache become authority-attested and
+        // eligible to serve, while W itself never authors the roster mutation.
+        let _ = apply_named_group_metadata_event(
+            &fixture.state,
+            raw_join_event,
+            fixture.member_id,
+            true,
+        )
+        .await;
+        let authority_event = {
+            let logs = fixture.state.treekem_event_log.read().await;
+            logs.get(&stable_group_id)
+                .and_then(|events| {
+                    events.iter().find(|event| {
+                        matches!(
+                            event,
+                            NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                                if agent_id == &member_hex
+                        )
+                    })
+                })
+                .cloned()
+                .expect("O logged authority-attested MemberAdded")
+        };
+        let authority_recovery = fixture
+            .state
+            .treekem_member_key_packages
+            .read()
+            .await
+            .get(&cache_key)
+            .cloned()
+            .expect("O cached the authority-attested recovery event");
+        {
+            let groups = fixture.state.named_groups.read().await;
+            let info = groups.get(&group_id).expect("O retained accepted roster");
+            assert!(
+                verify_authority_attested_member_joined_recovery(info, &authority_recovery),
+                "O's accepted roster verifies its countersigned recovery record"
+            );
+        }
+        assert!(
+            apply_named_group_metadata_event(
+                &w_state,
+                authority_event,
+                fixture.state.agent.agent_id(),
+                true,
+            )
+            .await,
+            "W applies O's compact authority commit without gaining authority"
+        );
+        assert!(
+            !apply_named_group_metadata_event(
+                &w_state,
+                authority_recovery,
+                fixture.state.agent.agent_id(),
+                true,
+            )
+            .await,
+            "independent recovery delivery never mutates the roster"
+        );
+
+        // Restart W on the same directory: the durable cache is reloaded and
+        // SERVES the verified event to a member-keyed catch-up requester.
+        let w_agent = Arc::clone(&w_state.agent);
+        let restarted = secure_endpoint_test_state_at(w_dir.path(), w_agent).await?;
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: stable_group_id.clone(),
+            requester_agent_id: hex::encode(restarted.agent.agent_id().as_bytes()),
+            from_revision: 0,
+            from_treekem_epoch: 0,
+            current_state_hash: String::new(),
+            missing_prev_state_hash: None,
+            target_member_id: Some(member_hex.clone()),
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        let log_keys = vec![group_id.clone(), stable_group_id.clone()];
+        let response = member_keyed_treekem_catchup_response(&restarted, &log_keys, &request)
+            .await
+            .expect("restarted witness serves the cached event");
+        assert_eq!(response.events.len(), 1, "exactly one cached event served");
+        assert!(
+            verify_member_joined_key_package_event(&response.events[0]),
+            "served event retains a valid member signature — independently re-verifiable"
+        );
+        Ok(())
+    }
+
+    /// WP-TK1 CRITICAL — admin removal recovery (issue #205): a promoted admin
+    /// A that never witnessed target B's join (roster carries B Active WITHOUT a
+    /// key package) recovers B's package from a peer's cached, self-signed
+    /// `MemberJoined` via a member-keyed catch-up, after which the removal-path
+    /// resolver returns B's package — all WITHOUT owner/inviter O or target B
+    /// cooperating. The package is authenticated by B's embedded ML-DSA-65
+    /// signature (re-verified on install), independent of the delivering peer,
+    /// so a forged or replayed response cannot install a wrong key.
+    #[tokio::test]
+    async fn member_keyed_catchup_then_recovery_advances_removal_without_inviter() -> Result<()> {
+        // O = owner/inviter, B = target, W = independent witness, and A = a
+        // later-promoted admin. W validates and retains B's event before O
+        // performs the inviter-only authoritative add.
+        let fixture = member_joined_treekem_fixture(0x93, 0x94).await?;
+        let o_state = Arc::clone(&fixture.state);
+        let group_id = fixture.group_id.clone();
+        let stable_group_id = fixture.stable_group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let o_hex = hex::encode(o_state.agent.agent_id().as_bytes());
+        let raw_join_event = without_recovery_attestation(fixture.event.clone());
+
+        let (w_state, _w_dir) = secure_endpoint_test_state().await?;
+        add_active_witness_to_treekem_fixture(&fixture, &w_state).await?;
+        assert!(
+            !apply_named_group_metadata_event(
+                &w_state,
+                raw_join_event.clone(),
+                fixture.member_id,
+                true,
+            )
+            .await,
+            "W retains B's signed event without exercising inviter mutation authority"
+        );
+        assert!(
+            w_state
+                .treekem_member_key_packages
+                .read()
+                .await
+                .contains_key(&join_result_key(&group_id, &member_hex)),
+            "independent witness W retained B's recovery record"
+        );
+
+        let _ = apply_named_group_metadata_event(&o_state, raw_join_event, fixture.member_id, true)
+            .await;
+        let authority_event = {
+            let logs = o_state.treekem_event_log.read().await;
+            logs.get(&stable_group_id)
+                .and_then(|events| {
+                    events.iter().find(|event| {
+                        matches!(
+                            event,
+                            NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                                if agent_id == &member_hex
+                        )
+                    })
+                })
+                .cloned()
+                .expect("O logged authority-attested MemberAdded")
+        };
+        let authority_recovery = o_state
+            .treekem_member_key_packages
+            .read()
+            .await
+            .get(&join_result_key(&group_id, &member_hex))
+            .cloned()
+            .expect("O cached authority-attested recovery");
+        assert!(
+            apply_named_group_metadata_event(
+                &w_state,
+                authority_event,
+                o_state.agent.agent_id(),
+                true,
+            )
+            .await,
+            "W upgrades its provisional cache from O's authority commit"
+        );
+        assert!(
+            !apply_named_group_metadata_event(
+                &w_state,
+                authority_recovery,
+                o_state.agent.agent_id(),
+                true,
+            )
+            .await,
+            "separate recovery delivery upgrades W's cache without roster mutation"
+        );
+        let original_kp = member_treekem_kp(&o_state, &group_id, &member_hex)
+            .await
+            .expect("inviter O installed B's package");
+
+        // A receives the authority-authored roster state, is promoted to Admin,
+        // but never receives B's KeyPackage. O and B take no further part.
+        let (a_state, _a_dir) = secure_endpoint_test_state().await?;
+        let a_hex = hex::encode(a_state.agent.agent_id().as_bytes());
+        let mut a_info = {
+            let groups = o_state.named_groups.read().await;
+            groups.get(&group_id).expect("group exists on O").clone()
+        };
+        a_info.members_v2.insert(
+            a_hex.clone(),
+            x0x::groups::GroupMember::new_member(a_hex.clone(), None, Some(o_hex.clone()), 1),
+        );
+        let w_hex = hex::encode(w_state.agent.agent_id().as_bytes());
+        a_info.members_v2.insert(
+            w_hex.clone(),
+            x0x::groups::GroupMember::new_member(w_hex, None, Some(o_hex.clone()), 1),
+        );
+        a_info.set_member_role(&a_hex, x0x::groups::GroupRole::Admin);
+        a_info.recompute_state_hash();
+        a_state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), a_info);
+        a_state
+            .treekem_groups
+            .write()
+            .await
+            .insert(group_id.clone(), Arc::clone(&fixture.group));
+        insert_active_member_without_kp(&a_state, &group_id, &member_hex, &o_hex).await;
+        {
+            let groups = a_state.named_groups.read().await;
+            let info = groups.get(&group_id).expect("A holds the group");
+            assert!(
+                require_admin_or_above(info, &a_hex).is_ok(),
+                "A has independent admin authority"
+            );
+        }
+        assert!(member_treekem_kp(&a_state, &group_id, &member_hex)
+            .await
+            .is_none());
+
+        let blocked = resolve_member_treekem_kp_for_removal(&a_state, &group_id, &member_hex).await;
+        let (status, body) = blocked.expect_err("removal waits for recovery evidence");
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY);
+        assert_eq!(body["error"], "member_key_package_pending");
+
+        // W, not O or B, serves the original signed event. A installs it through
+        // the production response handler, which re-verifies B's signature.
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: stable_group_id.clone(),
+            requester_agent_id: a_hex.clone(),
+            from_revision: 0,
+            from_treekem_epoch: 0,
+            current_state_hash: String::new(),
+            missing_prev_state_hash: None,
+            target_member_id: Some(member_hex.clone()),
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        let log_keys = vec![group_id.clone(), stable_group_id];
+        let response = member_keyed_treekem_catchup_response(&w_state, &log_keys, &request)
+            .await
+            .expect("independent witness W serves B's cached event");
+        handle_treekem_catchup_response(&a_state, &w_state.agent.agent_id(), true, response).await;
+        assert_eq!(
+            member_treekem_kp(&a_state, &group_id, &member_hex)
+                .await
+                .as_deref(),
+            Some(original_kp.as_str()),
+            "A installed the package authenticated by B's original signature"
+        );
+
+        // Exercise the actual TreeKEM removal helper under its documented outer
+        // serialization boundary. Neither O nor B is consulted after recovery.
+        let membership_lock = group_membership_lock(&a_state, &group_id).await;
+        let membership_guard = membership_lock.lock().await;
+        let (status, body) = remove_treekem_named_group_member(
+            Arc::clone(&a_state),
+            group_id.clone(),
+            member_hex.clone(),
+            a_hex,
+        )
+        .await;
+        drop(membership_guard);
+        assert_eq!(status, StatusCode::OK, "removal failed: {body:?}");
+        assert_eq!(body["removed_member"], member_hex);
+        Ok(())
+    }
+
+    /// WP-TK1 CRITICAL — stale-clone serialization (issue #205): a recovered
+    /// key-package install and a racing full-`GroupInfo` write-back must be
+    /// serialized by the per-group membership lock, or a stale clone stored
+    /// after the install erases the just-installed package. T1 holds the lock
+    /// and writes a stale clone (member present, package absent — a snapshot
+    /// predating the install); T2's `apply_recovered_member_key_package` BLOCKS
+    /// on the lock, so its install is the final write and the package survives.
+    /// Without the lock, T2 would install first and T1's stale write-back would
+    /// clobber it — the exact regression the lock exists to prevent.
+    #[tokio::test]
+    async fn recovered_key_package_survives_stale_clone_race_under_membership_lock() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x95, 0x96).await?;
+        let state = Arc::clone(&fixture.state);
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let expected_kp = match &fixture.event {
+            NamedGroupMetadataEvent::MemberJoined {
+                treekem_key_package_b64: Some(kp),
+                ..
+            } => kp.clone(),
+            _ => unreachable!("fixture carries a key package"),
+        };
+
+        // Roster: member Active WITHOUT a key package — the regression scenario.
+        insert_active_member_without_kp(&state, &group_id, &member_hex, &inviter_hex).await;
+        assert!(
+            member_treekem_kp(&state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "member starts without a key package"
+        );
+
+        // T1 acquires the per-group membership lock — the SAME lock
+        // `apply_recovered_member_key_package` takes — and holds it across a
+        // stale-clone write-back.
+        let membership_lock = group_membership_lock(state.as_ref(), &group_id).await;
+        let t1_guard = membership_lock.lock().await;
+
+        let reached_lock_attempt = Arc::new(tokio::sync::Notify::new());
+        *RECOVERED_KP_BEFORE_MEMBERSHIP_LOCK_NOTIFY
+            .lock()
+            .expect("recovery lock test hook poisoned") =
+            Some((group_id.clone(), Arc::clone(&reached_lock_attempt)));
+        // T2: production recovery install. It resolves the same lock Arc and
+        // PARKS on it because T1 owns the mutex.
+        let t2_state = Arc::clone(&state);
+        let t2_event = fixture.event.clone();
+        let t2 =
+            tokio::spawn(
+                async move { apply_recovered_member_key_package(&t2_state, &t2_event).await },
+            );
+
+        // The production hook fires after T2 resolves the exact per-group lock
+        // and immediately before it awaits acquisition. This barrier proves T2
+        // reached the contested boundary; scheduling cannot make the test pass
+        // merely because the spawned task ran late.
+        reached_lock_attempt.notified().await;
+        *RECOVERED_KP_BEFORE_MEMBERSHIP_LOCK_NOTIFY
+            .lock()
+            .expect("recovery lock test hook poisoned") = None;
+        assert!(
+            !t2.is_finished(),
+            "T2 reached the membership lock and remains blocked behind T1"
+        );
+        assert!(
+            member_treekem_kp(&state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "T2 is blocked on the membership lock while T1 owns it — no install yet"
+        );
+
+        // T1 writes the STALE clone under the lock: member present, key package
+        // explicitly absent (a read-modify-write whose snapshot predates the
+        // install). This is exactly the write-back that, unsynchronized, would
+        // erase a concurrent install.
+        {
+            let mut groups = state.named_groups.write().await;
+            if let Some(info) = groups.get_mut(&group_id) {
+                if let Some(m) = info.members_v2.get_mut(&member_hex) {
+                    m.treekem_key_package_b64 = None;
+                    m.updated_at = 7777;
+                }
+            }
+        }
+
+        // Release the lock — T2 acquires it and installs as the final write.
+        drop(t1_guard);
+        let installed = t2.await.expect("T2 recover task panicked");
+        assert!(
+            installed,
+            "T2 installed the recovered package after T1 released the lock"
+        );
+
+        // The package SURVIVED T1's stale-clone write-back: because the lock
+        // serialized T2's install AFTER it, the install is the final word.
+        assert_eq!(
+            member_treekem_kp(&state, &group_id, &member_hex).await,
+            Some(expected_kp),
+            "package survived the stale-clone write-back — install serialized last by the membership lock"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovered_key_package_survives_stale_disk_snapshot_write() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0xb1, 0xb2).await?;
+        let state = Arc::clone(&fixture.state);
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        insert_active_member_without_kp(&state, &group_id, &member_hex, &inviter_hex).await;
+
+        let snapshot_reached = Arc::new(tokio::sync::Notify::new());
+        let release_snapshot = Arc::new(tokio::sync::Notify::new());
+        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+            .lock()
+            .expect("save race hook poisoned") =
+            Some((Arc::clone(&snapshot_reached), Arc::clone(&release_snapshot)));
+        let stale_state = Arc::clone(&state);
+        let stale_save = tokio::spawn(async move { save_named_groups(&stale_state).await });
+        snapshot_reached.notified().await;
+        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+            .lock()
+            .expect("save race hook poisoned") = None;
+
+        let recovery_state = Arc::clone(&state);
+        let recovery_event = fixture.event.clone();
+        let recovery = tokio::spawn(async move {
+            apply_recovered_member_key_package(&recovery_state, &recovery_event).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !recovery.is_finished(),
+            "recovery save waits behind the older persistence snapshot"
+        );
+
+        release_snapshot.notify_one();
+        stale_save.await.expect("stale save task panicked");
+        assert!(recovery.await.expect("recovery task panicked"));
+
+        let persisted = tokio::fs::read_to_string(&state.named_groups_path).await?;
+        let groups: HashMap<String, x0x::groups::GroupInfo> = serde_json::from_str(&persisted)?;
+        assert!(
+            groups
+                .get(&group_id)
+                .and_then(|info| info.members_v2.get(&member_hex))
+                .and_then(|member| member.treekem_key_package_b64.as_ref())
+                .is_some(),
+            "newer recovery snapshot is the final durable write"
+        );
+        Ok(())
+    }
+
+    /// WP-TK1 CRITICAL — fail-closed recovery gate (issue #205): a recovered
+    /// key-package install is authenticated THREE independent ways, each of
+    /// which alone must refuse the install. (1) The member's ML-DSA-65 signature
+    /// over the canonical bytes must verify. (2) The AgentId derived from the
+    /// embedded public key must equal the claimed `member_agent_id` — an impostor
+    /// signing with its own key while claiming a victim's AgentId is refused
+    /// EVEN with a valid signature (AgentId-binding, the defense the existing
+    /// signature/cross-group tests do not isolate). (3) The `group_id` bound into
+    /// the signed bytes must match this group. A positive control at the end
+    /// proves the member/roster setup is valid, so the three refusals are
+    /// attributable to the specific gate, not to a setup defect.
+    #[tokio::test]
+    async fn recovered_member_key_package_rejects_forgery_agent_mismatch_and_cross_group(
+    ) -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x97, 0x98).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        // Member is Active in the roster so rejection is attributable to the
+        // specific defense under test, not "unknown member".
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        let valid_event = fixture.event.clone();
+
+        // A compromised target can self-sign a fresh package after joining.
+        // Member authentication alone is therefore insufficient: without the
+        // inviter's post-acceptance countersignature, recovery must reject it.
+        let member_only_event = without_recovery_attestation(valid_event.clone());
+        assert!(
+            !apply_recovered_member_key_package(state, &member_only_event).await,
+            "member-signed package without inviter acceptance is refused"
+        );
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "unattested member package cannot poison the sticky roster slot"
+        );
+
+        // A historical inviter cannot countersign a replacement package against
+        // the old admission commit: that commit binds the exact accepted record.
+        let replacement_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(fixture.member_id, &[0xee; 32])?;
+        let mut replacement = without_recovery_attestation(valid_event.clone());
+        let old_commit = match &valid_event {
+            NamedGroupMetadataEvent::MemberJoined {
+                recovery_authority_commit: Some(commit),
+                ..
+            } => commit.clone(),
+            _ => unreachable!("fixture carries authority commit"),
+        };
+        if let NamedGroupMetadataEvent::MemberJoined {
+            member_public_key_b64,
+            treekem_key_package_b64,
+            signature_b64,
+            ..
+        } = &mut replacement
+        {
+            member_public_key_b64.clear();
+            *treekem_key_package_b64 =
+                Some(BASE64.encode(replacement_prepared.key_package_bytes()));
+            signature_b64.clear();
+        }
+        let replacement = attest_member_joined_recovery_event(
+            &replacement,
+            state.agent.identity().agent_keypair(),
+            &old_commit,
+        )?;
+        assert!(
+            !apply_recovered_member_key_package(state, &replacement).await,
+            "old admission commit cannot authorize a later replacement package"
+        );
+
+        // (1) Forged signature → refused; roster untouched.
+        let forged_sig = match valid_event.clone() {
+            NamedGroupMetadataEvent::MemberJoined {
+                group_id,
+                stable_group_id,
+                member_agent_id,
+                member_public_key_b64,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                ..
+            } => NamedGroupMetadataEvent::MemberJoined {
+                group_id,
+                stable_group_id,
+                member_agent_id,
+                member_public_key_b64,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                recovery_authority_agent_id: None,
+                recovery_authority_public_key_b64: None,
+                recovery_authority_signature_b64: None,
+                recovery_authority_commit: None,
+                signature_b64: BASE64.encode(vec![0xcdu8; 64]),
+            },
+            _ => unreachable!("fixture is MemberJoined"),
+        };
+        assert!(
+            !apply_recovered_member_key_package(state, &forged_sig).await,
+            "forged signature refused"
+        );
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "forged event installed nothing"
+        );
+
+        // (2) AgentId-binding mismatch: an impostor signs the canonical bytes
+        // (claiming the victim's member_agent_id) with ITS OWN key. The
+        // signature verifies, but the AgentId derived from the impostor's public
+        // key != the claimed member_agent_id, so the binding check refuses. The
+        // member is in the roster, so this isolates the AgentId-binding defense
+        // — not "unknown member" and not a signature failure.
+        let impostor = x0x::identity::AgentKeypair::generate()?;
+        let impostor_pub_b64 = BASE64.encode(impostor.public_key().as_bytes());
+        let agent_mismatch_event = match valid_event.clone() {
+            NamedGroupMetadataEvent::MemberJoined {
+                group_id,
+                stable_group_id,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                ..
+            } => {
+                // Recompute canonical bytes with the impostor's public key but
+                // the VICTIM's member_agent_id, then sign with the impostor key.
+                let canonical = canonical_member_joined_bytes(
+                    &group_id,
+                    stable_group_id.as_deref(),
+                    &member_hex,
+                    &impostor_pub_b64,
+                    role,
+                    display_name.as_deref(),
+                    &inviter_agent_id,
+                    &invite_secret,
+                    ts_ms,
+                    treekem_key_package_b64.as_deref(),
+                );
+                let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                    impostor.secret_key(),
+                    &canonical,
+                )
+                .map_err(|e| anyhow::anyhow!("sign impostor fixture: {e:?}"))?;
+                NamedGroupMetadataEvent::MemberJoined {
+                    group_id,
+                    stable_group_id,
+                    member_agent_id: member_hex.clone(),
+                    member_public_key_b64: impostor_pub_b64,
+                    role,
+                    display_name,
+                    inviter_agent_id,
+                    invite_secret,
+                    ts_ms,
+                    treekem_key_package_b64,
+                    recovery_authority_agent_id: None,
+                    recovery_authority_public_key_b64: None,
+                    recovery_authority_signature_b64: None,
+                    recovery_authority_commit: None,
+                    signature_b64: BASE64.encode(sig.as_bytes()),
+                }
+            }
+            _ => unreachable!("fixture is MemberJoined"),
+        };
+        assert!(
+            !apply_recovered_member_key_package(state, &agent_mismatch_event).await,
+            "AgentId-binding mismatch refused — impostor's key does not derive to the claimed member"
+        );
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "AgentId-mismatch event installed nothing"
+        );
+
+        // (3) Cross-group: a validly-signed event for group A is refused for a
+        // different group B because group_id is bound into the signed canonical
+        // bytes, so the signature fails to verify against B's group_id.
+        let group_b = "99".repeat(32);
+        let stable_b = "9a".repeat(32);
+        let info_b = treekem_metadata_group_info(state.agent.agent_id(), &group_b, &stable_b);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_b.clone(), info_b);
+        insert_active_member_without_kp(state, &group_b, &member_hex, &inviter_hex).await;
+        let cross_group_event = match valid_event.clone() {
+            NamedGroupMetadataEvent::MemberJoined {
+                member_agent_id,
+                member_public_key_b64,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                signature_b64,
+                ..
+            } => NamedGroupMetadataEvent::MemberJoined {
+                group_id: group_b.clone(),
+                stable_group_id: Some(stable_b.clone()),
+                member_agent_id,
+                member_public_key_b64,
+                role,
+                display_name,
+                inviter_agent_id,
+                invite_secret,
+                ts_ms,
+                treekem_key_package_b64,
+                recovery_authority_agent_id: None,
+                recovery_authority_public_key_b64: None,
+                recovery_authority_signature_b64: None,
+                recovery_authority_commit: None,
+                signature_b64,
+            },
+            _ => unreachable!("fixture is MemberJoined"),
+        };
+        assert!(
+            !apply_recovered_member_key_package(state, &cross_group_event).await,
+            "cross-group forgery refused — group_id is bound into the signed canonical bytes"
+        );
+        assert!(
+            member_treekem_kp(state, &group_b, &member_hex)
+                .await
+                .is_none(),
+            "group B roster untouched by group A's signed event"
+        );
+
+        // Positive control: the untampered valid event installs for the member,
+        // proving the three refusals above were due to the specific gate, not a
+        // setup defect (and that removing any one gate would let an attack in).
+        assert!(
+            apply_recovered_member_key_package(state, &valid_event).await,
+            "valid event installs — the three gates are the only reason the above were refused"
+        );
+        let replacement =
+            x0x::mls::TreeKemMlsGroup::prepare_member(fixture.member_id, &[0xef; 32])?;
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group exists");
+            info.set_member_treekem_key_package(
+                &member_hex,
+                BASE64.encode(replacement.key_package_bytes()),
+            );
+            info.members_v2
+                .get_mut(&member_hex)
+                .expect("member exists")
+                .treekem_key_package_b64 = None;
+        }
+        let cache_key = join_result_key(&group_id, &member_hex);
+        state
+            .treekem_member_key_packages
+            .write()
+            .await
+            .remove(&cache_key);
+        assert!(
+            !apply_named_group_metadata_event(state, valid_event.clone(), fixture.member_id, true,)
+                .await,
+            "self-delivered recovery evidence never exercises roster mutation authority"
+        );
+        assert!(
+            !state
+                .treekem_member_key_packages
+                .read()
+                .await
+                .contains_key(&cache_key),
+            "a valid old-incarnation attestation cannot poison the current recovery cache"
+        );
+        assert!(
+            !apply_recovered_member_key_package(state, &valid_event).await,
+            "an exact prior admission cannot poison a re-added member's new package slot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisional_witness_recovery_cache_is_bounded_per_group() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0xa7, 0xa8).await?;
+        let raw = without_recovery_attestation(fixture.event.clone());
+        for index in 0..=TREEKEM_PROVISIONAL_RECOVERY_PER_GROUP_CAP {
+            cache_treekem_member_key_package(
+                &fixture.state,
+                format!("{}:provisional-{index}", fixture.group_id),
+                raw.clone(),
+                false,
+            )
+            .await;
+        }
+        let cache = fixture.state.treekem_member_key_packages.read().await;
+        let provisional_count = cache
+            .values()
+            .filter(|event| {
+                matches!(
+                    event,
+                    NamedGroupMetadataEvent::MemberJoined {
+                        recovery_authority_signature_b64: None,
+                        ..
+                    } if named_group_metadata_event_group_id(event) == fixture.group_id
+                )
+            })
+            .count();
+        assert_eq!(
+            provisional_count,
+            TREEKEM_PROVISIONAL_RECOVERY_PER_GROUP_CAP,
+            "valid self-signed witness records cannot grow the per-group provisional cache without bound"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_access_treekem_approval_publishes_recoverable_attestation() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0xb3, 0xb4).await?;
+        let requester = x0x::identity::AgentKeypair::generate()?;
+        let requester_id = requester.agent_id();
+        let requester_hex = hex::encode(requester_id.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(requester_id, &[0xb5; 32])?;
+        let mut request = x0x::groups::JoinRequest::new(
+            fixture.group_id.clone(),
+            requester_hex.clone(),
+            None,
+            now_millis_u64(),
+        );
+        request.treekem_key_package_b64 = Some(BASE64.encode(prepared.key_package_bytes()));
+        let request_id = request.request_id.clone();
+        fixture
+            .state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&fixture.group_id)
+            .expect("group exists")
+            .join_requests
+            .insert(request_id.clone(), request);
+        let caller_hex = hex::encode(fixture.state.agent.agent_id().as_bytes());
+        let (status, _) = approve_treekem_join_request(
+            Arc::clone(&fixture.state),
+            fixture.group_id.clone(),
+            request_id,
+            caller_hex,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "TreeKEM request approval succeeds");
+
+        let recovery = fixture
+            .state
+            .treekem_member_key_packages
+            .read()
+            .await
+            .get(&join_result_key(&fixture.group_id, &requester_hex))
+            .cloned()
+            .expect("request approval caches recovery evidence");
+        {
+            let mut groups = fixture.state.named_groups.write().await;
+            groups
+                .get_mut(&fixture.group_id)
+                .and_then(|info| info.members_v2.get_mut(&requester_hex))
+                .expect("approved requester exists")
+                .treekem_key_package_b64 = None;
+        }
+        assert!(
+            apply_recovered_member_key_package(&fixture.state, &recovery).await,
+            "approved requester's exact package remains recoverable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_access_treekem_approval_binds_receiver_to_authority_accepted_package(
+    ) -> Result<()> {
+        // Authority O admits requester R via package A. An independent
+        // receiver W holds a divergent local JoinRequestCreated snapshot
+        // (package B). W must adopt the authority-accepted hash, discard B,
+        // and later install A from the separately authority-attested recovery
+        // record — proving the approval binds every receiver to O's choice.
+        let fixture = member_joined_treekem_fixture(0xc1, 0xc2).await?;
+        let authority_id = fixture.state.agent.agent_id();
+        let authority_hex = hex::encode(authority_id.as_bytes());
+
+        let (w_state, _w_dir) = secure_endpoint_test_state().await?;
+        assert_ne!(
+            w_state.agent.agent_id(),
+            authority_id,
+            "receiver W must be a distinct agent from the authority"
+        );
+        add_active_witness_to_treekem_fixture(&fixture, &w_state).await?;
+
+        let requester = x0x::identity::AgentKeypair::generate()?;
+        let requester_id = requester.agent_id();
+        let requester_hex = hex::encode(requester_id.as_bytes());
+        let prepared_a = x0x::mls::TreeKemMlsGroup::prepare_member(requester_id, &[0xc3; 32])?;
+        let package_a_b64 = BASE64.encode(prepared_a.key_package_bytes());
+        let package_a_hash = blake3::hash(package_a_b64.as_bytes()).to_hex().to_string();
+        let prepared_b = x0x::mls::TreeKemMlsGroup::prepare_member(requester_id, &[0xc4; 32])?;
+        let package_b_b64 = BASE64.encode(prepared_b.key_package_bytes());
+        assert_ne!(
+            blake3::hash(package_b_b64.as_bytes()).to_hex().to_string(),
+            package_a_hash,
+            "packages A and B must be distinct incarnations"
+        );
+
+        let now_ms = now_millis_u64();
+        let mut request = x0x::groups::JoinRequest::new(
+            fixture.group_id.clone(),
+            requester_hex.clone(),
+            None,
+            now_ms,
+        );
+        request.treekem_key_package_b64 = Some(package_a_b64.clone());
+        let request_id = request.request_id.clone();
+        {
+            let mut groups = fixture.state.named_groups.write().await;
+            groups
+                .get_mut(&fixture.group_id)
+                .expect("authority group exists")
+                .join_requests
+                .insert(request_id.clone(), request.clone());
+        }
+        {
+            let mut request_b = request.clone();
+            request_b.treekem_key_package_b64 = Some(package_b_b64.clone());
+            let mut groups = w_state.named_groups.write().await;
+            groups
+                .get_mut(&fixture.group_id)
+                .expect("receiver W has the group")
+                .join_requests
+                .insert(request_id.clone(), request_b);
+        }
+
+        let (status, _) = approve_treekem_join_request(
+            Arc::clone(&fixture.state),
+            fixture.group_id.clone(),
+            request_id.clone(),
+            authority_hex,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "authority approves package A");
+
+        let approval_event = {
+            let logs = fixture.state.treekem_event_log.read().await;
+            logs.get(&fixture.stable_group_id)
+                .and_then(|events| {
+                    events.iter().rev().find(|event| {
+                        matches!(
+                            event,
+                            NamedGroupMetadataEvent::JoinRequestApproved {
+                                requester_agent_id, ..
+                            } if requester_agent_id == &requester_hex
+                        )
+                    })
+                })
+                .cloned()
+                .expect("authority logged JoinRequestApproved")
+        };
+        let recovery = fixture
+            .state
+            .treekem_member_key_packages
+            .read()
+            .await
+            .get(&join_result_key(&fixture.group_id, &requester_hex))
+            .cloned()
+            .expect("authority cached the attested recovery record");
+
+        // (1) The approval event carries A's hash.
+        let NamedGroupMetadataEvent::JoinRequestApproved {
+            treekem_key_package_hash,
+            ..
+        } = &approval_event
+        else {
+            unreachable!("captured event is JoinRequestApproved");
+        };
+        assert_eq!(
+            treekem_key_package_hash.as_deref(),
+            Some(package_a_hash.as_str()),
+            "approval event commits package A's hash"
+        );
+
+        // (2) Receiver W applies the authority commit/hash through the
+        // production apply path, even though its local snapshot held B.
+        assert!(
+            apply_named_group_metadata_event(&w_state, approval_event, authority_id, true).await,
+            "receiver applies the authority JoinRequestApproved commit"
+        );
+        {
+            let groups = w_state.named_groups.read().await;
+            let info = groups.get(&fixture.group_id).expect("W retains group");
+            let member = info
+                .members_v2
+                .get(&requester_hex)
+                .expect("requester admitted on W");
+            assert_eq!(
+                member.treekem_key_package_hash.as_deref(),
+                Some(package_a_hash.as_str()),
+                "receiver adopts the authority-accepted hash"
+            );
+            assert!(
+                member.treekem_key_package_b64.is_none(),
+                "receiver discards local package B — bytes do not match the committed hash"
+            );
+        }
+
+        // (3) The separately authority-attested recovery record installs A.
+        assert!(
+            apply_recovered_member_key_package(&w_state, &recovery).await,
+            "authority-attested recovery installs package A on the receiver"
+        );
+        {
+            let groups = w_state.named_groups.read().await;
+            let info = groups.get(&fixture.group_id).expect("W retains group");
+            let member = info
+                .members_v2
+                .get(&requester_hex)
+                .expect("requester present on W");
+            assert_eq!(
+                member.treekem_key_package_b64.as_deref(),
+                Some(package_a_b64.as_str()),
+                "receiver installed package A from the recovery record"
+            );
+            assert_eq!(
+                member.treekem_key_package_hash.as_deref(),
+                Some(package_a_hash.as_str()),
+                "installed package A matches the committed incarnation hash"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_join_group_via_invite_for_present_group_returns_conflict_preserving_state(
+    ) -> Result<()> {
+        // Codex blocker 2: a second join_group_via_invite for an already-present
+        // group must short-circuit with CONFLICT before mutating any GroupInfo or
+        // TreeKEM state.
+        let fixture = member_joined_treekem_fixture(0xd1, 0xd2).await?;
+        let state = Arc::clone(&fixture.state);
+        let (pre_hash, pre_epoch) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&fixture.group_id).expect("group present");
+            let epoch = fixture.group.lock().await.epoch();
+            (info.state_hash.clone(), epoch)
+        };
+        let invite = x0x::groups::invite::SignedInvite::new(
+            fixture.group_id.clone(),
+            "conflict-guard".to_string(),
+            &state.agent.agent_id(),
+            3600,
+        );
+        let invite_link = invite
+            .encode_link()
+            .expect("minimal invite encodes under budget");
+        let response = join_group_via_invite(
+            State(Arc::clone(&state)),
+            Json(JoinGroupRequest {
+                invite: invite_link,
+                display_name: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "second join for present group returns CONFLICT, body: {body}"
+        );
+        let (post_hash, post_epoch) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&fixture.group_id).expect("group still present");
+            let epoch = fixture.group.lock().await.epoch();
+            (info.state_hash.clone(), epoch)
+        };
+        assert_eq!(post_hash, pre_hash, "GroupInfo state hash preserved");
+        assert_eq!(post_epoch, pre_epoch, "TreeKEM epoch preserved");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_treekem_add_publishes_recoverable_authority_attestation() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0xa4, 0xa5).await?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let target_id = target.agent_id();
+        let target_hex = hex::encode(target_id.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(target_id, &[0xa6; 32])?;
+        let (status, _) = add_treekem_named_group_member(
+            Arc::clone(&fixture.state),
+            fixture.group_id.clone(),
+            target_id,
+            AddNamedGroupMemberRequest {
+                agent_id: target_hex.clone(),
+                display_name: None,
+                treekem_key_package_b64: Some(BASE64.encode(prepared.key_package_bytes())),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "direct TreeKEM add succeeds");
+
+        let member_added = {
+            let logs = fixture.state.treekem_event_log.read().await;
+            logs.values()
+                .flat_map(|events| events.iter())
+                .find(|event| {
+                    matches!(
+                        event,
+                        NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                            if agent_id == &target_hex
+                    )
+                })
+                .cloned()
+                .expect("direct add records its compact MemberAdded event")
+        };
+        let NamedGroupMetadataEvent::MemberAdded {
+            treekem_key_package_hash,
+            member_joined_recovery,
+            member_recovery_history,
+            ..
+        } = &member_added
+        else {
+            unreachable!("selected event is MemberAdded");
+        };
+        assert!(
+            treekem_key_package_hash.is_some(),
+            "MemberAdded commits only the admitted package hash"
+        );
+        assert!(
+            member_joined_recovery.is_none() && member_recovery_history.is_empty(),
+            "large recovery records travel as independently retryable direct events"
+        );
+        assert!(
+            serde_json::to_vec(&member_added)?.len() <= crate::dm::MAX_PAYLOAD_BYTES,
+            "the Welcome-bearing authority event must remain deliverable in one DM"
+        );
+
+        let recovery = fixture
+            .state
+            .treekem_member_key_packages
+            .read()
+            .await
+            .get(&join_result_key(&fixture.group_id, &target_hex))
+            .cloned()
+            .expect("direct add caches authority recovery attestation");
+        {
+            let groups = fixture.state.named_groups.read().await;
+            let info = groups.get(&fixture.group_id).expect("group exists");
+            assert!(
+                verify_authority_attested_member_joined_recovery(info, &recovery),
+                "direct-add KeyPackage is bound to the signed admission commit"
+            );
+        }
+        {
+            let mut groups = fixture.state.named_groups.write().await;
+            groups
+                .get_mut(&fixture.group_id)
+                .and_then(|info| info.members_v2.get_mut(&target_hex))
+                .expect("direct-added member exists")
+                .treekem_key_package_b64 = None;
+        }
+        assert!(
+            apply_recovered_member_key_package(&fixture.state, &recovery).await,
+            "direct-added member package can be recovered for removal"
+        );
+        let restarted =
+            secure_endpoint_test_state_at(fixture._dir.path(), Arc::clone(&fixture.state.agent))
+                .await?;
+        let restarted_recovery = restarted
+            .treekem_member_key_packages
+            .read()
+            .await
+            .get(&join_result_key(&fixture.group_id, &target_hex))
+            .cloned()
+            .expect("authority-only direct-add recovery survives restart");
+        let groups = restarted.named_groups.read().await;
+        assert!(
+            verify_authority_attested_member_joined_recovery(
+                groups
+                    .get(&fixture.group_id)
+                    .expect("restarted group exists"),
+                &restarted_recovery,
+            ),
+            "restarted direct-add recovery remains verifiable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn later_joiner_installs_individually_delivered_recovery_history() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0xa1, 0xa2).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let stable_group_id = fixture.stable_group_id.clone();
+        let first_member = fixture.member_hex.clone();
+        let raw_first = without_recovery_attestation(fixture.event.clone());
+        let _ = apply_named_group_metadata_event(state, raw_first, fixture.member_id, true).await;
+
+        let later_keypair = x0x::identity::AgentKeypair::generate()?;
+        let later_id = later_keypair.agent_id();
+        let later_hex = hex::encode(later_id.as_bytes());
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let invite_secret = "later-joiner-history-invite".to_string();
+        let now_ms = now_millis_u64();
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group exists")
+                .record_issued_invite(
+                    invite_secret.clone(),
+                    now_ms / 1_000,
+                    0,
+                    x0x::groups::GroupRole::Member,
+                );
+        }
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(later_id, &[0xa3; 32])?;
+        let kp_b64 = BASE64.encode(prepared.key_package_bytes());
+        let public_key_b64 = BASE64.encode(later_keypair.public_key().as_bytes());
+        let canonical = canonical_member_joined_bytes(
+            &group_id,
+            Some(&stable_group_id),
+            &later_hex,
+            &public_key_b64,
+            x0x::groups::GroupRole::Member,
+            None,
+            &inviter_hex,
+            &invite_secret,
+            now_ms,
+            Some(&kp_b64),
+        );
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            later_keypair.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| anyhow::anyhow!("sign later MemberJoined: {e:?}"))?;
+        let later_join = NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.clone(),
+            stable_group_id: Some(stable_group_id.clone()),
+            member_agent_id: later_hex.clone(),
+            member_public_key_b64: public_key_b64,
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: inviter_hex,
+            invite_secret,
+            ts_ms: now_ms,
+            treekem_key_package_b64: Some(kp_b64),
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: BASE64.encode(signature.as_bytes()),
+        };
+        let _ = apply_named_group_metadata_event(state, later_join, later_id, true).await;
+
+        let later_added = {
+            let logs = state.treekem_event_log.read().await;
+            logs.get(&stable_group_id)
+                .and_then(|events| {
+                    events.iter().rev().find(|event| {
+                        matches!(
+                            event,
+                            NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                                if agent_id == &later_hex
+                        )
+                    })
+                })
+                .cloned()
+                .expect("later MemberAdded logged")
+        };
+        let NamedGroupMetadataEvent::MemberAdded {
+            member_recovery_history,
+            ..
+        } = later_added
+        else {
+            panic!("expected MemberAdded");
+        };
+        assert!(
+            member_recovery_history.is_empty(),
+            "recovery history must not grow the Welcome-bearing MemberAdded payload"
+        );
+        let prior_recovery = {
+            let cache = state.treekem_member_key_packages.read().await;
+            cache
+                .values()
+                .find(|event| {
+                    matches!(
+                        event,
+                        NamedGroupMetadataEvent::MemberJoined { member_agent_id, .. }
+                            if member_agent_id == &first_member
+                    )
+                })
+                .cloned()
+                .expect("prior authority-attested recovery record")
+        };
+        assert!(
+            serde_json::to_vec(&prior_recovery)?.len() < crate::dm::MAX_PAYLOAD_BYTES,
+            "each independently delivered recovery record fits one DM payload"
+        );
+        let (later_state, _later_dir) = secure_endpoint_test_state().await?;
+        let mut later_info = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("authority group exists")
+            .clone();
+        later_info
+            .members_v2
+            .get_mut(&first_member)
+            .expect("prior member exists")
+            .treekem_key_package_b64 = None;
+        later_state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), later_info);
+        assert!(
+            apply_recovered_member_key_package(&later_state, &prior_recovery).await,
+            "later joiner installs a separately delivered historical recovery record"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovered_member_key_package_survives_inviter_demotion() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x9d, 0x9e).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group exists");
+            info.set_member_role(&inviter_hex, x0x::groups::GroupRole::Member);
+            info.recompute_state_hash();
+        }
+
+        assert!(
+            apply_recovered_member_key_package(state, &fixture.event).await,
+            "historical signed admission remains valid after inviter demotion"
+        );
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_some(),
+            "recovery depends on historical commit authority, not current role"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovered_member_key_package_rejects_unauthorized_and_revoked_couriers() -> Result<()>
+    {
+        let fixture = member_joined_treekem_fixture(0x9b, 0x9c).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+
+        let response = TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: fixture.stable_group_id.clone(),
+            events: vec![fixture.event.clone()],
+            truncated: false,
+        };
+        let unauthorized = x0x::identity::AgentKeypair::generate()?;
+        handle_treekem_catchup_response(state, &unauthorized.agent_id(), true, response.clone())
+            .await;
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "verified transport alone does not authorize an unsolicited recovery courier"
+        );
+
+        let courier = x0x::identity::AgentKeypair::generate()?;
+        let courier_id = courier.agent_id();
+        let courier_hex = hex::encode(courier_id.as_bytes());
+        insert_active_member_without_kp(state, &group_id, &courier_hex, &inviter_hex).await;
+        let revocation = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(courier_id),
+            courier.public_key(),
+            courier.secret_key(),
+            now_millis_u64(),
+            Some("recovery courier compromised".to_string()),
+        )?;
+        state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(revocation, None)?;
+        handle_treekem_catchup_response(state, &courier_id, true, response).await;
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "revoked active member cannot courier recovery evidence"
+        );
+        Ok(())
+    }
+
+    /// A newly created private TreeKEM group provisions a creator recovery
+    /// package that is fully authority-attested (signed by the creator-as-admin
+    /// over the sealed group-state commit), whose package hashes to the live
+    /// roster incarnation, and which reinstalls itself on demand after the
+    /// roster bytes are wiped. Driven through the real POST /groups handler so
+    /// the entire production create-group TreeKEM provisioning path is
+    /// exercised — no production logic is re-implemented in the test.
+    #[tokio::test]
+    async fn creator_package_is_authority_attested_and_recoverable_after_roster_wipe() -> Result<()>
+    {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+
+        // Drive the real production create-group handler with a private-secure
+        // request, which routes through the secure-by-default TreeKEM path and
+        // provisions the creator's attested recovery package.
+        let response = create_named_group(
+            State(Arc::clone(&state)),
+            Json(CreateGroupRequest {
+                name: "secure".to_string(),
+                description: String::new(),
+                display_name: None,
+                preset: Some("private_secure".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "private TreeKEM group created via handler: {body}"
+        );
+        let group_id = body["group_id"]
+            .as_str()
+            .expect("group_id in create response")
+            .to_string();
+        let creator_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        // (1) The creator package was provisioned as a fully authority-attested
+        //     recovery record: it carries an authority signature over the
+        //     sealed group-state commit (not merely a member self-signature).
+        let cached = state
+            .treekem_member_key_packages
+            .read()
+            .await
+            .get(&join_result_key(&group_id, &creator_hex))
+            .cloned()
+            .expect("creator recovery record is cached at group creation");
+        let cached_package = match &cached {
+            NamedGroupMetadataEvent::MemberJoined {
+                recovery_authority_agent_id: Some(auth),
+                recovery_authority_signature_b64: Some(sig),
+                recovery_authority_commit: Some(commit),
+                treekem_key_package_b64: Some(kp),
+                ..
+            } if !auth.is_empty() && !sig.is_empty() && commit.verify_structure().is_ok() => {
+                kp.clone()
+            }
+            _ => panic!("creator recovery record is authority-attested over the sealed commit"),
+        };
+
+        // (2) The cached package matches the current roster incarnation: the
+        //     resolver's hash gate (blake3(package) == roster hash) admits it.
+        let roster_package = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&group_id)
+                .and_then(|info| info.members_v2.get(&creator_hex))
+                .and_then(current_member_treekem_key_package)
+        };
+        assert_eq!(
+            roster_package.as_deref(),
+            Some(cached_package.as_str()),
+            "creator package hashes to the current roster incarnation"
+        );
+
+        // (3) Wipe the roster bytes (a stale GroupInfo write-back or cache miss
+        //     that dropped the in-roster package). The hash is retained, so the
+        //     gate must refuse to serve anything from the roster alone.
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group exists")
+                .members_v2
+                .get_mut(&creator_hex)
+                .expect("creator exists")
+                .treekem_key_package_b64 = None;
+        }
+        let gated = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&group_id)
+                .and_then(|info| info.members_v2.get(&creator_hex))
+                .and_then(current_member_treekem_key_package)
+        };
+        assert!(
+            gated.is_none(),
+            "with roster bytes wiped, the hash gate serves no unverified package"
+        );
+
+        // (4) On-demand recovery signature-verifies the cached attested record
+        //     and reinstalls the exact package, restoring the hash-matched leaf.
+        let recovered = recover_member_treekem_key_package(&state, &group_id, &creator_hex).await;
+        assert!(
+            recovered,
+            "creator package recovered from the authority-attested cache after a roster wipe"
+        );
+        let restored = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&group_id)
+                .and_then(|info| info.members_v2.get(&creator_hex))
+                .and_then(current_member_treekem_key_package)
+        };
+        assert_eq!(
+            restored.as_deref(),
+            Some(cached_package.as_str()),
+            "recovered creator package still hashes to the current roster incarnation"
+        );
+        Ok(())
+    }
+
+    /// Replacing a member's committed incarnation hash wipes any stale package
+    /// bytes from the roster, and the removal-path resolver never serves a
+    /// package whose hash no longer matches the current incarnation — even when
+    /// a fully authority-attested record for the superseded package is sitting
+    /// in the recovery cache. This pins the incarnation-invalidation invariant:
+    /// a re-keyed or re-added member's old KeyPackage cannot be replayed.
+    #[tokio::test]
+    async fn replacing_incarnation_hash_clears_stale_package_bytes() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x91, 0x92).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        // The fixture leaves the member soft-removed with the original
+        // incarnation hash retained; re-activate them and install the matching
+        // package bytes so the resolver currently serves it.
+        let original_package = match fixture.event.clone() {
+            NamedGroupMetadataEvent::MemberJoined {
+                treekem_key_package_b64: Some(kp),
+                ..
+            } => kp,
+            _ => unreachable!("fixture event carries a key package"),
+        };
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group exists")
+                .set_member_treekem_key_package(&member_hex, original_package.clone());
+        }
+
+        // Sanity: the resolver currently serves the installed, incarnation-matched package.
+        let served = resolve_member_treekem_kp_for_removal(state, &group_id, &member_hex)
+            .await
+            .expect("resolver serves the current incarnation package");
+        assert_eq!(
+            served, original_package,
+            "resolver returns the package whose hash matches the current incarnation"
+        );
+
+        // Seed the recovery cache with the authority-attested record for the
+        // ORIGINAL package — the stale evidence that must NOT be replayable.
+        state.treekem_member_key_packages.write().await.insert(
+            join_result_key(&group_id, &member_hex),
+            fixture.event.clone(),
+        );
+
+        // Replace the member's incarnation hash (a re-key / re-add). The setter
+        // MUST wipe the now-stale package bytes because they no longer match.
+        let new_incarnation_hash = blake3::hash(b"a-fresh-rotated-key-package")
+            .to_hex()
+            .to_string();
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group exists")
+                .set_member_treekem_key_package_hash(&member_hex, new_incarnation_hash.clone());
+        }
+        let (stale_bytes, recorded_hash) = {
+            let groups = state.named_groups.read().await;
+            let member = groups
+                .get(&group_id)
+                .and_then(|info| info.members_v2.get(&member_hex))
+                .expect("member exists");
+            (
+                member.treekem_key_package_b64.clone(),
+                member.treekem_key_package_hash.clone(),
+            )
+        };
+        assert!(
+            stale_bytes.is_none(),
+            "stale package bytes are wiped when the incarnation hash changes"
+        );
+        assert_eq!(
+            recorded_hash.as_deref(),
+            Some(new_incarnation_hash.as_str()),
+            "the new incarnation hash is recorded"
+        );
+
+        // The resolver refuses to serve the stale package: the roster has no
+        // hash-matched bytes, and recovery cannot install the cached attested
+        // record because its package hashes to the superseded incarnation.
+        let resolved = resolve_member_treekem_kp_for_removal(state, &group_id, &member_hex).await;
+        assert!(
+            resolved.is_err(),
+            "resolver never returns a hash-mismatched stale package, even with attested cache evidence"
+        );
+        let (status, body) = resolved.expect_err("pending error");
+        assert_eq!(
+            status,
+            StatusCode::FAILED_DEPENDENCY,
+            "a missing current-incarnation package is a retryable pending condition"
+        );
+        assert_eq!(body["error"], "member_key_package_pending");
+        assert_eq!(body["retry"], true);
+        Ok(())
+    }
+
+    fn without_recovery_attestation(mut event: NamedGroupMetadataEvent) -> NamedGroupMetadataEvent {
+        if let NamedGroupMetadataEvent::MemberJoined {
+            recovery_authority_agent_id,
+            recovery_authority_public_key_b64,
+            recovery_authority_signature_b64,
+            recovery_authority_commit,
+            ..
+        } = &mut event
+        {
+            *recovery_authority_agent_id = None;
+            *recovery_authority_public_key_b64 = None;
+            *recovery_authority_signature_b64 = None;
+            *recovery_authority_commit = None;
+        }
+        event
+    }
+
     async fn set_member_state(
         state: &Arc<AppState>,
         group_id: &str,
@@ -23623,15 +26408,18 @@ mod tests {
     ) {
         let mut groups = state.named_groups.write().await;
         if let Some(info) = groups.get_mut(group_id) {
-            info.members_v2.insert(
+            let package_hash = info
+                .members_v2
+                .get(member)
+                .and_then(|existing| existing.treekem_key_package_hash.clone());
+            let mut active = x0x::groups::GroupMember::new_member(
                 member.to_string(),
-                x0x::groups::GroupMember::new_member(
-                    member.to_string(),
-                    None,
-                    Some(added_by.to_string()),
-                    1,
-                ),
+                None,
+                Some(added_by.to_string()),
+                1,
             );
+            active.treekem_key_package_hash = package_hash;
+            info.members_v2.insert(member.to_string(), active);
         }
     }
 }

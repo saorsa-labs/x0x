@@ -448,6 +448,9 @@ pub(super) struct AppState {
     pub(super) kv_stores: RwLock<HashMap<String, KvStoreHandle>>,
     pub(super) named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
     pub(super) named_groups_path: PathBuf,
+    /// Serializes snapshot-and-write of `named_groups.json` so an older
+    /// snapshot cannot rename over a newer recovered KeyPackage.
+    pub(super) named_groups_persistence_lock: Mutex<()>,
     /// Background metadata listeners for named groups (one per group id).
     pub(super) group_metadata_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Cached group cards discovered via gossip or imported from peers.
@@ -503,11 +506,12 @@ pub(super) struct AppState {
     pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,
     /// Member-keyed cache of verified TreeKEM key-package-bearing
     /// `MemberJoined` events (`join_result_key(group_id, member_id)` → event).
-    /// Populated when a node applies a joiner's self-signed `MemberJoined`
-    /// (inviter side) and served to promoted admins that never saw the join via
-    /// the member-keyed catch-up protocol (issue #205). The ML-DSA-65 signature
-    /// over `canonical_member_joined_bytes` authenticates the embedded key
-    /// package, so a recovering admin installs it without the inviter-only gate.
+    /// Populated by the inviter after authoritative apply and by any receiver
+    /// that validates the joiner's sender binding, signature, AgentId, group,
+    /// and role without applying the inviter-only roster mutation. Promoted
+    /// admins fetch the original signed event through member-keyed catch-up.
+    /// The signature over `canonical_member_joined_bytes` authenticates the
+    /// package, so recovery does not require the inviter or target to cooperate.
     pub(super) treekem_member_key_packages: RwLock<HashMap<String, NamedGroupMetadataEvent>>,
     /// Disk location for the signed member key-package recovery cache.
     pub(super) treekem_member_key_packages_path: PathBuf,

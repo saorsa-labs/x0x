@@ -81,12 +81,10 @@ pub fn compute_roster_root(members_v2: &BTreeMap<String, GroupMember>) -> String
     roster_root_from_entries(&mut entries)
 }
 
-/// Shared hashing core for the roster root. Sorts `entries` by id and folds
-/// `(id, role, state)` into the canonical `x0x.roster-root.v1` digest. Both
-/// [`compute_roster_root`] (over a live roster) and
-/// [`roster_root_of_projection`] (over a retained projection) route through
-/// this so a retained projection re-derives the exact root its commit signed.
 fn roster_root_from_entries(entries: &mut [(&str, GroupRole, GroupMemberState)]) -> String {
+    // `(id, role, state)` is the v1 canonical roster entry. KeyPackage
+    // incarnation hashes are authenticated by the add commit's signed
+    // `security_binding`; changing this root would partition older peers.
     entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut buf = Vec::with_capacity(entries.len() * 48 + 16);
     buf.extend_from_slice(b"x0x.roster-root.v1");
@@ -109,8 +107,9 @@ fn roster_root_from_entries(entries: &mut [(&str, GroupRole, GroupMemberState)])
 pub struct RosterMemberSnapshot {
     pub role: GroupRole,
     pub state: GroupMemberState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treekem_key_package_hash: Option<String>,
 }
-
 /// Project the roster-root-relevant view of a roster: `Active` + `Banned`
 /// members with their `(role, state)`. Mirrors [`compute_roster_root`]'s
 /// filter exactly so [`roster_root_of_projection`] re-derives the same root.
@@ -127,6 +126,7 @@ pub fn roster_projection(
                 RosterMemberSnapshot {
                     role: m.role,
                     state: m.state,
+                    treekem_key_package_hash: m.treekem_key_package_hash.clone(),
                 },
             )
         })

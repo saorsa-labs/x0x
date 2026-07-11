@@ -267,6 +267,15 @@ impl TreeKemMlsGroup {
             )));
         }
         let kp: KeyPackage = decode(joiner_key_package, "joiner key package")?;
+        // A KeyPackage's stable public keys identify its TreeKEM leaf. Allowing
+        // a different AgentId to reuse an existing package creates two leaves
+        // that recovery cannot distinguish and can make removal delete the
+        // victim's earlier leaf. Reject duplicate identities before mutation.
+        if self.inner.find_leaf_by_key_package(&kp).is_some() {
+            return Err(MlsError::MlsOperation(
+                "TreeKEM key package identity is already present in this group".to_string(),
+            ));
+        }
         let (commit, welcome) = self
             .inner
             .add_member(&kp)
@@ -770,6 +779,24 @@ mod tests {
             alice.member_count(),
             2,
             "duplicate add must not grow the tree"
+        );
+    }
+
+    #[test]
+    fn different_agent_cannot_reuse_existing_key_package() {
+        let mut alice = TreeKemMlsGroup::create(b"g".to_vec(), agent(1), &seed(1)).expect("create");
+        let victim = TreeKemMlsGroup::prepare_member(agent(2), &seed(2)).expect("prepare");
+        let victim_kp = victim.key_package_bytes().to_vec();
+        alice
+            .add_member(agent(2), &victim_kp)
+            .expect("first identity add succeeds");
+
+        let err = alice.add_member(agent(3), &victim_kp).unwrap_err();
+        assert!(matches!(err, MlsError::MlsOperation(_)));
+        assert_eq!(
+            alice.member_count(),
+            2,
+            "reused stable keys must not create an ambiguous second leaf"
         );
     }
 
