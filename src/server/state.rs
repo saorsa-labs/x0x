@@ -32,6 +32,32 @@ use super::{
     WelcomeFetchWaiter,
 };
 
+fn validate_instance_name_grammar(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() || name.len() > 64 {
+        anyhow::bail!("instance name must be 1-64 characters");
+    }
+    let valid = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !valid {
+        anyhow::bail!(
+            "instance name must start with alphanumeric and contain only alphanumeric or hyphens"
+        );
+    }
+    Ok(())
+}
+
+/// Validate a daemon instance name without taking ownership or allocating on
+/// the success path.
+///
+/// New path-derivation code should construct [`InstanceName`] so invalid state
+/// is unrepresentable. This function remains the stable borrowed validation API.
+pub fn validate_instance_name(name: &str) -> anyhow::Result<()> {
+    validate_instance_name_grammar(name)
+}
+
 /// Validated daemon instance name used for every instance-scoped path.
 ///
 /// Construction enforces the shared CLI/config grammar, so path derivation
@@ -57,19 +83,7 @@ impl TryFrom<String> for InstanceName {
     type Error = anyhow::Error;
 
     fn try_from(name: String) -> Result<Self, Self::Error> {
-        if name.is_empty() || name.len() > 64 {
-            anyhow::bail!("instance name must be 1-64 characters");
-        }
-        let valid = name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-        if !valid {
-            anyhow::bail!(
-                "instance name must start with alphanumeric and contain only alphanumeric or hyphens"
-            );
-        }
+        validate_instance_name_grammar(&name)?;
         Ok(Self(name))
     }
 }
@@ -716,6 +730,87 @@ mod tests {
                 raw,
                 "an accepted name must be preserved byte-for-byte (no trim/lowercase)"
             );
+        }
+    }
+
+    /// Backcompat / parity guard for the stable borrowed validator.
+    ///
+    /// `x0x::server::validate_instance_name` is the documented
+    /// `fn(&str) -> anyhow::Result<()>` surface that pre-dates the typed
+    /// [`InstanceName`] constructor. It must reach the SAME verdict as
+    /// [`InstanceName::try_from`] and emit the SAME error bytes for every
+    /// grammar/length boundary, so a caller cannot observe a name that one path
+    /// accepts but the other rejects. The two `try_from_*` tests above pin the
+    /// constructor's absolute behavior against the canonical messages; this test
+    /// pins the *relationship* between the two surfaces and deliberately does
+    /// not re-encode the grammar (it derives expectations from the sibling API),
+    /// so it stays correct if the messages are ever reworded.
+    #[test]
+    fn borrowed_validator_matches_typed_constructor_outcomes_and_messages() {
+        // Bind the restored public signature as a typed fn pointer. If the
+        // `fn(&str) -> anyhow::Result<()>` surface ever changes arity, argument
+        // type, or return type, this binding fails to COMPILE — a
+        // backcompat guard stronger than any runtime assertion.
+        let validate: fn(&str) -> anyhow::Result<()> = x0x::server::validate_instance_name;
+
+        let max = "a".repeat(64); // exactly 64 — upper length boundary (valid)
+        let over = "a".repeat(65); // 65 — one past the boundary (invalid)
+
+        // One representative row per documented category: valid boundaries on
+        // the success side; every documented rejection class on the failure
+        // side. No grammar is re-encoded below — each row is compared against
+        // the typed constructor's actual output.
+        let cases: &[&str] = &[
+            // --- valid boundaries ---
+            "a",          // single char — lower length boundary
+            "testnet",    // lowercase alphanumeric
+            "x0x-443",    // alphanumeric + hyphen (embedded hyphen allowed)
+            max.as_str(), // exactly 64 chars — upper length boundary
+            // --- invalid: empty (length rule) ---
+            "",
+            // --- invalid: whitespace ---
+            "   ",   // whitespace only
+            "ab cd", // embedded space
+            "\t",    // tab
+            // --- invalid: path separators ---
+            "/",    // forward slash
+            "\\",   // backslash
+            "a/b",  // embedded forward slash
+            "a\\b", // embedded backslash
+            // --- invalid: traversal + absolute & platform path forms ---
+            "..",                // parent traversal
+            "../etc/passwd",     // traversal with target
+            "/etc/passwd",       // absolute POSIX path
+            "C:\\Users",         // absolute Windows drive path (platform form)
+            "\\\\server\\share", // UNC path form
+            // --- invalid: leading hyphen (also a CLI-flag-injection hazard) ---
+            "-lead",
+            // --- invalid: non-ASCII ---
+            "café", // accented Latin
+            "测试", // CJK
+            // --- invalid: overlength (length rule) ---
+            over.as_str(),
+        ];
+
+        for &raw in cases {
+            let borrowed = validate(raw);
+            let typed = InstanceName::try_from(raw.to_owned());
+            match (&borrowed, &typed) {
+                (Ok(()), Ok(_)) => {}
+                (Err(borrowed_err), Err(typed_err)) => assert_eq!(
+                    borrowed_err.to_string(),
+                    typed_err.to_string(),
+                    "borrowed and typed validators disagree on error message for {raw:?}"
+                ),
+                (Ok(()), Err(typed_err)) => panic!(
+                    "parity break: borrowed validator ACCEPTED {raw:?} \
+                     but typed constructor rejected it: {typed_err}"
+                ),
+                (Err(borrowed_err), Ok(_)) => panic!(
+                    "parity break: borrowed validator REJECTED {raw:?} \
+                     but typed constructor accepted it: {borrowed_err}"
+                ),
+            }
         }
     }
 }

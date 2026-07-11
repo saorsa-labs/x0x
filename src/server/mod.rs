@@ -31,8 +31,8 @@ use routes::{
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
-    default_api_address, default_bind_address, default_data_dir, DaemonConfig, InstanceName,
-    ServeOptions, ServerHandle, DEFAULT_QUIC_PORT,
+    default_api_address, default_bind_address, default_data_dir, validate_instance_name,
+    DaemonConfig, InstanceName, ServeOptions, ServerHandle, DEFAULT_QUIC_PORT,
 };
 use state::{shared_cache_dir, AppState, CachedUpgradeCheck, DaemonUpdateConfig};
 use ws::{ws_diagnostics, ws_direct_handler, ws_handler, ws_sessions, WsOutboundStats};
