@@ -303,8 +303,9 @@ pub enum RelayRefusal {
 ///
 /// Even with the contact gate on, a compromised contact could attempt to
 /// drain the relay. The forward path is therefore bounded by three
-/// per-`limit_window` caps, all enforced in `disposition_for` before
-/// any byte is forwarded:
+/// per-`limit_window` caps, atomically enforced by
+/// [`PeerRelay::reserve_forward`] after destination resolution and encoding
+/// but before transmission:
 /// - `max_forwards_per_sender` — per-sender forward rate
 ///   ([`RelayRefusal::RateLimited`]),
 /// - `max_total_forwards` — global forward rate across all senders,
@@ -431,9 +432,10 @@ pub struct RelayStats {
     relay_refused_blocked: AtomicU64,
     relay_refused_rate_limited: AtomicU64,
     relay_refused_bandwidth_exceeded: AtomicU64,
-    /// Total bytes committed to forward on the relay path (the
-    /// observable bandwidth metric). Incremented on each accepted
-    /// forward by the predicted inner-envelope wire size.
+    /// Total bytes successfully transmitted on the relay-forward path (the
+    /// observable bandwidth metric). Incremented only when a reservation is
+    /// committed after transport success, using the encoded inner-envelope
+    /// wire size.
     relay_forward_bytes: AtomicU64,
 }
 
