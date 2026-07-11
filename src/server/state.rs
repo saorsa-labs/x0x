@@ -560,17 +560,12 @@ pub(super) struct AppState {
     /// Bounded per-group log of locally authored/applied TreeKEM membership
     /// events used to satisfy explicit catch-up requests.
     pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,
-    /// Member-keyed cache of verified TreeKEM key-package-bearing
-    /// `MemberJoined` events (`join_result_key(group_id, member_id)` → event).
-    /// Populated by the inviter after authoritative apply and by any receiver
-    /// that validates the joiner's sender binding, signature, AgentId, group,
-    /// and role without applying the inviter-only roster mutation. Promoted
-    /// admins fetch the original signed event through member-keyed catch-up.
-    /// The signature over `canonical_member_joined_bytes` authenticates the
-    /// package, so recovery does not require the inviter or target to cooperate.
-    pub(super) treekem_member_key_packages: RwLock<HashMap<String, NamedGroupMetadataEvent>>,
-    /// Disk location for the signed member key-package recovery cache.
-    pub(super) treekem_member_key_packages_path: PathBuf,
+    /// Bounded member-keyed cache of verified TreeKEM key-package-bearing
+    /// `MemberJoined` recovery records. It retains inviter-authority-attested
+    /// records and independently witnessed provisional records under the same
+    /// global count/byte limits, and owns lifecycle pruning, serialized
+    /// persistence, dirty retry state, and diagnostics.
+    pub(super) treekem_member_key_packages: super::TreeKemMemberKeyPackageCache,
     /// Anti-spam throttle for outbound catch-up requests.
     pub(super) treekem_catchup_throttle: RwLock<HashMap<String, Instant>>,
     /// Per-group serialization for authoritative membership mutations. The

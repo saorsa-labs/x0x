@@ -108,6 +108,58 @@ const TREEKEM_EVENT_LOG_PER_GROUP_CAP: usize = 128;
 const TREEKEM_CATCHUP_RESPONSE_EVENT_CAP: usize = 1;
 const TREEKEM_PROVISIONAL_RECOVERY_PER_GROUP_CAP: usize = 64;
 const TREEKEM_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
+
+/// Recovery records are large signed events (~15.7 KiB each). Bound the
+/// compact snapshot to 512 active-member records and 8 MiB encoded JSON.
+/// Both limits are enforced after every mutation and during startup load.
+const TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_ENTRIES: usize = 512;
+const TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+struct TreeKemMemberKeyPackageCacheEntry {
+    event: NamedGroupMetadataEvent,
+    encoded_bytes: usize,
+}
+
+struct TreeKemMemberKeyPackageCacheState {
+    entries: BTreeMap<String, TreeKemMemberKeyPackageCacheEntry>,
+    encoded_bytes: usize,
+    revision: u64,
+    persisted_revision: u64,
+    dirty: bool,
+    write_failures: u64,
+    last_error: Option<String>,
+}
+
+struct TreeKemMemberKeyPackageCache {
+    path: PathBuf,
+    state: RwLock<TreeKemMemberKeyPackageCacheState>,
+    persistence: Mutex<()>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum TreeKemCachePersistenceStatus {
+    Durable { revision: u64 },
+    Dirty { revision: u64, error: String },
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct TreeKemCacheDiagnostics {
+    entries: usize,
+    encoded_bytes: usize,
+    max_entries: usize,
+    max_encoded_bytes: usize,
+    revision: u64,
+    persisted_revision: u64,
+    dirty: bool,
+    write_failures: u64,
+    last_error: Option<String>,
+}
+
+struct TreeKemCacheMutation {
+    persistence: TreeKemCachePersistenceStatus,
+    evicted: usize,
+}
 const DM_INBOX_START_MAX_ATTEMPTS: u32 = 120;
 const DM_INBOX_START_RETRY_DELAY: Duration = Duration::from_millis(250);
 
@@ -129,6 +181,36 @@ static RECOVERED_KP_BEFORE_MEMBERSHIP_LOCK_NOTIFY: StdMutex<
 static NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY: StdMutex<
     Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 > = StdMutex::new(None);
+#[cfg(test)]
+struct TreeKemCacheWriterHookControl {
+    // Signalled with a stored permit once the writer has entered the hook, so a
+    // test can deterministically observe that the write is in flight regardless
+    // of await ordering.
+    entered: Arc<tokio::sync::Notify>,
+    // When present, the writer parks here until signalled (slow-disk simulation).
+    release: Option<Arc<tokio::sync::Notify>>,
+    // When present, the write returns this error instead of touching the disk.
+    force_error: Option<std::io::Error>,
+}
+
+// Test-only, path-scoped, one-shot writer seam for the TreeKEM recovery cache.
+// Keyed by the cache's on-disk path so tests over distinct temp directories can
+// never cross-talk. A hook is consumed the first time the writer fires it
+// (`take_*` removes it), and the owning guard removes any still-pending entry
+// on drop, so cleanup is RAII-safe even on panic. Production code only reaches
+// this through the `#[cfg(test)]` block in `write_treekem_cache_json_atomic`.
+#[cfg(test)]
+static TREEKEM_CACHE_WRITER_HOOKS: std::sync::LazyLock<
+    StdMutex<std::collections::HashMap<PathBuf, TreeKemCacheWriterHookControl>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn take_treekem_cache_writer_hook_for_test(path: &FsPath) -> Option<TreeKemCacheWriterHookControl> {
+    TREEKEM_CACHE_WRITER_HOOKS
+        .lock()
+        .expect("TreeKEM cache writer hook poisoned")
+        .remove(path)
+}
 
 // ---------------------------------------------------------------------------
 // Shared application state
@@ -760,9 +842,11 @@ pub async fn serve_with_options(
         .await
         .map_err(|e| anyhow::anyhow!("failed to recover TreeKEM persistence journal: {e}"))?;
     let named_groups = load_named_groups(&named_groups_path).await?;
-    let treekem_member_key_packages_path = treekem_dir.join("member-key-packages.json");
-    let treekem_member_key_packages =
-        load_treekem_member_key_packages(&treekem_member_key_packages_path).await?;
+    let treekem_member_key_packages = load_treekem_member_key_packages(
+        &treekem_dir.join("member-key-packages.json"),
+        &named_groups,
+    )
+    .await?;
 
     // Load or generate API bearer token for local authentication.
     let api_token = auth::load_or_generate_api_token(&config.data_dir).await?;
@@ -893,8 +977,7 @@ pub async fn serve_with_options(
         pending_welcome_acks: RwLock::new(HashMap::new()),
         treekem_pending_events: RwLock::new(HashMap::new()),
         treekem_event_log: RwLock::new(HashMap::new()),
-        treekem_member_key_packages: RwLock::new(treekem_member_key_packages),
-        treekem_member_key_packages_path,
+        treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
@@ -5882,6 +5965,71 @@ fn member_joined_kp_cache_entry(
     }
 }
 
+fn member_joined_key_package_matches_groups(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id,
+        member_agent_id,
+        treekem_key_package_b64: Some(event_key_package),
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let Some(info) = groups.get(group_id).or_else(|| {
+        groups
+            .values()
+            .find(|info| info.stable_group_id() == group_id)
+    }) else {
+        return false;
+    };
+    !info.withdrawn
+        && info.has_active_member(member_agent_id)
+        && info
+            .members_v2
+            .get(member_agent_id)
+            .and_then(|member| member.treekem_key_package_b64.as_ref())
+            == Some(event_key_package)
+}
+
+fn member_joined_key_package_relevant_to_groups(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id,
+        recovery_authority_signature_b64,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let Some(info) = groups.get(group_id).or_else(|| {
+        groups
+            .values()
+            .find(|info| info.stable_group_id() == group_id || info.mls_group_id == group_id)
+    }) else {
+        return false;
+    };
+    if info.withdrawn || !verify_member_joined_key_package_event(event) {
+        return false;
+    }
+    if recovery_authority_signature_b64.is_some() {
+        verify_authority_attested_member_joined_recovery(info, event)
+    } else {
+        true
+    }
+}
+
+async fn member_joined_key_package_matches_roster(
+    state: &AppState,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    let groups = state.named_groups.read().await;
+    member_joined_key_package_matches_groups(&groups, event)
+}
 /// Verify that a key-package-bearing `MemberJoined` is self-authenticated by
 /// the claimed member. This is intentionally independent of inviter and roster
 /// state so persisted recovery records can be authenticated during startup.
@@ -6252,52 +6400,471 @@ fn verify_authority_attested_member_joined_recovery(
         .is_ok()
 }
 
+fn member_joined_event_timestamp(event: &NamedGroupMetadataEvent) -> u64 {
+    match event {
+        NamedGroupMetadataEvent::MemberJoined { ts_ms, .. } => *ts_ms,
+        _ => 0,
+    }
+}
+
+fn cache_entry_encoded_bytes(
+    key: &str,
+    event: &NamedGroupMetadataEvent,
+) -> serde_json::Result<usize> {
+    let key_bytes = serde_json::to_vec(key)?.len();
+    let event_bytes = serde_json::to_vec(event)?.len();
+    Ok(key_bytes.saturating_add(1).saturating_add(event_bytes))
+}
+
+fn cache_snapshot_encoded_bytes(state: &TreeKemMemberKeyPackageCacheState) -> usize {
+    2usize
+        .saturating_add(state.encoded_bytes)
+        .saturating_add(state.entries.len().saturating_sub(1))
+}
+
+fn enforce_treekem_member_key_package_cache_bounds(
+    state: &mut TreeKemMemberKeyPackageCacheState,
+) -> usize {
+    let mut evicted = 0usize;
+    while state.entries.len() > TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_ENTRIES
+        || cache_snapshot_encoded_bytes(state) > TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_BYTES
+    {
+        let victim = state
+            .entries
+            .iter()
+            .min_by(|(left_key, left), (right_key, right)| {
+                member_joined_event_timestamp(&left.event)
+                    .cmp(&member_joined_event_timestamp(&right.event))
+                    .then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(key, _)| key.clone());
+        let Some(victim) = victim else {
+            break;
+        };
+        if let Some(removed) = state.entries.remove(&victim) {
+            state.encoded_bytes = state.encoded_bytes.saturating_sub(removed.encoded_bytes);
+            evicted = evicted.saturating_add(1);
+        }
+    }
+    evicted
+}
+
+fn recovery_attestation_revision(event: &NamedGroupMetadataEvent) -> Option<u64> {
+    let NamedGroupMetadataEvent::MemberJoined {
+        recovery_authority_signature_b64: Some(_),
+        recovery_authority_commit: Some(commit),
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some(commit.revision)
+}
+
+fn should_replace_recovery_cache_entry(
+    existing: &NamedGroupMetadataEvent,
+    candidate: &NamedGroupMetadataEvent,
+    overwrite: bool,
+) -> bool {
+    if !overwrite {
+        return false;
+    }
+    match (
+        recovery_attestation_revision(existing),
+        recovery_attestation_revision(candidate),
+    ) {
+        (None, Some(_)) => true,
+        (Some(existing_revision), Some(candidate_revision)) => {
+            candidate_revision > existing_revision
+        }
+        _ => false,
+    }
+}
+
+fn provisional_recovery_cache_victim(
+    state: &TreeKemMemberKeyPackageCacheState,
+    group_id: &str,
+) -> Option<String> {
+    let mut provisional = state
+        .entries
+        .iter()
+        .filter_map(|(key, entry)| {
+            let NamedGroupMetadataEvent::MemberJoined {
+                recovery_authority_signature_b64,
+                ts_ms,
+                ..
+            } = &entry.event
+            else {
+                return None;
+            };
+            (recovery_authority_signature_b64.is_none()
+                && named_group_metadata_event_group_id(&entry.event) == group_id)
+                .then_some((key, *ts_ms))
+        })
+        .collect::<Vec<_>>();
+    if provisional.len() < TREEKEM_PROVISIONAL_RECOVERY_PER_GROUP_CAP {
+        return None;
+    }
+    provisional.sort_by(|(left_key, left_ts), (right_key, right_ts)| {
+        left_ts.cmp(right_ts).then_with(|| left_key.cmp(right_key))
+    });
+    provisional.first().map(|(key, _)| (*key).clone())
+}
+
+impl TreeKemMemberKeyPackageCache {
+    fn from_entries(
+        path: PathBuf,
+        entries: BTreeMap<String, NamedGroupMetadataEvent>,
+        dirty: bool,
+    ) -> serde_json::Result<(Self, usize)> {
+        let mut state = TreeKemMemberKeyPackageCacheState {
+            entries: BTreeMap::new(),
+            encoded_bytes: 0,
+            revision: u64::from(dirty),
+            persisted_revision: 0,
+            dirty,
+            write_failures: 0,
+            last_error: None,
+        };
+        for (key, event) in entries {
+            let encoded_bytes = cache_entry_encoded_bytes(&key, &event)?;
+            state.encoded_bytes = state.encoded_bytes.saturating_add(encoded_bytes);
+            state.entries.insert(
+                key,
+                TreeKemMemberKeyPackageCacheEntry {
+                    event,
+                    encoded_bytes,
+                },
+            );
+        }
+        let evicted = enforce_treekem_member_key_package_cache_bounds(&mut state);
+        if evicted > 0 && !state.dirty {
+            state.revision = 1;
+            state.dirty = true;
+        }
+        Ok((
+            Self {
+                path,
+                state: RwLock::new(state),
+                persistence: Mutex::new(()),
+            },
+            evicted,
+        ))
+    }
+
+    async fn get(&self, key: &str) -> Option<NamedGroupMetadataEvent> {
+        self.state
+            .read()
+            .await
+            .entries
+            .get(key)
+            .map(|entry| entry.event.clone())
+    }
+
+    async fn find_for_member(
+        &self,
+        group_ids: &[String],
+        member_id: &str,
+    ) -> Option<NamedGroupMetadataEvent> {
+        let state = self.state.read().await;
+        group_ids.iter().find_map(|group_id| {
+            state
+                .entries
+                .get(&join_result_key(group_id, member_id))
+                .map(|entry| entry.event.clone())
+        })
+    }
+
+    async fn events_matching(
+        &self,
+        mut predicate: impl FnMut(&NamedGroupMetadataEvent) -> bool,
+    ) -> Vec<NamedGroupMetadataEvent> {
+        self.state
+            .read()
+            .await
+            .entries
+            .values()
+            .filter(|entry| predicate(&entry.event))
+            .map(|entry| entry.event.clone())
+            .collect()
+    }
+
+    async fn insert(
+        &self,
+        key: String,
+        event: NamedGroupMetadataEvent,
+        overwrite: bool,
+    ) -> Result<TreeKemCacheMutation> {
+        let expected_key = member_joined_kp_cache_entry(&event)
+            .map(|(expected_key, _)| expected_key)
+            .context("TreeKEM recovery cache accepts only key-package MemberJoined events")?;
+        if expected_key != key || !verify_member_joined_key_package_event(&event) {
+            anyhow::bail!("TreeKEM recovery cache rejected invalid key or member signature");
+        }
+        let encoded_bytes = cache_entry_encoded_bytes(&key, &event)
+            .context("failed to encode TreeKEM member key-package cache entry")?;
+        let evicted = {
+            let mut state = self.state.write().await;
+            if let Some(existing) = state.entries.get(&key) {
+                if !should_replace_recovery_cache_entry(&existing.event, &event, overwrite) {
+                    drop(state);
+                    let persistence = self.persist_latest().await;
+                    return Ok(TreeKemCacheMutation {
+                        persistence,
+                        evicted: 0,
+                    });
+                }
+            }
+
+            let mut evicted = 0usize;
+            if let Some(previous) = state.entries.remove(&key) {
+                state.encoded_bytes = state.encoded_bytes.saturating_sub(previous.encoded_bytes);
+            } else if recovery_attestation_revision(&event).is_none() {
+                let group_id = named_group_metadata_event_group_id(&event);
+                if let Some(victim) = provisional_recovery_cache_victim(&state, group_id) {
+                    if let Some(removed) = state.entries.remove(&victim) {
+                        state.encoded_bytes =
+                            state.encoded_bytes.saturating_sub(removed.encoded_bytes);
+                        evicted = evicted.saturating_add(1);
+                    }
+                }
+            }
+            state.encoded_bytes = state.encoded_bytes.saturating_add(encoded_bytes);
+            state.entries.insert(
+                key,
+                TreeKemMemberKeyPackageCacheEntry {
+                    event,
+                    encoded_bytes,
+                },
+            );
+            state.revision = state.revision.saturating_add(1);
+            state.dirty = true;
+            evicted.saturating_add(enforce_treekem_member_key_package_cache_bounds(&mut state))
+        };
+        let persistence = self.persist_latest().await;
+        Ok(TreeKemCacheMutation {
+            persistence,
+            evicted,
+        })
+    }
+
+    async fn remove_member(
+        &self,
+        group_ids: &HashSet<String>,
+        member_id: &str,
+    ) -> TreeKemCacheMutation {
+        self.remove_matching(|event| match event {
+            NamedGroupMetadataEvent::MemberJoined {
+                group_id,
+                member_agent_id,
+                ..
+            } => group_ids.contains(group_id) && member_agent_id == member_id,
+            _ => false,
+        })
+        .await
+    }
+
+    async fn remove_groups(&self, group_ids: &HashSet<String>) -> TreeKemCacheMutation {
+        self.remove_matching(|event| match event {
+            NamedGroupMetadataEvent::MemberJoined { group_id, .. } => group_ids.contains(group_id),
+            _ => false,
+        })
+        .await
+    }
+
+    async fn remove_matching(
+        &self,
+        should_remove: impl Fn(&NamedGroupMetadataEvent) -> bool,
+    ) -> TreeKemCacheMutation {
+        let removed = {
+            let mut state = self.state.write().await;
+            let victims: Vec<String> = state
+                .entries
+                .iter()
+                .filter(|(_, entry)| should_remove(&entry.event))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in &victims {
+                if let Some(entry) = state.entries.remove(key) {
+                    state.encoded_bytes = state.encoded_bytes.saturating_sub(entry.encoded_bytes);
+                }
+            }
+            if !victims.is_empty() {
+                state.revision = state.revision.saturating_add(1);
+                state.dirty = true;
+            }
+            victims.len()
+        };
+        let persistence = self.persist_latest().await;
+        TreeKemCacheMutation {
+            persistence,
+            evicted: removed,
+        }
+    }
+
+    async fn persist_latest(&self) -> TreeKemCachePersistenceStatus {
+        let _persistence = self.persistence.lock().await;
+        loop {
+            let (revision, snapshot) = {
+                let state = self.state.read().await;
+                if !state.dirty {
+                    return TreeKemCachePersistenceStatus::Durable {
+                        revision: state.persisted_revision,
+                    };
+                }
+                let snapshot = state
+                    .entries
+                    .iter()
+                    .map(|(key, entry)| (key.clone(), entry.event.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                (state.revision, snapshot)
+            };
+            let json = match serde_json::to_string(&snapshot) {
+                Ok(json) => json,
+                Err(error) => {
+                    return self
+                        .record_persistence_failure(
+                            revision,
+                            format!("serialization failed: {error}"),
+                        )
+                        .await;
+                }
+            };
+            if let Err(error) = write_treekem_cache_json_atomic(&self.path, &json).await {
+                return self
+                    .record_persistence_failure(revision, format!("write failed: {error}"))
+                    .await;
+            }
+            let mut state = self.state.write().await;
+            state.persisted_revision = state.persisted_revision.max(revision);
+            if state.revision == revision {
+                state.dirty = false;
+                state.last_error = None;
+                return TreeKemCachePersistenceStatus::Durable { revision };
+            }
+        }
+    }
+
+    async fn record_persistence_failure(
+        &self,
+        attempted_revision: u64,
+        error: String,
+    ) -> TreeKemCachePersistenceStatus {
+        let mut state = self.state.write().await;
+        state.dirty = true;
+        state.write_failures = state.write_failures.saturating_add(1);
+        state.last_error = Some(error.clone());
+        TreeKemCachePersistenceStatus::Dirty {
+            revision: state.revision.max(attempted_revision),
+            error,
+        }
+    }
+
+    async fn diagnostics(&self) -> TreeKemCacheDiagnostics {
+        let state = self.state.read().await;
+        TreeKemCacheDiagnostics {
+            entries: state.entries.len(),
+            encoded_bytes: cache_snapshot_encoded_bytes(&state),
+            max_entries: TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_ENTRIES,
+            max_encoded_bytes: TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_BYTES,
+            revision: state.revision,
+            persisted_revision: state.persisted_revision,
+            dirty: state.dirty,
+            write_failures: state.write_failures,
+            last_error: state.last_error.clone(),
+        }
+    }
+}
+
+fn log_treekem_cache_mutation(context: &str, mutation: &TreeKemCacheMutation) {
+    if mutation.evicted > 0 {
+        tracing::debug!(
+            context,
+            removed = mutation.evicted,
+            "compacted TreeKEM recovery cache"
+        );
+    }
+    if let TreeKemCachePersistenceStatus::Dirty { revision, error } = &mutation.persistence {
+        tracing::error!(
+            context,
+            revision,
+            error,
+            "TreeKEM recovery cache remains dirty"
+        );
+    }
+}
+
 async fn cache_treekem_member_key_package(
     state: &AppState,
     key: String,
     event: NamedGroupMetadataEvent,
     overwrite: bool,
-) {
-    let mut cache = state.treekem_member_key_packages.write().await;
-    if overwrite {
-        cache.insert(key, event);
-    } else {
-        if !cache.contains_key(&key) {
-            let event_group = named_group_metadata_event_group_id(&event);
-            let provisional_keys = cache
-                .iter()
-                .filter_map(|(cached_key, cached)| {
-                    let NamedGroupMetadataEvent::MemberJoined {
-                        recovery_authority_signature_b64,
-                        ts_ms,
-                        ..
-                    } = cached
-                    else {
-                        return None;
-                    };
-                    (recovery_authority_signature_b64.is_none()
-                        && named_group_metadata_event_group_id(cached) == event_group)
-                        .then_some((cached_key.clone(), *ts_ms))
-                })
-                .collect::<Vec<_>>();
-            if provisional_keys.len() >= TREEKEM_PROVISIONAL_RECOVERY_PER_GROUP_CAP {
-                if let Some((oldest, _)) = provisional_keys.into_iter().min_by_key(|(_, ts)| *ts) {
-                    cache.remove(&oldest);
-                }
+) -> TreeKemCachePersistenceStatus {
+    match state
+        .treekem_member_key_packages
+        .insert(key, event, overwrite)
+        .await
+    {
+        Ok(mutation) => {
+            log_treekem_cache_mutation("insert", &mutation);
+            mutation.persistence
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to mutate TreeKEM recovery cache");
+            TreeKemCachePersistenceStatus::Dirty {
+                revision: state
+                    .treekem_member_key_packages
+                    .diagnostics()
+                    .await
+                    .revision,
+                error: error.to_string(),
             }
         }
-        cache.entry(key).or_insert(event);
     }
-    match serde_json::to_string(&*cache) {
-        Ok(json) => {
-            if let Err(e) =
-                write_named_groups_json_atomic(&state.treekem_member_key_packages_path, &json).await
-            {
-                tracing::error!("Failed to save TreeKEM member key-package cache: {e}");
-            }
-        }
-        Err(e) => tracing::error!("Failed to serialize TreeKEM member key-package cache: {e}"),
-    }
+}
+
+async fn treekem_cache_group_aliases(state: &AppState, group_id: &str) -> HashSet<String> {
+    let groups = state.named_groups.read().await;
+    let stable_group_id = groups
+        .get(group_id)
+        .map(|info| info.stable_group_id())
+        .or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_id || info.mls_group_id == group_id)
+                .map(x0x::groups::GroupInfo::stable_group_id)
+        });
+    let mut aliases = collect_same_stable_group_aliases(&groups, group_id, stable_group_id);
+    aliases.insert(group_id.to_string());
+    aliases
+}
+
+async fn prune_treekem_cache_member(
+    state: &AppState,
+    group_id: &str,
+    member_id: &str,
+    context: &str,
+) -> TreeKemCachePersistenceStatus {
+    let aliases = treekem_cache_group_aliases(state, group_id).await;
+    let mutation = state
+        .treekem_member_key_packages
+        .remove_member(&aliases, member_id)
+        .await;
+    log_treekem_cache_mutation(context, &mutation);
+    mutation.persistence
+}
+
+async fn prune_treekem_cache_groups(
+    state: &AppState,
+    aliases: &HashSet<String>,
+    context: &str,
+) -> TreeKemCachePersistenceStatus {
+    let mutation = state
+        .treekem_member_key_packages
+        .remove_groups(aliases)
+        .await;
+    log_treekem_cache_mutation(context, &mutation);
+    mutation.persistence
 }
 
 /// Install a TreeKEM KeyPackage recovered from a member-signed `MemberJoined`
@@ -6449,10 +7016,7 @@ async fn recover_member_treekem_key_package_locked(
         }
     }
     let key = join_result_key(group_id, member_agent_id);
-    let cached = {
-        let cache = state.treekem_member_key_packages.read().await;
-        cache.get(&key).cloned()
-    };
+    let cached = state.treekem_member_key_packages.get(&key).await;
     let Some(event) = cached else {
         return false;
     };
@@ -6729,14 +7293,11 @@ async fn member_keyed_treekem_catchup_response(
             })
             .cloned()
     }?;
-    let event = {
-        let cache = state.treekem_member_key_packages.read().await;
-        log_keys
-            .iter()
-            .find_map(|group_id| cache.get(&join_result_key(group_id, target_member_id)))
-            .filter(|event| verify_authority_attested_member_joined_recovery(&info, event))
-            .cloned()
-    };
+    let event = state
+        .treekem_member_key_packages
+        .find_for_member(log_keys, target_member_id)
+        .await
+        .filter(|event| verify_authority_attested_member_joined_recovery(&info, event));
     Some(TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
         group_id: request.group_id.clone(),
@@ -7669,6 +8230,7 @@ async fn apply_named_group_metadata_event_inner_with_witness(
             }) else {
                 return false;
             };
+            let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let removed_self = agent_id == local_agent_hex;
             if removed_self {
                 state.named_groups.write().await.remove(&resolved_group_key);
@@ -7704,6 +8266,8 @@ async fn apply_named_group_metadata_event_inner_with_witness(
                 .await;
                 save_named_groups(state).await;
                 save_mls_groups(state).await;
+                let _ =
+                    prune_treekem_cache_groups(state, &cache_aliases, "member_removed_self").await;
                 return true;
             }
             if let Some((commit_b64, _epoch)) = treekem_payload {
@@ -7741,6 +8305,9 @@ async fn apply_named_group_metadata_event_inner_with_witness(
             save_named_groups(state).await;
             save_mls_groups(state).await;
             remember_treekem_membership_event(state, &event_for_log).await;
+            let _ =
+                prune_treekem_cache_member(state, &resolved_group_key, &agent_id, "member_removed")
+                    .await;
             true
         }
         NamedGroupMetadataEvent::GroupDeleted {
@@ -7939,6 +8506,7 @@ async fn apply_named_group_metadata_event_inner_with_witness(
             ) else {
                 return false;
             };
+            let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let banned_self = agent_id == local_agent_hex;
             if banned_self {
                 state
@@ -7986,6 +8554,18 @@ async fn apply_named_group_metadata_event_inner_with_witness(
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             remember_treekem_membership_event(state, &event_for_log).await;
+            if banned_self {
+                let _ =
+                    prune_treekem_cache_groups(state, &cache_aliases, "member_banned_self").await;
+            } else {
+                let _ = prune_treekem_cache_member(
+                    state,
+                    &resolved_group_key,
+                    &agent_id,
+                    "member_banned",
+                )
+                .await;
+            }
             true
         }
         NamedGroupMetadataEvent::MemberUnbanned {
@@ -8967,29 +9547,22 @@ async fn apply_named_group_metadata_event_inner_with_witness(
                 )
                 .await;
             }
-            let member_recovery_deliveries = {
-                let cache = state.treekem_member_key_packages.read().await;
-                let mut seen = HashSet::new();
-                cache
-                    .values()
-                    .filter_map(|recovery| {
-                        let NamedGroupMetadataEvent::MemberJoined {
-                            member_agent_id: recovered_member,
-                            ..
-                        } = recovery
-                        else {
-                            return None;
-                        };
-                        if recovered_member == &member_agent_id
-                            || !seen.insert(recovered_member.clone())
-                            || !verify_authority_attested_member_joined_recovery(&next, recovery)
-                        {
-                            return None;
-                        }
-                        Some(recovery.clone())
-                    })
-                    .collect::<Vec<_>>()
-            };
+            let mut seen = HashSet::new();
+            let member_recovery_deliveries = state
+                .treekem_member_key_packages
+                .events_matching(|recovery| {
+                    let NamedGroupMetadataEvent::MemberJoined {
+                        member_agent_id: recovered_member,
+                        ..
+                    } = recovery
+                    else {
+                        return false;
+                    };
+                    recovered_member != &member_agent_id
+                        && seen.insert(recovered_member.clone())
+                        && verify_authority_attested_member_joined_recovery(&next, recovery)
+                })
+                .await;
             let event = NamedGroupMetadataEvent::MemberAdded {
                 group_id: event_group_id.clone(),
                 revision,
@@ -10898,20 +11471,16 @@ async fn add_treekem_named_group_member(
         std::slice::from_ref(&agent_hex),
     );
     spawn_named_group_event_delivery_to_active_members(&state, &next, &member_joined_recovery, &[]);
-    let recovery_deliveries = {
-        let cache = state.treekem_member_key_packages.read().await;
-        cache
-            .values()
-            .filter(|recovery| {
-                matches!(
-                    recovery,
-                    NamedGroupMetadataEvent::MemberJoined { member_agent_id, .. }
-                        if member_agent_id != &agent_hex
-                ) && verify_authority_attested_member_joined_recovery(&next, recovery)
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    };
+    let recovery_deliveries = state
+        .treekem_member_key_packages
+        .events_matching(|recovery| {
+            matches!(
+                recovery,
+                NamedGroupMetadataEvent::MemberJoined { member_agent_id, .. }
+                    if member_agent_id != &agent_hex
+            ) && verify_authority_attested_member_joined_recovery(&next, recovery)
+        })
+        .await;
     for recovery in recovery_deliveries {
         spawn_named_group_event_delivery(&state, &agent_hex, &recovery);
         spawn_named_group_event_delivery_after(
@@ -11471,6 +12040,7 @@ async fn wipe_local_group_crypto_material(
         expected.retain(|key, _| !join_result_key_matches_any_group_alias(key, &aliases));
     }
 
+    let _ = prune_treekem_cache_groups(state, &aliases, reason).await;
     let mut welcome_ids = Vec::new();
     {
         let mut welcomes = state.pending_welcomes.write().await;
@@ -11823,6 +12393,7 @@ async fn remove_treekem_named_group_member(
     drop(groups);
     save_named_groups(&state).await;
     save_mls_groups(&state).await;
+    let _ = prune_treekem_cache_member(&state, &id, &agent_id_hex, "local_member_removed").await;
 
     let event = NamedGroupMetadataEvent::MemberRemoved {
         group_id: event_group_id,
@@ -12219,6 +12790,8 @@ async fn leave_group(
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
+    let cache_aliases = treekem_cache_group_aliases(&state, &id).await;
+    let _ = prune_treekem_cache_groups(&state, &cache_aliases, "leave_group").await;
     state.named_groups.write().await.remove(&id);
     let mut cache = state.group_card_cache.write().await;
     prune_expired_group_cards(&mut cache, now_millis_u64());
@@ -13039,6 +13612,7 @@ async fn ban_treekem_group_member(
     groups.insert(id.clone(), next.clone());
     drop(groups);
     save_named_groups(&state).await;
+    let _ = prune_treekem_cache_member(&state, &id, &agent_id_hex, "local_member_banned").await;
 
     let event = NamedGroupMetadataEvent::MemberBanned {
         group_id: event_group_id,
@@ -13663,20 +14237,16 @@ async fn approve_treekem_join_request(
     )
     .await;
     spawn_named_group_event_delivery_to_active_members(&state, &next, &approval_recovery, &[]);
-    let prior_recovery = {
-        let cache = state.treekem_member_key_packages.read().await;
-        cache
-            .values()
-            .filter(|recovery| {
-                matches!(
-                    recovery,
-                    NamedGroupMetadataEvent::MemberJoined { member_agent_id, .. }
-                        if member_agent_id != &requester_hex
-                ) && verify_authority_attested_member_joined_recovery(&next, recovery)
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    };
+    let prior_recovery = state
+        .treekem_member_key_packages
+        .events_matching(|recovery| {
+            matches!(
+                recovery,
+                NamedGroupMetadataEvent::MemberJoined { member_agent_id, .. }
+                    if member_agent_id != &requester_hex
+            ) && verify_authority_attested_member_joined_recovery(&next, recovery)
+        })
+        .await;
     for recovery in prior_recovery {
         spawn_named_group_event_delivery(&state, &requester_hex, &recovery);
         spawn_named_group_event_delivery_after(
@@ -17033,11 +17603,13 @@ async fn groups_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
     let snap = state
         .groups_diagnostics
         .snapshot(&groups_view, &metadata_keys, &public_keys);
+    let treekem_recovery_cache = state.treekem_member_key_packages.diagnostics().await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "groups": snap.groups,
+            "treekem_recovery_cache": treekem_recovery_cache,
         })),
     )
 }
@@ -17646,48 +18218,98 @@ async fn restore_treekem_groups(
     restored
 }
 
+async fn quarantine_corrupt_treekem_cache(path: &FsPath) -> std::io::Result<PathBuf> {
+    let mut quarantine_os = path.as_os_str().to_owned();
+    quarantine_os.push(format!(".corrupt-{}", uuid::Uuid::new_v4()));
+    let quarantine_path = PathBuf::from(quarantine_os);
+    tokio::fs::rename(path, &quarantine_path).await?;
+    Ok(quarantine_path)
+}
+
 async fn load_treekem_member_key_packages(
     path: &FsPath,
-) -> Result<HashMap<String, NamedGroupMetadataEvent>> {
-    match tokio::fs::read_to_string(path).await {
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+) -> Result<TreeKemMemberKeyPackageCache> {
+    let (entries, startup_dirty) = match tokio::fs::read_to_string(path).await {
         Ok(json) => {
-            let mut cache = serde_json::from_str::<HashMap<String, NamedGroupMetadataEvent>>(&json)
-                .with_context(|| {
-                    format!(
-                        "failed to parse TreeKEM member key-package cache {}",
-                        path.display()
-                    )
-                })?;
-            let persisted_count = cache.len();
-            cache.retain(|key, event| {
-                member_joined_kp_cache_entry(event)
-                    .is_some_and(|(expected_key, _)| expected_key == *key)
-                    && (verify_member_joined_key_package_event(event)
-                        || verify_recovery_attestation_structure(event))
-            });
-            let rejected_count = persisted_count.saturating_sub(cache.len());
-            if rejected_count > 0 {
-                tracing::warn!(
-                    path = %path.display(),
-                    rejected_count,
-                    "discarded invalid persisted TreeKEM member key-package recovery records"
-                );
+            match serde_json::from_str::<BTreeMap<String, NamedGroupMetadataEvent>>(&json) {
+                Ok(mut cache) => {
+                    let persisted_count = cache.len();
+                    cache.retain(|key, event| {
+                        member_joined_kp_cache_entry(event)
+                            .is_some_and(|(expected_key, _)| expected_key == *key)
+                            && member_joined_key_package_relevant_to_groups(groups, event)
+                    });
+                    let rejected_count = persisted_count.saturating_sub(cache.len());
+                    if rejected_count > 0 {
+                        tracing::warn!(
+                            path = %path.display(),
+                            rejected_count,
+                            "pruned invalid or irrelevant TreeKEM recovery-cache records at startup"
+                        );
+                    }
+                    (cache, rejected_count > 0)
+                }
+                Err(error) => {
+                    let quarantine_path = quarantine_corrupt_treekem_cache(path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to quarantine corrupt TreeKEM recovery cache {} after parse error: {error}",
+                                path.display()
+                            )
+                        })?;
+                    tracing::error!(
+                        path = %path.display(),
+                        quarantine_path = %quarantine_path.display(),
+                        cause = %error,
+                        "quarantined corrupt TreeKEM recovery cache; starting empty"
+                    );
+                    (BTreeMap::new(), true)
+                }
             }
-            tracing::info!(
-                path = %path.display(),
-                records = cache.len(),
-                "loaded TreeKEM member key-package recovery cache"
-            );
-            Ok(cache)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
-        Err(e) => Err(e).with_context(|| {
-            format!(
-                "failed to read TreeKEM member key-package cache {}",
-                path.display()
-            )
-        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (BTreeMap::new(), false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read TreeKEM member key-package cache {}",
+                    path.display()
+                )
+            });
+        }
+    };
+
+    let (cache, evicted) =
+        TreeKemMemberKeyPackageCache::from_entries(path.to_path_buf(), entries, startup_dirty)
+            .context("failed to size TreeKEM member key-package cache")?;
+    if evicted > 0 {
+        tracing::warn!(
+            path = %path.display(),
+            evicted,
+            "bounded TreeKEM recovery cache during startup compaction"
+        );
     }
+    if cache.diagnostics().await.dirty {
+        let persistence = cache.persist_latest().await;
+        if let TreeKemCachePersistenceStatus::Dirty { revision, error } = persistence {
+            tracing::error!(
+                path = %path.display(),
+                revision,
+                error,
+                "startup TreeKEM recovery-cache compaction remains dirty"
+            );
+        }
+    }
+    let diagnostics = cache.diagnostics().await;
+    tracing::info!(
+        path = %path.display(),
+        records = diagnostics.entries,
+        encoded_bytes = diagnostics.encoded_bytes,
+        dirty = diagnostics.dirty,
+        "loaded TreeKEM member key-package recovery cache"
+    );
+    Ok(cache)
 }
 
 async fn load_named_groups(
@@ -17750,6 +18372,24 @@ async fn save_named_groups(state: &AppState) {
         }
         Err(e) => tracing::error!("Failed to serialize named groups: {e}"),
     }
+}
+
+async fn write_treekem_cache_json_atomic(path: &FsPath, json: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(control) = take_treekem_cache_writer_hook_for_test(path) {
+        // The writer has entered the one-shot hook. Signal entry with a stored
+        // permit (notify_one keeps it until awaited, so observation is free of
+        // await-ordering races), then either inject a failure or park until the
+        // test releases a slow-disk simulation.
+        control.entered.notify_one();
+        if let Some(error) = control.force_error {
+            return Err(error);
+        }
+        if let Some(release) = control.release {
+            release.notified().await;
+        }
+    }
+    write_named_groups_json_atomic(path, json).await
 }
 
 async fn write_named_groups_json_atomic(path: &FsPath, json: &str) -> std::io::Result<()> {
@@ -20179,9 +20819,11 @@ mod tests {
         tokio::fs::create_dir_all(&treekem_dir).await?;
         let named_groups_path = data_dir.join("named_groups.json");
         let named_groups = load_named_groups(&named_groups_path).await?;
-        let treekem_member_key_packages_path = treekem_dir.join("member-key-packages.json");
-        let treekem_member_key_packages =
-            load_treekem_member_key_packages(&treekem_member_key_packages_path).await?;
+        let treekem_member_key_packages = load_treekem_member_key_packages(
+            &treekem_dir.join("member-key-packages.json"),
+            &named_groups,
+        )
+        .await?;
         let contacts = Arc::clone(agent.contacts());
         agent.set_contacts(Arc::clone(&contacts));
 
@@ -20226,8 +20868,7 @@ mod tests {
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
             treekem_pending_events: RwLock::new(HashMap::new()),
-            treekem_member_key_packages: RwLock::new(treekem_member_key_packages),
-            treekem_member_key_packages_path,
+            treekem_member_key_packages,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
@@ -24349,13 +24990,19 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(state.treekem_member_key_packages.read().await.len(), 1);
-        tokio::fs::metadata(&state.treekem_member_key_packages_path).await?;
+        assert_eq!(
+            state
+                .treekem_member_key_packages
+                .diagnostics()
+                .await
+                .entries,
+            1
+        );
+        tokio::fs::metadata(&state.treekem_member_key_packages.path).await?;
 
         // Model process loss explicitly, then construct a distinct AppState on
         // the same durable directory. Startup must repopulate the empty runtime
         // cache from the authenticated signed-event file.
-        state.treekem_member_key_packages.write().await.clear();
         let restarted =
             secure_endpoint_test_state_at(fixture._dir.path(), Arc::clone(&state.agent)).await?;
         assert!(!Arc::ptr_eq(state, &restarted));
@@ -24401,10 +25048,13 @@ mod tests {
         // promoted-admin regression. Seed the recovery cache with the member's
         // self-signed MemberJoined (what the inviter / catch-up would supply).
         insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
-        state.treekem_member_key_packages.write().await.insert(
-            join_result_key(&group_id, &member_hex),
-            fixture.event.clone(),
-        );
+        state
+            .treekem_member_key_packages
+            .insert(
+                join_result_key(&group_id, &member_hex),
+                fixture.event.clone(),
+            )
+            .await?;
         assert!(member_treekem_kp(state, &group_id, &member_hex)
             .await
             .is_none());
@@ -24643,10 +25293,13 @@ mod tests {
 
         // Join: roster member (Active, no kp) + cached self-signed event.
         insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
-        state.treekem_member_key_packages.write().await.insert(
-            join_result_key(&group_id, &member_hex),
-            fixture.event.clone(),
-        );
+        state
+            .treekem_member_key_packages
+            .insert(
+                join_result_key(&group_id, &member_hex),
+                fixture.event.clone(),
+            )
+            .await?;
         assert!(
             recover_member_treekem_key_package(state, &group_id, &member_hex).await,
             "first recovery installs"
@@ -24768,13 +25421,13 @@ mod tests {
         assert!(
             w_state
                 .treekem_member_key_packages
-                .read()
+                .get(&cache_key)
                 .await
-                .contains_key(&cache_key),
+                .is_some(),
             "witness caches the signed MemberJoined in-memory"
         );
         assert!(
-            tokio::fs::try_exists(&w_state.treekem_member_key_packages_path).await?,
+            tokio::fs::try_exists(&w_state.treekem_member_key_packages.path).await?,
             "witness persisted the key-package cache to disk"
         );
 
@@ -24805,12 +25458,7 @@ mod tests {
                 .expect("O logged authority-attested MemberAdded")
         };
         let authority_recovery = fixture
-            .state
-            .treekem_member_key_packages
-            .read()
-            .await
-            .get(&cache_key)
-            .cloned()
+            .state.treekem_member_key_packages.get(&cache_key).await
             .expect("O cached the authority-attested recovery event");
         {
             let groups = fixture.state.named_groups.read().await;
@@ -24904,9 +25552,9 @@ mod tests {
         assert!(
             w_state
                 .treekem_member_key_packages
-                .read()
+                .get(&join_result_key(&group_id, &member_hex))
                 .await
-                .contains_key(&join_result_key(&group_id, &member_hex)),
+                .is_some(),
             "independent witness W retained B's recovery record"
         );
 
@@ -24927,12 +25575,7 @@ mod tests {
                 .cloned()
                 .expect("O logged authority-attested MemberAdded")
         };
-        let authority_recovery = o_state
-            .treekem_member_key_packages
-            .read()
-            .await
-            .get(&join_result_key(&group_id, &member_hex))
-            .cloned()
+        let authority_recovery = o_state.treekem_member_key_packages.get(&join_result_key(&group_id, &member_hex)).await
             .expect("O cached authority-attested recovery");
         assert!(
             apply_named_group_metadata_event(
@@ -25465,22 +26108,22 @@ mod tests {
                 .treekem_key_package_b64 = None;
         }
         let cache_key = join_result_key(&group_id, &member_hex);
+        let aliases = HashSet::from([group_id.clone()]);
         state
             .treekem_member_key_packages
-            .write()
-            .await
-            .remove(&cache_key);
+            .remove_member(&aliases, &member_hex)
+            .await;
         assert!(
             !apply_named_group_metadata_event(state, valid_event.clone(), fixture.member_id, true,)
                 .await,
             "self-delivered recovery evidence never exercises roster mutation authority"
         );
         assert!(
-            !state
+            state
                 .treekem_member_key_packages
-                .read()
+                .get(&cache_key)
                 .await
-                .contains_key(&cache_key),
+                .is_none(),
             "a valid old-incarnation attestation cannot poison the current recovery cache"
         );
         assert!(
@@ -25559,12 +26202,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "TreeKEM request approval succeeds");
 
         let recovery = fixture
-            .state
-            .treekem_member_key_packages
-            .read()
-            .await
-            .get(&join_result_key(&fixture.group_id, &requester_hex))
-            .cloned()
+            .state.treekem_member_key_packages.get(&join_result_key(&fixture.group_id, &requester_hex)).await
             .expect("request approval caches recovery evidence");
         {
             let mut groups = fixture.state.named_groups.write().await;
@@ -25669,12 +26307,7 @@ mod tests {
                 .expect("authority logged JoinRequestApproved")
         };
         let recovery = fixture
-            .state
-            .treekem_member_key_packages
-            .read()
-            .await
-            .get(&join_result_key(&fixture.group_id, &requester_hex))
-            .cloned()
+            .state.treekem_member_key_packages.get(&join_result_key(&fixture.group_id, &requester_hex)).await
             .expect("authority cached the attested recovery record");
 
         // (1) The approval event carries A's hash.
@@ -25847,12 +26480,7 @@ mod tests {
         );
 
         let recovery = fixture
-            .state
-            .treekem_member_key_packages
-            .read()
-            .await
-            .get(&join_result_key(&fixture.group_id, &target_hex))
-            .cloned()
+            .state.treekem_member_key_packages.get(&join_result_key(&fixture.group_id, &target_hex)).await
             .expect("direct add caches authority recovery attestation");
         {
             let groups = fixture.state.named_groups.read().await;
@@ -25877,12 +26505,7 @@ mod tests {
         let restarted =
             secure_endpoint_test_state_at(fixture._dir.path(), Arc::clone(&fixture.state.agent))
                 .await?;
-        let restarted_recovery = restarted
-            .treekem_member_key_packages
-            .read()
-            .await
-            .get(&join_result_key(&fixture.group_id, &target_hex))
-            .cloned()
+        let restarted_recovery = restarted.treekem_member_key_packages.get(&join_result_key(&fixture.group_id, &target_hex)).await
             .expect("authority-only direct-add recovery survives restart");
         let groups = restarted.named_groups.read().await;
         assert!(
@@ -25990,20 +26613,19 @@ mod tests {
             member_recovery_history.is_empty(),
             "recovery history must not grow the Welcome-bearing MemberAdded payload"
         );
-        let prior_recovery = {
-            let cache = state.treekem_member_key_packages.read().await;
-            cache
-                .values()
-                .find(|event| {
-                    matches!(
-                        event,
-                        NamedGroupMetadataEvent::MemberJoined { member_agent_id, .. }
-                            if member_agent_id == &first_member
-                    )
-                })
-                .cloned()
-                .expect("prior authority-attested recovery record")
-        };
+        let prior_recovery = state
+            .treekem_member_key_packages
+            .events_matching(|event| {
+                matches!(
+                    event,
+                    NamedGroupMetadataEvent::MemberJoined { member_agent_id, .. }
+                        if member_agent_id == &first_member
+                )
+            })
+            .await
+            .into_iter()
+            .next()
+            .expect("prior authority-attested recovery record");
         assert!(
             serde_json::to_vec(&prior_recovery)?.len() < crate::dm::MAX_PAYLOAD_BYTES,
             "each independently delivered recovery record fits one DM payload"
@@ -26155,12 +26777,7 @@ mod tests {
         // (1) The creator package was provisioned as a fully authority-attested
         //     recovery record: it carries an authority signature over the
         //     sealed group-state commit (not merely a member self-signature).
-        let cached = state
-            .treekem_member_key_packages
-            .read()
-            .await
-            .get(&join_result_key(&group_id, &creator_hex))
-            .cloned()
+        let cached = state.treekem_member_key_packages.get(&join_result_key(&group_id, &creator_hex)).await
             .expect("creator recovery record is cached at group creation");
         let cached_package = match &cached {
             NamedGroupMetadataEvent::MemberJoined {
@@ -26281,10 +26898,14 @@ mod tests {
 
         // Seed the recovery cache with the authority-attested record for the
         // ORIGINAL package — the stale evidence that must NOT be replayable.
-        state.treekem_member_key_packages.write().await.insert(
-            join_result_key(&group_id, &member_hex),
-            fixture.event.clone(),
-        );
+        state
+            .treekem_member_key_packages
+            .insert(
+                join_result_key(&group_id, &member_hex),
+                fixture.event.clone(),
+                true,
+            )
+            .await?;
 
         // Replace the member's incarnation hash (a re-key / re-add). The setter
         // MUST wipe the now-stale package bytes because they no longer match.
@@ -26404,5 +27025,656 @@ mod tests {
             active.treekem_key_package_hash = package_hash;
             info.members_v2.insert(member.to_string(), active);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // TreeKEM member key-package cache: loader quarantine, bounds, and
+    // lifecycle regression coverage (WP-TK2 findings 3-6).
+    //
+    // `synthetic_member_joined` builds deliberately NON-verifying
+    // `MemberJoined` events used only to size the cache via `from_entries`,
+    // which enforces count/byte bounds without signature verification. Tests
+    // that exercise the load path or `insert()` use real signed
+    // `member_joined_treekem_fixture` events, since those paths authenticate
+    // the member signature.
+    // ---------------------------------------------------------------------
+
+    /// Compact, deliberately NON-verifying `MemberJoined` for cache *sizing*
+    /// tests. `from_entries` never calls `verify_member_joined_key_package_event`,
+    /// so these events exist purely to control entry count, `ts_ms` ordering,
+    /// and encoded byte size. Must never be passed to `insert()`.
+    fn synthetic_member_joined(
+        group_id: &str,
+        member: &str,
+        ts_ms: u64,
+        key_package_payload_len: usize,
+    ) -> NamedGroupMetadataEvent {
+        NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.to_string(),
+            stable_group_id: Some(group_id.to_string()),
+            member_agent_id: member.to_string(),
+            member_public_key_b64: BASE64.encode([0xA5u8; 48]),
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: format!("inviter-{group_id}"),
+            invite_secret: format!("invite-{group_id}-{member}"),
+            ts_ms,
+            treekem_key_package_b64: Some(BASE64.encode(vec![0xA5u8; key_package_payload_len])),
+            signature_b64: BASE64.encode([0xA5u8; 64]),
+        }
+    }
+
+    /// Read the durable cache JSON and return its key set. Used to prove the
+    /// on-disk state — not just the in-memory cache — after loader/lifecycle
+    /// operations.
+    async fn durable_cache_keys(path: &FsPath) -> Result<HashSet<String>> {
+        let on_disk = tokio::fs::read_to_string(path).await?;
+        let parsed: BTreeMap<String, serde_json::Value> = serde_json::from_str(&on_disk)?;
+        Ok(parsed.into_keys().collect())
+    }
+
+    /// Locate the `<base>.corrupt-<uuid>` quarantine sibling written when the
+    /// loader quarantines an unparseable cache file.
+    async fn quarantine_sibling(dir: &FsPath, base: &str) -> Option<PathBuf> {
+        let prefix = format!("{base}.corrupt-");
+        let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                return Some(entry.path());
+            }
+        }
+        None
+    }
+
+    /// WP-TK2: an unparseable or schema-incompatible recovery cache must NOT
+    /// abort startup or overwrite the corrupt bytes. The loader renames the
+    /// file to a quarantine sibling (preserving it verbatim) and starts from
+    /// an empty cache, rewriting the active path as `{}`.
+    #[tokio::test]
+    async fn treekem_recovery_cache_quarantines_corrupt_json_without_overwrite() -> Result<()> {
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("malformed JSON", b"{not valid json".to_vec()),
+            ("truncated JSON", b"{\"g:m\":".to_vec()),
+            ("schema-incompatible value", b"{\"g:m\":123}".to_vec()),
+            ("JSON array (not object)", b"[]".to_vec()),
+        ];
+        let empty_roster: HashMap<String, x0x::groups::GroupInfo> = HashMap::new();
+
+        for (label, corpus) in &cases {
+            let dir = tempfile::tempdir()?;
+            let base = "member-key-packages.json";
+            let path = dir.path().join(base);
+            tokio::fs::write(&path, corpus.as_slice()).await?;
+
+            let cache = load_treekem_member_key_packages(&path, &empty_roster)
+                .await
+                .expect("corrupt cache quarantines and loads empty, not a fatal startup error");
+
+            assert_eq!(
+                cache.diagnostics().await.entries,
+                0,
+                "{label}: in-memory cache empty after quarantine"
+            );
+
+            // Original corrupt bytes are preserved verbatim in a quarantine
+            // sibling (rename, not overwrite).
+            let quarantine = quarantine_sibling(dir.path(), base)
+                .await
+                .unwrap_or_else(|| panic!("{label}: quarantine sibling exists"));
+            let preserved = tokio::fs::read(&quarantine).await?;
+            assert_eq!(
+                preserved, *corpus,
+                "{label}: quarantine preserves the original corrupt bytes verbatim"
+            );
+
+            // The active path is rewritten as an empty cache (no corrupt residue).
+            assert!(
+                durable_cache_keys(&path).await?.is_empty(),
+                "{label}: active path rewritten as an empty cache"
+            );
+        }
+        Ok(())
+    }
+
+    /// WP-TK2: a read error other than `NotFound` (here: the path is a
+    /// directory, so `read_to_string` fails with EISDIR) is fatal — the loader
+    /// surfaces the error and must NOT quarantine or silently start empty.
+    #[tokio::test]
+    async fn treekem_recovery_cache_non_notfound_read_error_is_fatal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("unreadable.json");
+        // A directory exists but cannot be read as a file -> error kind != NotFound.
+        tokio::fs::create_dir(&path).await?;
+
+        let empty_roster: HashMap<String, x0x::groups::GroupInfo> = HashMap::new();
+        let result = load_treekem_member_key_packages(&path, &empty_roster).await;
+        assert!(
+            result.is_err(),
+            "non-NotFound read error must be fatal, not quarantined to empty"
+        );
+
+        // The fatal branch neither quarantines (renames) nor touches the path.
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .expect("path still present");
+        assert!(
+            metadata.is_dir(),
+            "unreadable directory left in place, not quarantined"
+        );
+        Ok(())
+    }
+
+    /// WP-TK2: at startup the loader retains only self-signed records that
+    /// still match an active roster. A validly-signed record for a group/member
+    /// absent from the roster is PRUNED (memory + durable JSON emptied), while
+    /// the same record IS retained when the roster carries the active member
+    /// with a matching key package — proving the prune is selective, not a wipe.
+    #[tokio::test]
+    async fn treekem_recovery_cache_startup_prunes_roster_irrelevant_signed_records() -> Result<()>
+    {
+        let fixture = member_joined_treekem_fixture(0x91, 0x92).await?;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let key = join_result_key(&group_id, &member_hex);
+        let persisted: BTreeMap<String, NamedGroupMetadataEvent> =
+            [(key.clone(), fixture.event.clone())].into_iter().collect();
+        let json = serde_json::to_string(&persisted)?;
+
+        // Case A: no active roster -> validly-signed record is pruned.
+        {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("kp.json");
+            tokio::fs::write(&path, &json).await?;
+            let empty_roster: HashMap<String, x0x::groups::GroupInfo> = HashMap::new();
+
+            let cache = load_treekem_member_key_packages(&path, &empty_roster).await?;
+            assert_eq!(
+                cache.diagnostics().await.entries,
+                0,
+                "roster-irrelevant record pruned from memory"
+            );
+            assert!(
+                cache.get(&key).await.is_none(),
+                "pruned record absent from memory"
+            );
+            assert!(
+                durable_cache_keys(&path).await?.is_empty(),
+                "durable JSON rewritten empty after startup prune"
+            );
+        }
+
+        // Case B: roster carries the active member with the matching key
+        // package -> the same signed record is retained (selective prune).
+        {
+            let inviter = fixture.state.agent.agent_id();
+            let roster_kp = match &fixture.event {
+                NamedGroupMetadataEvent::MemberJoined {
+                    treekem_key_package_b64: Some(kp),
+                    ..
+                } => kp.clone(),
+                _ => unreachable!("fixture event is MemberJoined with a key package"),
+            };
+            let mut info =
+                treekem_metadata_group_info(inviter, &group_id, &fixture.stable_group_id);
+            let mut member = x0x::groups::GroupMember::new_member(
+                member_hex.clone(),
+                None,
+                Some(hex::encode(inviter.as_bytes())),
+                1,
+            );
+            member.treekem_key_package_b64 = Some(roster_kp);
+            info.members_v2.insert(member_hex.clone(), member);
+            let roster: HashMap<String, x0x::groups::GroupInfo> =
+                [(group_id.clone(), info)].into_iter().collect();
+
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("kp.json");
+            tokio::fs::write(&path, &json).await?;
+
+            let cache = load_treekem_member_key_packages(&path, &roster).await?;
+            assert_eq!(
+                cache.diagnostics().await.entries,
+                1,
+                "roster-relevant signed record retained"
+            );
+            assert!(
+                cache.get(&key).await.is_some(),
+                "retained record present in memory"
+            );
+            assert!(
+                durable_cache_keys(&path).await?.contains(&key),
+                "durable JSON retains roster-relevant record (no rewrite when nothing pruned)"
+            );
+        }
+        Ok(())
+    }
+
+    /// WP-TK2: group/member lifecycle removals must evict both the in-memory
+    /// entry and the durable JSON record. `remove_groups` covers the
+    /// group-deletion lifecycle; `remove_member` covers per-member removal.
+    #[tokio::test]
+    async fn treekem_recovery_cache_lifecycle_prune_removes_memory_and_durable() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x93, 0x94).await?;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let key = join_result_key(&group_id, &member_hex);
+        let aliases = HashSet::from([group_id.clone()]);
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kp.json");
+        let (cache, _) = TreeKemMemberKeyPackageCache::from_entries(path, BTreeMap::new(), false)?;
+
+        // Group lifecycle: remove_groups drops memory + durable JSON.
+        cache
+            .insert(key.clone(), fixture.event.clone(), true)
+            .await?;
+        assert_eq!(cache.diagnostics().await.entries, 1, "seeded one record");
+        let removed_groups = cache.remove_groups(&aliases).await;
+        assert_eq!(
+            removed_groups.evicted, 1,
+            "group lifecycle pruned the record"
+        );
+        assert!(
+            cache.get(&key).await.is_none(),
+            "group prune cleared memory"
+        );
+        assert!(
+            durable_cache_keys(&cache.path).await?.is_empty(),
+            "group prune cleared durable JSON"
+        );
+
+        // Member lifecycle: remove_member drops memory + durable JSON.
+        cache
+            .insert(key.clone(), fixture.event.clone(), true)
+            .await?;
+        assert!(
+            cache.get(&key).await.is_some(),
+            "re-seeded before member prune"
+        );
+        let removed_member = cache.remove_member(&aliases, &member_hex).await;
+        assert_eq!(
+            removed_member.evicted, 1,
+            "member lifecycle pruned the record"
+        );
+        assert!(
+            cache.get(&key).await.is_none(),
+            "member prune cleared memory"
+        );
+        assert!(
+            cache
+                .find_for_member(std::slice::from_ref(&group_id), &member_hex)
+                .await
+                .is_none(),
+            "member prune cleared find_for_member"
+        );
+        assert!(
+            durable_cache_keys(&cache.path).await?.is_empty(),
+            "member prune cleared durable JSON"
+        );
+        Ok(())
+    }
+
+    /// WP-TK2: the entry-count cap is enforced on `from_entries` and overflow
+    /// is shed oldest-`ts_ms`-first until the cache fits.
+    #[tokio::test]
+    async fn treekem_recovery_cache_count_limit_evicts_oldest() -> Result<()> {
+        let cap = TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_ENTRIES;
+        let overflow = 3;
+        let total = cap + overflow;
+
+        let mut entries = BTreeMap::new();
+        for i in 0..total {
+            let g = format!("g{i:04x}");
+            let m = format!("m{i:04x}");
+            entries.insert(
+                format!("{g}:{m}"),
+                synthetic_member_joined(&g, &m, i as u64, 8),
+            );
+        }
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kp.json");
+        let (cache, evicted) = TreeKemMemberKeyPackageCache::from_entries(path, entries, true)?;
+        let diag = cache.diagnostics().await;
+
+        assert_eq!(evicted, overflow, "excess entries evicted to reach the cap");
+        assert_eq!(diag.entries, cap, "entry count held at MAX_ENTRIES");
+        assert!(
+            diag.encoded_bytes <= diag.max_encoded_bytes,
+            "byte budget respected after count compaction"
+        );
+        // Eviction is oldest-ts first: the three smallest-ts records (i=0,1,2)
+        // are evicted; i=3 is the first retained and the newest survives.
+        assert!(cache.get("g0000:m0000").await.is_none(), "i=0 evicted");
+        assert!(
+            cache.get("g0002:m0002").await.is_none(),
+            "i=2 evicted (last of overflow trio)"
+        );
+        assert!(
+            cache.get("g0003:m0003").await.is_some(),
+            "i=3 retained (first inside the cap)"
+        );
+        let last_idx = total - 1;
+        assert!(
+            cache
+                .get(&format!("g{last_idx:04x}:m{last_idx:04x}"))
+                .await
+                .is_some(),
+            "newest-ts record retained"
+        );
+        Ok(())
+    }
+
+    /// WP-TK2: the encoded-byte cap is enforced independently of the count
+    /// cap. With a handful of oversized records (count well under MAX_ENTRIES
+    /// but combined bytes over MAX_BYTES), the oldest-ts record is evicted so
+    /// the durable snapshot fits the byte budget.
+    #[tokio::test]
+    async fn treekem_recovery_cache_encoded_byte_limit_evicts_to_fit() -> Result<()> {
+        let payload_len = 2_500_000;
+        let ev_a = synthetic_member_joined("ga", "ma", 100, payload_len);
+        let ev_b = synthetic_member_joined("gb", "mb", 200, payload_len);
+        let ev_c = synthetic_member_joined("gc", "mc", 300, payload_len);
+        let (key_a, key_b, key_c) = (
+            "ga:ma".to_string(),
+            "gb:mb".to_string(),
+            "gc:mc".to_string(),
+        );
+
+        // Assert the byte budget — not the count cap — is the trigger, using
+        // the cache's own encoded-size function (mirrors cache_snapshot_encoded_bytes).
+        let bytes_a = cache_entry_encoded_bytes(&key_a, &ev_a)?;
+        let bytes_b = cache_entry_encoded_bytes(&key_b, &ev_b)?;
+        let bytes_c = cache_entry_encoded_bytes(&key_c, &ev_c)?;
+        let snapshot = |n: usize, sum: usize| {
+            2usize
+                .saturating_add(sum)
+                .saturating_add(n.saturating_sub(1))
+        };
+        let triple = snapshot(3, bytes_a + bytes_b + bytes_c);
+        let surviving_pair = snapshot(2, bytes_b + bytes_c);
+        assert!(
+            triple > TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_BYTES,
+            "precondition: three oversized records exceed the byte budget"
+        );
+        assert!(
+            surviving_pair <= TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_BYTES,
+            "precondition: the two newest records fit the byte budget"
+        );
+
+        let mut entries = BTreeMap::new();
+        entries.insert(key_a.clone(), ev_a);
+        entries.insert(key_b.clone(), ev_b);
+        entries.insert(key_c.clone(), ev_c);
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kp.json");
+        let (cache, evicted) = TreeKemMemberKeyPackageCache::from_entries(path, entries, true)?;
+        let diag = cache.diagnostics().await;
+
+        assert_eq!(evicted, 1, "one record evicted to fit the byte budget");
+        assert_eq!(diag.entries, 2, "two records remain");
+        assert!(
+            diag.encoded_bytes <= diag.max_encoded_bytes,
+            "encoded bytes within budget after compaction"
+        );
+        // Oldest-ts (ev_a) is the victim; the two newer records survive.
+        assert!(
+            cache.get(&key_a).await.is_none(),
+            "oldest-ts record evicted"
+        );
+        assert!(cache.get(&key_b).await.is_some(), "newer record retained");
+        assert!(cache.get(&key_c).await.is_some(), "newest record retained");
+        Ok(())
+    }
+
+    /// WP-TK2: eviction is deterministic — victim selection is min `ts_ms`,
+    /// then min key. With one eviction forced (`cap + 1` entries) and three
+    /// entries sharing the smallest `ts_ms`, the lexicographically smallest key
+    /// is the victim while its equal-ts siblings survive.
+    #[tokio::test]
+    async fn treekem_recovery_cache_eviction_tiebreak_is_timestamp_then_key() -> Result<()> {
+        let cap = TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_ENTRIES;
+        let mut entries = BTreeMap::new();
+        // Three equal-ts (ts=10) records with distinct keys.
+        for k in ["tie-a", "tie-b", "tie-c"] {
+            entries.insert(
+                k.to_string(),
+                synthetic_member_joined(k, &format!("mem-{k}"), 10, 8),
+            );
+        }
+        // `cap - 2` newer records (distinct ts) fill the cache to `cap + 1`,
+        // forcing exactly one eviction.
+        for i in 0..(cap - 2) {
+            let g = format!("ng{i:04x}");
+            entries.insert(
+                format!("{g}:m"),
+                synthetic_member_joined(&g, "m", 100 + i as u64, 8),
+            );
+        }
+        assert_eq!(entries.len(), cap + 1, "precondition: one over the cap");
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kp.json");
+        let (cache, evicted) = TreeKemMemberKeyPackageCache::from_entries(path, entries, true)?;
+        assert_eq!(evicted, 1, "exactly one record evicted");
+        assert_eq!(cache.diagnostics().await.entries, cap);
+
+        // Tie broken by smallest key: "tie-a" is the victim; "tie-b"/"tie-c"
+        // (equal ts, larger keys) survive.
+        assert!(
+            cache.get("tie-a").await.is_none(),
+            "smallest-key victim evicted on tie"
+        );
+        assert!(
+            cache.get("tie-b").await.is_some(),
+            "larger-key sibling survives the tie"
+        );
+        assert!(
+            cache.get("tie-c").await.is_some(),
+            "largest-key sibling survives the tie"
+        );
+        Ok(())
+    }
+
+    struct TreeKemCacheWriterHookGuard {
+        path: PathBuf,
+    }
+
+    impl Drop for TreeKemCacheWriterHookGuard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = TREEKEM_CACHE_WRITER_HOOKS.lock() {
+                hooks.remove(&self.path);
+            }
+        }
+    }
+
+    fn install_treekem_cache_writer_hook(
+        path: &FsPath,
+        release: Option<Arc<tokio::sync::Notify>>,
+        force_error: Option<std::io::Error>,
+    ) -> (Arc<tokio::sync::Notify>, TreeKemCacheWriterHookGuard) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut hooks = TREEKEM_CACHE_WRITER_HOOKS
+            .lock()
+            .expect("TreeKEM cache writer hook poisoned");
+        hooks.insert(
+            path.to_path_buf(),
+            TreeKemCacheWriterHookControl {
+                entered: Arc::clone(&entered),
+                release,
+                force_error,
+            },
+        );
+        (
+            entered,
+            TreeKemCacheWriterHookGuard {
+                path: path.to_path_buf(),
+            },
+        )
+    }
+
+    async fn signed_cache_fixture_entries() -> Result<(
+        MemberJoinedTreeKemFixture,
+        MemberJoinedTreeKemFixture,
+        String,
+        String,
+    )> {
+        let first = member_joined_treekem_fixture(0xa1, 0xa2).await?;
+        let second = member_joined_treekem_fixture(0xa3, 0xa4).await?;
+        let first_key = join_result_key(&first.group_id, &first.member_hex);
+        let second_key = join_result_key(&second.group_id, &second.member_hex);
+        Ok((first, second, first_key, second_key))
+    }
+
+    /// WP-TK2 #5: the persistence mutex serializes disk writes without holding
+    /// the cache map lock. While the first writer is deterministically parked,
+    /// readers observe both the first mutation and a concurrent newer mutation;
+    /// after release, the coalescing writer persists the newest snapshot.
+    #[tokio::test]
+    async fn treekem_recovery_cache_slow_writer_does_not_block_readers_and_newest_wins(
+    ) -> Result<()> {
+        let (first, second, first_key, second_key) = signed_cache_fixture_entries().await?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kp.json");
+        let (cache, _) =
+            TreeKemMemberKeyPackageCache::from_entries(path.clone(), BTreeMap::new(), false)?;
+        let cache = Arc::new(cache);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entered, _hook_guard) =
+            install_treekem_cache_writer_hook(&path, Some(Arc::clone(&release)), None);
+
+        let first_cache = Arc::clone(&cache);
+        let first_key_for_write = first_key.clone();
+        let first_event = first.event.clone();
+        let first_write =
+            tokio::spawn(async move { first_cache.insert(first_key_for_write, first_event, true).await });
+        entered.notified().await;
+
+        assert!(
+            cache.get(&first_key).await.is_some(),
+            "reader proceeds while the first disk writer is parked"
+        );
+
+        let second_cache = Arc::clone(&cache);
+        let second_key_for_write = second_key.clone();
+        let second_event = second.event.clone();
+        let second_write = tokio::spawn(async move {
+            second_cache
+                .insert(second_key_for_write, second_event, true)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cache.get(&second_key).await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("newer in-memory mutation blocked behind slow disk writer")?;
+        assert!(
+            cache.get(&first_key).await.is_some(),
+            "readers remain available after the concurrent mutation"
+        );
+
+        release.notify_one();
+        let first_result = first_write.await??;
+        let second_result = second_write.await??;
+        assert!(matches!(
+            first_result.persistence,
+            TreeKemCachePersistenceStatus::Durable { .. }
+        ));
+        assert!(matches!(
+            second_result.persistence,
+            TreeKemCachePersistenceStatus::Durable { .. }
+        ));
+
+        let durable = durable_cache_keys(&path).await?;
+        assert_eq!(
+            durable,
+            HashSet::from([first_key, second_key]),
+            "serialized/coalesced persistence leaves the newest complete snapshot on disk"
+        );
+        let diagnostics = cache.diagnostics().await;
+        assert!(!diagnostics.dirty);
+        assert_eq!(diagnostics.persisted_revision, diagnostics.revision);
+        Ok(())
+    }
+
+    /// WP-TK2 #6: a failed durable write returns structured `Dirty`, retains
+    /// failure diagnostics, and remains retryable. A later mutation retries the
+    /// entire newest snapshot and clears dirty state only after disk success.
+    #[tokio::test]
+    async fn treekem_recovery_cache_failed_write_stays_dirty_and_retry_persists_newest(
+    ) -> Result<()> {
+        let (first, second, first_key, second_key) = signed_cache_fixture_entries().await?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kp.json");
+        let (cache, _) =
+            TreeKemMemberKeyPackageCache::from_entries(path.clone(), BTreeMap::new(), false)?;
+        let (entered, _hook_guard) = install_treekem_cache_writer_hook(
+            &path,
+            None,
+            Some(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected TreeKEM cache persistence failure",
+            )),
+        );
+
+        let failed = cache
+            .insert(first_key.clone(), first.event.clone(), true)
+            .await?;
+        entered.notified().await;
+        let TreeKemCachePersistenceStatus::Dirty {
+            revision: failed_revision,
+            error,
+        } = failed.persistence
+        else {
+            anyhow::bail!("injected persistence failure was falsely reported durable");
+        };
+        assert!(error.contains("injected TreeKEM cache persistence failure"));
+        let dirty = cache.diagnostics().await;
+        assert!(dirty.dirty, "failed write remains explicitly dirty");
+        assert_eq!(dirty.revision, failed_revision);
+        assert_eq!(dirty.write_failures, 1);
+        assert!(dirty
+            .last_error
+            .as_deref()
+            .is_some_and(|last| { last.contains("injected TreeKEM cache persistence failure") }));
+        assert!(
+            cache.get(&first_key).await.is_some(),
+            "failed persistence does not discard the retryable in-memory record"
+        );
+        assert!(
+            tokio::fs::try_exists(&path)
+                .await
+                .is_ok_and(|exists| !exists),
+            "failed writer did not create a falsely durable snapshot"
+        );
+
+        let retried = cache
+            .insert(second_key.clone(), second.event.clone(), true)
+            .await?;
+        assert!(matches!(
+            retried.persistence,
+            TreeKemCachePersistenceStatus::Durable { .. }
+        ));
+        let durable = durable_cache_keys(&path).await?;
+        assert_eq!(
+            durable,
+            HashSet::from([first_key, second_key]),
+            "successful retry persists the newest snapshot, including the prior dirty record"
+        );
+        let clean = cache.diagnostics().await;
+        assert!(!clean.dirty, "successful retry clears dirty state");
+        assert_eq!(clean.persisted_revision, clean.revision);
+        assert_eq!(
+            clean.write_failures, 1,
+            "failure history remains observable"
+        );
+        assert_eq!(
+            clean.last_error, None,
+            "active error clears after durability succeeds"
+        );
+        Ok(())
     }
 }
