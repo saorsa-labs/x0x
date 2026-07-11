@@ -10344,8 +10344,24 @@ fn spawn_relay_dm_listener(
                             continue;
                         }
                     };
+                    let forward_bytes = u64::try_from(inner_wire.len()).unwrap_or(u64::MAX);
+                    let reservation = match peer_relay
+                        .reserve_forward(relayed.header.sender_agent_id, forward_bytes)
+                    {
+                        Ok(reservation) => reservation,
+                        Err(reason) => {
+                            tracing::debug!(
+                                target: "x0x::relay",
+                                stage = "refuse",
+                                relay_peer = ?relay_peer_id,
+                                reason = ?reason,
+                                "RelayedDm forward refused by quota admission"
+                            );
+                            continue;
+                        }
+                    };
                     let dst_peer_id = ant_quic::PeerId(dst_machine_id.0);
-                    if let Err(e) = network
+                    match network
                         .send_direct_typed(
                             &dst_peer_id,
                             local_agent_id.as_bytes(),
@@ -10354,13 +10370,16 @@ fn spawn_relay_dm_listener(
                         )
                         .await
                     {
-                        tracing::warn!(
-                            target: "x0x::relay",
-                            stage = "forward",
-                            dst = %hex::encode(dst.as_bytes()),
-                            error = %e,
-                            "Forward send_direct_typed failed"
-                        );
+                        Ok(()) => reservation.commit(),
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "x0x::relay",
+                                stage = "forward",
+                                dst = %hex::encode(dst.as_bytes()),
+                                error = %e,
+                                "Forward send_direct_typed failed"
+                            );
+                        }
                     }
                 }
                 peer_relay::RelayDisposition::Refuse(reason) => {

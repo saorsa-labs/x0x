@@ -316,6 +316,8 @@ pub struct PeerRelayConfig {
     /// Sliding window (milliseconds) for the rate + bandwidth caps above
     /// (#193). Defaults to
     /// [`crate::peer_relay::DEFAULT_RELAY_LIMIT_WINDOW`] in milliseconds.
+    /// `0` is clamped to [`crate::peer_relay::MIN_RELAY_LIMIT_WINDOW`] during
+    /// policy conversion so the caps can never become implicitly unlimited.
     #[serde(default = "default_peer_relay_limit_window_ms")]
     pub limit_window_ms: u64,
 
@@ -388,8 +390,11 @@ impl PeerRelayConfig {
     ///
     /// `fail_threshold` is clamped to `>= 1` so a misconfigured `0`
     /// never silently flips the engine into "every failure triggers
-    /// relay". `freshness` is taken from the engine's own default
-    /// since it is not currently surfaced in the TOML schema.
+    /// relay". `limit_window_ms` is clamped to the documented positive
+    /// [`crate::peer_relay::MIN_RELAY_LIMIT_WINDOW`] boundary so zero cannot
+    /// disable rate or bandwidth accounting. `freshness` is taken from the
+    /// engine's own default since it is not currently surfaced in the TOML
+    /// schema.
     #[must_use]
     pub fn to_policy(&self) -> crate::peer_relay::RelayPolicy {
         let defaults = crate::peer_relay::RelayPolicy::default();
@@ -401,7 +406,8 @@ impl PeerRelayConfig {
             require_contact_to_relay: self.require_contact_to_relay,
             max_forwards_per_sender: self.max_forwards_per_sender,
             max_total_forwards: self.max_total_forwards,
-            limit_window: Duration::from_millis(self.limit_window_ms),
+            limit_window: Duration::from_millis(self.limit_window_ms)
+                .max(crate::peer_relay::MIN_RELAY_LIMIT_WINDOW),
             max_forward_bytes_per_window: self.max_forward_bytes_per_window,
         }
     }
@@ -3451,6 +3457,48 @@ mod tests {
         let policy = cfg.to_policy();
         assert_eq!(policy.fail_threshold, 5);
         assert_eq!(policy.fail_window, Duration::from_millis(120_000));
+    }
+
+    #[test]
+    fn peer_relay_to_policy_clamps_zero_limit_window_to_one_ms() {
+        // Why (#193): a TOML config with `limit_window_ms = 0` would make
+        // every committed charge prune on the next admission, silently
+        // disabling the per-sender/global/byte caps — turning an opted-in
+        // relay into an unbounded one via a typo. Clamping to
+        // MIN_RELAY_LIMIT_WINDOW (1 ms) keeps accounting live; the positive
+        // 1 ms floor survives unchanged.
+        let clamped = PeerRelayConfig {
+            enabled: true,
+            limit_window_ms: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            clamped.to_policy().limit_window,
+            crate::peer_relay::MIN_RELAY_LIMIT_WINDOW,
+            "limit_window_ms = 0 must clamp to MIN_RELAY_LIMIT_WINDOW"
+        );
+
+        let one_ms = PeerRelayConfig {
+            enabled: true,
+            limit_window_ms: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            one_ms.to_policy().limit_window,
+            crate::peer_relay::MIN_RELAY_LIMIT_WINDOW,
+            "1 ms is the floor and survives unchanged"
+        );
+
+        // A generous window is carried through, not clamped.
+        let generous = PeerRelayConfig {
+            enabled: true,
+            limit_window_ms: 120_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            generous.to_policy().limit_window,
+            Duration::from_millis(120_000)
+        );
     }
 
     #[test]

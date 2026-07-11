@@ -53,10 +53,12 @@
 //! `needs_relay` decision, relay-candidate selection), the `RelayStats`
 //! counters, the fallback path in `Agent::send_direct_with_config`, and
 //! the inbound receiver in `NetworkNode` (X0X-0070b, shipped). The #193
-//! contact gate + rate/bandwidth limits are enforced in
-//! `PeerRelay::disposition_for`. The `RelayPolicy` is **disabled by
-//! default** — the relay path only engages when a runtime explicitly
-//! enables it.
+//! contact gate is enforced in [`PeerRelay::disposition_for`]; rate and
+//! bandwidth admission is enforced by [`PeerRelay::reserve_forward`]. A
+//! reservation charges quotas only when its send succeeds and releases its
+//! capacity automatically on every failed or abandoned forward. The
+//! [`RelayPolicy`] is **disabled by default** — the relay path only engages
+//! when a runtime explicitly enables it.
 //!
 //! Reference: Tailscale Peer Relays beta
 //! <https://tailscale.com/blog/peer-relays-beta>; iroh DERP
@@ -97,6 +99,12 @@ pub const RELAY_CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
 /// order of magnitude so an operator's mental model of "one minute" is
 /// consistent across the engine.
 pub const DEFAULT_RELAY_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Smallest supported rate/bandwidth accounting window. Zero-duration
+/// windows would prune every committed charge immediately and silently
+/// disable all relay caps, so policy construction and runtime admission both
+/// clamp to this positive boundary.
+pub const MIN_RELAY_LIMIT_WINDOW: Duration = Duration::from_millis(1);
 
 /// Default cap on forwards a single sender may request within
 /// [`DEFAULT_RELAY_LIMIT_WINDOW`] before being throttled. Generous for a
@@ -226,17 +234,6 @@ pub struct RelayedDm {
     /// The original DM envelope, opaque to the relay (still e2e
     /// encrypted and signed by the origin agent).
     pub inner: DmEnvelope,
-}
-
-/// Predicted postcard wire size of a [`DmEnvelope`] — the bandwidth unit
-/// for the #193 forward-path cap. Postcard encoding is deterministic, so
-/// this equals the bytes the relay listener actually sends on a
-/// successful forward. Returns `0` only if serialization itself fails
-/// (treated as zero-cost rather than blocking the forward).
-fn inner_wire_bytes(inner: &DmEnvelope) -> u64 {
-    postcard::to_allocvec(inner)
-        .map(|b| b.len() as u64)
-        .unwrap_or(0)
 }
 
 /// What a relay node should do with an inbound [`RelayedDm`].
@@ -387,7 +384,9 @@ impl RelayPolicy {
     }
 
     /// Override the forward-path resource caps (#193). All windows share
-    /// `window`; `0` for a rate field means "block all forwards".
+    /// `window`; `0` for a rate field means "block all forwards". A zero
+    /// window is clamped to [`MIN_RELAY_LIMIT_WINDOW`] so it can never disable
+    /// accounting.
     #[must_use]
     pub fn with_forward_limits(
         mut self,
@@ -399,7 +398,7 @@ impl RelayPolicy {
         self.max_forwards_per_sender = max_per_sender;
         self.max_total_forwards = max_total;
         self.max_forward_bytes_per_window = max_bytes;
-        self.limit_window = window;
+        self.limit_window = window.max(MIN_RELAY_LIMIT_WINDOW);
         self
     }
 }
@@ -503,48 +502,119 @@ impl RelayStats {
     }
 }
 
-/// #193 forward-path resource state: per-sender + global forward-rate
-/// timestamps and a global bandwidth ledger, all over a shared sliding
-/// `limit_window`. Held under a single mutex so a forward decision is
-/// atomic across all three caps.
+/// A pending or successfully committed relay-forward charge. Pending entries
+/// participate in every cap so concurrent admissions cannot oversubscribe;
+/// they are never window-pruned while the send is in flight. A successful
+/// commit starts its accounting window at the transmission time.
+#[derive(Debug)]
+struct RelayCharge {
+    reservation_id: Option<u64>,
+    sender: [u8; 32],
+    recorded_at: Instant,
+    bytes: u64,
+}
+
+/// #193 forward-path resource state. Pending reservations and committed
+/// forwards share one ledger behind one mutex, making admission atomic across
+/// the per-sender, global, and bandwidth caps.
 #[derive(Debug, Default)]
 struct RelayLimiter {
-    /// Per-sender forward-request timestamps within the window.
-    per_sender_forwards: HashMap<[u8; 32], Vec<Instant>>,
-    /// Global forward-request timestamps within the window (all senders).
-    total_forward_times: Vec<Instant>,
-    /// `(timestamp, bytes)` for each accepted forward within the window —
-    /// the bandwidth ledger. Pruned by `limit_window` on every check.
-    forward_bytes: Vec<(Instant, u64)>,
+    charges: Vec<RelayCharge>,
+    next_reservation_id: u64,
 }
 
 impl RelayLimiter {
-    /// Drop entries older than `window` from all three ledgers.
+    /// Drop committed entries older than `window`. Pending reservations stay
+    /// until their send commits or their guard is dropped.
     fn prune(&mut self, now: Instant, window: Duration) {
-        self.per_sender_forwards.retain(|_, times| {
-            times.retain(|t| now.saturating_duration_since(*t) < window);
-            !times.is_empty()
+        self.charges.retain(|charge| {
+            charge.reservation_id.is_some()
+                || now.saturating_duration_since(charge.recorded_at) < window
         });
-        self.total_forward_times
-            .retain(|t| now.saturating_duration_since(*t) < window);
-        self.forward_bytes
-            .retain(|(t, _)| now.saturating_duration_since(*t) < window);
     }
 
-    /// Total bytes recorded in the current window.
-    fn bytes_in_window(&self) -> u64 {
-        self.forward_bytes.iter().map(|(_, b)| b).sum()
+    fn would_exceed_bytes(&self, additional_bytes: u64, limit: u64) -> bool {
+        let total = self
+            .charges
+            .iter()
+            .try_fold(additional_bytes, |total, charge| {
+                total.checked_add(charge.bytes)
+            });
+        match total {
+            Some(total) => total > limit,
+            None => true,
+        }
     }
 
-    /// Record an accepted forward of `bytes` for `sender`.
-    fn record(&mut self, sender: [u8; 32], now: Instant, bytes: u64) {
-        self.per_sender_forwards
-            .entry(sender)
-            .or_default()
-            .push(now);
-        self.total_forward_times.push(now);
-        if bytes > 0 {
-            self.forward_bytes.push((now, bytes));
+    fn reserve(&mut self, sender: [u8; 32], now: Instant, bytes: u64) -> u64 {
+        let reservation_id = self.next_reservation_id;
+        self.next_reservation_id = self.next_reservation_id.wrapping_add(1);
+        self.charges.push(RelayCharge {
+            reservation_id: Some(reservation_id),
+            sender,
+            recorded_at: now,
+            bytes,
+        });
+        reservation_id
+    }
+
+    fn commit(&mut self, reservation_id: u64, now: Instant) -> Option<u64> {
+        let charge = self
+            .charges
+            .iter_mut()
+            .find(|charge| charge.reservation_id == Some(reservation_id))?;
+        charge.reservation_id = None;
+        charge.recorded_at = now;
+        Some(charge.bytes)
+    }
+
+    fn cancel(&mut self, reservation_id: u64) {
+        self.charges
+            .retain(|charge| charge.reservation_id != Some(reservation_id));
+    }
+}
+
+/// In-flight quota reservation for one relay forward.
+///
+/// Dropping this guard without calling [`commit`](Self::commit) releases all
+/// reserved sender/global/byte capacity. This makes destination, encoding,
+/// send, cancellation, and early-return failures fail-open for legitimate
+/// later traffic without any check-then-act race.
+#[must_use = "dropping the reservation cancels the relay admission"]
+pub struct RelayForwardReservation<'a> {
+    relay: &'a PeerRelay,
+    reservation_id: Option<u64>,
+}
+
+impl RelayForwardReservation<'_> {
+    /// Commit quota and success telemetry after the transport confirms that
+    /// the forward was transmitted. Consumes the guard, so a retry cannot
+    /// double-commit the same reservation.
+    pub fn commit(mut self) {
+        let Some(reservation_id) = self.reservation_id.take() else {
+            return;
+        };
+        let committed_bytes = self
+            .relay
+            .limiter_lock()
+            .commit(reservation_id, Instant::now());
+        if let Some(bytes) = committed_bytes {
+            self.relay
+                .stats
+                .relay_forwarded
+                .fetch_add(1, Ordering::Relaxed);
+            self.relay
+                .stats
+                .relay_forward_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for RelayForwardReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(reservation_id) = self.reservation_id.take() {
+            self.relay.limiter_lock().cancel(reservation_id);
         }
     }
 }
@@ -758,8 +828,9 @@ impl PeerRelay {
     /// *explicitly-trusted* contact (Known/Trusted — NOT a merely-
     /// discovered `Unknown` entry); `is_sender_blocked` is whether it is
     /// an explicitly-blocked contact. The listener resolves both from
-    /// `ContactStore` before calling. Updates the telemetry counters as
-    /// a side effect.
+    /// `ContactStore` before calling. Classification refusal telemetry is
+    /// updated here; forwarding quota and success telemetry are updated by
+    /// [`reserve_forward`](Self::reserve_forward) and its reservation guard.
     ///
     /// Classification order (each refusal is fail-closed and counted):
     /// - Policy disabled → `Refuse(PolicyDisabled)`. Runs **before** the
@@ -781,14 +852,10 @@ impl PeerRelay {
     ///      `Refuse(NotAContact)`, `relay_refused_not_a_contact` += 1.
     ///      Only Known/Trusted pass; a discovery-only `Unknown` entry
     ///      does not.
-    ///   3. per-sender or global forward-rate cap exceeded →
-    ///      `Refuse(RateLimited)`, `relay_refused_rate_limited` += 1.
-    ///   4. bandwidth cap would be exceeded →
-    ///      `Refuse(BandwidthExceeded)`, `relay_refused_bandwidth_exceeded`
-    ///      += 1.
-    ///   5. all pass → record the forward, `relay_forwarded` += 1,
-    ///      `relay_forward_bytes` += predicted inner wire size, return
-    ///      [`RelayDisposition::Forward`].
+    ///   3. all pass → return [`RelayDisposition::Forward`]. The caller must
+    ///      resolve and encode the destination, then call
+    ///      [`reserve_forward`](Self::reserve_forward) immediately before the
+    ///      transport send.
     #[must_use]
     pub fn disposition_for(
         &self,
@@ -852,53 +919,60 @@ impl PeerRelay {
                 .fetch_add(1, Ordering::Relaxed);
             return RelayDisposition::Refuse(RelayRefusal::NotAContact);
         }
-        // Predicted wire size of the inner envelope — the bandwidth unit.
-        // Postcard is deterministic, so this equals the bytes the listener
-        // will actually send on a successful forward. Computed only on the
-        // (cold) relay path after crypto verification.
-        let predicted_bytes = inner_wire_bytes(&relayed.inner);
-        let now = Instant::now();
-        let window = self.policy.limit_window;
-        let mut limiter = self.limiter_lock();
-        limiter.prune(now, window);
-        // Per-sender forward rate.
-        let sender_count = limiter
-            .per_sender_forwards
-            .get(&relayed.header.sender_agent_id)
-            .map(Vec::len)
-            .unwrap_or(0);
-        if sender_count >= self.policy.max_forwards_per_sender as usize {
-            self.stats
-                .relay_refused_rate_limited
-                .fetch_add(1, Ordering::Relaxed);
-            return RelayDisposition::Refuse(RelayRefusal::RateLimited);
-        }
-        // Global forward rate (all senders combined).
-        if limiter.total_forward_times.len() >= self.policy.max_total_forwards as usize {
-            self.stats
-                .relay_refused_rate_limited
-                .fetch_add(1, Ordering::Relaxed);
-            return RelayDisposition::Refuse(RelayRefusal::RateLimited);
-        }
-        // Bandwidth cap (fail-closed: would-exceed → refuse).
-        if limiter.bytes_in_window().saturating_add(predicted_bytes)
-            > self.policy.max_forward_bytes_per_window
-        {
-            self.stats
-                .relay_refused_bandwidth_exceeded
-                .fetch_add(1, Ordering::Relaxed);
-            return RelayDisposition::Refuse(RelayRefusal::BandwidthExceeded);
-        }
-        // All caps pass — commit the forward.
-        limiter.record(relayed.header.sender_agent_id, now, predicted_bytes);
-        drop(limiter);
-        self.stats.relay_forwarded.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .relay_forward_bytes
-            .fetch_add(predicted_bytes, Ordering::Relaxed);
         RelayDisposition::Forward {
             dst_agent_id: relayed.header.dst_agent_id,
         }
+    }
+
+    /// Atomically reserve per-sender, global, and byte capacity for an
+    /// already-resolved and encoded forward.
+    ///
+    /// Pending reservations count against every cap, preventing concurrent
+    /// callers from oversubscribing. The returned guard cancels on drop; call
+    /// [`RelayForwardReservation::commit`] exactly once and only after the
+    /// transport reports a successful transmission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelayRefusal::RateLimited`] when either forward-count cap is
+    /// full, or [`RelayRefusal::BandwidthExceeded`] when admitting `bytes`
+    /// would exceed the byte cap. The corresponding refusal counter is
+    /// incremented once.
+    pub fn reserve_forward(
+        &self,
+        sender_agent_id: [u8; 32],
+        bytes: u64,
+    ) -> Result<RelayForwardReservation<'_>, RelayRefusal> {
+        let now = Instant::now();
+        let window = self.policy.limit_window.max(MIN_RELAY_LIMIT_WINDOW);
+        let mut limiter = self.limiter_lock();
+        limiter.prune(now, window);
+
+        let sender_count = limiter
+            .charges
+            .iter()
+            .filter(|charge| charge.sender == sender_agent_id)
+            .count();
+        if sender_count >= self.policy.max_forwards_per_sender as usize
+            || limiter.charges.len() >= self.policy.max_total_forwards as usize
+        {
+            self.stats
+                .relay_refused_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(RelayRefusal::RateLimited);
+        }
+        if limiter.would_exceed_bytes(bytes, self.policy.max_forward_bytes_per_window) {
+            self.stats
+                .relay_refused_bandwidth_exceeded
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(RelayRefusal::BandwidthExceeded);
+        }
+
+        let reservation_id = limiter.reserve(sender_agent_id, now, bytes);
+        Ok(RelayForwardReservation {
+            relay: self,
+            reservation_id: Some(reservation_id),
+        })
     }
 
     /// Number of peers with tracked failure state (diagnostic).
@@ -1209,9 +1283,11 @@ mod tests {
 
     #[test]
     fn disposition_forwards_when_we_are_an_intermediate_relay() {
-        // Why: a relayed DM addressed to someone else must be
-        // classified for one-hop forward to its dst, counted as
-        // `relay_forwarded`.
+        // Why: a relayed DM addressed to someone else must be classified
+        // for one-hop forward to its dst. Classification lives in
+        // `disposition_for` and no longer charges quotas; admission + byte
+        // accounting is exercised via `reserve_forward` (see the dedicated
+        // reservation tests).
         let kp = AgentKeypair::generate().expect("keypair");
         let sender = kp.agent_id();
         let (pub_bytes, sec_bytes) = kp.to_bytes();
@@ -1235,7 +1311,12 @@ mod tests {
                 dst_agent_id: dst.0
             }
         );
-        assert_eq!(relay.stats().snapshot().relay_forwarded, 1);
+        // Classification only: no quota charge, no telemetry bump.
+        assert_eq!(
+            relay.stats().snapshot().relay_forwarded,
+            0,
+            "disposition_for classifies only; admission happens in reserve_forward"
+        );
     }
 
     #[test]
@@ -1414,25 +1495,41 @@ mod tests {
     #[test]
     fn disposition_forwards_for_contact_when_require_contact_set() {
         // Why (#193): the contact gate is a gate, not a block — a known
-        // contact's forward request still succeeds (subject to the
-        // rate/bandwidth caps), and the committed bytes are observable.
+        // contact's forward request classifies as Forward. Classification
+        // (`disposition_for`) no longer charges quotas; the caller admits
+        // and commits via `reserve_forward`, and the committed bytes are
+        // observable. This pins the classification-vs-admission split.
         let dst = aid(42);
         let we = aid(43);
         let now_ms = 1_700_000_000_000u64;
         let relayed = signed_forward_envelope(dst, now_ms);
 
         let relay = PeerRelay::with_policy(RelayPolicy::enabled());
+        // Classification only — no quota charge, no telemetry bump.
         assert_eq!(
             relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
             RelayDisposition::Forward {
                 dst_agent_id: dst.0
             }
         );
+        assert_eq!(
+            relay.stats().snapshot().relay_forwarded,
+            0,
+            "disposition_for classifies only; admission happens in reserve_forward"
+        );
+
+        // Admission: reserve the predicted wire size and commit once the
+        // transport confirms transmission.
+        const FORWARD_BYTES: u64 = 512;
+        relay
+            .reserve_forward(relayed.header.sender_agent_id, FORWARD_BYTES)
+            .expect("contact-gated forward admits")
+            .commit();
         let snap = relay.stats().snapshot();
         assert_eq!(snap.relay_forwarded, 1);
-        assert!(
-            snap.relay_forward_bytes > 0,
-            "a successful forward must account its predicted wire bytes"
+        assert_eq!(
+            snap.relay_forward_bytes, FORWARD_BYTES,
+            "commit charges the exact reserved byte count, once"
         );
     }
 
@@ -1484,108 +1581,98 @@ mod tests {
     }
 
     #[test]
-    fn disposition_refuses_when_sender_rate_limit_exceeded() {
-        // Why (#193): a sender that bursts more than
-        // max_forwards_per_sender within the window is throttled. Tested
-        // under burst: the (cap+1)-th forward from the same sender is
-        // refused with RateLimited. Global + bandwidth caps are loosened
-        // so only the per-sender gate fires.
-        let dst = aid(50);
-        let we = aid(51);
-        let now_ms = 1_700_000_000_000u64;
-        let relayed = signed_forward_envelope(dst, now_ms);
-
+    fn reserve_forward_refuses_when_sender_rate_limit_exceeded() {
+        // Why (#193): rate admission lives in `reserve_forward`, not
+        // `disposition_for` (which classifies only). A sender holding more
+        // than max_forwards_per_sender pending/committed forwards within
+        // the window is throttled: the (cap+1)-th reservation from the SAME
+        // sender is refused with RateLimited. Global + bandwidth caps are
+        // loosened so only the per-sender gate fires. Held reservations
+        // count against the cap (concurrent admissions cannot oversubscribe),
+        // and committing each charges it exactly once.
+        let sender = aid(7).0;
         let policy = RelayPolicy::enabled().with_forward_limits(
-            2,
-            1_000_000,
-            u64::MAX,
+            2,         // max_per_sender
+            1_000_000, // max_total (loose)
+            u64::MAX,  // max_bytes (loose)
             Duration::from_secs(60),
         );
         let relay = PeerRelay::with_policy(policy);
 
-        // First two forwards from this sender succeed.
-        for _ in 0..2 {
-            assert_eq!(
-                relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
-                RelayDisposition::Forward {
-                    dst_agent_id: dst.0
-                }
-            );
-        }
-        // Third forward from the SAME sender is refused.
+        // First two reservations from this sender admit and are held.
+        let r1 = relay.reserve_forward(sender, 100).expect("first admits");
+        let r2 = relay.reserve_forward(sender, 100).expect("second admits");
+        // Third reservation from the SAME sender is refused while the first
+        // two are still outstanding (pending charges count toward the cap).
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
-            RelayDisposition::Refuse(RelayRefusal::RateLimited)
+            relay.reserve_forward(sender, 100).err(),
+            Some(RelayRefusal::RateLimited)
         );
         let snap = relay.stats().snapshot();
         assert_eq!(snap.relay_refused_rate_limited, 1);
+        assert_eq!(snap.relay_forwarded, 0, "nothing committed yet");
+
+        // Committing the two held forwards charges each exactly once.
+        r1.commit();
+        r2.commit();
+        let snap = relay.stats().snapshot();
         assert_eq!(snap.relay_forwarded, 2);
+        assert_eq!(snap.relay_forward_bytes, 200);
     }
 
     #[test]
-    fn disposition_refuses_when_global_rate_limit_exceeded() {
+    fn reserve_forward_refuses_when_global_rate_limit_exceeded() {
         // Why (#193): the global concurrent-forward cap bounds total
-        // forwards across ALL senders. With max_total_forwards = 1, a
-        // second forward from a *different* sender is still refused.
-        let dst = aid(60);
-        let we = aid(61);
-        let now_ms = 1_700_000_000_000u64;
-        let first = signed_forward_envelope(dst, now_ms);
-        let second = signed_forward_envelope(dst, now_ms);
-
+        // forwards across ALL senders. Admission lives in `reserve_forward`:
+        // with max_total_forwards = 1, a second reservation from a DIFFERENT
+        // sender is refused while the first is still outstanding.
         let policy = RelayPolicy::enabled().with_forward_limits(
-            1_000_000,
-            1,
-            u64::MAX,
+            1_000_000, // max_per_sender (loose)
+            1,         // max_total
+            u64::MAX,  // max_bytes (loose)
             Duration::from_secs(60),
         );
         let relay = PeerRelay::with_policy(policy);
 
+        // First forward (sender A) admits and is held.
+        let held = relay
+            .reserve_forward(aid(1).0, 100)
+            .expect("first global forward admits");
+        // A different sender is still refused — the global budget is full.
         assert_eq!(
-            relay.disposition_for(&first, &we, now_ms + 100, true, false),
-            RelayDisposition::Forward {
-                dst_agent_id: dst.0
-            }
-        );
-        // Different sender, but the global budget is exhausted.
-        assert_eq!(
-            relay.disposition_for(&second, &we, now_ms + 100, true, false),
-            RelayDisposition::Refuse(RelayRefusal::RateLimited)
+            relay.reserve_forward(aid(2).0, 100).err(),
+            Some(RelayRefusal::RateLimited)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_rate_limited, 1);
+        drop(held);
     }
 
     #[test]
-    fn disposition_refuses_when_bandwidth_cap_exceeded() {
-        // Why (#193): once cumulative forwarded bytes in the window
-        // would exceed max_forward_bytes_per_window, further forwards
-        // are refused with BandwidthExceeded — and the refusal + zero
-        // committed bytes are observable in the stats snapshot.
-        let dst = aid(52);
-        let we = aid(53);
-        let now_ms = 1_700_000_000_000u64;
-        let relayed = signed_forward_envelope(dst, now_ms);
-
-        // Cap at 1 byte: the first forward's predicted wire size (~tens
-        // of bytes) already exceeds it → fail-closed refusal.
+    fn reserve_forward_refuses_when_bandwidth_cap_exceeded() {
+        // Why (#193): once cumulative reserved bytes in the window would
+        // exceed max_forward_bytes_per_window, further admissions are
+        // refused with BandwidthExceeded. Admission lives in
+        // `reserve_forward`; the refusal + zero committed bytes are
+        // observable. With a 1-byte cap, reserving any non-zero size
+        // overflows it immediately → fail-closed refusal.
         let policy = RelayPolicy::enabled().with_forward_limits(
-            1_000_000,
-            1_000_000,
-            1,
+            1_000_000, // max_per_sender (loose)
+            1_000_000, // max_total (loose)
+            1,         // max_bytes
             Duration::from_secs(60),
         );
         let relay = PeerRelay::with_policy(policy);
 
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
-            RelayDisposition::Refuse(RelayRefusal::BandwidthExceeded)
+            relay.reserve_forward(aid(1).0, 100).err(),
+            Some(RelayRefusal::BandwidthExceeded)
         );
         let snap = relay.stats().snapshot();
         assert_eq!(snap.relay_refused_bandwidth_exceeded, 1);
         assert_eq!(snap.relay_forwarded, 0);
         assert_eq!(
             snap.relay_forward_bytes, 0,
-            "no bytes committed on a refused forward"
+            "a refused admission commits no bytes"
         );
     }
     #[test]
@@ -1681,5 +1768,252 @@ mod tests {
                 dst_agent_id: dst.0
             }
         );
+    }
+
+    #[test]
+    fn dropped_reservations_free_capacity_and_never_charge_counters() {
+        // Why: a reservation models an in-flight forward. If the
+        // destination is unavailable or the forward fails before
+        // transmission, the caller drops the guard (cancel) — it must NOT
+        // commit any counter, and the freed capacity must be reusable by
+        // later legitimate traffic. Repeated reserve-then-drop churn must
+        // leave sender, global, and byte capacity pristine.
+        let sender = aid(5).0;
+        let policy = RelayPolicy::enabled().with_forward_limits(
+            2,   // max_per_sender
+            2,   // max_total
+            256, // max_bytes
+            Duration::from_secs(60),
+        );
+        let relay = PeerRelay::with_policy(policy);
+
+        // Churn several reservations that each "fail" and are dropped.
+        for _ in 0..5 {
+            let reservation = relay
+                .reserve_forward(sender, 100)
+                .expect("dropped reservation admits while capacity is free");
+            drop(reservation); // models destination-unavailable / early failure
+        }
+
+        // Counters untouched: nothing committed.
+        let snap = relay.stats().snapshot();
+        assert_eq!(snap.relay_forwarded, 0);
+        assert_eq!(snap.relay_forward_bytes, 0);
+        assert_eq!(snap.relay_refused_rate_limited, 0);
+        assert_eq!(snap.relay_refused_bandwidth_exceeded, 0);
+
+        // Capacity is fully reusable: a fresh reservation still admits.
+        let reusable = relay
+            .reserve_forward(sender, 100)
+            .expect("capacity is reusable after dropped reservations");
+        drop(reusable);
+    }
+
+    #[test]
+    fn failed_forward_then_retry_commits_exactly_once() {
+        // Why: the retry/error path must not double-commit or leak
+        // capacity. A forward that reserves then fails (send error /
+        // encode failure) drops its guard — cancelling its admission
+        // without charging. The legitimate retry reserves fresh and
+        // commits once: exactly one charge lands, and the failed attempt's
+        // capacity was freed so the retry could even reuse the same
+        // sender slot.
+        let sender = aid(9).0;
+        let policy = RelayPolicy::enabled().with_forward_limits(
+            1, // max_per_sender: the retry only fits if the
+            // failed attempt freed its slot
+            1_000_000,
+            u64::MAX,
+            Duration::from_secs(60),
+        );
+        let relay = PeerRelay::with_policy(policy);
+
+        // First attempt reserves, then the transport reports a send failure.
+        let failed = relay
+            .reserve_forward(sender, 64)
+            .expect("first attempt reserves");
+        drop(failed); // send failure → cancel, no charge
+
+        // The slot is free again (cap=1), so the retry admits and commits.
+        relay
+            .reserve_forward(sender, 64)
+            .expect("retry reserves after the failed attempt freed capacity")
+            .commit();
+
+        let snap = relay.stats().snapshot();
+        assert_eq!(snap.relay_forwarded, 1, "only the retry committed");
+        assert_eq!(snap.relay_forward_bytes, 64);
+    }
+
+    #[test]
+    fn dropping_one_reservation_frees_just_that_slot() {
+        // Why: cancelling (dropping) a single in-flight reservation must
+        // release exactly its sender/global/byte capacity — no more, no
+        // less. One freed slot admits exactly one new reservation while
+        // other outstanding reservations stay counted.
+        let sender = aid(3).0;
+        let policy = RelayPolicy::enabled().with_forward_limits(
+            2, // max_per_sender
+            1_000_000,
+            u64::MAX,
+            Duration::from_secs(60),
+        );
+        let relay = PeerRelay::with_policy(policy);
+
+        let r1 = relay.reserve_forward(sender, 10).expect("first slot");
+        let _r2 = relay.reserve_forward(sender, 10).expect("second slot");
+        // Both per-sender slots are full.
+        assert_eq!(
+            relay.reserve_forward(sender, 10).err(),
+            Some(RelayRefusal::RateLimited)
+        );
+
+        // Cancel just r1 → exactly one slot frees.
+        drop(r1);
+        let _r3 = relay
+            .reserve_forward(sender, 10)
+            .expect("freed slot re-admits");
+        // Full again — the cancellation freed one slot, not two.
+        assert_eq!(
+            relay.reserve_forward(sender, 10).err(),
+            Some(RelayRefusal::RateLimited)
+        );
+    }
+
+    #[test]
+    fn commit_charges_counters_once_and_consumes_capacity() {
+        // Why: commit() consumes the guard (so a retry cannot double-commit
+        // the same reservation) and the guard's Drop is a no-op once
+        // committed — the reservation_id is taken. The observable contract:
+        // a committed charge bumps relay_forwarded by exactly one and
+        // relay_forward_bytes by exactly the reserved bytes, AND it keeps
+        // consuming a cap slot (a post-commit Drop cannot spuriously free
+        // it). Had commit's implicit drop cancelled the charge, the global
+        // cap below would have re-opened.
+        let policy = RelayPolicy::enabled().with_forward_limits(
+            1_000_000, // per-sender loose
+            2,         // global cap
+            u64::MAX,
+            Duration::from_secs(60),
+        );
+        let relay = PeerRelay::with_policy(policy);
+
+        relay.reserve_forward(aid(1).0, 111).unwrap().commit();
+        relay.reserve_forward(aid(2).0, 222).unwrap().commit();
+
+        // Both committed charges occupy the global cap → a third (distinct
+        // sender) is refused. This proves commit's Drop was a no-op.
+        assert_eq!(
+            relay.reserve_forward(aid(3).0, 100).err(),
+            Some(RelayRefusal::RateLimited),
+            "committed charges still consume the global cap"
+        );
+
+        let snap = relay.stats().snapshot();
+        assert_eq!(snap.relay_forwarded, 2);
+        assert_eq!(snap.relay_forward_bytes, 333);
+    }
+
+    #[test]
+    fn concurrent_admissions_never_oversubscribe_global_cap() {
+        // Why: pending and committed charges share one ledger behind one
+        // mutex, so concurrent callers cannot race past the global cap.
+        // Many threads, each reserving for a distinct sender against a
+        // small global budget, must admit exactly `cap` — never more.
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const CAP: usize = 4;
+        const THREADS: usize = 16;
+        let relay = Arc::new(PeerRelay::with_policy(
+            RelayPolicy::enabled().with_forward_limits(
+                1_000_000, // per-sender loose (distinct senders anyway)
+                CAP as u32,
+                u64::MAX,
+                Duration::from_secs(60),
+            ),
+        ));
+        // Release every thread onto reserve_forward at once, then hold them
+        // (holding their reservations) until main has counted, so no slot
+        // frees prematurely and the cap is the real binding constraint.
+        let start = Arc::new(Barrier::new(THREADS));
+        let hold = Arc::new(Barrier::new(THREADS + 1));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for i in 0..THREADS {
+            let relay = Arc::clone(&relay);
+            let start = Arc::clone(&start);
+            let hold = Arc::clone(&hold);
+            let admitted = Arc::clone(&admitted);
+            let refused = Arc::clone(&refused);
+            handles.push(thread::spawn(move || {
+                let sender = [i as u8; 32];
+                start.wait();
+                match relay.reserve_forward(sender, 64) {
+                    Ok(r) => {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                        hold.wait(); // keep the slot reserved until counted
+                        drop(r);
+                    }
+                    Err(RelayRefusal::RateLimited) => {
+                        refused.fetch_add(1, Ordering::SeqCst);
+                        hold.wait();
+                    }
+                    Err(other) => panic!("unexpected refusal {other:?}"),
+                }
+            }));
+        }
+
+        // All threads have now reserved or been refused and are holding at
+        // `hold`; main joins the barrier so the counts are stable to read.
+        hold.wait();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            admitted.load(Ordering::SeqCst),
+            CAP,
+            "exactly the global cap admits, never more"
+        );
+        assert_eq!(
+            refused.load(Ordering::SeqCst),
+            THREADS - CAP,
+            "the rest are refused with RateLimited"
+        );
+        assert_eq!(
+            relay.stats().snapshot().relay_forwarded,
+            0,
+            "none committed"
+        );
+    }
+
+    #[test]
+    fn relay_policy_with_forward_limits_clamps_zero_window() {
+        // Why: `with_forward_limits` is the direct programmatic builder for
+        // the rate/bandwidth caps. A zero window would silently disable
+        // accounting (committed charges would prune on the next admission),
+        // so it must clamp to MIN_RELAY_LIMIT_WINDOW. The positive 1 ms
+        // floor survives unchanged.
+        let zero = RelayPolicy::enabled().with_forward_limits(10, 100, 1_024, Duration::ZERO);
+        assert_eq!(
+            zero.limit_window, MIN_RELAY_LIMIT_WINDOW,
+            "Duration::ZERO must clamp to the 1 ms floor"
+        );
+
+        let one_ms =
+            RelayPolicy::enabled().with_forward_limits(10, 100, 1_024, Duration::from_millis(1));
+        assert_eq!(
+            one_ms.limit_window, MIN_RELAY_LIMIT_WINDOW,
+            "1 ms is the floor and survives unchanged"
+        );
+
+        // A generous window is never clamped down.
+        let generous =
+            RelayPolicy::enabled().with_forward_limits(10, 100, 1_024, Duration::from_secs(60));
+        assert_eq!(generous.limit_window, Duration::from_secs(60));
     }
 }
