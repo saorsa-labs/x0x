@@ -32,6 +32,62 @@ use super::{
     WelcomeFetchWaiter,
 };
 
+fn validate_instance_name_grammar(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() || name.len() > 64 {
+        anyhow::bail!("instance name must be 1-64 characters");
+    }
+    let valid = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !valid {
+        anyhow::bail!(
+            "instance name must start with alphanumeric and contain only alphanumeric or hyphens"
+        );
+    }
+    Ok(())
+}
+
+/// Validate a daemon instance name without taking ownership or allocating on
+/// the success path.
+///
+/// New path-derivation code should construct [`InstanceName`] so invalid state
+/// is unrepresentable. This function remains the stable borrowed validation API.
+pub fn validate_instance_name(name: &str) -> anyhow::Result<()> {
+    validate_instance_name_grammar(name)
+}
+
+/// Validated daemon instance name used for every instance-scoped path.
+///
+/// Construction enforces the shared CLI/config grammar, so path derivation
+/// cannot receive separators, traversal components, or empty names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceName(String);
+
+impl InstanceName {
+    /// Borrow the validated instance name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the validated name and return its owned representation.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for InstanceName {
+    type Error = anyhow::Error;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        validate_instance_name_grammar(&name)?;
+        Ok(Self(name))
+    }
+}
+
 /// Carries the CLI-derived flags that the server-bringup path consumes.
 /// Phase 1: minimal — do not redesign config here.
 #[derive(Default)]
@@ -599,4 +655,162 @@ pub(super) struct CachedUpgradeCheck {
     pub(super) status: StatusCode,
     pub(super) body: serde_json::Value,
     pub(super) ttl: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The two canonical messages enforced by `InstanceName::try_from`.
+    // `x0xd::resolve_instance_startup` propagates these verbatim (bare `?`,
+    // no added context), so an invalid CLI or config name surfaces one
+    // identical, established message at startup.
+    const GRAMMAR_ERR: &str =
+        "instance name must start with alphanumeric and contain only alphanumeric or hyphens";
+    const LENGTH_ERR: &str = "instance name must be 1-64 characters";
+
+    #[test]
+    fn try_from_rejects_path_traversal_separators_and_invalid_grammar() {
+        // Each row is a named boundary a path-injection or grammar bug would
+        // ride in on. The separator/traversal cluster is security-critical:
+        // these are the exact strings that must never reach path derivation.
+        let overlength = "a".repeat(65); // 65 > 64 max
+        let cases: &[(&str, &str)] = &[
+            // separators — forward slash + backslash, bare and embedded
+            ("/", GRAMMAR_ERR),
+            ("\\", GRAMMAR_ERR),
+            ("a/b", GRAMMAR_ERR),
+            ("a\\b", GRAMMAR_ERR),
+            // traversal components / absolute paths
+            ("..", GRAMMAR_ERR),
+            ("../etc/passwd", GRAMMAR_ERR),
+            ("/etc/passwd", GRAMMAR_ERR),
+            // emptiness (length rule, checked before grammar)
+            ("", LENGTH_ERR),
+            // whitespace
+            ("   ", GRAMMAR_ERR),
+            ("ab cd", GRAMMAR_ERR),
+            // leading hyphen (also a CLI-flag-injection hazard)
+            ("-lead", GRAMMAR_ERR),
+            // non-ASCII
+            ("café", GRAMMAR_ERR),
+            // overlength boundary (length rule)
+            (overlength.as_str(), LENGTH_ERR),
+        ];
+
+        for &(raw, expected) in cases {
+            let err = InstanceName::try_from(raw.to_owned())
+                .expect_err("invalid instance name must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected),
+                "{raw:?}: expected error containing {expected:?}, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn try_from_accepts_valid_names_and_preserves_bytes() {
+        // Boundary pair with the 65-char case above: 64 passes, 65 fails.
+        let max_len = "a".repeat(64);
+        let cases: &[&str] = &[
+            "a",              // single char — lower length boundary
+            "testnet",        // lowercase alphanumeric
+            "x0x-443",        // alphanumeric + hyphen
+            "ProdNode1",      // mixed case + digits
+            "build-",         // trailing hyphen allowed (hyphen barred only at position 0)
+            max_len.as_str(), // exactly 64 chars — upper length boundary
+        ];
+
+        for &raw in cases {
+            let name = InstanceName::try_from(raw.to_owned())
+                .unwrap_or_else(|e| panic!("{raw:?}: expected valid, got {e}"));
+            assert_eq!(
+                name.as_str(),
+                raw,
+                "an accepted name must be preserved byte-for-byte (no trim/lowercase)"
+            );
+        }
+    }
+
+    /// Backcompat / parity guard for the stable borrowed validator.
+    ///
+    /// `x0x::server::validate_instance_name` is the documented
+    /// `fn(&str) -> anyhow::Result<()>` surface that pre-dates the typed
+    /// [`InstanceName`] constructor. It must reach the SAME verdict as
+    /// [`InstanceName::try_from`] and emit the SAME error bytes for every
+    /// grammar/length boundary, so a caller cannot observe a name that one path
+    /// accepts but the other rejects. The two `try_from_*` tests above pin the
+    /// constructor's absolute behavior against the canonical messages; this test
+    /// pins the *relationship* between the two surfaces and deliberately does
+    /// not re-encode the grammar (it derives expectations from the sibling API),
+    /// so it stays correct if the messages are ever reworded.
+    #[test]
+    fn borrowed_validator_matches_typed_constructor_outcomes_and_messages() {
+        // Bind the restored public signature as a typed fn pointer. If the
+        // `fn(&str) -> anyhow::Result<()>` surface ever changes arity, argument
+        // type, or return type, this binding fails to COMPILE — a
+        // backcompat guard stronger than any runtime assertion.
+        let validate: fn(&str) -> anyhow::Result<()> = x0x::server::validate_instance_name;
+
+        let max = "a".repeat(64); // exactly 64 — upper length boundary (valid)
+        let over = "a".repeat(65); // 65 — one past the boundary (invalid)
+
+        // One representative row per documented category: valid boundaries on
+        // the success side; every documented rejection class on the failure
+        // side. No grammar is re-encoded below — each row is compared against
+        // the typed constructor's actual output.
+        let cases: &[&str] = &[
+            // --- valid boundaries ---
+            "a",          // single char — lower length boundary
+            "testnet",    // lowercase alphanumeric
+            "x0x-443",    // alphanumeric + hyphen (embedded hyphen allowed)
+            max.as_str(), // exactly 64 chars — upper length boundary
+            // --- invalid: empty (length rule) ---
+            "",
+            // --- invalid: whitespace ---
+            "   ",   // whitespace only
+            "ab cd", // embedded space
+            "\t",    // tab
+            // --- invalid: path separators ---
+            "/",    // forward slash
+            "\\",   // backslash
+            "a/b",  // embedded forward slash
+            "a\\b", // embedded backslash
+            // --- invalid: traversal + absolute & platform path forms ---
+            "..",                // parent traversal
+            "../etc/passwd",     // traversal with target
+            "/etc/passwd",       // absolute POSIX path
+            "C:\\Users",         // absolute Windows drive path (platform form)
+            "\\\\server\\share", // UNC path form
+            // --- invalid: leading hyphen (also a CLI-flag-injection hazard) ---
+            "-lead",
+            // --- invalid: non-ASCII ---
+            "café", // accented Latin
+            "测试", // CJK
+            // --- invalid: overlength (length rule) ---
+            over.as_str(),
+        ];
+
+        for &raw in cases {
+            let borrowed = validate(raw);
+            let typed = InstanceName::try_from(raw.to_owned());
+            match (&borrowed, &typed) {
+                (Ok(()), Ok(_)) => {}
+                (Err(borrowed_err), Err(typed_err)) => assert_eq!(
+                    borrowed_err.to_string(),
+                    typed_err.to_string(),
+                    "borrowed and typed validators disagree on error message for {raw:?}"
+                ),
+                (Ok(()), Err(typed_err)) => panic!(
+                    "parity break: borrowed validator ACCEPTED {raw:?} \
+                     but typed constructor rejected it: {typed_err}"
+                ),
+                (Err(borrowed_err), Ok(_)) => panic!(
+                    "parity break: borrowed validator REJECTED {raw:?} \
+                     but typed constructor accepted it: {borrowed_err}"
+                ),
+            }
+        }
+    }
 }

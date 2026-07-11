@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(feature = "profile-heap")]
@@ -39,7 +39,29 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static MALLOC_CONF: &[u8] =
     b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,abort_conf:true\0";
 
-use x0x::server::{DaemonConfig, ServeOptions};
+use x0x::server::{DaemonConfig, InstanceName, ServeOptions};
+
+/// Resolve CLI/config precedence before deriving any instance-scoped ACL path.
+///
+/// A CLI name is already validated because it may be needed to locate the
+/// named default config file. A config name is validated only when it wins,
+/// so an invalid discarded config value cannot override a valid CLI name.
+fn resolve_instance_startup(
+    cli_name: Option<InstanceName>,
+    config_name: Option<String>,
+    connect_acl_override: Option<&Path>,
+) -> Result<(Option<InstanceName>, Option<PathBuf>)> {
+    let instance_name = match cli_name {
+        Some(name) => Some(name),
+        None => config_name.map(InstanceName::try_from).transpose()?,
+    };
+    let connect_acl_path = match (connect_acl_override, instance_name.as_ref()) {
+        (Some(path), _) => Some(path.to_path_buf()),
+        (None, Some(name)) => Some(x0x::connect::default_connect_acl_path_for(name)),
+        (None, None) => None,
+    };
+    Ok((instance_name, connect_acl_path))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -154,14 +176,13 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Parse --name for multi-instance support
-    let instance_name = if let Some(idx) = args.iter().position(|a| a == "--name") {
+    // Parse and validate --name before using it to locate a named config file.
+    let cli_instance_name = if let Some(idx) = args.iter().position(|a| a == "--name") {
         let name = args
             .get(idx + 1)
             .context("--name requires an instance name")?
             .clone();
-        x0x::server::validate_instance_name(&name)?;
-        Some(name)
+        Some(InstanceName::try_from(name)?)
     } else {
         None
     };
@@ -175,8 +196,8 @@ async fn main() -> anyhow::Result<()> {
     let mut config = match &config_path {
         Some(path) => load_config(path).await?,
         None => {
-            let config_dir_name = match &instance_name {
-                Some(name) => format!("x0x-{name}"),
+            let config_dir_name = match &cli_instance_name {
+                Some(name) => format!("x0x-{}", name.as_str()),
                 None => "x0x".to_string(),
             };
             let default_path = dirs::config_dir()
@@ -190,8 +211,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // CLI --name takes precedence over config file instance_name
-    let instance_name = instance_name.or_else(|| config.instance_name.clone());
+    let (instance_name, effective_connect_acl_path) = resolve_instance_startup(
+        cli_instance_name,
+        config.instance_name.clone(),
+        connect_acl_override.as_deref(),
+    )?;
 
     // Apply instance-scoped defaults for data_dir and api_address when --name
     // is active but the config didn't explicitly set instance-scoped values.
@@ -199,8 +223,8 @@ async fn main() -> anyhow::Result<()> {
         let default_data_dir = x0x::server::default_data_dir();
         if config.data_dir == default_data_dir {
             config.data_dir = dirs::data_dir()
-                .map(|d| d.join(format!("x0x-{name}")))
-                .unwrap_or_else(|| PathBuf::from(format!("/var/lib/x0x-{name}")));
+                .map(|d| d.join(format!("x0x-{}", name.as_str())))
+                .unwrap_or_else(|| PathBuf::from(format!("/var/lib/x0x-{}", name.as_str())));
         }
         if config.api_address == x0x::server::default_api_address() {
             config.api_address = SocketAddr::from(([127, 0, 0, 1], 0));
@@ -214,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
         if config.bind_address == x0x::server::default_bind_address() {
             config.bind_address = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0));
         }
-        config.instance_name = Some(name.clone());
+        config.instance_name = Some(name.as_str().to_owned());
     }
 
     // CLI --api-port overrides config (applied after instance defaults)
@@ -238,18 +262,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to load exec ACL")?;
 
-    // #189: give each named network plane its own default connect-ACL path so
-    // co-located daemons (prod / testnet / :443) no longer silently share
-    // /etc/x0x/connect-acl.toml. An explicit --connect-acl always wins; a named
-    // instance with no override falls back to connect-acl-<name>.toml (missing
-    // ⇒ disabled, same fail-closed behaviour as the base default); an unnamed
-    // daemon keeps the base default.
-    let effective_connect_acl_path: Option<PathBuf> = match (&connect_acl_override, &instance_name)
-    {
-        (Some(p), _) => Some(p.clone()),
-        (None, Some(name)) => Some(x0x::connect::default_connect_acl_path_for(name)),
-        (None, None) => None,
-    };
     let connect_policy = x0x::connect::load_connect_policy(
         effective_connect_acl_path.as_deref(),
         connect_acl_load_mode,
@@ -292,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
         skip_update_check,
         cli_no_port_mapping,
         cli_disable_peer_cache,
-        instance_name,
+        instance_name: instance_name.map(InstanceName::into_string),
         exec_policy,
         connect_policy,
         self_update_enabled,
@@ -607,4 +619,115 @@ fn init_logging(level: &str, format: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use x0x::server::InstanceName;
+
+    /// Construct a valid `InstanceName` from test data. Mirrors the CLI's own
+    /// `InstanceName::try_from(name)?` construction at the `--name` parse site.
+    fn valid_name(raw: &str) -> InstanceName {
+        InstanceName::try_from(raw.to_owned())
+            .unwrap_or_else(|e| panic!("{raw:?}: expected valid instance name, got {e}"))
+    }
+
+    #[test]
+    fn cli_name_wins_over_invalid_config_loser() {
+        // A CLI name is already validated; a config name is validated only when
+        // it wins. So an invalid config value must be silently discarded, never
+        // allowed to veto a valid CLI name. The named CLI instance still owns
+        // the identity and derives its plane-scoped ACL path.
+        let cli = valid_name("prod");
+        let expected_path = x0x::connect::default_connect_acl_path_for(&cli);
+        let (instance, path) =
+            resolve_instance_startup(Some(cli.clone()), Some("../etc/passwd".to_owned()), None)
+                .expect("valid CLI name must shadow an invalid config loser");
+        assert_eq!(
+            instance,
+            Some(cli),
+            "CLI name must win the instance identity"
+        );
+        assert_eq!(
+            path,
+            Some(expected_path),
+            "named CLI instance must derive its plane-scoped ACL path"
+        );
+    }
+
+    #[test]
+    fn config_only_traversal_name_is_rejected_with_canonical_error() {
+        // No CLI name: the config value is validated, and a traversal name must
+        // be rejected before any ACL path is derived. `resolve_instance_startup`
+        // is pure (no filesystem access), so this needs no fixtures. The bare
+        // `?` means the CLI/config invalid winner surfaces the exact, established
+        // InstanceName error — no extra context added.
+        let bad = "../etc/passwd".to_owned();
+        let resolver_err = resolve_instance_startup(None, Some(bad.clone()), None)
+            .expect_err("traversal config name must be rejected before path derivation")
+            .to_string();
+        let canonical_err = InstanceName::try_from(bad)
+            .expect_err("traversal name must be rejected by the grammar")
+            .to_string();
+        assert_eq!(
+            resolver_err, canonical_err,
+            "resolver must propagate the canonical InstanceName error unchanged"
+        );
+        assert!(
+            resolver_err.contains("alphanumeric"),
+            "expected the grammar error, got {resolver_err:?}"
+        );
+    }
+
+    #[test]
+    fn unnamed_instance_has_no_default_acl_path() {
+        // No name anywhere and no explicit override: no instance identity and
+        // no derived ACL path. The unnamed daemon falls through to the base
+        // default and load_connect_policy's DefaultPath fail-closed behaviour.
+        let (instance, path) =
+            resolve_instance_startup(None, None, None).expect("no inputs resolves trivially");
+        assert_eq!(instance, None, "no name ⇒ no instance identity");
+        assert_eq!(path, None, "no name and no override ⇒ no derived ACL path");
+    }
+
+    #[test]
+    fn connect_acl_override_shadows_named_instance() {
+        // An explicit --connect-acl path always wins, even over a named
+        // instance's plane-scoped default. The CLI name still owns identity.
+        let cli = valid_name("prod");
+        let override_path = std::path::Path::new("/etc/x0x/custom-connect.toml");
+        let (instance, path) = resolve_instance_startup(
+            Some(cli.clone()),
+            Some("testnet".to_owned()), // a valid config loser, also ignored for identity
+            Some(override_path),
+        )
+        .expect("override + valid names resolve");
+        assert_eq!(instance, Some(cli), "CLI name owns the instance identity");
+        assert_eq!(
+            path.as_deref(),
+            Some(override_path),
+            "explicit override must shadow the named default path"
+        );
+    }
+
+    #[test]
+    fn valid_config_name_resolves_when_no_cli_name() {
+        // The config-name arm: with no CLI name, the config value is validated
+        // and becomes the instance identity, deriving its own plane-scoped path.
+        let resolved = valid_name("testnet");
+        let expected_path = x0x::connect::default_connect_acl_path_for(&resolved);
+        let (instance, path) = resolve_instance_startup(None, Some("testnet".to_owned()), None)
+            .expect("valid config name resolves");
+        assert_eq!(
+            instance,
+            Some(resolved),
+            "config name wins when no CLI name is present"
+        );
+        assert_eq!(
+            path,
+            Some(expected_path),
+            "config name derives its plane-scoped default"
+        );
+    }
 }

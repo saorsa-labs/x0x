@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::exec::acl::{parse_agent_id, parse_machine_id, LoadMode};
 use crate::identity::{AgentId, MachineId};
+use crate::server::InstanceName;
 
 // ---------------------------------------------------------------------------
 // Path
@@ -57,15 +58,11 @@ pub fn default_connect_acl_path() -> PathBuf {
 /// co-located daemons (prod / testnet / `:443`) do not silently share one
 /// connect-ACL file (issue #189). An explicit `--connect-acl` always wins; a
 /// missing plane-specific file disables connect with the same fail-closed
-/// behaviour as the base default. `server::validate_instance_name` restricts
-/// the name to `[a-zA-Z0-9-]`, so the derived filename is path-traversal-safe.
+/// behaviour as the base default. [`InstanceName`] construction enforces the
+/// shared CLI/config grammar before this function can derive a path.
 #[must_use]
-pub fn default_connect_acl_path_for(name: &str) -> PathBuf {
-    debug_assert!(
-        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
-        "instance name must be validated before deriving a connect-ACL path"
-    );
-    let file = format!("connect-acl-{name}.toml");
+pub fn default_connect_acl_path_for(name: &InstanceName) -> PathBuf {
+    let file = format!("connect-acl-{}.toml", name.as_str());
     default_connect_acl_path()
         .parent()
         .map(|dir| dir.join(&file))

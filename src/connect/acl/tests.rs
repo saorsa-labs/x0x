@@ -8,6 +8,7 @@ use std::path::Path;
 
 use super::*;
 use crate::exec::acl::{parse_agent_id, parse_machine_id};
+use crate::server::InstanceName;
 
 // ===========================================================================
 // Matrix A — fail-closed load matrix (mirror exec::acl tests one-for-one)
@@ -413,7 +414,9 @@ unknown_key = "surprise"
 fn default_connect_acl_path_for_is_plane_scoped_and_safe() {
     // A named instance gets its own default path in the same directory as the
     // base default, named connect-acl-<name>.toml.
-    let testnet = default_connect_acl_path_for("testnet");
+    let name =
+        InstanceName::try_from("testnet".to_owned()).expect("testnet is a valid instance name");
+    let testnet = default_connect_acl_path_for(&name);
     let base = default_connect_acl_path();
     let base_dir = base
         .parent()
@@ -439,6 +442,52 @@ fn default_connect_acl_path_for_is_plane_scoped_and_safe() {
             .is_some_and(|n| n == "connect-acl.toml"),
         "base default must stay connect-acl.toml, got {base:?}"
     );
+}
+
+/// Path derivation is guarded by the `InstanceName` type, not a `debug_assert!`
+/// that vanishes in release builds.
+///
+/// The path-injection vectors below cannot be constructed as an `InstanceName`
+/// in ANY build profile — `TryFrom` validation is not `cfg(debug_assertions)`
+/// gated — so they can never reach `default_connect_acl_path_for`. Path safety
+/// is therefore the `&InstanceName` signature itself: the function is
+/// statically impossible to call with a raw traversal string, which is why it
+/// carries no internal assertion and stays correct in release builds.
+#[test]
+fn default_connect_acl_path_for_is_type_gated_not_debug_asserted() {
+    // Premise: every path-injection vector is unconstructible in debug and
+    // release alike, so none can reach the path function.
+    for injection in &["/", "\\", "..", "../etc/passwd", "/etc/passwd"] {
+        assert!(
+            InstanceName::try_from((*injection).to_owned()).is_err(),
+            "{injection:?}: must be unconstructible, else it could reach the path function"
+        );
+    }
+
+    // Consequence: every constructible name maps to a well-formed path under
+    // the base directory with the connect-acl-<name>.toml shape — no internal
+    // assertion or validation required inside the path function. The names here
+    // are deliberately distinct from the named-path test's "testnet" case.
+    let base = default_connect_acl_path();
+    let base_dir = base
+        .parent()
+        .expect("base default connect-ACL path has a parent dir");
+    for raw in &["ci", "x0x-443", "ProdNode1", "build-"] {
+        let name = InstanceName::try_from((*raw).to_owned())
+            .unwrap_or_else(|e| panic!("{raw:?}: valid, got {e}"));
+        let path = default_connect_acl_path_for(&name);
+        assert_eq!(path.parent(), Some(base_dir), "{raw:?}: wrong directory");
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| panic!("{raw:?}: non-UTF-8 filename"));
+        let expected = format!("connect-acl-{raw}.toml");
+        assert_eq!(
+            fname,
+            expected.as_str(),
+            "{raw:?}: filename must be connect-acl-<name>.toml"
+        );
+    }
 }
 
 #[tokio::test]
