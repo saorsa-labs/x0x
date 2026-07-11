@@ -12097,16 +12097,18 @@ async fn retain_withdrawn_group_tombstone(
     let stable_group_id = info.stable_group_id().to_string();
     info.withdrawn = true;
     clear_group_info_key_material(&mut info);
-    {
+    let aliases = {
         let mut groups = state.named_groups.write().await;
         let mut aliases =
             collect_same_stable_group_aliases(&groups, group_id, Some(&stable_group_id));
         aliases.insert(group_id.to_string());
         aliases.insert(stable_group_id.clone());
-        for alias in aliases {
-            groups.insert(alias, info.clone());
+        for alias in &aliases {
+            groups.insert(alias.clone(), info.clone());
         }
-    }
+        aliases
+    };
+    let _ = prune_treekem_cache_groups(state, &aliases, reason).await;
     wipe_local_group_crypto_material(state, group_id, Some(&stable_group_id), reason).await;
     remove_directory_cache_entries_for_group_info(state, &info).await;
     refresh_group_card_cache_from_info(state, group_id, &info).await;
@@ -27310,6 +27312,92 @@ mod tests {
         assert!(
             durable_cache_keys(&cache.path).await?.is_empty(),
             "member prune cleared durable JSON"
+        );
+        Ok(())
+    }
+
+    /// PR #219 review finding #4: the shared retained-tombstone path used by
+    /// GroupDeleted/withdraw/import must prune signed recovery records only
+    /// after the terminal state is committed. Exercise the real GroupDeleted
+    /// apply path rather than calling cache lifecycle helpers directly.
+    #[tokio::test]
+    async fn group_deleted_tombstone_prunes_recovery_cache_memory_and_disk() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0xb1, 0xb2).await?;
+        let state = &fixture.state;
+        let cache_key = join_result_key(&fixture.group_id, &fixture.member_hex);
+
+        let _ =
+            apply_named_group_metadata_event(state, fixture.event.clone(), fixture.member_id, true)
+                .await;
+        assert!(
+            state
+                .treekem_member_key_packages
+                .get(&cache_key)
+                .await
+                .is_some(),
+            "precondition: real MemberJoined apply seeded the signed recovery record"
+        );
+        assert!(
+            durable_cache_keys(&state.treekem_member_key_packages.path)
+                .await?
+                .contains(&cache_key),
+            "precondition: signed recovery record is durable before terminality"
+        );
+
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(&fixture.group_id)
+            .expect("fixture group retained after MemberJoined")
+            .clone();
+        let mut terminal = parent.clone();
+        terminal.withdrawn = true;
+        let commit = sign_metadata_terminality_commit(&parent, &terminal, state, 1_000);
+        assert!(commit.withdrawn);
+        let event = NamedGroupMetadataEvent::GroupDeleted {
+            group_id: fixture.stable_group_id.clone(),
+            revision: parent.roster_revision.saturating_add(1),
+            actor: hex::encode(state.agent.agent_id().as_bytes()),
+            commit: Some(commit),
+        };
+
+        let applied = apply_named_group_metadata_event_inner(
+            state,
+            event,
+            state.agent.agent_id(),
+            true,
+            true,
+        )
+        .await;
+        assert!(
+            applied,
+            "GroupDeleted committed through the production apply path"
+        );
+        {
+            let groups = state.named_groups.read().await;
+            let tombstone = groups
+                .get(&fixture.group_id)
+                .expect("terminal tombstone retained under storage alias");
+            assert!(
+                tombstone.withdrawn,
+                "terminal state committed before cache pruning"
+            );
+            assert_eq!(tombstone.shared_secret, None);
+        }
+        assert!(
+            state
+                .treekem_member_key_packages
+                .get(&cache_key)
+                .await
+                .is_none(),
+            "GroupDeleted tombstone pruned the in-memory signed recovery record"
+        );
+        assert!(
+            !durable_cache_keys(&state.treekem_member_key_packages.path)
+                .await?
+                .contains(&cache_key),
+            "GroupDeleted tombstone pruned the durable signed recovery record"
         );
         Ok(())
     }
