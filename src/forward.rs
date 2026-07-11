@@ -459,6 +459,7 @@ struct AttestationVerifyCtx {
         tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
     >,
     contact_store: std::sync::Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
+    own_machine_id: MachineId,
     now_ms: u64,
 }
 
@@ -500,7 +501,7 @@ async fn decide_inbound_attested(
     // ── Replay: recipient scope binding ──────────────────────────────
     // The header must name THIS machine as the recipient — a header captured
     // on machine A cannot be replayed to machine B.
-    if header.recipient_machine_id != *peer_machine {
+    if header.recipient_machine_id != ctx.own_machine_id {
         return Err(ConnectDenialReason::AttestationFailed);
     }
 
@@ -668,6 +669,7 @@ pub(crate) struct InboundCtx {
     pub discovery_cache:
         Arc<tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>>,
     pub contact_store: Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
+    pub own_machine_id: MachineId,
     pub require_attestation: bool,
 }
 
@@ -748,6 +750,7 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
             let verify_ctx = AttestationVerifyCtx {
                 discovery_cache: Arc::clone(&ctx.discovery_cache),
                 contact_store: Arc::clone(&ctx.contact_store),
+                own_machine_id: ctx.own_machine_id,
                 now_ms,
             };
             match decide_inbound_attested(&header, &ctx.policy, &machine_id, &verify_ctx).await {
@@ -1247,6 +1250,7 @@ impl ForwardService {
                         revocation_set: Arc::clone(&this.revocation_set),
                         discovery_cache: Arc::clone(&this.discovery_cache),
                         contact_store: Arc::clone(&this.contact_store),
+                        own_machine_id: this.agent.machine_id(),
                         require_attestation: this.require_attestation,
                     };
                     handle_inbound(stream, &inbound_ctx).await;
@@ -1967,6 +1971,19 @@ mod tests {
     }
 
     #[test]
+    fn v2_attestation_sign_encode_decode_and_verify() {
+        let kp = AgentKeypair::generate().unwrap();
+        let machine = MachineId([2u8; 32]);
+        let h = signed_v2_header("127.0.0.1", 22, &kp, machine);
+        let bytes = h.encode();
+        let (decoded, _) = ForwardV2Header::decode(&bytes).expect("decode");
+
+        let verification = decoded.verify_attestation(&decoded.opener_agent_public_key);
+        eprintln!("wire-round-trip verify_attestation result: {verification:?}");
+        assert_eq!(verification, Ok(()));
+    }
+
+    #[test]
     fn v2_attestation_rejects_missing_signature() {
         let kp = AgentKeypair::generate().unwrap();
         let machine = MachineId([2u8; 32]);
@@ -2089,6 +2106,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: ts
                 }
             )
@@ -2106,6 +2124,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: ts
                 }
             )
@@ -2125,6 +2144,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: ts
                 }
             )
@@ -2143,6 +2163,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: ts
                 }
             )
@@ -2161,6 +2182,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: ts
                 }
             )
@@ -2179,6 +2201,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: ts
                 }
             )
@@ -2189,25 +2212,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decide_inbound_attested_wrong_recipient_denied() {
-        // Replay: header for machine A replayed to B.
+    async fn v2_cross_node_wire_header_verifies_then_distinct_machine_allows() {
+        // Distinct-machine happy path. The opener lives on `opener_machine`
+        // (transport-authenticated as `peer_machine`) and signs the header for
+        // the local recipient `own_machine`. The cache + ACL bind the opener
+        // agent to `opener_machine`; the recipient scope binding accepts
+        // because the header names `own_machine` as recipient. Under the OLD
+        // comparison the header's recipient was checked against `peer_machine`
+        // (`opener_machine`) and wrongly denied — the fix checks it against
+        // `own_machine_id`, so the legitimate cross-node forward succeeds.
         let kp = AgentKeypair::generate().unwrap();
         let agent = kp.agent_id();
-        let machine_a = MachineId([2u8; 32]);
-        let machine_b = MachineId([3u8; 32]);
+        let opener_machine = MachineId([2u8; 32]);
+        let own_machine = MachineId([3u8; 32]);
         let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
-        let cache = cache_with_agent(&kp, machine_b);
+        let cache = cache_with_agent(&kp, opener_machine);
         let contacts = trusted_store(agent);
-        let policy = policy_with_allow(agent, machine_b, target);
-        let hdr = signed_v2_header("127.0.0.1", 22, &kp, machine_a);
+        let policy = policy_with_allow(agent, opener_machine, target);
+
+        // Explicit wire encode/decode round trip + signature verification.
+        let header = signed_v2_header("127.0.0.1", 22, &kp, own_machine);
+        let bytes = header.encode();
+        let (decoded, _) = ForwardV2Header::decode(&bytes).expect("decode");
+        decoded
+            .verify_attestation(&decoded.opener_agent_public_key)
+            .expect("wire-round-trip attestation must verify");
+
+        // Distinct-machine gate decision: opener on `opener_machine`, local
+        // recipient is `own_machine` — gate returns the resolved target.
+        assert_eq!(
+            decide_inbound_attested(
+                &decoded,
+                &policy,
+                &opener_machine,
+                &AttestationVerifyCtx {
+                    discovery_cache: cache,
+                    contact_store: contacts,
+                    own_machine_id: own_machine,
+                    now_ms: now_ms(),
+                },
+            )
+            .await
+            .unwrap(),
+            target,
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_inbound_attested_wrong_recipient_denied() {
+        // Replay / misdelivery: the opener (on `opener_machine`) signed a
+        // header addressed to `other_recipient`, but THIS machine is
+        // `own_machine`. The cache binding, signature, trust, and ACL are
+        // all set up to ALLOW a legitimate forward — the ONLY reason this
+        // denies is that the signed recipient differs from `own_machine_id`.
+        let kp = AgentKeypair::generate().unwrap();
+        let agent = kp.agent_id();
+        let opener_machine = MachineId([2u8; 32]);
+        let own_machine = MachineId([3u8; 32]);
+        let other_recipient = MachineId([9u8; 32]);
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+        let cache = cache_with_agent(&kp, opener_machine);
+        let contacts = trusted_store(agent);
+        let policy = policy_with_allow(agent, opener_machine, target);
+        let hdr = signed_v2_header("127.0.0.1", 22, &kp, other_recipient);
         assert_eq!(
             decide_inbound_attested(
                 &hdr,
                 &policy,
-                &machine_b,
+                &opener_machine,
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: own_machine,
                     now_ms: now_ms()
                 }
             )
@@ -2236,6 +2312,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: other_machine,
                     now_ms: now_ms()
                 }
             )
@@ -2267,6 +2344,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: ts
                 }
             )
@@ -2298,6 +2376,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: ts
                 }
             )
@@ -2326,6 +2405,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: now_ms()
                 }
             )
@@ -2387,6 +2467,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: now_ms()
                 }
             )
@@ -2403,6 +2484,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: now_ms()
                 }
             )
@@ -2465,6 +2547,7 @@ mod tests {
                 &AttestationVerifyCtx {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
+                    own_machine_id: machine,
                     now_ms: now_ms(),
                 }
             )
