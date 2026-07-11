@@ -31,8 +31,8 @@ use routes::{
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
-    default_api_address, default_bind_address, default_data_dir, DaemonConfig, ServeOptions,
-    ServerHandle, DEFAULT_QUIC_PORT,
+    default_api_address, default_bind_address, default_data_dir, DaemonConfig, InstanceName,
+    ServeOptions, ServerHandle, DEFAULT_QUIC_PORT,
 };
 use state::{shared_cache_dir, AppState, CachedUpgradeCheck, DaemonUpdateConfig};
 use ws::{ws_diagnostics, ws_direct_handler, ws_handler, ws_sessions, WsOutboundStats};
@@ -1796,23 +1796,6 @@ pub async fn serve_with_options(
         cancel,
         task: Some(task),
     })
-}
-
-pub fn validate_instance_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 64 {
-        anyhow::bail!("instance name must be 1-64 characters");
-    }
-    let valid = name
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    if !valid {
-        anyhow::bail!(
-            "instance name must start with alphanumeric and contain only alphanumeric or hyphens"
-        );
-    }
-    Ok(())
 }
 
 pub async fn list_instances() -> Result<()> {

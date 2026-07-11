@@ -32,6 +32,48 @@ use super::{
     WelcomeFetchWaiter,
 };
 
+/// Validated daemon instance name used for every instance-scoped path.
+///
+/// Construction enforces the shared CLI/config grammar, so path derivation
+/// cannot receive separators, traversal components, or empty names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceName(String);
+
+impl InstanceName {
+    /// Borrow the validated instance name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the validated name and return its owned representation.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for InstanceName {
+    type Error = anyhow::Error;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if name.is_empty() || name.len() > 64 {
+            anyhow::bail!("instance name must be 1-64 characters");
+        }
+        let valid = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if !valid {
+            anyhow::bail!(
+                "instance name must start with alphanumeric and contain only alphanumeric or hyphens"
+            );
+        }
+        Ok(Self(name))
+    }
+}
+
 /// Carries the CLI-derived flags that the server-bringup path consumes.
 /// Phase 1: minimal — do not redesign config here.
 #[derive(Default)]
@@ -599,4 +641,81 @@ pub(super) struct CachedUpgradeCheck {
     pub(super) status: StatusCode,
     pub(super) body: serde_json::Value,
     pub(super) ttl: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The two canonical messages enforced by `InstanceName::try_from`.
+    // `x0xd::resolve_instance_startup` propagates these verbatim (bare `?`,
+    // no added context), so an invalid CLI or config name surfaces one
+    // identical, established message at startup.
+    const GRAMMAR_ERR: &str =
+        "instance name must start with alphanumeric and contain only alphanumeric or hyphens";
+    const LENGTH_ERR: &str = "instance name must be 1-64 characters";
+
+    #[test]
+    fn try_from_rejects_path_traversal_separators_and_invalid_grammar() {
+        // Each row is a named boundary a path-injection or grammar bug would
+        // ride in on. The separator/traversal cluster is security-critical:
+        // these are the exact strings that must never reach path derivation.
+        let overlength = "a".repeat(65); // 65 > 64 max
+        let cases: &[(&str, &str)] = &[
+            // separators — forward slash + backslash, bare and embedded
+            ("/", GRAMMAR_ERR),
+            ("\\", GRAMMAR_ERR),
+            ("a/b", GRAMMAR_ERR),
+            ("a\\b", GRAMMAR_ERR),
+            // traversal components / absolute paths
+            ("..", GRAMMAR_ERR),
+            ("../etc/passwd", GRAMMAR_ERR),
+            ("/etc/passwd", GRAMMAR_ERR),
+            // emptiness (length rule, checked before grammar)
+            ("", LENGTH_ERR),
+            // whitespace
+            ("   ", GRAMMAR_ERR),
+            ("ab cd", GRAMMAR_ERR),
+            // leading hyphen (also a CLI-flag-injection hazard)
+            ("-lead", GRAMMAR_ERR),
+            // non-ASCII
+            ("café", GRAMMAR_ERR),
+            // overlength boundary (length rule)
+            (overlength.as_str(), LENGTH_ERR),
+        ];
+
+        for &(raw, expected) in cases {
+            let err = InstanceName::try_from(raw.to_owned())
+                .expect_err("invalid instance name must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected),
+                "{raw:?}: expected error containing {expected:?}, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn try_from_accepts_valid_names_and_preserves_bytes() {
+        // Boundary pair with the 65-char case above: 64 passes, 65 fails.
+        let max_len = "a".repeat(64);
+        let cases: &[&str] = &[
+            "a",              // single char — lower length boundary
+            "testnet",        // lowercase alphanumeric
+            "x0x-443",        // alphanumeric + hyphen
+            "ProdNode1",      // mixed case + digits
+            "build-",         // trailing hyphen allowed (hyphen barred only at position 0)
+            max_len.as_str(), // exactly 64 chars — upper length boundary
+        ];
+
+        for &raw in cases {
+            let name = InstanceName::try_from(raw.to_owned())
+                .unwrap_or_else(|e| panic!("{raw:?}: expected valid, got {e}"));
+            assert_eq!(
+                name.as_str(),
+                raw,
+                "an accepted name must be preserved byte-for-byte (no trim/lowercase)"
+            );
+        }
+    }
 }
