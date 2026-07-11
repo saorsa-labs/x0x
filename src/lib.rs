@@ -233,6 +233,14 @@ pub struct Agent {
     identity_discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
+    /// Latest authenticated agent→machine bindings accepted from verified
+    /// identity announcements. Unlike reachability caches, these bindings
+    /// survive revocation eviction so relayed DMs cannot replace a revoked
+    /// origin machine with an envelope-controlled claim.
+    /// The bounded LRU is intentionally in-memory: restart and eviction degrade
+    /// to the observable claimed-machine fallback until a verified announcement
+    /// repopulates the binding. Protocol-level closure is tracked in issue #213.
+    authenticated_machine_bindings: dm_inbox::AuthenticatedMachineBindings,
     /// Cache of discovered machine endpoints from machine announcements and
     /// agent→machine identity links.
     machine_discovery_cache: std::sync::Arc<
@@ -957,6 +965,67 @@ impl IdentityAnnouncement {
             )),
         }
     }
+}
+
+/// Maximum accepted positive clock skew for identity announcements retained as
+/// security bindings. Mirrors the direct-message freshness policy.
+const IDENTITY_ANNOUNCEMENT_CLOCK_SKEW_SECS: u64 = dm::CLOCK_SKEW_TOLERANCE_MS / 1_000;
+
+fn identity_announcement_timestamp_is_acceptable(announced_at: u64, now: u64) -> bool {
+    announced_at <= now.saturating_add(IDENTITY_ANNOUNCEMENT_CLOCK_SKEW_SECS)
+}
+
+fn identity_announcement_has_direct_agent_origin(
+    msg: &gossip::PubSubMessage,
+    announcement: &IdentityAnnouncement,
+) -> bool {
+    if !msg.verified || msg.sender != Some(announcement.agent_id) {
+        return false;
+    }
+    let Some(sender_public_key) = msg.sender_public_key.as_deref() else {
+        return false;
+    };
+    let Ok(sender_public_key) = ant_quic::MlDsaPublicKey::from_bytes(sender_public_key) else {
+        return false;
+    };
+    identity::AgentId::from_public_key(&sender_public_key) == announcement.agent_id
+}
+
+/// Record a security binding only for a fresh announcement observed directly
+/// from its authenticated origin agent. Verified rebroadcasts remain eligible
+/// for ordinary discovery but cannot populate or overwrite this cache.
+async fn record_authenticated_machine_binding_from_message(
+    bindings: &dm_inbox::AuthenticatedMachineBindings,
+    msg: &gossip::PubSubMessage,
+    announcement: &IdentityAnnouncement,
+    now: u64,
+) -> bool {
+    if !identity_announcement_timestamp_is_acceptable(announcement.announced_at, now) {
+        tracing::warn!(
+            agent = %hex::encode(announcement.agent_id.as_bytes()),
+            announced_at = announcement.announced_at,
+            now,
+            max_future_skew_secs = IDENTITY_ANNOUNCEMENT_CLOCK_SKEW_SECS,
+            "ignoring far-future identity announcement for authenticated machine binding"
+        );
+        return false;
+    }
+    if !identity_announcement_has_direct_agent_origin(msg, announcement) {
+        tracing::debug!(
+            agent = %hex::encode(announcement.agent_id.as_bytes()),
+            sender = ?msg.sender.map(|id| hex::encode(id.as_bytes())),
+            "identity announcement is not direct-origin authenticated; retained binding unchanged"
+        );
+        return false;
+    }
+    dm_inbox::record_authenticated_machine_binding(
+        bindings,
+        announcement.agent_id,
+        announcement.machine_id,
+        announcement.announced_at,
+    )
+    .await;
+    true
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -5814,6 +5883,8 @@ impl Agent {
             None => None,
         };
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let authenticated_machine_bindings =
+            std::sync::Arc::clone(&self.authenticated_machine_bindings);
         let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
         let user_cache = std::sync::Arc::clone(&self.user_discovery_cache);
         let bootstrap_cache = self.bootstrap_cache.clone();
@@ -6214,6 +6285,18 @@ impl Agent {
                     remember_verified_payload(&mut seen_identity_payloads, &raw_payload);
                 }
 
+                let now = Agent::unix_timestamp_secs();
+                if !identity_announcement_timestamp_is_acceptable(announcement.announced_at, now) {
+                    tracing::warn!(
+                        agent = %hex::encode(announcement.agent_id.as_bytes()),
+                        announced_at = announcement.announced_at,
+                        now,
+                        max_future_skew_secs = IDENTITY_ANNOUNCEMENT_CLOCK_SKEW_SECS,
+                        "ignoring far-future identity announcement"
+                    );
+                    continue;
+                }
+
                 // Evaluate trust for this (agent, machine) pair.
                 // Blocked or machine-pinning violations are silently dropped.
                 {
@@ -6297,9 +6380,6 @@ impl Agent {
                 )
                 .await;
 
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
 
                 // Add only globally-advertisable addresses to the persistent
                 // bootstrap cache. Legacy peers may still ship LAN, CGNAT,
@@ -6357,6 +6437,13 @@ impl Agent {
                     agent_certificate: announcement.agent_certificate.clone(),
                     agent_public_key: announcement.agent_public_key.clone(),
                 };
+                record_authenticated_machine_binding_from_message(
+                    &authenticated_machine_bindings,
+                    &msg,
+                    &announcement,
+                    now,
+                )
+                .await;
                 upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
                 upsert_discovered_agent(&cache, discovered_agent).await;
                 tracing::debug!(
@@ -7044,6 +7131,7 @@ impl Agent {
             std::sync::Arc::clone(&self.recent_delivery_cache),
             config,
             std::sync::Arc::clone(&self.revocation_set),
+            std::sync::Arc::clone(&self.authenticated_machine_bindings),
         )
         .await
         .map_err(|e| {
@@ -9603,6 +9691,9 @@ impl AgentBuilder {
             bootstrap_cache,
             gossip_cache_adapter,
             identity_discovery_cache,
+            authenticated_machine_bindings: std::sync::Arc::new(tokio::sync::RwLock::new(
+                dm_inbox::AuthenticatedMachineBindingCache::default(),
+            )),
             machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -12483,6 +12574,292 @@ fn discovered_agent_fixture(
         agent_certificate: None,
         agent_public_key: Vec::new(),
     }
+}
+
+#[cfg(test)]
+fn signed_identity_announcement_fixture(
+    agent_id: identity::AgentId,
+    machine: &identity::MachineKeypair,
+    announced_at: u64,
+) -> IdentityAnnouncement {
+    let machine_public_key = machine.public_key().as_bytes().to_vec();
+    let unsigned = IdentityAnnouncementUnsigned {
+        agent_id,
+        machine_id: machine.machine_id(),
+        user_id: None,
+        agent_certificate: None,
+        machine_public_key: machine_public_key.clone(),
+        addresses: Vec::new(),
+        announced_at,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+    };
+    let unsigned_bytes = bincode::serialize(&unsigned).expect("serialize announcement");
+    let machine_signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        machine.secret_key(),
+        &unsigned_bytes,
+    )
+    .expect("sign announcement")
+    .as_bytes()
+    .to_vec();
+    IdentityAnnouncement {
+        agent_id,
+        machine_id: machine.machine_id(),
+        user_id: None,
+        agent_certificate: None,
+        machine_public_key,
+        machine_signature,
+        addresses: Vec::new(),
+        announced_at,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+fn verified_identity_origin_message(sender: &identity::AgentKeypair) -> gossip::PubSubMessage {
+    gossip::PubSubMessage {
+        topic: "identity-ingest-test".to_string(),
+        payload: bytes::Bytes::new(),
+        sender: Some(sender.agent_id()),
+        sender_public_key: Some(sender.public_key().as_bytes().to_vec()),
+        verified: true,
+        trust_level: None,
+    }
+}
+
+#[tokio::test]
+async fn direct_origin_identity_ingest_populates_authenticated_binding() {
+    let sender = identity::AgentKeypair::generate().expect("sender keygen");
+    let machine = identity::MachineKeypair::generate().expect("machine keygen");
+    let now = 1_000;
+    let announcement = signed_identity_announcement_fixture(sender.agent_id(), &machine, now);
+    announcement.verify().expect("valid machine announcement");
+    let message = verified_identity_origin_message(&sender);
+    let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+        dm_inbox::AuthenticatedMachineBindingCache::default(),
+    ));
+
+    assert!(
+        record_authenticated_machine_binding_from_message(&bindings, &message, &announcement, now,)
+            .await
+    );
+    assert_eq!(
+        dm_inbox::authenticated_machine_binding_for_testing(&bindings, &sender.agent_id()).await,
+        Some(machine.machine_id())
+    );
+}
+
+#[tokio::test]
+async fn wrong_origin_machine_announcement_cannot_populate_or_overwrite_binding() {
+    let victim = identity::AgentKeypair::generate().expect("victim keygen");
+    let attacker = identity::AgentKeypair::generate().expect("attacker keygen");
+    let trusted_machine = identity::MachineKeypair::generate().expect("trusted machine keygen");
+    let attacker_machine = identity::MachineKeypair::generate().expect("attacker machine keygen");
+    let now = 2_000;
+    let trusted = signed_identity_announcement_fixture(victim.agent_id(), &trusted_machine, now);
+    let trusted_message = verified_identity_origin_message(&victim);
+    let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+        dm_inbox::AuthenticatedMachineBindingCache::default(),
+    ));
+    assert!(
+        record_authenticated_machine_binding_from_message(
+            &bindings,
+            &trusted_message,
+            &trusted,
+            now,
+        )
+        .await
+    );
+
+    let poisoned =
+        signed_identity_announcement_fixture(victim.agent_id(), &attacker_machine, now + 1);
+    poisoned.verify().expect("valid attacker machine signature");
+    let attacker_message = verified_identity_origin_message(&attacker);
+    assert!(
+        !record_authenticated_machine_binding_from_message(
+            &bindings,
+            &attacker_message,
+            &poisoned,
+            now + 1,
+        )
+        .await
+    );
+    assert_eq!(
+        dm_inbox::authenticated_machine_binding_for_testing(&bindings, &victim.agent_id()).await,
+        Some(trusted_machine.machine_id())
+    );
+}
+
+#[tokio::test]
+async fn verified_rebroadcast_cannot_populate_or_overwrite_authenticated_binding() {
+    let origin = identity::AgentKeypair::generate().expect("origin keygen");
+    let relay = identity::AgentKeypair::generate().expect("relay keygen");
+    let machine_a = identity::MachineKeypair::generate().expect("machine A keygen");
+    let machine_b = identity::MachineKeypair::generate().expect("machine B keygen");
+    let now = 3_000;
+    let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+        dm_inbox::AuthenticatedMachineBindingCache::default(),
+    ));
+    let direct = signed_identity_announcement_fixture(origin.agent_id(), &machine_a, now);
+    assert!(
+        record_authenticated_machine_binding_from_message(
+            &bindings,
+            &verified_identity_origin_message(&origin),
+            &direct,
+            now,
+        )
+        .await
+    );
+
+    let rebroadcast = signed_identity_announcement_fixture(origin.agent_id(), &machine_b, now + 1);
+    let relay_message = verified_identity_origin_message(&relay);
+    assert!(
+        !record_authenticated_machine_binding_from_message(
+            &bindings,
+            &relay_message,
+            &rebroadcast,
+            now + 1,
+        )
+        .await
+    );
+    assert_eq!(
+        dm_inbox::authenticated_machine_binding_for_testing(&bindings, &origin.agent_id()).await,
+        Some(machine_a.machine_id())
+    );
+}
+
+#[tokio::test]
+async fn missing_or_invalid_sender_key_cannot_populate_authenticated_binding() {
+    let origin = identity::AgentKeypair::generate().expect("origin keygen");
+    let machine = identity::MachineKeypair::generate().expect("machine keygen");
+    let now = 4_000;
+    let announcement = signed_identity_announcement_fixture(origin.agent_id(), &machine, now);
+    let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+        dm_inbox::AuthenticatedMachineBindingCache::default(),
+    ));
+
+    let mut missing = verified_identity_origin_message(&origin);
+    missing.sender_public_key = None;
+    assert!(
+        !record_authenticated_machine_binding_from_message(
+            &bindings,
+            &missing,
+            &announcement,
+            now,
+        )
+        .await
+    );
+    let mut invalid = verified_identity_origin_message(&origin);
+    invalid.sender_public_key = Some(vec![0xFF; 8]);
+    assert!(
+        !record_authenticated_machine_binding_from_message(
+            &bindings,
+            &invalid,
+            &announcement,
+            now,
+        )
+        .await
+    );
+    assert_eq!(
+        dm_inbox::authenticated_machine_binding_for_testing(&bindings, &origin.agent_id()).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn far_future_direct_origin_cannot_poison_portable_move_ordering() {
+    let origin = identity::AgentKeypair::generate().expect("origin keygen");
+    let machine_a = identity::MachineKeypair::generate().expect("machine A keygen");
+    let machine_b = identity::MachineKeypair::generate().expect("machine B keygen");
+    let now = 5_000;
+    let message = verified_identity_origin_message(&origin);
+    let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+        dm_inbox::AuthenticatedMachineBindingCache::default(),
+    ));
+    let current = signed_identity_announcement_fixture(origin.agent_id(), &machine_a, now);
+    assert!(
+        record_authenticated_machine_binding_from_message(&bindings, &message, &current, now,)
+            .await
+    );
+
+    let far_future = signed_identity_announcement_fixture(origin.agent_id(), &machine_b, u64::MAX);
+    assert!(
+        !record_authenticated_machine_binding_from_message(&bindings, &message, &far_future, now,)
+            .await
+    );
+    assert_eq!(
+        dm_inbox::authenticated_machine_binding_for_testing(&bindings, &origin.agent_id()).await,
+        Some(machine_a.machine_id())
+    );
+
+    let normal_move = signed_identity_announcement_fixture(origin.agent_id(), &machine_b, now + 1);
+    assert!(
+        record_authenticated_machine_binding_from_message(
+            &bindings,
+            &message,
+            &normal_move,
+            now + 1,
+        )
+        .await
+    );
+    assert_eq!(
+        dm_inbox::authenticated_machine_binding_for_testing(&bindings, &origin.agent_id()).await,
+        Some(machine_b.machine_id())
+    );
+}
+
+#[tokio::test]
+async fn revocation_discovery_eviction_preserves_authenticated_binding() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let receiver = Agent::builder()
+        .with_identity_dir(tempdir.path())
+        .build()
+        .await
+        .expect("receiver agent");
+    let origin = identity::AgentKeypair::generate().expect("origin keygen");
+    let machine = identity::MachineKeypair::generate().expect("machine keygen");
+    let now = 6_000;
+    let announcement = signed_identity_announcement_fixture(origin.agent_id(), &machine, now);
+    assert!(
+        record_authenticated_machine_binding_from_message(
+            &receiver.authenticated_machine_bindings,
+            &verified_identity_origin_message(&origin),
+            &announcement,
+            now,
+        )
+        .await
+    );
+    let mut discovered = discovered_agent_fixture(0x66, now, &[], None);
+    discovered.agent_id = origin.agent_id();
+    discovered.machine_id = machine.machine_id();
+    discovered.machine_public_key = machine.public_key().as_bytes().to_vec();
+    receiver
+        .insert_discovered_agent_for_testing(discovered)
+        .await;
+    assert!(receiver.cached_agent(&origin.agent_id()).await.is_some());
+
+    receiver
+        .evict_revoked_subject(&revocation::RevokedSubject::Machine(machine.machine_id()))
+        .await;
+
+    assert!(receiver.cached_agent(&origin.agent_id()).await.is_none());
+    assert_eq!(
+        dm_inbox::authenticated_machine_binding_for_testing(
+            &receiver.authenticated_machine_bindings,
+            &origin.agent_id(),
+        )
+        .await,
+        Some(machine.machine_id())
+    );
 }
 
 #[tokio::test]
