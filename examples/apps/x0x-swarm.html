@@ -96,7 +96,19 @@ const API_URL = (CONFIG.get("api") || localStorage.getItem("x0x.apiBase") || "ht
 const API_TOKEN = CONFIG.get("token") || localStorage.getItem("x0x.apiToken") || "";
 if (CONFIG.get("api")) localStorage.setItem("x0x.apiBase", API_URL);
 if (CONFIG.get("token")) localStorage.setItem("x0x.apiToken", API_TOKEN);
-const WS_URL = API_URL.replace(/^http/, "ws") + "/ws" + (API_TOKEN ? "?token=" + encodeURIComponent(API_TOKEN) : "");
+const WS_BASE = API_URL.replace(/^http/, "ws") + "/ws";
+// The durable token must never appear in a URL; exchange it for a short-lived
+// session token (POST /auth/session) each time the WebSocket is opened.
+async function wsUrl() {
+  if (!API_TOKEN) return WS_BASE;
+  const res = await fetch(API_URL + "/auth/session", {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + API_TOKEN },
+  });
+  if (!res.ok) throw new Error("session mint failed: " + res.status);
+  const body = await res.json();
+  return WS_BASE + "?token=" + encodeURIComponent(body.session_token);
+}
 
 let ws = null, connected = false, myAgentId = null, sessionId = null, taskListId = null;
 let myTasks = [], feedEvents = [], agents = new Map(), taskMap = new Map();
@@ -168,9 +180,11 @@ async function ensureTaskList() {
   } catch (e) { console.warn("Could not create task list", e); }
 }
 
-function connectWs() {
+async function connectWs() {
   if (ws) try { ws.close(); } catch (e) { /* ignore */ }
-  ws = new WebSocket(WS_URL);
+  let url;
+  try { url = await wsUrl(); } catch (e) { setStatus(false, "Auth failed"); return; }
+  ws = new WebSocket(url);
   ws.onopen = () => {
     setStatus(false, "Subscribing");
   };

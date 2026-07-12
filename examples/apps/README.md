@@ -19,7 +19,7 @@ The apps connect to `http://localhost:12700` by default. To target another daemo
 x0x-chat.html?api=http://127.0.0.1:51555&token=<api-token>
 ```
 
-The apps remember those values in `localStorage` as `x0x.apiBase` and `x0x.apiToken`. WebSocket apps derive their `ws://.../ws?token=...` endpoint from the configured API base.
+The apps remember those values in `localStorage` as `x0x.apiBase` and `x0x.apiToken`. WebSocket apps exchange the durable token for a short-lived session token (`POST /auth/session`) on every connection attempt, then connect to `ws://.../ws?token=<session_token>` — the durable token never appears in a URL.
 
 When using an authenticated daemon from a browser, serve these files from a loopback HTTP origin so the daemon CORS policy can allow the request:
 
