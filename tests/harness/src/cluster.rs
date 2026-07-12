@@ -49,17 +49,83 @@ impl AgentInstance {
     }
 
     /// Start the daemon again after [`Self::stop`] and wait until healthy.
+    ///
+    /// Test-only: when `X0X_TEST_LOG_DIR` is set, the restarted daemon's
+    /// stdout/stderr are appended to `{dir}/{name}.restart.{out,err}.log`
+    /// (outside the per-node temp data_dir, so logs survive cleanup and are
+    /// preserved on test failure). When unset, I/O is discarded as before.
+    /// The daemon inherits `RUST_LOG` from this process — set it in the test
+    /// environment to raise verbosity for post-restart diagnostics.
     pub async fn start(&mut self) {
+        let (stdout, stderr) = match test_log_stdio(&self.name, "restart") {
+            Some(pair) => pair,
+            None => (Stdio::null(), Stdio::null()),
+        };
         self.process = Command::new(&self.binary)
             .arg("--config")
             .arg(&self.config_path)
             .arg("--name")
             .arg(&self.name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
             .spawn()
             .unwrap_or_else(|e| panic!("Failed to restart x0xd {}: {e}", self.name));
         self.refresh_runtime_state().await;
+    }
+    /// Restart the daemon on a FORCED NEW QUIC (bind) port, keeping the same
+    /// data_dir (hence the same `machine.key`/`agent.key` → same MachineId and
+    /// QUIC peer_id), and with NO bootstrap peers configured.
+    ///
+    /// This is the named-node-restart primitive for the reconnect-policy
+    /// regression: the restarted peer cannot startup-dial anyone (no
+    /// bootstrap, `--no-hard-coded-bootstrap`), so the mesh can only reform
+    /// via the SURVIVOR's proactive reconnect refreshing the new mDNS-announced
+    /// endpoint. Returns the new QUIC bind port so the test can assert it
+    /// differs from the pre-kill port (no fixed-port shortcut).
+    pub async fn restart_on_new_quic_port_no_bootstrap(&mut self) -> u16 {
+        self.stop();
+        let new_bind = allocate_unused_udp_port();
+
+        // Rewrite the config in place: drop every `bootstrap_peers` line (so
+        // the restarted peer cannot initiate) and repoint `bind_address` at the
+        // new port. `data_dir` is preserved verbatim → identity is preserved.
+        let old_cfg = std::fs::read_to_string(&self.config_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", self.config_path.display()));
+        let mut rebuilt = String::new();
+        for line in old_cfg.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("bootstrap_peers") {
+                continue;
+            }
+            if trimmed.starts_with("bind_address") {
+                rebuilt.push_str(&format!("bind_address = \"0.0.0.0:{new_bind}\"\n"));
+                continue;
+            }
+            rebuilt.push_str(line);
+            rebuilt.push('\n');
+        }
+        std::fs::write(&self.config_path, &rebuilt)
+            .unwrap_or_else(|e| panic!("rewrite {}: {e}", self.config_path.display()));
+
+        let (stdout, stderr) = match test_log_stdio(&self.name, "restart-newport") {
+            Some(pair) => pair,
+            None => (Stdio::null(), Stdio::null()),
+        };
+        self.process = Command::new(&self.binary)
+            .arg("--config")
+            .arg(&self.config_path)
+            .arg("--name")
+            .arg(&self.name)
+            // No hard-coded internet bootstrap either: this peer must be
+            // unreachable by its own dialing so reconnection is attributable
+            // solely to the survivor's proactive path.
+            .arg("--no-hard-coded-bootstrap")
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .unwrap_or_else(|e| panic!("Failed to restart x0xd {}: {e}", self.name));
+        self.refresh_runtime_state().await;
+        new_bind
     }
 
     async fn refresh_runtime_state(&mut self) {
@@ -529,6 +595,38 @@ fn allocate_unused_udp_port() -> u16 {
         .port()
 }
 
+/// Test-only daemon log capture.
+///
+/// When `X0X_TEST_LOG_DIR` is set, returns stdout/stderr `Stdio` handles that
+/// append to `{dir}/{name}.{suffix}.{out,err}.log`. That path lives outside the
+/// per-node temp data_dir, so the logs survive data-dir cleanup and are
+/// preserved on test failure. Returns `None` when the env var is unset so the
+/// caller's default sink (per-node data-dir files, or `Stdio::null()`) is used
+/// and other tests are unaffected.
+///
+/// The daemon inherits `RUST_LOG` from this process, so set `RUST_LOG` (e.g.
+/// `x0x::crdt=debug,x0x::server=debug`) in the test environment to raise
+/// verbosity; the directive is honoured by the daemon's `init_logging`.
+fn test_log_stdio(name: &str, suffix: &str) -> Option<(Stdio, Stdio)> {
+    let dir = std::env::var("X0X_TEST_LOG_DIR").ok()?;
+    let dir = dir.trim();
+    if dir.is_empty() {
+        return None;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let base = std::path::Path::new(dir).join(format!("{name}.{suffix}"));
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}.log", base.display()))
+            .unwrap_or_else(|e| panic!("open test log {base:?}: {e}"))
+    };
+    // Two independent append handles to the same path; both file descriptions
+    // share O_APPEND, so interleaved stdout/stderr writes stay ordered.
+    Some((Stdio::from(open()), Stdio::from(open())))
+}
+
 async fn start_instance(
     binary: &PathBuf,
     name: &str,
@@ -563,12 +661,20 @@ async fn start_instance(
     );
     std::fs::write(&config_path, &config_content).expect("write config");
 
-    let stdout_path = config_dir.join("daemon.stdout.log");
-    let stderr_path = config_dir.join("daemon.stderr.log");
-    let stdout = std::fs::File::create(&stdout_path)
-        .unwrap_or_else(|e| panic!("Failed to create stdout log for {name}: {e}"));
-    let stderr = std::fs::File::create(&stderr_path)
-        .unwrap_or_else(|e| panic!("Failed to create stderr log for {name}: {e}"));
+    // Test-only capture (see `test_log_stdio`); fall back to per-node data-dir
+    // logs so the default behaviour is unchanged.
+    let (stdout, stderr) = match test_log_stdio(name, "start") {
+        Some(pair) => pair,
+        None => {
+            let stdout_path = config_dir.join("daemon.stdout.log");
+            let stderr_path = config_dir.join("daemon.stderr.log");
+            let out = std::fs::File::create(&stdout_path)
+                .unwrap_or_else(|e| panic!("Failed to create stdout log for {name}: {e}"));
+            let err = std::fs::File::create(&stderr_path)
+                .unwrap_or_else(|e| panic!("Failed to create stderr log for {name}: {e}"));
+            (Stdio::from(out), Stdio::from(err))
+        }
+    };
 
     let process = Command::new(binary)
         .arg("--config")
@@ -576,8 +682,8 @@ async fn start_instance(
         .arg("--name")
         .arg(name)
         .arg("--no-hard-coded-bootstrap")
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()
         .unwrap_or_else(|e| panic!("Failed to start x0xd {name}: {e}"));
 

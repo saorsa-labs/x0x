@@ -31,5 +31,7 @@ pub mod sync;
 pub use delta::KvStoreDelta;
 pub use entry::KvEntry;
 pub use error::{KvError, Result};
-pub use store::{AccessPolicy, KvStore, KvStoreId};
+pub use store::{
+    AccessPolicy, AnchorChannel, KvStore, KvStoreId, OwnershipSource, OwnershipStatus,
+};
 pub use sync::KvStoreSync;

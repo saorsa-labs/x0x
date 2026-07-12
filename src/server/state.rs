@@ -517,6 +517,18 @@ pub(super) struct AppState {
     /// Disk location for the CRDT subscription manifest (instance data dir,
     /// alongside `directory-subscriptions.json`).
     pub(super) crdt_subscriptions_path: PathBuf,
+    /// Serializes snapshot-and-write of `crdt-subscriptions.json` so an older
+    /// in-memory snapshot cannot rename over a newer one after a concurrent
+    /// `crdt_subscriptions::record` (the snapshot-after-unlock lost update).
+    /// Mirrors `named_groups_persistence_lock`.
+    pub(super) crdt_subscriptions_persistence_lock: Mutex<()>,
+    /// Per-`(kind,id)` reservation locks serialising the full
+    /// create/join → insert-handle → persist-manifest transaction for CRDT
+    /// subscriptions. Shared by REST handlers and rehydration so concurrent
+    /// same-`(kind,id)` requests cannot interleave handle insertion with
+    /// failure rollback, and REST-vs-rehydrate cannot spawn duplicate
+    /// long-lived sync listeners. Keyed by `"{kind}:{id}"`.
+    pub(super) crdt_handle_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     pub(super) named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
     pub(super) named_groups_path: PathBuf,
     /// Serializes snapshot-and-write of `named_groups.json` so an older

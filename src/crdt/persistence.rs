@@ -100,7 +100,22 @@ impl TaskListStorage {
 
         let serialized = fs::read(&file_path).await?;
 
-        bincode::deserialize(&serialized).map_err(crate::crdt::error::CrdtError::Serialization)
+        let mut list: TaskList = bincode::deserialize(&serialized)
+            .map_err(crate::crdt::error::CrdtError::Serialization)?;
+
+        // Run the fail-closed admission gate on every task so a tampered or
+        // corrupted on-disk state cannot bypass provenance verification.
+        // Drops unauthenticated checkbox elements and restores attested
+        // elements censored by forged tombstones.
+        let dropped = list.admit_all();
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "purged unauthenticated checkbox elements during persistence load"
+            );
+        }
+
+        Ok(list)
     }
 
     /// List all stored task lists.

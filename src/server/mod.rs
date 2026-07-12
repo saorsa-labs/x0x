@@ -954,6 +954,8 @@ pub async fn serve_with_options(
         kv_stores: RwLock::new(HashMap::new()),
         crdt_subscriptions: RwLock::new(crdt_subscriptions::CrdtSubscriptionManifest::default()),
         crdt_subscriptions_path: config.data_dir.join("crdt-subscriptions.json"),
+        crdt_subscriptions_persistence_lock: Mutex::new(()),
+        crdt_handle_locks: RwLock::new(HashMap::new()),
         named_groups: RwLock::new(named_groups),
         named_groups_path,
         named_groups_persistence_lock: Mutex::new(()),
@@ -15808,23 +15810,57 @@ struct PutValueRequest {
     content_type: Option<String>,
 }
 
+/// Request body for POST /stores/:id/join.
+///
+/// `expected_owner` is the optional hex-encoded AgentId of the authoritative
+/// owner, supplied out-of-band (the local user/operator is the trust root).
+/// Omitting it yields a permanently read-only replica (no permissive fallback).
+#[derive(Debug, Default, Deserialize)]
+struct JoinStoreRequest {
+    expected_owner: Option<String>,
+}
+
 /// Response entry for GET /stores.
 #[derive(Debug, Serialize)]
 struct StoreListEntry {
     id: String,
     topic: String,
+    /// Hex-encoded anchored owner, or `null` for a read-only no-anchor store.
+    owner: Option<String>,
+    /// Access policy string.
+    policy: String,
+    /// Store version.
+    version: u64,
+    /// Owner-announce policy freshness counter.
+    policy_version: u64,
+    /// Strongly-typed ownership discriminant.
+    ownership_status: x0x::kv::OwnershipStatus,
 }
 
 /// GET /stores
 async fn list_kv_stores(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let stores = state.kv_stores.read().await;
-    let entries: Vec<StoreListEntry> = stores
-        .keys()
-        .map(|id| StoreListEntry {
-            id: id.clone(),
+    // Snapshot (id, handle) pairs without holding the read lock across the
+    // per-store ownership_info() awaits.
+    let pairs: Vec<(String, x0x::KvStoreHandle)> = {
+        let stores = state.kv_stores.read().await;
+        stores
+            .iter()
+            .map(|(id, h)| (id.clone(), h.clone()))
+            .collect()
+    };
+    let mut entries = Vec::with_capacity(pairs.len());
+    for (id, handle) in pairs {
+        let info = handle.ownership_info().await;
+        entries.push(StoreListEntry {
             topic: id.clone(),
-        })
-        .collect();
+            id,
+            owner: info.owner,
+            policy: info.policy,
+            version: info.version,
+            policy_version: info.policy_version,
+            ownership_status: info.ownership_status,
+        });
+    }
     Json(serde_json::json!({ "ok": true, "stores": entries }))
 }
 
@@ -15833,13 +15869,34 @@ async fn create_kv_store(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateStoreRequest>,
 ) -> impl IntoResponse {
+    let id = req.topic.clone();
+    // Reserve the entire handle+manifest transaction for this (kind,id) so
+    // a concurrent create/rehydrate for the same id cannot interleave handle
+    // insertion with failure rollback, or spawn a duplicate listener.
+    let reservation =
+        crdt_subscriptions::handle_reservation(&state, crdt_subscriptions::KIND_KV_STORE, &id)
+            .await;
+    let _guard = reservation.lock().await;
+    // Under the reservation: if a handle already exists (created by a prior
+    // successful request or rehydration), return conflict rather than
+    // overwriting it and leaking the existing sync listener.
+    if state.kv_stores.read().await.contains_key(&id) {
+        return api_error(StatusCode::CONFLICT, "store already exists");
+    }
     match state.agent.create_kv_store(&req.name, &req.topic).await {
         Ok(handle) => {
-            let id = req.topic.clone();
+            let info = handle.ownership_info().await;
             state.kv_stores.write().await.insert(id.clone(), handle);
             // Persist the registration so it survives a daemon restart
             // (rehydrated after join_network — see crdt_subscriptions).
-            crdt_subscriptions::record(
+            // Record the owner so a restarted creator re-anchors on itself.
+            let owner_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let mut extra = serde_json::Map::new();
+            extra.insert(
+                "expected_owner".to_string(),
+                serde_json::Value::String(owner_hex),
+            );
+            if let Err(e) = crdt_subscriptions::record(
                 &state,
                 crdt_subscriptions::CrdtSubscriptionEntry {
                     kind: crdt_subscriptions::KIND_KV_STORE.to_string(),
@@ -15847,14 +15904,26 @@ async fn create_kv_store(
                     name: req.name.clone(),
                     topic: req.topic.clone(),
                     role: crdt_subscriptions::ROLE_CREATED.to_string(),
-                    extra: serde_json::Map::new(),
+                    extra,
                 },
             )
-            .await;
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({ "ok": true, "id": id })),
-            )
+            .await
+            {
+                // Durable write failed: roll back the live handle so success is
+                // not acknowledged for an un-persisted registration.
+                tracing::error!("failed to persist kv store registration {id}: {e}");
+                state.kv_stores.write().await.remove(&id);
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to persist subscription registration: {e}"),
+                );
+            }
+            let mut resp = serde_json::to_value(&info).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = resp.as_object_mut() {
+                obj.insert("ok".to_string(), serde_json::Value::Bool(true));
+                obj.insert("id".to_string(), serde_json::Value::String(id));
+            }
+            (StatusCode::CREATED, Json(resp))
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
@@ -15864,14 +15933,55 @@ async fn create_kv_store(
 async fn join_kv_store(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    body: Option<Json<JoinStoreRequest>>,
 ) -> impl IntoResponse {
-    match state.agent.join_kv_store(&id).await {
+    // The out-of-band owner anchor is REQUIRED: a replica with no anchor can
+    // never accept policy-restricted data, so an unanchored join is a dead
+    // replica, not a successful join. The local user/operator is the trust
+    // root for this param.
+    let owner: AgentId = match body.and_then(|Json(r)| r.expected_owner) {
+        Some(hex_owner) => match parse_agent_id_hex(&hex_owner) {
+            Ok(agent) => agent,
+            Err(e) => return bad_request(format!("invalid expected_owner: {e}")),
+        },
+        None => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "owner_required: an expected_owner anchor is required to join a store",
+            )
+        }
+    };
+    // Reserve the entire handle+manifest transaction for this (kind,id) so
+    // a concurrent join/rehydrate for the same id cannot interleave handle
+    // insertion with failure rollback, or spawn a duplicate listener.
+    let reservation =
+        crdt_subscriptions::handle_reservation(&state, crdt_subscriptions::KIND_KV_STORE, &id)
+            .await;
+    let _guard = reservation.lock().await;
+    // Under the reservation: if a handle already exists (created by a prior
+    // successful request or rehydration), return conflict rather than
+    // overwriting it and leaking the existing sync listener.
+    if state.kv_stores.read().await.contains_key(&id) {
+        return api_error(StatusCode::CONFLICT, "store already joined");
+    }
+    match state
+        .agent
+        .join_kv_store(&id, owner, x0x::kv::store::AnchorChannel::RestParam)
+        .await
+    {
         Ok(handle) => {
+            let info = handle.ownership_info().await;
             state.kv_stores.write().await.insert(id.clone(), handle);
             // Persist the registration so it survives a daemon restart
             // (rehydrated after join_network — see crdt_subscriptions). The
             // join path only knows the topic, so it doubles as the name.
-            crdt_subscriptions::record(
+            // Record the anchor so rehydrate re-anchors on the same owner.
+            let mut extra = serde_json::Map::new();
+            extra.insert(
+                "expected_owner".to_string(),
+                serde_json::Value::String(hex::encode(owner.as_bytes())),
+            );
+            if let Err(e) = crdt_subscriptions::record(
                 &state,
                 crdt_subscriptions::CrdtSubscriptionEntry {
                     kind: crdt_subscriptions::KIND_KV_STORE.to_string(),
@@ -15879,14 +15989,26 @@ async fn join_kv_store(
                     name: id.clone(),
                     topic: id.clone(),
                     role: crdt_subscriptions::ROLE_JOINED.to_string(),
-                    extra: serde_json::Map::new(),
+                    extra,
                 },
             )
-            .await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "id": id })),
-            )
+            .await
+            {
+                // Durable write failed: roll back the live handle so success is
+                // not acknowledged for an un-persisted registration.
+                tracing::error!("failed to persist kv store join {id}: {e}");
+                state.kv_stores.write().await.remove(&id);
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to persist subscription registration: {e}"),
+                );
+            }
+            let mut resp = serde_json::to_value(&info).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = resp.as_object_mut() {
+                obj.insert("ok".to_string(), serde_json::Value::Bool(true));
+                obj.insert("id".to_string(), serde_json::Value::String(id));
+            }
+            (StatusCode::OK, Json(resp))
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
@@ -21154,6 +21276,8 @@ mod tests {
             kv_stores: RwLock::new(HashMap::new()),
             crdt_subscriptions: RwLock::new(crdt_subscriptions::CrdtSubscriptionManifest::default()),
             crdt_subscriptions_path: data_dir.join("crdt-subscriptions.json"),
+            crdt_subscriptions_persistence_lock: Mutex::new(()),
+            crdt_handle_locks: RwLock::new(HashMap::new()),
             named_groups: RwLock::new(named_groups),
             named_groups_path,
             named_groups_persistence_lock: Mutex::new(()),

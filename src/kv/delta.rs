@@ -13,6 +13,21 @@ use std::collections::{HashMap, HashSet};
 /// Unique tag for OR-Set elements: (PeerId, sequence_number).
 pub type UniqueTag = (PeerId, u64);
 
+/// Deserialize an optional owner checkpoint, tolerating its absence (trailing
+/// field). A legacy peer's delta omits this field entirely; decoding it on a
+/// current node yields `None` instead of an EOF error, preserving cross-version
+/// delta compatibility. A malformed value is also treated as `None` (the delta
+/// then falls back to sender-auth).
+pub(crate) fn deserialize_checkpoint_opt<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<crate::kv::store::OwnerCheckpoint>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(Option::<crate::kv::store::OwnerCheckpoint>::deserialize(deserializer).unwrap_or(None))
+}
+
 /// Delta representing changes to a KvStore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvStoreDelta {
@@ -38,6 +53,15 @@ pub struct KvStoreDelta {
 
     /// Version number of this delta.
     pub version: u64,
+
+    /// Owner-signed checkpoint carried by owner-published deltas and relays.
+    /// Replicas cache it; an anchored receiver verifies the owner signature +
+    /// recomputed content root and adopts the proven entries independent of
+    /// the relayer. `None` uses the existing sender-auth path. The field is
+    /// trailing and deserializes to `None` if absent (so a legacy pre-checkpoint
+    /// peer's 7-field delta still decodes on a current node).
+    #[serde(default, deserialize_with = "deserialize_checkpoint_opt")]
+    pub owner_checkpoint: Option<crate::kv::store::OwnerCheckpoint>,
 }
 
 impl KvStoreDelta {
@@ -52,6 +76,7 @@ impl KvStoreDelta {
             allowlist_additions: None,
             allowlist_removals: None,
             version,
+            owner_checkpoint: None,
         }
     }
 
@@ -72,7 +97,6 @@ impl KvStoreDelta {
     }
 
     /// Check if this delta is empty.
-    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.added.is_empty()
             && self.removed.is_empty()
@@ -80,6 +104,7 @@ impl KvStoreDelta {
             && self.name_update.is_none()
             && self.allowlist_additions.is_none()
             && self.allowlist_removals.is_none()
+            && self.owner_checkpoint.is_none()
     }
 }
 
@@ -245,5 +270,37 @@ mod tests {
         assert_eq!(delta.version, restored.version);
         assert!(restored.allowlist_additions.is_some());
         assert_eq!(restored.allowlist_additions.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn test_legacy_delta_without_checkpoint_decodes() {
+        // A pre-checkpoint (legacy / v0.30.1) delta omits the owner_checkpoint
+        // field entirely. It must still decode on a current node, with the
+        // checkpoint defaulting to None — otherwise cross-version Signed-store
+        // convergence (legacy owner -> current joiner) would break.
+        #[derive(Serialize)]
+        struct LegacyDelta {
+            added: HashMap<String, (KvEntry, UniqueTag)>,
+            removed: HashMap<String, HashSet<UniqueTag>>,
+            updated: HashMap<String, KvEntry>,
+            name_update: Option<LwwRegister<String>>,
+            allowlist_additions: Option<Vec<AgentId>>,
+            allowlist_removals: Option<Vec<AgentId>>,
+            version: u64,
+        }
+        let legacy = LegacyDelta {
+            added: HashMap::new(),
+            removed: HashMap::new(),
+            updated: HashMap::new(),
+            name_update: None,
+            allowlist_additions: None,
+            allowlist_removals: None,
+            version: 7,
+        };
+        let bytes = bincode::serialize(&legacy).expect("serialize legacy");
+        let restored: KvStoreDelta =
+            bincode::deserialize(&bytes).expect("legacy delta must decode");
+        assert_eq!(restored.version, 7);
+        assert!(restored.owner_checkpoint.is_none());
     }
 }

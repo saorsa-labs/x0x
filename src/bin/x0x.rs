@@ -1102,9 +1102,16 @@ enum StoreSub {
         topic: String,
     },
     /// Join an existing store by topic.
+    ///
+    /// `--owner` (hex AgentId of the authoritative owner) is REQUIRED: a join
+    /// without an owner anchor is a dead replica. The owner anchor lets the
+    /// joiner accept the owner's deltas and write iff it is the owner.
     Join {
         /// Gossip topic.
         topic: String,
+        /// Hex-encoded AgentId of the authoritative owner (the required anchor).
+        #[arg(long)]
+        owner: String,
     },
     /// List keys in a store.
     Keys {
@@ -1766,7 +1773,9 @@ async fn run(
             Some(StoreSub::Create { name, topic }) => {
                 commands::store::create(&client, &name, &topic).await
             }
-            Some(StoreSub::Join { topic }) => commands::store::join(&client, &topic).await,
+            Some(StoreSub::Join { topic, owner }) => {
+                commands::store::join(&client, &topic, &owner).await
+            }
             Some(StoreSub::Keys { store_id }) => commands::store::keys(&client, &store_id).await,
             Some(StoreSub::Put {
                 store_id,
@@ -1984,7 +1993,7 @@ x0x (v{VERSION})
 +-- Data
 |   +-- store list         List key-value stores
 |   +-- store create       Create a KV store
-|   +-- store join         Join existing store by topic
+|   +-- store join         Join existing store by topic (--owner to anchor)
 |   +-- store keys         List keys
 |   +-- store put          Write a value
 |   +-- store get          Read a value

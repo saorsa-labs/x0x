@@ -6,11 +6,15 @@
 //! forked the joiner's replica away from the state authorized peers accept
 //! (the creator rejected the joiner's deltas, but the joiner kept its junk).
 //!
-//! The fix: a joined replica starts with no owner (fail closed, read-only),
-//! learns the authoritative owner + policy from an owner-signed announcement
-//! on the state-sync side topic, and enforces the same `is_authorized` rule
-//! on local writes as on inbound deltas. REST returns 403 for rejected
-//! writes.
+//! The fix: ownership is anchored ONLY at construction from trusted
+//! out-of-band input (an explicit `expected_owner` at join). It is NEVER
+//! adopted from an owner-signed announcement — `verified_sender == owner` is
+//! trivially satisfied by any self-claim, so learning ownership from an
+//! announce would let any agent that speaks first seize the topic
+//! (first-self-capture). A joiner anchored on the real owner accepts its
+//! deltas and enforces the same `is_authorized` rule on local writes as on
+//! inbound deltas; a no-anchor join is permanently read-only (no permissive
+//! fallback). REST returns 403 for rejected writes.
 //!
 //! All tests are `#[ignore]` — they boot real x0xd daemons.
 //! Run with: cargo nextest run --test kv_signed_store_auth -- --ignored
@@ -67,14 +71,19 @@ async fn joiner_put_on_signed_store_is_403_and_does_not_mutate() {
         .await;
     assert!(r.status().is_success(), "alice (owner) writes seed key");
 
-    // Bob joins. His replica must sync the seed key — which also proves he
-    // has adopted the authoritative owner, since a replica with an unknown
-    // owner rejects all inbound deltas (fail closed).
+    // Bob joins, anchoring on Alice's authoritative owner (out-of-band). His
+    // replica now accepts Alice's deltas and converges. Ownership is anchored
+    // at construction — never learned from an (attackable) announce — so a
+    // rogue that self-announces first cannot seize the topic.
+    let alice_id = pair.alice.agent_id().await;
     let r = pair
         .bob
-        .post(&format!("/stores/{topic}/join"), serde_json::json!({}))
+        .post(
+            &format!("/stores/{topic}/join"),
+            serde_json::json!({ "expected_owner": alice_id }),
+        )
         .await;
-    assert!(r.status().is_success(), "bob joins store");
+    assert!(r.status().is_success(), "bob joins store anchored on alice");
     wait_for_key(&pair.bob, &topic, "seed", 60).await;
 
     // THE DEFECT: bob (non-owner) PUTs into the Signed store. This used to

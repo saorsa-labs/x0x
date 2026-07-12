@@ -6518,9 +6518,14 @@ impl Agent {
                 // PlumTree topic trees once the QUIC connection is established.
                 if announcement.agent_id != own_agent_id
                     && !auto_connect_addresses.is_empty()
-                    && !auto_connect_attempted.contains(&announcement.agent_id)
+                    && (!auto_connect_attempted.contains(&announcement.agent_id)
+                        || (if let Some(net) = &network {
+                            !net.is_connected(&ant_quic::PeerId(announcement.machine_id.0)).await
+                        } else {
+                            false
+                        }))
                 {
-                    if let Some(ref net) = &network {
+                    if let Some(net) = &network {
                         let ant_peer = ant_quic::PeerId(announcement.machine_id.0);
                         if !net.is_connected(&ant_peer).await {
                             auto_connect_attempted.insert(announcement.agent_id);
@@ -7574,14 +7579,30 @@ impl Agent {
         match subject {
             revocation::RevokedSubject::Agent(agent_id) => {
                 // Remove from identity cache, which also starves the verified annotation.
-                let mut cache = self.identity_discovery_cache.write().await;
-                if let Some(entry) = cache.remove(agent_id) {
+                let revoked_machine = {
+                    let mut cache = self.identity_discovery_cache.write().await;
+                    let m = cache.remove(agent_id).map(|entry| entry.machine_id);
+                    drop(cache);
+                    m
+                };
+                if let Some(machine_id) = revoked_machine {
                     // Also evict the linked machine so it cannot be dialed.
-                    drop(cache);
                     let mut mcache = self.machine_discovery_cache.write().await;
-                    mcache.remove(&entry.machine_id);
-                } else {
-                    drop(cache);
+                    mcache.remove(&machine_id);
+                    drop(mcache);
+                    // Suppress redial and tear down any live connection to the
+                    // revoked machine (final review P1: never redial
+                    // revocation). disconnect_with_reason records the tombstone
+                    // regardless of connect state, so a later transport close
+                    // or stale lifecycle Closed cannot redial it either.
+                    if let Some(net) = &self.network {
+                        let _ = net
+                            .disconnect_with_reason(
+                                &ant_quic::PeerId(machine_id.0),
+                                network::DisconnectReason::Revocation,
+                            )
+                            .await;
+                    }
                 }
                 // Best-effort: mark as Blocked in the contact store so that
                 // trust evaluation also refuses the agent on any late-arriving path.
@@ -7601,6 +7622,18 @@ impl Agent {
                 // Also evict any agents linked to this machine.
                 let mut cache = self.identity_discovery_cache.write().await;
                 cache.retain(|_, agent| agent.machine_id != *machine_id);
+                drop(cache);
+                // Suppress redial and tear down any live connection (final
+                // review P1: never redial revocation). The tombstone is set
+                // inside disconnect_with_reason regardless of connect state.
+                if let Some(net) = &self.network {
+                    let _ = net
+                        .disconnect_with_reason(
+                            &ant_quic::PeerId(machine_id.0),
+                            network::DisconnectReason::Revocation,
+                        )
+                        .await;
+                }
                 tracing::info!(
                     machine = %hex::encode(machine_id.as_bytes()),
                     "evicted revoked machine from discovery cache"
@@ -8034,7 +8067,12 @@ impl Agent {
         let lifecycle_dm = std::sync::Arc::clone(&dm);
         let event_token = self.shutdown_token.clone();
         let lifecycle_token = self.shutdown_token.clone();
-
+        let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
+        let active_reconnects: ReconnectTracker =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // Clones for the lifecycle watcher task (Task 1 moves the originals).
+        let lifecycle_machine_cache = std::sync::Arc::clone(&machine_cache);
+        let lifecycle_reconnects = std::sync::Arc::clone(&active_reconnects);
         self.spawn_tracked(async move {
             let mut rx = network.subscribe();
             tracing::info!("Network event reconciliation listener started");
@@ -8072,8 +8110,15 @@ impl Agent {
                         if let Some(agent_id) = agent_id {
                             dm.mark_connected(agent_id, machine_id).await;
                         }
+                        // Cancel any pending proactive reconnect for this peer
+                        // — the connection is back, no need to keep trying.
+                        if let Ok(mut tracker) = active_reconnects.lock() {
+                            if let Some(handle) = tracker.remove(&peer_id) {
+                                handle.abort();
+                            }
+                        }
                     }
-                    network::NetworkEvent::PeerDisconnected { peer_id } => {
+                    network::NetworkEvent::PeerDisconnected { peer_id, reason } => {
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
                             let cache = cache.read().await;
@@ -8088,6 +8133,22 @@ impl Agent {
                         };
                         if let Some(agent_id) = agent_id {
                             dm.mark_disconnected(&agent_id).await;
+                        }
+                        // Schedule a bounded backoff reconnect only for
+                        // transport-level disconnects (idle timeout, remote
+                        // daemon restart, network failure). Policy rejection,
+                        // pool eviction, admin teardown, revocation, and
+                        // shutdown carry a non-transport reason and must never
+                        // be redialed — otherwise proactive reconnect undoes a
+                        // security/eviction decision (final review P1).
+                        if reason.reconnect_eligible() {
+                            schedule_reconnect(
+                                std::sync::Arc::clone(&network),
+                                std::sync::Arc::clone(&machine_cache),
+                                event_token.clone(),
+                                peer_id,
+                                std::sync::Arc::clone(&active_reconnects),
+                            );
                         }
                     }
                     _ => {}
@@ -8136,6 +8197,28 @@ impl Agent {
                             Some(generation),
                             format!("closed: {reason}"),
                         );
+                        // Transport-level close (e.g. remote daemon restart, QUIC
+                        // idle timeout). Schedule a bounded backoff reconnect so
+                        // a known/mDNS-discovered peer is re-dialed without
+                        // waiting for a new external trigger. This is the
+                        // primary fix for the post-restart transport failure.
+                        //
+                        // A non-transport disconnect (policy rejection, LRU/idle
+                        // eviction, admin, revocation) records a suppression
+                        // tombstone *before* it closes the connection, so the
+                        // `Closed` event fired by that close must not redial —
+                        // this is the second event stream the review flagged.
+                        // Genuine transport closes leave no tombstone and are
+                        // reconnect-eligible (the named-node restart path).
+                        if !lifecycle_network.is_reconnect_suppressed(peer_id.0) {
+                            schedule_reconnect(
+                                std::sync::Arc::clone(&lifecycle_network),
+                                std::sync::Arc::clone(&lifecycle_machine_cache),
+                                lifecycle_token.clone(),
+                                peer_id.0,
+                                std::sync::Arc::clone(&lifecycle_reconnects),
+                            );
+                        }
                     }
                     ant_quic::PeerLifecycleEvent::ReaderExited { generation } => {
                         tracing::debug!(
@@ -8999,6 +9082,10 @@ impl Agent {
             sync,
             agent_id: self.agent_id(),
             peer_id,
+            replica_epoch: TaskListHandle::fresh_epoch(),
+            signing: std::sync::Arc::new(gossip::SigningContext::from_keypair(
+                self.identity.agent_keypair(),
+            )),
         })
     }
 
@@ -9063,8 +9150,223 @@ impl Agent {
             sync,
             agent_id: self.agent_id(),
             peer_id,
+            replica_epoch: TaskListHandle::fresh_epoch(),
+            signing: std::sync::Arc::new(gossip::SigningContext::from_keypair(
+                self.identity.agent_keypair(),
+            )),
         })
     }
+}
+
+// ─── Proactive peer reconnect (post-disconnect / post-restart) ──────────────
+
+/// Exponential backoff delays for proactive reconnect attempts after a known
+/// peer disconnects. Each delay is the wait *before* the attempt, so the first
+/// attempt fires after 1 s — fast enough for a daemon restart on the same host
+/// while avoiding a tight retry loop on a genuinely-down peer.
+const RECONNECT_BACKOFF_DELAYS: &[std::time::Duration] = &[
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+    std::time::Duration::from_secs(16),
+];
+
+/// Type alias for the single-flight reconnect tracker shared between the
+/// network-event listener and the peer-lifecycle watcher.
+type ReconnectTracker = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<[u8; 32], tokio::task::JoinHandle<()>>>,
+>;
+
+/// Schedule a bounded, backoff reconnect for a peer that just disconnected.
+///
+/// This closes the gap identified in the post-restart transport failure: when a
+/// known/mDNS-discovered peer's direct QUIC connection drops (daemon restart,
+/// transport idle timeout), x0x previously observed the disconnect and did
+/// nothing — no redial. CRDT state requests then exhausted against a peer that
+/// was still mDNS-visible.
+///
+/// The spawned task:
+/// - Tries **discovery-cache addresses** first (these include LAN/loopback
+///   when `allow_local_scope`, which the public-only bootstrap cache drops).
+/// - Falls back to **bootstrap-cache addresses** via `connect_cached_peer`.
+///   The bootstrap cache retains the raw connection address (including
+///   LAN/loopback) from every successful connect/accept, so Phase 2 covers
+///   the default global-bootstrap config where `allow_local_scope=FALSE`
+///   filters loopback out of the discovery cache (CR-HOST-1).
+/// - Self-cancels when the peer reconnects (checked via `is_connected` on each
+///   attempt) or when the shutdown token fires.
+/// - Is **single-flight** per peer: only one reconnect task runs at a time,
+///   tracked in `active_reconnects`. A `PeerConnected` event aborts the pending
+///   task.
+/// - Is **bounded** to `RECONNECT_BACKOFF_DELAYS.len()` attempts with
+///   exponential backoff, preventing reconnect storms.
+fn schedule_reconnect(
+    network: std::sync::Arc<network::NetworkNode>,
+    machine_cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    peer_id_bytes: [u8; 32],
+    active_reconnects: ReconnectTracker,
+) {
+    // Single-flight: hold the lock across check + spawn + insert so two
+    // concurrent callers cannot both start a reconnect for the same peer.
+    let mut tracker = match active_reconnects.lock() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    if tracker.contains_key(&peer_id_bytes) {
+        return;
+    }
+
+    let tracker_clone = std::sync::Arc::clone(&active_reconnects);
+    let handle = tokio::spawn(async move {
+        let peer_id = ant_quic::PeerId(peer_id_bytes);
+        let machine_id = identity::MachineId(peer_id_bytes);
+        let prefix = network::hex_prefix(&peer_id_bytes, 4);
+
+        // Candidate discovery-cache addresses are refreshed on every attempt
+        // (see the per-attempt read inside the loop) so a named daemon that
+        // restarted on a different ephemeral port is rediscovered once it
+        // re-announces, rather than pinned to a stale one-time snapshot.
+        tracing::info!(
+            target: "x0x::connect",
+            peer_id_prefix = %prefix,
+            "scheduling proactive reconnect for disconnected peer",
+        );
+
+        for (attempt, &delay) in RECONNECT_BACKOFF_DELAYS.iter().enumerate() {
+            // Wait with cancellation before each attempt.
+            tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                _ = tokio::time::sleep(delay) => {}
+            }
+
+            // Another path (mDNS auto-connect, inbound dial, announcement
+            // auto-connect) may have already recovered the connection.
+            if network.is_connected(&peer_id).await {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %prefix,
+                    attempt,
+                    "reconnect cancelled: peer already connected",
+                );
+                break;
+            }
+
+            // Refresh discovery-cache candidate addresses on EVERY attempt
+            // (not a one-time snapshot). These include LAN/loopback addresses
+            // when allow_local_scope is active (same-host scenario). A named
+            // daemon that restarted on a different ephemeral port re-announces;
+            // its new address is merged into the cache (upsert_discovered_
+            // machine is append-only) and picked up on this backoff tick. A
+            // one-time snapshot would pin the stale old port and never
+            // rediscover the peer (final review: named restart on a new port).
+            let candidate_addrs = {
+                let cache = machine_cache.read().await;
+                cache
+                    .get(&machine_id)
+                    .map(|m| m.addresses.clone())
+                    .unwrap_or_default()
+            };
+
+            tracing::info!(
+                target: "x0x::connect",
+                peer_id_prefix = %prefix,
+                attempt = attempt + 1,
+                max_attempts = RECONNECT_BACKOFF_DELAYS.len(),
+                candidate_addrs = candidate_addrs.len(),
+                "proactive reconnect attempt",
+            );
+
+            let mut connected = false;
+
+            // Phase 1: discovery-cache addresses (LAN/loopback for same-host).
+            for addr in &candidate_addrs {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    network.connect_addr(*addr),
+                )
+                .await
+                {
+                    Ok(Ok(connected_peer)) if connected_peer == peer_id => {
+                        tracing::info!(
+                            target: "x0x::connect",
+                            peer_id_prefix = %prefix,
+                            attempt = attempt + 1,
+                            addr = %addr,
+                            "proactive reconnect succeeded via discovery address",
+                        );
+                        connected = true;
+                        break;
+                    }
+                    Ok(Ok(other)) => {
+                        tracing::warn!(
+                            target: "x0x::connect",
+                            peer_id_prefix = %prefix,
+                            addr = %addr,
+                            "reconnect resolved to unexpected peer {:?}",
+                            other,
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            peer_id_prefix = %prefix,
+                            addr = %addr,
+                            error = %e,
+                            "reconnect attempt at discovery address failed",
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            peer_id_prefix = %prefix,
+                            addr = %addr,
+                            "reconnect attempt at discovery address timed out",
+                        );
+                    }
+                }
+            }
+
+            // Phase 2: bootstrap-cache fallback (public addresses for remote
+            // peers that may have NAT-stable endpoints).
+            if !connected {
+                match network.connect_cached_peer(peer_id).await {
+                    Ok(_) => {
+                        tracing::info!(
+                            target: "x0x::connect",
+                            peer_id_prefix = %prefix,
+                            attempt = attempt + 1,
+                            "proactive reconnect succeeded via bootstrap cache",
+                        );
+                        connected = true;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            peer_id_prefix = %prefix,
+                            error = %e,
+                            "reconnect via bootstrap cache failed",
+                        );
+                    }
+                }
+            }
+
+            if connected {
+                break;
+            }
+        }
+
+        // Remove ourselves from the single-flight tracker. If a PeerConnected
+        // event already aborted us and removed the entry, this is a no-op.
+        if let Ok(mut t) = tracker_clone.lock() {
+            t.remove(&peer_id_bytes);
+        }
+    });
+
+    tracker.insert(peer_id_bytes, handle);
 }
 
 impl AgentBuilder {
@@ -9755,6 +10057,15 @@ pub struct TaskListHandle {
     sync: std::sync::Arc<crdt::TaskListSync>,
     agent_id: identity::AgentId,
     peer_id: saorsa_gossip_types::PeerId,
+    /// Per-replica fencing epoch. Regenerated when the handle is (re)built —
+    /// i.e. on daemon restart — so a numeric fence token captured before a
+    /// restart can never ABA-match a post-restart token (the epoch differs).
+    /// See [`FenceToken`].
+    replica_epoch: u64,
+    /// Signing context for self-signing claim/complete operations
+    /// (authenticated operation provenance). Threaded from the agent's
+    /// keypair at construction; the secret key never leaves the handle.
+    signing: std::sync::Arc<crate::gossip::SigningContext>,
 }
 
 impl std::fmt::Debug for TaskListHandle {
@@ -9763,6 +10074,83 @@ impl std::fmt::Debug for TaskListHandle {
             .field("agent_id", &self.agent_id)
             .field("peer_id", &self.peer_id)
             .finish_non_exhaustive()
+    }
+}
+
+impl TaskListHandle {
+    /// Generate a fresh per-replica epoch at handle construction.
+    ///
+    /// Uses a CSPRNG incarnation nonce (64-bit random from `OsRng`) so a
+    /// pre-restart fence token can never ABA-match a post-restart one (the
+    /// epoch component differs with overwhelming probability). Unlike
+    /// wall-clock nanoseconds, a random nonce is not predictable and does not
+    /// depend on monotonic clock behaviour across restarts. `OsRng` never
+    /// blocks on a functioning system; if it fails (catastrophic entropy
+    /// failure), we fall back to wall-clock nanoseconds (still advances across
+    /// restart). Epoch 0 is reserved as "uninitialized" and is never returned.
+    fn fresh_epoch() -> u64 {
+        use rand::RngCore;
+        let mut bytes = [0u8; 8];
+        match rand::rngs::OsRng.try_fill_bytes(&mut bytes) {
+            Ok(()) => {
+                let epoch = u64::from_le_bytes(bytes);
+                if epoch == 0 {
+                    1
+                } else {
+                    epoch
+                }
+            }
+            Err(_) => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(1)
+                .max(1),
+        }
+    }
+
+    /// Build the current fence token for this replica at the given revision.
+    fn current_fence(&self, revision: u64) -> FenceToken {
+        FenceToken {
+            epoch: self.replica_epoch,
+            revision,
+        }
+    }
+
+    /// Set the authorized-member set for group-scoped task lists.
+    ///
+    /// When set, remote CRDT admission rejects checkbox elements (claims/
+    /// completions) whose attesting agent is not in this set — applying group
+    /// authorization at replication admission, not just at REST. The server
+    /// layer should call this when creating/joining a group-scoped list and
+    /// when group membership changes.
+    ///
+    /// This is a best-effort consistency measure: the set is not persisted and
+    /// must be re-established after a restart (before the sync listener starts
+    /// to avoid a race window).
+    pub async fn set_authorized_agents(
+        &self,
+        agents: std::collections::HashSet<identity::AgentId>,
+    ) {
+        let mut list = self.sync.write().await;
+        list.set_authorized_agents(agents);
+    }
+
+    /// Clear the authorized-member set (revert to open admission for all
+    /// validly-attested operations).
+    pub async fn clear_authorized_agents(&self) {
+        let mut list = self.sync.write().await;
+        list.clear_authorized_agents();
+    }
+
+    /// Test-only: override the per-replica epoch so a pre-restart fence token
+    /// can be simulated in-process without a real daemon restart.
+    ///
+    /// Two handles sharing the same `Arc<TaskListSync>` but with different
+    /// epochs exercise the restart-ABA rejection: a token captured at epoch E1
+    /// is rejected when the handle's epoch is E2.
+    #[cfg(test)]
+    pub fn set_replica_epoch_for_testing(&mut self, epoch: u64) {
+        self.replica_epoch = epoch;
     }
 }
 
@@ -9839,19 +10227,30 @@ impl TaskListHandle {
     ///
     /// Returns an error if the task cannot be claimed.
     pub async fn claim_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
-        // No expected version ⇒ can never conflict.
+        // No local-version guard ⇒ unconditional (still advisory; concurrent
+        // remote claims coexist in the CRDT regardless).
         self.claim_task_versioned(task_id, None).await.map(|_| ())
     }
 
-    /// Claim a task, optionally guarded by an expected list version (CAS).
+    /// Claim a task, optionally guarded by an expected list version.
     ///
-    /// If `expected_version` is `Some(v)` and the task list's current version
-    /// is not `v`, nothing is mutated and
-    /// [`TaskCasOutcome::VersionConflict`] is returned with the current
-    /// version. The check and the mutation happen under a single write lock.
+    /// `expected_version` is a **local-replica fencing precondition**, not a
+    /// distributed compare-and-swap: when `Some(v)` and this replica's local
+    /// version counter is not `v`, nothing is mutated and
+    /// [`TaskMutationOutcome::StaleLocalVersion`] is returned. Two replicas
+    /// that both happen to be at version `v` will BOTH pass — this guard
+    /// cannot provide cross-replica exclusion. The check and the mutation
+    /// happen under a single local write lock.
     ///
-    /// `Committed` means the claim was applied to the local replica and a
-    /// delta was published to peers — not that any peer has observed it.
+    /// The claim itself is **advisory**: it records a `Claimed` candidate in
+    /// the OR-Set and publishes a delta. Concurrent claims (on this or other
+    /// replicas) coexist; the deterministic winner resolves at convergence.
+    /// The returned [`AdvisoryOwnership`] reports the local snapshot at commit
+    /// time and is provisional.
+    ///
+    /// `Committed` means applied to the local replica + best-effort delta
+    /// publish — not that any peer observed it, nor that the caller won
+    /// exclusively.
     ///
     /// # Errors
     ///
@@ -9860,45 +10259,52 @@ impl TaskListHandle {
     pub async fn claim_task_versioned(
         &self,
         task_id: crdt::TaskId,
-        expected_version: Option<u64>,
-    ) -> error::Result<TaskCasOutcome> {
-        let (version, delta) = {
+        expected: Option<FenceToken>,
+    ) -> error::Result<TaskMutationOutcome> {
+        let (fence, delta, advisory) = {
             let mut list = self.sync.write().await;
-            if let Some(expected) = expected_version {
+            if let Some(expected) = expected {
                 let current = list.current_version();
-                if current != expected {
-                    return Ok(TaskCasOutcome::VersionConflict {
-                        current_version: current,
+                // Reject if either the epoch (restart-ABA) or the revision
+                // (stale local snapshot) mismatches. Both are local-only.
+                if expected.epoch != self.replica_epoch || expected.revision != current {
+                    return Ok(TaskMutationOutcome::StaleLocalVersion {
+                        current: self.current_fence(current),
                     });
                 }
             }
             let seq = list.next_seq();
-            list.claim_task(&task_id, self.agent_id, self.peer_id, seq)
+            list.claim_task(&task_id, self.agent_id, self.peer_id, seq, &self.signing)
                 .map_err(|e| {
                     error::IdentityError::Storage(std::io::Error::other(format!(
                         "claim_task failed: {}",
                         e
                     )))
                 })?;
+            // Read back the task once (under the same lock) to compute the
+            // advisory ownership snapshot and the delta payload atomically.
+            let task = list.get_task(&task_id).ok_or_else(|| {
+                error::IdentityError::Storage(std::io::Error::other("task disappeared after claim"))
+            })?;
+            let winner = task.claim_record();
+            let advisory = AdvisoryOwnership {
+                agent: self.agent_id,
+                locally_winning: winner.is_some_and(|(a, _)| a == self.agent_id),
+                current_winner: winner,
+            };
             // Include full task so receivers can upsert if add hasn't arrived yet
-            let full_task = list
-                .get_task(&task_id)
-                .ok_or_else(|| {
-                    error::IdentityError::Storage(std::io::Error::other(
-                        "task disappeared after claim",
-                    ))
-                })?
-                .clone();
+            let full_task = task.clone();
             let version = list.current_version();
             (
-                version,
+                self.current_fence(version),
                 crdt::TaskListDelta::for_state_change(task_id, full_task, version),
+                advisory,
             )
         };
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish claim_task delta: {}", e);
         }
-        Ok(TaskCasOutcome::Committed { version })
+        Ok(TaskMutationOutcome::Committed { fence, advisory })
     }
 
     /// Complete a task in the list.
@@ -9911,17 +10317,20 @@ impl TaskListHandle {
     ///
     /// Returns an error if the task cannot be completed.
     pub async fn complete_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
-        // No expected version ⇒ can never conflict.
+        // No local-version guard ⇒ unconditional (still advisory).
         self.complete_task_versioned(task_id, None)
             .await
             .map(|_| ())
     }
 
-    /// Complete a task, optionally guarded by an expected list version (CAS).
+    /// Complete a task, optionally guarded by an expected list version.
     ///
-    /// Semantics mirror [`TaskListHandle::claim_task_versioned`]: a mismatch
-    /// between `expected_version` and the current list version returns
-    /// [`TaskCasOutcome::VersionConflict`] with no mutation.
+    /// Semantics mirror [`TaskListHandle::claim_task_versioned`]:
+    /// `expected_version` is a **local-replica** fencing precondition (not a
+    /// distributed CAS); a mismatch returns
+    /// [`TaskMutationOutcome::StaleLocalVersion`] with no mutation. The
+    /// completion is advisory; the returned [`AdvisoryOwnership`] reports the
+    /// local `completion_record()` snapshot at commit time and is provisional.
     ///
     /// # Errors
     ///
@@ -9930,44 +10339,49 @@ impl TaskListHandle {
     pub async fn complete_task_versioned(
         &self,
         task_id: crdt::TaskId,
-        expected_version: Option<u64>,
-    ) -> error::Result<TaskCasOutcome> {
-        let (version, delta) = {
+        expected: Option<FenceToken>,
+    ) -> error::Result<TaskMutationOutcome> {
+        let (fence, delta, advisory) = {
             let mut list = self.sync.write().await;
-            if let Some(expected) = expected_version {
+            if let Some(expected) = expected {
                 let current = list.current_version();
-                if current != expected {
-                    return Ok(TaskCasOutcome::VersionConflict {
-                        current_version: current,
+                if expected.epoch != self.replica_epoch || expected.revision != current {
+                    return Ok(TaskMutationOutcome::StaleLocalVersion {
+                        current: self.current_fence(current),
                     });
                 }
             }
             let seq = list.next_seq();
-            list.complete_task(&task_id, self.agent_id, self.peer_id, seq)
+            list.complete_task(&task_id, self.agent_id, self.peer_id, seq, &self.signing)
                 .map_err(|e| {
                     error::IdentityError::Storage(std::io::Error::other(format!(
                         "complete_task failed: {}",
                         e
                     )))
                 })?;
-            let full_task = list
-                .get_task(&task_id)
-                .ok_or_else(|| {
-                    error::IdentityError::Storage(std::io::Error::other(
-                        "task disappeared after complete",
-                    ))
-                })?
-                .clone();
+            let task = list.get_task(&task_id).ok_or_else(|| {
+                error::IdentityError::Storage(std::io::Error::other(
+                    "task disappeared after complete",
+                ))
+            })?;
+            let winner = task.completion_record();
+            let advisory = AdvisoryOwnership {
+                agent: self.agent_id,
+                locally_winning: winner.is_some_and(|(a, _)| a == self.agent_id),
+                current_winner: winner,
+            };
+            let full_task = task.clone();
             let version = list.current_version();
             (
-                version,
+                self.current_fence(version),
                 crdt::TaskListDelta::for_state_change(task_id, full_task, version),
+                advisory,
             )
         };
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish complete_task delta: {}", e);
         }
-        Ok(TaskCasOutcome::Committed { version })
+        Ok(TaskMutationOutcome::Committed { fence, advisory })
     }
 
     /// List all tasks in their current order.
@@ -9988,13 +10402,14 @@ impl TaskListHandle {
     ///
     /// The snapshots and the version are read atomically under a single read
     /// lock, so the returned version is consistent with the returned tasks —
-    /// suitable as the `expected_version` for a subsequent CAS mutation via
+    /// suitable as the `expected_version` (a local-replica fencing
+    /// precondition, not a distributed CAS) for a subsequent mutation via
     /// [`TaskListHandle::claim_task_versioned`].
     ///
     /// # Errors
     ///
     /// Returns an error if the task list cannot be read.
-    pub async fn list_tasks_with_version(&self) -> error::Result<(Vec<TaskSnapshot>, u64)> {
+    pub async fn list_tasks_with_version(&self) -> error::Result<(Vec<TaskSnapshot>, FenceToken)> {
         let list = self.sync.read().await;
         let version = list.current_version();
         let tasks = list.tasks_ordered();
@@ -10018,17 +10433,19 @@ impl TaskListHandle {
                 }
             })
             .collect();
-        Ok((snapshots, version))
+        Ok((snapshots, self.current_fence(version)))
     }
 
     /// The task list's current version counter.
     ///
     /// Incremented on every local or merged mutation. Useful as the
-    /// `expected_version` for CAS mutations; prefer
+    /// `expected_version` (a local-replica fencing precondition, not a
+    /// distributed CAS) for mutations; prefer
     /// [`TaskListHandle::list_tasks_with_version`] when the tasks are also
     /// needed, to read both atomically.
-    pub async fn version(&self) -> u64 {
-        self.sync.read().await.current_version()
+    pub async fn version(&self) -> FenceToken {
+        let revision = self.sync.read().await.current_version();
+        self.current_fence(revision)
     }
 
     /// Reorder tasks in the list.
@@ -10084,7 +10501,7 @@ impl Agent {
         })?;
 
         let peer_id = runtime.peer_id();
-        let store_id = kv::KvStoreId::from_content(name, &self.agent_id());
+        let store_id = kv::KvStoreId::for_topic_owner(topic, &self.agent_id());
         let store = kv::KvStore::new(
             store_id,
             name.to_string(),
@@ -10114,26 +10531,45 @@ impl Agent {
                 )))
             })?;
 
+        // The creator is the owner: capture signing material so each write
+        // produces an owner-signed content checkpoint (cold-recovery provenance).
+        let (pk_bytes, sk_bytes) = self.identity().agent_keypair().to_bytes();
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
             peer_id,
+            owner_signing: Some(std::sync::Arc::new(OwnerSigningMaterial {
+                public_key_bytes: pk_bytes,
+                secret_key_bytes: sk_bytes,
+            })),
         })
     }
 
-    /// Join an existing key-value store by topic.
+    /// Join an existing key-value store by topic, anchoring ownership on the
+    /// trusted out-of-band `owner`.
     ///
-    /// Creates an empty replica that will be populated via delta sync from
-    /// peers already sharing the topic. The replica starts with **no owner**
-    /// and the default `Signed` policy, which fails closed: local writes are
-    /// rejected until the authoritative owner and policy are learned from an
-    /// owner-signed announcement on the state-sync channel (published by the
-    /// owner in response to this replica's state requests).
+    /// The owner anchor is **required** on every public join path: a replica
+    /// with no anchor can never accept policy-restricted data, so an unanchored
+    /// join is a dead replica, not a successful join. Callers MUST supply the
+    /// authoritative owner (an Agent Card, invite, explicit REST/CLI param, or
+    /// persisted manifest entry). The replica is anchored on `owner`: it accepts
+    /// `owner`'s deltas and (if this node *is* `owner`) its own local writes,
+    /// converging against any owner version — including a v0.30.1 owner that
+    /// never announces — because the data path never consults an announce.
+    ///
+    /// `channel` records how the anchor was supplied (audit metadata); pass
+    /// [`kv::store::AnchorChannel::RestParam`] for client-initiated joins and
+    /// [`kv::store::AnchorChannel::Persistence`] for manifest replay.
     ///
     /// # Errors
     ///
     /// Returns an error if the gossip runtime is not initialized.
-    pub async fn join_kv_store(&self, topic: &str) -> error::Result<KvStoreHandle> {
+    pub async fn join_kv_store(
+        &self,
+        topic: &str,
+        owner: identity::AgentId,
+        channel: kv::store::AnchorChannel,
+    ) -> error::Result<KvStoreHandle> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
                 "gossip runtime not initialized - configure agent with network first",
@@ -10141,10 +10577,10 @@ impl Agent {
         })?;
 
         let peer_id = runtime.peer_id();
-        // Local placeholder id — the replica is addressed by topic; the id
-        // is not used for merge decisions on the delta path.
-        let store_id = kv::KvStoreId::from_content(topic, &self.agent_id());
-        let store = kv::KvStore::new_replica(store_id, String::new());
+        // The store id is the verifiable topic→owner binding; it agrees with
+        // the creator's id (both derive for_topic_owner(topic, owner)).
+        let store_id = kv::KvStoreId::for_topic_owner(topic, &owner);
+        let store = kv::KvStore::new_replica(store_id, String::new(), Some(owner), channel);
 
         let sync = kv::KvStoreSync::new(
             store,
@@ -10172,6 +10608,9 @@ impl Agent {
             sync,
             agent_id: self.agent_id(),
             peer_id,
+            // A joiner is not the owner and never produces checkpoints; it
+            // only caches + relays owner-produced ones.
+            owner_signing: None,
         })
     }
 }
@@ -10185,6 +10624,20 @@ pub struct KvStoreHandle {
     sync: std::sync::Arc<kv::KvStoreSync>,
     agent_id: identity::AgentId,
     peer_id: saorsa_gossip_types::PeerId,
+    /// Owner signing material, present only when this node is the store owner
+    /// (creator path). Used to produce owner-signed content checkpoints on
+    /// each write so replicas can cold-recover while the owner is offline.
+    owner_signing: Option<std::sync::Arc<OwnerSigningMaterial>>,
+}
+
+/// Serialized owner keypair for checkpoint signing (held only by the owner's
+/// handle). The bytes are reconstructed into keys at sign time.
+#[derive(Clone)]
+pub struct OwnerSigningMaterial {
+    /// ML-DSA-65 public key bytes.
+    pub public_key_bytes: Vec<u8>,
+    /// ML-DSA-65 secret key bytes.
+    pub secret_key_bytes: Vec<u8>,
 }
 
 impl std::fmt::Debug for KvStoreHandle {
@@ -10201,6 +10654,80 @@ impl KvStoreHandle {
     #[must_use]
     pub fn peer_id(&self) -> saorsa_gossip_types::PeerId {
         self.peer_id
+    }
+
+    /// Return the store's ownership/policy/version metadata for auditability.
+    ///
+    /// Reads are never gated on ownership — only writes are — so this always
+    /// succeeds and surfaces the anchored owner (or `None` for a read-only
+    /// no-anchor replica), the policy, the freshness version, and the derived
+    /// [`kv::OwnershipSource`].
+    pub async fn ownership_info(&self) -> KvStoreOwnershipInfo {
+        let s = self.sync.read().await;
+        let src = s.ownership_source();
+        let (status, announced) = match &src {
+            kv::OwnershipSource::Anchored { .. } => (kv::OwnershipStatus::Anchored, None),
+            kv::OwnershipSource::Unknown => (kv::OwnershipStatus::Unknown, None),
+            kv::OwnershipSource::Conflict { announced, .. } => (
+                kv::OwnershipStatus::Conflict,
+                Some(hex::encode(announced.as_bytes())),
+            ),
+        };
+        KvStoreOwnershipInfo {
+            owner: s.owner().map(|o| hex::encode(o.as_bytes())),
+            policy: s.policy().to_string(),
+            version: s.current_version(),
+            // The owner-announce freshness counter — distinct from the general
+            // mutation `version`. Surfaced so callers can observe the policy
+            // freshness invariant (not just store churn).
+            policy_version: s.policy_version(),
+            ownership_status: status,
+            announced_owner: announced,
+        }
+    }
+
+    /// Produce and install an owner-signed content checkpoint, returning it
+    /// for attachment to the published delta.
+    ///
+    /// Only the owner produces checkpoints (it holds the signing key). The
+    /// checkpoint binds the post-write content root so replicas can
+    /// cold-recover this state from a non-owner relay while the owner is
+    /// offline. Returns `None` for non-owners or if signing is unavailable.
+    fn produce_checkpoint(&self, store: &mut kv::KvStore) -> Option<kv::store::OwnerCheckpoint> {
+        let signing = self.owner_signing.as_ref()?;
+        // Only the owner signs; a joiner (even one anchored on itself, which is
+        // unusual) without signing material does not produce checkpoints.
+        if store.owner() != Some(&self.agent_id) {
+            return None;
+        }
+        let topic = self.sync.topic();
+        let id = *store.id();
+        let pairs = store.checkpoint_pairs();
+        let root = kv::store::content_root(&id, store.name(), &pairs);
+        let seq = store.highest_checkpoint_seq.checked_add(1)?;
+        let policy_version = store.policy_version();
+        let policy = store.policy().clone();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let pubkey = ant_quic::MlDsaPublicKey::from_bytes(&signing.public_key_bytes).ok()?;
+        let seckey = ant_quic::MlDsaSecretKey::from_bytes(&signing.secret_key_bytes).ok()?;
+        let cp = kv::store::make_owner_checkpoint(kv::store::OwnerCheckpointParams {
+            topic,
+            store_id: &id,
+            secret_key: &seckey,
+            public_key: &pubkey,
+            policy: &policy,
+            policy_version,
+            checkpoint_seq: seq,
+            content_root: root,
+            timestamp: ts,
+        })
+        .ok()?;
+        store.latest_checkpoint = Some(cp.clone());
+        store.highest_checkpoint_seq = seq;
+        Some(cp)
     }
 
     /// Enforce the store's access policy for a local mutation.
@@ -10267,7 +10794,7 @@ impl KvStoreHandle {
                 })?;
             let entry = store.get(&key).cloned();
             let version = store.current_version();
-            match entry {
+            let mut delta = match entry {
                 Some(e) => {
                     kv::KvStoreDelta::for_put(key, e, (self.peer_id, store.next_seq()), version)
                 }
@@ -10276,7 +10803,16 @@ impl KvStoreHandle {
                         "kv put succeeded but entry was not readable",
                     )));
                 }
+            };
+            // Owner: attach an owner-signed checkpoint for relay-based recovery.
+            if let Some(cp) = self.produce_checkpoint(&mut store) {
+                delta.owner_checkpoint = Some(cp);
+                // Carry the authoritative owner name so a relay whose local
+                // name hasn't synced yet can still cache the checkpoint
+                // (content_root binds the store name).
+                delta.name_update = Some(store.name_register().clone());
             }
+            delta
         };
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv put delta: {e}");
@@ -10333,6 +10869,13 @@ impl KvStoreHandle {
             let mut d = kv::KvStoreDelta::new(store.current_version());
             d.removed
                 .insert(key.to_string(), std::collections::HashSet::new());
+            // Owner: attach an owner-signed checkpoint for the post-remove state.
+            if let Some(cp) = self.produce_checkpoint(&mut store) {
+                d.owner_checkpoint = Some(cp);
+                // Carry the authoritative owner name alongside the checkpoint
+                // so a relay can cache it regardless of local name state.
+                d.name_update = Some(store.name_register().clone());
+            }
             d
         };
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
@@ -10414,6 +10957,28 @@ pub struct KvEntrySnapshot {
     pub updated_at: u64,
 }
 
+/// Ownership/policy/version metadata for a store, for auditability.
+///
+/// Returned by [`KvStoreHandle::ownership_info`]. `owner` is the hex-encoded
+/// anchored owner, or `None` for a read-only no-anchor replica.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KvStoreOwnershipInfo {
+    /// Hex-encoded anchored owner, or `None` when no owner is anchored
+    /// (read-only by design).
+    pub owner: Option<String>,
+    /// Access policy (`"signed"` / `"allowlisted"` / `"encrypted"`).
+    pub policy: String,
+    /// Store version (monotonic, bumped on every mutation).
+    pub version: u64,
+    /// Owner-announce policy freshness counter (distinct from `version`).
+    pub policy_version: u64,
+    /// Strongly-typed ownership discriminant (`"anchored"` / `"unknown"` /
+    /// `"conflict"`).
+    pub ownership_status: kv::OwnershipStatus,
+    /// Hex-encoded owner claimed by a rejected announce (`conflict` only).
+    pub announced_owner: Option<String>,
+}
+
 /// Read-only snapshot of a task's current state.
 ///
 /// This is returned by `TaskListHandle::list_tasks()` and hides CRDT
@@ -10445,25 +11010,127 @@ pub struct TaskSnapshot {
     pub completed_at: Option<u64>,
 }
 
-/// Outcome of a task-list mutation guarded by an optional expected version.
+/// Outcome of a task-list mutation (claim or complete).
 ///
 /// Returned by [`TaskListHandle::claim_task_versioned`] and
-/// [`TaskListHandle::complete_task_versioned`]. `Committed` means the
-/// mutation was applied to the **local** replica and a delta was published —
-/// it does NOT mean any peer has observed the change yet.
+/// [`TaskListHandle::complete_task_versioned`].
+///
+/// `Committed` means the mutation was applied to the **local** replica and a
+/// delta was best-effort published — it does NOT mean any peer has observed
+/// the change, and it does NOT grant exclusive ownership. Claims and
+/// completions are **advisory**: concurrent operations on other replicas
+/// coexist in the CRDT and resolve to a single deterministic winner (earliest
+/// timestamp, then lexicographic agent id) only after convergence.
+///
+/// `StaleLocalVersion` means the caller's fence token did not match this
+/// replica's current `(epoch, revision)` — a LOCAL fencing signal. It is NOT
+/// a distributed conflict: two replicas at the same token both pass, so the
+/// fence cannot provide cross-replica exclusion. A mismatch may be a stale
+/// revision (the local snapshot moved) OR a stale epoch (the daemon restarted
+/// and the caller's token predates it — the restart-ABA case).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskCasOutcome {
-    /// The mutation was committed locally; `version` is the new list version.
+pub enum TaskMutationOutcome {
+    /// The mutation was committed locally; `fence` is the new local token.
     Committed {
-        /// The task list's version after this mutation.
-        version: u64,
+        /// The task list's fence token after this mutation (epoch + revision).
+        fence: FenceToken,
+        /// Advisory ownership snapshot computed from the local OR-Set at
+        /// commit time. Advisory — see [`AdvisoryOwnership`].
+        advisory: AdvisoryOwnership,
     },
-    /// The caller's `expected_version` did not match the current list
-    /// version; nothing was mutated.
-    VersionConflict {
-        /// The task list's current (unchanged) version.
-        current_version: u64,
+    /// The caller's fence token did not match this replica's current token;
+    /// nothing was mutated. Local staleness guard (stale revision) or a
+    /// restart-epoch mismatch — never a distributed conflict.
+    StaleLocalVersion {
+        /// The task list's current (unchanged) local fence token.
+        current: FenceToken,
     },
+}
+
+/// Opaque local-replica fencing token.
+///
+/// Combines a per-replica `epoch` (regenerated when the handle is rebuilt —
+/// i.e. on daemon restart) with the local `revision` (the TaskList version
+/// counter, which advances on every effective local snapshot change,
+/// including remote merges). The token is **opaque** over the wire: clients
+/// must echo it verbatim and MUST NOT interpret or construct it.
+///
+/// ABA safety: because the epoch changes across restart, a token captured
+/// before a restart can never match a post-restart token even if the revision
+/// counter later reaches the same value. This closes the restart-ABA window
+/// without persisting task state.
+///
+/// This is a LOCAL fence only (per-replica): two replicas at the same
+/// `(epoch, revision)` can both accept. It is not a distributed CAS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FenceToken {
+    /// Per-replica epoch; regenerated on restart.
+    pub epoch: u64,
+    /// Local revision = TaskList version counter.
+    pub revision: u64,
+}
+
+impl FenceToken {
+    /// Opaque wire encoding: `"epoch:revision"`. Clients echo this verbatim.
+    #[must_use]
+    pub fn to_wire(&self) -> String {
+        format!("{}:{}", self.epoch, self.revision)
+    }
+
+    /// Parse an opaque wire token.
+    ///
+    /// Returns `Ok(token)` for a well-formed `"epoch:revision"` string, or
+    /// `Err(&'static str)` if the token is malformed (missing colon,
+    /// non-numeric, or integer overflow). Callers MUST distinguish **absent**
+    /// (`fence_token: None` → unconditional advisory commit) from **present but
+    /// malformed** (`Err` → reject with 400/409 without mutation). Collapsing
+    /// the two into `None` would let a corrupt/legacy/attacker token silently
+    /// downgrade a fenced request to an unfenced one.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the string is not exactly two colon-separated `u64`
+    /// fields.
+    pub fn from_wire(s: &str) -> Result<Self, &'static str> {
+        let (epoch, revision) = s
+            .split_once(':')
+            .ok_or("malformed fence token: expected 'epoch:revision'")?;
+        let epoch = epoch
+            .parse()
+            .map_err(|_| "malformed fence token: epoch is not a valid u64")?;
+        let revision = revision
+            .parse()
+            .map_err(|_| "malformed fence token: revision is not a valid u64")?;
+        Ok(Self { epoch, revision })
+    }
+}
+
+/// Advisory ownership snapshot reported after a local claim/complete commit.
+///
+/// "Advisory" means this reflects the local replica's CRDT resolution at the
+/// instant of commit. It is **not** a distributed lock and **not** a promise
+/// of final ownership:
+///
+/// - `locally_winning` is provisional. A strictly-earlier-timestamp candidate
+///   arriving via a later merge will flip it to `false` (the resolved winner
+///   timestamp is monotone non-increasing).
+/// - Final ownership is only determinable after all replicas have converged,
+///   and is always non-exclusive — every candidate remains recorded in the
+///   OR-Set (see [`crdt::TaskItem::claims`]).
+///
+/// `current_winner` lets a superseded caller see who currently beats them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdvisoryOwnership {
+    /// The agent that performed this mutation (the caller's own candidate).
+    pub agent: identity::AgentId,
+    /// Whether `agent` is the local OR-Set's current deterministic winner for
+    /// this operation (claim → [`crdt::TaskItem::claim_record`], complete →
+    /// [`crdt::TaskItem::completion_record`]). Provisional; may flip on merge.
+    pub locally_winning: bool,
+    /// The local OR-Set's current deterministic winner `(agent, unix_ms)`, or
+    /// `None` if no candidate exists. When `!locally_winning`, this is the
+    /// agent that currently beats `agent`.
+    pub current_winner: Option<(identity::AgentId, u64)>,
 }
 
 /// The x0x protocol version.
@@ -11259,6 +11926,92 @@ mod tests {
         }
     }
 
+    /// P1 fence (restart-ABA): a fence token captured before an incarnation
+    /// change (daemon restart) must be rejected even when submitted at the
+    /// SAME revision afterwards — the per-replica epoch component differs, so
+    /// the token cannot ABA-match the post-restart one. A token captured after
+    /// the epoch change at the same revision is accepted (teeth: the gate
+    /// rejects the stale epoch, not everything).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pre_restart_fence_token_rejected_at_same_revision_after_epoch_change() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+
+        let mut handle = agent
+            .create_task_list("restart-fence", "restart-fence-topic")
+            .await
+            .expect("create task list");
+        let (task_id, _added_version) = handle
+            .add_task_versioned("task".to_string(), "d".to_string())
+            .await
+            .expect("add task");
+
+        // Token captured at epoch E1, revision R (before the "restart").
+        let pre_restart_token = handle.version().await;
+        let revision = pre_restart_token.revision;
+
+        // Simulate a restart: a new incarnation epoch, revision UNCHANGED.
+        handle.set_replica_epoch_for_testing(pre_restart_token.epoch.wrapping_add(1));
+
+        // The pre-restart token at the same revision MUST be rejected — the
+        // epoch differs, so it cannot ABA-match. Nothing mutates.
+        let outcome = handle
+            .claim_task_versioned(task_id, Some(pre_restart_token))
+            .await
+            .expect("claim call");
+        match outcome {
+            crate::TaskMutationOutcome::StaleLocalVersion { current } => {
+                assert_eq!(
+                    current.revision, revision,
+                    "a rejected fence must not change the revision"
+                );
+                assert_ne!(
+                    current.epoch, pre_restart_token.epoch,
+                    "the echoed current token carries the new (post-restart) epoch"
+                );
+            }
+            other => panic!("expected StaleLocalVersion, got {other:?}"),
+        }
+
+        // Non-mutation: the task is still unclaimed.
+        let tasks = handle.list_tasks().await.expect("list tasks");
+        let t = tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .expect("task present after rejection");
+        assert!(
+            t.state.is_empty(),
+            "a rejected fence must not mutate the task: {:?}",
+            t.state
+        );
+
+        // Teeth: a token captured AFTER the epoch change, at the same revision,
+        // is accepted — the gate rejects the stale epoch specifically.
+        let post_restart_token = handle.version().await;
+        assert_ne!(
+            post_restart_token.epoch, pre_restart_token.epoch,
+            "post-restart token carries the new epoch"
+        );
+        let outcome2 = handle
+            .claim_task_versioned(task_id, Some(post_restart_token))
+            .await
+            .expect("claim call 2");
+        assert!(
+            matches!(outcome2, crate::TaskMutationOutcome::Committed { .. }),
+            "a post-restart token at the current revision must commit"
+        );
+
+        agent.shutdown().await;
+    }
+
     // ========================================================================
     // #124 / WS1.3 tranche 4 — shutdown ordering invariants.
     //
@@ -11512,6 +12265,690 @@ mod tests {
             .direct_messaging()
             .lifecycle_block_reason(&bob.machine_id())
             .is_none());
+    }
+
+    /// Proactive reconnect: after a known peer's connection is dropped
+    /// (simulating a daemon restart / transport idle timeout), x0x must
+    /// schedule bounded backoff reconnect attempts and recover a direct
+    /// connection without a new external trigger.
+    ///
+    /// This is the focused test for the post-restart transport failure fix:
+    /// GAP 1-4 (mDNS discovery never feeds the dialer, announcement
+    /// auto-connect is one-shot, PeerDisconnected does not reconnect,
+    /// send-path reconnect dials public-only addresses).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn proactive_reconnect_recovers_dropped_same_host_peer() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+
+        // Start the network event listener so the proactive reconnect
+        // scheduler is active. In production this is started by
+        // join_network(); here we invoke it directly for a focused test.
+        alice.start_network_event_listener();
+
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let alice_network = alice.network().expect("alice network");
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+
+        // Phase 1: connect alice → bob.
+        let connected_peer = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects to bob");
+        assert_eq!(connected_peer.0, bob.machine_id().0);
+
+        // Wait for the connection to register on both sides.
+        let connected_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < connected_deadline {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "alice should be connected to bob after initial dial"
+        );
+
+        // Phase 2: force a disconnect (simulates the QUIC transport drop
+        // that occurs when the remote daemon restarts or the idle timeout
+        // fires). This emits PeerDisconnected, which triggers
+        // schedule_reconnect.
+        alice_network
+            .disconnect(&bob_peer)
+            .await
+            .expect("disconnect bob");
+
+        // Give the disconnect time to propagate.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !alice_network.is_connected(&bob_peer).await,
+            "alice should be disconnected after explicit disconnect"
+        );
+
+        // Phase 3: wait for the proactive reconnect to recover the
+        // connection. The first backoff delay is 1 s; allow generous
+        // headroom for CI scheduling jitter.
+        let reconnect_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while tokio::time::Instant::now() < reconnect_deadline {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "alice should have proactively reconnected to bob \
+             within the backoff window"
+        );
+
+        // Phase 4: verify a subsequent DM succeeds over the recovered
+        // connection. Mark connected (the PeerConnected handler does this
+        // in production, but may race with our assertion in the test).
+        alice
+            .direct_messaging()
+            .mark_connected(bob.agent_id(), bob.machine_id())
+            .await;
+
+        let receipt = alice
+            .send_direct_with_config(
+                &bob.agent_id(),
+                b"post-reconnect-probe".to_vec(),
+                dm::DmSendConfig {
+                    prefer_raw_quic_if_connected: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await
+            .expect("DM should succeed over the recovered connection");
+        assert_eq!(
+            receipt.path,
+            dm::DmPath::RawQuic,
+            "DM should use the raw QUIC path over the recovered connection"
+        );
+    }
+
+    /// Default global-bootstrap config (allow_local_scope=FALSE): same-host
+    /// reconnect must still work because the bootstrap cache retains the raw
+    /// loopback address from the initial connection and Phase 2 of
+    /// `schedule_reconnect` dials it via `connect_cached_peer` (CR-HOST-1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn proactive_reconnect_default_global_bootstrap_same_host() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+
+        // A non-local bootstrap node forces allow_local_scope=FALSE so the
+        // discovery cache will NOT retain LAN/loopback addresses. The reconnect
+        // must therefore rely on Phase 2 (bootstrap cache), which stores the
+        // raw connection address unfiltered.
+        let global_cfg = network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
+            bootstrap_nodes: vec!["142.93.199.50:5483".parse().expect("wan seed")],
+            ..network::NetworkConfig::default()
+        };
+        assert!(
+            !allow_local_discovery_addresses(&global_cfg),
+            "test precondition: config must have allow_local_scope=FALSE"
+        );
+
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(global_cfg.clone())
+            .build()
+            .await
+            .expect("alice");
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(global_cfg)
+            .build()
+            .await
+            .expect("bob");
+
+        alice.start_network_event_listener();
+
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let alice_network = alice.network().expect("alice network");
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+
+        // Connect alice → bob.
+        let connected = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects to bob");
+        assert_eq!(connected.0, bob.machine_id().0);
+
+        // Wait for connection to register.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "alice should be connected to bob"
+        );
+
+        // CR-HOST-1 assertion: the bootstrap cache retains the raw loopback
+        // address from the successful connection. connect_cached_peer must
+        // return that address, proving Phase 2 can redial it after a drop.
+        let cached_addr = alice_network
+            .connect_cached_peer(bob_peer)
+            .await
+            .expect("bootstrap cache should retain bob's loopback address");
+        // CR-HOST-1 assertion: the bootstrap cache retains the raw loopback
+        // address from the successful connection. connect_cached_peer must
+        // return a loopback address at bob's port, proving Phase 2 can redial
+        // it after a drop. (Dual-stack QUIC may report IPv4-mapped IPv6, so we
+        // compare port + loopback-ness rather than exact address equality.)
+        assert_eq!(
+            cached_addr.port(),
+            bob_addr.port(),
+            "connect_cached_peer must return bob's port — \
+             confirms bootstrap cache retains the connection address"
+        );
+        assert!(
+            match cached_addr.ip() {
+                std::net::IpAddr::V4(v4) => v4.is_loopback(),
+                std::net::IpAddr::V6(v6) => {
+                    v6.is_loopback() || v6.to_ipv4().is_some_and(|v4| v4.is_loopback())
+                }
+            },
+            "connect_cached_peer must return a loopback address — \
+             confirms bootstrap cache does not scope-filter (got {cached_addr})"
+        );
+
+        // Force disconnect (simulates transport drop / restart).
+        alice_network
+            .disconnect(&bob_peer)
+            .await
+            .expect("disconnect bob");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !alice_network.is_connected(&bob_peer).await,
+            "alice should be disconnected"
+        );
+
+        // Wait for proactive reconnect via Phase 2 (bootstrap cache).
+        let reconnect_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while tokio::time::Instant::now() < reconnect_deadline {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "alice should have reconnected to bob via bootstrap cache \
+             even with allow_local_scope=FALSE"
+        );
+
+        // Verify DM succeeds over the recovered connection.
+        alice
+            .direct_messaging()
+            .mark_connected(bob.agent_id(), bob.machine_id())
+            .await;
+        let receipt = alice
+            .send_direct_with_config(
+                &bob.agent_id(),
+                b"post-reconnect-global-bootstrap".to_vec(),
+                dm::DmSendConfig {
+                    prefer_raw_quic_if_connected: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await
+            .expect("DM should succeed over the recovered connection");
+        assert_eq!(receipt.path, dm::DmPath::RawQuic);
+    }
+    // ─── Reconnect-policy suppression regression tests ─────────────────────
+    //
+    // These defend the invariant from the final independent review: a peer
+    // disconnected for a NON-transport reason (policy rejection, pool
+    // eviction, admin teardown, revocation, shutdown) must never be
+    // proactively redialed. Pre-fix every `PeerDisconnected` was generic and
+    // `schedule_reconnect` restored the peer via the bootstrap-cache fallback
+    // within the first backoff attempt (~1 s), undoing the security/eviction
+    // decision. `DisconnectReason` now carries reconnect eligibility through
+    // both event streams and records a suppression tombstone.
+
+    /// Positive control: a Transport-level disconnect (QUIC idle timeout /
+    /// remote restart) is reconnect-eligible — the suppression machinery must
+    /// not over-fire and starve genuine transport recovery. `disconnect()`
+    /// defaults to Transport, preserving the existing happy-path semantics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transport_disconnect_is_reconnect_eligible_and_recovers() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        alice.start_network_event_listener();
+        let alice_network = alice.network().expect("alice network");
+
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+        let bob_addr = normalize_loopback_addr(
+            bob.network()
+                .expect("bob net")
+                .bound_addr()
+                .await
+                .expect("bob bound"),
+        );
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+
+        let connected = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects to bob");
+        assert_eq!(connected.0, bob.machine_id().0);
+        let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < reg {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "bob connected before transport disconnect"
+        );
+
+        assert!(
+            network::DisconnectReason::Transport.reconnect_eligible(),
+            "Transport is the only reconnect-eligible reason"
+        );
+
+        alice_network
+            .disconnect_with_reason(&bob_peer, network::DisconnectReason::Transport)
+            .await
+            .expect("transport disconnect");
+        assert!(
+            !alice_network.is_reconnect_suppressed(bob.machine_id().0),
+            "Transport disconnect must NOT set a tombstone"
+        );
+        assert!(
+            !alice_network.is_connected(&bob_peer).await,
+            "bob disconnected after transport disconnect"
+        );
+
+        // Proactive reconnect must recover bob within the backoff window.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "Transport disconnect must be redialed within the backoff window"
+        );
+    }
+
+    /// Admin teardown, revocation, and shutdown must suppress proactive
+    /// reconnect. For each reason: alice connects bob (so bob is in alice's
+    /// bootstrap cache — the Phase-2 fallback path that restored rejected
+    /// peers pre-fix), issues the disconnect with the reason, and asserts the
+    /// tombstone is set immediately AND bob stays disconnected past the first
+    /// two backoff attempts (1 s + 2 s), which is where the pre-fix
+    /// cache-fallback redial would have re-established the connection.
+    /// `PolicyRejection` (full backoff window) and `PoolEviction` (real
+    /// eviction) have dedicated tests below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admin_revocation_shutdown_disconnect_suppresses_proactive_reconnect() {
+        let reasons = [
+            network::DisconnectReason::Admin,
+            network::DisconnectReason::Revocation,
+            network::DisconnectReason::Shutdown,
+        ];
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        // Arm the proactive-reconnect scheduler so the gating is exercised for
+        // real, not just the tombstone lookup.
+        alice.start_network_event_listener();
+        let alice_network = alice.network().expect("alice network");
+
+        for reason in reasons {
+            // Fresh bob per reason: Revocation/Shutdown tombstones are
+            // permanent, so a suppressed bob can never be reused.
+            let tag = format!("{reason:?}");
+            let bob = Agent::builder()
+                .with_machine_key(dir.path().join(format!("{tag}-machine.key")))
+                .with_agent_key_path(dir.path().join(format!("{tag}-agent.key")))
+                .with_contact_store_path(dir.path().join(format!("{tag}-contacts.json")))
+                .with_peer_cache_dir(dir.path().join(format!("{tag}-peers")))
+                .with_network_config(loopback_network_config())
+                .build()
+                .await
+                .expect("bob");
+            let bob_network = bob.network().expect("bob network");
+            let bob_addr =
+                normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+            let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+            let bob_id = bob.machine_id().0;
+
+            // Establish a real connection so bob lands in alice's bootstrap
+            // cache — the exact fallback that restored rejected peers pre-fix.
+            let connected = alice_network
+                .connect_addr(bob_addr)
+                .await
+                .expect("alice connects to bob");
+            assert_eq!(connected.0, bob.machine_id().0, "{tag}: connected to bob");
+            let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while tokio::time::Instant::now() < reg {
+                if alice_network.is_connected(&bob_peer).await {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            assert!(
+                alice_network.is_connected(&bob_peer).await,
+                "{tag}: alice connected to bob before disconnect"
+            );
+            assert!(
+                !alice_network.is_reconnect_suppressed(bob_id),
+                "{tag}: no tombstone before disconnect"
+            );
+            assert!(
+                !reason.reconnect_eligible(),
+                "{tag}: non-transport reasons are not reconnect-eligible"
+            );
+
+            // The security/lifecycle teardown — the single production seam.
+            alice_network
+                .disconnect_with_reason(&bob_peer, reason)
+                .await
+                .expect("disconnect_with_reason");
+
+            assert!(
+                !alice_network.is_connected(&bob_peer).await,
+                "{tag}: bob disconnected immediately"
+            );
+            assert!(
+                alice_network.is_reconnect_suppressed(bob_id),
+                "{tag}: suppression tombstone set"
+            );
+
+            // Teeth: poll past the first two backoff attempts (1 s + 2 s).
+            // Pre-fix the generic PeerDisconnected fired schedule_reconnect
+            // and restored bob via the bootstrap cache within ~1 s. bob is
+            // still listening, so a redial WOULD succeed if the gate failed.
+            let guard = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+            let mut redialed = false;
+            while tokio::time::Instant::now() < guard {
+                if alice_network.is_connected(&bob_peer).await {
+                    redialed = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert!(
+                !redialed,
+                "{tag}: suppressed peer must not be redialed within the backoff window"
+            );
+            // bob dropped here; the next iteration builds a fresh bob.
+        }
+    }
+
+    /// A peer rejected by pinned-bootstrap policy must stay disconnected for
+    /// the ENTIRE proactive-reconnect backoff window (1+2+4+8+16 s), even
+    /// though it remains in the bootstrap cache and would be restored by the
+    /// cache-fallback redial under the pre-fix generic-event code. This is the
+    /// acceptance gate from the final independent review: "Test a wrong pinned
+    /// peer for the full backoff window."
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wrong_pinned_peer_stays_disconnected_for_full_backoff_window() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        alice.start_network_event_listener();
+        let alice_network = alice.network().expect("alice network");
+
+        // The imposter: alice connects it first so it lands in alice's
+        // bootstrap cache — the exact Phase-2 fallback path that restored a
+        // policy-rejected peer pre-fix.
+        let imposter = Agent::builder()
+            .with_machine_key(dir.path().join("imp-machine.key"))
+            .with_agent_key_path(dir.path().join("imp-agent.key"))
+            .with_contact_store_path(dir.path().join("imp-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("imp-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("imposter");
+        let imp_network = imposter.network().expect("imposter network");
+        let imp_addr = normalize_loopback_addr(imp_network.bound_addr().await.expect("imp bound"));
+        let imp_peer = ant_quic::PeerId(imposter.machine_id().0);
+
+        let connected = alice_network
+            .connect_addr(imp_addr)
+            .await
+            .expect("alice connects to imposter");
+        assert_eq!(connected.0, imposter.machine_id().0);
+        let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < reg {
+            if alice_network.is_connected(&imp_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&imp_peer).await,
+            "imposter connected before rejection"
+        );
+
+        // Reject the imposter for pinned-bootstrap policy — the exact seam the
+        // real dial_bootstrap / peer-mismatch paths call.
+        alice_network
+            .disconnect_with_reason(&imp_peer, network::DisconnectReason::PolicyRejection)
+            .await
+            .expect("policy reject");
+        assert!(
+            !alice_network.is_connected(&imp_peer).await,
+            "imposter disconnected after policy rejection"
+        );
+        assert!(
+            alice_network.is_reconnect_suppressed(imposter.machine_id().0),
+            "PolicyRejection sets a permanent tombstone"
+        );
+
+        // Poll the FULL backoff window. The imposter is still listening (so a
+        // redial WOULD succeed) and still in the bootstrap cache; under the
+        // pre-fix code schedule_reconnect's Phase 2 (connect_cached_peer)
+        // restored it within the first attempt (~1 s). It must never reappear.
+        // Sum of RECONNECT_BACKOFF_DELAYS (1+2+4+8+16) = 31 s; add margin.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(34);
+        while tokio::time::Instant::now() < deadline {
+            assert!(
+                !alice_network.is_connected(&imp_peer).await,
+                "wrong pinned peer must stay disconnected for the full backoff \
+                 window despite being in the bootstrap cache"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    /// A connection-pool eviction (LRU over `max_connections`) must not
+    /// trigger a redial that immediately reconnects the evicted peer — the
+    /// evict/redial churn loop flagged in the final review. This exercises the
+    /// GENUINE eviction path: alice's pool is capped at one connection, so
+    /// connecting charlie evicts bob via the real `disconnect_pool_candidates`
+    /// path with a `PoolEviction` reason. The tombstone must keep bob from
+    /// being redialed while alice holds charlie — pre-fix the eviction emitted
+    /// a generic `PeerDisconnected`, schedule_reconnect redialed bob, the pool
+    /// re-evicted charlie to readmit bob, and the cycle repeated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pool_cap_eviction_does_not_churn_redial() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        // Cap the pool at one connection so a second peer forces a real LRU
+        // eviction through disconnect_pool_candidates (PoolEviction).
+        let mut one_conn_cfg = loopback_network_config();
+        one_conn_cfg.max_connections = 1;
+
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(one_conn_cfg)
+            .build()
+            .await
+            .expect("alice");
+        alice.start_network_event_listener();
+        let alice_network = alice.network().expect("alice network");
+
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+        let charlie = Agent::builder()
+            .with_machine_key(dir.path().join("charlie-machine.key"))
+            .with_agent_key_path(dir.path().join("charlie-agent.key"))
+            .with_contact_store_path(dir.path().join("charlie-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("charlie-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("charlie");
+
+        let bob_addr = normalize_loopback_addr(
+            bob.network()
+                .expect("bob net")
+                .bound_addr()
+                .await
+                .expect("bob bound"),
+        );
+        let charlie_addr = normalize_loopback_addr(
+            charlie
+                .network()
+                .expect("charlie net")
+                .bound_addr()
+                .await
+                .expect("charlie bound"),
+        );
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let charlie_peer = ant_quic::PeerId(charlie.machine_id().0);
+
+        // alice → bob fills the single pool slot.
+        let cb = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("connect bob");
+        assert_eq!(cb.0, bob.machine_id().0);
+        let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < reg {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "bob connected before eviction"
+        );
+
+        // alice → charlie: the real LRU eviction path fires — bob is evicted
+        // with PoolEviction via note_connection_pool_activity.
+        let cc = alice_network
+            .connect_addr(charlie_addr)
+            .await
+            .expect("connect charlie");
+        assert_eq!(cc.0, charlie.machine_id().0);
+
+        // Wait for the eviction to land (bob disconnected + tombstoned).
+        let evict_dl = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < evict_dl {
+            if !alice_network.is_connected(&bob_peer).await
+                && alice_network.is_reconnect_suppressed(bob.machine_id().0)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            alice_network.is_reconnect_suppressed(bob.machine_id().0),
+            "evicted bob must carry a PoolEviction tombstone"
+        );
+        assert!(
+            !alice_network.is_connected(&bob_peer).await,
+            "evicted bob must be disconnected"
+        );
+
+        // Teeth: bob must NOT be redialed (which would evict charlie and
+        // churn). charlie stays put — proof the loop is broken. Poll past the
+        // first two backoff attempts.
+        let guard = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+        while tokio::time::Instant::now() < guard {
+            assert!(
+                !alice_network.is_connected(&bob_peer).await,
+                "evicted bob must not be redialed (churn)"
+            );
+            assert!(
+                alice_network.is_connected(&charlie_peer).await,
+                "charlie must stay connected — no churn displacement"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     #[tokio::test]
@@ -13247,4 +14684,113 @@ fn deserialize_identity_announcement_rejects_garbage() {
 fn deserialize_machine_announcement_rejects_garbage() {
     let result = deserialize_machine_announcement(b"not-a-valid-bincode");
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Restart-safe FenceToken: restart-epoch ABA fence (unit tests)
+// ---------------------------------------------------------------------------
+//
+// FenceToken combines a per-replica epoch (regenerated on daemon restart via
+// `fresh_epoch`) with the local revision. The handle accepts a caller's token
+// only when BOTH match its current `(epoch, revision)` — i.e. exactly when
+// `expected == current`. These tests pin that equality contract: an identical
+// revision under a DIFFERENT epoch is rejected (closes the restart-ABA window
+// without persisting task state), and a moved revision at the same epoch is
+// rejected (stale local snapshot). The wire encoding is opaque to clients.
+
+#[cfg(test)]
+mod fence_token_tests {
+    use crate::FenceToken;
+
+    #[test]
+    fn wire_roundtrip_preserves_epoch_and_revision() {
+        let token = FenceToken {
+            epoch: 123,
+            revision: 456,
+        };
+        let wire = token.to_wire();
+        let back = FenceToken::from_wire(&wire).expect("roundtrip parses");
+        assert_eq!(back, token);
+    }
+
+    #[test]
+    fn from_wire_returns_err_for_malformed_and_overflow_tokens() {
+        // `from_wire` returns Result: a present-but-malformed/overflow token is
+        // `Err`, which the PATCH handler maps to 400 BAD_REQUEST (non-mutating).
+        // This is distinct from an ABSENT token (still a valid unfenced advisory
+        // commit). A corrupt/legacy/overflow token can never bypass the guard or
+        // silently downgrade to "no fence".
+        assert!(FenceToken::from_wire("").is_err());
+        assert!(FenceToken::from_wire("no-colon").is_err());
+        assert!(FenceToken::from_wire(":5").is_err(), "missing epoch");
+        assert!(FenceToken::from_wire("1:").is_err(), "missing revision");
+        assert!(FenceToken::from_wire("1:2:3").is_err(), "too many parts");
+        assert!(FenceToken::from_wire("abc:2").is_err(), "non-numeric epoch");
+        assert!(
+            FenceToken::from_wire("1:xyz").is_err(),
+            "non-numeric revision"
+        );
+        // Integer overflow beyond u64 must be Err, not wrapped/truncated to a
+        // bogus token that could ABA-match a real one.
+        assert!(
+            FenceToken::from_wire("999999999999999999999999999999:1").is_err(),
+            "epoch overflow must be rejected"
+        );
+        assert!(
+            FenceToken::from_wire("1:999999999999999999999999999999").is_err(),
+            "revision overflow must be rejected"
+        );
+        // Teeth check: a well-formed token still parses to Ok, so the parser
+        // rejects malformed input specifically, not all input.
+        let ok = FenceToken::from_wire("123:456");
+        assert!(ok.is_ok(), "well-formed token must parse");
+        assert_eq!(
+            ok.unwrap(),
+            FenceToken {
+                epoch: 123,
+                revision: 456
+            }
+        );
+    }
+
+    #[test]
+    fn same_revision_different_epoch_is_stale_the_restart_aba_breaker() {
+        // The handle regenerates its epoch on restart (fresh_epoch). A token
+        // captured BEFORE a restart carries the pre-restart epoch; even if the
+        // revision counter later reaches the SAME value post-restart, the
+        // epoch differs ⇒ the token is rejected. This is the restart-ABA fence.
+        let pre_restart = FenceToken {
+            epoch: 100,
+            revision: 42,
+        };
+        let post_restart_same_revision = FenceToken {
+            epoch: 999,
+            revision: 42,
+        };
+        assert_ne!(
+            pre_restart, post_restart_same_revision,
+            "epoch differs ⇒ stale even at an identical revision (ABA safe)"
+        );
+        // An exact (epoch, revision) match is accepted.
+        let current = FenceToken {
+            epoch: 999,
+            revision: 42,
+        };
+        assert_eq!(post_restart_same_revision, current, "exact match accepts");
+    }
+
+    #[test]
+    fn stale_revision_at_same_epoch_is_stale() {
+        // Within one epoch (no restart), a moved local snapshot (revision
+        // advanced) also rejects the caller's stale token.
+        let stale = FenceToken {
+            epoch: 7,
+            revision: 3,
+        };
+        let current = FenceToken {
+            epoch: 7,
+            revision: 4,
+        };
+        assert_ne!(stale, current, "revision moved ⇒ token is stale");
+    }
 }

@@ -6,17 +6,39 @@
 //! from multiple agents. Tests OR-Set, LWW-Register, and RGA semantics.
 
 use saorsa_gossip_types::PeerId;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Duration};
 use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
 use x0x::identity::AgentId;
 
+fn test_keys() -> &'static std::collections::HashMap<u8, (AgentId, x0x::gossip::SigningContext)> {
+    static KEYS: LazyLock<std::collections::HashMap<u8, (AgentId, x0x::gossip::SigningContext)>> =
+        LazyLock::new(|| {
+            (0u8..=64)
+                .map(|n| {
+                    let kp = x0x::identity::AgentKeypair::generate().expect("agent keygen");
+                    (
+                        n,
+                        (
+                            kp.agent_id(),
+                            x0x::gossip::SigningContext::from_keypair(&kp),
+                        ),
+                    )
+                })
+                .collect()
+        });
+    &KEYS
+}
+
 /// Helper to create unique agent ID
 fn agent_id(n: u8) -> AgentId {
-    let mut bytes = [0u8; 32];
-    bytes[0] = n;
-    bytes[1] = 0xFF; // Ensure uniqueness
-    AgentId(bytes)
+    test_keys().get(&n).expect("agent key").0
+}
+
+/// Helper to get the cached signing context matching `agent_id(n)` (self-signed).
+fn signing(n: u8) -> &'static x0x::gossip::SigningContext {
+    &test_keys().get(&n).expect("agent key").1
 }
 
 /// Helper to create unique peer ID
@@ -171,17 +193,17 @@ async fn test_concurrent_claim_same_task() {
 
     // Agent 1 claims
     replicas[0]
-        .claim_task(&tid, agent_id(1), peer_id(1), timestamp1)
+        .claim_task(&tid, agent_id(1), peer_id(1), timestamp1, signing(1))
         .expect("Agent 1 claim failed");
 
     // Agent 2 claims (same task, different agent)
     replicas[1]
-        .claim_task(&tid, agent_id(2), peer_id(2), timestamp2)
+        .claim_task(&tid, agent_id(2), peer_id(2), timestamp2, signing(2))
         .expect("Agent 2 claim failed");
 
     // Agent 3 claims (same task, different agent)
     replicas[2]
-        .claim_task(&tid, agent_id(3), peer_id(3), timestamp3)
+        .claim_task(&tid, agent_id(3), peer_id(3), timestamp3, signing(3))
         .expect("Agent 3 claim failed");
 
     // Merge all replicas
@@ -229,7 +251,7 @@ async fn test_same_task_claim_conflict_different_timestamps_converges() {
         .collect();
 
     replicas[0]
-        .claim_task(&tid, agent_id(1), peer_id(1), 1)
+        .claim_task(&tid, agent_id(1), peer_id(1), 1, signing(1))
         .expect("Agent 1 claim failed");
     let first_claim = replicas[0]
         .get_task(&tid)
@@ -241,7 +263,7 @@ async fn test_same_task_claim_conflict_different_timestamps_converges() {
 
     wait_until_clock_after(first_timestamp).await;
     replicas[1]
-        .claim_task(&tid, agent_id(2), peer_id(2), 1)
+        .claim_task(&tid, agent_id(2), peer_id(2), 1, signing(2))
         .expect("Agent 2 claim failed");
     let second_timestamp = replicas[1]
         .get_task(&tid)
@@ -253,7 +275,7 @@ async fn test_same_task_claim_conflict_different_timestamps_converges() {
 
     wait_until_clock_after(second_timestamp).await;
     replicas[2]
-        .claim_task(&tid, agent_id(3), peer_id(3), 1)
+        .claim_task(&tid, agent_id(3), peer_id(3), 1, signing(3))
         .expect("Agent 3 claim failed");
     let third_timestamp = replicas[2]
         .get_task(&tid)
@@ -440,7 +462,7 @@ async fn test_concurrent_complete_task() {
             let meta = metadata("Task to Complete", 1);
             let mut task = TaskItem::new(tid, meta, peer_id(1));
             // Pre-claim the task
-            task.claim(agent_id(1), peer_id(1), 100)
+            task.claim(task_list_id, agent_id(1), peer_id(1), 100, signing(1))
                 .expect("Failed to claim");
             list.add_task(task, peer_id(1), 1)
                 .expect("Failed to add task");
@@ -453,11 +475,11 @@ async fn test_concurrent_complete_task() {
     let timestamp2 = unix_timestamp_ms() + 50;
 
     replicas[0]
-        .complete_task(&tid, agent_id(1), peer_id(1), timestamp1)
+        .complete_task(&tid, agent_id(1), peer_id(1), timestamp1, signing(1))
         .expect("Agent 1 complete failed");
 
     replicas[1]
-        .complete_task(&tid, agent_id(2), peer_id(2), timestamp2)
+        .complete_task(&tid, agent_id(2), peer_id(2), timestamp2, signing(2))
         .expect("Agent 2 complete failed");
 
     // Merge
@@ -508,7 +530,13 @@ async fn test_mixed_concurrent_operations() {
         replicas[2].merge(&r0).expect("Failed to sync");
     }
     replicas[2]
-        .claim_task(&task_id(1), agent_id(3), peer_id(3), unix_timestamp_ms())
+        .claim_task(
+            &task_id(1),
+            agent_id(3),
+            peer_id(3),
+            unix_timestamp_ms(),
+            signing(3),
+        )
         .expect("Failed to claim task A");
 
     // Agent 4: Add task C
@@ -523,7 +551,13 @@ async fn test_mixed_concurrent_operations() {
         replicas[4].merge(&r1).expect("Failed to sync");
     }
     replicas[4]
-        .claim_task(&task_id(2), agent_id(5), peer_id(5), unix_timestamp_ms())
+        .claim_task(
+            &task_id(2),
+            agent_id(5),
+            peer_id(5),
+            unix_timestamp_ms(),
+            signing(5),
+        )
         .expect("Failed to claim task B");
 
     // Agent 6: Complete task A (need to sync first)
@@ -532,7 +566,13 @@ async fn test_mixed_concurrent_operations() {
         replicas[5].merge(&r2).expect("Failed to sync");
     }
     replicas[5]
-        .complete_task(&task_id(1), agent_id(6), peer_id(6), unix_timestamp_ms())
+        .complete_task(
+            &task_id(1),
+            agent_id(6),
+            peer_id(6),
+            unix_timestamp_ms(),
+            signing(6),
+        )
         .expect("Failed to complete task A");
 
     // Full mesh merge (simulates gossip convergence)

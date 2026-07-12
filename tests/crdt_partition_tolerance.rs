@@ -9,6 +9,7 @@ use saorsa_gossip_types::PeerId;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListDelta, TaskListId, TaskMetadata};
@@ -16,12 +17,33 @@ use x0x::identity::AgentId;
 
 type AntiEntropyFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
+fn test_keys() -> &'static std::collections::HashMap<u8, (AgentId, x0x::gossip::SigningContext)> {
+    static KEYS: LazyLock<std::collections::HashMap<u8, (AgentId, x0x::gossip::SigningContext)>> =
+        LazyLock::new(|| {
+            (0u8..=64)
+                .map(|n| {
+                    let kp = x0x::identity::AgentKeypair::generate().expect("agent keygen");
+                    (
+                        n,
+                        (
+                            kp.agent_id(),
+                            x0x::gossip::SigningContext::from_keypair(&kp),
+                        ),
+                    )
+                })
+                .collect()
+        });
+    &KEYS
+}
+
 /// Helper to create unique agent ID
 fn agent_id(n: u8) -> AgentId {
-    let mut bytes = [0u8; 32];
-    bytes[0] = n;
-    bytes[1] = 0xAA;
-    AgentId(bytes)
+    test_keys().get(&n).expect("agent key").0
+}
+
+/// Helper to get the cached signing context matching `agent_id(n)` (self-signed).
+fn signing(n: u8) -> &'static x0x::gossip::SigningContext {
+    &test_keys().get(&n).expect("agent key").1
 }
 
 /// Helper to create unique peer ID
@@ -341,7 +363,7 @@ fn test_partition_conflicting_claims() -> Result<()> {
 
     // Partition: Group A claims first. claim_task's fourth argument is the
     // OR-Set sequence tag; TaskItem::claim generates the conflict timestamp.
-    group_a[0].claim_task(&contested_task_id, agent_id(1), peer_id(1), 2)?;
+    group_a[0].claim_task(&contested_task_id, agent_id(1), peer_id(1), 2, signing(1))?;
     let group_a_claim_timestamp = group_a[0]
         .get_task(&contested_task_id)
         .and_then(|task| task.current_state().timestamp())
@@ -350,7 +372,7 @@ fn test_partition_conflicting_claims() -> Result<()> {
     wait_until_clock_after(group_a_claim_timestamp);
 
     // Partition: Group B claims after the clock advances, using its own sequence tag.
-    group_b[0].claim_task(&contested_task_id, agent_id(2), peer_id(3), 2)?;
+    group_b[0].claim_task(&contested_task_id, agent_id(2), peer_id(3), 2, signing(2))?;
     let group_b_claim_timestamp = group_b[0]
         .get_task(&contested_task_id)
         .and_then(|task| task.current_state().timestamp())
@@ -602,7 +624,13 @@ fn test_partition_state_transitions() {
     // Group A claims the task
     let timestamp_claim = unix_timestamp_ms();
     group_a[0]
-        .claim_task(&task_id_shared, agent_id(1), peer_id(1), timestamp_claim)
+        .claim_task(
+            &task_id_shared,
+            agent_id(1),
+            peer_id(1),
+            timestamp_claim,
+            signing(1),
+        )
         .expect("Claim failed");
 
     // Group B also claims and completes the task (later timestamps)
@@ -610,10 +638,22 @@ fn test_partition_state_transitions() {
     let timestamp_complete = timestamp_claim + 100;
 
     group_b[0]
-        .claim_task(&task_id_shared, agent_id(2), peer_id(2), timestamp_claim_b)
+        .claim_task(
+            &task_id_shared,
+            agent_id(2),
+            peer_id(2),
+            timestamp_claim_b,
+            signing(2),
+        )
         .expect("Claim B failed");
     group_b[0]
-        .complete_task(&task_id_shared, agent_id(2), peer_id(2), timestamp_complete)
+        .complete_task(
+            &task_id_shared,
+            agent_id(2),
+            peer_id(2),
+            timestamp_complete,
+            signing(2),
+        )
         .expect("Complete failed");
 
     // Heal

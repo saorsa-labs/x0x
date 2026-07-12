@@ -2012,6 +2012,26 @@ async fn daemon_api_claim_returns_version_and_structured_fields() -> Result<()> 
         body["committed"] == "local",
         "claim missing committed marker: {body:?}"
     );
+    // Advisory contract: claim is local + non-exclusive. The resolution
+    // block reports the local OR-Set snapshot; the caller is the sole
+    // candidate so locally_winning is true, yet exclusivity is disclaimed.
+    ensure!(
+        body["exclusive"] == false,
+        "claim must not claim exclusivity: {body:?}"
+    );
+    ensure!(
+        body["execution"]["authorization"] == "advisory",
+        "claim authorization is advisory: {body:?}"
+    );
+    ensure!(
+        body["resolution"]["locally_winning"] == true
+            && body["resolution"]["pending_convergence"] == true,
+        "claim resolution is local/provisional: {body:?}"
+    );
+    ensure!(
+        body["resolution"]["current_winner"]["agent_id"].is_string(),
+        "claim reports the current deterministic winner: {body:?}"
+    );
 
     // GET: structured ownership fields must be populated, legacy state kept.
     let listed = list_task_list_items(&d, &list_id).await?;
@@ -2082,35 +2102,62 @@ async fn daemon_api_claim_returns_version_and_structured_fields() -> Result<()> 
     Ok(())
 }
 
-// WHY: without a CAS signal two agents could both "successfully" claim and
-// neither could detect the race. expected_version turns a stale claim into
-// a visible 409 with the current version and NO mutation.
+// WHY: `fence_token` is a LOCAL, restart-safe fencing precondition, not a
+// distributed CAS. It is an OPAQUE `{epoch,revision}` token ("epoch:revision"
+// on the wire): the epoch changes on daemon restart, so a token captured
+// before a restart can never ABA-match a post-restart token even if the
+// revision counter reaches the same value. A stale revision OR a stale epoch
+// ⇒ 409 with no mutation. It still cannot stop two replicas at the same token
+// from both committing — cross-replica exclusion is intentionally not provided
+// (claims are advisory CRDT candidates).
 #[tokio::test]
 #[ignore]
-async fn daemon_api_claim_expected_version_cas() -> Result<()> {
+async fn daemon_api_claim_fence_token() -> Result<()> {
     let d = daemon().await;
-    let (list_id, task_id) = create_task_list_item(&d, "CAS claim").await?;
+    let (list_id, task_id) = create_task_list_item(&d, "fence claim").await?;
 
     let listed = list_task_list_items(&d, &list_id).await?;
     let version = listed["version"].as_u64().context("list version present")?;
+    let fence = listed["fence_token"]
+        .as_str()
+        .context("GET must return an opaque fence_token")?;
 
-    // Stale expected_version ⇒ 409 with current_version, task untouched.
+    // Build a stale fence token: same epoch, bumped revision (local snapshot
+    // moved). The token is opaque to clients; we fabricate a stale one to
+    // exercise the guard.
+    let (epoch, rev) = fence.split_once(':').context("fence token shape")?;
+    let stale_fence = format!("{}:{}", epoch, rev.parse::<u64>().unwrap() + 1000);
+
+    // Stale fence_token ⇒ 409 with current_version + current fence_token,
+    // task untouched, version unchanged.
     let (status, body) = patch_task_raw(
         &d,
         &list_id,
         &task_id,
-        serde_json::json!({"action":"claim","expected_version": version + 1000}),
+        serde_json::json!({"action":"claim","fence_token": stale_fence}),
     )
     .await?;
-    ensure!(status == StatusCode::CONFLICT, "stale CAS status: {status}");
-    ensure!(body["ok"] == false, "conflict response: {body:?}");
     ensure!(
-        body["error"] == "version conflict",
-        "conflict error: {body:?}"
+        status == StatusCode::CONFLICT,
+        "stale-fence status: {status}"
+    );
+    ensure!(body["ok"] == false, "conflict response: {body:?}");
+    // Honest wording: LOCAL staleness guard, not a distributed "version conflict".
+    ensure!(
+        body["error"] == "stale_local_version",
+        "conflict error wording: {body:?}"
+    );
+    ensure!(
+        body["cas"]["scope"] == "local_replica",
+        "fence scope must be localized: {body:?}"
     );
     ensure!(
         body["current_version"].as_u64() == Some(version),
-        "conflict must report current version: {body:?}"
+        "conflict must report current revision: {body:?}"
+    );
+    ensure!(
+        body["fence_token"].is_string(),
+        "conflict must echo the current fence token: {body:?}"
     );
     let listed = list_task_list_items(&d, &list_id).await?;
     let entry = task_entry(&listed, &task_id).context("task still listed")?;
@@ -2123,23 +2170,149 @@ async fn daemon_api_claim_expected_version_cas() -> Result<()> {
         "409 must not bump the version: {listed:?}"
     );
 
-    // Fresh expected_version ⇒ 200 committed with a bumped version.
+    // Fresh fence_token ⇒ 200 committed with a bumped version and a NEW token.
     let (status, body) = patch_task_raw(
         &d,
         &list_id,
         &task_id,
-        serde_json::json!({"action":"claim","expected_version": version}),
+        serde_json::json!({"action":"claim","fence_token": fence}),
     )
     .await?;
-    ensure!(status == StatusCode::OK, "fresh CAS status: {status}");
+    ensure!(status == StatusCode::OK, "fresh-fence status: {status}");
     ensure!(
         body["ok"] == true && body["committed"] == "local",
-        "fresh CAS response: {body:?}"
+        "fresh-fence response: {body:?}"
     );
     ensure!(
         body["version"].as_u64().is_some_and(|v| v > version),
-        "fresh CAS bumps version: {body:?}"
+        "fresh fence bumps version: {body:?}"
     );
+    ensure!(
+        body["fence_token"].is_string() && body["fence_token"] != fence,
+        "commit must return a new fence token: {body:?}"
+    );
+    // Advisory honesty: a fresh commit is local + advisory, NOT exclusive.
+    // The sole claimer is locally winning at commit time, but the response
+    // must still flag pending convergence and non-exclusivity.
+    ensure!(
+        body["resolution"]["pending_convergence"] == true,
+        "commit must be marked pending convergence: {body:?}"
+    );
+    ensure!(
+        body["exclusive"] == false,
+        "commit must never claim exclusivity: {body:?}"
+    );
+    ensure!(
+        body["execution"]["authorization"] == "advisory",
+        "execution authorization is advisory: {body:?}"
+    );
+    ensure!(
+        body["resolution"]["locally_winning"] == true,
+        "sole claimer is locally winning at commit: {body:?}"
+    );
+    Ok(())
+}
+// WHY (P1 fence bypass): the route parsed a provided `fence_token` with
+// `Option::and_then(FenceToken::from_wire)`, collapsing "present but
+// malformed/overflow" into `None` — and `None` means an *unfenced* advisory
+// commit. So a corrupt/legacy/garbage token silently downgraded to no fence
+// and the claim committed 200, exactly the opposite of the token contract.
+// A malformed or overflow token MUST be a hard client error (4xx) with NO
+// mutation of task, version, or fence — distinct from an ABSENT token (still
+// a valid unfenced advisory commit). This test pins that distinction.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_claim_malformed_fence_token_is_rejected_non_mutating() -> Result<()> {
+    let d = daemon().await;
+    let (list_id, task_id) = create_task_list_item(&d, "malformed fence").await?;
+
+    let listed = list_task_list_items(&d, &list_id).await?;
+    let version_before = listed["version"]
+        .as_u64()
+        .context("list version present before attack")?;
+
+    // Every entry here is "present but invalid": a real client would never
+    // send these, but an attacker (or a corrupt/legacy cache) might. None of
+    // them may silently downgrade to an unfenced commit.
+    let malformed_tokens: &[&str] = &[
+        "",         // empty
+        "no-colon", // missing separator
+        ":5",       // missing epoch
+        "1:",       // missing revision
+        "1:2:3",    // too many parts
+        "abc:2",    // non-numeric epoch
+        "1:xyz",    // non-numeric revision
+        " 1:2 ",    // surrounding whitespace is not valid
+        // Overflow beyond u64 must be rejected, not wrapped/truncated.
+        "999999999999999999999999999999:1",
+        "1:999999999999999999999999999999",
+    ];
+
+    for bad in malformed_tokens {
+        let (status, body) = patch_task_raw(
+            &d,
+            &list_id,
+            &task_id,
+            serde_json::json!({"action":"claim","fence_token": bad}),
+        )
+        .await?;
+
+        // Contract: a present-but-malformed/overflow token is 400
+        // BAD_REQUEST with error "malformed_fence_token", never a silent 2xx
+        // commit. (Distinct from an ABSENT token, which is still a valid
+        // unfenced advisory commit.)
+        ensure!(
+            status == StatusCode::BAD_REQUEST,
+            "malformed fence_token {bad:?} must be 400, got {status}: {body:?}"
+        );
+        ensure!(
+            body["error"] == "malformed_fence_token",
+            "malformed fence_token {bad:?} must report malformed_fence_token: {body:?}"
+        );
+        ensure!(
+            body["ok"] == false,
+            "malformed fence_token must not report ok:true: {bad:?} -> {body:?}"
+        );
+    }
+
+    // After a storm of malformed attempts the task MUST be untouched: still
+    // empty, still unclaimed, and the list version unchanged (the rejection
+    // path neither claimed nor bumped the revision/fence).
+    let listed = list_task_list_items(&d, &list_id).await?;
+    let entry = task_entry(&listed, &task_id).context("task still present")?;
+    ensure!(
+        entry["state"] == "empty",
+        "malformed fence must not mutate task state: {entry:?}"
+    );
+    ensure!(
+        entry["claimed_by"].is_null(),
+        "malformed fence must not claim the task: {entry:?}"
+    );
+    ensure!(
+        listed["version"].as_u64() == Some(version_before),
+        "malformed fence rejection must not change the version: {:?} != {version_before}",
+        listed["version"]
+    );
+
+    // Teeth check: a VALID fence token (captured fresh from the current list
+    // state) still commits 200. This proves the gate rejects *malformed*
+    // tokens specifically, not all tokens — an over-rejection bug would fail
+    // here while passing every assertion above.
+    let fresh_fence = listed["fence_token"]
+        .as_str()
+        .context("GET must return an opaque fence_token")?;
+    let (status, body) = patch_task_raw(
+        &d,
+        &list_id,
+        &task_id,
+        serde_json::json!({"action":"claim","fence_token": fresh_fence}),
+    )
+    .await?;
+    ensure!(
+        status == StatusCode::OK,
+        "valid fence_token must still commit: {status} {body:?}"
+    );
+    ensure!(body["ok"] == true, "valid commit reports ok: {body:?}");
     Ok(())
 }
 

@@ -19,7 +19,7 @@ use crate::identity::AgentId;
 use saorsa_gossip_crdt_sync::{LwwRegister, OrSet};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -105,6 +105,16 @@ pub struct TaskList {
     /// counters from 0; uniqueness comes from the `PeerId` component.
     #[serde(skip, default = "default_seq_counter")]
     seq_counter: Arc<AtomicU64>,
+
+    /// Optional authorized-member set for group-scoped lists.
+    ///
+    /// When set, the admission gate rejects checkbox elements whose attesting
+    /// agent is not in this set, applying group authorization at replication
+    /// admission (not just at REST). None for non-group-scoped lists — all
+    /// validly-attested operations are admitted. Not serialized; set at
+    /// runtime by the handle from the group service.
+    #[serde(skip, default)]
+    authorized_agents: Option<Arc<HashSet<AgentId>>>,
 }
 
 impl TaskList {
@@ -129,15 +139,97 @@ impl TaskList {
             name: LwwRegister::new(name),
             version: 0,
             seq_counter: Arc::new(AtomicU64::new(0)),
+            authorized_agents: None,
         }
+    }
+
+    /// Set the authorized-member set for group-scoped lists.
+    ///
+    /// When set, the admission gate ([`TaskList::admit_all`] and the merge
+    /// paths) drops checkbox elements whose attesting agent is not in this
+    /// set. This applies group authorization at replication admission, not
+    /// just at REST. Pass an empty set to deny ALL remote claims/completions
+    /// (fail-closed for a group with no active members). Call before starting
+    /// the sync listener to avoid a race window.
+    pub fn set_authorized_agents(&mut self, agents: HashSet<AgentId>) {
+        self.authorized_agents = Some(Arc::new(agents));
+    }
+
+    /// Clear the authorized-member set (revert to open admission for all
+    /// validly-attested operations).
+    pub fn clear_authorized_agents(&mut self) {
+        self.authorized_agents = None;
     }
 
     /// Get the current version counter.
     ///
-    /// Incremented on every mutation (add, remove, claim, complete, reorder, rename).
+    /// Incremented on every effective local snapshot change — local mutations
+    /// (add/remove/claim/complete/reorder/rename) AND remote merges that
+    /// change the resolved observable state. A merge that is a no-op (e.g.
+    /// re-applying an already-known delta) does NOT bump it. This makes the
+    /// counter a correct local-replica fencing token: a caller that captured
+    /// `version` before a remote claim merged in observes a mismatch and is
+    /// rejected. It is still LOCAL only (per-replica); it is not a distributed
+    /// CAS.
     #[must_use]
     pub fn current_version(&self) -> u64 {
         self.version
+    }
+
+    /// Deterministic fingerprint of the resolved observable state.
+    ///
+    /// Hashes the *resolution* of every task (current state, claim/completion
+    /// winners, title, description, assignee, priority) plus list ordering and
+    /// name, iterated in sorted task-id order. Because it is based on resolved
+    /// values (order-independent minima over the OR-Set) and sorted iteration,
+    /// it is:
+    /// - **deterministic** — identical resolved state yields an identical
+    ///   fingerprint; and
+    /// - **idempotent-stable** — re-merging an already-known delta leaves the
+    ///   resolutions unchanged, so the fingerprint (and thus `version`) does
+    ///   not change.
+    ///
+    /// Used by [`TaskList::merge`] and [`TaskList::merge_delta`] to advance
+    /// `version` exactly once per effective local snapshot change. Cost is
+    /// O(tasks); task lists are small.
+    #[must_use]
+    pub(crate) fn state_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Sorted task-id iteration ⇒ deterministic regardless of HashMap
+        // randomization.
+        let mut ids: Vec<&TaskId> = self.task_data.keys().collect();
+        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for id in &ids {
+            let task = &self.task_data[*id];
+            hasher.write(id.as_bytes());
+            task.title().hash(&mut hasher);
+            task.description().hash(&mut hasher);
+            task.priority().hash(&mut hasher);
+            task.current_state().hash(&mut hasher);
+            task.claim_record().hash(&mut hasher);
+            task.completion_record().hash(&mut hasher);
+            task.assignee().hash(&mut hasher);
+        }
+        for tid in self.ordering.get() {
+            hasher.write(tid.as_bytes());
+        }
+        hasher.write(self.name.get().as_bytes());
+        hasher.finish()
+    }
+
+    /// Advance the local revision iff the resolved observable fingerprint has
+    /// changed since `before_fingerprint`.
+    ///
+    /// Idempotent-stable: a merge that leaves the resolutions unchanged (e.g.
+    /// re-applying an already-known delta) does not bump `version`, so it
+    /// causes no spurious false conflict. This is the single entry point both
+    /// [`TaskList::merge`] and [`TaskList::merge_delta`] use to keep the
+    /// local-replica fence token honest.
+    pub(crate) fn commit_revision_if_changed(&mut self, before_fingerprint: u64) {
+        if self.state_fingerprint() != before_fingerprint {
+            self.version += 1;
+        }
     }
 
     /// Return the next monotonically-increasing sequence number.
@@ -177,7 +269,21 @@ impl TaskList {
     ///
     /// Returns an error if the OR-Set operation fails.
     pub fn add_task(&mut self, task: TaskItem, peer_id: PeerId, seq: u64) -> Result<()> {
+        self.add_task_core(task, peer_id, seq)?;
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Core add-task logic (OR-Set add, task_data merge/admit, ordering
+    /// append) shared by the public [`add_task`] (local mutation, bumps
+    /// version) and the delta-merge path ([`Self::delta_upsert_task`], which
+    /// defers the version bump to [`Self::commit_revision_if_changed`]).
+    fn add_task_core(&mut self, task: TaskItem, peer_id: PeerId, seq: u64) -> Result<()> {
         let task_id = *task.id();
+        // Snapshot scope + authorized set before any mutable borrow of
+        // task_data so the admission gate can run without borrow conflicts.
+        let scope = self.id;
+        let authorized = self.authorized_agents.clone();
 
         // Add to OR-Set
         let tag = (peer_id, seq);
@@ -188,9 +294,30 @@ impl TaskList {
         // Store or merge task data
         if let Some(existing) = self.task_data.get_mut(&task_id) {
             // Task already exists - merge CRDT state instead of overwriting
-            existing.merge(&task)?;
+            existing.merge(scope, &task)?;
+            // Apply group-authorization filter on the merged result so a
+            // nonmember's claim/complete arriving via merge is rejected.
+            if let Some(members) = &authorized {
+                let dropped = existing.filter_unauthorized(members);
+                if dropped > 0 {
+                    tracing::debug!(dropped, "dropped nonmember elements during merge-add");
+                }
+            }
         } else {
-            // New task - insert
+            // New task — run the fail-closed admission gate before inserting
+            // so a first-seen forged/unattested element is purged before it
+            // can influence resolution. This closes the first-seen bypass.
+            let mut task = task;
+            let mut dropped = task.admit(scope);
+            if let Some(members) = &authorized {
+                dropped += task.filter_unauthorized(members);
+            }
+            if dropped > 0 {
+                tracing::debug!(
+                    dropped,
+                    "purged unauthenticated/nonmember checkbox elements during first-seen add_task"
+                );
+            }
             self.task_data.insert(task_id, task);
         }
 
@@ -201,7 +328,65 @@ impl TaskList {
             self.ordering.set(current_order, peer_id);
         }
 
-        self.version += 1;
+        Ok(())
+    }
+
+    // ── Delta-merge internal helpers (no version bump) ───────────────────
+    //
+    // These mirror the public mutators but do NOT advance `self.version`.
+    // `merge_delta` wraps the entire body in a fingerprint snapshot and calls
+    // `commit_revision_if_changed` exactly once at the end, so the version
+    // advances iff the resolved observable state actually changed. If these
+    // helpers bumped version internally, an idempotent redelivery would
+    // advance the fence despite no effective state change.
+
+    /// Upsert a task during delta merge without bumping version.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn delta_upsert_task(
+        &mut self,
+        task: TaskItem,
+        peer_id: PeerId,
+        seq: u64,
+    ) -> Result<()> {
+        self.add_task_core(task, peer_id, seq)
+    }
+
+    /// Remove a task during delta merge without bumping version. No-op if the
+    /// task does not exist locally.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn delta_remove_task(&mut self, task_id: &TaskId) {
+        if self.task_data.contains_key(task_id) {
+            let _ = self.tasks.remove(task_id);
+            self.task_data.remove(task_id);
+        }
+    }
+
+    /// Merge a remote ordering register during delta merge without bumping
+    /// version.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn delta_merge_ordering(&mut self, other: &LwwRegister<Vec<TaskId>>) {
+        self.ordering.merge(other);
+    }
+
+    /// Merge a remote name register during delta merge without bumping version.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn delta_merge_name(&mut self, other: &LwwRegister<String>) {
+        self.name.merge(other);
+    }
+
+    /// Merge a remote task into an existing local task during delta merge,
+    /// then apply the authentication and membership admission gates. Does NOT
+    /// bump version (deferred to `commit_revision_if_changed`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn delta_merge_task(&mut self, task_id: &TaskId, other: &TaskItem) -> Result<()> {
+        let scope = self.id;
+        let authorized = self.authorized_agents.clone();
+        if let Some(existing) = self.task_data.get_mut(task_id) {
+            existing.merge(scope, other)?;
+            if let Some(members) = &authorized {
+                let _dropped = existing.filter_unauthorized(members);
+            }
+        }
         Ok(())
     }
 
@@ -262,13 +447,14 @@ impl TaskList {
         agent_id: AgentId,
         peer_id: PeerId,
         seq: u64,
+        signing: &crate::gossip::SigningContext,
     ) -> Result<()> {
         let task = self
             .task_data
             .get_mut(task_id)
             .ok_or(CrdtError::TaskNotFound(*task_id))?;
 
-        task.claim(agent_id, peer_id, seq)?;
+        task.claim(self.id, agent_id, peer_id, seq, signing)?;
         self.version += 1;
         Ok(())
     }
@@ -297,13 +483,14 @@ impl TaskList {
         agent_id: AgentId,
         peer_id: PeerId,
         seq: u64,
+        signing: &crate::gossip::SigningContext,
     ) -> Result<()> {
         let task = self
             .task_data
             .get_mut(task_id)
             .ok_or(CrdtError::TaskNotFound(*task_id))?;
 
-        task.complete(agent_id, peer_id, seq)?;
+        task.complete(self.id, agent_id, peer_id, seq, signing)?;
         self.version += 1;
         Ok(())
     }
@@ -399,6 +586,15 @@ impl TaskList {
             )));
         }
 
+        // Capture the resolved observable fingerprint BEFORE merging so the
+        // local version advances exactly once iff this merge effectively
+        // changes the local snapshot. Without this, a remote claim that
+        // merges in would not advance `version` and a caller's stale token
+        // would still be accepted — defeating the local-replica fence.
+        let before = self.state_fingerprint();
+        let scope = self.id;
+        let authorized = self.authorized_agents.clone();
+
         // Merge OR-Set (task membership)
         self.tasks
             .merge_state(&other.tasks)
@@ -409,10 +605,26 @@ impl TaskList {
         for (task_id, other_task) in &other.task_data {
             if let Some(our_task) = self.task_data.get_mut(task_id) {
                 // Merge existing task
-                our_task.merge(other_task)?;
+                our_task.merge(scope, other_task)?;
+                if let Some(members) = &authorized {
+                    let _dropped = our_task.filter_unauthorized(members);
+                }
             } else {
-                // Add new task
-                self.task_data.insert(*task_id, other_task.clone());
+                // Add new task — run the admission gate so a first-seen
+                // forged/unattested element is purged before it can influence
+                // resolution.
+                let mut new_task = other_task.clone();
+                let mut dropped = new_task.admit(scope);
+                if let Some(members) = &authorized {
+                    dropped += new_task.filter_unauthorized(members);
+                }
+                if dropped > 0 {
+                    tracing::debug!(
+                        dropped,
+                        "purged unauthenticated/nonmember checkbox elements during first-seen merge"
+                    );
+                }
+                self.task_data.insert(*task_id, new_task);
             }
         }
 
@@ -420,6 +632,11 @@ impl TaskList {
         self.ordering.merge(&other.ordering);
         self.name.merge(&other.name);
 
+        // Advance the local revision exactly once iff the resolved snapshot
+        // changed. Idempotent re-merges leave the fingerprint unchanged ⇒ no
+        // bump (fixes spurious false conflicts from repeated full-state
+        // merges).
+        self.commit_revision_if_changed(before);
         Ok(())
     }
 
@@ -468,6 +685,25 @@ impl TaskList {
         self.version += 1;
     }
 
+    /// Run the fail-closed admission gate on every task in this list.
+    ///
+    /// Drops unauthenticated checkbox elements (missing/malformed/wrong-agent/
+    /// attacker signatures) and restores attested elements censored by forged
+    /// tombstones. Called after deserializing from persistent storage so a
+    /// corrupted/tampered on-disk state cannot bypass the admission gate.
+    pub fn admit_all(&mut self) -> usize {
+        let scope = self.id;
+        let authorized = self.authorized_agents.clone();
+        let mut total_dropped = 0usize;
+        for task in self.task_data.values_mut() {
+            total_dropped += task.admit(scope);
+            if let Some(members) = &authorized {
+                total_dropped += task.filter_unauthorized(members);
+            }
+        }
+        total_dropped
+    }
+
     /// Get the number of tasks in the list.
     #[must_use]
     pub fn task_count(&self) -> usize {
@@ -497,6 +733,18 @@ mod tests {
 
     fn peer(n: u8) -> PeerId {
         PeerId::new([n; 32])
+    }
+
+    /// Real (key-derived) agent identity + matching signing context for a
+    /// claim/complete caller. `sign_attestation` self-signs
+    /// (`agent_id == signing.agent_id`), so callers cannot use the fixed
+    /// `AgentId([n;32])`; the agent id MUST be the keypair's derived id.
+    fn signing_for(_n: u8) -> (AgentId, crate::gossip::SigningContext) {
+        let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
+        (
+            kp.agent_id(),
+            crate::gossip::SigningContext::from_keypair(&kp),
+        )
     }
 
     fn list_id(n: u8) -> TaskListId {
@@ -581,7 +829,7 @@ mod tests {
     #[test]
     fn test_claim_task() {
         let peer = peer(1);
-        let agent = agent(1);
+        let (agent, signing) = signing_for(1);
         let id = list_id(1);
         let mut list = TaskList::new(id, "My List".to_string(), peer);
 
@@ -590,7 +838,7 @@ mod tests {
 
         list.add_task(task, peer, 1).ok().unwrap();
 
-        let result = list.claim_task(&task_id, agent, peer, 2);
+        let result = list.claim_task(&task_id, agent, peer, 2, &signing);
         assert!(result.is_ok());
 
         let task = list.get_task(&task_id).unwrap();
@@ -600,7 +848,7 @@ mod tests {
     #[test]
     fn test_complete_task() {
         let peer = peer(1);
-        let agent = agent(1);
+        let (agent, signing) = signing_for(1);
         let id = list_id(1);
         let mut list = TaskList::new(id, "My List".to_string(), peer);
 
@@ -608,9 +856,11 @@ mod tests {
         let task_id = *task.id();
 
         list.add_task(task, peer, 1).ok().unwrap();
-        list.claim_task(&task_id, agent, peer, 2).ok().unwrap();
+        list.claim_task(&task_id, agent, peer, 2, &signing)
+            .ok()
+            .unwrap();
 
-        let result = list.complete_task(&task_id, agent, peer, 3);
+        let result = list.complete_task(&task_id, agent, peer, 3, &signing);
         assert!(result.is_ok());
 
         let task = list.get_task(&task_id).unwrap();
@@ -707,7 +957,7 @@ mod tests {
     fn test_merge_with_concurrent_task_modifications() {
         let peer1 = peer(1);
         let peer2 = peer(2);
-        let agent1 = agent(1);
+        let (agent1, signing1) = signing_for(1);
         let _agent2 = agent(2);
         let id = list_id(1);
 
@@ -723,7 +973,10 @@ mod tests {
         list2.add_task(task2, peer2, 1).ok().unwrap();
 
         // list1 claims the task
-        list1.claim_task(&task_id, agent1, peer1, 2).ok().unwrap();
+        list1
+            .claim_task(&task_id, agent1, peer1, 2, &signing1)
+            .ok()
+            .unwrap();
 
         // list2 updates the title
         list2
@@ -740,6 +993,140 @@ mod tests {
         // Title update depends on vector clock ordering
     }
 
+    // ── Local-fence version invariants (review §3 P0/P1) ────────────────
+
+    #[test]
+    fn test_remote_claim_merge_advances_version_invalidating_stale_token() {
+        // P0: a remote claim merged in must advance the local version so a
+        // caller that captured an earlier version (its local-replica fence
+        // token) is rejected. Without this the fence is defeated.
+        let peer1 = peer(1);
+        let peer2 = peer(2);
+        let id = list_id(1);
+
+        let mut list_a = TaskList::new(id, "List".to_string(), peer1);
+        let mut list_b = TaskList::new(id, "List".to_string(), peer2);
+
+        // Both add the same task.
+        let task_a = make_task(1, peer1);
+        let task_b = make_task(1, peer2);
+        let task_id = *task_a.id();
+        list_a.add_task(task_a, peer1, 1).unwrap();
+        list_b.add_task(task_b, peer2, 1).unwrap();
+
+        // B reads its snapshot + version (its local fence token).
+        let token_b = list_b.current_version();
+        assert_eq!(token_b, 1, "version after one local add");
+        assert!(!list_b
+            .get_task(&task_id)
+            .unwrap()
+            .current_state()
+            .is_claimed());
+
+        // A claims the task (advances A's version, not B's).
+        let (agent, signing) = signing_for(1);
+        list_a
+            .claim_task(&task_id, agent, peer1, 2, &signing)
+            .unwrap();
+
+        // B merges A's state. B's resolved snapshot now shows A's claim, and
+        // B's version MUST have advanced past `token_b`.
+        list_b.merge(&list_a).unwrap();
+        assert!(
+            list_b
+                .get_task(&task_id)
+                .unwrap()
+                .current_state()
+                .is_claimed(),
+            "B observed A's claim after merge"
+        );
+        assert!(
+            list_b.current_version() > token_b,
+            "remote claim merge must advance the local version (fence invalidated): {} > {}",
+            list_b.current_version(),
+            token_b
+        );
+    }
+
+    #[test]
+    fn test_merge_delta_remote_claim_advances_version() {
+        // P0 via the delta path (the actual inbound gossip route): a state-
+        // change delta merged through `merge_delta` must also advance version.
+        let peer1 = peer(1);
+        let peer2 = peer(2);
+        let id = list_id(1);
+        let mut list_a = TaskList::new(id, "List".to_string(), peer1);
+        let mut list_b = TaskList::new(id, "List".to_string(), peer2);
+        let task_a = make_task(1, peer1);
+        let task_b = make_task(1, peer2);
+        let task_id = *task_a.id();
+        list_a.add_task(task_a, peer1, 1).unwrap();
+        list_b.add_task(task_b, peer2, 1).unwrap();
+
+        let token_b = list_b.current_version();
+
+        // A claims and produces a state-change delta.
+        let (agent, signing) = signing_for(1);
+        list_a
+            .claim_task(&task_id, agent, peer1, 2, &signing)
+            .unwrap();
+        let claimed_task = list_a.get_task(&task_id).unwrap().clone();
+        let delta = crate::crdt::TaskListDelta::for_state_change(
+            task_id,
+            claimed_task,
+            list_a.current_version(),
+        );
+
+        // B applies the delta over the gossip path.
+        list_b.merge_delta(&delta, peer1).unwrap();
+        assert!(
+            list_b
+                .get_task(&task_id)
+                .unwrap()
+                .current_state()
+                .is_claimed(),
+            "delta merge applied the claim"
+        );
+        assert!(
+            list_b.current_version() > token_b,
+            "remote state-change delta must advance local version"
+        );
+    }
+
+    #[test]
+    fn test_idempotent_merge_does_not_bump_version() {
+        // P1: re-merging an already-known delta leaves the resolved snapshot
+        // (and thus the version) unchanged — no spurious false conflicts.
+        let peer1 = peer(1);
+        let peer2 = peer(2);
+        let id = list_id(1);
+        let mut list_a = TaskList::new(id, "List".to_string(), peer1);
+        let mut list_b = TaskList::new(id, "List".to_string(), peer2);
+        let task_a = make_task(1, peer1);
+        let task_b = make_task(1, peer2);
+        let task_id = *task_a.id();
+        list_a.add_task(task_a, peer1, 1).unwrap();
+        list_b.add_task(task_b, peer2, 1).unwrap();
+
+        // B claims → its snapshot changes.
+        let (agent, signing) = signing_for(1);
+        list_b
+            .claim_task(&task_id, agent, peer2, 2, &signing)
+            .unwrap();
+
+        // First merge brings B's claim into A ⇒ A's version advances once.
+        list_a.merge(&list_b).unwrap();
+        let v1 = list_a.current_version();
+        assert!(v1 > 1, "effective merge (claim) must bump version: {v1}");
+
+        // Second identical merge: A already resolved B's claim ⇒ no change.
+        list_a.merge(&list_b).unwrap();
+        assert_eq!(
+            list_a.current_version(),
+            v1,
+            "idempotent re-merge must not bump the version"
+        );
+    }
     #[test]
     fn test_merge_different_list_ids_fails() {
         let peer = peer(1);

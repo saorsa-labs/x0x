@@ -5,12 +5,37 @@
 //! and synchronizing across multiple agents.
 
 use saorsa_gossip_types::PeerId;
+use std::sync::LazyLock;
 use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
 use x0x::identity::AgentId;
 
+fn test_keys() -> &'static std::collections::HashMap<u8, (AgentId, x0x::gossip::SigningContext)> {
+    static KEYS: LazyLock<std::collections::HashMap<u8, (AgentId, x0x::gossip::SigningContext)>> =
+        LazyLock::new(|| {
+            (0u8..=64)
+                .map(|n| {
+                    let kp = x0x::identity::AgentKeypair::generate().expect("agent keygen");
+                    (
+                        n,
+                        (
+                            kp.agent_id(),
+                            x0x::gossip::SigningContext::from_keypair(&kp),
+                        ),
+                    )
+                })
+                .collect()
+        });
+    &KEYS
+}
+
 /// Helper to create a test agent ID.
 fn test_agent_id(n: u8) -> AgentId {
-    AgentId([n; 32])
+    test_keys().get(&n).expect("agent key").0
+}
+
+/// Helper to get the cached signing context matching `test_agent_id(n)` (self-signed).
+fn signing(n: u8) -> &'static x0x::gossip::SigningContext {
+    &test_keys().get(&n).expect("agent key").1
 }
 
 /// Helper to create a test peer ID.
@@ -40,7 +65,7 @@ fn test_metadata(title: &str, creator: u8) -> TaskMetadata {
         title: title.to_string(),
         description: format!("Test task: {}", title),
         priority: 128,
-        created_by: test_agent_id(creator),
+        created_by: AgentId([creator; 32]),
         owner: None,
         created_at: 1000 + creator as u64,
         tags: vec!["test".to_string()],
@@ -85,6 +110,7 @@ fn test_task_list_claim_task() {
     let task_id = test_task_id(1);
     let peer_id = test_peer_id(1);
     let agent_id = test_agent_id(1);
+    let signing = signing(1);
 
     let mut task_list = TaskList::new(list_id, "Sprint".to_string(), peer_id);
     let metadata = test_metadata("Write code", agent_id.as_bytes()[0]);
@@ -93,7 +119,7 @@ fn test_task_list_claim_task() {
     task_list
         .add_task(task, peer_id, 1)
         .expect("Failed to add task");
-    let claim_result = task_list.claim_task(&task_id, agent_id, peer_id, 2);
+    let claim_result = task_list.claim_task(&task_id, agent_id, peer_id, 2, signing);
 
     assert!(claim_result.is_ok());
     let task = task_list.get_task(&task_id).expect("Task should exist");
@@ -107,6 +133,7 @@ fn test_task_list_complete_task() {
     let task_id = test_task_id(1);
     let peer_id = test_peer_id(1);
     let agent_id = test_agent_id(1);
+    let signing = signing(1);
 
     let mut task_list = TaskList::new(list_id, "Sprint".to_string(), peer_id);
     let metadata = test_metadata("Test code", agent_id.as_bytes()[0]);
@@ -116,9 +143,9 @@ fn test_task_list_complete_task() {
         .add_task(task, peer_id, 1)
         .expect("Failed to add task");
     task_list
-        .claim_task(&task_id, agent_id, peer_id, 2)
+        .claim_task(&task_id, agent_id, peer_id, 2, signing)
         .expect("Failed to claim task");
-    let complete_result = task_list.complete_task(&task_id, agent_id, peer_id, 3);
+    let complete_result = task_list.complete_task(&task_id, agent_id, peer_id, 3, signing);
 
     assert!(complete_result.is_ok());
     let task = task_list.get_task(&task_id).expect("Task should exist");
@@ -228,6 +255,8 @@ fn test_concurrent_claims() {
     let peer_id_b = test_peer_id(2);
     let agent_id_a = test_agent_id(1);
     let _agent_id_b = test_agent_id(2);
+    let signing_a = signing(1);
+    let signing_b = signing(2);
 
     let mut task_list = TaskList::new(list_id, "Sprint".to_string(), peer_id_a);
     let metadata = test_metadata("Claim test", agent_id_a.as_bytes()[0]);
@@ -239,12 +268,12 @@ fn test_concurrent_claims() {
 
     // Agent A claims the task
     task_list
-        .claim_task(&task_id, agent_id_a, peer_id_a, 2)
+        .claim_task(&task_id, agent_id_a, peer_id_a, 2, signing_a)
         .expect("A should claim");
 
     // Agent B also claims (concurrent)
     task_list
-        .claim_task(&task_id, _agent_id_b, peer_id_b, 2)
+        .claim_task(&task_id, _agent_id_b, peer_id_b, 2, signing_b)
         .expect("B should claim");
 
     // Both should be visible (OR-Set semantics)
@@ -301,6 +330,7 @@ fn test_version_tracking() {
     let list_id = test_task_list_id(1);
     let peer_id = test_peer_id(1);
     let agent_id = test_agent_id(1);
+    let signing = signing(1);
 
     let mut task_list = TaskList::new(list_id, "Sprint".to_string(), peer_id);
     let initial_version = task_list.version();
@@ -317,7 +347,7 @@ fn test_version_tracking() {
 
     // Claim the task
     task_list
-        .claim_task(&task_id, agent_id, peer_id, 2)
+        .claim_task(&task_id, agent_id, peer_id, 2, signing)
         .expect("Failed to claim");
 
     let version_after_claim = task_list.version();
@@ -351,6 +381,7 @@ fn test_invalid_state_transitions() {
     let task_id = test_task_id(1);
     let peer_id = test_peer_id(1);
     let agent_id = test_agent_id(1);
+    let signing = signing(1);
 
     let mut task_list = TaskList::new(list_id, "Sprint".to_string(), peer_id);
     let metadata = test_metadata("State test", agent_id.as_bytes()[0]);
@@ -359,7 +390,7 @@ fn test_invalid_state_transitions() {
     task_list.add_task(task, peer_id, 1).expect("Failed to add");
 
     // Try to complete without claiming first
-    let result = task_list.complete_task(&task_id, agent_id, peer_id, 2);
+    let result = task_list.complete_task(&task_id, agent_id, peer_id, 2, signing);
     assert!(result.is_err());
 }
 

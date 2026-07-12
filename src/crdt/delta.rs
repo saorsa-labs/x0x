@@ -173,54 +173,68 @@ impl TaskList {
     ///
     /// Returns an error if merge operations fail.
     pub fn merge_delta(&mut self, delta: &TaskListDelta, peer_id: PeerId) -> Result<()> {
-        // Apply added tasks
+        // Capture the resolved observable fingerprint BEFORE applying the
+        // delta so the local version advances exactly once iff this merge
+        // effectively changes the local snapshot. (Remote claim/complete
+        // merges must invalidate a caller's stale local token.)
+        //
+        // The body uses delta_* helpers that do NOT bump version internally;
+        // only commit_revision_if_changed advances it. This ensures an
+        // idempotent redelivery (same resolved state) does NOT advance the
+        // fence, while a real remote change advances it exactly once.
+        //
+        // NOTE (composition with the provenance gate): any unauthenticated or
+        // forged Claimed/Done element is dropped by the admission gate inside
+        // delta_upsert_task / TaskItem::merge — before it can influence
+        // resolution. Because this fingerprint wraps the entire merge body, it
+        // is computed over post-gate (authenticated) state by construction.
+        let before = self.state_fingerprint();
         for (task_id, (task, tag)) in &delta.added_tasks {
-            // If task doesn't exist, add it
+            // If task doesn't exist, add it (admit runs inside delta_upsert_task).
+            // If it exists, merge + filter (admit + membership run inside
+            // delta_merge_task).
             if self.get_task(task_id).is_none() {
-                self.add_task(task.clone(), tag.0, tag.1)?;
+                self.delta_upsert_task(task.clone(), tag.0, tag.1)?;
             } else {
-                // Task exists, merge it
-                if let Some(existing_task) = self.get_task_mut(task_id) {
-                    existing_task.merge(task)?;
-                }
+                self.delta_merge_task(task_id, task)?;
             }
         }
 
-        // Apply removed tasks
+        // Apply removed tasks (no version bump; deferred to commit_revision).
         for task_id in delta.removed_tasks.keys() {
-            // Attempt to remove (will fail silently if task doesn't exist)
-            let _ = self.remove_task(task_id);
+            self.delta_remove_task(task_id);
         }
 
         // Apply task updates (upsert: merge if exists, insert if missing).
         // The upsert is critical for out-of-order delivery — a claim/complete
         // delta may arrive before the corresponding add delta. Since the
         // TaskItem in task_updates contains full state, inserting it directly
-        // is safe and preserves the state change.
+        // is safe and preserves the state change. The admission gate runs
+        // inside delta_upsert_task / merge.
         for (task_id, updated_task) in &delta.task_updates {
-            if let Some(existing_task) = self.get_task_mut(task_id) {
-                existing_task.merge(updated_task)?;
+            if self.get_task(task_id).is_some() {
+                self.delta_merge_task(task_id, updated_task)?;
             } else {
-                // Task not yet known — insert it with a synthetic OR-Set add.
-                // Use the peer_id from the delta sender and seq=0 (the OR-Set
-                // tag just needs to exist; uniqueness is already guaranteed by
-                // the sender's monotonic counter).
-                self.add_task(updated_task.clone(), peer_id, 0)?;
+                // Task not yet known — insert it (admit runs inside).
+                self.delta_upsert_task(updated_task.clone(), peer_id, 0)?;
             }
         }
 
         // Apply ordering update via LWW (vector-clock) merge. The merged
         // ordering may reference task IDs not yet present (out-of-order
         // delivery); tasks_ordered filters those at read time.
-        if let Some(ref order_register) = delta.ordering_update {
-            self.merge_ordering(order_register);
+        if let Some(order_register) = &delta.ordering_update {
+            self.delta_merge_ordering(order_register);
         }
 
         // Apply name update via LWW (vector-clock) merge.
-        if let Some(ref name_register) = delta.name_update {
-            self.merge_name(name_register);
+        if let Some(name_register) = &delta.name_update {
+            self.delta_merge_name(name_register);
         }
 
+        // Advance the local revision exactly once iff the resolved observable
+        // snapshot changed. Idempotent re-merges (same resolutions) ⇒ no bump.
+        self.commit_revision_if_changed(before);
         Ok(())
     }
 }
@@ -527,5 +541,51 @@ mod tests {
 
         // Verify name changed
         assert_eq!(list.name(), "Updated");
+    }
+
+    #[test]
+    fn duplicate_merge_delta_advances_version_once_then_is_idempotent() {
+        // P1 fence: the TaskList version IS the local-replica fence token. A
+        // real remote change must advance it exactly once; an idempotent
+        // re-delivery of an already-resolved delta must NOT advance it (else
+        // revision churn would spuriously invalidate callers and satisfy
+        // "fence changed" gates with no real change). merge_delta must not
+        // bump version inside its sub-operations; only commit_revision_if_changed
+        // advances it, iff the resolved snapshot changed.
+        let peer = peer(1);
+        let id = list_id(1);
+        let mut list = TaskList::new(id, "L".to_string(), peer);
+        let t1 = make_task(1, peer);
+        let t2 = make_task(2, peer);
+        let id1 = *t1.id();
+        let id2 = *t2.id();
+        list.add_task(t1, peer, 1).unwrap();
+        list.add_task(t2, peer, 2).unwrap();
+
+        // A remote peer reverses the order on top of the shared history; its
+        // register causally dominates ours, so the first merge is a real change.
+        let mut order_register = list.ordering_register().clone();
+        order_register.set(vec![id2, id1], peer);
+        let mut delta = TaskListDelta::new(10);
+        delta.ordering_update = Some(order_register);
+
+        let v0 = list.version();
+        list.merge_delta(&delta, peer).unwrap();
+        let v1 = list.version();
+        assert!(
+            v1 > v0,
+            "a real remote ordering change must advance the version/fence once"
+        );
+
+        // Second identical merge: the ordering is already resolved identically
+        // ⇒ the fingerprint is unchanged ⇒ the version MUST NOT advance again.
+        list.merge_delta(&delta, peer).unwrap();
+        assert_eq!(
+            list.version(),
+            v1,
+            "duplicate delta must not advance the version/fence again"
+        );
+        // The two real tasks are still present (no spurious removal).
+        assert_eq!(list.task_count(), 2);
     }
 }
