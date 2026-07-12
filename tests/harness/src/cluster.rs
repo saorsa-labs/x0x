@@ -36,8 +36,20 @@ impl AgentInstance {
     }
 
     pub async fn restart(&mut self) {
+        self.stop();
+        self.start().await;
+    }
+
+    /// Kill the daemon process without restarting it. Pair with
+    /// [`Self::start`] to create a downtime window during which other
+    /// instances can mutate shared state (offline-mutation tests).
+    pub fn stop(&mut self) {
         let _ = self.process.kill();
         let _ = self.process.wait();
+    }
+
+    /// Start the daemon again after [`Self::stop`] and wait until healthy.
+    pub async fn start(&mut self) {
         self.process = Command::new(&self.binary)
             .arg("--config")
             .arg(&self.config_path)
