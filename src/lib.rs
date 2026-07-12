@@ -6527,7 +6527,16 @@ impl Agent {
                 {
                     if let Some(net) = &network {
                         let ant_peer = ant_quic::PeerId(announcement.machine_id.0);
-                        if !net.is_connected(&ant_peer).await {
+                        // Security gate: a peer that was revoked, policy-rejected,
+                        // admin-disconnected, or capacity-evicted carries a
+                        // reconnect-suppression tombstone. Such a peer may keep
+                        // broadcasting identity announcements over gossip; if we
+                        // auto-connected on those, we would silently undo the
+                        // security/eviction decision. Skip the dial (and do not
+                        // record an attempt) while the tombstone is live.
+                        let suppressed = net.is_reconnect_suppressed(announcement.machine_id.0);
+                        let connected = net.is_connected(&ant_peer).await;
+                        if announcement_should_auto_connect(suppressed, connected) {
                             auto_connect_attempted.insert(announcement.agent_id);
                             let net = std::sync::Arc::clone(net);
                             let addresses = auto_connect_addresses.clone();
@@ -6550,6 +6559,12 @@ impl Agent {
                                     addresses.len(),
                                 );
                             });
+                        } else if suppressed {
+                            tracing::debug!(
+                                target: "x0x::connect",
+                                peer_id_prefix = %network::hex_prefix(&announcement.machine_id.0, 4),
+                                "skipping announcement auto-connect for reconnect-suppressed peer",
+                            );
                         }
                     }
                 }
@@ -9172,6 +9187,33 @@ const RECONNECT_BACKOFF_DELAYS: &[std::time::Duration] = &[
     std::time::Duration::from_secs(16),
 ];
 
+/// Whether a discovered peer's identity announcement should trigger an
+/// auto-connect dial.
+///
+/// Returns `false` when the peer's reconnect is suppressed — it was revoked,
+/// policy-rejected, admin-disconnected, or capacity-evicted — so that a
+/// suppressed peer which keeps broadcasting identity announcements is not
+/// silently reconnected (which would undo the security/eviction decision), and
+/// `false` when the peer is already connected. Extracted as a pure predicate so
+/// the security invariant is unit-testable independently of the gossip stack.
+fn announcement_should_auto_connect(reconnect_suppressed: bool, already_connected: bool) -> bool {
+    !reconnect_suppressed && !already_connected
+}
+
+/// Apply bounded ±20% random jitter to a reconnect backoff delay.
+///
+/// Fixed backoff delays cause N peers that disconnected together (e.g. a shared
+/// bootstrap node restart) to redial in lockstep, producing synchronized
+/// connection storms. Scaling each delay by a random factor in `[0.8, 1.2)`
+/// decorrelates those redials while preserving the intended exponential
+/// backoff shape. The jitter is for load-spreading only, so a fast non-crypto
+/// RNG is sufficient.
+fn jittered_backoff_delay(delay: std::time::Duration) -> std::time::Duration {
+    // factor ∈ [0.8, 1.2): rand::random::<f64>() yields [0.0, 1.0).
+    let factor = 0.8 + rand::random::<f64>() * 0.4;
+    delay.mul_f64(factor)
+}
+
 /// Type alias for the single-flight reconnect tracker shared between the
 /// network-event listener and the peer-lifecycle watcher.
 type ReconnectTracker = std::sync::Arc<
@@ -9210,6 +9252,15 @@ fn schedule_reconnect(
     peer_id_bytes: [u8; 32],
     active_reconnects: ReconnectTracker,
 ) {
+    // Defense in depth: never schedule a reconnect for a peer whose redial is
+    // suppressed (revocation, policy rejection, admin teardown, capacity
+    // eviction). The call sites already gate on this, but re-checking here
+    // keeps the scheduler authoritative if a future call site forgets — a
+    // suppressed peer must never be proactively redialed.
+    if network.is_reconnect_suppressed(peer_id_bytes) {
+        return;
+    }
+
     // Single-flight: hold the lock across check + spawn + insert so two
     // concurrent callers cannot both start a reconnect for the same peer.
     let mut tracker = match active_reconnects.lock() {
@@ -9236,11 +9287,28 @@ fn schedule_reconnect(
             "scheduling proactive reconnect for disconnected peer",
         );
 
-        for (attempt, &delay) in RECONNECT_BACKOFF_DELAYS.iter().enumerate() {
-            // Wait with cancellation before each attempt.
+        'attempts: for (attempt, &delay) in RECONNECT_BACKOFF_DELAYS.iter().enumerate() {
+            // Wait with cancellation before each attempt. Apply bounded jitter
+            // so peers that disconnected together do not redial in lockstep.
             tokio::select! {
                 _ = shutdown_token.cancelled() => break,
-                _ = tokio::time::sleep(delay) => {}
+                _ = tokio::time::sleep(jittered_backoff_delay(delay)) => {}
+            }
+
+            // Re-check suppression on every attempt: a peer that was revoked,
+            // policy-rejected, admin-disconnected, or evicted *during* the
+            // backoff sequence must stop being redialed mid-flight. Re-checked
+            // again immediately before each dial below, since the intervening
+            // `is_connected`/cache-read awaits give a concurrent
+            // `disconnect_with_reason` a window to set the tombstone.
+            if network.is_reconnect_suppressed(peer_id_bytes) {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %prefix,
+                    attempt,
+                    "reconnect cancelled: peer reconnect-suppressed",
+                );
+                break;
             }
 
             // Another path (mDNS auto-connect, inbound dial, announcement
@@ -9284,6 +9352,18 @@ fn schedule_reconnect(
 
             // Phase 1: discovery-cache addresses (LAN/loopback for same-host).
             for addr in &candidate_addrs {
+                // Final suppression gate immediately before the dial: closes the
+                // TOCTOU window left open by the awaits above (and by prior dials
+                // in this same loop), so a peer revoked/evicted mid-backoff is
+                // never actually redialed.
+                if network.is_reconnect_suppressed(peer_id_bytes) {
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        peer_id_prefix = %prefix,
+                        "reconnect aborted before dial: peer reconnect-suppressed",
+                    );
+                    break 'attempts;
+                }
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     network.connect_addr(*addr),
@@ -9333,6 +9413,15 @@ fn schedule_reconnect(
             // Phase 2: bootstrap-cache fallback (public addresses for remote
             // peers that may have NAT-stable endpoints).
             if !connected {
+                // Final suppression gate before the fallback dial (see Phase 1).
+                if network.is_reconnect_suppressed(peer_id_bytes) {
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        peer_id_prefix = %prefix,
+                        "reconnect aborted before bootstrap-cache dial: peer reconnect-suppressed",
+                    );
+                    break 'attempts;
+                }
                 match network.connect_cached_peer(peer_id).await {
                     Ok(_) => {
                         tracing::info!(
@@ -12735,6 +12824,107 @@ mod tests {
                 "{tag}: suppressed peer must not be redialed within the backoff window"
             );
             // bob dropped here; the next iteration builds a fresh bob.
+        }
+    }
+
+    /// The announcement auto-connect gate must refuse to dial a peer whose
+    /// reconnect is suppressed. WHY: a revoked / policy-rejected / admin-
+    /// disconnected / evicted peer can keep broadcasting identity announcements
+    /// over gossip. If the auto-connect path dialed on those, it would silently
+    /// undo the security/eviction decision (the ungated hole). This exercises
+    /// the exact production predicate (`announcement_should_auto_connect`) with
+    /// live network state: a real revocation tombstone set via the production
+    /// `disconnect_with_reason` seam.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn suppressed_peer_announcement_is_not_auto_connected() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let alice_network = alice.network().expect("alice network");
+
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let bob_id = bob.machine_id().0;
+
+        // Connect so bob is known, then revoke him. The tombstone is what the
+        // announcement gate consults.
+        alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects bob");
+        let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < reg {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        alice_network
+            .disconnect_with_reason(&bob_peer, network::DisconnectReason::Revocation)
+            .await
+            .expect("revoke bob");
+        assert!(
+            alice_network.is_reconnect_suppressed(bob_id),
+            "revoked bob must carry a suppression tombstone"
+        );
+
+        // The exact production decision an inbound announcement from bob would
+        // reach: suppressed=true, so no auto-connect regardless of connect
+        // state. Compute both inputs from live network state (not literals).
+        let suppressed = alice_network.is_reconnect_suppressed(bob_id);
+        let connected = alice_network.is_connected(&bob_peer).await;
+        assert!(
+            !announcement_should_auto_connect(suppressed, connected),
+            "a suppressed peer's announcement must not trigger auto-connect"
+        );
+    }
+
+    /// The auto-connect predicate only dials an un-suppressed, not-yet-connected
+    /// peer. Encodes the security invariant directly: suppression always wins,
+    /// and an already-connected peer is never redundantly dialed.
+    #[test]
+    fn announcement_auto_connect_predicate_truth_table() {
+        // (suppressed, connected) -> should_dial
+        assert!(announcement_should_auto_connect(false, false));
+        assert!(!announcement_should_auto_connect(false, true));
+        assert!(!announcement_should_auto_connect(true, false));
+        assert!(!announcement_should_auto_connect(true, true));
+    }
+
+    /// Jittered backoff must stay within ±20% of each base delay. WHY: the
+    /// jitter decorrelates synchronized redials, but it must not shrink or
+    /// inflate the exponential backoff beyond the intended envelope, or a
+    /// genuinely-down peer would be hammered (too small) or recovery would lag
+    /// (too large). Sampled across all base delays.
+    #[test]
+    fn jittered_backoff_stays_within_bounds() {
+        for &base in RECONNECT_BACKOFF_DELAYS {
+            let lower = base.mul_f64(0.8);
+            let upper = base.mul_f64(1.2);
+            for _ in 0..10_000 {
+                let j = jittered_backoff_delay(base);
+                assert!(
+                    j >= lower && j <= upper,
+                    "jittered delay {j:?} out of [{lower:?}, {upper:?}] for base {base:?}"
+                );
+            }
         }
     }
 
