@@ -429,39 +429,6 @@ pub struct KvStore {
     #[serde(default)]
     owner: Option<AgentId>,
 
-    /// How the owner was anchored (audit metadata); meaningful only when
-    /// `owner` is `Some`.
-    #[serde(default)]
-    anchor_channel: AnchorChannel,
-
-    /// Monotonic freshness counter for owner-announced policy refreshes.
-    ///
-    /// A policy refresh from [`learn_ownership`](Self::learn_ownership) is
-    /// applied only when the announce carries a strictly greater
-    /// `policy_version`, which blocks a replayed authentic-but-stale announce
-    /// from downgrading policy. This is owner-local metadata; it is NOT a
-    /// CRDT-merged value.
-    #[serde(default)]
-    policy_version: u64,
-
-    /// The last announce whose claimed owner conflicted with the anchored
-    /// owner (audit only). Cleared when the anchored owner itself refreshes
-    /// via a matching forward-version announce. `None` when no conflict has
-    /// been observed (or it has been cleared).
-    #[serde(default)]
-    ownership_conflict: Option<(AgentId, AgentId)>,
-
-    /// Latest owner-signed checkpoint this replica has merged or produced.
-    /// Persisted (serde default) so owner restarts never regress the
-    /// checkpoint sequence; old data without this field deserializes to
-    /// `None` (safe forward default).
-    #[serde(default)]
-    pub(crate) latest_checkpoint: Option<OwnerCheckpoint>,
-    /// Highest `checkpoint_seq` adopted (replay/downgrade high-water mark).
-    /// Persisted so owner restarts never regress the checkpoint sequence.
-    #[serde(default)]
-    pub(crate) highest_checkpoint_seq: u64,
-
     /// Agents allowed to write (for Allowlisted policy).
     /// The owner is implicitly allowed and does not need to be in this set.
     #[serde(default)]
@@ -471,9 +438,75 @@ pub struct KvStore {
     #[serde(default)]
     version: u64,
 
+    // ---------------------------------------------------------------------
+    // TRAILING FIELDS — added after the original `KvStore` shape.
+    //
+    // bincode (wire + disk format) is positional and non-self-describing.
+    // Plain `#[serde(default)]` does NOT tolerate a missing field there:
+    // bincode returns an EOF *error* (not `Ok(None)`) at stream end, so serde
+    // never applies the default. Every field below is therefore (a) declared
+    // LAST, after the original `id..version` shape, and (b) decoded with
+    // `de_tolerant`, a custom deserializer that catches EOF/short streams and
+    // yields the field's `Default`. This lets a blob written by the original
+    // (pre-ownership, pre-checkpoint) `KvStore` shape — whose bytes END at
+    // `version` — deserialize with these fields defaulted instead of failing.
+    //
+    // INVARIANT: any NEW persisted field MUST be appended at the end of this
+    // block with the same `de_tolerant` treatment. Never insert a persisted
+    // field mid-struct, or older blobs will misalign and fail to decode.
+    // ---------------------------------------------------------------------
+    /// Latest owner-signed checkpoint this replica has merged or produced.
+    /// Persisted so owner restarts never regress the checkpoint sequence; a
+    /// blob written before this field existed decodes to `None`.
+    #[serde(default, deserialize_with = "de_tolerant")]
+    pub(crate) latest_checkpoint: Option<OwnerCheckpoint>,
+
+    /// Highest `checkpoint_seq` adopted (replay/downgrade high-water mark).
+    /// Persisted so owner restarts never regress the checkpoint sequence.
+    #[serde(default, deserialize_with = "de_tolerant")]
+    pub(crate) highest_checkpoint_seq: u64,
+
+    /// How the owner was anchored (audit metadata); meaningful only when
+    /// `owner` is `Some`.
+    #[serde(default, deserialize_with = "de_tolerant")]
+    anchor_channel: AnchorChannel,
+
+    /// Monotonic freshness counter for owner-announced policy refreshes.
+    ///
+    /// A policy refresh from [`learn_ownership`](Self::learn_ownership) is
+    /// applied only when the announce carries a strictly greater
+    /// `policy_version`, which blocks a replayed authentic-but-stale announce
+    /// from downgrading policy. This is owner-local metadata; it is NOT a
+    /// CRDT-merged value.
+    #[serde(default, deserialize_with = "de_tolerant")]
+    policy_version: u64,
+
+    /// The last announce whose claimed owner conflicted with the anchored
+    /// owner (audit only). Cleared when the anchored owner itself refreshes
+    /// via a matching forward-version announce. `None` when no conflict has
+    /// been observed (or it has been cleared).
+    #[serde(default, deserialize_with = "de_tolerant")]
+    ownership_conflict: Option<(AgentId, AgentId)>,
+
     /// Monotonic sequence counter for unique OR-Set tags.
     #[serde(skip, default = "default_seq_counter")]
     seq_counter: Arc<AtomicU64>,
+}
+
+/// Deserialize a trailing, defaultable `KvStore` field, tolerating its absence.
+///
+/// bincode is positional and non-self-describing: a blob written by an older
+/// `KvStore` shape simply ends before these trailing fields, so bincode hits
+/// EOF when asked to read them. Decoding the value if present, or falling back
+/// to `T::default()` on EOF / any malformed tail, makes such a blob load with
+/// the newer fields defaulted rather than failing outright. Only sound at
+/// stream-EOF for genuinely trailing fields (see the struct's TRAILING note).
+fn de_tolerant<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(T::deserialize(deserializer).unwrap_or_default())
 }
 
 fn default_policy() -> AccessPolicy {
@@ -1505,6 +1538,81 @@ mod tests {
         assert_eq!(store.id(), restored.id());
         assert_eq!(store.name(), restored.name());
         assert_eq!(store.len(), restored.len());
+    }
+
+    #[test]
+    fn pre_wave_kvstore_blob_decodes_with_trailing_fields_defaulted() {
+        // Regression guard for the mid-struct bincode footgun. The ownership
+        // (anchor_channel, policy_version, ownership_conflict) and checkpoint
+        // (latest_checkpoint, highest_checkpoint_seq) fields were added by the
+        // security wave. bincode is positional, so those fields MUST be trailing
+        // AND decoded with `de_tolerant`; otherwise a blob written by the
+        // original `KvStore` shape (id..version) fails with UnexpectedEof.
+        //
+        // This mirror is the EXACT original serialized shape at commit b573441:
+        // id, keys, entries, name, policy, owner, allowed_writers, version.
+        #[derive(Serialize)]
+        struct PreWaveKvStore<'a> {
+            id: &'a KvStoreId,
+            keys: &'a OrSet<String>,
+            entries: &'a HashMap<String, KvEntry>,
+            name: &'a LwwRegister<String>,
+            policy: &'a AccessPolicy,
+            owner: &'a Option<AgentId>,
+            allowed_writers: &'a HashSet<AgentId>,
+            version: u64,
+        }
+
+        let owner = agent(1);
+        let mut store = KvStore::new(
+            store_id(1),
+            "Legacy".to_string(),
+            owner,
+            AccessPolicy::Signed,
+        );
+        store
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+
+        let legacy = PreWaveKvStore {
+            id: &store.id,
+            keys: &store.keys,
+            entries: &store.entries,
+            name: &store.name,
+            policy: &store.policy,
+            owner: &store.owner,
+            allowed_writers: &store.allowed_writers,
+            version: store.version,
+        };
+        let bytes = bincode::serialize(&legacy).expect("serialize pre-wave shape");
+        let restored: KvStore =
+            bincode::deserialize(&bytes).expect("pre-wave blob (id..version) must decode");
+
+        // Original content survives.
+        assert_eq!(restored.id(), store.id(), "id preserved");
+        assert_eq!(restored.len(), 1, "entries preserved");
+        assert_eq!(restored.owner, store.owner, "owner preserved");
+        // All five wave-added trailing fields default cleanly.
+        assert!(
+            restored.latest_checkpoint.is_none(),
+            "latest_checkpoint defaults"
+        );
+        assert_eq!(restored.highest_checkpoint_seq, 0, "high-water defaults");
+        assert_eq!(
+            restored.anchor_channel,
+            AnchorChannel::default(),
+            "anchor_channel defaults"
+        );
+        assert_eq!(restored.policy_version, 0, "policy_version defaults");
+        assert!(
+            restored.ownership_conflict.is_none(),
+            "ownership_conflict defaults"
+        );
     }
 
     #[test]
