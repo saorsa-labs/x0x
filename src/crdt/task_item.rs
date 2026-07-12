@@ -68,16 +68,6 @@ pub struct TaskItem {
     /// any element whose attestation is missing or fails verification.
     checkbox: OrSet<CheckboxState>,
 
-    /// Per-element operation attestations, keyed by the `CheckboxState` value.
-    ///
-    /// Each `Claimed`/`Done` element in `checkbox` MUST have an entry here that
-    /// [`crate::crdt::verify_attestation`]s against the element's
-    /// `(kind, agent_id, timestamp)`. Serialized with the task so attestations
-    /// survive delta replication and historical (`full_delta`) state sync.
-    /// Merged as a union (same key ⇒ content-addressed identical attestation).
-    #[serde(default)]
-    attestations: BTreeMap<CheckboxState, OpAttestation>,
-
     /// Task title (LWW semantics).
     title: LwwRegister<String>,
 
@@ -99,6 +89,46 @@ pub struct TaskItem {
 
     /// When this task was created (immutable, Unix milliseconds).
     created_at: u64,
+
+    /// Per-element operation attestations, keyed by the `CheckboxState` value.
+    ///
+    /// Each `Claimed`/`Done` element in `checkbox` MUST have an entry here that
+    /// [`crate::crdt::verify_attestation`]s against the element's
+    /// `(kind, agent_id, timestamp)`. Serialized with the task so attestations
+    /// survive delta replication and historical (`full_delta`) state sync.
+    /// Merged as a union (same key ⇒ content-addressed identical attestation).
+    ///
+    /// This is the **trailing** serialized field. bincode (the wire and disk
+    /// format) is positional and non-self-describing, so `#[serde(default)]`
+    /// alone would not save a blob written without it — a mid-struct absence
+    /// misaligns every following field. Kept last with a tolerant deserializer
+    /// so a blob whose bytes END before this field (a pre-provenance /
+    /// differently-shaped TaskItem at the tail of the stream) decodes to an
+    /// empty map instead of an EOF error. An empty map resolves to
+    /// `current_state() == Empty`, i.e. no attested elements — fail-closed,
+    /// never fail-open. The tolerance is genuine only at stream-EOF: a fieldless
+    /// TaskItem nested mid-stream inside a larger bincode value cannot be
+    /// recovered positionally. New fields MUST be added after this one.
+    #[serde(default, deserialize_with = "deserialize_attestations")]
+    attestations: BTreeMap<CheckboxState, OpAttestation>,
+}
+
+/// Deserialize the trailing per-element attestation map, tolerating its
+/// absence. A blob written by a struct shape lacking this field (e.g. a
+/// pre-provenance TaskItem) simply ends before it; bincode would then hit EOF.
+/// This mirrors the KvStoreDelta `owner_checkpoint` pattern: decode the value
+/// if present, otherwise (EOF or any malformed value) yield an empty map. An
+/// empty attestation map is the fail-closed default — the provenance admission
+/// gate treats it as "no attested elements", so nothing is admitted on the
+/// strength of missing bytes.
+fn deserialize_attestations<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<CheckboxState, OpAttestation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(BTreeMap::<CheckboxState, OpAttestation>::deserialize(deserializer).unwrap_or_default())
 }
 
 impl TaskItem {
@@ -130,13 +160,13 @@ impl TaskItem {
         Self {
             id,
             checkbox: OrSet::new(),
-            attestations: BTreeMap::new(),
             title: LwwRegister::new(metadata.title),
             description: LwwRegister::new(metadata.description),
             assignee: LwwRegister::new(None),
             priority: LwwRegister::new(metadata.priority),
             created_by: metadata.created_by,
             created_at: metadata.created_at,
+            attestations: BTreeMap::new(),
         }
     }
 
@@ -1377,6 +1407,117 @@ mod tests {
         assert_eq!(task.title(), deserialized.title());
         assert_eq!(task.priority(), deserialized.priority());
         assert_eq!(task.current_state(), deserialized.current_state());
+    }
+
+    // ── bincode wire/disk compatibility: attestations is a TRAILING field ────
+    //
+    // WHY: `attestations` was originally inserted mid-struct (field #3, between
+    // `checkbox` and `title`) with only `#[serde(default)]`. bincode is
+    // positional and non-self-describing — `#[serde(default)]` does nothing for
+    // it — so a blob written by any struct shape lacking that exact field at
+    // that exact position (a pre-provenance TaskItem, or an older peer/disk
+    // record) misaligns at field #3 and the WHOLE decode errors with EOF.
+    // Because TaskItem is nested in TaskListDelta maps, one bad item fails the
+    // entire delta and a persisted TaskList cannot load. The fix moves
+    // `attestations` to the LAST serialized field with a tolerant deserializer,
+    // so a blob that simply ends before it decodes to an empty map.
+    //
+    // This test reconstructs the EXACT pre-wave byte layout via a local
+    // `LegacyTaskItemV0` (the v0.30.1 field order, no `attestations`). If the
+    // field were ever moved back mid-struct, or lost its tolerant deserializer,
+    // this decode fails — that is the whole point of the test.
+
+    #[test]
+    fn legacy_taskitem_without_attestations_decodes() {
+        let peer = peer(1);
+        let (agent, signing) = signing_for(1);
+        let mut task = make_task(peer);
+        // A real claim so the checkbox OR-Set and LWW registers are non-trivial.
+        task.claim(item_scope(), agent, peer, 1, &signing)
+            .expect("claim");
+        task.update_title("Legacy".to_string(), peer);
+
+        // Mirror the pre-provenance-wave TaskItem field layout exactly (see
+        // `git show b573441:src/crdt/task_item.rs`): the 8 fields in declaration
+        // order, with NO `attestations`. bincode is positional, so serializing
+        // this is byte-identical to what a pre-wave node wrote for this task.
+        #[derive(Serialize)]
+        struct LegacyTaskItemV0 {
+            id: TaskId,
+            checkbox: OrSet<CheckboxState>,
+            title: LwwRegister<String>,
+            description: LwwRegister<String>,
+            assignee: LwwRegister<Option<AgentId>>,
+            priority: LwwRegister<u8>,
+            created_by: AgentId,
+            created_at: u64,
+        }
+        let legacy = LegacyTaskItemV0 {
+            id: task.id,
+            checkbox: task.checkbox.clone(),
+            title: task.title.clone(),
+            description: task.description.clone(),
+            assignee: task.assignee.clone(),
+            priority: task.priority.clone(),
+            created_by: task.created_by,
+            created_at: task.created_at,
+        };
+
+        let bytes = bincode::serialize(&legacy).expect("serialize legacy shape");
+        let restored: TaskItem = bincode::deserialize(&bytes)
+            .expect("legacy TaskItem (no attestations bytes) must decode");
+
+        // The trailing field defaults to an empty map instead of erroring.
+        assert!(
+            restored.attestations.is_empty(),
+            "absent trailing field decodes to an empty attestation map"
+        );
+        // Every other field survives intact (proves alignment, not just non-error).
+        assert_eq!(restored.id(), task.id());
+        assert_eq!(restored.title(), "Legacy");
+        assert_eq!(restored.description(), task.description());
+        assert_eq!(restored.priority(), task.priority());
+        assert_eq!(restored.created_by(), task.created_by());
+        assert_eq!(restored.created_at(), task.created_at());
+        // Resolution is fail-closed: with an empty attestation map (the
+        // authoritative source), a legacy claim element in the OR-Set does NOT
+        // resolve — the task reads Empty rather than admitting an unattested op.
+        assert!(
+            restored.current_state().is_empty(),
+            "no attestation ⇒ fail-closed Empty even though the OR-Set carries a claim element"
+        );
+    }
+
+    #[test]
+    fn taskitem_roundtrip_preserves_populated_attestations() {
+        let peer = peer(1);
+        let (agent, signing) = signing_for(1);
+        let mut task = make_task(peer);
+        task.claim(item_scope(), agent, peer, 1, &signing)
+            .expect("claim");
+        task.complete(item_scope(), agent, peer, 2, &signing)
+            .expect("complete");
+        task.update_title("Roundtrip".to_string(), peer);
+        assert!(
+            !task.attestations.is_empty(),
+            "precondition: a claim + complete populate the attestation map"
+        );
+
+        let bytes = bincode::serialize(&task).expect("serialize");
+        let restored: TaskItem = bincode::deserialize(&bytes).expect("deserialize");
+
+        // The populated trailing map round-trips byte-for-byte.
+        assert_eq!(
+            restored.attestations, task.attestations,
+            "populated attestation map survives the round-trip"
+        );
+        assert_eq!(restored.id(), task.id());
+        assert_eq!(restored.title(), task.title());
+        assert_eq!(restored.current_state(), task.current_state());
+        assert!(
+            restored.current_state().is_done(),
+            "attested Done state resolves after round-trip"
+        );
     }
 
     // ── Provenance admission gate: integration into TaskItem::merge ──────────
