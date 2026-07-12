@@ -158,6 +158,28 @@ impl KvStore {
         }
     }
 
+    /// Create a joined replica of a store whose authoritative owner is not
+    /// yet known.
+    ///
+    /// The replica starts with the default `Signed` policy and `owner: None`,
+    /// which fails closed: no local or inbound policy-restricted write is
+    /// accepted until [`learn_ownership`](Self::learn_ownership) installs the
+    /// authoritative owner and policy from an owner-signed announcement.
+    #[must_use]
+    pub fn new_replica(id: KvStoreId, name: String) -> Self {
+        Self {
+            id,
+            keys: OrSet::new(),
+            entries: HashMap::new(),
+            name: LwwRegister::new(name),
+            policy: AccessPolicy::Signed,
+            owner: None,
+            allowed_writers: HashSet::new(),
+            version: 0,
+            seq_counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     /// Get the next monotonically-increasing sequence number.
     pub fn next_seq(&self) -> u64 {
         self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1
@@ -240,6 +262,84 @@ impl KvStore {
                 // the secure sync path once wired.
                 true
             }
+        }
+    }
+
+    /// Check that `writer` may perform a local mutation on this store.
+    ///
+    /// This is the local-write counterpart of the inbound check in
+    /// [`merge_delta`](Self::merge_delta): the same
+    /// [`is_authorized`](Self::is_authorized) rule is applied before a local
+    /// put/remove mutates the replica, so an unauthorized local write can
+    /// never fork
+    /// the replica away from what authorized peers accept.
+    ///
+    /// # Errors
+    ///
+    /// - [`KvError::OwnerUnknown`] if the store has a policy-restricted
+    ///   (`Signed`/`Allowlisted`) policy but its authoritative owner has not
+    ///   been learned yet (a freshly joined replica). Fail closed.
+    /// - [`KvError::Unauthorized`] if `writer` is not authorized under the
+    ///   store's policy.
+    pub fn authorize_local_write(&self, writer: &AgentId) -> Result<()> {
+        if matches!(self.policy, AccessPolicy::Encrypted { .. }) {
+            // Matches the inbound path: the reserved Encrypted policy is
+            // currently permissive at the store layer.
+            return Ok(());
+        }
+        let Some(owner) = self.owner.as_ref() else {
+            return Err(KvError::OwnerUnknown);
+        };
+        if !self.is_authorized(writer) {
+            return Err(KvError::Unauthorized(format!(
+                "store policy is {}; owner is {}",
+                self.policy,
+                hex::encode(owner.as_bytes())
+            )));
+        }
+        Ok(())
+    }
+
+    /// Install the authoritative owner and policy learned from an
+    /// owner-signed announcement.
+    ///
+    /// `verified_sender` is the cryptographically verified identity of the
+    /// peer that published the announcement (the pub/sub layer verifies the
+    /// ML-DSA-65 signature before delivery). Ownership claims are only
+    /// accepted when the sender claims *itself* as owner, so no third party
+    /// can assign ownership. Once an owner is established it is immutable;
+    /// the established owner may still refresh the policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KvError::Unauthorized` if `verified_sender` differs from the
+    /// claimed `owner`, or if a different owner is already established.
+    pub fn learn_ownership(
+        &mut self,
+        owner: AgentId,
+        policy: AccessPolicy,
+        verified_sender: &AgentId,
+    ) -> Result<()> {
+        if *verified_sender != owner {
+            return Err(KvError::Unauthorized(
+                "ownership announcement sender does not match claimed owner".to_string(),
+            ));
+        }
+        match self.owner {
+            None => {
+                self.owner = Some(owner);
+                self.policy = policy;
+                self.version += 1;
+                Ok(())
+            }
+            Some(existing) if existing == owner => {
+                self.policy = policy;
+                self.version += 1;
+                Ok(())
+            }
+            Some(_) => Err(KvError::Unauthorized(
+                "store owner already established; conflicting ownership claim rejected".to_string(),
+            )),
         }
     }
 
@@ -379,7 +479,7 @@ impl KvStore {
         // Access control: reject unauthorized writes
         if let Some(writer_id) = writer {
             if !self.is_authorized(writer_id) {
-                tracing::debug!(
+                tracing::warn!(
                     "rejected delta from unauthorized writer {} for store {}",
                     hex::encode(writer_id.as_bytes()),
                     self.id
@@ -393,7 +493,7 @@ impl KvStore {
             match &self.policy {
                 AccessPolicy::Encrypted { .. } => {} // OK
                 _ => {
-                    tracing::debug!(
+                    tracing::warn!(
                         "rejected anonymous delta for non-encrypted store {}",
                         self.id
                     );
@@ -916,6 +1016,149 @@ mod tests {
             .merge_delta(&delta, peer(99), None)
             .expect("silent rejection");
         assert!(store.get("anon").is_none());
+    }
+
+    // -- Local write authorization (fail closed) --
+    //
+    // WHY: a non-owner joiner that mutates its local replica creates a fork
+    // the owner's replica rejects — the local path must enforce the same
+    // policy as the inbound path.
+
+    #[test]
+    fn test_local_write_owner_authorized_on_signed_store() {
+        let owner = agent(1);
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        store
+            .authorize_local_write(&owner)
+            .expect("owner must be able to write locally");
+    }
+
+    #[test]
+    fn test_local_write_non_owner_rejected_on_signed_store() {
+        let owner = agent(1);
+        let joiner = agent(2);
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let err = store
+            .authorize_local_write(&joiner)
+            .expect_err("non-owner local write must be rejected, not silently applied");
+        assert!(matches!(err, KvError::Unauthorized(_)));
+        assert!(
+            format!("{err}").contains(&hex::encode(owner.as_bytes())),
+            "rejection must name the true owner so the caller can tell why"
+        );
+    }
+
+    #[test]
+    fn test_local_write_rejected_while_owner_unknown() {
+        // A joined replica must be read-only until the authoritative owner
+        // is learned — otherwise the joiner writes into a fork.
+        let joiner = agent(2);
+        let store = KvStore::new_replica(store_id(1), String::new());
+        assert!(
+            store.owner().is_none(),
+            "joined replica must not claim an owner"
+        );
+        let err = store
+            .authorize_local_write(&joiner)
+            .expect_err("write on unknown-owner store must fail closed");
+        assert!(matches!(err, KvError::OwnerUnknown));
+    }
+
+    #[test]
+    fn test_replica_rejects_inbound_deltas_until_owner_learned() {
+        // Fail closed on the inbound side too: without a known owner there
+        // is no authorized writer, so nothing merges.
+        let mut store = KvStore::new_replica(store_id(1), String::new());
+        let entry = KvEntry::new("k".to_string(), b"v".to_vec(), "text/plain".to_string());
+        let delta = KvStoreDelta::for_put("k".to_string(), entry, (peer(9), 1), 1);
+        store
+            .merge_delta(&delta, peer(9), Some(&agent(9)))
+            .expect("silent rejection");
+        assert!(store.get("k").is_none());
+    }
+
+    // -- learn_ownership: owner-signed metadata adoption --
+
+    #[test]
+    fn test_learn_ownership_requires_sender_to_be_claimed_owner() {
+        // A third party must not be able to assign ownership of a store —
+        // only a verified sender claiming itself is trusted.
+        let mut store = KvStore::new_replica(store_id(1), String::new());
+        let owner = agent(1);
+        let rogue = agent(9);
+        let err = store
+            .learn_ownership(owner, AccessPolicy::Signed, &rogue)
+            .expect_err("third-party ownership claim must be rejected");
+        assert!(matches!(err, KvError::Unauthorized(_)));
+        assert!(store.owner().is_none());
+    }
+
+    #[test]
+    fn test_learn_ownership_then_policy_enforced_both_paths() {
+        // After adoption: the joiner still cannot write locally, and the
+        // owner's deltas merge while a non-owner's are rejected.
+        let owner = agent(1);
+        let joiner = agent(2);
+        let mut store = KvStore::new_replica(store_id(1), String::new());
+        store
+            .learn_ownership(owner, AccessPolicy::Signed, &owner)
+            .expect("owner self-claim adopted");
+        assert_eq!(store.owner(), Some(&owner));
+        assert_eq!(*store.policy(), AccessPolicy::Signed);
+
+        // Local write by the joiner: still rejected.
+        assert!(matches!(
+            store.authorize_local_write(&joiner),
+            Err(KvError::Unauthorized(_))
+        ));
+
+        // Inbound owner delta: accepted.
+        let entry = KvEntry::new("ok".to_string(), b"v".to_vec(), "text/plain".to_string());
+        let delta = KvStoreDelta::for_put("ok".to_string(), entry, (peer(1), 1), 1);
+        store
+            .merge_delta(&delta, peer(1), Some(&owner))
+            .expect("owner delta merges");
+        assert!(store.get("ok").is_some());
+
+        // Inbound non-owner delta: rejected.
+        let entry = KvEntry::new("bad".to_string(), b"x".to_vec(), "text/plain".to_string());
+        let delta = KvStoreDelta::for_put("bad".to_string(), entry, (peer(2), 1), 2);
+        store
+            .merge_delta(&delta, peer(2), Some(&joiner))
+            .expect("silent rejection");
+        assert!(store.get("bad").is_none());
+    }
+
+    #[test]
+    fn test_learn_ownership_owner_is_immutable_once_established() {
+        // First verified claim wins; a later conflicting claim cannot hijack
+        // the replica.
+        let owner = agent(1);
+        let hijacker = agent(9);
+        let mut store = KvStore::new_replica(store_id(1), String::new());
+        store
+            .learn_ownership(owner, AccessPolicy::Signed, &owner)
+            .expect("adopt owner");
+        let err = store
+            .learn_ownership(hijacker, AccessPolicy::Signed, &hijacker)
+            .expect_err("conflicting ownership claim must be rejected");
+        assert!(matches!(err, KvError::Unauthorized(_)));
+        assert_eq!(store.owner(), Some(&owner));
+    }
+
+    #[test]
+    fn test_local_write_encrypted_policy_stays_permissive() {
+        // The reserved Encrypted policy is permissive at the store layer on
+        // the inbound path; the local path must match it, not diverge.
+        let store = KvStore::new(
+            store_id(1),
+            "Test".to_string(),
+            agent(1),
+            AccessPolicy::Encrypted { group_id: vec![1] },
+        );
+        store
+            .authorize_local_write(&agent(9))
+            .expect("encrypted policy is permissive at the store layer");
     }
 
     #[test]

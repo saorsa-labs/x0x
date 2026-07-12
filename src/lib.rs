@@ -10097,6 +10097,7 @@ impl Agent {
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
             peer_id,
+            Some(self.agent_id()),
         )
         .map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -10122,9 +10123,12 @@ impl Agent {
 
     /// Join an existing key-value store by topic.
     ///
-    /// Creates an empty store that will be populated via delta sync
-    /// from peers already sharing the topic. The access policy will
-    /// be learned from the first full delta received from the owner.
+    /// Creates an empty replica that will be populated via delta sync from
+    /// peers already sharing the topic. The replica starts with **no owner**
+    /// and the default `Signed` policy, which fails closed: local writes are
+    /// rejected until the authoritative owner and policy are learned from an
+    /// owner-signed announcement on the state-sync channel (published by the
+    /// owner in response to this replica's state requests).
     ///
     /// # Errors
     ///
@@ -10137,23 +10141,17 @@ impl Agent {
         })?;
 
         let peer_id = runtime.peer_id();
+        // Local placeholder id — the replica is addressed by topic; the id
+        // is not used for merge decisions on the delta path.
         let store_id = kv::KvStoreId::from_content(topic, &self.agent_id());
-        // Use Encrypted as the most permissive default — the actual policy
-        // will be set when the first delta from the owner arrives.
-        let store = kv::KvStore::new(
-            store_id,
-            String::new(),
-            self.agent_id(),
-            kv::AccessPolicy::Encrypted {
-                group_id: Vec::new(),
-            },
-        );
+        let store = kv::KvStore::new_replica(store_id, String::new());
 
         let sync = kv::KvStoreSync::new(
             store,
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
             peer_id,
+            Some(self.agent_id()),
         )
         .map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -10205,6 +10203,18 @@ impl KvStoreHandle {
         self.peer_id
     }
 
+    /// Enforce the store's access policy for a local mutation.
+    ///
+    /// Applies the same authorization rule as the inbound delta path
+    /// (`KvStore::merge_delta`), so a local write that peers would reject
+    /// never mutates this replica (no local fork).
+    fn check_local_write(store: &kv::KvStore, writer: &identity::AgentId) -> error::Result<()> {
+        store.authorize_local_write(writer).map_err(|e| match e {
+            kv::KvError::Unauthorized(msg) => error::IdentityError::Unauthorized(msg),
+            other => error::IdentityError::Unauthorized(other.to_string()),
+        })
+    }
+
     /// Put a key-value pair into the store.
     ///
     /// If the key already exists, the value is updated. Changes are
@@ -10230,7 +10240,10 @@ impl KvStoreHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the value exceeds the maximum inline size (64 KB).
+    /// Returns an error if the value exceeds the maximum inline size (64 KB),
+    /// or [`error::IdentityError::Unauthorized`] if this agent is not
+    /// permitted to write under the store's access policy (including a
+    /// joined replica whose authoritative owner is not yet known).
     pub async fn put_with_delta(
         &self,
         key: String,
@@ -10239,6 +10252,7 @@ impl KvStoreHandle {
     ) -> error::Result<kv::KvStoreDelta> {
         let delta = {
             let mut store = self.sync.write().await;
+            Self::check_local_write(&store, &self.agent_id)?;
             store
                 .put(
                     key.clone(),
@@ -10304,10 +10318,13 @@ impl KvStoreHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the key does not exist.
+    /// Returns an error if the key does not exist, or
+    /// [`error::IdentityError::Unauthorized`] if this agent is not permitted
+    /// to write under the store's access policy.
     pub async fn remove_with_delta(&self, key: &str) -> error::Result<kv::KvStoreDelta> {
         let delta = {
             let mut store = self.sync.write().await;
+            Self::check_local_write(&store, &self.agent_id)?;
             store.remove(key).map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
                     "kv remove failed: {e}",

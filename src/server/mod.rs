@@ -15914,7 +15914,12 @@ async fn put_kv_value(
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
         }
         Err(e) => {
-            let status = if format!("{e}").contains("value too large") {
+            let status = if matches!(e, x0x::error::IdentityError::Unauthorized(_)) {
+                // Local write rejected by the store's access policy — the
+                // caller is not the owner (or an allowlisted writer), or the
+                // joined replica has not yet learned the authoritative owner.
+                StatusCode::FORBIDDEN
+            } else if format!("{e}").contains("value too large") {
                 StatusCode::PAYLOAD_TOO_LARGE
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -15978,6 +15983,9 @@ async fn delete_kv_value(
             let recipients = kv_store_delta_direct_recipients(&state).await;
             spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
+        Err(e) if matches!(e, x0x::error::IdentityError::Unauthorized(_)) => {
+            api_error(StatusCode::FORBIDDEN, format!("{e}"))
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }

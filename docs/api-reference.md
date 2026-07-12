@@ -623,6 +623,16 @@ single winner (`claimed_by`) after convergence.
 }
 ```
 
+### Store write authorization
+
+Stores default to the `Signed` policy: only the creating agent (the owner)
+may write. `PUT` and `DELETE` on `/stores/:id/:key` return **403** with
+`{"ok":false,"error":"not authorized: store policy is signed; owner is <hex>"}`
+when this daemon's agent is not authorized — including on a joined replica
+that has not yet learned the store's authoritative owner from the
+owner-signed announcement (`"not authorized: store owner unknown: ..."`).
+Reads are always allowed.
+
 ## File transfers
 
 | Method | Endpoint | CLI | Purpose |
