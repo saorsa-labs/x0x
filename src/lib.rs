@@ -9786,7 +9786,25 @@ impl TaskListHandle {
         title: String,
         description: String,
     ) -> error::Result<crdt::TaskId> {
-        let (task_id, delta) = {
+        let (task_id, _version) = self.add_task_versioned(title, description).await?;
+        Ok(task_id)
+    }
+
+    /// Add a new task and report the task list's post-mutation version.
+    ///
+    /// Same as [`TaskListHandle::add_task`] but additionally returns the
+    /// list's version counter after the add, read atomically under the same
+    /// write lock as the mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task cannot be added.
+    pub async fn add_task_versioned(
+        &self,
+        title: String,
+        description: String,
+    ) -> error::Result<(crdt::TaskId, u64)> {
+        let (task_id, version, delta) = {
             let mut list = self.sync.write().await;
             let seq = list.next_seq();
             let task_id = crdt::TaskId::new(&title, &self.agent_id, seq);
@@ -9800,14 +9818,15 @@ impl TaskListHandle {
                     )))
                 })?;
             let tag = (self.peer_id, seq);
-            let delta = crdt::TaskListDelta::for_add(task_id, task, tag, list.current_version());
-            (task_id, delta)
+            let version = list.current_version();
+            let delta = crdt::TaskListDelta::for_add(task_id, task, tag, version);
+            (task_id, version, delta)
         };
         // Best-effort replication: local mutation succeeded regardless
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish add_task delta: {}", e);
         }
-        Ok(task_id)
+        Ok((task_id, version))
     }
 
     /// Claim a task in the list.
@@ -9820,8 +9839,39 @@ impl TaskListHandle {
     ///
     /// Returns an error if the task cannot be claimed.
     pub async fn claim_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
-        let delta = {
+        // No expected version ⇒ can never conflict.
+        self.claim_task_versioned(task_id, None).await.map(|_| ())
+    }
+
+    /// Claim a task, optionally guarded by an expected list version (CAS).
+    ///
+    /// If `expected_version` is `Some(v)` and the task list's current version
+    /// is not `v`, nothing is mutated and
+    /// [`TaskCasOutcome::VersionConflict`] is returned with the current
+    /// version. The check and the mutation happen under a single write lock.
+    ///
+    /// `Committed` means the claim was applied to the local replica and a
+    /// delta was published to peers — not that any peer has observed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task does not exist or the state transition
+    /// is invalid (e.g. the task is already done).
+    pub async fn claim_task_versioned(
+        &self,
+        task_id: crdt::TaskId,
+        expected_version: Option<u64>,
+    ) -> error::Result<TaskCasOutcome> {
+        let (version, delta) = {
             let mut list = self.sync.write().await;
+            if let Some(expected) = expected_version {
+                let current = list.current_version();
+                if current != expected {
+                    return Ok(TaskCasOutcome::VersionConflict {
+                        current_version: current,
+                    });
+                }
+            }
             let seq = list.next_seq();
             list.claim_task(&task_id, self.agent_id, self.peer_id, seq)
                 .map_err(|e| {
@@ -9839,12 +9889,16 @@ impl TaskListHandle {
                     ))
                 })?
                 .clone();
-            crdt::TaskListDelta::for_state_change(task_id, full_task, list.current_version())
+            let version = list.current_version();
+            (
+                version,
+                crdt::TaskListDelta::for_state_change(task_id, full_task, version),
+            )
         };
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish claim_task delta: {}", e);
         }
-        Ok(())
+        Ok(TaskCasOutcome::Committed { version })
     }
 
     /// Complete a task in the list.
@@ -9857,8 +9911,37 @@ impl TaskListHandle {
     ///
     /// Returns an error if the task cannot be completed.
     pub async fn complete_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
-        let delta = {
+        // No expected version ⇒ can never conflict.
+        self.complete_task_versioned(task_id, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Complete a task, optionally guarded by an expected list version (CAS).
+    ///
+    /// Semantics mirror [`TaskListHandle::claim_task_versioned`]: a mismatch
+    /// between `expected_version` and the current list version returns
+    /// [`TaskCasOutcome::VersionConflict`] with no mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task does not exist or the state transition
+    /// is invalid (e.g. the task was never claimed).
+    pub async fn complete_task_versioned(
+        &self,
+        task_id: crdt::TaskId,
+        expected_version: Option<u64>,
+    ) -> error::Result<TaskCasOutcome> {
+        let (version, delta) = {
             let mut list = self.sync.write().await;
+            if let Some(expected) = expected_version {
+                let current = list.current_version();
+                if current != expected {
+                    return Ok(TaskCasOutcome::VersionConflict {
+                        current_version: current,
+                    });
+                }
+            }
             let seq = list.next_seq();
             list.complete_task(&task_id, self.agent_id, self.peer_id, seq)
                 .map_err(|e| {
@@ -9875,12 +9958,16 @@ impl TaskListHandle {
                     ))
                 })?
                 .clone();
-            crdt::TaskListDelta::for_state_change(task_id, full_task, list.current_version())
+            let version = list.current_version();
+            (
+                version,
+                crdt::TaskListDelta::for_state_change(task_id, full_task, version),
+            )
         };
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish complete_task delta: {}", e);
         }
-        Ok(())
+        Ok(TaskCasOutcome::Committed { version })
     }
 
     /// List all tasks in their current order.
@@ -9893,20 +9980,55 @@ impl TaskListHandle {
     ///
     /// Returns an error if the task list cannot be read.
     pub async fn list_tasks(&self) -> error::Result<Vec<TaskSnapshot>> {
+        let (tasks, _version) = self.list_tasks_with_version().await?;
+        Ok(tasks)
+    }
+
+    /// List all tasks together with the task list's current version.
+    ///
+    /// The snapshots and the version are read atomically under a single read
+    /// lock, so the returned version is consistent with the returned tasks —
+    /// suitable as the `expected_version` for a subsequent CAS mutation via
+    /// [`TaskListHandle::claim_task_versioned`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task list cannot be read.
+    pub async fn list_tasks_with_version(&self) -> error::Result<(Vec<TaskSnapshot>, u64)> {
         let list = self.sync.read().await;
+        let version = list.current_version();
         let tasks = list.tasks_ordered();
-        Ok(tasks
+        let snapshots = tasks
             .into_iter()
-            .map(|task| TaskSnapshot {
-                id: *task.id(),
-                title: task.title().to_string(),
-                description: task.description().to_string(),
-                state: task.current_state(),
-                assignee: task.assignee().copied(),
-                owner: None,
-                priority: task.priority(),
+            .map(|task| {
+                let claim = task.claim_record();
+                let completion = task.completion_record();
+                TaskSnapshot {
+                    id: *task.id(),
+                    title: task.title().to_string(),
+                    description: task.description().to_string(),
+                    state: task.current_state(),
+                    assignee: task.assignee().copied(),
+                    owner: None,
+                    priority: task.priority(),
+                    claimed_by: claim.map(|(agent, _)| agent),
+                    claimed_at: claim.map(|(_, ts)| ts),
+                    completed_by: completion.map(|(agent, _)| agent),
+                    completed_at: completion.map(|(_, ts)| ts),
+                }
             })
-            .collect())
+            .collect();
+        Ok((snapshots, version))
+    }
+
+    /// The task list's current version counter.
+    ///
+    /// Incremented on every local or merged mutation. Useful as the
+    /// `expected_version` for CAS mutations; prefer
+    /// [`TaskListHandle::list_tasks_with_version`] when the tasks are also
+    /// needed, to read both atomically.
+    pub async fn version(&self) -> u64 {
+        self.sync.read().await.current_version()
     }
 
     /// Reorder tasks in the list.
@@ -10295,6 +10417,36 @@ pub struct TaskSnapshot {
     pub owner: Option<identity::UserId>,
     /// Task priority (0-255, higher = more important).
     pub priority: u8,
+    /// The agent whose claim won (deterministic OR-Set winner), if claimed.
+    /// Remains set after the task transitions to Done.
+    pub claimed_by: Option<identity::AgentId>,
+    /// Unix-millisecond timestamp of the winning claim, if claimed.
+    pub claimed_at: Option<u64>,
+    /// The agent whose completion won (deterministic OR-Set winner), if done.
+    pub completed_by: Option<identity::AgentId>,
+    /// Unix-millisecond timestamp of the winning completion, if done.
+    pub completed_at: Option<u64>,
+}
+
+/// Outcome of a task-list mutation guarded by an optional expected version.
+///
+/// Returned by [`TaskListHandle::claim_task_versioned`] and
+/// [`TaskListHandle::complete_task_versioned`]. `Committed` means the
+/// mutation was applied to the **local** replica and a delta was published —
+/// it does NOT mean any peer has observed the change yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskCasOutcome {
+    /// The mutation was committed locally; `version` is the new list version.
+    Committed {
+        /// The task list's version after this mutation.
+        version: u64,
+    },
+    /// The caller's `expected_version` did not match the current list
+    /// version; nothing was mutated.
+    VersionConflict {
+        /// The task list's current (unchanged) version.
+        current_version: u64,
+    },
 }
 
 /// The x0x protocol version.

@@ -153,6 +153,11 @@ pub(in crate::server) struct AddTaskRequest {
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct UpdateTaskRequest {
     pub(in crate::server) action: String, // "claim" or "complete"
+    /// Optional optimistic-concurrency guard: if set and it does not match
+    /// the task list's current version, the mutation is rejected with 409
+    /// and nothing changes. Absent ⇒ unconditional (last-writer CRDT merge).
+    #[serde(default)]
+    pub(in crate::server) expected_version: Option<u64>,
 }
 
 /// Task list entry.
@@ -168,9 +173,19 @@ pub(in crate::server) struct TaskEntry {
     pub(in crate::server) id: String,
     pub(in crate::server) title: String,
     pub(in crate::server) description: String,
+    /// Legacy Display string ("empty" | "claimed:<hex>" | "done:<hex>").
+    /// Kept for backward compatibility — prefer the structured fields below.
     pub(in crate::server) state: String,
     pub(in crate::server) assignee: Option<String>,
     pub(in crate::server) priority: u8,
+    /// Hex AgentId of the deterministic claim winner; null if never claimed.
+    pub(in crate::server) claimed_by: Option<String>,
+    /// Unix-ms timestamp of the winning claim; null if never claimed.
+    pub(in crate::server) claimed_at: Option<u64>,
+    /// Hex AgentId of the deterministic completion winner; null unless done.
+    pub(in crate::server) completed_by: Option<String>,
+    /// Unix-ms timestamp of the winning completion; null unless done.
+    pub(in crate::server) completed_at: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,10 +231,16 @@ pub(in crate::server) async fn create_task_list(
     match state.agent.create_task_list(&req.name, &req.topic).await {
         Ok(handle) => {
             let id = req.topic.clone();
+            let version = handle.version().await;
             state.task_lists.write().await.insert(id.clone(), handle);
             (
                 StatusCode::CREATED,
-                Json(serde_json::json!({ "ok": true, "id": id })),
+                Json(serde_json::json!({
+                    "ok": true,
+                    "id": id,
+                    "version": version,
+                    "committed": "local",
+                })),
             )
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
@@ -240,8 +261,8 @@ pub(in crate::server) async fn list_tasks(
         return not_found("task list not found");
     };
 
-    match handle.list_tasks().await {
-        Ok(tasks) => {
+    match handle.list_tasks_with_version().await {
+        Ok((tasks, version)) => {
             let entries: Vec<TaskEntry> = tasks
                 .into_iter()
                 .map(|t| TaskEntry {
@@ -249,13 +270,17 @@ pub(in crate::server) async fn list_tasks(
                     title: t.title,
                     description: t.description,
                     state: format!("{}", t.state),
-                    assignee: t.assignee.map(|a| format!("{a}")),
+                    assignee: t.assignee.map(|a| hex::encode(a.as_bytes())),
                     priority: t.priority,
+                    claimed_by: t.claimed_by.map(|a| hex::encode(a.as_bytes())),
+                    claimed_at: t.claimed_at,
+                    completed_by: t.completed_by.map(|a| hex::encode(a.as_bytes())),
+                    completed_at: t.completed_at,
                 })
                 .collect();
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "tasks": entries })),
+                Json(serde_json::json!({ "ok": true, "version": version, "tasks": entries })),
             )
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
@@ -278,12 +303,17 @@ pub(in crate::server) async fn add_task(
     };
 
     match handle
-        .add_task(req.title, req.description.unwrap_or_default())
+        .add_task_versioned(req.title, req.description.unwrap_or_default())
         .await
     {
-        Ok(task_id) => (
+        Ok((task_id, version)) => (
             StatusCode::CREATED,
-            Json(serde_json::json!({ "ok": true, "task_id": format!("{task_id}") })),
+            Json(serde_json::json!({
+                "ok": true,
+                "task_id": format!("{task_id}"),
+                "version": version,
+                "committed": "local",
+            })),
         ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
@@ -318,15 +348,40 @@ pub(in crate::server) async fn update_task(
     let task_id = x0x::crdt::TaskId::from_bytes(task_id_bytes);
 
     let result = match req.action.as_str() {
-        "claim" => handle.claim_task(task_id).await,
-        "complete" => handle.complete_task(task_id).await,
+        "claim" => {
+            handle
+                .claim_task_versioned(task_id, req.expected_version)
+                .await
+        }
+        "complete" => {
+            handle
+                .complete_task_versioned(task_id, req.expected_version)
+                .await
+        }
         _ => {
             return bad_request("action must be 'claim' or 'complete'");
         }
     };
 
     match result {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        // "committed": "local" makes explicit that success = local CRDT
+        // commit + best-effort delta publish, NOT replicated observation.
+        Ok(x0x::TaskCasOutcome::Committed { version }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "version": version,
+                "committed": "local",
+            })),
+        ),
+        Ok(x0x::TaskCasOutcome::VersionConflict { current_version }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "version conflict",
+                "current_version": current_version,
+            })),
+        ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
