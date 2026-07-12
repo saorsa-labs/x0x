@@ -141,11 +141,11 @@ Important: direct events do not currently include `verified` or `trust_level`. T
 
 ## WebSocket for apps
 
-For browser or app UIs, use the WebSocket endpoints with the token in the query string:
+For browser or app UIs, use the WebSocket endpoints with a token in the query string. Only a short-lived session token is accepted there — mint one with `POST /auth/session` (durable Bearer token required; returns `{"session_token": "...", "expires_in": 600}`). The durable api-token is never valid in a URL:
 
 ```text
-ws://127.0.0.1:12700/ws?token=<TOKEN>
-ws://127.0.0.1:12700/ws/direct?token=<TOKEN>
+ws://127.0.0.1:12700/ws?token=<SESSION_TOKEN>
+ws://127.0.0.1:12700/ws/direct?token=<SESSION_TOKEN>
 ```
 
 Client messages:

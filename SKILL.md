@@ -185,9 +185,11 @@ x0x agent
 x0x subscribe hello-world
 x0x publish hello-world "Hello!"
 
-# REST API auth: /health and /constitution* are public; /gui, /ws, /events
-# accept the token via ?token=; every other route requires the
-# Authorization: Bearer header shown below.
+# REST API auth: /health and /constitution* are public; every other route
+# requires the Authorization: Bearer header shown below. Browser endpoints
+# (/gui, /ws, /ws/direct, /events, /direct/events) also accept
+# ?token=<session_token> — but ONLY a short-lived session token minted via
+# POST /auth/session (the durable api-token is never accepted in a URL).
 DATA_DIR="$HOME/Library/Application Support/x0x"   # macOS
 # DATA_DIR="$HOME/.local/share/x0x"                # Linux
 API=$(cat "$DATA_DIR/api.port")
@@ -246,11 +248,17 @@ curl -X POST "http://$API/mls/groups/GROUP_ID/encrypt" \
 For real-time bidirectional communication, use WebSocket instead of REST+SSE:
 
 ```bash
+# Mint a short-lived session token first — the durable api-token is
+# rejected in query strings (Bearer header only). Sessions expire after
+# 10 minutes ({"session_token": "...", "expires_in": 600}).
+SESSION=$(curl -s -X POST "http://$API/auth/session" \
+  -H "Authorization: Bearer $TOKEN" | jq -r .session_token)
+
 # Connect (general purpose)
-wscat -c "ws://$API/ws?token=$TOKEN"
+wscat -c "ws://$API/ws?token=$SESSION"
 
 # Connect with auto-subscribe to direct messages
-wscat -c "ws://$API/ws/direct?token=$TOKEN"
+wscat -c "ws://$API/ws/direct?token=$SESSION"
 
 # Check active sessions
 curl -H "Authorization: Bearer $TOKEN" "http://$API/ws/sessions"

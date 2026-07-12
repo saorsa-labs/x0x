@@ -536,9 +536,14 @@ x0x routes
 For live data — chat messages, direct messages, events — use WebSocket. Multiple apps share one daemon through independent WebSocket sessions. `127.0.0.1:12700` is the default API address, but using `api.port` is more correct for named instances and custom configs.
 
 ```bash
-# Using $API and $TOKEN from the REST API section above
-wscat -c "ws://$API/ws?token=$TOKEN"         # General-purpose session
-wscat -c "ws://$API/ws/direct?token=$TOKEN"  # Auto-subscribe to direct messages
+# Using $API and $TOKEN from the REST API section above.
+# The durable token is never accepted in a URL — mint a short-lived
+# session token (10 min TTL) and pass THAT as ?token=:
+SESSION=$(curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://$API/auth/session" | jq -r .session_token)
+
+wscat -c "ws://$API/ws?token=$SESSION"         # General-purpose session
+wscat -c "ws://$API/ws/direct?token=$SESSION"  # Auto-subscribe to direct messages
 ```
 
 **Subscribe to topics:**
@@ -587,18 +592,28 @@ A complete chat app in a single HTML file — serve it from `http://127.0.0.1` o
     const TOKEN = 'YOUR_TOKEN_HERE'; // inject from <data_dir>/api-token
     const TOPIC = 'my-chat-room';
     const API = 'http://127.0.0.1:12700';
-    const WS_URL = `ws://127.0.0.1:12700/ws?token=${TOKEN}`;
 
-    // Connect WebSocket
-    const ws = new WebSocket(WS_URL);
-    ws.onopen = () => ws.send(JSON.stringify({type:'subscribe', topics:[TOPIC]}));
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'message') {
-        const div = document.getElementById('messages');
-        div.innerHTML += `<p><b>${msg.origin?.slice(0,8)}:</b> ${atob(msg.payload)}</p>`;
-      }
-    };
+    // WebSockets can't set an Authorization header, so exchange the durable
+    // token for a short-lived session token and pass that as ?token=
+    // (the durable token is rejected in query strings).
+    let ws;
+    (async () => {
+      const { session_token } = await fetch(`${API}/auth/session`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      }).then((r) => r.json());
+
+      // Connect WebSocket
+      ws = new WebSocket(`ws://127.0.0.1:12700/ws?token=${session_token}`);
+      ws.onopen = () => ws.send(JSON.stringify({type:'subscribe', topics:[TOPIC]}));
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'message') {
+          const div = document.getElementById('messages');
+          div.innerHTML += `<p><b>${msg.origin?.slice(0,8)}:</b> ${atob(msg.payload)}</p>`;
+        }
+      };
+    })();
 
     // Send via REST
     function send() {
