@@ -9067,7 +9067,10 @@ impl Agent {
         })?;
 
         let peer_id = runtime.peer_id();
-        let list_id = crdt::TaskListId::from_content(name, &self.agent_id(), 0);
+        // The id MUST derive from the shared topic alone (not name/agent_id) so
+        // every replica of this list agrees on it — it is the attestation scope
+        // bound into claim/complete signatures. See TaskListId::from_topic.
+        let list_id = crdt::TaskListId::from_topic(topic);
         let task_list = crdt::TaskList::new(list_id, name.to_string(), peer_id);
 
         let sync = crdt::TaskListSync::new(
@@ -9134,8 +9137,11 @@ impl Agent {
         })?;
 
         let peer_id = runtime.peer_id();
-        // Create empty task list; it will be populated via delta sync
-        let list_id = crdt::TaskListId::from_content(topic, &self.agent_id(), 0);
+        // Create empty task list; it will be populated via delta sync. The id
+        // MUST match the creator's — derive it from the shared topic alone (see
+        // create_task_list / TaskListId::from_topic), otherwise the scope bound
+        // into remote claim attestations won't verify and claims never converge.
+        let list_id = crdt::TaskListId::from_topic(topic);
         let task_list = crdt::TaskList::new(list_id, String::new(), peer_id);
 
         let sync = crdt::TaskListSync::new(

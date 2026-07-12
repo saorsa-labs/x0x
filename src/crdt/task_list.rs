@@ -53,6 +53,23 @@ impl TaskListId {
         let hash = hasher.finalize();
         Self(*hash.as_bytes())
     }
+
+    /// Deterministic id for a task list reached via the gossip `topic`.
+    ///
+    /// Every replica that creates or joins the same logical list does so via
+    /// the same topic, so the id MUST derive from the topic ALONE. It must not
+    /// fold in per-node data (e.g. the local agent id) or per-call data (a
+    /// name, a timestamp): the id is the attestation `scope` bound into every
+    /// claim/complete signature ([`TaskItem::admit`]), so if two replicas
+    /// derived different ids their scope-bound attestations would fail to
+    /// verify across the wire and claims would never converge.
+    #[must_use]
+    pub fn from_topic(topic: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x.tasklist.id.v1");
+        hasher.update(topic.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
 }
 
 impl std::fmt::Display for TaskListId {
@@ -1194,6 +1211,25 @@ mod tests {
 
         let id3 = TaskListId::from_content("Different", &agent, 1000);
         assert_ne!(id1, id3); // Different content
+    }
+
+    #[test]
+    fn from_topic_is_deterministic_and_agent_independent() {
+        // Regression guard: every replica that creates or joins a list via the
+        // same topic MUST derive the SAME id, regardless of which agent does it
+        // — the id is the attestation scope bound into claim/complete
+        // signatures, so a per-node id makes cross-replica claims fail to
+        // verify and claims never converge. `from_topic` takes no agent/name,
+        // so two different agents joining the same topic agree by construction.
+        let t = "team-sprint";
+        assert_eq!(TaskListId::from_topic(t), TaskListId::from_topic(t));
+        assert_ne!(TaskListId::from_topic(t), TaskListId::from_topic("other"));
+        // Distinct from the (per-node) content derivation it replaced, so a
+        // stale from_content-based replica cannot silently share scope.
+        assert_ne!(
+            TaskListId::from_topic(t),
+            TaskListId::from_content(t, &agent(1), 0)
+        );
     }
 
     #[test]
