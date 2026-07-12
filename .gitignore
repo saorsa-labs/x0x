@@ -48,3 +48,6 @@ NETWORK_TEST_REPORT.txt
 .pi/messenger/
 native-build.log
 wpa-build.log
+
+# Convergence soak harness output (daemon logs, per-run reports)
+tests/convergence/out/
