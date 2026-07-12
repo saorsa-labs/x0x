@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate as x0x;
 
+use super::super::crdt_subscriptions;
 use super::super::state::AppState;
 use super::super::{api_error, bad_request, forbidden, not_found};
 
@@ -217,6 +218,20 @@ pub(in crate::server) async fn create_task_list(
         Ok(handle) => {
             let id = req.topic.clone();
             state.task_lists.write().await.insert(id.clone(), handle);
+            // Persist the registration so it survives a daemon restart
+            // (rehydrated after join_network — see crdt_subscriptions).
+            crdt_subscriptions::record(
+                &state,
+                crdt_subscriptions::CrdtSubscriptionEntry {
+                    kind: crdt_subscriptions::KIND_TASK_LIST.to_string(),
+                    id: id.clone(),
+                    name: req.name.clone(),
+                    topic: req.topic.clone(),
+                    role: crdt_subscriptions::ROLE_CREATED.to_string(),
+                    extra: serde_json::Map::new(),
+                },
+            )
+            .await;
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({ "ok": true, "id": id })),

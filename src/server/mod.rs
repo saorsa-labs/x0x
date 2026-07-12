@@ -10,6 +10,7 @@
 use crate as x0x;
 
 mod auth;
+mod crdt_subscriptions;
 mod routes;
 mod sse;
 mod state;
@@ -951,6 +952,8 @@ pub async fn serve_with_options(
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
         kv_stores: RwLock::new(HashMap::new()),
+        crdt_subscriptions: RwLock::new(crdt_subscriptions::CrdtSubscriptionManifest::default()),
+        crdt_subscriptions_path: config.data_dir.join("crdt-subscriptions.json"),
         named_groups: RwLock::new(named_groups),
         named_groups_path,
         named_groups_persistence_lock: Mutex::new(()),
@@ -1053,6 +1056,10 @@ pub async fn serve_with_options(
     // Phase C.2: load persisted shard subscriptions and re-subscribe with
     // staggered jitter to avoid anti-entropy storms.
     bg_tasks.extend(spawn_directory_resubscribe(Arc::clone(&state)).await);
+    // Restart-amnesia fix: load the persisted task-list/kv-store subscription
+    // manifest now (before REST handlers can mutate it) — the actual
+    // re-create/re-join runs after `join_network` in the join task below.
+    crdt_subscriptions::load(&state).await;
     // Phase C.2: subscribe inbound direct messages for the
     // ListedToContacts pairwise sync channel.
     bg_tasks.extend(spawn_listed_to_contacts_listener(Arc::clone(&state)).await);
@@ -1128,6 +1135,7 @@ pub async fn serve_with_options(
         dm_inbox_kv_store_delta_route_tx,
     )));
 
+    let crdt_rehydrate_state = Arc::clone(&state);
     bg_tasks.push(tokio::spawn(async move {
         match join_agent.join_network().await {
             Ok(()) => {
@@ -1144,6 +1152,13 @@ pub async fn serve_with_options(
                 tracing::error!("Failed to join network: {e}");
             }
         }
+        // Restart-amnesia fix: re-register every persisted task-list/kv-store
+        // subscription via the same Agent create/join paths the REST handlers
+        // use, so the topic subscription + empty-replica state-request happen
+        // and offline mutations arrive from peers. Runs on BOTH join arms:
+        // even when join_network errors, the local gossip runtime exists and
+        // the subscription is what lets state recover once peers appear.
+        crdt_subscriptions::rehydrate(crdt_rehydrate_state).await;
     }));
 
     let self_published_release_manifests =
@@ -15822,6 +15837,20 @@ async fn create_kv_store(
         Ok(handle) => {
             let id = req.topic.clone();
             state.kv_stores.write().await.insert(id.clone(), handle);
+            // Persist the registration so it survives a daemon restart
+            // (rehydrated after join_network — see crdt_subscriptions).
+            crdt_subscriptions::record(
+                &state,
+                crdt_subscriptions::CrdtSubscriptionEntry {
+                    kind: crdt_subscriptions::KIND_KV_STORE.to_string(),
+                    id: id.clone(),
+                    name: req.name.clone(),
+                    topic: req.topic.clone(),
+                    role: crdt_subscriptions::ROLE_CREATED.to_string(),
+                    extra: serde_json::Map::new(),
+                },
+            )
+            .await;
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({ "ok": true, "id": id })),
@@ -15839,6 +15868,21 @@ async fn join_kv_store(
     match state.agent.join_kv_store(&id).await {
         Ok(handle) => {
             state.kv_stores.write().await.insert(id.clone(), handle);
+            // Persist the registration so it survives a daemon restart
+            // (rehydrated after join_network — see crdt_subscriptions). The
+            // join path only knows the topic, so it doubles as the name.
+            crdt_subscriptions::record(
+                &state,
+                crdt_subscriptions::CrdtSubscriptionEntry {
+                    kind: crdt_subscriptions::KIND_KV_STORE.to_string(),
+                    id: id.clone(),
+                    name: id.clone(),
+                    topic: id.clone(),
+                    role: crdt_subscriptions::ROLE_JOINED.to_string(),
+                    extra: serde_json::Map::new(),
+                },
+            )
+            .await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "id": id })),
@@ -21100,6 +21144,8 @@ mod tests {
             subscriptions: RwLock::new(HashMap::new()),
             task_lists: RwLock::new(HashMap::new()),
             kv_stores: RwLock::new(HashMap::new()),
+            crdt_subscriptions: RwLock::new(crdt_subscriptions::CrdtSubscriptionManifest::default()),
+            crdt_subscriptions_path: data_dir.join("crdt-subscriptions.json"),
             named_groups: RwLock::new(named_groups),
             named_groups_path,
             named_groups_persistence_lock: Mutex::new(()),

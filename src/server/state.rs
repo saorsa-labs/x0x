@@ -510,6 +510,13 @@ pub(super) struct AppState {
     pub(super) subscriptions: RwLock<HashMap<String, RestSubscription>>,
     pub(super) task_lists: RwLock<HashMap<String, TaskListHandle>>,
     pub(super) kv_stores: RwLock<HashMap<String, KvStoreHandle>>,
+    /// Persisted task-list/kv-store subscription manifest so registrations
+    /// survive a daemon restart (rehydrated after `join_network`; see
+    /// `crdt_subscriptions`).
+    pub(super) crdt_subscriptions: RwLock<super::crdt_subscriptions::CrdtSubscriptionManifest>,
+    /// Disk location for the CRDT subscription manifest (instance data dir,
+    /// alongside `directory-subscriptions.json`).
+    pub(super) crdt_subscriptions_path: PathBuf,
     pub(super) named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
     pub(super) named_groups_path: PathBuf,
     /// Serializes snapshot-and-write of `named_groups.json` so an older
