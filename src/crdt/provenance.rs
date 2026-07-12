@@ -94,7 +94,7 @@ pub struct OpAttestation {
     /// `AgentId::from_public_key(author_public_key)` and the element's
     /// `agent_id`; checked at verification.
     pub author_agent_id: AgentId,
-    /// ML-DSA-65 public key bytes whose hash equals [`author_agent_id`].
+    /// ML-DSA-65 public key bytes whose hash equals `author_agent_id`.
     pub author_public_key: Vec<u8>,
     /// ML-DSA-65 signature over [`canonical_op_bytes`] under the matching
     /// secret key.
