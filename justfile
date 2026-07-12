@@ -108,3 +108,17 @@ bump-version VERSION:
 
 release-dryrun:
     bash scripts/release-dryrun.sh
+
+# ── Convergence soak (tests/convergence) ──────────────────────────────────
+
+# Full soak: repeat the 3-node convergence scenario (cold-join, live
+# propagation, restart recovery, concurrent claims, signed-store non-owner
+# write) with per-phase gossip-diagnostics deltas. Requires a release x0xd
+# (cargo build --release --bin x0xd) or X0XD_TEST_BINARY.
+# Usage: just convergence-soak [RUNS]
+convergence-soak RUNS="10":
+    python3 tests/convergence/convergence_soak.py --runs {{RUNS}}
+
+# Single-run smoke of the convergence harness (same phases, one pass).
+convergence-soak-quick:
+    python3 tests/convergence/convergence_soak.py --runs 1
