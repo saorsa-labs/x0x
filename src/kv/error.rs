@@ -42,6 +42,14 @@ pub enum KvError {
     /// Unauthorized write attempt.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+
+    /// The store's authoritative owner is not yet known.
+    ///
+    /// A joined replica starts with no owner and learns it from an
+    /// owner-signed announcement on the state-sync channel. Until then,
+    /// policy-restricted writes are rejected (fail closed).
+    #[error("store owner unknown: store is read-only until the authoritative owner is learned")]
+    OwnerUnknown,
 }
 
 #[cfg(test)]
