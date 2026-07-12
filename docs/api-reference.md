@@ -558,6 +558,50 @@ or
 {"action":"complete"}
 ```
 
+### Task versions, structured claim fields, and optimistic concurrency
+
+Every task-list response carries the list's `version` — a counter bumped on
+each local or merged mutation. Mutation responses (create list, add task,
+claim, complete) return:
+
+```json
+{"ok":true,"version":7,"committed":"local"}
+```
+
+`"committed":"local"` is explicit about the consistency model: success means
+the mutation was committed to the **local** CRDT replica and a delta was
+published to peers — it does NOT mean any peer has observed it yet.
+Replication is eventual (gossip anti-entropy).
+
+Each task in `GET /task-lists/:id/tasks` includes structured ownership fields
+alongside the legacy `state` string (unchanged for backward compatibility):
+
+- `claimed_by` / `claimed_at` — hex AgentId and Unix-ms timestamp of the
+  deterministic claim winner (the OR-Set resolution both replicas converge
+  to). Non-null once claimed; `claimed_by` survives completion.
+- `completed_by` / `completed_at` — same, for the winning completion; null
+  unless done.
+- `assignee` — hex AgentId from the task's LWW assignee register, now
+  populated by claim/complete (was previously always null).
+
+The update-task request accepts an optional `expected_version` for
+compare-and-set semantics (honored for both `claim` and `complete`):
+
+```json
+{"action":"claim","expected_version":7}
+```
+
+If `expected_version` does not match the list's current version, nothing is
+mutated and the daemon returns **409 Conflict**:
+
+```json
+{"ok":false,"error":"version conflict","current_version":9}
+```
+
+Without `expected_version`, behavior is unchanged: concurrent claims from two
+agents both return 200, and the CRDT merge deterministically resolves a
+single winner (`claimed_by`) after convergence.
+
 ## Key-value stores
 
 | Method | Endpoint | CLI | Purpose |

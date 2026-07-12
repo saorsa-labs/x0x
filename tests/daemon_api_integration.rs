@@ -1960,6 +1960,189 @@ async fn daemon_api_complete_task() -> Result<()> {
     Ok(())
 }
 
+/// PATCH a task with an arbitrary body, returning (status, body) for
+/// assertions on both success and conflict responses.
+async fn patch_task_raw(
+    d: &DaemonFixture,
+    list_id: &str,
+    task_id: &str,
+    body: Value,
+) -> Result<(StatusCode, Value)> {
+    let response = ca(d)
+        .patch(d.url(&format!("/task-lists/{list_id}/tasks/{task_id}")))
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await?;
+    Ok((status, body))
+}
+
+fn task_entry<'a>(body: &'a Value, task_id: &str) -> Option<&'a Value> {
+    body["tasks"].as_array().and_then(|tasks| {
+        tasks
+            .iter()
+            .find(|task| task["id"].as_str() == Some(task_id))
+    })
+}
+
+// WHY: claiming used to return bare {"ok":true} with the task's assignee
+// null forever — ownership was only recoverable by parsing the Display
+// string "claimed:<hex>", and success gave no version or consistency
+// signal. This test pins the structured contract.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_claim_returns_version_and_structured_fields() -> Result<()> {
+    let d = daemon().await;
+    let (list_id, task_id) = create_task_list_item(&d, "Structured claim").await?;
+
+    // Claim: response must carry the new list version and the explicit
+    // local-commit marker (success = local commit + publish, NOT replication).
+    let (status, body) = patch_task_raw(
+        &d,
+        &list_id,
+        &task_id,
+        serde_json::json!({"action":"claim"}),
+    )
+    .await?;
+    ensure!(status == StatusCode::OK, "claim status: {status}");
+    ensure!(body["ok"] == true, "claim response: {body:?}");
+    ensure!(body["version"].is_u64(), "claim missing version: {body:?}");
+    ensure!(
+        body["committed"] == "local",
+        "claim missing committed marker: {body:?}"
+    );
+
+    // GET: structured ownership fields must be populated, legacy state kept.
+    let listed = list_task_list_items(&d, &list_id).await?;
+    ensure!(
+        listed["version"].is_u64(),
+        "list missing version: {listed:?}"
+    );
+    let entry = task_entry(&listed, &task_id).context("task present in listing")?;
+    let claimed_by = entry["claimed_by"]
+        .as_str()
+        .context("claimed_by non-null")?;
+    ensure!(
+        claimed_by.len() == 64,
+        "claimed_by is hex AgentId: {entry:?}"
+    );
+    ensure!(
+        entry["claimed_at"]
+            .as_u64()
+            .is_some_and(|t| t > 1_000_000_000_000),
+        "claimed_at is Unix ms: {entry:?}"
+    );
+    ensure!(
+        entry["assignee"].as_str() == Some(claimed_by),
+        "assignee register populated by claim: {entry:?}"
+    );
+    ensure!(
+        entry["state"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("claimed:")),
+        "legacy state string unchanged: {entry:?}"
+    );
+    ensure!(
+        entry["completed_by"].is_null() && entry["completed_at"].is_null(),
+        "completion fields null before done: {entry:?}"
+    );
+
+    // Complete: completion fields become non-null, claim record survives.
+    let (status, body) = patch_task_raw(
+        &d,
+        &list_id,
+        &task_id,
+        serde_json::json!({"action":"complete"}),
+    )
+    .await?;
+    ensure!(status == StatusCode::OK, "complete status: {status}");
+    ensure!(
+        body["version"].is_u64() && body["committed"] == "local",
+        "complete response: {body:?}"
+    );
+    let listed = list_task_list_items(&d, &list_id).await?;
+    let entry = task_entry(&listed, &task_id).context("task present after done")?;
+    ensure!(
+        entry["completed_by"]
+            .as_str()
+            .is_some_and(|s| s.len() == 64),
+        "completed_by non-null after done: {entry:?}"
+    );
+    ensure!(
+        entry["completed_at"]
+            .as_u64()
+            .is_some_and(|t| t > 1_000_000_000_000),
+        "completed_at is Unix ms: {entry:?}"
+    );
+    ensure!(
+        entry["claimed_by"].as_str() == Some(claimed_by),
+        "claim record survives completion: {entry:?}"
+    );
+    Ok(())
+}
+
+// WHY: without a CAS signal two agents could both "successfully" claim and
+// neither could detect the race. expected_version turns a stale claim into
+// a visible 409 with the current version and NO mutation.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_claim_expected_version_cas() -> Result<()> {
+    let d = daemon().await;
+    let (list_id, task_id) = create_task_list_item(&d, "CAS claim").await?;
+
+    let listed = list_task_list_items(&d, &list_id).await?;
+    let version = listed["version"].as_u64().context("list version present")?;
+
+    // Stale expected_version ⇒ 409 with current_version, task untouched.
+    let (status, body) = patch_task_raw(
+        &d,
+        &list_id,
+        &task_id,
+        serde_json::json!({"action":"claim","expected_version": version + 1000}),
+    )
+    .await?;
+    ensure!(status == StatusCode::CONFLICT, "stale CAS status: {status}");
+    ensure!(body["ok"] == false, "conflict response: {body:?}");
+    ensure!(
+        body["error"] == "version conflict",
+        "conflict error: {body:?}"
+    );
+    ensure!(
+        body["current_version"].as_u64() == Some(version),
+        "conflict must report current version: {body:?}"
+    );
+    let listed = list_task_list_items(&d, &list_id).await?;
+    let entry = task_entry(&listed, &task_id).context("task still listed")?;
+    ensure!(
+        entry["state"] == "empty" && entry["claimed_by"].is_null(),
+        "409 must not mutate the task: {entry:?}"
+    );
+    ensure!(
+        listed["version"].as_u64() == Some(version),
+        "409 must not bump the version: {listed:?}"
+    );
+
+    // Fresh expected_version ⇒ 200 committed with a bumped version.
+    let (status, body) = patch_task_raw(
+        &d,
+        &list_id,
+        &task_id,
+        serde_json::json!({"action":"claim","expected_version": version}),
+    )
+    .await?;
+    ensure!(status == StatusCode::OK, "fresh CAS status: {status}");
+    ensure!(
+        body["ok"] == true && body["committed"] == "local",
+        "fresh CAS response: {body:?}"
+    );
+    ensure!(
+        body["version"].as_u64().is_some_and(|v| v > version),
+        "fresh CAS bumps version: {body:?}"
+    );
+    Ok(())
+}
+
 // ===========================================================================
 // Network (5)
 // ===========================================================================

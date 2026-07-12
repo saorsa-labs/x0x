@@ -165,6 +165,12 @@ impl TaskItem {
     /// Adds a Claimed state to the OR-Set. If multiple agents claim concurrently,
     /// all claims are recorded, and the earliest timestamp wins as the "current" state.
     ///
+    /// Also sets the `assignee` LWW register to the claiming agent, so the
+    /// task's assignee is observable without parsing the checkbox state.
+    /// Under truly concurrent claims the LWW register may resolve to either
+    /// claimer; the authoritative winner is [`TaskItem::claim_record`], which
+    /// derives deterministically from the OR-Set.
+    ///
     /// # Arguments
     ///
     /// * `agent_id` - The agent claiming this task
@@ -216,6 +222,11 @@ impl TaskItem {
             .add(claimed_state, tag)
             .map_err(|e| CrdtError::Merge(format!("Failed to add claimed state: {}", e)))?;
 
+        // Mirror the claim into the assignee LWW register so the assignee is
+        // directly observable (same timestamp source as update_assignee: the
+        // register's own vector clock keyed by peer_id).
+        self.assignee.set(Some(agent_id), peer_id);
+
         Ok(())
     }
 
@@ -223,6 +234,10 @@ impl TaskItem {
     ///
     /// Adds a Done state to the OR-Set. If multiple agents complete concurrently,
     /// the earliest completion wins.
+    ///
+    /// Also sets the `assignee` LWW register to the completing agent
+    /// (mirroring [`TaskItem::claim`]). The authoritative completer is
+    /// [`TaskItem::completion_record`], derived from the OR-Set.
     ///
     /// # Arguments
     ///
@@ -287,6 +302,9 @@ impl TaskItem {
         self.checkbox
             .add(done_state, tag)
             .map_err(|e| CrdtError::Merge(format!("Failed to add done state: {}", e)))?;
+
+        // Mirror the completion into the assignee LWW register (see claim).
+        self.assignee.set(Some(agent_id), peer_id);
 
         Ok(())
     }
@@ -399,6 +417,59 @@ impl TaskItem {
 
         // Otherwise empty
         CheckboxState::Empty
+    }
+
+    /// The winning claim record, if this task has ever been claimed.
+    ///
+    /// Resolves the OR-Set's `Claimed` entries to a single deterministic
+    /// winner (earliest timestamp, `CheckboxState` ordering as tiebreaker) —
+    /// the same resolution [`TaskItem::current_state`] uses. Unlike
+    /// `current_state`, the claim record remains available after the task
+    /// transitions to Done.
+    ///
+    /// # Returns
+    ///
+    /// `Some((agent_id, timestamp_ms))` for the winning claim, or `None` if
+    /// the task was never claimed.
+    #[must_use]
+    pub fn claim_record(&self) -> Option<(AgentId, u64)> {
+        self.checkbox
+            .elements()
+            .into_iter()
+            .filter(|s| s.is_claimed())
+            .min()
+            .and_then(|s| match s {
+                CheckboxState::Claimed {
+                    agent_id,
+                    timestamp,
+                } => Some((*agent_id, *timestamp)),
+                _ => None,
+            })
+    }
+
+    /// The winning completion record, if this task has been completed.
+    ///
+    /// Resolves the OR-Set's `Done` entries to a single deterministic winner
+    /// (earliest timestamp, `CheckboxState` ordering as tiebreaker).
+    ///
+    /// # Returns
+    ///
+    /// `Some((agent_id, timestamp_ms))` for the winning completion, or `None`
+    /// if the task is not done.
+    #[must_use]
+    pub fn completion_record(&self) -> Option<(AgentId, u64)> {
+        self.checkbox
+            .elements()
+            .into_iter()
+            .filter(|s| s.is_done())
+            .min()
+            .and_then(|s| match s {
+                CheckboxState::Done {
+                    agent_id,
+                    timestamp,
+                } => Some((*agent_id, *timestamp)),
+                _ => None,
+            })
     }
 
     /// Merge another TaskItem into this one.
@@ -768,6 +839,87 @@ mod tests {
             CrdtError::Merge(_) => {}
             _ => panic!("Expected Merge error"),
         }
+    }
+
+    // ── Structured claim/completion semantics (task-claim API fix) ─────────
+    //
+    // WHY: the REST API used to return bare {"ok":true} on claim and the
+    // assignee register stayed None forever — ownership was only recoverable
+    // by parsing the Display string "claimed:<hex>". These tests pin the
+    // contract that claim/complete populate the assignee register and that
+    // the OR-Set winner (claim_record) is deterministic across replicas.
+
+    #[test]
+    fn claim_populates_assignee_register() {
+        let peer = peer(1);
+        let claimer = agent(7);
+        let mut task = make_task(peer);
+        assert_eq!(task.assignee(), None, "precondition: unassigned");
+
+        task.claim(claimer, peer, 1).ok().unwrap();
+
+        assert_eq!(
+            task.assignee(),
+            Some(&claimer),
+            "claim must set the assignee register — clients read assignee, not Display strings"
+        );
+        let (by, at) = task.claim_record().expect("claim record exists");
+        assert_eq!(by, claimer);
+        assert!(at > 1_000_000_000_000, "claimed_at is Unix ms");
+    }
+
+    #[test]
+    fn concurrent_claims_converge_to_same_winner_on_both_replicas() {
+        let peer1 = peer(1);
+        let peer2 = peer(2);
+        let agent1 = agent(1);
+        let agent2 = agent(2);
+
+        let mut replica_a = make_task(peer1);
+        let mut replica_b = make_task(peer1);
+
+        // Two agents claim "successfully" on their own replicas.
+        replica_a.claim(agent1, peer1, 100).ok().unwrap();
+        replica_b.claim(agent2, peer2, 200).ok().unwrap();
+
+        // Full state exchange (order differs per replica).
+        let a_before = replica_a.clone();
+        replica_a.merge(&replica_b).ok().unwrap();
+        replica_b.merge(&a_before).ok().unwrap();
+
+        // Both replicas must agree on a SINGLE winner — this is the CAS-free
+        // conflict signal: exactly one agent owns the task after convergence.
+        let (winner_a, ts_a) = replica_a.claim_record().expect("winner on A");
+        let (winner_b, ts_b) = replica_b.claim_record().expect("winner on B");
+        assert_eq!(winner_a, winner_b, "replicas disagree on claim winner");
+        assert_eq!(ts_a, ts_b);
+
+        // And claimed_by derived from current_state matches that winner.
+        let state = replica_a.current_state();
+        assert_eq!(state.claimed_by(), Some(&winner_a));
+    }
+
+    #[test]
+    fn complete_sets_completion_record_and_assignee() {
+        let peer = peer(1);
+        let claimer = agent(1);
+        let completer = agent(2);
+        let mut task = make_task(peer);
+
+        task.claim(claimer, peer, 1).ok().unwrap();
+        task.complete(completer, peer, 2).ok().unwrap();
+
+        let (done_by, done_at) = task.completion_record().expect("completion record");
+        assert_eq!(done_by, completer);
+        assert!(done_at > 1_000_000_000_000, "completed_at is Unix ms");
+        assert_eq!(
+            task.assignee(),
+            Some(&completer),
+            "complete mirrors the completer into the assignee register"
+        );
+        // The original claim record survives the transition to Done.
+        let (claimed_by, _) = task.claim_record().expect("claim record survives Done");
+        assert_eq!(claimed_by, claimer);
     }
 
     #[test]
