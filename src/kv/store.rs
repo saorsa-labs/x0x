@@ -1116,21 +1116,6 @@ impl KvStore {
         if cp.checkpoint_seq <= self.highest_checkpoint_seq {
             return false; // stale replay — ignore, fall through
         }
-        // 4b. Reject injected removals. The signed `content_root` binds only the
-        //     surviving (added+updated) set, NOT `delta.removed`. An honest
-        //     full-state relay never carries removals (`full_delta` populates
-        //     only `added`), so a non-empty `removed` here is a relay injecting
-        //     deletions the owner never signed — which would silently truncate a
-        //     cold-recovering joiner's state. Fail closed and fall through to the
-        //     sender-auth path (which requires owner authorization for a Signed
-        //     store), so the injection is rejected outright.
-        if !delta.removed.is_empty() {
-            tracing::warn!(
-                "rejected owner checkpoint with injected removals for store {}",
-                self.id
-            );
-            return false;
-        }
         // 5. Validate every relayed entry's integrity before any mutation.
         //    Fail-closed: a single malformed/inconsistent entry rejects the
         //    entire checkpoint adoption.
@@ -1181,10 +1166,15 @@ impl KvStore {
                 self.entries.insert(key.clone(), entry.clone());
             }
         }
-        // 8. Apply removals/tombstones. Guaranteed empty here by gate 4b (a
-        //    full-state checkpoint never carries removals); retained as a
-        //    defensive no-op so the loop is correct if that invariant ever
-        //    changes. Legitimate deletions replicate via the sender-auth path.
+        // 8. Apply removals/tombstones — critical for delete-to-empty and
+        //    delete-recovery so a cold-recovering joiner reflects owner
+        //    deletions (the owner relays the post-delete checkpoint alongside
+        //    the removal tombstones). NOTE: a relay-injected `removed` can
+        //    currently truncate a subset of owner-signed state during first
+        //    delivery (contained/self-healing MEDIUM — see docs follow-up); the
+        //    correct fix is full-replace-to-signed-set adoption, not rejecting
+        //    the whole checkpoint (which strands delete-recovery, resurrecting
+        //    deleted keys).
         for key in delta.removed.keys() {
             let _ = self.keys.remove(&key.to_string());
             self.entries.remove(key.as_str());
@@ -2579,61 +2569,6 @@ mod tests {
             );
             assert_ne!(joiner.name(), "EVIL", "{name}: store name not forged");
         }
-    }
-
-    #[test]
-    fn relay_injected_removed_key_cannot_truncate_recovery() {
-        // MEDIUM: `content_root` binds only the surviving (added+updated) set,
-        // not `delta.removed`. A non-owner relay takes the owner's valid
-        // full-snapshot checkpoint and injects `removed = {k}` for a key that IS
-        // in `added`. Without gate 4b the adopt path would add `k` then delete
-        // it, leaving the cold-recovering joiner with a silently truncated
-        // subset of owner-signed state (a relay privilege escalation). The gate
-        // must reject the adoption entirely and leave the joiner unmutated so it
-        // falls through to sender-auth (which a non-owner relay cannot satisfy).
-        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
-        let owner = kp.agent_id();
-        let topic = "store/removed-injection";
-        let id = KvStoreId::for_topic_owner(topic, &owner);
-
-        let mut owner_store = KvStore::new(id, "Legit".to_string(), owner, AccessPolicy::Signed);
-        owner_store
-            .put(
-                "k".to_string(),
-                b"v".to_vec(),
-                "text/plain".to_string(),
-                peer(1),
-            )
-            .expect("owner put");
-        let cp = checkpoint_for(&owner_store, topic, &kp, 1);
-
-        let mut delta = owner_store.full_delta();
-        delta.owner_checkpoint = Some(cp);
-        // Inject a deletion the owner never signed.
-        let mut tags = std::collections::HashSet::new();
-        tags.insert((peer(9), 1));
-        delta.removed.insert("k".to_string(), tags);
-
-        let mut joiner =
-            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
-        joiner
-            .merge_delta(&delta, peer(9), Some(&agent(9)))
-            .expect("silent rejection never errors");
-
-        // Adoption rejected: the joiner adopts neither the add nor the injected
-        // removal — it stays empty rather than converging to a truncated subset.
-        assert!(
-            joiner.entries.is_empty(),
-            "injected removal must reject the whole adoption, not truncate"
-        );
-        assert_eq!(
-            joiner.highest_checkpoint_seq, 0,
-            "high-water mark unchanged after rejected adoption"
-        );
-        assert!(
-            joiner.latest_checkpoint.is_none(),
-            "checkpoint cache empty after rejected adoption"
-        );
     }
 
     #[test]

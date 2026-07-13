@@ -2238,6 +2238,12 @@ def run_forged_first_seen_gate(args, out_dir):
                              "description": "must survive the forged delta"})
         legit_tid = legit["body"].get("task_id") if isinstance(
             legit.get("body"), dict) else None
+        # The receiver MUST join the task list (subscribe to the topic) or it
+        # receives neither the legit task nor the forged delta — which would
+        # make the security check vacuous (sees nothing) and the liveness check
+        # fail. Join uses the same POST /task-lists as the core cold-join phase.
+        receiver.req("POST", "/task-lists",
+                     {"name": "forged admission", "topic": topic})
         # Baseline convergence; snapshot receiver list state BEFORE attack.
         sample_until({"t": lambda: task_visible(receiver, topic, legit_tid)},
                      gate_secs=args.cold_gate, interval=args.poll_interval)
