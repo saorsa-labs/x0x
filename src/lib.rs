@@ -5916,9 +5916,14 @@ impl Agent {
                 Revocation(crate::gossip::PubSubMessage),
             }
 
-            // Track agents we've already initiated auto-connect to, preventing
-            // duplicate connection attempts from concurrent announcements.
-            let mut auto_connect_attempted = std::collections::HashSet::<identity::AgentId>::new();
+            // Track when we last initiated an auto-connect dial per agent.
+            // Prevents duplicate attempts from concurrent announcements AND
+            // rate-limits redials to an announcing-but-unreachable peer: every
+            // failed dial accumulates ant-quic NAT-traversal/connection state,
+            // so dialing on each received announcement copy leaks memory
+            // without bound (see ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN).
+            let mut auto_connect_attempts =
+                std::collections::HashMap::<identity::AgentId, std::time::Instant>::new();
 
             // One-shot dedup for re-broadcast: (agent_id, announced_at)
             // → first-rebroadcast Instant. Bounds each fresh announcement to at
@@ -6518,12 +6523,10 @@ impl Agent {
                 // PlumTree topic trees once the QUIC connection is established.
                 if announcement.agent_id != own_agent_id
                     && !auto_connect_addresses.is_empty()
-                    && (!auto_connect_attempted.contains(&announcement.agent_id)
-                        || (if let Some(net) = &network {
-                            !net.is_connected(&ant_quic::PeerId(announcement.machine_id.0)).await
-                        } else {
-                            false
-                        }))
+                    && announcement_auto_connect_retry_allowed(
+                        auto_connect_attempts.get(&announcement.agent_id).copied(),
+                        std::time::Instant::now(),
+                    )
                 {
                     if let Some(net) = &network {
                         let ant_peer = ant_quic::PeerId(announcement.machine_id.0);
@@ -6537,7 +6540,8 @@ impl Agent {
                         let suppressed = net.is_reconnect_suppressed(announcement.machine_id.0);
                         let connected = net.is_connected(&ant_peer).await;
                         if announcement_should_auto_connect(suppressed, connected) {
-                            auto_connect_attempted.insert(announcement.agent_id);
+                            auto_connect_attempts
+                                .insert(announcement.agent_id, std::time::Instant::now());
                             let net = std::sync::Arc::clone(net);
                             let addresses = auto_connect_addresses.clone();
                             tokio::spawn(async move {
@@ -9216,6 +9220,33 @@ const RECONNECT_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::fro
 /// the security invariant is unit-testable independently of the gossip stack.
 fn announcement_should_auto_connect(reconnect_suppressed: bool, already_connected: bool) -> bool {
     !reconnect_suppressed && !already_connected
+}
+
+/// Minimum interval between auto-connect dials to the same announcing agent.
+///
+/// A peer that announces but is unreachable (behind NAT, blackholed, or dead
+/// with its announcements still circulating) would otherwise be redialed on
+/// EVERY received announcement copy — and rebroadcast fan-out delivers each
+/// fresh announcement many times within seconds. Every failed dial drives
+/// ant-quic NAT traversal/hole-punch and accumulates connection state
+/// (~2.5 MB per failed dial measured on a loopback replay repro), which is
+/// unbounded growth on a churning mesh. One dial per cooldown window per agent
+/// bounds that; a first-ever announcement still dials immediately.
+const ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Whether the per-agent auto-connect rate limit allows another dial attempt.
+///
+/// Pure so the anti-storm invariant (at most one dial per
+/// [`ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN`] per agent) is unit-testable
+/// independently of the gossip stack.
+fn announcement_auto_connect_retry_allowed(
+    last_attempt: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    last_attempt.is_none_or(|last| {
+        now.saturating_duration_since(last) >= ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN
+    })
 }
 
 /// Apply bounded ±20% random jitter to a reconnect backoff delay.
@@ -12941,6 +12972,37 @@ mod tests {
         assert!(!announcement_should_auto_connect(false, true));
         assert!(!announcement_should_auto_connect(true, false));
         assert!(!announcement_should_auto_connect(true, true));
+    }
+
+    /// The per-agent auto-connect rate limit must allow a first-ever dial
+    /// immediately, refuse a redial inside the cooldown window, and allow it
+    /// again once the window has elapsed. WHY: an announcing-but-unreachable
+    /// peer is redialed per received announcement copy; every failed dial
+    /// accumulates ant-quic NAT-traversal state (~2.5 MB measured), so an
+    /// unbounded dial rate is an unbounded memory leak (v0.31 testnet OOM).
+    #[test]
+    fn announcement_auto_connect_retry_cooldown_gates_redials() {
+        let now = std::time::Instant::now();
+        // First-ever announcement: dial immediately.
+        assert!(announcement_auto_connect_retry_allowed(None, now));
+        // Same instant as the last attempt: refuse.
+        assert!(!announcement_auto_connect_retry_allowed(Some(now), now));
+        // Just inside the window: refuse.
+        let inside =
+            now + ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN - std::time::Duration::from_millis(1);
+        assert!(!announcement_auto_connect_retry_allowed(Some(now), inside));
+        // At/after the window boundary: allow.
+        let at_boundary = now + ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN;
+        assert!(announcement_auto_connect_retry_allowed(
+            Some(now),
+            at_boundary
+        ));
+        // Clock going backwards (last_attempt in the "future") must not panic
+        // and must refuse the dial.
+        assert!(!announcement_auto_connect_retry_allowed(
+            Some(at_boundary),
+            now
+        ));
     }
 
     /// Jittered backoff must stay within ±20% of each base delay. WHY: the
