@@ -1166,18 +1166,32 @@ impl KvStore {
                 self.entries.insert(key.clone(), entry.clone());
             }
         }
-        // 8. Apply removals/tombstones — critical for delete-to-empty and
-        //    delete-recovery so a cold-recovering joiner reflects owner
-        //    deletions (the owner relays the post-delete checkpoint alongside
-        //    the removal tombstones). NOTE: a relay-injected `removed` can
-        //    currently truncate a subset of owner-signed state during first
-        //    delivery (contained/self-healing MEDIUM — see docs follow-up); the
-        //    correct fix is full-replace-to-signed-set adoption, not rejecting
-        //    the whole checkpoint (which strands delete-recovery, resurrecting
-        //    deleted keys).
-        for key in delta.removed.keys() {
-            let _ = self.keys.remove(&key.to_string());
-            self.entries.remove(key.as_str());
+        // 8. Full-replace to the owner-signed set. Step 6 proved the relayed
+        //    (added ∪ updated) keys ARE the owner's complete signed state, so
+        //    the store's state after adoption must be EXACTLY that set. Drop any
+        //    local key not in it — that reflects owner deletions on a
+        //    cold-recovering joiner WITHOUT trusting the untrusted `delta.removed`
+        //    field. This is the authoritative full-replace: a relay-injected
+        //    `removed` cannot truncate (it is ignored; the signed set wins), and
+        //    a relay cannot resurrect or hide keys (a stale/mismatched relayed
+        //    set fails step 6 and never reaches here). `delta.removed` is
+        //    deliberately NOT consulted on the checkpoint-adopt path.
+        let signed_keys: std::collections::HashSet<&str> = delta
+            .added
+            .keys()
+            .map(String::as_str)
+            .chain(delta.updated.keys().map(String::as_str))
+            .collect();
+        let stale: Vec<String> = self
+            .keys
+            .elements()
+            .into_iter()
+            .filter(|k| !signed_keys.contains(k.as_str()))
+            .cloned()
+            .collect();
+        for key in stale {
+            let _ = self.keys.remove(&key);
+            self.entries.remove(&key);
         }
         // 9. Apply name update.
         if let Some(name_register) = &delta.name_update {
@@ -2172,6 +2186,101 @@ mod tests {
             .expect("checkpoint-gated merge");
         assert!(joiner.get("k").is_some(), "adopted relayed owner content");
         assert_eq!(joiner.highest_checkpoint_seq, 1);
+    }
+
+    #[test]
+    fn full_replace_ignores_relay_injected_removed() {
+        // A non-owner relay copies the owner's valid full-snapshot checkpoint of
+        // {k} and injects removed={k}. The full-replace adopt path IGNORES the
+        // untrusted `delta.removed` — the owner-signed set {k} is authoritative —
+        // so the injection cannot truncate the joiner's recovered state.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/inject";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        owner_store
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let cp = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut delta = owner_store.full_delta();
+        delta.owner_checkpoint = Some(cp);
+        let mut tags = std::collections::HashSet::new();
+        tags.insert((peer(9), 1));
+        delta.removed.insert("k".to_string(), tags);
+
+        let mut joiner =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        joiner
+            .merge_delta(&delta, peer(9), Some(&agent(9)))
+            .expect("merge");
+        assert!(
+            joiner.get("k").is_some(),
+            "injected removed must not truncate the owner-signed set"
+        );
+        assert_eq!(joiner.highest_checkpoint_seq, 1, "checkpoint adopted");
+    }
+
+    #[test]
+    fn full_replace_drops_keys_absent_from_newer_checkpoint() {
+        // A replica holding {k1,k2} (from a seq-1 checkpoint) adopts a NEWER
+        // seq-2 checkpoint whose signed set is {k1} — the owner deleted k2.
+        // Full-replace drops k2; it is NOT resurrected. Proves checkpoint
+        // adoption is authoritative full-state, not additive (the exact
+        // delete-recovery invariant the soak's owner_offline gate exercises).
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/delrec";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        owner_store
+            .put(
+                "k1".to_string(),
+                b"a".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put k1");
+        owner_store
+            .put(
+                "k2".to_string(),
+                b"b".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put k2");
+        let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut d1 = owner_store.full_delta();
+        d1.owner_checkpoint = Some(cp1);
+        let mut joiner =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        joiner
+            .merge_delta(&d1, peer(9), Some(&agent(9)))
+            .expect("adopt cp1");
+        assert!(
+            joiner.get("k1").is_some() && joiner.get("k2").is_some(),
+            "joiner recovered both keys from cp1"
+        );
+
+        // Owner deletes k2 and cuts a newer checkpoint over {k1}.
+        owner_store.remove("k2").expect("delete k2");
+        let cp2 = checkpoint_for(&owner_store, topic, &kp, 2);
+        let mut d2 = owner_store.full_delta();
+        d2.owner_checkpoint = Some(cp2);
+        joiner
+            .merge_delta(&d2, peer(9), Some(&agent(9)))
+            .expect("adopt cp2");
+        assert!(joiner.get("k1").is_some(), "k1 survives");
+        assert!(
+            joiner.get("k2").is_none(),
+            "k2 dropped by full-replace, not resurrected"
+        );
+        assert_eq!(joiner.highest_checkpoint_seq, 2);
     }
 
     #[test]
