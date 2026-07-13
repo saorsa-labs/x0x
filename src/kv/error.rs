@@ -1,5 +1,7 @@
 //! Error types for KvStore operations.
 
+use crate::identity::AgentId;
+
 /// Result type for KvStore operations.
 pub type Result<T> = std::result::Result<T, KvError>;
 
@@ -42,6 +44,41 @@ pub enum KvError {
     /// Unauthorized write attempt.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+
+    /// The store has no anchored owner.
+    ///
+    /// Ownership is established ONLY at construction from trusted out-of-band
+    /// input (the creator, or an explicit `expected_owner` at join). A replica
+    /// that joined without an anchor has no owner and is permanently read-only
+    /// by design — the protocol never derives ownership from an untrusted
+    /// network announce, so there is no silent path from `None` to `Some`.
+    /// Policy-restricted writes (and the local-write counterpart) fail closed.
+    #[error("store owner unknown: no anchored owner — store is read-only; supply expected_owner at join")]
+    OwnerUnknown,
+
+    /// The established owner disagrees with a received ownership announcement.
+    ///
+    /// Ownership is immutable once anchored. An announce whose claimed owner
+    /// differs from the anchored owner is a conflict (possible takeover
+    /// attempt or genuine misconfiguration): it is rejected, the anchored
+    /// owner is unchanged, and the conflict is surfaced for auditability.
+    #[error("ownership conflict: anchored owner {anchored} != announced owner {claimed}")]
+    OwnershipConflict {
+        /// The anchored (construction-time) owner.
+        anchored: AgentId,
+        /// The conflicting owner claimed by the announce.
+        claimed: AgentId,
+    },
+
+    /// An ownership announcement is not a valid basis for establishing or
+    /// refreshing ownership.
+    ///
+    /// Covers: a sender that does not match the claimed owner (third-party
+    /// assignment), an attempt to establish ownership on a store that has none
+    /// (first-self-capture guard — ownership is construction-only), and a
+    /// stale/replayed policy refresh. The store state is unchanged.
+    #[error("invalid ownership token: {0}")]
+    OwnerTokenInvalid(String),
 }
 
 #[cfg(test)]

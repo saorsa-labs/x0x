@@ -8,7 +8,7 @@
 use proptest::prelude::*;
 use saorsa_gossip_types::PeerId;
 use x0x::crdt::{CheckboxState, TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
-use x0x::identity::AgentId;
+use x0x::identity::{AgentId, AgentKeypair};
 
 // ── Strategies ──────────────────────────────────────────────────────────
 
@@ -34,6 +34,25 @@ fn make_task_item(title: &str, agent_id: AgentId, peer_id: PeerId) -> TaskItem {
 fn make_task_list(name: &str, peer_id: PeerId) -> TaskList {
     let id = TaskListId::new([0u8; 32]);
     TaskList::new(id, name.to_string(), peer_id)
+}
+
+fn test_scope() -> TaskListId {
+    TaskListId::new([0u8; 32])
+}
+
+/// Deterministically derive a self-consistent signing context and its agent id
+/// from a 32-byte seed. `claim`/`complete` self-sign the attestation and reject
+/// any `agent_id` that does not match the signing key, so the actor's `AgentId`
+/// must be the one derived from this keypair's public key.
+fn signing_from_seed(seed: [u8; 32]) -> (x0x::gossip::SigningContext, AgentId) {
+    use fips204::traits::{KeyGen, SerDes};
+    let (public_key, secret_key) = fips204::ml_dsa_65::KG::keygen_from_seed(&seed);
+    let kp = AgentKeypair::from_bytes(&public_key.into_bytes(), &secret_key.into_bytes())
+        .expect("deterministic seed yields a valid ML-DSA-65 keypair");
+    (
+        x0x::gossip::SigningContext::from_keypair(&kp),
+        kp.agent_id(),
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -163,14 +182,14 @@ proptest! {
     /// Claiming an empty task succeeds.
     #[test]
     fn task_item_claim_empty_succeeds(
-        agent_bytes in prop::array::uniform32(any::<u8>()),
+        seed in prop::array::uniform32(any::<u8>()),
         peer_bytes in prop::array::uniform32(any::<u8>()),
     ) {
-        let agent = AgentId(agent_bytes);
+        let (signing, agent) = signing_from_seed(seed);
         let peer = make_peer_id(peer_bytes);
         let mut task = make_task_item("test", agent, peer);
 
-        let result = task.claim(agent, peer, 1);
+        let result = task.claim(test_scope(), agent, peer, 1, &signing);
         prop_assert!(result.is_ok(), "claim on empty should succeed");
 
         let state = task.current_state();
@@ -183,15 +202,15 @@ proptest! {
     /// Completing a claimed task succeeds.
     #[test]
     fn task_item_complete_claimed_succeeds(
-        agent_bytes in prop::array::uniform32(any::<u8>()),
+        seed in prop::array::uniform32(any::<u8>()),
         peer_bytes in prop::array::uniform32(any::<u8>()),
     ) {
-        let agent = AgentId(agent_bytes);
+        let (signing, agent) = signing_from_seed(seed);
         let peer = make_peer_id(peer_bytes);
         let mut task = make_task_item("test", agent, peer);
 
-        prop_assert!(task.claim(agent, peer, 1).is_ok(), "claim should succeed");
-        let result = task.complete(agent, peer, 2);
+        prop_assert!(task.claim(test_scope(), agent, peer, 1, &signing).is_ok(), "claim should succeed");
+        let result = task.complete(test_scope(), agent, peer, 2, &signing);
         prop_assert!(result.is_ok(), "complete on claimed should succeed");
 
         let state = task.current_state();
@@ -204,26 +223,25 @@ proptest! {
     /// TaskItem merge is idempotent: A.merge(B).merge(B) == A.merge(B).
     #[test]
     fn task_item_merge_idempotent(
-        agent_bytes in prop::array::uniform32(any::<u8>()),
+        seed in prop::array::uniform32(any::<u8>()),
         peer_bytes in prop::array::uniform32(any::<u8>()),
     ) {
-        let agent = AgentId(agent_bytes);
+        let (signing, agent) = signing_from_seed(seed);
         let peer = make_peer_id(peer_bytes);
-
         let mut a = make_task_item("test", agent, peer);
         let mut b = make_task_item("test", agent, peer);
-        prop_assert!(b.claim(agent, peer, 1).is_ok(), "claim should succeed");
+        prop_assert!(b.claim(test_scope(), agent, peer, 1, &signing).is_ok(), "claim should succeed");
         b.update_title("updated title".to_string(), peer);
         b.update_description("updated description".to_string(), peer);
         b.update_assignee(Some(agent), peer);
         b.update_priority(255, peer);
 
         // First merge
-        prop_assert!(a.merge(&b).is_ok(), "first merge should succeed");
+        prop_assert!(a.merge(test_scope(), &b).is_ok(), "first merge should succeed");
         let snapshot_after_one = task_snapshot(&a);
 
         // Second merge (same b)
-        prop_assert!(a.merge(&b).is_ok(), "second merge should succeed");
+        prop_assert!(a.merge(test_scope(), &b).is_ok(), "second merge should succeed");
         let snapshot_after_two = task_snapshot(&a);
 
         prop_assert_eq!(snapshot_after_one, snapshot_after_two, "merge should be idempotent");
@@ -309,7 +327,7 @@ proptest! {
     fn task_list_merge_commutative(
         peer_a_bytes in prop::array::uniform32(any::<u8>()),
         peer_b_bytes in prop::array::uniform32(any::<u8>()),
-        agent_bytes in prop::array::uniform32(any::<u8>()),
+        seed in prop::array::uniform32(any::<u8>()),
     ) {
         let peer_a = make_peer_id(peer_a_bytes);
         let peer_b = if peer_a_bytes == peer_b_bytes {
@@ -317,16 +335,15 @@ proptest! {
         } else {
             make_peer_id(peer_b_bytes)
         };
-        let agent = AgentId(agent_bytes);
+        let (signing, agent) = signing_from_seed(seed);
 
         let mut a = make_task_list("test", peer_a);
         let mut b = make_task_list("test", peer_b);
 
-        // Add the same task to each replica, then diverge observable state.
         let task_id = TaskId::new("shared-task", &agent, 1000);
         let metadata = TaskMetadata::new("shared-task", "desc", 128, agent, 1000);
         let mut task_a = TaskItem::new(task_id, metadata.clone(), peer_a);
-        prop_assert!(task_a.claim(agent, peer_a, 2).is_ok(), "claim should succeed");
+        prop_assert!(task_a.claim(test_scope(), agent, peer_a, 2, &signing).is_ok(), "claim should succeed");
         task_a.update_title("title from a".to_string(), peer_a);
         let seq_a = a.next_seq();
         prop_assert!(a.add_task(task_a, peer_a, seq_a).is_ok(), "add to a should succeed");

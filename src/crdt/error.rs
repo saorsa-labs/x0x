@@ -1,7 +1,6 @@
 //! Error types for CRDT task list operations.
 
 use crate::crdt::{CheckboxState, TaskId};
-use crate::identity::AgentId;
 
 /// Result type for CRDT operations.
 pub type Result<T> = std::result::Result<T, CrdtError>;
@@ -21,10 +20,6 @@ pub enum CrdtError {
         /// The attempted new state.
         attempted: CheckboxState,
     },
-
-    /// Task is already claimed by another agent.
-    #[error("task already claimed by {0}")]
-    AlreadyClaimed(AgentId),
 
     /// Serialization error.
     #[error("serialization error: {0}")]
@@ -50,6 +45,7 @@ pub enum CrdtError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::AgentId;
 
     fn mock_agent_id() -> AgentId {
         AgentId([42u8; 32])
@@ -110,14 +106,6 @@ mod tests {
         assert!(display.contains("invalid state transition"));
         assert!(display.contains("Empty"));
         assert!(display.contains("Done"));
-    }
-
-    #[test]
-    fn test_error_display_already_claimed() {
-        let agent = mock_agent_id();
-        let error = CrdtError::AlreadyClaimed(agent);
-        let display = format!("{}", error);
-        assert!(display.contains("already claimed"));
     }
 
     #[test]

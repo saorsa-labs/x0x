@@ -5,6 +5,8 @@
 
 use crate::gossip::wire::{decode_delta, encode_delta};
 use crate::gossip::PubSubManager;
+use crate::identity::AgentId;
+use crate::kv::store::AccessPolicy;
 use crate::kv::{KvStore, KvStoreDelta, Result};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
@@ -24,11 +26,39 @@ const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
 const STATE_REQUEST_RETRY_SECS: [u64; 4] = [1, 5, 15, 30];
 
 /// Message exchanged on the state-sync side topic.
+///
+/// Wire compatibility: `StateRequest` keeps its variant index and shape, so
+/// v0.30.1 peers decode it unchanged. Older peers receiving the newer
+/// `OwnerAnnounce` variant fail to deserialize it and skip the message
+/// (their receive loop tolerates undecodable payloads), so the addition is
+/// purely additive.
 #[derive(Debug, Serialize, Deserialize)]
 enum KvSyncMessage {
     /// A peer with no local state for the store asks holders to republish
     /// their full state (as a regular delta) on the main topic.
     StateRequest { requester: PeerId },
+    /// The store owner's self-attestation of the store's authoritative
+    /// metadata, published in response to a `StateRequest`.
+    ///
+    /// Trust model: the pub/sub layer verifies the ML-DSA-65 signature of
+    /// every delivered v2 message and exposes the verified sender `AgentId`.
+    /// The verified sender must equal the claimed `owner` — an owner can only
+    /// attest to its own stores, and no third party can assign ownership.
+    ///
+    /// **Ownership is never established from this message.** A receiver's
+    /// owner is anchored only at construction (see `KvStore::new_replica`).
+    /// The announce can solely refresh policy (when the owner matches AND
+    /// `policy_version` is strictly newer, blocking a replayed stale announce
+    /// from downgrading policy) or record a conflict.
+    OwnerAnnounce {
+        /// The owning agent (must equal the verified message sender).
+        owner: AgentId,
+        /// The store's access policy as set by the owner.
+        policy: AccessPolicy,
+        /// Monotonic freshness counter — a refresh applies only when this is
+        /// strictly greater than the receiver's current `policy_version`.
+        policy_version: u64,
+    },
 }
 
 /// Synchronization wrapper for a KvStore.
@@ -48,6 +78,11 @@ pub struct KvStoreSync {
     /// This node's gossip peer id — identifies our deltas and state
     /// requests on the wire.
     local_peer_id: PeerId,
+
+    /// This node's agent id, when known. Used to decide whether this node
+    /// is the store owner (and should answer state requests with an
+    /// [`KvSyncMessage::OwnerAnnounce`]) and to ignore its own announces.
+    local_agent_id: Option<AgentId>,
 }
 
 impl KvStoreSync {
@@ -59,11 +94,15 @@ impl KvStoreSync {
     /// * `pubsub` - Pub/sub manager for gossip messaging.
     /// * `topic` - Topic name for pub/sub.
     /// * `local_peer_id` - This node's gossip peer id.
+    /// * `local_agent_id` - This node's agent id, if available. Required for
+    ///   the owner to answer state requests with an ownership announcement;
+    ///   `None` disables announcing (joined replicas can still adopt).
     pub fn new(
         store: KvStore,
         pubsub: Arc<PubSubManager>,
         topic: String,
         local_peer_id: PeerId,
+        local_agent_id: Option<AgentId>,
     ) -> Result<Self> {
         let store = Arc::new(RwLock::new(store));
 
@@ -72,6 +111,7 @@ impl KvStoreSync {
             pubsub,
             topic,
             local_peer_id,
+            local_agent_id,
         })
     }
 
@@ -112,9 +152,25 @@ impl KvStoreSync {
     {
         let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
         let store = Arc::clone(&self.store);
+        // Capture emptiness BEFORE any listener can merge a cached delta.
+        // Otherwise a partial cache replay landing between subscribe and this
+        // check would make the store non-empty and skip the bootstrap
+        // state-request schedule — aged/pruned keys would never arrive.
+        let bootstrap_needed = store.read().await.is_empty();
+        // Defense in depth against cross-topic replay: the v2 signature covers
+        // the embedded topic, but pub/sub delivery does not re-check it against
+        // this subscription, so a raw-mesh participant could place a valid
+        // owner-signed envelope from store A under topic B. Each listener binds
+        // to the exact topic it subscribed to.
+        let main_topic = self.topic.clone();
 
         spawn(Box::pin(async move {
             while let Some(msg) = sub.recv().await {
+                if msg.topic != main_topic {
+                    // Cross-topic replay defense: ignore envelopes not on our
+                    // subscribed topic (see start_with_spawner).
+                    continue;
+                }
                 let decoded = decode_delta::<KvStoreDelta>(&msg.payload);
                 match decoded {
                     Ok((peer_id, delta)) => {
@@ -133,41 +189,131 @@ impl KvStoreSync {
             }
         }));
 
-        // Responder: holders with non-empty state answer StateRequests by
-        // republishing their full state as a regular delta on the main
-        // topic. CRDT merge makes duplicate responses from multiple
-        // holders harmless (idempotent), so no response suppression is
-        // needed at current mesh sizes.
+        // Responder + ownership listener on the state-sync side topic.
+        //
+        // StateRequest: holders with non-empty state answer by republishing
+        // their full state as a regular delta on the main topic. CRDT merge
+        // makes duplicate responses from multiple holders harmless
+        // (idempotent), so no response suppression is needed at current mesh
+        // sizes. Additionally, if this node is the store OWNER it publishes
+        // an OwnerAnnounce (regardless of emptiness) so joined replicas can
+        // learn the authoritative owner and policy.
+        //
+        // OwnerAnnounce: a replica with an unknown owner adopts the owner
+        // and policy — but only when the announcement's pub/sub-verified
+        // sender is the claimed owner itself (see KvSyncMessage docs).
         let mut sync_sub = self.pubsub.subscribe(self.state_sync_topic()).await;
         let responder_store = Arc::clone(&self.store);
         let responder_pubsub = Arc::clone(&self.pubsub);
         let responder_topic = self.topic.clone();
+        let sync_topic = self.state_sync_topic();
         let local_peer_id = self.local_peer_id;
+        let local_agent_id = self.local_agent_id;
         spawn(Box::pin(async move {
             while let Some(msg) = sync_sub.recv().await {
-                let Ok(KvSyncMessage::StateRequest { requester }) =
-                    bincode::deserialize::<KvSyncMessage>(&msg.payload)
-                else {
-                    continue;
-                };
-                if requester == local_peer_id {
+                if msg.topic != sync_topic {
+                    // Cross-topic replay defense (see start_with_spawner).
                     continue;
                 }
-                let full = {
-                    let s = responder_store.read().await;
-                    if s.is_empty() {
-                        continue;
-                    }
-                    s.full_delta()
-                };
-                let Ok(serialized) = encode_delta(local_peer_id, &full) else {
+                let Ok(sync_msg) = bincode::deserialize::<KvSyncMessage>(&msg.payload) else {
                     continue;
                 };
-                if let Err(e) = responder_pubsub
-                    .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
-                    .await
-                {
-                    tracing::warn!("KvStore state-response publish failed: {e}");
+                match sync_msg {
+                    KvSyncMessage::StateRequest { requester } => {
+                        if requester == local_peer_id {
+                            continue;
+                        }
+                        // Owner: announce authoritative metadata so anchored
+                        // joiners can refresh policy / confirm ownership.
+                        // (Ownership itself is never learned from this — a
+                        // joiner anchors its owner at construction.)
+                        let announce = {
+                            let s = responder_store.read().await;
+                            match (local_agent_id, s.owner()) {
+                                (Some(me), Some(owner)) if me == *owner => {
+                                    Some(KvSyncMessage::OwnerAnnounce {
+                                        owner: me,
+                                        policy: s.policy().clone(),
+                                        policy_version: s.policy_version(),
+                                    })
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(announce) = announce {
+                            match bincode::serialize(&announce) {
+                                Ok(serialized) => {
+                                    if let Err(e) = responder_pubsub
+                                        .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "KvStore owner-announce publish failed: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("KvStore owner-announce serialize failed: {e}");
+                                }
+                            }
+                        }
+                        let full = {
+                            let s = responder_store.read().await;
+                            if s.is_empty() {
+                                continue;
+                            }
+                            s.full_delta()
+                        };
+                        let Ok(serialized) = encode_delta(local_peer_id, &full) else {
+                            continue;
+                        };
+                        if let Err(e) = responder_pubsub
+                            .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
+                            .await
+                        {
+                            tracing::warn!("KvStore state-response publish failed: {e}");
+                        }
+                    }
+                    KvSyncMessage::OwnerAnnounce {
+                        owner,
+                        policy,
+                        policy_version,
+                    } => {
+                        // Only a signature-verified sender is trusted; the
+                        // pub/sub layer drops signed messages that fail
+                        // verification, so `sender: Some(..)` is verified.
+                        let Some(sender) = msg.sender else {
+                            tracing::warn!(
+                                "ignoring unsigned KvStore ownership announcement on {}",
+                                msg.topic
+                            );
+                            continue;
+                        };
+                        if local_agent_id.is_some_and(|me| me == sender) {
+                            continue; // our own announce echoed back
+                        }
+                        let mut s = responder_store.write().await;
+                        // learn_ownership can only refresh policy (when the
+                        // owner matches and policy_version is forward) or
+                        // record a conflict; it never establishes ownership.
+                        match s.learn_ownership(owner, policy, policy_version, &sender) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "KvStore {} processed owner announce from {} (policy {}, version {})",
+                                    s.id(),
+                                    hex::encode(owner.as_bytes()),
+                                    s.policy(),
+                                    s.policy_version()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "rejected KvStore ownership announcement from {}: {e}",
+                                    hex::encode(sender.as_bytes())
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }));
@@ -183,7 +329,7 @@ impl KvStoreSync {
         // full-delta responses they trigger are idempotent CRDT merges,
         // so the extra chatter is bounded and harmless. A creator of a
         // genuinely new store also sends these — nobody answers.
-        if self.store.read().await.is_empty() {
+        if bootstrap_needed {
             let requester_pubsub = Arc::clone(&self.pubsub);
             let sync_topic = self.state_sync_topic();
             spawn(Box::pin(async move {
@@ -283,7 +429,8 @@ mod tests {
         let node = make_node().await;
         let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
         let store = KvStore::new(store_id(1), "Test".to_string(), agent(1), policy);
-        KvStoreSync::new(store, pubsub, topic.to_string(), peer(1)).expect("kv sync")
+        KvStoreSync::new(store, pubsub, topic.to_string(), peer(1), Some(agent(1)))
+            .expect("kv sync")
     }
 
     /// Build a `KvStoreSync` that shares its pubsub with the caller (so the
@@ -295,8 +442,14 @@ mod tests {
         let node = make_node().await;
         let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
         let store = KvStore::new(store_id(1), "Test".to_string(), agent(1), policy);
-        let sync = KvStoreSync::new(store, Arc::clone(&pubsub), topic.to_string(), peer(1))
-            .expect("kv sync");
+        let sync = KvStoreSync::new(
+            store,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(agent(1)),
+        )
+        .expect("kv sync");
         (sync, pubsub)
     }
 

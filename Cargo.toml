@@ -128,6 +128,11 @@ name = "gui-coverage"
 path = "src/bin/gui_coverage.rs"
 test = false
 
+[[bin]]
+name = "x0xd-forge-injector"
+path = "src/bin/x0xd_forge_injector.rs"
+test = false
+
 [[bench]]
 name = "gossip_dispatch_throughput"
 harness = false

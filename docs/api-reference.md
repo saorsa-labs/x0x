@@ -558,6 +558,102 @@ or
 {"action":"complete"}
 ```
 
+### Task versions, advisory claims, and local-replica fencing
+
+Every task-list response carries the list's `version` — a local counter bumped
+on each local or merged mutation. Mutation responses (create list, add task,
+claim, complete) return the new version plus `"committed":"local"`:
+
+```json
+{"ok":true,"version":7,"committed":"local"}
+```
+
+`"committed":"local"` is explicit about the consistency model: success means
+the mutation was committed to the **local** CRDT replica and a delta was
+published to peers — it does NOT mean any peer has observed it yet.
+Replication is eventual (gossip anti-entropy).
+
+Each task in `GET /task-lists/:id/tasks` includes structured ownership fields
+alongside the legacy `state` string (unchanged for backward compatibility):
+
+- `claimed_by` / `claimed_at` — hex AgentId and Unix-ms timestamp of the
+  deterministic claim winner (the OR-Set resolution both replicas converge
+  to). Non-null once claimed; `claimed_by` survives completion.
+- `completed_by` / `completed_at` — same, for the winning completion; null
+  unless done.
+- `assignee` — hex AgentId from the task's LWW assignee register, populated
+  by claim/complete.
+
+#### Claims are advisory, never exclusive
+
+A successful `claim` records a *candidate* in the OR-Set. It does **not**
+grant exclusive ownership and does **not** prevent another agent (on this or
+any other replica) from also claiming. Concurrent claims coexist and resolve
+to a single deterministic winner (earliest timestamp, then lexicographic
+agent id) only after convergence — a strictly earlier-timestamp candidate
+arriving via a later merge can still displace the current winner. There is no
+distributed lock.
+
+The claim/complete response makes this advisory status explicit:
+
+```json
+{
+  "ok": true,
+  "version": 8,
+  "fence_token": "<opaque epoch:revision — echo on next mutation>",
+  "committed": "local",
+  "resolution": {
+    "agent_id": "<hex>",
+    "locally_winning": true,
+    "current_winner": { "agent_id": "<hex>", "timestamp_ms": 1700000000000 },
+    "pending_convergence": true
+  },
+  "cas": { "scope": "local_replica" },
+  "execution": { "authorization": "advisory" },
+  "exclusive": false
+}
+```
+
+- `resolution.locally_winning` — whether the caller is the local OR-Set's
+  current deterministic winner at commit time. **Provisional**: a
+  strictly-earlier candidate arriving via merge flips it to `false`.
+- `resolution.current_winner` — the local deterministic winner (claim or
+  completion), or `null`; lets a superseded caller see who currently beats
+  them.
+- `resolution.pending_convergence` — always `true` under CRDT: a later
+  earlier-timestamp candidate may still arrive.
+- `cas.scope` — `"local_replica"`: the `fence_token` guard (below)
+  serializes ops on ONE daemon only.
+- `execution.authorization` — `"advisory"`: callers MAY begin
+  idempotent/reconcilable work and MUST re-check the winner after
+  convergence. Exactly-once side effects are NOT provided.
+- `exclusive` — always `false`.
+#### `fence_token`: restart-safe local fence, not distributed CAS
+
+The update-task request accepts an optional `fence_token` — an **opaque**
+`"epoch:revision"` string returned by GET and by every mutation. Clients echo
+it verbatim and MUST NOT construct or interpret it:
+
+```json
+{"action":"claim","fence_token":"1779123456789:7"}
+```
+
+This is a **local-replica fencing precondition**, not a distributed
+compare-and-swap. When it does not match THIS daemon's current
+`(epoch, revision)`, nothing is mutated and the daemon returns **409 Conflict**:
+
+```json
+{"ok":false,"error":"stale_local_version","current_version":9,"fence_token":"1779123456789:9","cas":{"scope":"local_replica"}}
+```
+
+A 409 means "this replica moved" (stale revision) or "the daemon restarted
+under you" (stale epoch) — never "a peer beat you". The epoch is regenerated
+when the daemon restarts, so a token captured before a restart can never
+ABA-match a post-restart token even if the revision counter later reaches the
+same value. Two daemons at the same token will BOTH accept, because the guard
+cannot provide cross-replica exclusion. Without `fence_token`, the mutation is
+unconditional (still advisory).
+
 ## Key-value stores
 
 | Method | Endpoint | CLI | Purpose |
@@ -578,6 +674,16 @@ or
   "content_type": "text/plain"
 }
 ```
+
+### Store write authorization
+
+Stores default to the `Signed` policy: only the creating agent (the owner)
+may write. `PUT` and `DELETE` on `/stores/:id/:key` return **403** with
+`{"ok":false,"error":"not authorized: store policy is signed; owner is <hex>"}`
+when this daemon's agent is not authorized — including on a joined replica
+that has not yet learned the store's authoritative owner from the
+owner-signed announcement (`"not authorized: store owner unknown: ..."`).
+Reads are always allowed.
 
 ## File transfers
 

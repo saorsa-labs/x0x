@@ -22,7 +22,7 @@ For named instances (`x0xd --name alice`), the directory is `x0x-alice/` instead
 
 ## Authentication
 
-All API endpoints (except `/health` and `/gui`) require a bearer token:
+All API endpoints (except `/health` and `/constitution*`) require a bearer token:
 
 ```
 Authorization: Bearer <token>
@@ -30,10 +30,13 @@ Authorization: Bearer <token>
 
 The token is generated once on first daemon startup and persists across restarts. It's stored at `<data_dir>/api-token` with 0600 permissions (owner read/write only).
 
-WebSocket connections pass the token as a query parameter since browsers cannot set custom headers on WebSocket upgrades:
+WebSocket connections pass a token as a query parameter since browsers cannot set custom headers on WebSocket upgrades — but the durable API token is **never** accepted in a URL. Exchange it for a short-lived session token (10 min TTL) via `POST /auth/session` and pass that instead:
 
 ```
-ws://127.0.0.1:12700/ws?token=<token>
+POST /auth/session            (Authorization: Bearer <durable token>)
+  → {"session_token": "...", "expires_in": 600}
+
+ws://127.0.0.1:12700/ws?token=<session_token>
 ```
 
 ## Quick Start Examples
@@ -109,8 +112,13 @@ const headers = { Authorization: `Bearer ${apiToken}` };
 const agent = await fetch(`${base}/agent`, { headers }).then((r) => r.json());
 console.log(`Agent ID: ${agent.agent_id}`);
 
-// WebSocket with token
-const ws = new WebSocket(`ws://${apiAddr}/ws?token=${apiToken}`);
+// WebSocket: mint a short-lived session token — the durable token
+// is rejected in query strings.
+const { session_token } = await fetch(`${base}/auth/session`, {
+  method: "POST",
+  headers,
+}).then((r) => r.json());
+const ws = new WebSocket(`ws://${apiAddr}/ws?token=${session_token}`);
 ws.onmessage = (e) => console.log(JSON.parse(e.data));
 ws.onopen = () => {
   ws.send(JSON.stringify({ type: "subscribe", topics: ["my-app/events"] }));

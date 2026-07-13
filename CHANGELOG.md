@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Anchored KV-store ownership + owner-signed content checkpoints.** A `KvStore`'s owner (its creator) now produces an ML-DSA-65-signed content checkpoint on every published write, binding the store topic, id, policy, a monotonic `checkpoint_seq`, and a BLAKE3 root over the active `(key, content_hash)` set. A replica already anchored on `expected_owner` verifies the owner signature and recomputes the content root independent of the relayer, so it can cold-recover a consistent snapshot from a non-owner relay while the owner is offline. Checkpoints never establish ownership — an unanchored replica rejects all of them fail-closed, and `checkpoint_seq` gates replay/downgrade. The trailing `owner_checkpoint` delta field deserializes to `None` when absent, so a legacy peer's delta still decodes on a current node.
+
+- **Advisory, authenticated task claims + restart-safe fence epoch.** `TaskItem::claim`/`complete` are advisory and non-exclusive: each records a self-attested candidate in the checkbox OR-Set (`sign_attestation` signs domain-separated bytes with the agent's ML-DSA key via `SigningContext`, requiring the element's `agent_id` to match the signing context), and concurrent claims coexist, resolving to a single deterministic winner (earliest timestamp, then lexicographic agent id) that is only stable once all replicas converge. There is no distributed lock. Local-replica fencing uses a `FenceToken` `(epoch, revision)` — the per-replica epoch is regenerated on every daemon restart, so a stale post-restart token can never ABA-match; a non-matching token rejects the mutation with `409` and changes nothing. Two daemons at the same token both accept (this is not a distributed compare-and-swap).
+
+- **Durable CRDT subscription manifest.** Task-list and KV-store registrations are persisted to `crdt-subscriptions.json` (instance data dir) and rehydrated on startup by driving the same create/join paths the REST handlers use, so subscriptions survive a daemon restart. A corrupt manifest is quarantined to a warning log and the process starts empty rather than failing to boot.
+
+- **Proactive reconnect with exponential backoff.** When a known peer disconnects, the daemon schedules a proactive reconnect with a bounded exponential backoff (first attempt after ~1 s — fast enough to cover a same-host restart without a tight retry loop on a genuinely-down peer), trying discovery addresses then the bootstrap cache. A pending reconnect is cancelled as soon as the connection returns.
+
+### Changed
+
+- **Removed dead `AlreadyClaimed` error variants.** `CrdtError::AlreadyClaimed` and `CheckboxError::AlreadyClaimed` were unreachable under advisory (additive OR-Set) claims — the production claim path adds a candidate and never rejects a re-claim except for an already-`Done` task — and have been deleted with no compatibility alias. `CheckboxState::transition_to_claimed` now permits a `Claimed → Claimed` re-claim (advisory), returning `CheckboxError::AlreadyDone` only for an immutable `Done` task; exhaustive matches and display tests were updated accordingly.
+
 ## [v0.30.1] - 2026-07-11
 
 ### Documentation

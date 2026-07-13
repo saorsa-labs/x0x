@@ -18,9 +18,13 @@ pub async fn create(client: &DaemonClient, name: &str, topic: &str) -> Result<()
 }
 
 /// `x0x store join` — POST /stores/:id/join.
-pub async fn join(client: &DaemonClient, topic: &str) -> Result<()> {
+///
+/// `owner` is the REQUIRED hex-encoded AgentId of the authoritative owner
+/// (the anchor). The joiner accepts the owner's deltas and writes iff it is
+/// the owner. The daemon rejects a join without an anchor (422 owner_required).
+pub async fn join(client: &DaemonClient, topic: &str, owner: &str) -> Result<()> {
     client.ensure_running().await?;
-    let body = serde_json::json!({});
+    let body = serde_json::json!({ "expected_owner": owner });
     let resp = client.post(&format!("/stores/{topic}/join"), &body).await?;
     print_value(client.format(), &resp);
     Ok(())

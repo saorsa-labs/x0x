@@ -796,7 +796,7 @@ Trust-gated introduction card served at `GET /introduction`. Filters visible fie
 ### 11.1 General WebSocket (5×)
 | # | Interface | Action | Expected |
 |---|-----------|--------|----------|
-| 1 | curl | Connect `ws://127.0.0.1:12701/ws?token=$TOKEN` | Connected |
+| 1 | curl | Mint session via `POST /auth/session` (Bearer $TOKEN), connect `ws://127.0.0.1:12701/ws?token=$SESSION_TOKEN` (durable token in URL → 401) | Connected |
 | 2 | curl | Send message via WS | Delivered |
 | 3 | curl | Receive event via WS | Event arrives |
 | 4 | GUI | WebSocket-backed real-time updates | Live updates |

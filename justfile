@@ -108,3 +108,38 @@ bump-version VERSION:
 
 release-dryrun:
     bash scripts/release-dryrun.sh
+
+# ── Convergence soak (tests/convergence) ──────────────────────────────────
+
+# Full soak: repeat the 3-node convergence scenario (cold-join, live
+# propagation, restart recovery, concurrent claims, signed-store non-owner
+# write, malformed/pre-restart fence, named new-port reconnect) with
+# per-phase gossip-diagnostics deltas, EXACT-VALUE oracles, and
+# binary/source provenance. Requires a release x0xd
+# (`cargo build --release --bin x0xd`) or X0XD_TEST_BINARY. Forwards
+# X0XD_LEGACY_BINARY to enable the mixed-version gate. This is a
+# DEVELOPMENT soak — it is NOT release-authoritative; use
+# `just convergence-release` for the gating recipe.
+# Usage: just convergence-soak [RUNS]
+convergence-soak RUNS="10":
+    python3 tests/convergence/convergence_soak.py --runs {{RUNS}}
+
+# Single-run smoke of the convergence harness (same phases, one pass).
+convergence-soak-quick:
+    python3 tests/convergence/convergence_soak.py --runs 1
+
+# Authoritative RELEASE convergence recipe. Self-contained: builds the daemon
+# AND the in-repo hostile gossip injector (x0xd-forge-injector) so the
+# forged-first-seen admission gate runs for real — no undocumented external
+# binary required. Requires --expect-fixed (every known-gap becomes a hard
+# gate), an AUTHENTICATED v0.30.1 legacy binary (X0XD_LEGACY_BINARY — the only
+# artifact that cannot be built from this tree; the harness verifies
+# --version == 0.30.1), and 10/10 clean runs. The harness refuses a binary
+# older than the reviewed sources. Under --expect-fixed an UNSUPPORTED or
+# unproven phase is a FAILURE, and provenance refusal fails fast. UNSUPPORTED
+# is failure: this recipe gates a release. convergence-soak-quick stays
+# available as a one-run smoke.
+convergence-release:
+    @test -n "${X0XD_LEGACY_BINARY:-}" || { echo "X0XD_LEGACY_BINARY must point at an authenticated v0.30.1 x0xd"; exit 2; }
+    cargo build --release --bin x0xd --bin x0xd-forge-injector
+    python3 tests/convergence/convergence_soak.py --runs 10 --expect-fixed

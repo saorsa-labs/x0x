@@ -60,10 +60,15 @@ Avoid hardcoding `127.0.0.1:12700`. Use `api.port` and `api-token` from the data
 </html>
 ```
 
-For real-time features:
+For real-time features, exchange the durable token for a short-lived session token first — `?token=` only accepts session tokens minted via `POST /auth/session`, never the durable api-token:
 
 ```javascript
-const ws = new WebSocket(`ws://127.0.0.1:12700/ws?token=${TOKEN}`);
+const { session_token } = await fetch(`${apiBase}/auth/session`, {
+  method: "POST",
+  headers: { Authorization: `Bearer ${token}` }
+}).then((r) => r.json());
+
+const ws = new WebSocket(`ws://127.0.0.1:12700/ws?token=${session_token}`);
 
 ws.onopen = () => {
   ws.send(JSON.stringify({

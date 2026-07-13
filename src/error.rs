@@ -65,6 +65,15 @@ pub enum IdentityError {
     /// (issuer-revocation). Third-party revocation is never accepted.
     #[error("revocation rejected: {0}")]
     Revocation(String),
+
+    /// A local write was rejected by a replicated store's access policy.
+    ///
+    /// Raised when this agent attempts to mutate a `Signed`/`Allowlisted`
+    /// KV store it is not authorized to write to, or a joined replica whose
+    /// authoritative owner is not yet known (fail closed). The API layer
+    /// maps this to HTTP 403.
+    #[error("not authorized: {0}")]
+    Unauthorized(String),
 }
 
 /// Standard Result type for x0x identity operations.

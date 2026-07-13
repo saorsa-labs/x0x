@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate as x0x;
 
+use super::super::crdt_subscriptions;
 use super::super::state::AppState;
 use super::super::{api_error, bad_request, forbidden, not_found};
 
@@ -130,6 +131,48 @@ pub(in crate::server) async fn ensure_task_list_access(
     }
 }
 
+/// Apply group authorization to a task list handle at the CRDT layer.
+///
+/// If the list `id` is group-scoped (`x0x.group.<gid>.symphony.<lid>`), look
+/// up the group's active members and call `set_authorized_agents` so remote
+/// CRDT admission rejects claims/completions from non-members. For plain
+/// (non-scoped) lists this is a no-op.
+///
+/// This closes the gap where group membership was enforced at REST but not at
+/// replication admission: a remote peer who subscribes to the topic but is not
+/// a group member cannot inject operations even with a valid signature.
+pub(in crate::server) async fn apply_group_authorization(
+    state: &Arc<AppState>,
+    id: &str,
+    handle: &x0x::TaskListHandle,
+) {
+    let Some(scoped) = parse_group_scoped_task_list_id(id) else {
+        return; // plain list — no group authorization
+    };
+    if scoped.is_malformed() {
+        return;
+    }
+    let mut agents = std::collections::HashSet::new();
+    {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&scoped.group_id) else {
+            return; // unknown group — can't authorize; leave open
+        };
+        for (agent_hex, member) in &info.members_v2 {
+            if matches!(member.state, x0x::groups::GroupMemberState::Active) {
+                if let Ok(bytes) = hex::decode(agent_hex) {
+                    if bytes.len() == x0x::identity::PEER_ID_LENGTH {
+                        let mut arr = [0u8; x0x::identity::PEER_ID_LENGTH];
+                        arr.copy_from_slice(&bytes);
+                        agents.insert(x0x::identity::AgentId(arr));
+                    }
+                }
+            }
+        }
+    }
+    handle.set_authorized_agents(agents).await;
+}
+
 // ---------------------------------------------------------------------------
 // Request / response DTOs
 // ---------------------------------------------------------------------------
@@ -151,8 +194,18 @@ pub(in crate::server) struct AddTaskRequest {
 
 /// PATCH /task-lists/:id/tasks/:tid request body.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::server) struct UpdateTaskRequest {
     pub(in crate::server) action: String, // "claim" or "complete"
+    /// Optional **local-replica** fencing precondition (opaque token). Echo
+    /// the `fence_token` from a prior GET/mutation verbatim. If it does not
+    /// match THIS daemon's current `(epoch, revision)`, the mutation is
+    /// rejected with 409 and nothing changes. This is NOT a distributed
+    /// compare-and-swap: two daemons at the same token both accept. A token
+    /// captured before a daemon restart never matches post-restart (the epoch
+    /// differs), closing the restart-ABA window.
+    #[serde(default)]
+    pub(in crate::server) fence_token: Option<String>,
 }
 
 /// Task list entry.
@@ -168,9 +221,19 @@ pub(in crate::server) struct TaskEntry {
     pub(in crate::server) id: String,
     pub(in crate::server) title: String,
     pub(in crate::server) description: String,
+    /// Legacy Display string ("empty" | "claimed:<hex>" | "done:<hex>").
+    /// Kept for backward compatibility — prefer the structured fields below.
     pub(in crate::server) state: String,
     pub(in crate::server) assignee: Option<String>,
     pub(in crate::server) priority: u8,
+    /// Hex AgentId of the deterministic claim winner; null if never claimed.
+    pub(in crate::server) claimed_by: Option<String>,
+    /// Unix-ms timestamp of the winning claim; null if never claimed.
+    pub(in crate::server) claimed_at: Option<u64>,
+    /// Hex AgentId of the deterministic completion winner; null unless done.
+    pub(in crate::server) completed_by: Option<String>,
+    /// Unix-ms timestamp of the winning completion; null unless done.
+    pub(in crate::server) completed_at: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -213,13 +276,61 @@ pub(in crate::server) async fn create_task_list(
     if let Err(denied) = ensure_task_list_access(&state, &req.topic).await {
         return denied;
     }
+    let id = req.topic.clone();
+    // Reserve the entire handle+manifest transaction for this (kind,id) so
+    // a concurrent create/rehydrate for the same id cannot interleave handle
+    // insertion with failure rollback, or spawn a duplicate listener.
+    let reservation =
+        crdt_subscriptions::handle_reservation(&state, crdt_subscriptions::KIND_TASK_LIST, &id)
+            .await;
+    let _guard = reservation.lock().await;
+    // Under the reservation: if a handle already exists (created by a prior
+    // successful request or rehydration), return conflict rather than
+    // overwriting it and leaking the existing sync listener.
+    if state.task_lists.read().await.contains_key(&id) {
+        return api_error(StatusCode::CONFLICT, "task list already exists");
+    }
     match state.agent.create_task_list(&req.name, &req.topic).await {
         Ok(handle) => {
-            let id = req.topic.clone();
+            let version = handle.version().await;
+            // Apply group authorization at the CRDT layer so remote admission
+            // rejects nonmember operations for group-scoped lists. Runs inside
+            // the reservation guard (serialized per (kind,id)).
+            apply_group_authorization(&state, &id, &handle).await;
             state.task_lists.write().await.insert(id.clone(), handle);
+            // Persist the registration so it survives a daemon restart
+            // (rehydrated after join_network — see crdt_subscriptions). This
+            // is a durable transaction: if the manifest write fails we roll
+            // back the just-inserted live handle and surface the error, so the
+            // registration is never acknowledged as durable when it is not.
+            let entry = crdt_subscriptions::CrdtSubscriptionEntry {
+                kind: crdt_subscriptions::KIND_TASK_LIST.to_string(),
+                id: id.clone(),
+                name: req.name.clone(),
+                topic: req.topic.clone(),
+                role: crdt_subscriptions::ROLE_CREATED.to_string(),
+                extra: serde_json::Map::new(),
+            };
+            if let Err(e) = crdt_subscriptions::record(&state, entry).await {
+                tracing::error!(
+                    topic = %req.topic,
+                    "failed to persist task-list subscription registration: {e}"
+                );
+                state.task_lists.write().await.remove(&id);
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to persist subscription registration",
+                );
+            }
             (
                 StatusCode::CREATED,
-                Json(serde_json::json!({ "ok": true, "id": id })),
+                Json(serde_json::json!({
+                    "ok": true,
+                    "id": id,
+                    "version": version.revision,
+                    "fence_token": version.to_wire(),
+                    "committed": "local",
+                })),
             )
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
@@ -240,8 +351,8 @@ pub(in crate::server) async fn list_tasks(
         return not_found("task list not found");
     };
 
-    match handle.list_tasks().await {
-        Ok(tasks) => {
+    match handle.list_tasks_with_version().await {
+        Ok((tasks, fence)) => {
             let entries: Vec<TaskEntry> = tasks
                 .into_iter()
                 .map(|t| TaskEntry {
@@ -249,13 +360,22 @@ pub(in crate::server) async fn list_tasks(
                     title: t.title,
                     description: t.description,
                     state: format!("{}", t.state),
-                    assignee: t.assignee.map(|a| format!("{a}")),
+                    assignee: t.assignee.map(|a| hex::encode(a.as_bytes())),
                     priority: t.priority,
+                    claimed_by: t.claimed_by.map(|a| hex::encode(a.as_bytes())),
+                    claimed_at: t.claimed_at,
+                    completed_by: t.completed_by.map(|a| hex::encode(a.as_bytes())),
+                    completed_at: t.completed_at,
                 })
                 .collect();
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "tasks": entries })),
+                Json(serde_json::json!({
+                    "ok": true,
+                    "version": fence.revision,
+                    "fence_token": fence.to_wire(),
+                    "tasks": entries,
+                })),
             )
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
@@ -278,12 +398,17 @@ pub(in crate::server) async fn add_task(
     };
 
     match handle
-        .add_task(req.title, req.description.unwrap_or_default())
+        .add_task_versioned(req.title, req.description.unwrap_or_default())
         .await
     {
-        Ok(task_id) => (
+        Ok((task_id, version)) => (
             StatusCode::CREATED,
-            Json(serde_json::json!({ "ok": true, "task_id": format!("{task_id}") })),
+            Json(serde_json::json!({
+                "ok": true,
+                "task_id": format!("{task_id}"),
+                "version": version,
+                "committed": "local",
+            })),
         ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
@@ -317,16 +442,77 @@ pub(in crate::server) async fn update_task(
     };
     let task_id = x0x::crdt::TaskId::from_bytes(task_id_bytes);
 
+    // Parse the opaque fence token.
+    //
+    // Distinguish **absent** (None ⇒ unconditional advisory commit) from
+    // **present but malformed** (parse error ⇒ 400 BAD_REQUEST, non-mutating).
+    // Collapsing the two would let a corrupt/legacy/attacker token silently
+    // downgrade a fenced request to an unfenced mutation.
+    let expected = match req.fence_token.as_deref() {
+        None => None,
+        Some(s) => match x0x::FenceToken::from_wire(s) {
+            Ok(token) => Some(token),
+            Err(_) => {
+                // Machine-readable error code — the API contract (and
+                // daemon_api_claim_malformed_fence_token_is_rejected_non_mutating)
+                // matches on this exact string.
+                return bad_request("malformed_fence_token");
+            }
+        },
+    };
+
     let result = match req.action.as_str() {
-        "claim" => handle.claim_task(task_id).await,
-        "complete" => handle.complete_task(task_id).await,
+        "claim" => handle.claim_task_versioned(task_id, expected).await,
+        "complete" => handle.complete_task_versioned(task_id, expected).await,
         _ => {
             return bad_request("action must be 'claim' or 'complete'");
         }
     };
 
     match result {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        // `committed:"local"` makes explicit that success = local CRDT
+        // commit + best-effort delta publish — NOT replicated observation and
+        // NOT exclusive ownership. The `resolution` block reports the local
+        // OR-Set snapshot at commit time; the deterministic winner may change
+        // when concurrent operations from other replicas merge in. `cas.scope`
+        // localizes the version guard; `execution.authorization:"advisory"`
+        // and `exclusive:false` make the non-exclusive status unambiguous, so
+        Ok(x0x::TaskMutationOutcome::Committed { fence, advisory }) => {
+            let current_winner = advisory.current_winner.map(|(agent, ts)| {
+                serde_json::json!({
+                    "agent_id": hex::encode(agent.as_bytes()),
+                    "timestamp_ms": ts,
+                })
+            });
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "version": fence.revision,
+                    "fence_token": fence.to_wire(),
+                    "committed": "local",
+                    "resolution": {
+                        "agent_id": hex::encode(advisory.agent.as_bytes()),
+                        "locally_winning": advisory.locally_winning,
+                        "current_winner": current_winner,
+                        "pending_convergence": true,
+                    },
+                    "cas": { "scope": "local_replica" },
+                    "execution": { "authorization": "advisory" },
+                    "exclusive": false,
+                })),
+            )
+        }
+        Ok(x0x::TaskMutationOutcome::StaleLocalVersion { current }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "stale_local_version",
+                "current_version": current.revision,
+                "fence_token": current.to_wire(),
+                "cas": { "scope": "local_replica" },
+            })),
+        ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
@@ -401,5 +587,41 @@ mod tests {
         let empty_list = parse_group_scoped_task_list_id("x0x.group.acme.symphony.");
         let scoped = empty_list.expect("scoped shape with empty list is Some");
         assert!(scoped.is_malformed(), "empty list_id ⇒ malformed ⇒ deny");
+    }
+
+    // ── UpdateTaskRequest strict parsing: no silent fence downgrade ────────
+    //
+    // The PATCH claim/complete body must reject unknown fields. The pre-fence
+    // API used `expected_version`; a client still sending it MUST get a 4xx
+    // (serde reject → axum Json extractor), NOT a silent ignore that drops the
+    // field and downgrades the request to fence_token=None (unfenced) — which
+    // would let a stale claim commit 200. `deny_unknown_fields` enforces this.
+
+    #[test]
+    fn update_task_request_rejects_obsolete_expected_version_field() {
+        // The obsolete pre-fence field is now unknown → rejected, not ignored.
+        let obsolete =
+            serde_json::from_str::<UpdateTaskRequest>(r#"{"action":"claim","expected_version":3}"#);
+        assert!(
+            obsolete.is_err(),
+            "obsolete expected_version must be rejected (4xx), not silently \
+             downgraded to an unfenced claim"
+        );
+    }
+
+    #[test]
+    fn update_task_request_accepts_current_contract_and_rejects_typos() {
+        // fence_token provided (fenced) parses.
+        let fenced =
+            serde_json::from_str::<UpdateTaskRequest>(r#"{"action":"claim","fence_token":"1:2"}"#);
+        assert!(fenced.is_ok(), "fenced request parses");
+        // fence_token omitted (unfenced) is still a valid shape — strictness is
+        // about UNKNOWN fields, not requiring a fence.
+        let unfenced = serde_json::from_str::<UpdateTaskRequest>(r#"{"action":"claim"}"#);
+        assert!(unfenced.is_ok(), "unfenced request parses");
+        // A typo'd field name is also rejected (defense in depth).
+        let typo =
+            serde_json::from_str::<UpdateTaskRequest>(r#"{"action":"claim","fence_tokn":"1:2"}"#);
+        assert!(typo.is_err(), "typo'd field name must be rejected");
     }
 }

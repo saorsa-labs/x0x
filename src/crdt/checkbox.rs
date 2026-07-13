@@ -16,10 +16,6 @@ pub type Result<T> = std::result::Result<T, CheckboxError>;
 /// Errors that can occur during checkbox state transitions.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CheckboxError {
-    /// Attempted to claim an already-claimed task.
-    #[error("task already claimed by {0}")]
-    AlreadyClaimed(AgentId),
-
     /// Attempted to transition from Done state (immutable).
     #[error("task is already done and cannot be modified")]
     AlreadyDone,
@@ -185,22 +181,20 @@ impl CheckboxState {
     /// # State Transitions
     ///
     /// - `Empty -> Claimed`: OK
-    /// - `Claimed -> Claimed`: Error (already claimed)
+    /// - `Claimed -> Claimed`: OK (advisory re-claim; the production path
+    ///   accumulates candidates in an OR-Set and resolves a deterministic
+    ///   winner — see `TaskItem::claim`)
     /// - `Done -> Claimed`: Error (immutable)
     ///
     /// # Errors
     ///
-    /// Returns an error if the transition is invalid.
+    /// Returns [`CheckboxError::AlreadyDone`] if the task is already completed.
     pub fn transition_to_claimed(&self, agent_id: AgentId, timestamp: u64) -> Result<Self> {
         match self {
-            Self::Empty => Ok(Self::Claimed {
+            Self::Empty | Self::Claimed { .. } => Ok(Self::Claimed {
                 agent_id,
                 timestamp,
             }),
-            Self::Claimed {
-                agent_id: existing_agent,
-                ..
-            } => Err(CheckboxError::AlreadyClaimed(*existing_agent)),
             Self::Done { .. } => Err(CheckboxError::AlreadyDone),
         }
     }
@@ -366,14 +360,19 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_transition_claimed_to_claimed() {
+    fn test_advisory_reclaim_permitted() {
         let agent1 = agent(1);
         let agent2 = agent(2);
         let claimed = CheckboxState::claim(agent1, 1000).ok().unwrap();
 
-        let result = claimed.transition_to_claimed(agent2, 2000);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), CheckboxError::AlreadyClaimed(agent1));
+        // Advisory (non-exclusive) claims: re-claiming a claimed task
+        // succeeds. The OR-Set accumulates candidates and resolves a
+        // deterministic winner; this single-value helper returns the new
+        // Claimed state.
+        let reclaimed = claimed.transition_to_claimed(agent2, 2000).ok().unwrap();
+        assert!(reclaimed.is_claimed());
+        assert_eq!(reclaimed.claimed_by(), Some(&agent2));
+        assert_eq!(reclaimed.timestamp(), Some(2000));
     }
 
     #[test]

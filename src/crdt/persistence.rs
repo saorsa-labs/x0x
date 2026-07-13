@@ -100,7 +100,22 @@ impl TaskListStorage {
 
         let serialized = fs::read(&file_path).await?;
 
-        bincode::deserialize(&serialized).map_err(crate::crdt::error::CrdtError::Serialization)
+        let mut list: TaskList = bincode::deserialize(&serialized)
+            .map_err(crate::crdt::error::CrdtError::Serialization)?;
+
+        // Run the fail-closed admission gate on every task so a tampered or
+        // corrupted on-disk state cannot bypass provenance verification.
+        // Drops unauthenticated checkbox elements and restores attested
+        // elements censored by forged tombstones.
+        let dropped = list.admit_all();
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "purged unauthenticated checkbox elements during persistence load"
+            );
+        }
+
+        Ok(list)
     }
 
     /// List all stored task lists.
@@ -274,6 +289,58 @@ mod tests {
 
         let lists = storage.list_task_lists().await.unwrap();
         assert_eq!(lists.len(), 1); // .tmp file should be skipped
+    }
+
+    #[tokio::test]
+    async fn attested_tasklist_roundtrips_through_disk() {
+        // On-disk path coverage: a TaskList carrying a genuinely self-attested
+        // task must survive save -> bincode -> load, INCLUDING the fail-closed
+        // admission gate `load_task_list` runs (`admit_all`). This pins that the
+        // trailing `attestations` field persists and resolves after a disk
+        // round-trip — the current-format guarantee.
+        //
+        // NOTE ON LEGACY BYTES: the trailing+tolerant field makes a *top-level*
+        // pre-attestations TaskItem decode (see task_item.rs
+        // `legacy_taskitem_without_attestations_decodes`). It does NOT recover a
+        // genuinely fieldless TaskItem nested mid-stream inside a TaskList,
+        // because bincode is positional: `task_data` is followed by `ordering`/
+        // `name`/`version`, so an absent trailing field is not at stream-EOF and
+        // the tolerant deserializer would consume the following struct's bytes.
+        // That case is intentionally out of scope (greenfield release, no
+        // pre-wave persisted lists exist); true nested-legacy compat would need
+        // a versioned/length-prefixed envelope, not EOF tolerance.
+        use crate::crdt::{TaskId, TaskItem, TaskMetadata};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x78);
+        let peer = test_peer_id();
+
+        let kp = crate::identity::AgentKeypair::generate().unwrap();
+        let agent = kp.agent_id();
+        let signing = crate::gossip::SigningContext::from_keypair(&kp);
+
+        let task_id = TaskId::new("persist-me", &agent, 1000);
+        let metadata = TaskMetadata::new("persist-me", "d", 128, agent, 1000);
+        let mut task = TaskItem::new(task_id, metadata, peer);
+        task.claim(list_id, agent, peer, 1, &signing).unwrap();
+
+        let mut list = create_test_list(list_id, "attested");
+        list.add_task(task, peer, 1).unwrap();
+
+        storage.save_task_list(&list_id, &list).await.unwrap();
+        let loaded = storage.load_task_list(&list_id).await.unwrap();
+
+        let t = loaded.get_task(&task_id).expect("attested task persisted");
+        assert!(
+            t.current_state().is_claimed(),
+            "attested claim survives save/load and the admission gate"
+        );
+        assert_eq!(
+            t.claim_record().map(|(a, _)| a),
+            Some(agent),
+            "the attested claimant round-trips"
+        );
     }
 
     #[tokio::test]

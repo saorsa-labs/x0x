@@ -1281,14 +1281,33 @@ async fn disconnect_pool_candidates(
     node: &Node,
     event_sender: &broadcast::Sender<NetworkEvent>,
     connection_pool: &ConnectionPool,
+    reconnect_suppressions: &Mutex<HashMap<[u8; 32], ReconnectSuppression>>,
     peer_ids: Vec<AntPeerId>,
     reason: &'static str,
 ) {
     for peer_id in peer_ids {
+        // Set the PoolEviction tombstone BEFORE the close so the ant-quic
+        // peer-lifecycle `Closed` watcher observes it regardless of event
+        // ordering, and so the NetworkEvent listener's PeerDisconnected
+        // arm sees a non-transport reason. Without this, proactive redial
+        // would immediately undo the LRU/idle eviction (review: "eviction
+        // does not churn").
+        if let Ok(mut map) = reconnect_suppressions.lock() {
+            map.insert(
+                peer_id.0,
+                ReconnectSuppression {
+                    reason: DisconnectReason::PoolEviction,
+                    set_at: Instant::now(),
+                },
+            );
+        }
         match node.disconnect(&peer_id).await {
             Ok(()) => {
                 connection_pool.record_disconnected(&peer_id);
-                let _ = event_sender.send(NetworkEvent::PeerDisconnected { peer_id: peer_id.0 });
+                let _ = event_sender.send(NetworkEvent::PeerDisconnected {
+                    peer_id: peer_id.0,
+                    reason: DisconnectReason::PoolEviction,
+                });
                 tracing::info!(
                     target: "x0x::connect",
                     peer_id_prefix = %hex_prefix(&peer_id.0, 4),
@@ -1354,6 +1373,14 @@ pub struct NetworkNode {
     liveness_last_ready: Arc<Mutex<HashMap<AntPeerId, Instant>>>,
     /// Daemon-local cap for concurrent pre-send probe/reconnect work.
     liveness_repair_semaphore: Arc<Semaphore>,
+    /// Reconnect-suppression tombstones, keyed by peer id. Set when a peer is
+    /// disconnected for a non-transport reason (policy rejection, pool
+    /// eviction, admin, revocation, shutdown) so neither the proactive
+    /// reconnect scheduler nor the ant-quic lifecycle `Closed` watcher redials
+    /// it — undoing a security rejection, churning an LRU eviction, or
+    /// ignoring an operator teardown. See [`DisconnectReason`] and
+    /// [`NetworkNode::is_reconnect_suppressed`].
+    reconnect_suppressions: Arc<Mutex<HashMap<[u8; 32], ReconnectSuppression>>>,
     /// Handles to the background tasks spawned at construction (receiver, accept
     /// loop, connection-pool eviction).
     ///
@@ -1482,6 +1509,7 @@ impl NetworkNode {
             liveness_locks: Arc::new(Mutex::new(HashMap::new())),
             liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
+            reconnect_suppressions: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -1745,6 +1773,7 @@ impl NetworkNode {
             &node,
             &self.event_sender,
             &self.connection_pool,
+            self.reconnect_suppressions.as_ref(),
             peer_ids,
             reason,
         )
@@ -2342,27 +2371,101 @@ impl NetworkNode {
 
     /// Disconnect from a peer.
     ///
+    /// Defaults to [`DisconnectReason::Transport`] semantics: the caller
+    /// treats this as a transient drop that may be recovered (send-path zombie
+    /// teardown, or a test simulating a remote restart). Such a disconnect
+    /// remains reconnect-eligible.
+    ///
+    /// Callers that must suppress proactive redial — security rejection,
+    /// capacity eviction, revocation, explicit admin teardown — use
+    /// [`Self::disconnect_with_reason`] with the appropriate
+    /// [`DisconnectReason`].
+    ///
     /// # Arguments
     ///
     /// * `peer_id` - The peer's ID.
-    ///
-    /// # Returns
-    ///
-    /// Ok on successful disconnection.
     ///
     /// # Errors
     ///
     /// Returns `NetworkError` if disconnection fails.
     pub async fn disconnect(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
+        self.disconnect_with_reason(peer_id, DisconnectReason::Transport)
+            .await
+    }
+
+    /// Disconnect from a peer carrying a structured [`DisconnectReason`].
+    ///
+    /// For any non-transport reason this records a suppression tombstone
+    /// *before* closing the connection, so that both the `NetworkEvent`
+    /// listener (which receives [`NetworkEvent::PeerDisconnected`] with the
+    /// reason) and the ant-quic peer-lifecycle `Closed` watcher (which
+    /// receives only a string reason) observe the suppression regardless of
+    /// event ordering. This closes the hole where a policy-rejected or
+    /// evicted peer was immediately redialed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if the underlying node is unavailable or the
+    /// transport disconnect fails.
+    pub async fn disconnect_with_reason(
+        &self,
+        peer_id: &AntPeerId,
+        reason: DisconnectReason,
+    ) -> NetworkResult<()> {
+        self.suppress_reconnect(peer_id.0, reason);
+
         let node = self.require_node().await?;
         node.disconnect(peer_id)
             .await
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 
-        self.emit_event(NetworkEvent::PeerDisconnected { peer_id: peer_id.0 });
+        self.emit_event(NetworkEvent::PeerDisconnected {
+            peer_id: peer_id.0,
+            reason,
+        });
         self.connection_pool.record_disconnected(peer_id);
 
         Ok(())
+    }
+
+    /// Record a reconnect-suppression tombstone for `peer_id`.
+    ///
+    /// Idempotent: re-recording refreshes `set_at`. A no-op for
+    /// [`DisconnectReason::Transport`] (transport closes are reconnect-
+    /// eligible by definition and never tombstoned).
+    fn suppress_reconnect(&self, peer_id: [u8; 32], reason: DisconnectReason) {
+        if reason.reconnect_eligible() {
+            return;
+        }
+        if let Ok(mut map) = self.reconnect_suppressions.lock() {
+            map.insert(
+                peer_id,
+                ReconnectSuppression {
+                    reason,
+                    set_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    /// Returns `true` iff a live suppression tombstone currently blocks
+    /// proactive redial of `peer_id`.
+    ///
+    /// Expired bounded tombstones (eviction/admin past their TTL) are pruned
+    /// as they are observed; permanent tombstones (policy rejection,
+    /// revocation, shutdown) never expire.
+    #[must_use]
+    pub fn is_reconnect_suppressed(&self, peer_id: [u8; 32]) -> bool {
+        let mut map = match self.reconnect_suppressions.lock() {
+            Ok(m) => m,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        let live = map.get(&peer_id).is_some_and(|s| s.is_live(now));
+        if !live {
+            map.remove(&peer_id);
+        }
+        live
     }
 
     /// Get list of connected peer IDs.
@@ -3002,8 +3105,9 @@ impl NetworkNode {
         let node = Arc::clone(&self.node);
         let event_sender = self.event_sender.clone();
         let bootstrap_cache = self.bootstrap_cache.clone();
-        let inbound_allowlist = self.config.inbound_allowlist.clone();
+        let reconnect_suppressions = Arc::clone(&self.reconnect_suppressions);
         let connection_pool = Arc::clone(&self.connection_pool);
+        let inbound_allowlist = self.config.inbound_allowlist.clone();
 
         tokio::spawn(async move {
             debug!("NetworkNode accept loop started");
@@ -3058,6 +3162,7 @@ impl NetworkNode {
                                 node_ref,
                                 &event_sender,
                                 connection_pool.as_ref(),
+                                reconnect_suppressions.as_ref(),
                                 evicted,
                                 "lru",
                             )
@@ -3078,6 +3183,7 @@ impl NetworkNode {
     fn spawn_connection_pool_eviction(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
         let event_sender = self.event_sender.clone();
+        let reconnect_suppressions = Arc::clone(&self.reconnect_suppressions);
         let connection_pool = Arc::clone(&self.connection_pool);
 
         tokio::spawn(async move {
@@ -3101,16 +3207,19 @@ impl NetworkNode {
                     &node_ref,
                     &event_sender,
                     connection_pool.as_ref(),
+                    reconnect_suppressions.as_ref(),
                     lru_evicted,
                     "lru",
                 )
                 .await;
 
                 let idle_evicted = connection_pool.evict_idle(Instant::now());
+
                 disconnect_pool_candidates(
                     &node_ref,
                     &event_sender,
                     connection_pool.as_ref(),
+                    reconnect_suppressions.as_ref(),
                     idle_evicted,
                     "idle",
                 )
@@ -3172,6 +3281,13 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                 "SECURITY: Peer mismatch - expected {:?}, got {:?}",
                 peer, connected_peer
             );
+            // The wrong identity is now connected (and cached by connect_addr).
+            // Tear it down with a PolicyRejection tombstone so neither the
+            // proactive reconnect scheduler nor the lifecycle Closed watcher
+            // redials it (review: wrong pinned peers stay disconnected).
+            let _ = self
+                .disconnect_with_reason(&connected_peer, DisconnectReason::PolicyRejection)
+                .await;
             return Err(anyhow::anyhow!(
                 "Connected to unexpected peer {:?} when dialing {:?}",
                 connected_peer,
@@ -3196,7 +3312,9 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                 "SECURITY: Bootstrap peer at {} has unexpected ID {:?} — not in pinned set",
                 addr, ant_peer_id
             );
-            let _ = self.disconnect(&ant_peer_id).await;
+            let _ = self
+                .disconnect_with_reason(&ant_peer_id, DisconnectReason::PolicyRejection)
+                .await;
             return Err(anyhow::anyhow!(
                 "Bootstrap peer at {} has unpinned ID {:?}",
                 addr,
@@ -3304,6 +3422,91 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     }
 }
 
+/// Why a peer disconnected, carried on [`NetworkEvent::PeerDisconnected`].
+///
+/// The proactive-reconnect scheduler keys off this value: only
+/// [`DisconnectReason::Transport`] is eligible for automatic redial. Every
+/// other reason records a suppression tombstone (see
+/// [`NetworkNode::is_reconnect_suppressed`]) so that a security rejection,
+/// capacity eviction, explicit teardown, revocation, or local shutdown is not
+/// immediately undone by a redial — the gap flagged in the final independent
+/// review ("Proactive reconnect can undo security/eviction decisions").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectReason {
+    /// Transport-level close not initiated by the local policy layer: QUIC
+    /// idle timeout, remote daemon restart, or network failure. This is the
+    /// *only* reason eligible for automatic proactive redial.
+    Transport,
+    /// A pinned-bootstrap, peer-identity, or inbound-allowlist policy rejected
+    /// the peer. Never redial — the peer is untrusted or the wrong identity.
+    PolicyRejection,
+    /// The connection pool evicted the peer over capacity (LRU/idle). A redial
+    /// would immediately churn against the eviction decision.
+    PoolEviction,
+    /// Explicit operator/API teardown of an otherwise-healthy connection.
+    Admin,
+    /// The peer's identity was revoked. Never redial.
+    Revocation,
+    /// Local node shutdown. Redial is meaningless (the node is going away);
+    /// the lifecycle listeners also stop on the shutdown token.
+    Shutdown,
+}
+
+impl DisconnectReason {
+    /// Returns `true` iff the proactive-reconnect scheduler may redial a peer
+    /// disconnected for this reason.
+    #[must_use]
+    pub fn reconnect_eligible(self) -> bool {
+        matches!(self, Self::Transport)
+    }
+
+    /// Returns the suppression-tombstone lifetime for this reason.
+    ///
+    /// `None` means the tombstone is permanent (the peer must never be
+    /// proactively redialed again). `Some(zero)` means the reason does not
+    /// suppress at all (only [`DisconnectReason::Transport`]).
+    fn suppression_ttl(self) -> Option<Duration> {
+        match self {
+            // Transport closes are reconnect-eligible; never tombstoned.
+            Self::Transport => Some(Duration::ZERO),
+            // Security-relevant: permanent suppression.
+            Self::PolicyRejection | Self::Revocation | Self::Shutdown => None,
+            // Capacity/operator intent: outlive the bounded reconnect backoff
+            // window (sum of RECONNECT_BACKOFF_DELAYS + per-attempt dial
+            // timeouts) so the proactive task has fully exited before the
+            // tombstone expires and no new transport event can re-arm it.
+            Self::PoolEviction | Self::Admin => Some(RECONNECT_SUPPRESSION_BOUNDED_TTL),
+        }
+    }
+}
+
+/// How long a bounded suppression tombstone (eviction/admin) stays live.
+///
+/// Generous relative to the proactive-reconnect backoff window so a tombstoned
+/// peer is not re-dialed by a lingering scheduled task. After expiry there is
+/// no new disconnect event to re-arm the proactive path, so the peer only
+/// returns via explicit demand (send-path reconnect, auto-connect).
+const RECONNECT_SUPPRESSION_BOUNDED_TTL: Duration = Duration::from_secs(120);
+
+/// Reconnect-suppression tombstone for a peer.
+#[derive(Debug, Clone, Copy)]
+struct ReconnectSuppression {
+    reason: DisconnectReason,
+    set_at: Instant,
+}
+
+impl ReconnectSuppression {
+    /// Returns `true` iff this tombstone still blocks proactive redial at
+    /// `now`. Permanent reasons never expire; bounded reasons expire after
+    /// their TTL.
+    fn is_live(&self, now: Instant) -> bool {
+        match self.reason.suppression_ttl() {
+            None => true,
+            Some(ttl) => now.duration_since(self.set_at) < ttl,
+        }
+    }
+}
+
 /// Events emitted by the network node.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
@@ -3319,6 +3522,9 @@ pub enum NetworkEvent {
     PeerDisconnected {
         /// The peer's ID.
         peer_id: [u8; 32],
+        /// Why the peer disconnected. Drives proactive-reconnect
+        /// eligibility: only [`DisconnectReason::Transport`] is redialed.
+        reason: DisconnectReason,
     },
 
     /// NAT type was detected.

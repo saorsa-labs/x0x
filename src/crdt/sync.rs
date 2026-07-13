@@ -33,6 +33,19 @@ const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
 /// flooding.
 const STATE_REQUEST_RETRY_SECS: [u64; 4] = [1, 5, 15, 30];
 
+/// Persistent tail interval for the state-request bootstrap. After the
+/// aggressive front-loaded schedule exhausts (~51s), a first-time joiner
+/// whose list is STILL empty keeps asking at this interval so a slow mesh
+/// reformation — e.g. a post-restart rejoin while sibling CRDTs also recover
+/// — still converges. The loop self-terminates the moment the local list
+/// becomes non-empty.
+const STATE_REQUEST_TAIL_SECS: u64 = 30;
+
+/// Hard cap on persistent-tail state requests so a genuinely-new (forever-
+/// empty) list stops after a bounded window instead of chattering
+/// indefinitely. 20 × 30s ≈ 10 min, ample for any realistic reformation.
+const STATE_REQUEST_MAX_TAIL_ATTEMPTS: usize = 20;
+
 /// Message exchanged on the state-sync side topic.
 #[derive(Debug, Serialize, Deserialize)]
 enum TaskListSyncMessage {
@@ -212,16 +225,47 @@ impl TaskListSync {
         // Bootstrap requester: a first-time joiner starts with an empty list
         // and has no other way to learn tasks written before it subscribed
         // (the gossip message cache only replays recent deltas). Ask holders
-        // to republish over a short retry schedule. Requests and the
+        // to republish. The schedule is front-loaded for a fast mesh, then
+        // runs a persistent tail so a SLOW mesh reformation still converges —
+        // e.g. a post-restart rejoin while sibling CRDTs also recover may not
+        // finish within the aggressive window. The loop self-terminates the
+        // moment the local list becomes non-empty (converged) and is hard-
+        // capped, so a genuinely-new list (no holder answers) stops after a
+        // bounded window instead of chattering forever. Requests and the
         // full-delta responses they trigger are idempotent CRDT merges, so the
-        // extra chatter is bounded and harmless. A creator of a genuinely new
-        // list also sends these — nobody answers.
+        // extra chatter is harmless.
         if self.task_list.read().await.task_count() == 0 {
             let requester_pubsub = Arc::clone(&self.pubsub);
+            let requester_list = Arc::clone(&self.task_list);
             let sync_topic = self.state_sync_topic();
             spawn(Box::pin(async move {
+                // Aggressive front-loaded schedule for a fast mesh.
                 for delay_secs in STATE_REQUEST_RETRY_SECS {
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    if requester_list.read().await.task_count() > 0 {
+                        return; // converged — stop asking
+                    }
+                    let request = TaskListSyncMessage::StateRequest {
+                        requester: local_peer_id,
+                    };
+                    let Ok(serialized) = bincode::serialize(&request) else {
+                        return;
+                    };
+                    if let Err(e) = requester_pubsub
+                        .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
+                        .await
+                    {
+                        tracing::debug!("TaskList state-request publish failed: {e}");
+                    }
+                }
+                // Persistent tail: keep asking until convergence or the cap,
+                // so a slow mesh reformation still recovers state.
+                for _ in 0..STATE_REQUEST_MAX_TAIL_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_secs(STATE_REQUEST_TAIL_SECS))
+                        .await;
+                    if requester_list.read().await.task_count() > 0 {
+                        return; // converged — stop asking
+                    }
                     let request = TaskListSyncMessage::StateRequest {
                         requester: local_peer_id,
                     };
