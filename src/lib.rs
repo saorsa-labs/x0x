@@ -9193,6 +9193,18 @@ const RECONNECT_BACKOFF_DELAYS: &[std::time::Duration] = &[
     std::time::Duration::from_secs(16),
 ];
 
+/// After a reconnect sequence exhausts all attempts WITHOUT reconnecting, hold
+/// the single-flight tracker slot for this long before releasing it. A
+/// genuinely dead/unreachable peer keeps emitting transport-close lifecycle
+/// events; without this cooldown each one immediately re-triggers a new
+/// reconnect sequence, and every attempt drives ant-quic NAT
+/// traversal/hole-punch to the dead endpoint — a tight loop that accumulates
+/// connection state and leaks memory (~1 MB/s observed on a churning mesh).
+/// Holding the slot means the existing single-flight guard suppresses
+/// re-scheduling for the cooldown window. A real recovery (PeerConnected)
+/// removes+aborts the entry, ending the cooldown immediately.
+const RECONNECT_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Whether a discovered peer's identity announcement should trigger an
 /// auto-connect dial.
 ///
@@ -9451,6 +9463,23 @@ fn schedule_reconnect(
 
             if connected {
                 break;
+            }
+        }
+
+        // Circuit breaker: if every attempt failed (peer genuinely
+        // dead/unreachable), hold the single-flight tracker slot for a cooldown
+        // before releasing it. A dead peer keeps emitting transport-close
+        // lifecycle events; each would otherwise immediately re-trigger a new
+        // reconnect sequence, and every attempt drives ant-quic NAT
+        // traversal/hole-punch to the dead endpoint — a tight loop that
+        // accumulates connection state and leaks memory. Keeping the entry
+        // present makes the existing single-flight guard suppress re-scheduling
+        // for the window. A genuine recovery via any path (PeerConnected aborts
+        // this task and removes the entry) ends the cooldown early.
+        if !network.is_connected(&peer_id).await {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => {}
+                _ = tokio::time::sleep(RECONNECT_FAILURE_COOLDOWN) => {}
             }
         }
 
