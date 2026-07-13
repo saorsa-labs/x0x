@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [v0.31.0] - 2026-07-13
 
 ### Added
 
@@ -13,6 +13,12 @@ All notable changes to this project will be documented in this file.
 - **Durable CRDT subscription manifest.** Task-list and KV-store registrations are persisted to `crdt-subscriptions.json` (instance data dir) and rehydrated on startup by driving the same create/join paths the REST handlers use, so subscriptions survive a daemon restart. A corrupt manifest is quarantined to a warning log and the process starts empty rather than failing to boot.
 
 - **Proactive reconnect with exponential backoff.** When a known peer disconnects, the daemon schedules a proactive reconnect with a bounded exponential backoff (first attempt after ~1 s — fast enough to cover a same-host restart without a tight retry loop on a genuinely-down peer), trying discovery addresses then the bootstrap cache. A pending reconnect is cancelled as soon as the connection returns.
+
+### Fixed
+
+- **Memory-leak regression that OOM-killed v0.31 release candidates on 4 GB hosts (two root causes).** (1) The lifecycle-`Closed` → proactive-reconnect path retriggered a full reconnect/NAT-traversal sequence on every transport-close event from a genuinely dead peer; a 60 s `RECONNECT_FAILURE_COOLDOWN` now holds the single-flight slot after a fully failed sequence (a real `PeerConnected` ends the cooldown immediately). (2) Announcement auto-connect had changed from one-shot-per-agent to redial-whenever-not-connected, dialing an unreachable announcing peer on every received announcement copy; each failed dial permanently retains ~2.3 MB of ant-quic connection state (upstream: ant-quic#210), which made the dial rate an unbounded leak (38 → 380 MB in 300 s under an announcement-replay repro). A per-agent 60 s `ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN` bounds redials; a first-ever announcement still dials immediately. Real-WAN soak of the fixed daemon: plateau ~520–535 MB over 7 h vs 1.4–2.3 GB and kernel OOM kills in under an hour before the fixes.
+
+- **Machine-readable `malformed_fence_token` error code.** The task claim/complete handler returned the human string "malformed fence token" where the API contract specifies the snake_case error code `malformed_fence_token` for a present-but-malformed fence token (400, non-mutating).
 
 ### Changed
 
