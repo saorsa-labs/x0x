@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.31.1] - 2026-07-13
+
+### Fixed
+
+- **Per-connection memory cut ~12× (ant-quic#210 follow-through).** The daemon advertised 50,000 concurrent uni streams per connection; ant-quic materializes a streams-table slot for every advertised stream at `Connection` construction, so every connection — live or failed dial — carried ~1.6 MB of preallocated stream state. This was the dominant term in the v0.31 memory investigation: ~2.3 MB retained per failed dial to an unreachable (NATed/dead) announcing peer. The advertisement is now 4,096 (>4× headroom over the concurrency the X0X-0063 soak actually measured; `data_channel_capacity` keeps its justified 50,000). Measured on identical loopback repros: announcement-replay storm +35 MB → +8–12 MB per 300 s; per-dead-peer residual ~25 MB → ~3 MB; idle 3-node baseline 38 MB → 33 MB.
+
+- **ant-quic 0.27.30 → 0.27.31.** Terminally-failed NAT-traversal sessions are now closed, released, and reaped instead of pinning their connection state indefinitely (ant-quic#210/#211).
+
 ## [v0.31.0] - 2026-07-13
 
 ### Added
