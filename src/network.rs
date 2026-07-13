@@ -1437,7 +1437,20 @@ impl NetworkNode {
             // backpressure earlier in the pubsub flush_ihave_batches loop is
             // the proper fix.
             .data_channel_capacity(50_000)
-            .max_concurrent_uni_streams(50_000);
+            // Deliberately NOT 50_000 like data_channel_capacity above: this
+            // is the per-connection QUIC uni-stream credit we ADVERTISE to
+            // the remote, and ant-quic materializes a streams-table slot for
+            // every advertised stream at Connection construction — 50_000
+            // slots ≈ 1.6 MB per connection (live OR failed dial), the
+            // dominant term in the v0.31 memory investigation (ant-quic#210:
+            // ~2.3 MB retained per failed dial to an unreachable peer).
+            // The X0X-0063 soak that justified 50_000 measured data_tx slot
+            // saturation (~67 events/s × ≤2.5 s hold ≈ hundreds concurrent),
+            // which bounds *our outbound* sends against the PEER's limit —
+            // not what we must advertise inbound. 4_096 keeps >4× headroom
+            // over that observed concurrency at 1/12 the per-connection
+            // memory (~130 KB).
+            .max_concurrent_uni_streams(4_096);
 
         if let Some(bind_addr) = config.bind_addr {
             builder = builder.bind_addr(bind_addr);
