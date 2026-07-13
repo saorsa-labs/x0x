@@ -453,7 +453,10 @@ pub(in crate::server) async fn update_task(
         Some(s) => match x0x::FenceToken::from_wire(s) {
             Ok(token) => Some(token),
             Err(_) => {
-                return bad_request("malformed fence token");
+                // Machine-readable error code — the API contract (and
+                // daemon_api_claim_malformed_fence_token_is_rejected_non_mutating)
+                // matches on this exact string.
+                return bad_request("malformed_fence_token");
             }
         },
     };

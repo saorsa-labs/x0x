@@ -69,9 +69,16 @@ async fn first_time_late_joiner_bootstraps_historical_keys() {
     // Only now does bob's daemon boot and connect.
     let bob = cluster::join_peer(&alice, alice_bind).await;
 
-    // Bob joins the store topic for the first time, after the write.
+    // Bob joins the store topic for the first time, after the write,
+    // anchoring on alice's authoritative owner. The expected_owner anchor is
+    // required out-of-band since the signed-store fork fix — an unanchored
+    // join is rejected fail-closed with 422 owner_required.
+    let alice_id = alice.agent_id().await;
     let r = bob
-        .post(&format!("/stores/{topic}/join"), serde_json::json!({}))
+        .post(
+            &format!("/stores/{topic}/join"),
+            serde_json::json!({ "expected_owner": alice_id }),
+        )
         .await;
     assert!(r.status().is_success(), "bob joins store");
     let pair = cluster::AgentPair { alice, bob };
@@ -127,9 +134,13 @@ async fn live_replication_still_works_after_bootstrap_change() {
         )
         .await;
     assert!(r.status().is_success(), "alice creates store");
+    let alice_id = pair.alice.agent_id().await;
     let r = pair
         .bob
-        .post(&format!("/stores/{topic}/join"), serde_json::json!({}))
+        .post(
+            &format!("/stores/{topic}/join"),
+            serde_json::json!({ "expected_owner": alice_id }),
+        )
         .await;
     assert!(r.status().is_success(), "bob joins before the write");
 
