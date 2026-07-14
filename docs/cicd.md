@@ -29,6 +29,22 @@ To exercise it locally, push a scratch tag on a commit with intentionally-red
 CI (e.g. a draft/prerelease) and confirm `require-green-ci` fails before any
 artifact is built; delete the tag/release afterward.
 
+## Convergence Release Gate (manual, pre-tag)
+
+`just convergence-release` is the authoritative multi-daemon convergence gate
+(10/10 clean runs of `tests/convergence/convergence_soak.py --expect-fixed`,
+including the owner-offline checkpoint-recovery and mixed-version skew gates).
+It is **not** wired into `release.yml`: it takes on the order of an hour and
+requires an authenticated v0.30.1 legacy binary (`X0XD_LEGACY_BINARY`) that
+cannot be built from this tree, so it runs manually on the release engineer's
+machine **before tagging**. The v0.31.1 external retest flagged that this gate
+had not been exercised for that release — treat it as a required pre-tag step
+for any release touching the KV/store, CRDT, or gossip planes.
+
+```bash
+X0XD_LEGACY_BINARY=/path/to/authentic/x0xd-0.30.1 just convergence-release
+```
+
 ## Coverage Gate
 
 The CI coverage job runs on Linux with `cargo-llvm-cov` and `cargo-nextest`.

@@ -978,6 +978,24 @@ impl KvStore {
             if self.try_adopt_full_snapshot(delta, peer_id, cp) {
                 return Ok(());
             }
+            // Stale-delta gate: a delta carrying a genuine owner checkpoint
+            // at or below the adopted high-water mark was published at or
+            // before the adopted checkpoint's state, so its mutations are
+            // already reflected in (or superseded by) that full snapshot.
+            // Without this gate the gossip replay/cache window re-delivers
+            // old owner-signed incremental deltas after a cold-recovery
+            // checkpoint adoption, and the sender-auth path below re-adds
+            // owner-DELETED keys on a fresh joiner (which holds no OR-Set
+            // tombstones for them) — resurrecting deleted state.
+            if self.is_subsumed_by_adopted_checkpoint(cp) {
+                tracing::debug!(
+                    "dropped stale owner delta (checkpoint_seq {} <= adopted {}) for store {}",
+                    cp.checkpoint_seq,
+                    self.highest_checkpoint_seq,
+                    self.id
+                );
+                return Ok(());
+            }
         }
         // Access control: reject unauthorized writes
         if let Some(writer_id) = writer {
@@ -1206,6 +1224,28 @@ impl KvStore {
         self.highest_checkpoint_seq = cp.checkpoint_seq;
         self.version += 1;
         true
+    }
+
+    /// True when `cp` is a genuine checkpoint for this store's anchored owner
+    /// whose sequence is at or below the adopted high-water mark.
+    ///
+    /// Only a verified owner checkpoint bound to this store may trigger the
+    /// stale-delta drop: an unverifiable or cross-store checkpoint falls
+    /// through to the sender-auth path unchanged, so a forged checkpoint
+    /// cannot be used to suppress legitimate writes. The writer's wire
+    /// signature covers the whole delta (checkpoint included), so a relay
+    /// cannot graft a stale checkpoint onto a fresh owner delta either.
+    fn is_subsumed_by_adopted_checkpoint(&self, cp: &OwnerCheckpoint) -> bool {
+        if cp.checkpoint_seq > self.highest_checkpoint_seq {
+            return false;
+        }
+        let Some(expected_owner) = self.owner else {
+            return false;
+        };
+        if cp.verify(&expected_owner).is_err() {
+            return false;
+        }
+        cp.store_id == self.id
     }
 
     /// After applying an incremental mutation via the sender-auth path, cache
@@ -2224,6 +2264,71 @@ mod tests {
             "injected removed must not truncate the owner-signed set"
         );
         assert_eq!(joiner.highest_checkpoint_seq, 1, "checkpoint adopted");
+    }
+
+    #[test]
+    fn stale_owner_delta_below_adopted_checkpoint_cannot_resurrect_deleted_keys() {
+        // v0.31.1 retest defect: owner writes k1 (checkpoint 1), later
+        // deletes it and writes k_final (checkpoint 2). A fresh anchored
+        // joiner cold-recovers checkpoint 2 ({k_final} only) from a relay,
+        // then the gossip replay/cache window re-delivers the owner's OLD
+        // k1 delta (still genuinely owner-signed, checkpoint 1 attached).
+        // The joiner holds no OR-Set tombstone for k1 — it never observed
+        // that add — so without the stale-delta gate the sender-auth path
+        // re-adds it, resurrecting an owner-deleted key.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/resurrect";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        // Owner at time 1: state {k1}; the broadcast delta carries cp seq 1.
+        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        owner_store
+            .put(
+                "k1".to_string(),
+                b"alpha".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put k1");
+        let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut stale_delta = owner_store.full_delta();
+        stale_delta.owner_checkpoint = Some(cp1);
+
+        // Owner at time 2: k1 deleted, k_final written; checkpoint seq 2.
+        owner_store.remove("k1").expect("remove k1");
+        owner_store
+            .put(
+                "k_final".to_string(),
+                b"final".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put k_final");
+        let cp2 = checkpoint_for(&owner_store, topic, &kp, 2);
+        let mut snapshot = owner_store.full_delta();
+        snapshot.owner_checkpoint = Some(cp2);
+
+        // Fresh anchored joiner cold-recovers checkpoint 2 via a relay.
+        let mut joiner =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        joiner
+            .merge_delta(&snapshot, peer(9), Some(&agent(9)))
+            .expect("adopt checkpoint 2");
+        assert!(joiner.get("k_final").is_some(), "recovered final state");
+        assert!(joiner.get("k1").is_none(), "k1 deleted in checkpoint 2");
+        assert_eq!(joiner.highest_checkpoint_seq, 2);
+
+        // Replay the stale owner delta (writer == owner, so the sender-auth
+        // path WOULD authorize it). The stale-delta gate must drop it.
+        joiner
+            .merge_delta(&stale_delta, peer(1), Some(&owner))
+            .expect("stale replay merge");
+        assert!(
+            joiner.get("k1").is_none(),
+            "owner-deleted key must not resurrect from a stale owner-signed delta"
+        );
+        assert_eq!(joiner.highest_checkpoint_seq, 2, "high-water unchanged");
     }
 
     #[test]
