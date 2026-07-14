@@ -232,6 +232,13 @@ class Node:
             # bootstrap network, keeping the cluster fully isolated. Do NOT
             # pass --no-hard-coded-bootstrap: it clears config peers too.
             f'bootstrap_peers = [{peers}]\n'
+            # Fully disable self-update. --skip-update-check (passed at
+            # start) only suppresses the startup GitHub check — it does NOT
+            # stop gossip-delivered auto-apply, which replaced a v0.30.1
+            # legacy participant with the latest release mid-run and
+            # invalidated the mixed-version skew gate (v0.31.1 retest).
+            '[update]\n'
+            'enabled = false\n'
         )
 
     def reconfigure_port(self, new_quic_port, bootstrap_quic_ports):

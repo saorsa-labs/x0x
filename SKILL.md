@@ -398,8 +398,15 @@ curl -H "Authorization: Bearer $TOKEN" "http://$API/stores/team-config-store/key
 curl -H "Authorization: Bearer $TOKEN" "http://$API/stores/team-config-store/greeting" # get (value is base64)
 curl -X DELETE "http://$API/stores/team-config-store/greeting" -H "Authorization: Bearer $TOKEN"
 
-# Join a store another agent created (replicate it locally)
-curl -X POST "http://$API/stores/team-config-store/join" -H "Authorization: Bearer $TOKEN"
+# Join a store another agent created (replicate it locally).
+# expected_owner anchors the join: pass the owner's agent_id, learned
+# OUT-OF-BAND (from the owner's message, agent card, or your contacts) —
+# never from the store itself. A replica only trusts owner-signed state
+# for the anchored owner; unanchored Signed-store joins are rejected
+# (422 owner_required) so a malicious replica cannot claim ownership.
+curl -X POST "http://$API/stores/team-config-store/join" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"expected_owner": "<owner agent_id, 64-hex>"}'
 ```
 
 ### Named Groups
