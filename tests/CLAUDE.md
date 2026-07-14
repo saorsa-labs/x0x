@@ -62,7 +62,7 @@ Bash + Python test harnesses in `tests/` for end-to-end validation:
 | `e2e_vps_groups.py` | Phase B — 6 VPS groups + contacts dogfood | up to 49 | Anchor creates a `public_open` group, DMs invites to all runners, each posts a group message, contacts add/Trust/Block/remove cycle per node. See §7c. |
 | `e2e_local_mesh.sh` | Local 3-node Phase A smoke | 6 directed pairs | Boots alice/bob/charlie + a runner each, runs `e2e_vps_mesh.py --no-tunnel` against alice. Proves the protocol without SSH. |
 | `e2e_dogfood_groups.sh` | Phase B — local 3-instance groups + contacts | 29 | Same dogfood as §7c but local. ~5 s wall-clock. |
-| `e2e_dogfood_local.sh` | Phase D — fast 2-instance pre-commit smoke | 19 | Identity + contacts + DM round-trip + group lifecycle, all via DMs. ~5 s wall-clock; targets every-commit cadence. See §7e. |
+| `e2e_dogfood_local.sh` | Phase D — fast 2-instance pre-commit smoke | 20 | Identity + contacts + DM round-trip + group lifecycle (incl. authority-committed join), all via DMs. ~5 s wall-clock; targets every-commit cadence. See §7e. |
 | `e2e_deploy.sh` | Build + deploy to VPS (with optional mesh verification) | ~24 | Cross-compile, upload `x0xd` **and** the mesh test runner (`x0x-test-runner.service`) to 6 nodes, verify health/version/mesh, collect API tokens. **`--mesh-verify` flag** chains Phase A + Phase B verification onto the deploy via 1 SSH tunnel. See §7d. |
 
 ## Running E2E Tests

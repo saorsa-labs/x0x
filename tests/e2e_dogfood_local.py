@@ -19,6 +19,7 @@ What gets exercised:
         bob's runner echoes a `received_dm` result back to the anchor
     Named groups (public_open)
         anchor creates → invite → bob joins
+        bob's join is committed by the authority (MemberAdded applied)
         each member posts; each member sees own message in local cache
         bob leaves → bob's /groups list no longer contains the group
 
@@ -541,6 +542,40 @@ class Phase_D_Harness:
             "peer joins via invite", join.get("outcome") == "ok",
         )
         peer_gid = (join.get("details") or {}).get("group_id") or gid
+
+        # Membership is authority-committed: the joiner seeds the invite's
+        # roster snapshot (which predates them) and only becomes an active
+        # member once the inviter's signed MemberAdded commit arrives
+        # (docs/design/groups-join-roster-propagation.md). Posting before
+        # that commit is rejected with 403 members-only write policy, so
+        # wait for the commit — itself a real end-to-end gate on the
+        # MemberJoined → MemberAdded round trip.
+        commit_deadline = time.time() + 15
+        peer_is_member = False
+        commit_err = ""
+        while time.time() < commit_deadline and not peer_is_member:
+            try:
+                view = self.call_remote(
+                    "group_members", {"group_id": peer_gid},
+                )
+            except Exception as exc:
+                commit_err = str(exc)
+                break
+            members = (view.get("details") or {}).get("members") or []
+            peer_is_member = any(
+                (m.get("agent_id") or "").lower()
+                == self.peer.agent_id.lower()
+                and m.get("state", "active") == "active"
+                for m in members
+            )
+            if not peer_is_member:
+                time.sleep(0.5)
+        if not self.assert_pass(
+            "peer join committed by authority (MemberAdded applied)",
+            peer_is_member,
+            commit_err,
+        ):
+            return
 
         # Each member posts in the group and sees their own message.
         anchor_msg = self.call_local(

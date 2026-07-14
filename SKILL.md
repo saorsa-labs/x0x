@@ -442,6 +442,10 @@ curl -X POST "http://$API/groups/<group_id>/invite" -H "Authorization: Bearer $T
 # Join via that invite link (on the other agent)
 curl -X POST "http://$API/groups/join" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"invite": "x0x://invite/<...>"}'
+# Membership is committed by the group authority: after joining, poll
+# GET /groups/<group_id>/members until your own agent_id appears with
+# state "active" (typically <1 s while the inviter is online) — posting
+# before that returns 403 "members-only write policy".
 ```
 
 ### Presence & Discovery
