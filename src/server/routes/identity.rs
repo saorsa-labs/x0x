@@ -608,24 +608,56 @@ pub(in crate::server) async fn import_agent_card(
     };
     let agent_id = x0x::identity::AgentId(agent_id_bytes);
 
-    // Add to contacts
+    // Add to contacts.
+    //
+    // Import must never change an existing deliberate trust decision. Two
+    // rules protect prior intent:
+    //   1. Blocked is sticky — a deliberately blocked agent (gossip/DMs
+    //      silently dropped) cannot be un-blocked by a card re-import.
+    //   2. Floor at existing level — for non-blocked contacts the effective
+    //      trust is max(existing, requested), so a re-import (default
+    //      "known") never downgrades a Trusted peer.
+    // Explicit changes (upgrade, downgrade, un-block) remain available via
+    // PATCH /contacts/:id or POST /contacts/trust.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let contact = x0x::contacts::Contact {
-        agent_id,
-        trust_level: trust,
-        label: Some(card.display_name.clone()),
-        added_at: now,
-        last_seen: None,
-        identity_type: x0x::contacts::IdentityType::default(),
-        machines: Vec::new(),
-        dm_capabilities: card.dm_capabilities.clone(),
-    };
+    let (effective_trust, change_ignored) = {
+        let mut store = state.contacts.write().await;
+        let existing = store.get(&agent_id).cloned();
 
-    state.contacts.write().await.add(contact);
+        let (eff, ignored) = match &existing {
+            // Blocked is an explicit deny — sticky on import regardless of
+            // the requested level.
+            Some(c) if c.trust_level == trust => (trust, false),
+            Some(c) if c.trust_level == x0x::contacts::TrustLevel::Blocked => {
+                (x0x::contacts::TrustLevel::Blocked, true)
+            }
+            // For non-blocked existing contacts, floor at existing level.
+            Some(c) if c.trust_level.rank() >= trust.rank() => (c.trust_level, true),
+            _ => (trust, false),
+        };
+
+        let contact = x0x::contacts::Contact {
+            agent_id,
+            trust_level: eff,
+            label: Some(card.display_name.clone()),
+            // Preserve provenance from any prior add.
+            added_at: existing.as_ref().map_or(now, |c| c.added_at),
+            last_seen: existing.as_ref().and_then(|c| c.last_seen),
+            identity_type: existing
+                .as_ref()
+                .map_or(x0x::contacts::IdentityType::default(), |c| c.identity_type),
+            machines: existing.as_ref().map_or(Vec::new(), |c| c.machines.clone()),
+            // Card-derived fields always refresh on re-import.
+            dm_capabilities: card.dm_capabilities.clone(),
+        };
+
+        store.add(contact);
+        (eff, ignored)
+    };
 
     // Also populate the identity discovery cache so connect_to_agent / send_direct
     // can find this agent without waiting for gossip announcements.
@@ -694,7 +726,8 @@ pub(in crate::server) async fn import_agent_card(
             "ok": true,
             "agent_id": card.agent_id,
             "display_name": card.display_name,
-            "trust_level": format!("{trust:?}"),
+            "trust_level": format!("{effective_trust:?}"),
+            "trust_change_ignored": change_ignored,
             "groups": card.groups.len(),
             "stores": card.stores.len(),
         })),

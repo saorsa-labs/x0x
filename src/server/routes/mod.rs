@@ -10,17 +10,19 @@ mod identity;
 mod machines;
 mod tasks;
 
+#[cfg(test)]
+pub(super) use contacts::UpdateContactRequest;
 pub(super) use contacts::{
     add_contact, delete_contact, list_contacts, list_revocations, quick_trust, revoke_contact,
     update_contact,
 };
-#[cfg(test)]
-pub(super) use identity::CardQuery;
 pub(super) use identity::{
     agent_info, agent_sign, agent_user_id_handler, agent_verify, announce_identity,
     get_a2a_agent_card, get_agent_card, identity_revocations, identity_revoke, import_agent_card,
     introduction, populate_invite_base_state_from_group_info,
 };
+#[cfg(test)]
+pub(super) use identity::{CardQuery, ImportCardRequest};
 pub(super) use machines::{
     add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,
     machines_by_user_handler, pin_machine, unpin_machine,

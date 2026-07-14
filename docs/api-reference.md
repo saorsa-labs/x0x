@@ -69,7 +69,7 @@ curl http://127.0.0.1:12700/status
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
 | GET | `/agent/card` | `x0x agent card` | Generate a shareable, signed identity card |
 | GET | `/.well-known/agent-card.json` | — | A2A-compatible discovery card (ADR-0017) |
-| POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature) |
+| POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature; never changes existing trust: floor at existing level, Blocked is sticky) |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 
@@ -103,6 +103,27 @@ Verification binds the embedded public key to the card's `agent_id`
 relay cannot substitute a foreign key. `POST /agent/card/import` rejects a signed
 card whose signature fails; legacy unsigned cards (`signature` absent) still
 import for backward compatibility.
+
+### Agent card import trust floor
+
+`POST /agent/card/import` never **changes an existing deliberate trust
+decision**. Two rules protect prior intent:
+
+1. **Blocked is sticky.** A deliberately blocked agent cannot be un-blocked
+   by a card re-import. Blocked contacts have gossip and DMs silently
+   dropped; un-blocking is only available via `PATCH /contacts/:agent_id` or
+   `POST /contacts/trust`.
+2. **Floor at existing level.** For non-blocked contacts, the effective
+   trust is `max(existing, requested)`, so a re-import (which defaults to
+   `"known"`) cannot downgrade a manually-trusted peer.
+
+For a new contact the requested `trust_level` (default `"known"`) is applied
+as-is. The response includes `trust_change_ignored: true` when the requested
+level conflicted with an existing trust decision and was therefore ignored.
+
+To explicitly change trust (upgrade, downgrade, block, or un-block), use
+`PATCH /contacts/:agent_id` or `POST /contacts/trust` — those are
+unambiguous user intent and always apply the requested level.
 
 ### A2A discovery card
 
