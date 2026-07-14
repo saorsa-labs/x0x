@@ -47,7 +47,7 @@ x0xd --name bob --api-port 12702 --no-hard-coded-bootstrap &
 sleep 2
 BOB_TOKEN=$(cat ~/Library/Application\ Support/x0x-bob/api-token 2>/dev/null || cat ~/.local/share/x0x-bob/api-token)
 
-# Instance 3: Charlie (port 12703, skips configured bootstrap peers; mDNS/cache may still discover locals)
+# Instance 3: Charlie (port 12703, skips embedded bootstrap peers; mDNS/cache may still discover locals)
 x0xd --name charlie --api-port 12703 --no-hard-coded-bootstrap &
 sleep 2
 CHARLIE_TOKEN=$(cat ~/Library/Application\ Support/x0x-charlie/api-token 2>/dev/null || cat ~/.local/share/x0x-charlie/api-token)

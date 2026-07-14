@@ -9650,7 +9650,8 @@ impl AgentBuilder {
     /// seen peers for embedders and dedicated test harnesses.
     ///
     /// Note: the x0xd daemon's `--no-hard-coded-bootstrap` flag does
-    /// not call this; it only clears configured seed peers.
+    /// not call this; it clears only the embedded global bootstrap
+    /// network (config-provided peers are honored verbatim).
     pub fn with_peer_cache_disabled(mut self) -> Self {
         self.disable_peer_cache = true;
         self

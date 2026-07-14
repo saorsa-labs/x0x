@@ -217,7 +217,7 @@ x0xd [OPTIONS]
   --config <PATH>                 Path to config file (TOML)
   --name <NAME>                   Instance name for multi-instance support
   --api-port <PORT>               Override API server port (otherwise ephemeral for named instances)
-  --no-hard-coded-bootstrap       Skip configured bootstrap peers
+  --no-hard-coded-bootstrap       Skip embedded bootstrap peers (config peers kept)
   --exec-acl <PATH>               Override default exec ACL path
   --check                         Check configuration and exit
   --check-updates                 Check for updates and exit

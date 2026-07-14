@@ -92,7 +92,9 @@ async fn main() -> anyhow::Result<()> {
         println!("    --config <PATH>                 Path to config file (TOML)");
         println!("    --name <NAME>                   Instance name for multi-instance support");
         println!("    --api-port <PORT>               Override API server port");
-        println!("    --no-hard-coded-bootstrap       Skip configured bootstrap peers");
+        println!(
+            "    --no-hard-coded-bootstrap       Skip embedded bootstrap peers (config peers kept)"
+        );
         println!("    --disable-peer-cache            Do not load or save cached peers");
         println!("    --exec-acl <PATH>               Override default exec ACL path");
         println!("    --connect-acl <PATH>            Override default connect ACL path");
@@ -246,9 +248,13 @@ async fn main() -> anyhow::Result<()> {
         config.api_address.set_port(port);
     }
 
-    // CLI --no-hard-coded-bootstrap clears configured seed peers only.
-    if disable_configured_bootstrap {
-        config.bootstrap_peers = Vec::new();
+    // CLI --no-hard-coded-bootstrap clears the *embedded* global bootstrap
+    // network only. When the config file explicitly set `bootstrap_peers`
+    // (Some), the operator's list is honored verbatim; when the value came
+    // from the embedded default (None), flip it to an explicit empty list so
+    // no seed peers are dialed. See DaemonConfig::resolved_bootstrap_peers.
+    if disable_configured_bootstrap && config.bootstrap_peers.is_none() {
+        config.bootstrap_peers = Some(Vec::new());
     }
 
     config

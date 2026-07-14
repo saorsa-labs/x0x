@@ -34,7 +34,7 @@ fn hermetic_config(dir: &std::path::Path) -> DaemonConfig {
     let mut config = DaemonConfig::default();
     config.api_address = SocketAddr::from(([127, 0, 0, 1], 0));
     config.bind_address = SocketAddr::from(([127, 0, 0, 1], 0));
-    config.bootstrap_peers = Vec::new();
+    config.bootstrap_peers = Some(Vec::new());
     config.data_dir = dir.join("data");
     config.identity_dir = Some(dir.join("identity"));
     config
@@ -379,7 +379,7 @@ async fn serve_then_immediate_shutdown_is_ok_and_prompt() {
     // join_network's in-flight start_identity_heartbeat / discovery_reaper /
     // presence-start / capability-advert / delayed-reannounce must all no-op
     // because the token is cancelled before bg_tasks are drained.
-    config.bootstrap_peers = vec![SocketAddr::from(([192, 0, 2, 1], 5483))];
+    config.bootstrap_peers = Some(vec![SocketAddr::from(([192, 0, 2, 1], 5483))]);
 
     let handle = serve(config).await.expect("serve() should start");
     let addr = handle.local_addr();
