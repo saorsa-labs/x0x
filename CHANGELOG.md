@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.31.2] - 2026-07-14
+
+### Fixed
+
+- **Signed-store deleted-key resurrection on fresh joiners (external v0.31.1 retest defect).** After a fresh anchored joiner cold-recovered a Signed store from a relay by adopting the owner's authoritative checkpoint, the gossip replay/cache window could re-deliver *older* owner-signed incremental deltas. Those failed full-snapshot adoption on the monotonic `checkpoint_seq` gate but fell through to the sender-auth path — where the owner is an authorized writer — and re-added keys the adopted checkpoint had deleted (the joiner holds no OR-Set tombstones for adds it never observed). `merge_delta` now drops any delta carrying a *verified* owner checkpoint at or below the adopted checkpoint high-water mark: such a delta was published at or before the adopted snapshot's state, so its mutations are already reflected in or superseded by it. A forged or cross-store checkpoint cannot trigger the drop (it falls through unchanged), and the writer's wire signature covers the whole delta, so a relay cannot graft a stale checkpoint onto a fresh owner delta to suppress it. Verified by a new unit test and by the convergence harness owner-offline gate: released 0.31.1 fails 2/5 local runs (nondeterministic key resurrection), the fixed daemon passes 6/6, and `just convergence-release` passes 10/10 with all prerequisite gates green against an authenticated v0.30.1 legacy binary.
+
+- **Phase-D dogfood smoke: assert authority-committed join before the peer posts (#226).** The joiner of a `public_open` group seeds the invite's committed roster snapshot and becomes an active member only when the inviter's signed `MemberAdded` commit is applied (~0.5 s while the inviter is online); posting before that is correctly rejected with 403 `members-only write policy`. The smoke posted immediately after `/groups/join` and had been failing 2/19 since the join-roster remediation — it now waits for (and hard-asserts) the commit, turning the race into an end-to-end gate on the MemberJoined → MemberAdded round trip. `SKILL.md` documents the poll-members-until-active step after joining.
+
+### Changed
+
+- **Test harnesses disable self-update end-to-end.** `--skip-update-check` only suppresses the startup GitHub check, not gossip-delivered auto-apply; a v0.30.1 binary under test replaced itself with the latest release mid-run (invalidating a mixed-version gate) before the harnesses set `[update] enabled = false` in every generated daemon config (Phase-D smoke + convergence harness).
+
+- **`SKILL.md` Signed-store join example now includes `expected_owner`** (anchored join with out-of-band owner provenance; unanchored Signed-store joins are rejected `422 owner_required`). `docs/cicd.md` documents `just convergence-release` as a required manual pre-tag gate.
+
 ## [v0.31.1] - 2026-07-13
 
 ### Fixed
