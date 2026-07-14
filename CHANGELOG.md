@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Security
+
+- **Bump `ant-quic` to 0.27.32** — pulls in the reassembly-buffer memory-exhaustion
+  fix (GHSA-4w2j-m93h-cj5j, CVSS 7.5, CWE-770: a peer could grow the receiver's
+  out-of-order reassembly buffer without bound via gapped fragments with a withheld
+  prefix) and lazy remote stream-state allocation (removes ~1.58 MB/connection of
+  eager per-stream preallocation, the dominant per-failed-dial retention behind the
+  fleet OOM churn tracked in ant-quic #210). Both are ant-quic-internal; no x0x API
+  change.
+
 ## [v0.31.2] - 2026-07-14
 
 ### Fixed
