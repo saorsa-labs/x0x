@@ -2,7 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [v0.31.3] - 2026-07-14
+
+Includes the previously-unreleased v0.31.2 changes (below); v0.31.2 was prepared
+but never tagged, so its content ships here.
 
 ### Security
 
@@ -11,8 +14,9 @@ All notable changes to this project will be documented in this file.
   out-of-order reassembly buffer without bound via gapped fragments with a withheld
   prefix) and lazy remote stream-state allocation (removes ~1.58 MB/connection of
   eager per-stream preallocation, the dominant per-failed-dial retention behind the
-  fleet OOM churn tracked in ant-quic #210). Both are ant-quic-internal; no x0x API
-  change.
+  fleet OOM churn tracked in ant-quic #210, verified eliminated: 0 leaks and ~1 KB
+  retained per failed dial vs the prior ~2.3 MB). Both are ant-quic-internal; no
+  x0x API change.
 
 ## [v0.31.2] - 2026-07-14
 
