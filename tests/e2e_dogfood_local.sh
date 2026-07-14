@@ -60,6 +60,12 @@ instance_name = "$node"
 data_dir = "${DATA_DIRS[$node]}"
 api_address = "127.0.0.1:${API_PORTS[$node]}"
 log_level = "warn"
+
+# Fully disable self-update: --skip-update-check only suppresses the
+# startup GitHub check, not gossip-delivered auto-apply — an older
+# binary under test would otherwise replace itself and exit mid-run.
+[update]
+enabled = false
 TOML
     "$X0XD" \
         --config "${CONFIGS[$node]}" \
