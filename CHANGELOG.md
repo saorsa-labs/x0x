@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.31.4] - 2026-07-15
+
+### Fixed
+
+- **`--no-hard-coded-bootstrap` no longer wipes explicit config `bootstrap_peers`.** The flag
+  cleared the config file's operator-specified peer list along with the embedded default
+  bootstrap network, so a daemon launched with the flag plus an explicit `bootstrap_peers`
+  list joined with zero seed peers (isolated-plane deployments only stayed meshed via the
+  ant-quic bootstrap cache). `DaemonConfig.bootstrap_peers` is now `Option<Vec<SocketAddr>>`:
+  an absent TOML key resolves to the embedded global network, an explicit list — including
+  `[]` — is honored verbatim, and the flag clears only the embedded fallback. The deprecated
+  `--no-bootstrap` alias gets the same semantics. Validated live: a daemon with the flag and
+  six explicit testnet peers dialed them and meshed (previously 0 peers).
+
+- **Agent-card import can no longer change an existing deliberate trust decision.** A card
+  re-import (default `trust_level: "known"`) silently downgraded a manually `trusted` contact,
+  flipping trust evaluation from `Accept` to `AcceptWithFlag` and breaking remote exec and
+  tailnet forwards with an unexplained `trust_rejected`. Import now floors at the existing
+  trust level for non-blocked contacts (`max(existing, requested)`) and `Blocked` is sticky —
+  a blocked agent cannot be un-blocked by re-importing their card. Existing contact provenance
+  (`added_at`, `last_seen`, `machines`, `identity_type`) is preserved on re-import, and the
+  response reports `trust_downgrade_ignored: true` when a requested lower level was ignored.
+  Explicit changes remain available via `PATCH /contacts/:id` and `POST /contacts/trust`.
+
 ## [v0.31.3] - 2026-07-14
 
 Includes the previously-unreleased v0.31.2 changes (below); v0.31.2 was prepared
