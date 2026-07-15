@@ -599,7 +599,20 @@ async fn rehydrate_one(state: Arc<AppState>, entry: CrdtSubscriptionEntry) -> Re
                         )
                         .await
                 }
-                ROLE_CREATED => state.agent.create_kv_store(&entry.name, &entry.topic).await,
+                ROLE_CREATED => {
+                    // Restore the persisted policy: an append-only store must
+                    // never rehydrate as plain Signed (that would silently
+                    // drop its immutability guarantees). Legacy entries with
+                    // no stored policy predate AppendOnly and were Signed.
+                    let policy = match entry.extra.get("policy").and_then(|v| v.as_str()) {
+                        Some("append_only") => crate::kv::AccessPolicy::AppendOnly,
+                        _ => crate::kv::AccessPolicy::Signed,
+                    };
+                    state
+                        .agent
+                        .create_kv_store_with_policy(&entry.name, &entry.topic, policy)
+                        .await
+                }
                 other => {
                     tracing::warn!(
                         id = %entry.id,

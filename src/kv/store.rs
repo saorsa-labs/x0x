@@ -12,6 +12,10 @@
 //! - **Encrypted**: Reserved for group-scoped encrypted stores. The current
 //!   KvStore sync path does not encrypt deltas; do not rely on this policy for
 //!   confidentiality until encrypted sync is wired.
+//! - **AppendOnly**: Like `Signed` (owner-only writes), but existing keys are
+//!   immutable — no update, no delete, even by the owner. Use for
+//!   tamper-evident event logs where the author must not be able to rewrite
+//!   history retroactively.
 
 use crate::identity::AgentId;
 use crate::kv::{KvEntry, KvError, KvStoreDelta, Result};
@@ -42,6 +46,23 @@ pub enum AccessPolicy {
         /// MLS group ID for this store.
         group_id: Vec<u8>,
     },
+
+    /// Owner-signed append-only store: like [`Signed`](Self::Signed), only the
+    /// owner can write — but existing keys are IMMUTABLE. A key, once written,
+    /// can never be updated to different content or deleted, **even by the
+    /// owner**. Re-putting byte-identical content is accepted as an idempotent
+    /// no-op (retry-friendly).
+    ///
+    /// This makes append-only event logs tamper-evident against their own
+    /// author: an owner retroactively rewriting or truncating history is
+    /// rejected at every enforcement point (local writes, remote deltas, and
+    /// owner-signed checkpoint adoption).
+    ///
+    /// NOTE: this variant MUST stay last — bincode encodes enum variants
+    /// positionally, and stores/checkpoints/deltas carrying `AccessPolicy`
+    /// are bincode-serialized on disk and on the wire. Inserting a variant
+    /// mid-enum would corrupt every existing store.
+    AppendOnly,
 }
 
 impl std::fmt::Display for AccessPolicy {
@@ -50,6 +71,7 @@ impl std::fmt::Display for AccessPolicy {
             Self::Signed => write!(f, "signed"),
             Self::Allowlisted => write!(f, "allowlisted"),
             Self::Encrypted { .. } => write!(f, "encrypted"),
+            Self::AppendOnly => write!(f, "append_only"),
         }
     }
 }
@@ -702,6 +724,12 @@ impl KvStore {
                 // the secure sync path once wired.
                 true
             }
+            AccessPolicy::AppendOnly => {
+                // Owner-only writes, exactly like Signed. Immutability of
+                // existing keys is enforced separately at each mutation site
+                // (put/remove/merge_delta/checkpoint adoption).
+                self.owner.as_ref().is_some_and(|o| o == agent_id)
+            }
         }
     }
 
@@ -858,7 +886,11 @@ impl KvStore {
 
     /// Put a key-value entry.
     ///
-    /// If the key already exists, the value is updated using LWW semantics.
+    /// If the key already exists, the value is updated using LWW semantics —
+    /// except under [`AccessPolicy::AppendOnly`], where an existing key is
+    /// immutable: a re-put of byte-identical content (same value AND
+    /// content type) is accepted as an idempotent no-op so retries are safe,
+    /// and anything else returns [`KvError::ImmutableKey`].
     pub fn put(
         &mut self,
         key: String,
@@ -871,6 +903,16 @@ impl KvStore {
                 size: value.len(),
                 max: crate::kv::entry::MAX_INLINE_SIZE,
             });
+        }
+
+        // AppendOnly: existing keys are immutable, even for the owner.
+        if matches!(self.policy, AccessPolicy::AppendOnly) {
+            if let Some(existing) = self.get(&key) {
+                if existing.value == value && existing.content_type == content_type {
+                    return Ok(()); // idempotent re-put of identical content
+                }
+                return Err(KvError::ImmutableKey(key));
+            }
         }
 
         let seq = self.next_seq();
@@ -910,9 +952,18 @@ impl KvStore {
     }
 
     /// Remove a key from the store.
+    ///
+    /// # Errors
+    ///
+    /// - [`KvError::KeyNotFound`] if the key does not exist.
+    /// - [`KvError::ImmutableKey`] under [`AccessPolicy::AppendOnly`]: keys
+    ///   can never be deleted, even by the owner.
     pub fn remove(&mut self, key: &str) -> Result<()> {
         if !self.entries.contains_key(key) {
             return Err(KvError::KeyNotFound(key.to_string()));
+        }
+        if matches!(self.policy, AccessPolicy::AppendOnly) {
+            return Err(KvError::ImmutableKey(key.to_string()));
         }
 
         self.keys
@@ -1041,6 +1092,9 @@ impl KvStore {
 
         // Apply added entries
         for (key, (entry, tag)) in &delta.added {
+            if self.append_only_rejects_entry(key, entry) {
+                continue; // skip this entry; the rest of the delta still applies
+            }
             self.keys
                 .add(key.clone(), *tag)
                 .map_err(|e| KvError::Merge(format!("OR-Set add failed: {e}")))?;
@@ -1052,14 +1106,30 @@ impl KvStore {
             }
         }
 
-        // Apply removed keys
-        for key in delta.removed.keys() {
-            let _ = self.keys.remove(&key.to_string());
-            self.entries.remove(key.as_str());
+        // Apply removed keys — never for AppendOnly stores: keys are immutable
+        // and cannot be removed, even by an owner-signed delta (an owner
+        // retroactively deleting records is exactly the attack AppendOnly
+        // exists to stop).
+        if matches!(self.policy, AccessPolicy::AppendOnly) {
+            if !delta.removed.is_empty() {
+                tracing::warn!(
+                    "append-only violation: skipped {} remote key removal(s) for store {}",
+                    delta.removed.len(),
+                    self.id
+                );
+            }
+        } else {
+            for key in delta.removed.keys() {
+                let _ = self.keys.remove(&key.to_string());
+                self.entries.remove(key.as_str());
+            }
         }
 
         // Apply updated entries (upsert)
         for (key, entry) in &delta.updated {
+            if self.append_only_rejects_entry(key, entry) {
+                continue; // skip this entry; the rest of the delta still applies
+            }
             if let Some(existing) = self.entries.get_mut(key) {
                 existing.merge(entry);
             } else {
@@ -1086,6 +1156,32 @@ impl KvStore {
 
         self.version += 1;
         Ok(())
+    }
+
+    /// AppendOnly guard for one incoming delta entry.
+    ///
+    /// `true` when this store is [`AccessPolicy::AppendOnly`] and `key` is
+    /// already active locally with different content — the mutation must be
+    /// skipped and the local value retained. Owner-signed deltas are NOT
+    /// exempt: an owner retroactively rewriting records is exactly the attack
+    /// this policy exists to stop. A byte-identical re-delivery is allowed
+    /// through (idempotent; the LWW entry merge is a no-op on content).
+    fn append_only_rejects_entry(&self, key: &str, entry: &KvEntry) -> bool {
+        if !matches!(self.policy, AccessPolicy::AppendOnly) {
+            return false;
+        }
+        match self.get(key) {
+            Some(local)
+                if local.value != entry.value || local.content_type != entry.content_type =>
+            {
+                tracing::warn!(
+                    "append-only violation: skipped remote update of existing key {key:?} for store {}",
+                    self.id
+                );
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Try to adopt an owner-signed checkpoint as an authoritative full
@@ -1166,6 +1262,48 @@ impl KvStore {
             .unwrap_or("");
         if content_root(&self.id, relayed_name, &relayed) != cp.content_root {
             return false; // tamper / truncation / subset / incremental — fall through
+        }
+        // 6b. AppendOnly immutability gate: a checkpoint may only EXTEND the
+        //     keyset. If adopting it would drop a locally-present key or
+        //     change its bytes, reject the whole checkpoint and keep local
+        //     state (fail loud) — an owner signing a rewritten/truncated
+        //     history is exactly the attack AppendOnly exists to stop. A
+        //     fresh joiner holds no local keys, so cold-start adoption is
+        //     unaffected. Checked against BOTH the local policy and the
+        //     checkpoint's claimed policy, so a hostile checkpoint cannot
+        //     dodge the gate by flipping its own policy field.
+        if matches!(self.policy, AccessPolicy::AppendOnly)
+            || matches!(cp.policy, AccessPolicy::AppendOnly)
+        {
+            let signed_entries: HashMap<&str, &KvEntry> =
+                relayed.iter().map(|(k, e)| (*k, *e)).collect();
+            for key in self.keys.elements() {
+                let Some(local) = self.entries.get(key) else {
+                    continue;
+                };
+                match signed_entries.get(key.as_str()) {
+                    None => {
+                        tracing::warn!(
+                            "append-only violation: rejected owner checkpoint seq {} for store {} — it drops existing key {key:?}",
+                            cp.checkpoint_seq,
+                            self.id
+                        );
+                        return false;
+                    }
+                    Some(remote)
+                        if remote.value != local.value
+                            || remote.content_type != local.content_type =>
+                    {
+                        tracing::warn!(
+                            "append-only violation: rejected owner checkpoint seq {} for store {} — it rewrites existing key {key:?}",
+                            cp.checkpoint_seq,
+                            self.id
+                        );
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
         }
         // 7. Adopt: merge the entries as owner-authorized (bypass sender-auth).
         for (key, (entry, tag)) in &delta.added {
@@ -3026,5 +3164,352 @@ mod tests {
             "newer checkpoint advances"
         );
         assert!(restarted.get("k2").is_some());
+    }
+
+    // ── AppendOnly policy ───────────────────────────────────────────────
+    //
+    // WHY these tests exist: AppendOnly makes an owner-signed store
+    // tamper-evident against its OWN author. Every path an owner (or anyone)
+    // could use to rewrite or truncate history — local put/remove, remote
+    // deltas, owner-signed checkpoint adoption — must refuse to touch an
+    // existing key. If any of these tests can pass while an existing key's
+    // bytes change or disappear, the policy's entire guarantee is void.
+
+    fn append_only_owner_store(owner: AgentId) -> KvStore {
+        let mut store = KvStore::new(
+            store_id(7),
+            "log".to_string(),
+            owner,
+            AccessPolicy::AppendOnly,
+        );
+        store
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("initial append");
+        store
+    }
+
+    #[test]
+    fn append_only_put_existing_key_different_content_rejected() {
+        let owner = agent(1);
+        let mut store = append_only_owner_store(owner);
+        let err = store
+            .put(
+                "k1".to_string(),
+                b"REWRITTEN".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect_err("owner must not be able to rewrite an existing key");
+        assert!(matches!(err, KvError::ImmutableKey(ref k) if k == "k1"));
+        assert_eq!(
+            store.get("k1").map(|e| e.value.clone()),
+            Some(b"v1".to_vec()),
+            "original bytes retained"
+        );
+    }
+
+    #[test]
+    fn append_only_put_identical_content_is_idempotent_noop() {
+        let owner = agent(1);
+        let mut store = append_only_owner_store(owner);
+        let v_before = store.current_version();
+        store
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("byte-identical re-put is accepted (retry-friendly)");
+        assert_eq!(
+            store.current_version(),
+            v_before,
+            "idempotent re-put is a no-op: no version bump, no state change"
+        );
+        // Same bytes but a different content type is a mutation — rejected.
+        let err = store
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "application/json".to_string(),
+                peer(1),
+            )
+            .expect_err("content-type change on an existing key is a mutation");
+        assert!(matches!(err, KvError::ImmutableKey(_)));
+    }
+
+    #[test]
+    fn append_only_remove_rejected() {
+        let owner = agent(1);
+        let mut store = append_only_owner_store(owner);
+        let err = store
+            .remove("k1")
+            .expect_err("owner must not be able to delete an existing key");
+        assert!(matches!(err, KvError::ImmutableKey(ref k) if k == "k1"));
+        assert!(store.get("k1").is_some(), "key retained after rejected delete");
+        // A key that never existed still reports KeyNotFound (unchanged).
+        assert!(matches!(
+            store.remove("ghost"),
+            Err(KvError::KeyNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn append_only_owner_delta_rewrite_skipped_value_retained() {
+        // A hostile delta authored by the OWNER updating an existing key must
+        // be skipped: owner-signed is not exempt from immutability.
+        let owner = agent(1);
+        let mut store = append_only_owner_store(owner);
+
+        let mut delta = KvStoreDelta::new(99);
+        delta.added.insert(
+            "k1".to_string(),
+            (
+                KvEntry::new(
+                    "k1".to_string(),
+                    b"REWRITTEN".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (peer(2), 42),
+            ),
+        );
+        // New keys in the same delta must still append fine.
+        delta.added.insert(
+            "k2".to_string(),
+            (
+                KvEntry::new("k2".to_string(), b"v2".to_vec(), "text/plain".to_string()),
+                (peer(2), 43),
+            ),
+        );
+        // The `updated` path must be gated identically.
+        delta.updated.insert(
+            "k1".to_string(),
+            KvEntry::new(
+                "k1".to_string(),
+                b"REWRITTEN-2".to_vec(),
+                "text/plain".to_string(),
+            ),
+        );
+        store
+            .merge_delta(&delta, peer(2), Some(&owner))
+            .expect("violations are skipped, not errors — delta not poisoned");
+        assert_eq!(
+            store.get("k1").map(|e| e.value.clone()),
+            Some(b"v1".to_vec()),
+            "existing key retained its original bytes"
+        );
+        assert_eq!(
+            store.get("k2").map(|e| e.value.clone()),
+            Some(b"v2".to_vec()),
+            "appends in the same delta still apply"
+        );
+    }
+
+    #[test]
+    fn append_only_owner_delta_removal_skipped_key_retained() {
+        let owner = agent(1);
+        let mut store = append_only_owner_store(owner);
+
+        let mut delta = KvStoreDelta::new(99);
+        delta.removed.insert("k1".to_string(), HashSet::new());
+        store
+            .merge_delta(&delta, peer(2), Some(&owner))
+            .expect("removal is skipped, not an error");
+        assert!(
+            store.get("k1").is_some(),
+            "owner-signed removal must not delete an append-only key"
+        );
+    }
+
+    #[test]
+    fn append_only_fresh_joiner_adopts_first_checkpoint() {
+        // Cold start: a fresh anchored joiner has no local keys, so the
+        // immutability gate is trivially satisfied and adoption proceeds.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/ao-cold";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        owner_store
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner append");
+        let cp = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut snap = owner_store.full_delta();
+        snap.owner_checkpoint = Some(cp);
+
+        let mut joiner =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        joiner
+            .merge_delta(&snap, peer(9), Some(&agent(9)))
+            .expect("fresh joiner adopts");
+        assert_eq!(joiner.highest_checkpoint_seq, 1);
+        assert_eq!(
+            joiner.get("k1").map(|e| e.value.clone()),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            *joiner.policy(),
+            AccessPolicy::AppendOnly,
+            "joiner learns the append-only policy from the checkpoint"
+        );
+    }
+
+    /// Build an owner-signed "rewritten history" snapshot: a fresh store with
+    /// the given entries, checkpointed at `seq`. Models an owner forging a
+    /// past-state replacement offline.
+    fn forged_snapshot(
+        id: KvStoreId,
+        owner: AgentId,
+        kp: &crate::identity::AgentKeypair,
+        topic: &str,
+        entries: &[(&str, &[u8])],
+        seq: u64,
+    ) -> KvStoreDelta {
+        let mut forged = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        for (k, v) in entries {
+            forged
+                .put(
+                    (*k).to_string(),
+                    v.to_vec(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("forge put");
+        }
+        let cp = checkpoint_for(&forged, topic, kp, seq);
+        let mut snap = forged.full_delta();
+        snap.owner_checkpoint = Some(cp);
+        snap
+    }
+
+    #[test]
+    fn append_only_checkpoint_shrinking_keyset_rejected() {
+        // An owner-signed checkpoint that DROPS an existing key must be
+        // rejected on a non-fresh replica: local state intact, high-water
+        // mark not advanced. An owner truncating its own log is exactly the
+        // attack this policy exists to stop.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/ao-shrink";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        for (k, v) in [("k1", b"v1".as_slice()), ("k2", b"v2".as_slice())] {
+            owner_store
+                .put(k.to_string(), v.to_vec(), "text/plain".to_string(), peer(1))
+                .expect("owner append");
+        }
+        let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut snap1 = owner_store.full_delta();
+        snap1.owner_checkpoint = Some(cp1);
+
+        let mut replica =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        replica
+            .merge_delta(&snap1, peer(9), Some(&agent(9)))
+            .expect("initial adoption");
+        assert_eq!(replica.highest_checkpoint_seq, 1);
+
+        // Owner forges history without k2.
+        let snap2 = forged_snapshot(id, owner, &kp, topic, &[("k1", b"v1")], 2);
+        replica
+            .merge_delta(&snap2, peer(9), Some(&owner))
+            .expect("rejection is loud in logs but not an error");
+        assert!(
+            replica.get("k2").is_some(),
+            "checkpoint that shrinks the keyset must not delete k2"
+        );
+        assert_eq!(
+            replica.highest_checkpoint_seq, 1,
+            "forged checkpoint must not advance the high-water mark"
+        );
+    }
+
+    #[test]
+    fn append_only_checkpoint_rewriting_value_rejected() {
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/ao-rewrite";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        owner_store
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner append");
+        let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut snap1 = owner_store.full_delta();
+        snap1.owner_checkpoint = Some(cp1);
+
+        let mut replica =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        replica
+            .merge_delta(&snap1, peer(9), Some(&agent(9)))
+            .expect("initial adoption");
+
+        // Owner forges history with k1 rewritten (same keyset, new bytes).
+        let snap2 = forged_snapshot(id, owner, &kp, topic, &[("k1", b"REWRITTEN")], 2);
+        replica
+            .merge_delta(&snap2, peer(9), Some(&owner))
+            .expect("rejection is loud in logs but not an error");
+        assert_eq!(
+            replica.get("k1").map(|e| e.value.clone()),
+            Some(b"v1".to_vec()),
+            "checkpoint rewriting an existing key must not change its bytes"
+        );
+        assert_eq!(replica.highest_checkpoint_seq, 1);
+    }
+
+    #[test]
+    fn signed_store_owner_update_and_delete_still_allowed() {
+        // Regression guard: AppendOnly enforcement must not leak into Signed
+        // stores — the owner's normal update/delete cycle is unchanged.
+        let owner = agent(1);
+        let mut store = KvStore::new(
+            store_id(8),
+            "plain".to_string(),
+            owner,
+            AccessPolicy::Signed,
+        );
+        store
+            .put(
+                "k".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        store
+            .put(
+                "k".to_string(),
+                b"v2".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("Signed store update must still work");
+        assert_eq!(
+            store.get("k").map(|e| e.value.clone()),
+            Some(b"v2".to_vec())
+        );
+        store.remove("k").expect("Signed store delete must still work");
+        assert!(store.get("k").is_none());
     }
 }

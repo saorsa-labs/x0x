@@ -15798,10 +15798,15 @@ async fn apply_direct_kv_store_delta(
 }
 
 /// Request body for POST /stores.
+///
+/// `policy` selects the access policy: `"signed"` (default — owner-only
+/// writes) or `"append_only"` (owner-only writes AND existing keys are
+/// immutable, even to the owner).
 #[derive(Debug, Deserialize)]
 struct CreateStoreRequest {
     name: String,
     topic: String,
+    policy: Option<String>,
 }
 
 /// Request body for PUT /stores/:id/:key.
@@ -15871,6 +15876,16 @@ async fn create_kv_store(
     Json(req): Json<CreateStoreRequest>,
 ) -> impl IntoResponse {
     let id = req.topic.clone();
+    // Resolve the requested access policy before any state is reserved.
+    let policy = match req.policy.as_deref() {
+        None | Some("signed") => x0x::kv::AccessPolicy::Signed,
+        Some("append_only") => x0x::kv::AccessPolicy::AppendOnly,
+        Some(other) => {
+            return bad_request(format!(
+                "unsupported policy {other:?}: expected \"signed\" or \"append_only\""
+            ))
+        }
+    };
     // Reserve the entire handle+manifest transaction for this (kind,id) so
     // a concurrent create/rehydrate for the same id cannot interleave handle
     // insertion with failure rollback, or spawn a duplicate listener.
@@ -15884,7 +15899,12 @@ async fn create_kv_store(
     if state.kv_stores.read().await.contains_key(&id) {
         return api_error(StatusCode::CONFLICT, "store already exists");
     }
-    match state.agent.create_kv_store(&req.name, &req.topic).await {
+    let policy_str = policy.to_string();
+    match state
+        .agent
+        .create_kv_store_with_policy(&req.name, &req.topic, policy)
+        .await
+    {
         Ok(handle) => {
             let info = handle.ownership_info().await;
             state.kv_stores.write().await.insert(id.clone(), handle);
@@ -15896,6 +15916,12 @@ async fn create_kv_store(
             extra.insert(
                 "expected_owner".to_string(),
                 serde_json::Value::String(owner_hex),
+            );
+            // Persist the policy so a restarted creator rehydrates with the
+            // same policy (an append-only store must never come back Signed).
+            extra.insert(
+                "policy".to_string(),
+                serde_json::Value::String(policy_str),
             );
             if let Err(e) = crdt_subscriptions::record(
                 &state,
@@ -16081,7 +16107,11 @@ async fn put_kv_value(
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
         }
         Err(e) => {
-            let status = if matches!(e, x0x::error::IdentityError::Unauthorized(_)) {
+            let status = if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) {
+                // AppendOnly store: the key already exists and existing keys
+                // are immutable, even to the owner.
+                StatusCode::CONFLICT
+            } else if matches!(e, x0x::error::IdentityError::Unauthorized(_)) {
                 // Local write rejected by the store's access policy — the
                 // caller is not the owner (or an allowlisted writer), or the
                 // joined replica has not yet learned the authoritative owner.
@@ -16150,6 +16180,10 @@ async fn delete_kv_value(
             let recipients = kv_store_delta_direct_recipients(&state).await;
             spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
+        Err(e) if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) => {
+            // AppendOnly store: keys can never be deleted, even by the owner.
+            api_error(StatusCode::CONFLICT, format!("{e}"))
         }
         Err(e) if matches!(e, x0x::error::IdentityError::Unauthorized(_)) => {
             api_error(StatusCode::FORBIDDEN, format!("{e}"))

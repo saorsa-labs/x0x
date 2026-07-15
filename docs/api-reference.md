@@ -721,6 +721,20 @@ unconditional (still advisory).
 | GET | `/stores/:id/:key` | `x0x store get <store_id> <key>` | Get a value |
 | DELETE | `/stores/:id/:key` | `x0x store rm <store_id> <key>` | Remove a value |
 
+### Store create request body
+
+```json
+{
+  "name": "events",
+  "topic": "my-app/events",
+  "policy": "append_only"
+}
+```
+
+`policy` is optional: `"signed"` (default) or `"append_only"`. Any other
+value is a **400**. CLI: `x0x store create <name> <topic> --policy append_only`.
+`GET /stores` and the create/join responses report the store's policy string.
+
 ### Store put request body
 
 ```json
@@ -739,6 +753,19 @@ when this daemon's agent is not authorized — including on a joined replica
 that has not yet learned the store's authoritative owner from the
 owner-signed announcement (`"not authorized: store owner unknown: ..."`).
 Reads are always allowed.
+
+### Append-only stores
+
+A store created with `"policy": "append_only"` behaves like `Signed`
+(owner-only writes) with one addition: **existing keys are immutable, even
+to the owner**. `PUT` on an existing key with different content and `DELETE`
+on any existing key return **409 Conflict** with
+`{"ok":false,"error":"immutable key: <key> — append-only store; ..."}`.
+Re-putting byte-identical content (same value and content type) is accepted
+as an idempotent no-op, so retries are safe. Replicas enforce the same rule
+against remote deltas and owner-signed checkpoints, so an owner cannot
+rewrite or truncate the log retroactively — this is what makes append-only
+event logs tamper-evident against their own author.
 
 ## File transfers
 

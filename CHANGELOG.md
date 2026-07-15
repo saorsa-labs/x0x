@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- `AccessPolicy::AppendOnly` for KV stores (tracker-integrity-v2 WP-X,
+  x0x-symphony #10): owner-signed like `Signed`, but existing keys are
+  IMMUTABLE — no update to different content, no delete, even by the owner.
+  Enforced at every path: local put/remove (`KvError::ImmutableKey`),
+  remote deltas (violating entries/removals are skipped and logged, the
+  rest of the delta still applies), and owner-signed checkpoint adoption
+  (a checkpoint that shrinks the keyset or rewrites an existing key is
+  rejected outright; fresh-joiner cold-start adoption is unaffected).
+  Byte-identical re-puts are accepted as idempotent no-ops (retry-friendly).
+  REST: `POST /stores` accepts `"policy": "append_only"`; `PUT`/`DELETE` on
+  an existing key of an append-only store return 409 Conflict. CLI:
+  `x0x store create --policy append_only`. The policy is persisted in the
+  subscription manifest so a restarted creator rehydrates append-only.
+  Wire/storage compat: the variant is appended at the END of the
+  bincode-positional `AccessPolicy` enum, so existing stores, deltas, and
+  checkpoints are unaffected.
+
 ## [v0.32.1] - 2026-07-15
 
 ### Changed

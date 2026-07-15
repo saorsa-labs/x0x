@@ -10656,6 +10656,26 @@ impl Agent {
     ///
     /// Returns an error if the gossip runtime is not initialized.
     pub async fn create_kv_store(&self, name: &str, topic: &str) -> error::Result<KvStoreHandle> {
+        self.create_kv_store_with_policy(name, topic, kv::AccessPolicy::Signed)
+            .await
+    }
+
+    /// Create a new key-value store with an explicit access policy.
+    ///
+    /// Like [`create_kv_store`](Self::create_kv_store) (which uses
+    /// [`kv::AccessPolicy::Signed`]), but lets the creator choose the policy —
+    /// e.g. [`kv::AccessPolicy::AppendOnly`] for tamper-evident event logs
+    /// whose existing keys are immutable even to the owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn create_kv_store_with_policy(
+        &self,
+        name: &str,
+        topic: &str,
+        policy: kv::AccessPolicy,
+    ) -> error::Result<KvStoreHandle> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
                 "gossip runtime not initialized - configure agent with network first",
@@ -10664,12 +10684,7 @@ impl Agent {
 
         let peer_id = runtime.peer_id();
         let store_id = kv::KvStoreId::for_topic_owner(topic, &self.agent_id());
-        let store = kv::KvStore::new(
-            store_id,
-            name.to_string(),
-            self.agent_id(),
-            kv::AccessPolicy::Signed,
-        );
+        let store = kv::KvStore::new(store_id, name.to_string(), self.agent_id(), policy);
 
         let sync = kv::KvStoreSync::new(
             store,
@@ -10949,10 +10964,13 @@ impl KvStoreHandle {
                     content_type.clone(),
                     self.peer_id,
                 )
-                .map_err(|e| {
-                    error::IdentityError::Storage(std::io::Error::other(format!(
-                        "kv put failed: {e}",
-                    )))
+                .map_err(|e| match e {
+                    // AppendOnly immutability violation — surfaced distinctly
+                    // so the API layer can map it to HTTP 409 Conflict.
+                    kv::KvError::ImmutableKey(k) => error::IdentityError::ImmutableKey(k),
+                    other => error::IdentityError::Storage(std::io::Error::other(format!(
+                        "kv put failed: {other}",
+                    ))),
                 })?;
             let entry = store.get(&key).cloned();
             let version = store.current_version();
@@ -11023,10 +11041,13 @@ impl KvStoreHandle {
         let delta = {
             let mut store = self.sync.write().await;
             Self::check_local_write(&store, &self.agent_id)?;
-            store.remove(key).map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "kv remove failed: {e}",
-                )))
+            store.remove(key).map_err(|e| match e {
+                // AppendOnly immutability violation — surfaced distinctly
+                // so the API layer can map it to HTTP 409 Conflict.
+                kv::KvError::ImmutableKey(k) => error::IdentityError::ImmutableKey(k),
+                other => error::IdentityError::Storage(std::io::Error::other(format!(
+                    "kv remove failed: {other}",
+                ))),
             })?;
             let mut d = kv::KvStoreDelta::new(store.current_version());
             d.removed
@@ -11128,7 +11149,8 @@ pub struct KvStoreOwnershipInfo {
     /// Hex-encoded anchored owner, or `None` when no owner is anchored
     /// (read-only by design).
     pub owner: Option<String>,
-    /// Access policy (`"signed"` / `"allowlisted"` / `"encrypted"`).
+    /// Access policy (`"signed"` / `"allowlisted"` / `"encrypted"` /
+    /// `"append_only"`).
     pub policy: String,
     /// Store version (monotonic, bumped on every mutation).
     pub version: u64,

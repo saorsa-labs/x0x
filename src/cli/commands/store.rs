@@ -9,9 +9,20 @@ pub async fn list(client: &DaemonClient) -> Result<()> {
 }
 
 /// `x0x store create` — POST /stores.
-pub async fn create(client: &DaemonClient, name: &str, topic: &str) -> Result<()> {
+///
+/// `policy` is the optional access policy: `"signed"` (default) or
+/// `"append_only"` (existing keys immutable, even to the owner).
+pub async fn create(
+    client: &DaemonClient,
+    name: &str,
+    topic: &str,
+    policy: Option<&str>,
+) -> Result<()> {
     client.ensure_running().await?;
-    let body = serde_json::json!({ "name": name, "topic": topic });
+    let mut body = serde_json::json!({ "name": name, "topic": topic });
+    if let Some(p) = policy {
+        body["policy"] = serde_json::Value::String(p.to_string());
+    }
     let resp = client.post("/stores", &body).await?;
     print_value(client.format(), &resp);
     Ok(())
