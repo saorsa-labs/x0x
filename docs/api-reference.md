@@ -766,9 +766,14 @@ as an idempotent no-op, so retries are safe (and no new owner checkpoint is
 produced). The policy is terminal: once a replica knows a store is
 append-only, no owner announce or checkpoint can transition it back to
 `signed`. The daemon snapshots every store's full state to
-`<data_dir>/kv-stores/<store-id-hex>.bin` after each mutation, so
-immutability knowledge survives restarts; a corrupt or conflicting snapshot
-fails closed at startup rather than silently starting empty.
+`<data_dir>/kv-stores/<store-id-hex>.bin` after each mutation (local
+writes, gossip deltas, and direct-delivery deltas alike), so immutability
+knowledge survives restarts; a corrupt or conflicting snapshot fails closed
+at startup rather than silently starting empty. If a snapshot write FAILS,
+the local write returns **500**, the delta is NOT published (durability
+before announcement), the store reports `"durability_degraded": true` in
+`GET /stores` and create/join responses, and further local writes are
+refused until a snapshot succeeds; remote replication continues.
 
 **Exact guarantee**: keys are immutable *after first observation by a
 continuously-persistent replica*. Such a replica rejects every rewrite or

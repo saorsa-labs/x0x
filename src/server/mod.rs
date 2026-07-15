@@ -15842,6 +15842,9 @@ struct StoreListEntry {
     policy_version: u64,
     /// Strongly-typed ownership discriminant.
     ownership_status: x0x::kv::OwnershipStatus,
+    /// True while snapshot persistence is failing (local writes refused
+    /// until a snapshot succeeds).
+    durability_degraded: bool,
 }
 
 /// GET /stores
@@ -15866,6 +15869,7 @@ async fn list_kv_stores(State(state): State<Arc<AppState>>) -> impl IntoResponse
             version: info.version,
             policy_version: info.policy_version,
             ownership_status: info.ownership_status,
+            durability_degraded: info.durability_degraded,
         });
     }
     Json(serde_json::json!({ "ok": true, "stores": entries }))

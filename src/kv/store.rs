@@ -649,16 +649,26 @@ impl KvStore {
         self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Floor the in-memory sequence counter to the persisted `version`.
+    /// Current value of the in-memory sequence counter (highest seq minted).
     ///
-    /// `seq_counter` is `serde(skip)`, so a snapshot-restored store would
-    /// otherwise mint OR-Set tags starting from 0 again — potentially
-    /// colliding with tags issued before the restart. `version` increments on
-    /// every mutation, so it is always >= the number of locally minted tags.
-    pub(crate) fn floor_seq_counter_to_version(&self) {
-        let v = self.version;
-        if self.seq_counter.load(Ordering::Relaxed) < v {
-            self.seq_counter.store(v, Ordering::Relaxed);
+    /// Snapshot persistence stores this alongside the store state so a
+    /// restart can restore the exact tag ceiling — `seq_counter` itself is
+    /// `serde(skip)` for wire/legacy-layout reasons.
+    pub(crate) fn seq_counter_value(&self) -> u64 {
+        self.seq_counter.load(Ordering::Relaxed)
+    }
+
+    /// Restore the in-memory sequence counter to at least `floor`.
+    ///
+    /// Called on snapshot restore with the persisted counter value so a
+    /// restarted node can never re-mint an OR-Set `(peer, seq)` tag it used
+    /// before the restart. (`KvStoreHandle::put_with_delta` mints a second
+    /// seq per put for the published delta tag, so the counter deliberately
+    /// runs ahead of `version` — persisting the real counter, not a
+    /// version-derived floor, is what makes this bound exact.)
+    pub(crate) fn restore_seq_counter(&self, floor: u64) {
+        if self.seq_counter.load(Ordering::Relaxed) < floor {
+            self.seq_counter.store(floor, Ordering::Relaxed);
         }
     }
 
@@ -1133,6 +1143,24 @@ impl KvStore {
                     );
                     return Ok(());
                 }
+            }
+        }
+
+        // Canonical-map gate, ALL policies: a delta carrying the same key in
+        // both `added` and `updated` is ambiguous by construction (two values
+        // for one key in one message) — no legitimate producer emits it
+        // (`for_put` is added-only, removals are removed-only, `full_delta`
+        // is added-only). Drop the whole delta rather than letting map
+        // iteration/LWW order decide which copy wins. Mirrors the adoption
+        // path's 5b gate; only the authorized writer can reach this point,
+        // so rejection cannot be used by third parties to censor writes.
+        for key in delta.updated.keys() {
+            if delta.added.contains_key(key) {
+                tracing::warn!(
+                    "rejected ambiguous delta for store {}: key {key:?} appears in both added and updated",
+                    self.id
+                );
+                return Ok(());
             }
         }
 
@@ -3423,21 +3451,15 @@ mod tests {
                 (peer(2), 42),
             ),
         );
-        // New keys in the same delta must still append fine.
+        // New keys in the same delta must still append fine. (k1 must NOT
+        // also appear in `updated` here — the global canonical-map gate
+        // drops any delta carrying one key in both maps; that shape has its
+        // own tests.)
         delta.added.insert(
             "k2".to_string(),
             (
                 KvEntry::new("k2".to_string(), b"v2".to_vec(), "text/plain".to_string()),
                 (peer(2), 43),
-            ),
-        );
-        // The `updated` path must be gated identically.
-        delta.updated.insert(
-            "k1".to_string(),
-            KvEntry::new(
-                "k1".to_string(),
-                b"REWRITTEN-2".to_vec(),
-                "text/plain".to_string(),
             ),
         );
         store
@@ -3452,6 +3474,26 @@ mod tests {
             store.get("k2").map(|e| e.value.clone()),
             Some(b"v2".to_vec()),
             "appends in the same delta still apply"
+        );
+
+        // The `updated` path is gated identically (separate delta so the
+        // canonical-map gate does not trigger).
+        let mut delta2 = KvStoreDelta::new(100);
+        delta2.updated.insert(
+            "k1".to_string(),
+            KvEntry::new(
+                "k1".to_string(),
+                b"REWRITTEN-2".to_vec(),
+                "text/plain".to_string(),
+            ),
+        );
+        store
+            .merge_delta(&delta2, peer(2), Some(&owner))
+            .expect("updated-path violation skipped");
+        assert_eq!(
+            store.get("k1").map(|e| e.value.clone()),
+            Some(b"v1".to_vec()),
+            "updated-path rewrite skipped too"
         );
     }
 
@@ -4096,6 +4138,65 @@ mod tests {
             root_before,
             "latest_checkpoint unchanged after a skip-only delta"
         );
+    }
+
+    #[test]
+    fn signed_store_ambiguous_added_updated_delta_dropped() {
+        // WHY: the canonical-map rule is global, not AppendOnly-only. A delta
+        // carrying one key in both `added` and `updated` holds two values for
+        // one key in one message — which copy wins would be decided by map
+        // iteration/LWW ordering, not by anything the producer expressed. No
+        // legitimate producer emits this shape, so merge_delta drops the
+        // whole delta for EVERY policy.
+        let owner = agent(1);
+        let mut store = KvStore::new(
+            store_id(9),
+            "plain".to_string(),
+            owner,
+            AccessPolicy::Signed,
+        );
+        store
+            .put(
+                "k".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let v_before = store.current_version();
+
+        let mut dup = KvStoreDelta::new(99);
+        dup.added.insert(
+            "k".to_string(),
+            (
+                KvEntry::new("k".to_string(), b"v2".to_vec(), "text/plain".to_string()),
+                (peer(2), 7),
+            ),
+        );
+        dup.updated.insert(
+            "k".to_string(),
+            KvEntry::new("k".to_string(), b"v3".to_vec(), "text/plain".to_string()),
+        );
+        // An innocent sibling key must not survive either: the ambiguity
+        // poisons the whole delta.
+        dup.added.insert(
+            "other".to_string(),
+            (
+                KvEntry::new("other".to_string(), b"x".to_vec(), "text/plain".to_string()),
+                (peer(2), 8),
+            ),
+        );
+
+        store
+            .merge_delta(&dup, peer(2), Some(&owner))
+            .expect("dropped, not an error");
+        assert_eq!(
+            store.get("k").map(|e| e.value.clone()),
+            Some(b"v1".to_vec()),
+            "ambiguous delta must not change the key on a Signed store"
+        );
+        assert!(store.get("other").is_none(), "whole delta dropped");
+        assert_eq!(store.current_version(), v_before, "no state change");
     }
 
     #[test]

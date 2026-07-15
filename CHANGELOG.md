@@ -34,18 +34,33 @@ All notable changes to this project will be documented in this file.
   checkpoints are unaffected.
 - KV store state snapshots: the daemon now persists every KV store's full
   state (policy, keyset, entries, latest adopted checkpoint, checkpoint
-  high-water mark) to `<data_dir>/kv-stores/<store-id-hex>.bin` (bincode,
-  atomic temp-file + fsync + rename) after every local mutation, merged
-  remote delta, and policy refresh — and restores it on restart BEFORE any
-  write is accepted (`Agent::create_kv_store_persistent` /
-  `Agent::join_kv_store_persistent`). This closes the restart-amnesia hole
-  where an append-only owner or replica came back empty and would have
-  re-accepted (and, for an owner, re-signed) rewrites of keys it no longer
-  remembered. Corrupt snapshots, store-id/owner mismatches, policy
-  conflicts, and malformed manifest policy strings all FAIL CLOSED (loud
-  skip/startup error, never a silent Signed downgrade). Legacy manifest
-  entries without a policy field remain Signed (documented compatibility
-  default).
+  high-water mark, and the OR-Set sequence-counter ceiling) to
+  `<data_dir>/kv-stores/<store-id-hex>.bin` after every local mutation,
+  merged remote delta — gossip AND the direct-delivery side channel — and
+  policy refresh, restoring it on restart BEFORE any write is accepted
+  (`Agent::create_kv_store_persistent` / `Agent::join_kv_store_persistent`).
+  This closes the restart-amnesia hole where an append-only owner or replica
+  came back empty and would have re-accepted (and, for an owner, re-signed)
+  rewrites of keys it no longer remembered. Corrupt snapshots,
+  store-id/owner mismatches, policy conflicts, and malformed manifest policy
+  strings all FAIL CLOSED (loud skip/startup error, never a silent Signed
+  downgrade). Legacy manifest entries without a policy field remain Signed
+  (documented compatibility default).
+  Durability contract: snapshot format v1 (`X0XKVS1` magic + bincode body;
+  introduced unreleased, no compat read path — unrecognized files fail
+  closed); writes are atomic (unique temp file + fsync + rename + parent
+  directory fsync on Unix; on non-Unix the parent fsync is skipped — the
+  rename stays atomic but its power-loss durability is not guaranteed
+  there); commits are serialized per store and version-gated so a
+  concurrent persist burst can never rename an older snapshot over a newer
+  one; a FAILED snapshot write on the local write path errors the write
+  (REST 500), does NOT publish the delta (durability before announcement —
+  the in-memory mutation stays applied and is recovered by the next
+  successful persist), flags the store `durability_degraded` (surfaced in
+  `GET /stores` and store create/join responses), and refuses further LOCAL
+  writes until a persist succeeds; remote-delta persist failures degrade
+  but never wedge replication. SIGKILL/power loss beyond the parent-dir
+  fsync (e.g. hardware write caches) is out of scope.
 
 ### Compatibility caveats
 
