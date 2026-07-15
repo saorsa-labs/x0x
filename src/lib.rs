@@ -9643,11 +9643,14 @@ impl AgentBuilder {
         self
     }
 
-    /// Disable the bootstrap peer cache entirely.
+    /// Disable bootstrap peer cache persistence.
     ///
-    /// When set, the agent will not open or load any cached peers on
-    /// startup. This ensures complete network isolation from previously
-    /// seen peers for embedders and dedicated test harnesses.
+    /// When set, the cache is in-memory only for this session: no cached
+    /// peers are loaded on startup and nothing is written to disk (no
+    /// cache directory is created). This ensures complete network
+    /// isolation from previously seen peers for embedders and dedicated
+    /// test harnesses, while the transport keeps its normal in-session
+    /// reconnection behaviour.
     ///
     /// Note: the x0xd daemon's `--no-hard-coded-bootstrap` flag does
     /// not call this; it clears only the embedded global bootstrap
@@ -9918,30 +9921,27 @@ impl AgentBuilder {
             identity::Identity::new(machine_keypair, agent_keypair)
         };
 
-        // Open bootstrap peer cache if network will be configured
-        // and the cache is not explicitly disabled by the caller.
-        let bootstrap_cache = if self.network_config.is_some() && !self.disable_peer_cache {
+        // Configure the bootstrap peer cache. The cache *instance* is owned
+        // by the ant-quic endpoint (one cache per node, shared by transport
+        // reconnection, x0x join phases and presence enrichment) — x0x only
+        // chooses where it lives and whether it persists, then borrows the
+        // endpoint's instance after node creation. `disable_peer_cache`
+        // yields a session-only in-memory cache: nothing is loaded from
+        // previous runs and nothing is written to disk.
+        let bootstrap_cache_config = if self.network_config.is_some() {
             let cache_dir = self.peer_cache_dir.unwrap_or_else(|| {
                 dirs::home_dir()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join(".x0x")
                     .join("peers")
             });
-            let config = ant_quic::BootstrapCacheConfig::builder()
-                .cache_dir(cache_dir)
-                .min_peers_to_save(1)
-                .build();
-            match ant_quic::BootstrapCache::open(config).await {
-                Ok(cache) => {
-                    let cache = std::sync::Arc::new(cache);
-                    std::sync::Arc::clone(&cache).start_maintenance();
-                    Some(cache)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to open bootstrap cache: {e}");
-                    None
-                }
-            }
+            Some(
+                ant_quic::BootstrapCacheConfig::builder()
+                    .cache_dir(cache_dir)
+                    .min_peers_to_save(1)
+                    .persist(!self.disable_peer_cache)
+                    .build(),
+            )
         } else {
             None
         };
@@ -10008,7 +10008,7 @@ impl AgentBuilder {
         > = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
         let network = if let Some(config) = self.network_config {
-            let node = network::NetworkNode::new(config, bootstrap_cache.clone(), machine_keypair)
+            let node = network::NetworkNode::new(config, bootstrap_cache_config, machine_keypair)
                 .await
                 .map_err(|e| {
                     error::IdentityError::Storage(std::io::Error::other(format!(
@@ -10028,6 +10028,12 @@ impl AgentBuilder {
         } else {
             None
         };
+
+        // Borrow the endpoint-owned cache so every layer (transport
+        // reconnection, join phases, presence enrichment, gossip adapter)
+        // reads and writes one instance. The endpoint runs maintenance —
+        // do not start it again here.
+        let bootstrap_cache = network.as_ref().and_then(|n| n.bootstrap_cache());
 
         // Load the local revocation set now (shared Arc) so the relay-DM
         // listener can enforce revocation on inbound relayed envelopes. The

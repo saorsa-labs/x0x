@@ -761,7 +761,6 @@ pub async fn serve_with_options(
         max_connections: 50,
         connection_timeout: std::time::Duration::from_secs(30),
         stats_interval: std::time::Duration::from_secs(60),
-        peer_cache_path: (!cli_disable_peer_cache).then(|| cache_dir.join("peers.cache")),
         pinned_bootstrap_peers: std::collections::HashSet::new(),
         inbound_allowlist: std::collections::HashSet::new(),
         max_peers_per_ip: 3,

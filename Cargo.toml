@@ -1,6 +1,6 @@
 [package]
 name = "x0x"
-version = "0.31.4"
+version = "0.32.0"
 edition = "2021"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
@@ -19,7 +19,7 @@ exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
 
 [dependencies]
 anyhow = "1.0"
-ant-quic = "0.27.32"
+ant-quic = "0.27.33"
 saorsa-mls = "0.3.8"
 async-trait = "0.1"
 bincode = "1.3"

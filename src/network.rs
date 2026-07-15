@@ -29,7 +29,6 @@ use saorsa_gossip_transport::GossipStreamType;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
@@ -213,10 +212,6 @@ pub struct NetworkConfig {
     /// Interval for collecting and reporting stats.
     #[serde(default = "default_stats_interval")]
     pub stats_interval: Duration,
-
-    /// Path to persist peer cache.
-    #[serde(default)]
-    pub peer_cache_path: Option<PathBuf>,
 
     /// Pinned bootstrap peer IDs. When non-empty, `dial_bootstrap()` rejects
     /// peers whose ID is not in this set. Prevents spoofed bootstrap nodes.
@@ -459,7 +454,6 @@ impl Default for NetworkConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             stats_interval: DEFAULT_STATS_INTERVAL,
-            peer_cache_path: None,
             pinned_bootstrap_peers: std::collections::HashSet::new(),
             inbound_allowlist: std::collections::HashSet::new(),
             max_peers_per_ip: 3,
@@ -1399,7 +1393,13 @@ impl NetworkNode {
     /// # Arguments
     ///
     /// * `config` - Network configuration options.
-    /// * `bootstrap_cache` - Optional bootstrap peer cache for quality-scored reconnection.
+    /// * `bootstrap_cache_config` - Optional bootstrap peer cache configuration.
+    ///   The cache instance itself is owned by the ant-quic endpoint (one cache
+    ///   per node, shared by transport reconnection and x0x enrichment); this
+    ///   parameter only chooses where it lives and whether it persists. When
+    ///   `None`, ant-quic's default applies — a **host-shared** cache directory,
+    ///   so callers running multiple nodes per host should pass an explicit
+    ///   per-instance config.
     /// * `keypair` - Optional ML-DSA-65 keypair for identity unification. When provided,
     ///   the ant-quic `Node` uses this keypair for QUIC TLS, making the transport PeerId
     ///   equal to the x0x MachineId derived from the same key.
@@ -1413,7 +1413,7 @@ impl NetworkNode {
     /// Returns `NetworkError` if node creation fails.
     pub async fn new(
         config: NetworkConfig,
-        bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
+        bootstrap_cache_config: Option<ant_quic::BootstrapCacheConfig>,
         keypair: Option<(ant_quic::MlDsaPublicKey, ant_quic::MlDsaSecretKey)>,
     ) -> NetworkResult<Self> {
         let mut builder = NodeConfig::builder()
@@ -1471,11 +1471,21 @@ impl NetworkNode {
         // (and downstream via the daemon's config TOML / CLI flag).
         builder = builder.port_mapping_enabled(config.port_mapping_enabled);
 
+        // Single-cache architecture: the endpoint owns the bootstrap cache;
+        // x0x borrows the same instance below instead of opening a second
+        // cache on the same directory.
+        if let Some(cache_config) = bootstrap_cache_config {
+            builder = builder.bootstrap_cache(cache_config);
+        }
+
         let node = Node::with_config(builder.build()).await.map_err(|e| {
             NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e))
         })?;
 
         let peer_id = node.peer_id();
+        // Share the endpoint's cache instance (never a second handle on the
+        // same file). The endpoint runs cache maintenance itself.
+        let bootstrap_cache = Some(node.bootstrap_cache());
         let (event_sender, _event_receiver) = broadcast::channel(32);
         // Inbound gossip buffers are split by stream type so PubSub back-pressure
         // cannot block Bulk presence beacons or Membership/SWIM control traffic.
@@ -1549,6 +1559,16 @@ impl NetworkNode {
     /// A reference to the network configuration.
     pub fn config(&self) -> &NetworkConfig {
         &self.config
+    }
+
+    /// The bootstrap peer cache shared with the ant-quic endpoint.
+    ///
+    /// This is the endpoint's own cache instance (see
+    /// [`ant_quic::Node::bootstrap_cache`]) — enrich and query it freely,
+    /// but do not call `start_maintenance` on it: the endpoint already
+    /// runs maintenance.
+    pub fn bootstrap_cache(&self) -> Option<Arc<ant_quic::BootstrapCache>> {
+        self.bootstrap_cache.clone()
     }
 
     /// Get the configured bind address (may contain port 0 before binding).
@@ -3944,6 +3964,85 @@ async fn test_network_node_multiple_subscribers() {
     assert!(rx2.recv().await.is_ok());
 }
 
+/// The endpoint must own exactly one bootstrap cache and honor the
+/// per-instance directory plumbed through the cache config. Before this,
+/// the endpoint silently opened a *second* cache in a host-shared
+/// directory (`$TMPDIR/ant-quic-cache`), so instances on one host (e.g.
+/// prod and testnet daemons on a VPS) could pollute each other's peer
+/// planes and the endpoint's reconnection data diverged from x0x's.
+#[tokio::test]
+async fn network_node_uses_plumbed_per_instance_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("peers");
+    let cache_config = ant_quic::BootstrapCacheConfig::builder()
+        .cache_dir(&cache_dir)
+        .min_peers_to_save(1)
+        .build();
+    let config = NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+        bootstrap_nodes: Vec::new(),
+        ..NetworkConfig::default()
+    };
+    let node = NetworkNode::new(config, Some(cache_config), None)
+        .await
+        .unwrap();
+
+    let cache = node
+        .bootstrap_cache()
+        .expect("endpoint cache must be shared with x0x");
+    cache
+        .add_seed(
+            ant_quic::PeerId([9u8; 32]),
+            vec!["127.0.0.1:9000".parse().unwrap()],
+        )
+        .await;
+    cache.save().await.unwrap();
+
+    assert!(
+        cache_dir.join("bootstrap_cache.json").exists(),
+        "endpoint cache must persist to the per-instance dir x0x configured"
+    );
+}
+
+/// `persist(false)` (the daemon's `--disable-peer-cache`) must leave zero
+/// disk state: nothing loaded from previous runs, nothing written — this
+/// is what guarantees hermetic test harnesses and local-only setups.
+#[tokio::test]
+async fn network_node_in_memory_cache_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("peers");
+    let cache_config = ant_quic::BootstrapCacheConfig::builder()
+        .cache_dir(&cache_dir)
+        .min_peers_to_save(1)
+        .persist(false)
+        .build();
+    let config = NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+        bootstrap_nodes: Vec::new(),
+        ..NetworkConfig::default()
+    };
+    let node = NetworkNode::new(config, Some(cache_config), None)
+        .await
+        .unwrap();
+
+    let cache = node
+        .bootstrap_cache()
+        .expect("in-memory cache still usable");
+    cache
+        .add_seed(
+            ant_quic::PeerId([9u8; 32]),
+            vec!["127.0.0.1:9000".parse().unwrap()],
+        )
+        .await;
+    cache.save().await.unwrap();
+
+    assert!(
+        !cache_dir.exists(),
+        "in-memory cache must not create any disk state"
+    );
+    assert_eq!(cache.peer_count().await, 1, "runtime behaviour unchanged");
+}
+
 /// Test that connections between local nodes are bidirectionally visible.
 ///
 /// This reproduces the "phantom connection" bug where `connect_addr()` succeeds
@@ -3972,7 +4071,6 @@ async fn test_mesh_connections_are_bidirectional() {
             max_connections: 100,
             connection_timeout: CONNECT_TIMEOUT,
             stats_interval: std::time::Duration::from_secs(60),
-            peer_cache_path: None,
             pinned_bootstrap_peers: std::collections::HashSet::new(),
             inbound_allowlist: std::collections::HashSet::new(),
             max_peers_per_ip: 3,

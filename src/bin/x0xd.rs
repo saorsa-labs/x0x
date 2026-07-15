@@ -327,6 +327,23 @@ async fn main() -> anyhow::Result<()> {
             cancel.cancel();
         }
     });
+    // SIGTERM (what systemd/launchd send on stop/restart) must drive the same
+    // graceful exit as Ctrl-C: the shutdown path closes connections and
+    // flushes the bootstrap peer cache so learned peers survive restart.
+    #[cfg(unix)]
+    {
+        let cancel = handle.cancellation_token();
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    if sigterm.recv().await.is_some() {
+                        cancel.cancel();
+                    }
+                }
+                Err(e) => tracing::warn!("failed to install SIGTERM handler: {e}"),
+            }
+        });
+    }
     handle.wait().await
 }
 
