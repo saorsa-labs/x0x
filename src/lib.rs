@@ -11143,13 +11143,21 @@ impl KvStoreHandle {
                     // NOTE: this next_seq() is the SECOND seq minted for this
                     // put (KvStore::put minted one for the local OR-Set tag),
                     // so the published delta tag differs from the local tag.
-                    // That divergence is benign — removals are key-scoped
-                    // (tag sets are not consulted) and tags only need to be
-                    // unique per peer — and the snapshot persists the real
-                    // counter, so neither tag can ever be re-minted after a
-                    // restart. Deliberately not "fixed": returning the tag
-                    // from KvStore::put would change its public signature
-                    // for no behavioral gain.
+                    // That divergence is benign, precisely because of how the
+                    // two remove paths treat tags: a LOCAL remove
+                    // (KvStore::remove) calls OrSet::remove, which tombstones
+                    // every tag the local set has OBSERVED for the key
+                    // (observed-remove — tags ARE consulted there, but only
+                    // locally-observed ones, which always include the local
+                    // tag); the WIRE remove path (merge_delta's `removed`
+                    // loop) is key-scoped — receivers remove by key and never
+                    // consult the delta's tag sets — so a receiver drops its
+                    // divergent tag too. Neither side can strand or resurrect
+                    // a key on account of the mismatch. The snapshot persists
+                    // the real counter, so neither tag can ever be re-minted
+                    // after a restart. Deliberately not "fixed": returning
+                    // the tag from KvStore::put would change its public
+                    // signature for no behavioral gain.
                     kv::KvStoreDelta::for_put(key, e, (self.peer_id, store.next_seq()), version)
                 }
                 None => {
@@ -12626,6 +12634,15 @@ mod tests {
             .expect("healthy put");
         assert!(!store.ownership_info().await.durability_degraded);
 
+        // Observe the store's main topic directly so publish suppression can
+        // be asserted, not merely inferred. (k1's delta was published before
+        // this subscription; the state-request/announce chatter uses the
+        // /state-sync side topic and cannot land here.)
+        let mut topic_sub = agent
+            .subscribe("degrade-topic")
+            .await
+            .expect("subscribe main topic");
+
         // Break the disk: the snapshot dir becomes unwritable.
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555))
             .expect("chmod ro");
@@ -12656,8 +12673,46 @@ mod tests {
             "fail-closed BEFORE mutation: k3 must not exist even in memory"
         );
 
-        // Heal the disk: the retry persists the full pending state (k2
-        // included), clears the flag, and writes flow again.
+        // Publish suppression, asserted DIRECTLY: neither the failed k2 put
+        // nor the refused k3 put may have announced anything on the topic.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(800), topic_sub.recv())
+                .await
+                .is_err(),
+            "failed-persist local writes must not publish a delta (durability before announcement)"
+        );
+
+        // Degrade-not-wedge: REMOTE merges continue while degraded. The
+        // owner-authored delta applies (state converges) even though its
+        // persist attempt fails; the store stays degraded but replication is
+        // never refused.
+        let mut remote = kv::KvStoreDelta::new(50);
+        remote.added.insert(
+            "remote-k".to_string(),
+            (
+                kv::KvEntry::new(
+                    "remote-k".to_string(),
+                    b"rv".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (store.peer_id(), 999),
+            ),
+        );
+        store
+            .apply_remote_delta(store.peer_id(), &remote, Some(agent.agent_id()))
+            .await
+            .expect("remote merge must CONTINUE while durability-degraded");
+        assert!(
+            store.get("remote-k").await.expect("read").is_some(),
+            "remote delta applied while degraded"
+        );
+        assert!(
+            store.ownership_info().await.durability_degraded,
+            "still degraded after the remote merge (its persist also failed) — degraded, not wedged"
+        );
+
+        // Heal the disk: the retry persists the full pending state (k2 and
+        // remote-k included), clears the flag, and writes flow again.
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755))
             .expect("chmod rw");
         store
@@ -12665,6 +12720,17 @@ mod tests {
             .await
             .expect("recovered put");
         assert!(!store.ownership_info().await.durability_degraded);
+
+        // Positive control for the suppression assert above: the recovered
+        // put DOES publish, proving the subscription observes this topic.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(15), topic_sub.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_some(),
+            "recovered put must publish its delta (subscription sees the topic)"
+        );
         let snap_path = kv_snapshot_path(
             &state_dir,
             &kv::KvStoreId::for_topic_owner("degrade-topic", &agent.agent_id()),
@@ -12672,14 +12738,103 @@ mod tests {
         let snap = kv::sync::load_snapshot(&snap_path)
             .expect("load")
             .expect("present");
-        for k in ["k1", "k2", "k4"] {
+        for k in ["k1", "k2", "k4", "remote-k"] {
             assert!(
                 snap.get(k).is_some(),
-                "recovered snapshot must contain {k} (k2 was applied in memory \
-                 before its persist failed and is captured by the recovery persist)"
+                "recovered snapshot must contain {k} (k2/remote-k were applied in \
+                 memory while degraded and are captured by the recovery persist)"
             );
         }
         assert!(snap.get("k3").is_none(), "refused write never existed");
+        agent.shutdown().await;
+    }
+
+    /// Nit-1 (round-3 review): the remove path has the identical durability
+    /// contract as put — a failed snapshot errors the remove (mutation stays
+    /// in memory), the NEXT remove is refused BEFORE mutating, and healing
+    /// the disk recovers the pending tombstone and clears the flag. Uses a
+    /// Signed store because AppendOnly rejects removes outright.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_remove_persist_failure_fails_closed_and_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+        let store = agent
+            .create_kv_store_persistent(
+                "rm-degrade",
+                "rm-degrade-topic",
+                kv::AccessPolicy::Signed,
+                &state_dir,
+            )
+            .await
+            .expect("create");
+        for k in ["k1", "k2", "k3"] {
+            store
+                .put(k.to_string(), b"v".to_vec(), "text/plain".to_string())
+                .await
+                .expect("seed put");
+        }
+
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod ro");
+
+        // Failing persist errors the remove; the tombstone is already in
+        // memory (mutation precedes persist, same as put).
+        let err = store
+            .remove("k1")
+            .await
+            .expect_err("persist failure must fail the local remove");
+        assert!(
+            format!("{err}").contains("durability-degraded"),
+            "error names the durability failure; got: {err}"
+        );
+        assert!(store.ownership_info().await.durability_degraded);
+        assert!(
+            store.get("k1").await.expect("read").is_none(),
+            "k1 tombstone applied in memory before the failed persist"
+        );
+
+        // While degraded, the NEXT remove is refused BEFORE mutating.
+        let err = store
+            .remove("k2")
+            .await
+            .expect_err("degraded store refuses further local removes");
+        assert!(
+            format!("{err}").contains("durability degraded"),
+            "gate error names degradation; got: {err}"
+        );
+        assert!(
+            store.get("k2").await.expect("read").is_some(),
+            "fail-closed BEFORE mutation: k2 still present"
+        );
+
+        // Heal: the retry persists the pending k1 tombstone, then the remove
+        // of k2 proceeds and the flag clears.
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod rw");
+        store.remove("k2").await.expect("recovered remove");
+        assert!(!store.ownership_info().await.durability_degraded);
+
+        let snap_path = kv_snapshot_path(
+            &state_dir,
+            &kv::KvStoreId::for_topic_owner("rm-degrade-topic", &agent.agent_id()),
+        );
+        let snap = kv::sync::load_snapshot(&snap_path)
+            .expect("load")
+            .expect("present");
+        assert!(snap.get("k1").is_none(), "pending tombstone recovered");
+        assert!(snap.get("k2").is_none(), "post-recovery remove persisted");
+        assert!(snap.get("k3").is_some(), "untouched key retained");
         agent.shutdown().await;
     }
 

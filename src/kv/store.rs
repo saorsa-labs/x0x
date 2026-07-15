@@ -4141,6 +4141,39 @@ mod tests {
     }
 
     #[test]
+    fn append_only_ambiguous_delta_dropped_without_checkpoint() {
+        // Standalone global-gate case: no checkpoint attached, so the
+        // adoption path is never entered — this exercises merge_delta's own
+        // canonical-map gate on an AppendOnly store. Even a NEW key (no
+        // immutability conflict at all) carried in both maps drops the
+        // whole delta.
+        let owner = agent(1);
+        let mut store = append_only_owner_store(owner);
+        let v_before = store.current_version();
+
+        let mut dup = KvStoreDelta::new(77);
+        dup.added.insert(
+            "fresh".to_string(),
+            (
+                KvEntry::new("fresh".to_string(), b"a".to_vec(), "text/plain".to_string()),
+                (peer(2), 11),
+            ),
+        );
+        dup.updated.insert(
+            "fresh".to_string(),
+            KvEntry::new("fresh".to_string(), b"b".to_vec(), "text/plain".to_string()),
+        );
+        store
+            .merge_delta(&dup, peer(2), Some(&owner))
+            .expect("dropped, not an error");
+        assert!(
+            store.get("fresh").is_none(),
+            "ambiguous delta dropped whole — neither copy of the new key applies"
+        );
+        assert_eq!(store.current_version(), v_before, "no state change");
+    }
+
+    #[test]
     fn signed_store_ambiguous_added_updated_delta_dropped() {
         // WHY: the canonical-map rule is global, not AppendOnly-only. A delta
         // carrying one key in both `added` and `updated` holds two values for
