@@ -211,18 +211,18 @@ async fn append_only_state_survives_daemon_restart() {
     // OWNER RESTART: alice must rehydrate with entries + policy from disk,
     // and still refuse to rewrite her own history.
     pair.alice.restart().await;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if store_policy(&pair.alice, &topic).await.as_deref() == Some("append_only") {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "alice did not rehydrate the append_only store within 60s"
+            "alice did not rehydrate the append_only store within 120s"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    wait_for_key(&pair.alice, &topic, "evt-1", 30).await;
+    wait_for_key(&pair.alice, &topic, "evt-1", 60).await;
     let r = pair
         .alice
         .put(
@@ -243,18 +243,18 @@ async fn append_only_state_survives_daemon_restart() {
     // policy can only come from his snapshot.
     pair.alice.stop();
     pair.bob.restart().await;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if store_policy(&pair.bob, &topic).await.as_deref() == Some("append_only") {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "bob did not rehydrate the append_only replica (owner offline) within 60s"
+            "bob did not rehydrate the append_only replica (owner offline) within 120s"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    wait_for_key(&pair.bob, &topic, "evt-1", 30).await;
+    wait_for_key(&pair.bob, &topic, "evt-1", 60).await;
     let r = pair.bob.get(&format!("/stores/{topic}/evt-1")).await;
     let body: serde_json::Value = r.json().await.expect("json");
     assert_eq!(

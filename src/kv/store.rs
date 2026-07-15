@@ -1453,10 +1453,9 @@ impl KvStore {
         //     Belt-and-braces: AppendOnly is terminal — the 6b gate already
         //     rejected any checkpoint that would downgrade it, so this branch
         //     can only keep or adopt AppendOnly, never leave it.
-        if cp.policy_version >= self.policy_version
-            && !(matches!(self.policy, AccessPolicy::AppendOnly)
-                && !matches!(cp.policy, AccessPolicy::AppendOnly))
-        {
+        let downgrades_terminal_policy = matches!(self.policy, AccessPolicy::AppendOnly)
+            && !matches!(cp.policy, AccessPolicy::AppendOnly);
+        if cp.policy_version >= self.policy_version && !downgrades_terminal_policy {
             self.policy = cp.policy.clone();
             self.policy_version = cp.policy_version;
         }

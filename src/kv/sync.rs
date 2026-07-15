@@ -133,7 +133,7 @@ impl KvStoreSync {
     /// Call before [`start`](Self::start) so no merged delta can land
     /// unpersisted. The caller is responsible for loading any existing
     /// snapshot BEFORE constructing this sync (see
-    /// [`load_snapshot`](load_snapshot)); this method only arms writes.
+    /// [`load_snapshot`]); this method only arms writes.
     pub fn set_persist_path(&self, path: PathBuf) {
         if let Ok(mut guard) = self.persist_path.lock() {
             *guard = Some(path);
