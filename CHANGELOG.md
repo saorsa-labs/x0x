@@ -2,7 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [v0.32.0] - 2026-07-15
+
+Breaking (library API): `NetworkNode::new` now takes an
+`Option<ant_quic::BootstrapCacheConfig>` instead of a pre-opened cache, and
+the dead `NetworkConfig.peer_cache_path` field was removed.
 
 ### Fixed
 
@@ -24,6 +28,10 @@ All notable changes to this project will be documented in this file.
   cache directory is created.
 - Removed the dead `NetworkConfig.peer_cache_path` field - it was written by the
   daemon but never read anywhere.
+- **x0xd now handles SIGTERM like Ctrl-C** (what systemd/launchd send on
+  stop/restart): the graceful shutdown path closes connections and flushes the
+  bootstrap peer cache, so learned peers survive a service restart without
+  waiting for the next periodic save tick.
 - SKILL.md/api-reference doc fixes: the peer cache file is
   `<data_dir>/peers/bootstrap_cache.json` (not `peers.cache`); documented the SSE
   `/events` envelope shape (fields nested under `data`, unlike the flat WebSocket
