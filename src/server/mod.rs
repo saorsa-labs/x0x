@@ -757,7 +757,7 @@ pub async fn serve_with_options(
     };
     let network_config = NetworkConfig {
         bind_addr: Some(bind_address),
-        bootstrap_nodes: config.bootstrap_peers.clone(),
+        bootstrap_nodes: config.resolved_bootstrap_peers(),
         max_connections: 50,
         connection_timeout: std::time::Duration::from_secs(30),
         stats_interval: std::time::Duration::from_secs(60),
@@ -794,7 +794,9 @@ pub async fn serve_with_options(
         builder = builder.with_peer_cache_disabled();
     }
 
-    // NOTE: --no-hard-coded-bootstrap only clears configured seed peers.
+    // NOTE: --no-hard-coded-bootstrap clears only the *embedded* global
+    // bootstrap network; an explicit `bootstrap_peers` list in the config
+    // file is honored verbatim (see DaemonConfig::resolved_bootstrap_peers).
     // mDNS LAN discovery and the peer cache remain active by design so that:
     //   - Local mesh (two laptops on WiFi) still works via mDNS
     //   - FOAF presence discovery still finds peers

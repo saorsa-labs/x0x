@@ -39,8 +39,9 @@ failing runs are kept for debugging; passing runs are cleaned unless
 - `conv1` has `bootstrap_peers = []`; every other node lists only conv1's
   QUIC address. The explicit (possibly empty) `bootstrap_peers` list in the
   config overrides the hardcoded global bootstrap network, so the cluster
-  is fully isolated. `--no-hard-coded-bootstrap` is deliberately NOT used:
-  it clears config-provided peers too.
+- `--no-hard-coded-bootstrap` is deliberately NOT used: even though it now
+  preserves config-provided peers, the explicit list already overrides the
+  hardcoded global network, so the flag is redundant here.
 - Rolling start: 15 s between node launches (`--stagger-secs`, a known
   network requirement).
 - API tokens are discovered from `<data_dir>/api-token`.

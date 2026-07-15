@@ -219,9 +219,17 @@ pub struct DaemonConfig {
     pub log_format: String,
 
     /// Bootstrap peers to connect on startup.
-    /// Defaults to the hardcoded global bootstrap network if not specified.
-    #[serde(default = "default_bootstrap_peers")]
-    pub bootstrap_peers: Vec<SocketAddr>,
+    ///
+    /// `None` (the TOML key absent, or `DaemonConfig::default()`) resolves to
+    /// the hardcoded global bootstrap network via [`Self::resolved_bootstrap_peers`].
+    /// `Some(vec)` honors the operator's explicit list verbatim — including an
+    /// explicit `bootstrap_peers = []`, which means "no seed peers at all".
+    ///
+    /// This three-valued distinction lets `--no-hard-coded-bootstrap` clear
+    /// *only* the embedded fallback (`None` → `Some([])`) without clobbering
+    /// peers an operator deliberately listed in their config file.
+    #[serde(default)]
+    pub bootstrap_peers: Option<Vec<SocketAddr>>,
 
     /// X0X-0062 reviewer P2 #2: enable or disable ant-quic's best-effort
     /// UPnP IGD port-mapping. Default `true` (matches ant-quic). Set to
@@ -468,6 +476,23 @@ impl DaemonConfig {
     pub fn update_enabled(&self) -> bool {
         self.update.enabled
     }
+
+    /// Resolve `bootstrap_peers` to a concrete dial list.
+    ///
+    /// - `Some(v)` → the operator's explicit peers, verbatim (including `[]`).
+    /// - `None` → the embedded global bootstrap network
+    ///   (`x0x::network::DEFAULT_BOOTSTRAP_PEERS`).
+    ///
+    /// The daemon applies `--no-hard-coded-bootstrap` *before* serving by
+    /// flipping `None` to `Some([])`, so the embedded fallback never reaches
+    /// this method under that flag while an explicit operator list is
+    /// preserved untouched.
+    #[must_use]
+    pub fn resolved_bootstrap_peers(&self) -> Vec<SocketAddr> {
+        self.bootstrap_peers
+            .clone()
+            .unwrap_or_else(default_bootstrap_peers)
+    }
 }
 
 impl Default for DaemonConfig {
@@ -478,10 +503,7 @@ impl Default for DaemonConfig {
             data_dir: default_data_dir(),
             log_level: default_log_level(),
             log_format: default_log_format(),
-            bootstrap_peers: x0x::network::DEFAULT_BOOTSTRAP_PEERS
-                .iter()
-                .filter_map(|s| s.parse().ok())
-                .collect(),
+            bootstrap_peers: None,
             port_mapping_enabled: default_port_mapping_enabled(),
             peer_relay: x0x::network::PeerRelayConfig::default(),
             update: DaemonUpdateConfig::default(),
@@ -838,5 +860,94 @@ mod tests {
                 ),
             }
         }
+    }
+    // Mirrors the exact logic in `src/bin/x0xd.rs` so the unit tests below
+    // exercise the real flag application, not an approximation.
+    fn apply_no_hard_coded_bootstrap(config: &mut DaemonConfig) {
+        if config.bootstrap_peers.is_none() {
+            config.bootstrap_peers = Some(Vec::new());
+        }
+    }
+
+    #[test]
+    fn flag_with_explicit_config_peers_keeps_them() {
+        // (1) Flag + explicit `bootstrap_peers` in config → operator peers
+        // kept verbatim, embedded defaults absent. This is the regression we
+        // are fixing: previously the flag wiped operator peers too.
+        let mut config: DaemonConfig =
+            toml::from_str(r#"bootstrap_peers = ["127.0.0.1:6483", "[::1]:6483"]"#)
+                .expect("explicit peers parse");
+        assert_eq!(
+            config.bootstrap_peers,
+            Some(vec![
+                "127.0.0.1:6483".parse().unwrap(),
+                "[::1]:6483".parse().unwrap(),
+            ])
+        );
+
+        apply_no_hard_coded_bootstrap(&mut config);
+
+        // Unchanged — the operator's list survives the flag.
+        let resolved = config.resolved_bootstrap_peers();
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.contains(&"127.0.0.1:6483".parse().unwrap()));
+        assert!(resolved.contains(&"[::1]:6483".parse().unwrap()));
+    }
+
+    #[test]
+    fn flag_without_config_key_clears_embedded_defaults() {
+        // (2) Flag + no `bootstrap_peers` key in config → the embedded
+        // global bootstrap network is skipped (resolves to empty).
+        let mut config: DaemonConfig = toml::from_str("").expect("empty config parses");
+        assert!(
+            config.bootstrap_peers.is_none(),
+            "absent key must deserialize to None, not the embedded defaults"
+        );
+
+        apply_no_hard_coded_bootstrap(&mut config);
+
+        assert_eq!(config.resolved_bootstrap_peers(), Vec::<SocketAddr>::new());
+    }
+
+    #[test]
+    fn no_flag_without_config_key_uses_embedded_defaults() {
+        // (3) No flag + no `bootstrap_peers` key → embedded global bootstrap
+        // network resolves (unchanged pre-existing behaviour).
+        let config: DaemonConfig = toml::from_str("").expect("empty config parses");
+        let resolved = config.resolved_bootstrap_peers();
+        let embedded: Vec<SocketAddr> = x0x::network::DEFAULT_BOOTSTRAP_PEERS
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        assert!(!embedded.is_empty(), "sanity: embedded list is non-empty");
+        assert_eq!(resolved, embedded);
+    }
+
+    #[test]
+    fn explicit_empty_list_is_honored_not_treated_as_default() {
+        // An explicit `bootstrap_peers = []` means "the operator wants no seed
+        // peers". It must deserialize to Some([]) — distinct from the absent
+        // key (None) — and survive the flag untouched.
+        let mut config: DaemonConfig =
+            toml::from_str("bootstrap_peers = []").expect("empty list parses");
+        assert_eq!(config.bootstrap_peers, Some(Vec::new()));
+
+        apply_no_hard_coded_bootstrap(&mut config);
+
+        // Still Some([]) — explicit-empty is an operator choice, not a default.
+        assert_eq!(config.resolved_bootstrap_peers(), Vec::<SocketAddr>::new());
+    }
+
+    #[test]
+    fn default_config_resolves_to_embedded_network() {
+        // DaemonConfig::default() (no config file at all) must resolve to the
+        // embedded bootstrap network — same as an absent TOML key.
+        let config = DaemonConfig::default();
+        assert!(config.bootstrap_peers.is_none());
+        let embedded: Vec<SocketAddr> = x0x::network::DEFAULT_BOOTSTRAP_PEERS
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        assert_eq!(config.resolved_bootstrap_peers(), embedded);
     }
 }

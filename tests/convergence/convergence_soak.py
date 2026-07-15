@@ -229,8 +229,9 @@ class Node:
             f'bind_address = "127.0.0.1:{self.quic_port}"\n'
             f'log_level = "{self.log_level}"\n'
             # Explicit list (possibly empty) overrides the hardcoded global
-            # bootstrap network, keeping the cluster fully isolated. Do NOT
-            # pass --no-hard-coded-bootstrap: it clears config peers too.
+            # bootstrap network, keeping the cluster fully isolated. The flag
+            # --no-hard-coded-bootstrap would now be redundant (it preserves
+            # config peers), so it is not passed.
             f'bootstrap_peers = [{peers}]\n'
             # Fully disable self-update. --skip-update-check (passed at
             # start) only suppresses the startup GitHub check — it does NOT
