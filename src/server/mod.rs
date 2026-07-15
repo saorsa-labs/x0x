@@ -19,8 +19,6 @@ mod ws;
 // Re-export the public server API surface so `x0x::server::*` paths are
 // unchanged after the #125 / WS1.4 extraction. Internal types (AppState,
 // DaemonUpdateConfig, CachedUpgradeCheck) stay private to the crate.
-#[cfg(test)]
-use routes::CardQuery;
 use routes::{
     add_contact, add_machine, add_task, agent_info, agent_sign, agent_user_id_handler,
     agent_verify, announce_identity, create_task_list, delete_contact, delete_machine,
@@ -30,6 +28,8 @@ use routes::{
     pin_machine, populate_invite_base_state_from_group_info, quick_trust, revoke_contact,
     unpin_machine, update_contact, update_task,
 };
+#[cfg(test)]
+use routes::{CardQuery, ImportCardRequest, UpdateContactRequest};
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
     default_api_address, default_bind_address, default_data_dir, validate_instance_name,
@@ -21549,6 +21549,211 @@ mod tests {
                 .iter()
                 .all(|group| group.name != "stale active alias"),
             "stale active aliases for a withdrawn stable group must not be re-advertised"
+        );
+        Ok(())
+    }
+
+    // ── Card import trust-floor tests ───────────────────────────────────
+    //
+    // Regression: importing an agent card must never LOWER an existing
+    // contact's trust level. A routine re-import (default trust_level:
+    // "known") silently downgraded manually-trusted peers, breaking the
+    // streams identity gate that requires unflagged `Accept` (Trusted →
+    // Accept, Known → AcceptWithFlag).
+
+    fn make_unsigned_card_link(display_name: &str, agent_id: &crate::identity::AgentId) -> String {
+        let machine_id = hex::encode([0x11u8; 32]);
+        let card =
+            x0x::groups::card::AgentCard::new(display_name.to_string(), agent_id, &machine_id);
+        card.to_link()
+    }
+
+    #[tokio::test]
+    async fn card_import_does_not_downgrade_trusted_contact() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_kp = crate::identity::AgentKeypair::generate()?;
+        let target_id = target_kp.agent_id();
+
+        // Pre-seed: manually trust the contact.
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&target_id, x0x::contacts::TrustLevel::Trusted);
+
+        // Import card with trust_level "known" — must NOT downgrade.
+        let card_link = make_unsigned_card_link("Alice", &target_id);
+        let req: ImportCardRequest = serde_json::from_value(serde_json::json!({
+            "card": card_link,
+            "trust_level": "known"
+        }))
+        .context("deserialize ImportCardRequest")?;
+        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+            .await
+            .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK);
+
+        // Response must show effective trust = Trusted and flag the ignored downgrade.
+        assert_eq!(
+            body["trust_level"], "Trusted",
+            "import must not downgrade a trusted contact"
+        );
+        assert_eq!(
+            body["trust_change_ignored"], true,
+            "response must flag that the requested downgrade was ignored"
+        );
+
+        // Store must still show Trusted.
+        let stored = state.contacts.read().await.trust_level(&target_id);
+        assert_eq!(
+            stored,
+            x0x::contacts::TrustLevel::Trusted,
+            "contact store must retain Trusted after card import"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn card_import_sets_requested_trust_for_new_contact() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_kp = crate::identity::AgentKeypair::generate()?;
+        let target_id = target_kp.agent_id();
+
+        // Import card for a brand-new contact with trust_level "known".
+        let card_link = make_unsigned_card_link("Bob", &target_id);
+        let req: ImportCardRequest = serde_json::from_value(serde_json::json!({
+            "card": card_link,
+            "trust_level": "known"
+        }))
+        .context("deserialize ImportCardRequest")?;
+        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+            .await
+            .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["trust_level"], "Known");
+        assert_eq!(body["trust_change_ignored"], false);
+
+        let stored = state.contacts.read().await.trust_level(&target_id);
+        assert_eq!(
+            stored,
+            x0x::contacts::TrustLevel::Known,
+            "new contact must get the requested trust level"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_patch_downgrade_still_works() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_kp = crate::identity::AgentKeypair::generate()?;
+        let target_id = target_kp.agent_id();
+        let target_hex = hex::encode(target_id.as_bytes());
+
+        // Start trusted.
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&target_id, x0x::contacts::TrustLevel::Trusted);
+
+        // Explicit PATCH downgrade to Known — unambiguous user intent, MUST work
+        // (unlike card import which is floor-protected).
+        let req: UpdateContactRequest = serde_json::from_value(serde_json::json!({
+            "trust_level": "known"
+        }))
+        .context("deserialize UpdateContactRequest")?;
+        let response = update_contact(State(Arc::clone(&state)), Path(target_hex), Json(req))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored = state.contacts.read().await.trust_level(&target_id);
+        assert_eq!(
+            stored,
+            x0x::contacts::TrustLevel::Known,
+            "explicit PATCH must be able to downgrade trust"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn card_import_does_not_unblock_blocked_contact() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_kp = crate::identity::AgentKeypair::generate()?;
+        let target_id = target_kp.agent_id();
+
+        // Pre-seed: deliberately block the contact.
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&target_id, x0x::contacts::TrustLevel::Blocked);
+
+        // Import card with trust_level "known" — must NOT un-block.
+        let card_link = make_unsigned_card_link("Mallory", &target_id);
+        let req: ImportCardRequest = serde_json::from_value(serde_json::json!({
+            "card": card_link,
+            "trust_level": "known"
+        }))
+        .context("deserialize ImportCardRequest")?;
+        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+            .await
+            .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK);
+
+        // Response must show Blocked and flag the ignored change.
+        assert_eq!(
+            body["trust_level"], "Blocked",
+            "import must not un-block a deliberately blocked contact"
+        );
+        assert_eq!(
+            body["trust_change_ignored"], true,
+            "response must flag that the requested un-block was ignored"
+        );
+
+        // Store must still show Blocked.
+        let stored = state.contacts.read().await.trust_level(&target_id);
+        assert_eq!(
+            stored,
+            x0x::contacts::TrustLevel::Blocked,
+            "contact store must retain Blocked after card import"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_patch_unblock_still_works() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_kp = crate::identity::AgentKeypair::generate()?;
+        let target_id = target_kp.agent_id();
+        let target_hex = hex::encode(target_id.as_bytes());
+
+        // Start blocked.
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&target_id, x0x::contacts::TrustLevel::Blocked);
+
+        // Explicit PATCH un-block to Known — unambiguous user intent, MUST work
+        // (unlike card import which is floor-protected and Blocked-sticky).
+        let req: UpdateContactRequest = serde_json::from_value(serde_json::json!({
+            "trust_level": "known"
+        }))
+        .context("deserialize UpdateContactRequest")?;
+        let response = update_contact(State(Arc::clone(&state)), Path(target_hex), Json(req))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored = state.contacts.read().await.trust_level(&target_id);
+        assert_eq!(
+            stored,
+            x0x::contacts::TrustLevel::Known,
+            "explicit PATCH must be able to un-block"
         );
         Ok(())
     }

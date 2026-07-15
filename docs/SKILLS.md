@@ -179,7 +179,7 @@ GET  /health                              # Health check (no auth required)
 GET  /status                              # Runtime status with uptime
 GET  /agent                               # Agent identity (agent_id, machine_id, user_id)
 GET  /agent/card                          # Generate shareable identity card
-POST /agent/card/import                   # Import agent card to contacts
+POST /agent/card/import                   # Import agent card to contacts (never changes existing trust: floor, Blocked sticky)
 POST /announce                            # Announce identity to network
 
 GET  /presence/online                     # Online agents (network view)
