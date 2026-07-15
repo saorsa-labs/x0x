@@ -3251,7 +3251,10 @@ mod tests {
             .remove("k1")
             .expect_err("owner must not be able to delete an existing key");
         assert!(matches!(err, KvError::ImmutableKey(ref k) if k == "k1"));
-        assert!(store.get("k1").is_some(), "key retained after rejected delete");
+        assert!(
+            store.get("k1").is_some(),
+            "key retained after rejected delete"
+        );
         // A key that never existed still reports KeyNotFound (unchanged).
         assert!(matches!(
             store.remove("ghost"),
@@ -3335,8 +3338,7 @@ mod tests {
         let topic = "store/ao-cold";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store =
-            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
         owner_store
             .put(
                 "k1".to_string(),
@@ -3405,8 +3407,7 @@ mod tests {
         let topic = "store/ao-shrink";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store =
-            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
         for (k, v) in [("k1", b"v1".as_slice()), ("k2", b"v2".as_slice())] {
             owner_store
                 .put(k.to_string(), v.to_vec(), "text/plain".to_string(), peer(1))
@@ -3445,8 +3446,7 @@ mod tests {
         let topic = "store/ao-rewrite";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store =
-            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
         owner_store
             .put(
                 "k1".to_string(),
@@ -3509,7 +3509,9 @@ mod tests {
             store.get("k").map(|e| e.value.clone()),
             Some(b"v2".to_vec())
         );
-        store.remove("k").expect("Signed store delete must still work");
+        store
+            .remove("k")
+            .expect("Signed store delete must still work");
         assert!(store.get("k").is_none());
     }
 }

@@ -15919,10 +15919,7 @@ async fn create_kv_store(
             );
             // Persist the policy so a restarted creator rehydrates with the
             // same policy (an append-only store must never come back Signed).
-            extra.insert(
-                "policy".to_string(),
-                serde_json::Value::String(policy_str),
-            );
+            extra.insert("policy".to_string(), serde_json::Value::String(policy_str));
             if let Err(e) = crdt_subscriptions::record(
                 &state,
                 crdt_subscriptions::CrdtSubscriptionEntry {
