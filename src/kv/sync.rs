@@ -563,6 +563,59 @@ mod tests {
         KvStoreId::new([n; 32])
     }
 
+    #[test]
+    fn snapshot_roundtrip_missing_and_corrupt() {
+        // WHY: snapshot restore is what makes AppendOnly immutability
+        // survive a restart. Missing file = clean first run (Ok(None));
+        // a valid snapshot must round-trip policy, entries, and the
+        // checkpoint high-water mark; a corrupt file must be an Err so
+        // callers FAIL CLOSED instead of silently starting empty (amnesia).
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("kv").join("snap.bin");
+
+        assert!(
+            matches!(load_snapshot(&path), Ok(None)),
+            "missing snapshot is a clean first run"
+        );
+
+        let mut store = KvStore::new(
+            store_id(7),
+            "log".to_string(),
+            agent(1),
+            AccessPolicy::AppendOnly,
+        );
+        store
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        store.highest_checkpoint_seq = 5;
+        let bytes = bincode::serialize(&store).expect("serialize");
+        write_snapshot_atomic(&path, &bytes).expect("atomic write");
+
+        let restored = load_snapshot(&path)
+            .expect("load ok")
+            .expect("snapshot present");
+        assert_eq!(*restored.policy(), AccessPolicy::AppendOnly);
+        assert_eq!(
+            restored.get("k1").map(|e| e.value.clone()),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(restored.highest_checkpoint_seq, 5);
+        // seq_counter floored to version: freshly minted tags cannot collide
+        // with pre-restart tags.
+        assert!(restored.next_seq() > restored.current_version());
+
+        std::fs::write(&path, b"not a snapshot").expect("corrupt");
+        assert!(
+            load_snapshot(&path).is_err(),
+            "corrupt snapshot must be an error (fail closed), not a silent fresh start"
+        );
+    }
+
     /// Construct an isolated network node (mirrors the helper in
     /// `src/gossip/pubsub.rs` tests). `PubSubManager` is fully constructable
     /// in tests, so `KvStoreSync` is testable end-to-end without a live mesh.

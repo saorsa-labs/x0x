@@ -11,12 +11,43 @@
 //! Before running: cargo build --release --bin x0xd
 
 use base64::Engine;
+use std::time::{Duration, Instant};
 
 #[path = "harness/src/cluster.rs"]
 mod cluster;
 
 fn b64(s: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(s)
+}
+
+/// Poll until `key` reads back successfully on `node`, panicking after `secs`.
+async fn wait_for_key(node: &cluster::AgentInstance, topic: &str, key: &str, secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let r = node.get(&format!("/stores/{topic}/{key}")).await;
+        if r.status().is_success() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "key {key} not visible on {topic} within {secs}s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Fetch the policy string GET /stores reports for `topic`.
+async fn store_policy(node: &cluster::AgentInstance, topic: &str) -> Option<String> {
+    let r = node.get("/stores").await;
+    if !r.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = r.json().await.ok()?;
+    body["stores"]
+        .as_array()?
+        .iter()
+        .find(|s| s["topic"] == topic)
+        .and_then(|s| s["policy"].as_str().map(str::to_string))
 }
 
 #[tokio::test]
@@ -131,4 +162,114 @@ async fn append_only_store_rest_put_conflict_and_delete_conflict() {
     }
     let r = node.delete(&format!("/stores/{signed_topic}/k")).await;
     assert!(r.status().is_success(), "Signed store delete still works");
+}
+
+/// WHY (P0-C restart amnesia): an append-only owner or replica must come
+/// back from a daemon restart with its state — otherwise the owner forgets
+/// key k, accepts its own k=v2 as a fresh append, and signs a rewritten
+/// history. State snapshots (`<data_dir>/kv-stores/<id>.bin`) are the fix;
+/// this proves them end-to-end through real daemon restarts, including a
+/// joiner restarting while the owner is OFFLINE (the data can only come
+/// from disk).
+#[tokio::test]
+#[ignore]
+async fn append_only_state_survives_daemon_restart() {
+    let mut pair = cluster::pair().await;
+    let topic = format!("kv-ao-restart-{}", rand::random::<u32>());
+
+    // Alice creates the append-only store and appends a key.
+    let r = pair
+        .alice
+        .post(
+            "/stores",
+            serde_json::json!({ "name": "events", "topic": topic, "policy": "append_only" }),
+        )
+        .await;
+    assert_eq!(r.status().as_u16(), 201, "alice creates append_only store");
+    let r = pair
+        .alice
+        .put(
+            &format!("/stores/{topic}/evt-1"),
+            serde_json::json!({ "value": b64(b"created") }),
+        )
+        .await;
+    assert!(r.status().is_success(), "alice appends evt-1");
+
+    // Bob joins anchored on alice and syncs the key (his replica learns the
+    // append_only policy from alice's owner-signed checkpoint).
+    let alice_id = pair.alice.agent_id().await;
+    let r = pair
+        .bob
+        .post(
+            &format!("/stores/{topic}/join"),
+            serde_json::json!({ "expected_owner": alice_id }),
+        )
+        .await;
+    assert!(r.status().is_success(), "bob joins");
+    wait_for_key(&pair.bob, &topic, "evt-1", 60).await;
+
+    // OWNER RESTART: alice must rehydrate with entries + policy from disk,
+    // and still refuse to rewrite her own history.
+    pair.alice.restart().await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if store_policy(&pair.alice, &topic).await.as_deref() == Some("append_only") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "alice did not rehydrate the append_only store within 60s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    wait_for_key(&pair.alice, &topic, "evt-1", 30).await;
+    let r = pair
+        .alice
+        .put(
+            &format!("/stores/{topic}/evt-1"),
+            serde_json::json!({ "value": b64(b"REWRITTEN") }),
+        )
+        .await;
+    assert_eq!(
+        r.status().as_u16(),
+        409,
+        "restarted owner must STILL refuse to rewrite (state restored from snapshot)"
+    );
+    let r = pair.alice.get(&format!("/stores/{topic}/evt-1")).await;
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["value"], b64(b"created"), "original bytes retained");
+
+    // JOINER RESTART WITH OWNER OFFLINE: bob's data + learned append_only
+    // policy can only come from his snapshot.
+    pair.alice.stop();
+    pair.bob.restart().await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if store_policy(&pair.bob, &topic).await.as_deref() == Some("append_only") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bob did not rehydrate the append_only replica (owner offline) within 60s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    wait_for_key(&pair.bob, &topic, "evt-1", 30).await;
+    let r = pair.bob.get(&format!("/stores/{topic}/evt-1")).await;
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(
+        body["value"],
+        b64(b"created"),
+        "joiner restored entry from disk while owner offline"
+    );
+    // Bob is not the owner: local writes stay 403 (authorization precedes
+    // immutability).
+    let r = pair
+        .bob
+        .put(
+            &format!("/stores/{topic}/evt-1"),
+            serde_json::json!({ "value": b64(b"junk") }),
+        )
+        .await;
+    assert_eq!(r.status().as_u16(), 403, "non-owner writes still 403");
 }

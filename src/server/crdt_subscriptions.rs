@@ -443,7 +443,9 @@ pub(super) async fn handle_reservation(state: &AppState, kind: &str, id: &str) -
 /// - Present but unrecognized → `None`: the caller must FAIL CLOSED (skip the
 ///   rehydration loudly). Mapping garbage to `Signed` would silently strip a
 ///   possibly-append-only store of its immutability.
-fn manifest_policy(extra: &serde_json::Map<String, serde_json::Value>) -> Option<crate::kv::AccessPolicy> {
+fn manifest_policy(
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Option<crate::kv::AccessPolicy> {
     match extra.get("policy") {
         None => Some(crate::kv::AccessPolicy::Signed),
         Some(serde_json::Value::String(s)) if s == "signed" => {
@@ -693,6 +695,40 @@ async fn rehydrate_one(state: Arc<AppState>, entry: CrdtSubscriptionEntry) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_policy_parses_and_fails_closed() {
+        // WHY: a malformed policy string must NEVER silently become Signed —
+        // that would strip a possibly-append-only store of its immutability
+        // on restart. Absent = legacy Signed (compat default); garbage =
+        // None (caller skips loudly).
+        let mut extra = serde_json::Map::new();
+        assert_eq!(
+            manifest_policy(&extra),
+            Some(crate::kv::AccessPolicy::Signed),
+            "legacy entry without a policy field is Signed"
+        );
+        extra.insert("policy".into(), serde_json::Value::String("signed".into()));
+        assert_eq!(
+            manifest_policy(&extra),
+            Some(crate::kv::AccessPolicy::Signed)
+        );
+        extra.insert(
+            "policy".into(),
+            serde_json::Value::String("append_only".into()),
+        );
+        assert_eq!(
+            manifest_policy(&extra),
+            Some(crate::kv::AccessPolicy::AppendOnly)
+        );
+        extra.insert(
+            "policy".into(),
+            serde_json::Value::String("immutable".into()),
+        );
+        assert_eq!(manifest_policy(&extra), None, "garbage fails closed");
+        extra.insert("policy".into(), serde_json::Value::Bool(true));
+        assert_eq!(manifest_policy(&extra), None, "non-string fails closed");
+    }
 
     fn entry(kind: &str, id: &str, role: &str) -> CrdtSubscriptionEntry {
         CrdtSubscriptionEntry {

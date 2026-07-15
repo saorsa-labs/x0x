@@ -3657,4 +3657,473 @@ mod tests {
             .expect("Signed store delete must still work");
         assert!(store.get("k").is_none());
     }
+
+    // ── AppendOnly hardening (adversarial-review wave) ──────────────────
+
+    #[test]
+    fn append_only_downgrade_announce_rejected() {
+        // WHY: if an owner-signed announce could flip append_only back to
+        // signed, the owner could downgrade, delete freely, and re-upgrade —
+        // the policy would be decorative. AppendOnly must be terminal for
+        // ANY policy_version (forward or equal).
+        let owner = agent(1);
+        let mut store = append_only_owner_store(owner);
+        let v = store.policy_version();
+
+        // Forward-version downgrade: rejected.
+        let err = store
+            .learn_ownership(owner, AccessPolicy::Signed, v + 10, &owner)
+            .expect_err("forward-version downgrade must be rejected");
+        assert!(matches!(err, KvError::OwnerTokenInvalid(_)));
+        assert_eq!(*store.policy(), AccessPolicy::AppendOnly);
+
+        // Equal-version downgrade: rejected.
+        let err = store
+            .learn_ownership(owner, AccessPolicy::Signed, v, &owner)
+            .expect_err("equal-version downgrade must be rejected");
+        assert!(matches!(err, KvError::OwnerTokenInvalid(_)));
+        assert_eq!(*store.policy(), AccessPolicy::AppendOnly);
+
+        // A refresh that KEEPS append_only is still fine.
+        store
+            .learn_ownership(owner, AccessPolicy::AppendOnly, v + 1, &owner)
+            .expect("append_only-preserving refresh is allowed");
+        assert_eq!(*store.policy(), AccessPolicy::AppendOnly);
+    }
+
+    #[test]
+    fn append_only_checkpoint_policy_downgrade_rejected() {
+        // WHY: the checkpoint adoption path refreshes policy from cp.policy
+        // (step 10). A content-identical checkpoint whose only change is
+        // policy=Signed would otherwise downgrade the replica, unfreezing
+        // the log. Content equality means the immutability gate alone
+        // cannot catch this — the terminal-policy gate must.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/ao-downgrade";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        owner_store
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner append");
+        let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut snap1 = owner_store.full_delta();
+        snap1.owner_checkpoint = Some(cp1.clone());
+
+        let mut replica =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        replica
+            .merge_delta(&snap1, peer(9), Some(&agent(9)))
+            .expect("initial adoption");
+        assert_eq!(*replica.policy(), AccessPolicy::AppendOnly);
+
+        // Forge: identical content, policy flipped to Signed, newer seq +
+        // newer policy_version.
+        let mut forged = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        forged
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("forge put");
+        let cp2 = checkpoint_for(&forged, topic, &kp, 2);
+        let mut snap2 = forged.full_delta();
+        snap2.owner_checkpoint = Some(cp2);
+
+        replica
+            .merge_delta(&snap2, peer(9), Some(&owner))
+            .expect("rejection is loud in logs but not an error");
+        assert_eq!(
+            *replica.policy(),
+            AccessPolicy::AppendOnly,
+            "append_only is terminal: a policy-downgrading checkpoint must not apply"
+        );
+        assert_eq!(replica.highest_checkpoint_seq, 1);
+    }
+
+    #[test]
+    fn adoption_rejects_key_in_both_added_and_updated() {
+        // WHY: adoption validates one merged view of (added ∪ updated) but
+        // applies both maps in sequence — a crafted delta carrying the same
+        // key twice with different values could rewrite what was validated.
+        // The canonical-map gate must reject the ambiguity outright.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/ao-dup";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        owner_store
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner append");
+        let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut snap1 = owner_store.full_delta();
+        snap1.owner_checkpoint = Some(cp1.clone());
+
+        let mut replica =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        replica
+            .merge_delta(&snap1, peer(9), Some(&agent(9)))
+            .expect("initial adoption");
+
+        // Craft the REAL attack: k1 in `added` with EVIL bytes and a maxed
+        // LWW timestamp (so adoption's entry merge would keep it), k1 in
+        // `updated` with the benign local entry (so a last-wins validation
+        // map sees only the benign copy), and a checkpoint the "owner"
+        // signed over the DUPLICATED relayed multiset — which is exactly
+        // what step 6's root computation hashes, so without the
+        // canonical-map gate the root check passes while adoption ends on
+        // the evil bytes.
+        let benign = replica.get("k1").expect("local k1").clone();
+        let mut evil = KvEntry::new(
+            "k1".to_string(),
+            b"REWRITTEN".to_vec(),
+            "text/plain".to_string(),
+        );
+        evil.updated_at = u64::MAX;
+        let multiset_root = content_root(&id, "S", &[("k1", &evil), ("k1", &benign)]);
+        let cp2 = make_owner_checkpoint(OwnerCheckpointParams {
+            topic,
+            store_id: &id,
+            secret_key: kp.secret_key(),
+            public_key: kp.public_key(),
+            policy: &AccessPolicy::AppendOnly,
+            policy_version: 0,
+            checkpoint_seq: 2,
+            content_root: multiset_root,
+            timestamp: 0,
+        })
+        .expect("sign forged multiset checkpoint");
+
+        let mut dup = KvStoreDelta::new(99);
+        dup.added.insert("k1".to_string(), (evil, (peer(2), 42)));
+        dup.updated.insert("k1".to_string(), benign);
+        dup.name_update = Some(owner_store.name_register().clone());
+        dup.owner_checkpoint = Some(cp2);
+
+        replica
+            .merge_delta(&dup, peer(9), Some(&owner))
+            .expect("rejected adoption falls through safely");
+        assert_eq!(
+            replica.get("k1").map(|e| e.value.clone()),
+            Some(b"v1".to_vec()),
+            "duplicate-key delta must not rewrite the validated value"
+        );
+        assert_eq!(
+            replica.highest_checkpoint_seq, 1,
+            "forged multiset checkpoint must not advance the high-water mark"
+        );
+    }
+
+    #[test]
+    fn append_only_public_merge_rejected_transactionally() {
+        // WHY: KvStore::merge is public API that bypasses every merge_delta
+        // gate. It must enforce the same freeze — and atomically, so a
+        // violating merge cannot leave partial state behind.
+        let owner = agent(1);
+        let mut store = append_only_owner_store(owner);
+        let v_before = store.current_version();
+
+        // Hostile full-state replica: k1 rewritten (newer LWW timestamp so
+        // the entry merge would pick it), plus an innocent new key k9 that
+        // must NOT survive the rejected transaction.
+        let mut hostile = KvStore::new(
+            *store.id(),
+            "log".to_string(),
+            owner,
+            AccessPolicy::AppendOnly,
+        );
+        hostile
+            .put(
+                "k1".to_string(),
+                b"REWRITTEN".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("hostile put");
+        hostile
+            .put(
+                "k9".to_string(),
+                b"new".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("hostile put");
+        if let Some(e) = hostile.entries.get_mut("k1") {
+            e.updated_at = u64::MAX; // guarantee LWW would pick the rewrite
+        }
+
+        let err = store
+            .merge(&hostile)
+            .expect_err("public merge must reject an append-only rewrite");
+        assert!(matches!(err, KvError::ImmutableKey(_)));
+        assert_eq!(
+            store.get("k1").map(|e| e.value.clone()),
+            Some(b"v1".to_vec()),
+            "value retained"
+        );
+        assert!(
+            store.get("k9").is_none(),
+            "rejected merge must be transactional — no partial application"
+        );
+        assert_eq!(store.current_version(), v_before, "no state change at all");
+
+        // A purely-additive merge still works.
+        let mut additive = KvStore::new(
+            *store.id(),
+            "log".to_string(),
+            owner,
+            AccessPolicy::AppendOnly,
+        );
+        additive
+            .put(
+                "k2".to_string(),
+                b"v2".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("additive put");
+        store.merge(&additive).expect("additive merge is allowed");
+        assert!(store.get("k1").is_some() && store.get("k2").is_some());
+    }
+
+    #[test]
+    fn append_only_delta_metadata_mutation_with_identical_bytes_skipped() {
+        // WHY: entries are frozen in FULL. KvEntry::merge is LWW on
+        // updated_at and replaces metadata wholesale — a same-value entry
+        // with a newer timestamp could otherwise mutate metadata/updated_at
+        // while the bytes "look" unchanged.
+        let owner = agent(1);
+        let mut store = append_only_owner_store(owner);
+        let (meta_before, updated_before) = {
+            let e = store.get("k1").expect("k1");
+            (e.metadata.clone(), e.updated_at)
+        };
+
+        let mut sneaky = KvEntry::new("k1".to_string(), b"v1".to_vec(), "text/plain".to_string());
+        sneaky
+            .metadata
+            .insert("injected".to_string(), "gotcha".to_string());
+        sneaky.updated_at = u64::MAX; // LWW would pick this entry
+
+        let mut delta = KvStoreDelta::new(99);
+        delta.added.insert("k1".to_string(), (sneaky, (peer(2), 7)));
+        store
+            .merge_delta(&delta, peer(2), Some(&owner))
+            .expect("skipped, not an error");
+
+        let e = store.get("k1").expect("k1 retained");
+        assert_eq!(e.metadata, meta_before, "metadata frozen");
+        assert_eq!(e.updated_at, updated_before, "updated_at frozen");
+    }
+
+    #[test]
+    fn two_fresh_joiners_conflicting_snapshots_diverge_detectably() {
+        // WHY (documented limitation, P0-D): a fresh joiner has no prior
+        // state, so it MUST trust the owner's current signed snapshot —
+        // signatures cannot distinguish original history from a rewrite.
+        // Two fresh joiners fed different owner-signed snapshots therefore
+        // diverge. The detection surface is the adopted checkpoint content
+        // root: they differ, and neither replica auto-reconciles (later
+        // cross-delivered snapshots hit the immutability gate).
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/ao-fork";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let snap_x = forged_snapshot(id, owner, &kp, topic, &[("k", b"x")], 1);
+        let snap_y = forged_snapshot(id, owner, &kp, topic, &[("k", b"y")], 1);
+
+        let mut a = KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        let mut b = KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        a.merge_delta(&snap_x, peer(9), Some(&agent(9)))
+            .expect("A adopts X");
+        b.merge_delta(&snap_y, peer(9), Some(&agent(9)))
+            .expect("B adopts Y");
+
+        assert_eq!(a.get("k").map(|e| e.value.clone()), Some(b"x".to_vec()));
+        assert_eq!(b.get("k").map(|e| e.value.clone()), Some(b"y".to_vec()));
+        assert_eq!(a.highest_checkpoint_seq, 1);
+        assert_eq!(b.highest_checkpoint_seq, 1);
+        let root_a = a.latest_checkpoint.as_ref().expect("A cp").content_root;
+        let root_b = b.latest_checkpoint.as_ref().expect("B cp").content_root;
+        assert_ne!(
+            root_a, root_b,
+            "divergence is detectable by comparing adopted checkpoint roots"
+        );
+
+        // Cross-feed: A now DROPS the other snapshot (same seq → the
+        // stale-delta gate; a newer-seq rewrite would hit the immutability
+        // gate instead) — the fork is sticky and visible, never silently
+        // reconciled.
+        a.merge_delta(&snap_y, peer(9), Some(&owner))
+            .expect("skip, not error");
+        assert_eq!(
+            a.get("k").map(|e| e.value.clone()),
+            Some(b"x".to_vec()),
+            "A keeps its observed history"
+        );
+    }
+
+    #[test]
+    fn rejected_truncated_checkpoint_does_not_poison_later_legit_flow() {
+        // WHY: interaction with the PR #230 stale-delta gate. A rejected
+        // forged checkpoint must not advance the high-water mark (else it
+        // would stale-drop legitimate owner deltas), and a later LEGITIMATE
+        // superset checkpoint must still adopt normally, while replays of
+        // old snapshots stay stale-dropped.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/ao-truncate";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        for (k, v) in [("k1", b"v1".as_slice()), ("k2", b"v2".as_slice())] {
+            owner_store
+                .put(k.to_string(), v.to_vec(), "text/plain".to_string(), peer(1))
+                .expect("owner append");
+        }
+        let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut snap1 = owner_store.full_delta();
+        snap1.owner_checkpoint = Some(cp1);
+
+        let mut replica =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        replica
+            .merge_delta(&snap1, peer(9), Some(&agent(9)))
+            .expect("initial adoption");
+        assert_eq!(replica.highest_checkpoint_seq, 1);
+
+        // Forged truncation at seq 2: rejected, HWM must NOT move.
+        let forged = forged_snapshot(id, owner, &kp, topic, &[("k1", b"v1")], 2);
+        replica
+            .merge_delta(&forged, peer(9), Some(&owner))
+            .expect("skip, not error");
+        assert!(replica.get("k2").is_some(), "truncation rejected");
+        assert_eq!(
+            replica.highest_checkpoint_seq, 1,
+            "rejected forge must not advance HWM (would stale-drop legit deltas)"
+        );
+
+        // Legit superset at seq 3 still adopts.
+        owner_store
+            .put(
+                "k3".to_string(),
+                b"v3".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner append k3");
+        let cp3 = checkpoint_for(&owner_store, topic, &kp, 3);
+        let mut snap3 = owner_store.full_delta();
+        snap3.owner_checkpoint = Some(cp3);
+        replica
+            .merge_delta(&snap3, peer(9), Some(&agent(9)))
+            .expect("legit superset adopts");
+        assert_eq!(replica.highest_checkpoint_seq, 3);
+        assert!(replica.get("k3").is_some());
+
+        // Replay of the old seq-1 snapshot: stale-dropped, no mutation.
+        let v_before = replica.current_version();
+        replica
+            .merge_delta(&snap1, peer(9), Some(&agent(9)))
+            .expect("stale replay is a no-op");
+        assert_eq!(replica.current_version(), v_before);
+        assert_eq!(replica.highest_checkpoint_seq, 3);
+    }
+
+    #[test]
+    fn skip_only_delta_does_not_advance_hwm_or_replace_checkpoint() {
+        // WHY: when every mutation in a hostile delta is skipped, the
+        // attached (genuine, newer-seq) checkpoint must not be cached either
+        // — the post-merge state root does not match it. HWM and
+        // latest_checkpoint must be exactly what they were.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/ao-skiponly";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        owner_store
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner append");
+        let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut snap1 = owner_store.full_delta();
+        snap1.owner_checkpoint = Some(cp1.clone());
+
+        let mut replica =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        replica
+            .merge_delta(&snap1, peer(9), Some(&agent(9)))
+            .expect("initial adoption");
+        let root_before = replica
+            .latest_checkpoint
+            .as_ref()
+            .expect("cp cached")
+            .content_root;
+
+        // Hostile: rewrite-only delta with a genuine seq-2 checkpoint over
+        // the forged state.
+        let hostile = forged_snapshot(id, owner, &kp, topic, &[("k1", b"REWRITTEN")], 2);
+        replica
+            .merge_delta(&hostile, peer(9), Some(&owner))
+            .expect("skip, not error");
+
+        assert_eq!(replica.highest_checkpoint_seq, 1, "HWM unchanged");
+        assert_eq!(
+            replica
+                .latest_checkpoint
+                .as_ref()
+                .expect("cp still cached")
+                .content_root,
+            root_before,
+            "latest_checkpoint unchanged after a skip-only delta"
+        );
+    }
+
+    #[test]
+    fn access_policy_bincode_discriminants_are_pinned() {
+        // WHY: AccessPolicy is bincode-encoded positionally in persisted
+        // stores, checkpoints (wire + signing bytes), and deltas. If anyone
+        // reorders or inserts a variant mid-enum, every existing store
+        // corrupts. This test pins the exact on-wire indices 0..=3.
+        let cases: [(AccessPolicy, u32); 4] = [
+            (AccessPolicy::Signed, 0),
+            (AccessPolicy::Allowlisted, 1),
+            (
+                AccessPolicy::Encrypted {
+                    group_id: Vec::new(),
+                },
+                2,
+            ),
+            (AccessPolicy::AppendOnly, 3),
+        ];
+        for (policy, index) in cases {
+            let bytes = bincode::serialize(&policy).expect("serialize");
+            assert!(bytes.len() >= 4, "bincode enum tag is a u32");
+            let tag = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            assert_eq!(
+                tag, index,
+                "bincode discriminant for {policy} moved — this BREAKS every existing store/checkpoint"
+            );
+        }
+    }
 }

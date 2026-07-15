@@ -12263,6 +12263,152 @@ mod tests {
         }
     }
 
+    /// AppendOnly end-to-end at the handle layer: an idempotent re-put must
+    /// be a TRUE no-op (no checkpoint-sequence advance — a non-mutation must
+    /// not consume owner-signature freshness), and an owner restart restored
+    /// from the state snapshot must retain entries, the terminal append_only
+    /// policy, and the checkpoint high-water mark — otherwise the owner
+    /// forgets its keys and re-signs rewrites of them (the P0-C amnesia
+    /// attack).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_only_idempotent_seq_and_owner_restart_persistence() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let build_agent = || async {
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(loopback_network_config())
+                .build()
+                .await
+                .expect("agent")
+        };
+
+        let agent = build_agent().await;
+        let store = agent
+            .create_kv_store_persistent(
+                "log",
+                "ao-persist-topic",
+                kv::AccessPolicy::AppendOnly,
+                &state_dir,
+            )
+            .await
+            .expect("create persistent append_only store");
+
+        store
+            .put("k".to_string(), b"v1".to_vec(), "text/plain".to_string())
+            .await
+            .expect("first append");
+        assert_eq!(store.sync.read().await.highest_checkpoint_seq, 1);
+
+        // Idempotent re-put: checkpoint sequence must NOT advance.
+        store
+            .put("k".to_string(), b"v1".to_vec(), "text/plain".to_string())
+            .await
+            .expect("idempotent re-put accepted");
+        assert_eq!(
+            store.sync.read().await.highest_checkpoint_seq,
+            1,
+            "idempotent re-put must not advance the checkpoint sequence"
+        );
+
+        // Rewrite rejected with the distinct error the API maps to 409.
+        let err = store
+            .put("k".to_string(), b"v2".to_vec(), "text/plain".to_string())
+            .await
+            .expect_err("rewrite rejected");
+        assert!(matches!(err, error::IdentityError::ImmutableKey(_)));
+
+        store
+            .put("k2".to_string(), b"v2".to_vec(), "text/plain".to_string())
+            .await
+            .expect("second append");
+        assert_eq!(store.sync.read().await.highest_checkpoint_seq, 2);
+        agent.shutdown().await;
+
+        // Restart (same identity, same state dir). Request Signed on purpose:
+        // the snapshot's terminal append_only must win.
+        let agent2 = build_agent().await;
+        let restored = agent2
+            .create_kv_store_persistent(
+                "log",
+                "ao-persist-topic",
+                kv::AccessPolicy::Signed,
+                &state_dir,
+            )
+            .await
+            .expect("restore from snapshot");
+        {
+            let s = restored.sync.read().await;
+            assert_eq!(
+                *s.policy(),
+                kv::AccessPolicy::AppendOnly,
+                "snapshot's terminal append_only policy wins over the request"
+            );
+            assert_eq!(s.highest_checkpoint_seq, 2, "HWM survives restart");
+            assert!(s.get("k").is_some() && s.get("k2").is_some());
+        }
+        // The restarted owner still cannot rewrite its own history.
+        let err = restored
+            .put(
+                "k".to_string(),
+                b"REWRITE".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect_err("post-restart rewrite rejected");
+        assert!(matches!(err, error::IdentityError::ImmutableKey(_)));
+        agent2.shutdown().await;
+
+        // Fail-closed checks: corrupt snapshot and policy-conflict requests
+        // must refuse to start, never silently start empty.
+        let agent3 = build_agent().await;
+        let store_id = kv::KvStoreId::for_topic_owner("ao-persist-topic", &agent3.agent_id());
+        let snap_path = kv_snapshot_path(&state_dir, &store_id);
+        let good_bytes = std::fs::read(&snap_path).expect("snapshot exists");
+        std::fs::write(&snap_path, b"garbage").expect("corrupt");
+        assert!(
+            agent3
+                .create_kv_store_persistent(
+                    "log",
+                    "ao-persist-topic",
+                    kv::AccessPolicy::AppendOnly,
+                    &state_dir,
+                )
+                .await
+                .is_err(),
+            "corrupt snapshot must fail closed, not start empty"
+        );
+        std::fs::write(&snap_path, good_bytes).expect("restore snapshot");
+
+        // Requesting append_only over a Signed snapshot fails closed.
+        let signed_store = agent3
+            .create_kv_store_persistent(
+                "plain",
+                "signed-persist-topic",
+                kv::AccessPolicy::Signed,
+                &state_dir,
+            )
+            .await
+            .expect("create signed persistent store");
+        drop(signed_store);
+        assert!(
+            agent3
+                .create_kv_store_persistent(
+                    "plain",
+                    "signed-persist-topic",
+                    kv::AccessPolicy::AppendOnly,
+                    &state_dir,
+                )
+                .await
+                .is_err(),
+            "append_only requested over a Signed snapshot must fail closed"
+        );
+        agent3.shutdown().await;
+    }
+
     /// P1 fence (restart-ABA): a fence token captured before an incarnation
     /// change (daemon restart) must be rejected even when submitted at the
     /// SAME revision afterwards — the per-replica epoch component differs, so
