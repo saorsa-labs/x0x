@@ -10676,37 +10676,93 @@ impl Agent {
         topic: &str,
         policy: kv::AccessPolicy,
     ) -> error::Result<KvStoreHandle> {
-        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
-            error::IdentityError::Storage(std::io::Error::other(
-                "gossip runtime not initialized - configure agent with network first",
-            ))
-        })?;
+        self.create_kv_store_inner(name, topic, policy, None).await
+    }
 
-        let peer_id = runtime.peer_id();
-        let store_id = kv::KvStoreId::for_topic_owner(topic, &self.agent_id());
-        let store = kv::KvStore::new(store_id, name.to_string(), self.agent_id(), policy);
-
-        let sync = kv::KvStoreSync::new(
-            store,
-            std::sync::Arc::clone(runtime.pubsub()),
-            topic.to_string(),
-            peer_id,
-            Some(self.agent_id()),
-        )
-        .map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "kv store sync creation failed: {e}",
-            )))
-        })?;
-
-        let sync = std::sync::Arc::new(sync);
-        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
+    /// Create (or restore) a key-value store with an on-disk state snapshot.
+    ///
+    /// Like [`create_kv_store_with_policy`](Self::create_kv_store_with_policy)
+    /// but the full store state (policy, keyset, entry contents, latest
+    /// adopted checkpoint, and the checkpoint high-water mark) is snapshotted
+    /// to `state_dir/<store-id-hex>.bin` after every mutation and restored
+    /// here on restart — BEFORE any network or local write is accepted. This
+    /// closes the restart-amnesia hole for [`kv::AccessPolicy::AppendOnly`]:
+    /// an owner that forgot its keys would otherwise re-accept (and re-sign)
+    /// rewrites of them.
+    ///
+    /// # Errors
+    ///
+    /// - Gossip runtime not initialized.
+    /// - A snapshot exists but is corrupt/undecodable, belongs to a different
+    ///   store, is owned by a different agent, or its policy conflicts with
+    ///   `policy` (requesting `AppendOnly` over a non-`AppendOnly` snapshot).
+    ///   All of these FAIL CLOSED — silently starting empty would reopen the
+    ///   amnesia window.
+    pub async fn create_kv_store_persistent(
+        &self,
+        name: &str,
+        topic: &str,
+        policy: kv::AccessPolicy,
+        state_dir: &std::path::Path,
+    ) -> error::Result<KvStoreHandle> {
+        self.create_kv_store_inner(name, topic, policy, Some(state_dir))
             .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "kv store sync start failed: {e}",
-                )))
-            })?;
+    }
+
+    async fn create_kv_store_inner(
+        &self,
+        name: &str,
+        topic: &str,
+        policy: kv::AccessPolicy,
+        state_dir: Option<&std::path::Path>,
+    ) -> error::Result<KvStoreHandle> {
+        let store_id = kv::KvStoreId::for_topic_owner(topic, &self.agent_id());
+        let persist_path = state_dir.map(|d| kv_snapshot_path(d, &store_id));
+        let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
+            Some(Ok(Some(snap))) => {
+                if snap.id() != &store_id {
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot store-id mismatch for topic {topic}"
+                    )));
+                }
+                if snap.owner() != Some(&self.agent_id()) {
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot for topic {topic} is owned by a different agent"
+                    )));
+                }
+                if matches!(policy, kv::AccessPolicy::AppendOnly)
+                    && !matches!(snap.policy(), kv::AccessPolicy::AppendOnly)
+                {
+                    // The registration says append-only but the snapshot says
+                    // otherwise: tamper or corruption. Fail closed rather
+                    // than silently downgrading immutability.
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot for topic {topic} is not append_only but the store was registered append_only; refusing to downgrade"
+                    )));
+                }
+                if matches!(snap.policy(), kv::AccessPolicy::AppendOnly)
+                    && !matches!(policy, kv::AccessPolicy::AppendOnly)
+                {
+                    // AppendOnly is terminal: the snapshot's knowledge wins.
+                    tracing::warn!(
+                        "kv store {topic}: snapshot policy is terminal append_only; ignoring requested policy {policy}"
+                    );
+                }
+                snap
+            }
+            Some(Ok(None)) | None => {
+                kv::KvStore::new(store_id, name.to_string(), self.agent_id(), policy)
+            }
+            Some(Err(e)) => {
+                // Corrupt snapshot: fail closed, loudly. Starting an empty
+                // replica here would silently discard append-only history.
+                return Err(kv_storage_err(format!(
+                    "kv snapshot for topic {topic} is unreadable ({e}); refusing to start with amnesia — repair or remove the snapshot file explicitly"
+                )));
+            }
+        };
+
+        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
 
         // The creator is the owner: capture signing material so each write
         // produces an owner-signed content checkpoint (cold-recovery provenance).
@@ -10720,6 +10776,44 @@ impl Agent {
                 secret_key_bytes: sk_bytes,
             })),
         })
+    }
+
+    /// Construct, arm persistence for, and start a `KvStoreSync`.
+    async fn spawn_kv_sync(
+        &self,
+        store: kv::KvStore,
+        topic: &str,
+        persist_path: Option<std::path::PathBuf>,
+    ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        let peer_id = runtime.peer_id();
+        let sync = kv::KvStoreSync::new(
+            store,
+            std::sync::Arc::clone(runtime.pubsub()),
+            topic.to_string(),
+            peer_id,
+            Some(self.agent_id()),
+        )
+        .map_err(|e| kv_storage_err(format!("kv store sync creation failed: {e}")))?;
+        // Arm persistence BEFORE start so no merged delta can land
+        // unpersisted, and write an initial snapshot so the file exists from
+        // the first moment the store does.
+        let persistent = persist_path.is_some();
+        if let Some(path) = persist_path {
+            sync.set_persist_path(path);
+        }
+        let sync = std::sync::Arc::new(sync);
+        if persistent {
+            sync.persist().await;
+        }
+        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
+            .await
+            .map_err(|e| kv_storage_err(format!("kv store sync start failed: {e}")))?;
+        Ok((sync, peer_id))
     }
 
     /// Join an existing key-value store by topic, anchoring ownership on the
@@ -10747,39 +10841,73 @@ impl Agent {
         owner: identity::AgentId,
         channel: kv::store::AnchorChannel,
     ) -> error::Result<KvStoreHandle> {
-        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
-            error::IdentityError::Storage(std::io::Error::other(
-                "gossip runtime not initialized - configure agent with network first",
-            ))
-        })?;
+        self.join_kv_store_inner(topic, owner, channel, None).await
+    }
 
-        let peer_id = runtime.peer_id();
+    /// Join (or restore) a key-value store replica with an on-disk snapshot.
+    ///
+    /// Like [`join_kv_store`](Self::join_kv_store) but the replica's full
+    /// state — including a learned `AppendOnly` policy, the keyset, entry
+    /// contents, and the checkpoint high-water mark — is snapshotted to
+    /// `state_dir/<store-id-hex>.bin` and restored here on restart, BEFORE
+    /// any delta is merged. Without this, a restarted joiner comes back as an
+    /// empty `Signed` replica and cannot detect an owner rewriting keys it
+    /// used to hold.
+    ///
+    /// # Errors
+    ///
+    /// As [`join_kv_store`](Self::join_kv_store), plus fail-closed snapshot
+    /// errors (corrupt file, store-id mismatch, or an anchored owner in the
+    /// snapshot that differs from `owner`).
+    pub async fn join_kv_store_persistent(
+        &self,
+        topic: &str,
+        owner: identity::AgentId,
+        channel: kv::store::AnchorChannel,
+        state_dir: &std::path::Path,
+    ) -> error::Result<KvStoreHandle> {
+        self.join_kv_store_inner(topic, owner, channel, Some(state_dir))
+            .await
+    }
+
+    async fn join_kv_store_inner(
+        &self,
+        topic: &str,
+        owner: identity::AgentId,
+        channel: kv::store::AnchorChannel,
+        state_dir: Option<&std::path::Path>,
+    ) -> error::Result<KvStoreHandle> {
         // The store id is the verifiable topic→owner binding; it agrees with
         // the creator's id (both derive for_topic_owner(topic, owner)).
         let store_id = kv::KvStoreId::for_topic_owner(topic, &owner);
-        let store = kv::KvStore::new_replica(store_id, String::new(), Some(owner), channel);
+        let persist_path = state_dir.map(|d| kv_snapshot_path(d, &store_id));
+        let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
+            Some(Ok(Some(snap))) => {
+                if snap.id() != &store_id {
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot store-id mismatch for topic {topic}"
+                    )));
+                }
+                if snap.owner() != Some(&owner) {
+                    // The snapshot is anchored on a different owner than the
+                    // caller supplied: identity confusion. Fail closed.
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot for topic {topic} is anchored on a different owner"
+                    )));
+                }
+                snap
+            }
+            Some(Ok(None)) | None => {
+                kv::KvStore::new_replica(store_id, String::new(), Some(owner), channel)
+            }
+            Some(Err(e)) => {
+                return Err(kv_storage_err(format!(
+                    "kv snapshot for topic {topic} is unreadable ({e}); refusing to start with amnesia — repair or remove the snapshot file explicitly"
+                )));
+            }
+        };
 
-        let sync = kv::KvStoreSync::new(
-            store,
-            std::sync::Arc::clone(runtime.pubsub()),
-            topic.to_string(),
-            peer_id,
-            Some(self.agent_id()),
-        )
-        .map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "kv store sync creation failed: {e}",
-            )))
-        })?;
-
-        let sync = std::sync::Arc::new(sync);
-        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
-            .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "kv store sync start failed: {e}",
-                )))
-            })?;
+        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
 
         Ok(KvStoreHandle {
             sync,
@@ -10790,6 +10918,16 @@ impl Agent {
             owner_signing: None,
         })
     }
+}
+
+/// Snapshot file path for a store: `<dir>/<store-id-hex>.bin`.
+fn kv_snapshot_path(dir: &std::path::Path, id: &kv::KvStoreId) -> std::path::PathBuf {
+    dir.join(format!("{}.bin", hex::encode(id.as_bytes())))
+}
+
+/// Shorthand for the storage-flavoured [`error::IdentityError`].
+fn kv_storage_err(msg: String) -> error::IdentityError {
+    error::IdentityError::Storage(std::io::Error::other(msg))
 }
 
 /// Handle for interacting with a replicated key-value store.
@@ -10957,6 +11095,7 @@ impl KvStoreHandle {
         let delta = {
             let mut store = self.sync.write().await;
             Self::check_local_write(&store, &self.agent_id)?;
+            let version_before = store.current_version();
             store
                 .put(
                     key.clone(),
@@ -10972,6 +11111,13 @@ impl KvStoreHandle {
                         "kv put failed: {other}",
                     ))),
                 })?;
+            // An AppendOnly idempotent re-put is a TRUE no-op: the store
+            // version did not move, so produce no checkpoint (the sequence
+            // must not advance for a non-mutation), publish nothing, and
+            // persist nothing. Retries stay observationally silent.
+            if store.current_version() == version_before {
+                return Ok(kv::KvStoreDelta::new(version_before));
+            }
             let entry = store.get(&key).cloned();
             let version = store.current_version();
             let mut delta = match entry {
@@ -10994,6 +11140,10 @@ impl KvStoreHandle {
             }
             delta
         };
+        // Persist the committed mutation before announcing it (crash between
+        // the two re-publishes on next write; the reverse order could sign a
+        // checkpoint the disk never saw).
+        self.sync.persist().await;
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv put delta: {e}");
         }
@@ -11061,6 +11211,9 @@ impl KvStoreHandle {
             }
             d
         };
+        // Persist the committed mutation before announcing it (see
+        // put_with_delta).
+        self.sync.persist().await;
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv remove delta: {e}");
         }

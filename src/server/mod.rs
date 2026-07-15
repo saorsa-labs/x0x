@@ -955,6 +955,7 @@ pub async fn serve_with_options(
         kv_stores: RwLock::new(HashMap::new()),
         crdt_subscriptions: RwLock::new(crdt_subscriptions::CrdtSubscriptionManifest::default()),
         crdt_subscriptions_path: config.data_dir.join("crdt-subscriptions.json"),
+        kv_store_state_dir: config.data_dir.join("kv-stores"),
         crdt_subscriptions_persistence_lock: Mutex::new(()),
         crdt_handle_locks: RwLock::new(HashMap::new()),
         named_groups: RwLock::new(named_groups),
@@ -15902,7 +15903,7 @@ async fn create_kv_store(
     let policy_str = policy.to_string();
     match state
         .agent
-        .create_kv_store_with_policy(&req.name, &req.topic, policy)
+        .create_kv_store_persistent(&req.name, &req.topic, policy, &state.kv_store_state_dir)
         .await
     {
         Ok(handle) => {
@@ -15990,7 +15991,12 @@ async fn join_kv_store(
     }
     match state
         .agent
-        .join_kv_store(&id, owner, x0x::kv::store::AnchorChannel::RestParam)
+        .join_kv_store_persistent(
+            &id,
+            owner,
+            x0x::kv::store::AnchorChannel::RestParam,
+            &state.kv_store_state_dir,
+        )
         .await
     {
         Ok(handle) => {
@@ -21308,6 +21314,7 @@ mod tests {
             kv_stores: RwLock::new(HashMap::new()),
             crdt_subscriptions: RwLock::new(crdt_subscriptions::CrdtSubscriptionManifest::default()),
             crdt_subscriptions_path: data_dir.join("crdt-subscriptions.json"),
+            kv_store_state_dir: data_dir.join("kv-stores"),
             crdt_subscriptions_persistence_lock: Mutex::new(()),
             crdt_handle_locks: RwLock::new(HashMap::new()),
             named_groups: RwLock::new(named_groups),

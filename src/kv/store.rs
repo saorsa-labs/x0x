@@ -49,14 +49,32 @@ pub enum AccessPolicy {
 
     /// Owner-signed append-only store: like [`Signed`](Self::Signed), only the
     /// owner can write — but existing keys are IMMUTABLE. A key, once written,
-    /// can never be updated to different content or deleted, **even by the
-    /// owner**. Re-putting byte-identical content is accepted as an idempotent
-    /// no-op (retry-friendly).
+    /// can never be updated or deleted, **even by the owner**, and the entry
+    /// is frozen in FULL (value, content type, metadata, timestamps).
+    /// Re-putting byte-identical content is accepted as an idempotent no-op
+    /// (retry-friendly, and it does not advance the checkpoint sequence).
+    /// The policy itself is TERMINAL: once a replica knows a store is
+    /// append-only, every policy transition away from it is rejected —
+    /// announces, checkpoints, and manifests included, regardless of
+    /// `policy_version`.
     ///
-    /// This makes append-only event logs tamper-evident against their own
-    /// author: an owner retroactively rewriting or truncating history is
-    /// rejected at every enforcement point (local writes, remote deltas, and
-    /// owner-signed checkpoint adoption).
+    /// ## Exact guarantee (read carefully)
+    ///
+    /// Keys are immutable **after first observation by a
+    /// continuously-persistent replica**. A replica that has seen key `k`
+    /// (and has not lost its state) rejects every rewrite or removal of `k`
+    /// at all enforcement points: local writes, remote deltas — owner-signed
+    /// included — and owner-signed checkpoint adoption. A **fresh joiner
+    /// with no prior state necessarily trusts the owner's current signed
+    /// snapshot**: signatures alone cannot tell it whether that snapshot is
+    /// the original history or a rewrite, so two fresh joiners fed different
+    /// owner-signed snapshots will adopt divergent states (detectable after
+    /// the fact by comparing adopted checkpoint content roots, never
+    /// auto-reconciled). Applications that need fresh-joiner rewrite
+    /// detection must layer content chaining on top (per-author sequence
+    /// numbers + previous-entry hashes, as x0x-symphony's tracker-integrity-v2
+    /// does — see saorsa-labs/x0x-symphony#10); witnesses/transparency logs
+    /// are out of scope here.
     ///
     /// NOTE: this variant MUST stay last — bincode encodes enum variants
     /// positionally, and stores/checkpoints/deltas carrying `AccessPolicy`
@@ -348,6 +366,23 @@ fn lp_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
 }
 
+/// Full-field entry equality for the AppendOnly freeze.
+///
+/// Under [`AccessPolicy::AppendOnly`] an existing entry is frozen in FULL —
+/// value, content hash, content type, metadata, and both timestamps — not
+/// just its value bytes. This matches exactly the fields the owner-signed
+/// checkpoint root commits to (see [`entry_commitment_bytes`]), so "equal
+/// here" and "same commitment" are the same statement.
+fn entry_frozen_fields_equal(a: &KvEntry, b: &KvEntry) -> bool {
+    a.key == b.key
+        && a.value == b.value
+        && a.content_hash == b.content_hash
+        && a.content_type == b.content_type
+        && a.metadata == b.metadata
+        && a.created_at == b.created_at
+        && a.updated_at == b.updated_at
+}
+
 /// Validate that a relayed entry is internally consistent before adoption.
 ///
 /// Independently enforces:
@@ -614,6 +649,19 @@ impl KvStore {
         self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Floor the in-memory sequence counter to the persisted `version`.
+    ///
+    /// `seq_counter` is `serde(skip)`, so a snapshot-restored store would
+    /// otherwise mint OR-Set tags starting from 0 again — potentially
+    /// colliding with tags issued before the restart. `version` increments on
+    /// every mutation, so it is always >= the number of locally minted tags.
+    pub(crate) fn floor_seq_counter_to_version(&self) {
+        let v = self.version;
+        if self.seq_counter.load(Ordering::Relaxed) < v {
+            self.seq_counter.store(v, Ordering::Relaxed);
+        }
+    }
+
     /// Get the current version.
     #[must_use]
     pub fn current_version(&self) -> u64 {
@@ -839,6 +887,20 @@ impl KvStore {
         // different policy at the same version cannot be signed by the owner.
         // An older replay (version < current) is still dropped, preventing a
         // downgrade. A matching forward refresh clears a recorded conflict.
+        //
+        // AppendOnly is TERMINAL: once this replica knows the store is
+        // append-only, no announce — however fresh, however genuinely
+        // owner-signed — may transition the policy away from it. Allowing
+        // that would let the owner downgrade to Signed, delete/rewrite keys,
+        // and (optionally) upgrade back: exactly the retroactive-rewrite
+        // attack AppendOnly exists to stop.
+        if matches!(self.policy, AccessPolicy::AppendOnly)
+            && !matches!(policy, AccessPolicy::AppendOnly)
+        {
+            return Err(KvError::OwnerTokenInvalid(
+                "append-only policy is terminal; policy downgrade rejected".to_string(),
+            ));
+        }
         if policy_version >= self.policy_version {
             self.policy = policy;
             self.policy_version = policy_version;
@@ -1161,27 +1223,29 @@ impl KvStore {
     /// AppendOnly guard for one incoming delta entry.
     ///
     /// `true` when this store is [`AccessPolicy::AppendOnly`] and `key` is
-    /// already active locally with different content — the mutation must be
-    /// skipped and the local value retained. Owner-signed deltas are NOT
-    /// exempt: an owner retroactively rewriting records is exactly the attack
-    /// this policy exists to stop. A byte-identical re-delivery is allowed
-    /// through (idempotent; the LWW entry merge is a no-op on content).
+    /// already active locally — the incoming entry must be skipped WHOLESALE.
+    /// Existing entries are frozen in full (value, content type, metadata,
+    /// timestamps, content hash): even a byte-identical redelivery is not
+    /// merged, because [`KvEntry::merge`] resolves by LWW timestamp and could
+    /// otherwise mutate `metadata`/`updated_at` while the value stays equal.
+    /// Owner-signed deltas are NOT exempt: an owner retroactively rewriting
+    /// records is exactly the attack this policy exists to stop. Only a
+    /// content-differing skip is warn-logged; an identical redelivery is a
+    /// silent idempotent no-op.
     fn append_only_rejects_entry(&self, key: &str, entry: &KvEntry) -> bool {
         if !matches!(self.policy, AccessPolicy::AppendOnly) {
             return false;
         }
-        match self.get(key) {
-            Some(local)
-                if local.value != entry.value || local.content_type != entry.content_type =>
-            {
-                tracing::warn!(
-                    "append-only violation: skipped remote update of existing key {key:?} for store {}",
-                    self.id
-                );
-                true
-            }
-            _ => false,
+        let Some(local) = self.get(key) else {
+            return false; // new key — a legitimate append
+        };
+        if !entry_frozen_fields_equal(local, entry) {
+            tracing::warn!(
+                "append-only violation: skipped remote update of existing key {key:?} for store {}",
+                self.id
+            );
         }
+        true
     }
 
     /// Try to adopt an owner-signed checkpoint as an authoritative full
@@ -1245,6 +1309,26 @@ impl KvStore {
                 return false;
             }
         }
+        // 5b. Canonical-map gate: `added` and `updated` must be DISJOINT on
+        //     the adoption path. No legitimate producer emits the same key in
+        //     both maps of a full-state relay (`full_delta` populates only
+        //     `added`; incremental owner deltas are single-map), but a crafted
+        //     delta could carry key K in both with different values — the
+        //     validation/root pass would see one set while adoption applies
+        //     both maps in sequence, letting the second silently rewrite what
+        //     was validated. Reject for ALL policies: adoption is a
+        //     security-critical full-replace and an ambiguous multiset is
+        //     tamper by construction. Fall-through to sender-auth is safe —
+        //     its loops re-check state sequentially per entry.
+        for key in delta.updated.keys() {
+            if delta.added.contains_key(key) {
+                tracing::warn!(
+                    "rejected owner checkpoint for store {}: key {key:?} appears in both added and updated",
+                    self.id
+                );
+                return false;
+            }
+        }
         // 6. Content integrity: the canonical root over the relayed entry set
         //    must match. This only holds for a full-state relay; an incremental
         //    delta's single entry set won't match a full-state checkpoint root,
@@ -1272,6 +1356,21 @@ impl KvStore {
         //     unaffected. Checked against BOTH the local policy and the
         //     checkpoint's claimed policy, so a hostile checkpoint cannot
         //     dodge the gate by flipping its own policy field.
+        // AppendOnly is TERMINAL: a checkpoint claiming the store is no
+        // longer append-only, presented to a replica that knows it is, is
+        // hostile by definition (adopting it would downgrade the policy in
+        // step 10 and unfreeze the log). Reject the whole checkpoint.
+        if matches!(self.policy, AccessPolicy::AppendOnly)
+            && !matches!(cp.policy, AccessPolicy::AppendOnly)
+        {
+            tracing::warn!(
+                "append-only violation: rejected owner checkpoint seq {} for store {} — it downgrades the terminal append_only policy to {}",
+                cp.checkpoint_seq,
+                self.id,
+                cp.policy
+            );
+            return false;
+        }
         if matches!(self.policy, AccessPolicy::AppendOnly)
             || matches!(cp.policy, AccessPolicy::AppendOnly)
         {
@@ -1290,10 +1389,7 @@ impl KvStore {
                         );
                         return false;
                     }
-                    Some(remote)
-                        if remote.value != local.value
-                            || remote.content_type != local.content_type =>
-                    {
+                    Some(remote) if !entry_frozen_fields_equal(remote, local) => {
                         tracing::warn!(
                             "append-only violation: rejected owner checkpoint seq {} for store {} — it rewrites existing key {key:?}",
                             cp.checkpoint_seq,
@@ -1354,7 +1450,13 @@ impl KvStore {
             self.name.merge(name_register);
         }
         // 10. Refresh policy (forward only) and cache the checkpoint.
-        if cp.policy_version >= self.policy_version {
+        //     Belt-and-braces: AppendOnly is terminal — the 6b gate already
+        //     rejected any checkpoint that would downgrade it, so this branch
+        //     can only keep or adopt AppendOnly, never leave it.
+        if cp.policy_version >= self.policy_version
+            && !(matches!(self.policy, AccessPolicy::AppendOnly)
+                && !matches!(cp.policy, AccessPolicy::AppendOnly))
+        {
             self.policy = cp.policy.clone();
             self.policy_version = cp.policy_version;
         }
@@ -1426,11 +1528,52 @@ impl KvStore {
     }
 
     /// Merge another store into this one.
+    ///
+    /// # Errors
+    ///
+    /// - [`KvError::StoreIdMismatch`] if the ids differ.
+    /// - [`KvError::ImmutableKey`] under [`AccessPolicy::AppendOnly`] if the
+    ///   merge would remove any locally-active key or change any of its
+    ///   frozen fields. The merge is applied transactionally: on violation
+    ///   NOTHING is applied (no partial merge). This closes the bypass where
+    ///   a full-state merge (which skips every `merge_delta` gate) could
+    ///   rewrite or tombstone append-only history. Currently this method has
+    ///   no non-test callers — the live sync path is
+    ///   [`merge_delta`](Self::merge_delta) — but it is public API, so the
+    ///   invariant is enforced here too rather than removed (removal would be
+    ///   a semver break; flagged for v0.33.0).
     pub fn merge(&mut self, other: &KvStore) -> Result<()> {
         if self.id != other.id {
             return Err(KvError::StoreIdMismatch);
         }
 
+        // AppendOnly: run the merge on a trial clone and verify the freeze
+        // invariant before committing, so a violating merge cannot leave
+        // partial state behind.
+        if matches!(self.policy, AccessPolicy::AppendOnly) {
+            let mut trial = self.clone();
+            trial.merge_unchecked(other)?;
+            for key in self.keys.elements() {
+                let Some(local) = self.get(key) else { continue };
+                match trial.get(key) {
+                    None => {
+                        return Err(KvError::ImmutableKey(key.clone()));
+                    }
+                    Some(merged) if !entry_frozen_fields_equal(merged, local) => {
+                        return Err(KvError::ImmutableKey(key.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            *self = trial;
+            return Ok(());
+        }
+
+        self.merge_unchecked(other)
+    }
+
+    /// The raw CRDT merge, without the AppendOnly freeze check.
+    fn merge_unchecked(&mut self, other: &KvStore) -> Result<()> {
         self.keys
             .merge_state(&other.keys)
             .map_err(|e| KvError::Merge(format!("OR-Set merge failed: {e}")))?;

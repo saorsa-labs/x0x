@@ -10,6 +10,7 @@ use crate::kv::store::AccessPolicy;
 use crate::kv::{KvStore, KvStoreDelta, Result};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -83,6 +84,17 @@ pub struct KvStoreSync {
     /// is the store owner (and should answer state requests with an
     /// [`KvSyncMessage::OwnerAnnounce`]) and to ignore its own announces.
     local_agent_id: Option<AgentId>,
+
+    /// Optional on-disk snapshot path. When set (see
+    /// [`set_persist_path`](Self::set_persist_path)), the full store state is
+    /// bincode-snapshotted atomically after every local mutation and every
+    /// merged remote delta, so a restart restores policy, keyset, entry
+    /// contents, the latest adopted checkpoint, and the checkpoint high-water
+    /// mark instead of coming back as an empty replica. This is what makes
+    /// `AppendOnly` immutability survive a restart: an owner (or replica)
+    /// with amnesia would otherwise accept rewrites of keys it no longer
+    /// remembers holding.
+    persist_path: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl KvStoreSync {
@@ -112,7 +124,35 @@ impl KvStoreSync {
             topic,
             local_peer_id,
             local_agent_id,
+            persist_path: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Enable on-disk snapshot persistence at `path`.
+    ///
+    /// Call before [`start`](Self::start) so no merged delta can land
+    /// unpersisted. The caller is responsible for loading any existing
+    /// snapshot BEFORE constructing this sync (see
+    /// [`load_snapshot`](load_snapshot)); this method only arms writes.
+    pub fn set_persist_path(&self, path: PathBuf) {
+        if let Ok(mut guard) = self.persist_path.lock() {
+            *guard = Some(path);
+        }
+    }
+
+    /// Snapshot the store to the configured persist path (no-op when
+    /// persistence is not armed). Failures are error-logged, never silent —
+    /// the in-memory state is already committed and published, so the write
+    /// path does not unwind, but a failing disk must be loud (it reopens the
+    /// restart-amnesia window this exists to close).
+    pub async fn persist(&self) {
+        let path = match self.persist_path.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        if let Some(path) = path {
+            persist_snapshot(&self.store, &path).await;
+        }
     }
 
     /// The state-sync side topic for this store.
@@ -163,7 +203,12 @@ impl KvStoreSync {
         // owner-signed envelope from store A under topic B. Each listener binds
         // to the exact topic it subscribed to.
         let main_topic = self.topic.clone();
+        // Snapshot the persist path once: it is armed before start() by
+        // construction (set_persist_path docs), so the loops never observe a
+        // late change.
+        let persist_path = self.persist_path.lock().ok().and_then(|g| g.clone());
 
+        let loop_persist_path = persist_path.clone();
         spawn(Box::pin(async move {
             while let Some(msg) = sub.recv().await {
                 if msg.topic != main_topic {
@@ -174,12 +219,25 @@ impl KvStoreSync {
                 let decoded = decode_delta::<KvStoreDelta>(&msg.payload);
                 match decoded {
                     Ok((peer_id, delta)) => {
-                        let mut s = store.write().await;
-                        // Pass sender identity for access control enforcement.
-                        // The gossip V2 wire format includes a verified AgentId.
-                        let writer = msg.sender.as_ref();
-                        if let Err(e) = s.merge_delta(&delta, peer_id, writer) {
-                            tracing::warn!("Failed to merge KvStore delta: {e}");
+                        let merged = {
+                            let mut s = store.write().await;
+                            // Pass sender identity for access control enforcement.
+                            // The gossip V2 wire format includes a verified AgentId.
+                            let writer = msg.sender.as_ref();
+                            match s.merge_delta(&delta, peer_id, writer) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    tracing::warn!("Failed to merge KvStore delta: {e}");
+                                    false
+                                }
+                            }
+                        };
+                        // Persist OUTSIDE the write guard so disk latency
+                        // never blocks other writers.
+                        if merged {
+                            if let Some(path) = loop_persist_path.as_ref() {
+                                persist_snapshot(&store, path).await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -204,6 +262,7 @@ impl KvStoreSync {
         // sender is the claimed owner itself (see KvSyncMessage docs).
         let mut sync_sub = self.pubsub.subscribe(self.state_sync_topic()).await;
         let responder_store = Arc::clone(&self.store);
+        let responder_persist_path = persist_path.clone();
         let responder_pubsub = Arc::clone(&self.pubsub);
         let responder_topic = self.topic.clone();
         let sync_topic = self.state_sync_topic();
@@ -292,25 +351,39 @@ impl KvStoreSync {
                         if local_agent_id.is_some_and(|me| me == sender) {
                             continue; // our own announce echoed back
                         }
-                        let mut s = responder_store.write().await;
-                        // learn_ownership can only refresh policy (when the
-                        // owner matches and policy_version is forward) or
-                        // record a conflict; it never establishes ownership.
-                        match s.learn_ownership(owner, policy, policy_version, &sender) {
-                            Ok(()) => {
-                                tracing::info!(
-                                    "KvStore {} processed owner announce from {} (policy {}, version {})",
-                                    s.id(),
-                                    hex::encode(owner.as_bytes()),
-                                    s.policy(),
-                                    s.policy_version()
-                                );
+                        let learned = {
+                            let mut s = responder_store.write().await;
+                            // learn_ownership can only refresh policy (when the
+                            // owner matches and policy_version is forward) or
+                            // record a conflict; it never establishes ownership.
+                            // AppendOnly is terminal: a downgrade announce is
+                            // rejected inside learn_ownership regardless of
+                            // policy_version.
+                            match s.learn_ownership(owner, policy, policy_version, &sender) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "KvStore {} processed owner announce from {} (policy {}, version {})",
+                                        s.id(),
+                                        hex::encode(owner.as_bytes()),
+                                        s.policy(),
+                                        s.policy_version()
+                                    );
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "rejected KvStore ownership announcement from {}: {e}",
+                                        hex::encode(sender.as_bytes())
+                                    );
+                                    false
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "rejected KvStore ownership announcement from {}: {e}",
-                                    hex::encode(sender.as_bytes())
-                                );
+                        };
+                        // A policy refresh mutates durable state — persist it
+                        // (outside the write guard).
+                        if learned {
+                            if let Some(path) = responder_persist_path.as_ref() {
+                                persist_snapshot(&responder_store, path).await;
                             }
                         }
                     }
@@ -389,6 +462,84 @@ impl KvStoreSync {
     pub fn topic(&self) -> &str {
         &self.topic
     }
+}
+
+/// Monotonic counter for unique snapshot temp-file names — concurrent
+/// persists (receive loop vs. local write) must never clobber each other's
+/// temp file mid-rename.
+static SNAPSHOT_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot the store to `path` (bincode, atomic temp-file + fsync + rename).
+///
+/// Failures are error-logged and never unwind the caller: the in-memory
+/// mutation is already committed and published, so the correct response to a
+/// failing disk is a loud log, not a poisoned store.
+async fn persist_snapshot(store: &Arc<RwLock<KvStore>>, path: &Path) {
+    let bytes = {
+        let s = store.read().await;
+        match bincode::serialize(&*s) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("kv snapshot serialize failed for {}: {e}", path.display());
+                return;
+            }
+        }
+    };
+    if let Err(e) = write_snapshot_atomic(path, &bytes) {
+        tracing::error!("kv snapshot write failed for {}: {e}", path.display());
+    }
+}
+
+/// Durable atomic file write: unique temp file in the same directory,
+/// fsync, then rename over the destination.
+fn write_snapshot_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let n = SNAPSHOT_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Load a previously persisted store snapshot from `path`.
+///
+/// Returns:
+/// - `Ok(Some(store))` — snapshot present and valid.
+/// - `Ok(None)` — no snapshot at `path` (first run).
+/// - `Err(_)` — snapshot present but unreadable/undecodable. Callers MUST
+///   fail closed on this (refuse to start an empty replica over a corrupt
+///   snapshot): silently discarding it would reopen the restart-amnesia
+///   window (an `AppendOnly` owner that forgets its keys will re-accept
+///   rewrites of them).
+///
+/// The restored store's in-memory `seq_counter` (not serialized) is floored
+/// to `version` so freshly minted OR-Set tags can never collide with tags
+/// issued before the restart.
+///
+/// # Errors
+///
+/// [`crate::kv::KvError::Io`]/[`crate::kv::KvError::Serialization`] as above.
+pub fn load_snapshot(path: &Path) -> Result<Option<KvStore>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let store: KvStore = bincode::deserialize(&bytes)?;
+    store.floor_seq_counter_to_version();
+    Ok(Some(store))
 }
 
 #[cfg(test)]

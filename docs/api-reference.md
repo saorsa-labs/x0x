@@ -762,10 +762,25 @@ to the owner**. `PUT` on an existing key with different content and `DELETE`
 on any existing key return **409 Conflict** with
 `{"ok":false,"error":"immutable key: <key> — append-only store; ..."}`.
 Re-putting byte-identical content (same value and content type) is accepted
-as an idempotent no-op, so retries are safe. Replicas enforce the same rule
-against remote deltas and owner-signed checkpoints, so an owner cannot
-rewrite or truncate the log retroactively — this is what makes append-only
-event logs tamper-evident against their own author.
+as an idempotent no-op, so retries are safe (and no new owner checkpoint is
+produced). The policy is terminal: once a replica knows a store is
+append-only, no owner announce or checkpoint can transition it back to
+`signed`. The daemon snapshots every store's full state to
+`<data_dir>/kv-stores/<store-id-hex>.bin` after each mutation, so
+immutability knowledge survives restarts; a corrupt or conflicting snapshot
+fails closed at startup rather than silently starting empty.
+
+**Exact guarantee**: keys are immutable *after first observation by a
+continuously-persistent replica*. Such a replica rejects every rewrite or
+removal — including owner-signed deltas and owner-signed checkpoints. A
+**fresh joiner with no prior state necessarily trusts the owner's current
+signed snapshot**: signatures alone cannot prove that snapshot is the
+original history rather than a rewrite, and two fresh joiners fed different
+owner-signed snapshots will diverge (detectable by comparing adopted
+checkpoint content roots). Applications that need fresh-joiner rewrite
+detection must layer content chaining above the store (per-author sequence
+numbers + previous-entry hashes) — x0x-symphony's tracker-integrity-v2 does
+exactly this (saorsa-labs/x0x-symphony#10).
 
 ## File transfers
 

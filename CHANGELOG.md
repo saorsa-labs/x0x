@@ -8,20 +8,54 @@ All notable changes to this project will be documented in this file.
 
 - `AccessPolicy::AppendOnly` for KV stores (tracker-integrity-v2 WP-X,
   x0x-symphony #10): owner-signed like `Signed`, but existing keys are
-  IMMUTABLE — no update to different content, no delete, even by the owner.
-  Enforced at every path: local put/remove (`KvError::ImmutableKey`),
-  remote deltas (violating entries/removals are skipped and logged, the
-  rest of the delta still applies), and owner-signed checkpoint adoption
-  (a checkpoint that shrinks the keyset or rewrites an existing key is
-  rejected outright; fresh-joiner cold-start adoption is unaffected).
-  Byte-identical re-puts are accepted as idempotent no-ops (retry-friendly).
-  REST: `POST /stores` accepts `"policy": "append_only"`; `PUT`/`DELETE` on
-  an existing key of an append-only store return 409 Conflict. CLI:
-  `x0x store create --policy append_only`. The policy is persisted in the
-  subscription manifest so a restarted creator rehydrates append-only.
+  IMMUTABLE — frozen in full (value, content type, metadata, timestamps),
+  no update, no delete, even by the owner. Enforced at every path: local
+  put/remove (`KvError::ImmutableKey`), remote deltas (violating
+  entries/removals are skipped and logged, the rest of the delta still
+  applies), full-state `KvStore::merge` (transactional reject), and
+  owner-signed checkpoint adoption (a checkpoint that shrinks the keyset,
+  rewrites an existing key, or downgrades the policy is rejected outright;
+  fresh-joiner cold-start adoption is unaffected). The policy is TERMINAL:
+  no announce, checkpoint, or manifest entry can transition a replica away
+  from append_only once known. Checkpoint adoption also rejects any delta
+  carrying the same key in both `added` and `updated` (ambiguous-multiset
+  tamper), for all policies. Byte-identical re-puts are accepted as true
+  idempotent no-ops (no version bump, no checkpoint-sequence advance, no
+  publish). REST: `POST /stores` accepts `"policy": "append_only"`;
+  `PUT`/`DELETE` on an existing key of an append-only store return 409
+  Conflict. CLI: `x0x store create --policy append_only`.
+  **Guarantee scope**: keys are immutable after first observation by a
+  continuously-persistent replica; a fresh joiner with no prior state
+  necessarily trusts the owner's current signed snapshot. Fresh-joiner
+  rewrite detection requires content chaining above the store
+  (x0x-symphony tracker-integrity-v2, saorsa-labs/x0x-symphony#10).
   Wire/storage compat: the variant is appended at the END of the
   bincode-positional `AccessPolicy` enum, so existing stores, deltas, and
   checkpoints are unaffected.
+- KV store state snapshots: the daemon now persists every KV store's full
+  state (policy, keyset, entries, latest adopted checkpoint, checkpoint
+  high-water mark) to `<data_dir>/kv-stores/<store-id-hex>.bin` (bincode,
+  atomic temp-file + fsync + rename) after every local mutation, merged
+  remote delta, and policy refresh — and restores it on restart BEFORE any
+  write is accepted (`Agent::create_kv_store_persistent` /
+  `Agent::join_kv_store_persistent`). This closes the restart-amnesia hole
+  where an append-only owner or replica came back empty and would have
+  re-accepted (and, for an owner, re-signed) rewrites of keys it no longer
+  remembered. Corrupt snapshots, store-id/owner mismatches, policy
+  conflicts, and malformed manifest policy strings all FAIL CLOSED (loud
+  skip/startup error, never a silent Signed downgrade). Legacy manifest
+  entries without a policy field remain Signed (documented compatibility
+  default).
+
+### Compatibility caveats
+
+- Binaries older than this release cannot decode an `AccessPolicy` value of
+  `append_only` (bincode positional variant 3): they skip checkpoints and
+  announces carrying it. Rolling BACK to an older x0xd after creating an
+  append-only store leaves that store's snapshot and manifest entry
+  undecodable/unenforced on the old binary — do not roll back daemons that
+  host append-only stores (the immutability guarantee does not exist on
+  pre-AppendOnly binaries).
 
 ## [v0.32.1] - 2026-07-15
 
