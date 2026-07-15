@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Single bootstrap cache shared with the transport (requires ant-quic >= 0.27.33).**
+  x0x previously opened its own bootstrap cache at `<data_dir>/peers/` while the
+  ant-quic endpoint silently opened a *second* cache in a **host-shared** default
+  directory (`$TMPDIR/ant-quic-cache` or `~/.cache/ant-quic`). The two never shared
+  data: the endpoint's reconnection quality data never reached x0x's cache-first
+  join phases, x0x's presence-beacon enrichment never reached the endpoint's
+  reconnection, and multiple daemons on one host (e.g. prod + testnet on a VPS)
+  could commingle peer planes in the shared directory. x0x now plumbs its
+  per-instance cache config through `NodeConfig::bootstrap_cache` and borrows the
+  endpoint's single instance (`Node::bootstrap_cache()`). The endpoint owns cache
+  maintenance and flushes the cache on shutdown.
+- **`--disable-peer-cache` is now truly hermetic.** It previously only stopped
+  x0x's own cache, while the endpoint kept using (and could persist to) the
+  host-shared default directory. The flag now yields a session-only in-memory
+  cache: nothing is loaded from previous runs, nothing is written to disk, and no
+  cache directory is created.
+- Removed the dead `NetworkConfig.peer_cache_path` field - it was written by the
+  daemon but never read anywhere.
+- SKILL.md/api-reference doc fixes: the peer cache file is
+  `<data_dir>/peers/bootstrap_cache.json` (not `peers.cache`); documented the SSE
+  `/events` envelope shape (fields nested under `data`, unlike the flat WebSocket
+  frame) and the flat `/direct/events` shape.
+
 ## [v0.31.4] - 2026-07-15
 
 ### Fixed

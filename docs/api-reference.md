@@ -222,6 +222,25 @@ Notes:
 }
 ```
 
+### `/events` SSE message shape
+
+Each gossip message arrives as an envelope with the fields nested under
+`data` (unlike the flat WebSocket `message` frame):
+
+```json
+{
+  "type": "message",
+  "data": {
+    "subscription_id": "8daec1f568bc0a54",
+    "topic": "updates",
+    "payload": "aGVsbG8=",
+    "sender": "8a3f...",
+    "verified": true,
+    "trust_level": "known"
+  }
+}
+```
+
 ### `local:` topics (same-daemon IPC)
 
 Topics whose name starts with `local:` (e.g. `local:my-app/events`) are
@@ -310,6 +329,21 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 {
   "agent_id": "8a3f...",
   "payload": "aGVsbG8="
+}
+```
+
+### `/direct/events` SSE message shape
+
+Direct messages arrive flat — no `data` envelope:
+
+```json
+{
+  "sender": "8a3f...",
+  "machine_id": "b2c4...",
+  "payload": "aGVsbG8=",
+  "received_at": 1774860000,
+  "verified": true,
+  "trust_decision": "Accept"
 }
 ```
 

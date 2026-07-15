@@ -208,6 +208,13 @@ curl -X POST "http://$API/publish" \
 curl -H "Authorization: Bearer $TOKEN" "http://$API/events"
 ```
 
+`/events` (SSE) wraps each gossip message in an envelope — the fields live
+under `data`, unlike the flat WebSocket shape shown later:
+
+```json
+{"type": "message", "data": {"subscription_id": "…", "topic": "…", "payload": "base64…", "sender": "hex…", "verified": true, "trust_level": "known"}}
+```
+
 ### Direct Messaging
 
 ```bash
@@ -225,6 +232,12 @@ curl -X POST "http://$API/direct/send" \
 
 # Stream direct messages (SSE)
 curl -H "Authorization: Bearer $TOKEN" "http://$API/direct/events"
+```
+
+`/direct/events` (SSE) delivers each message flat (no `data` envelope):
+
+```json
+{"sender": "hex…", "machine_id": "hex…", "payload": "base64…", "received_at": 1774860000, "verified": true, "trust_decision": "Accept"}
 ```
 
 ### MLS Group Encryption
@@ -334,7 +347,7 @@ rendezvous_enabled = true             # Global agent findability
 <data_dir>/api-token         # Bearer token for CLI/apps/scripts
 <data_dir>/contacts.json     # Trust/contact store
 <data_dir>/mls_groups.bin    # MLS group state
-<data_dir>/peers/peers.cache   # Bootstrap peer cache
+<data_dir>/peers/bootstrap_cache.json   # Bootstrap peer cache
 ```
 
 **Default identity_dir:** `~/.x0x/` | named instances: `~/.x0x-<name>/`
