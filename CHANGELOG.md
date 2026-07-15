@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.32.1] - 2026-07-15
+
+### Changed
+
+- saorsa-gossip 0.5.66 → 0.5.67: the pubsub admission counter
+  `dropped_critical_hard_error` no longer counts Critical control sends
+  that find zero transport-connected targets (unreachable bootstrap/stale
+  peers); those are now attributed to the new `dropped_critical_no_target`
+  counter, visible under `pubsub_stages.admission` in
+  `GET /diagnostics/gossip`. Hard errors are once again a genuine
+  must-stay-zero signal (FIFO overflow and internal races only); cooling
+  and budget-exhaustion skips keep their existing accounting. Fixes the
+  false hard-error growth (~10/min) observed on small topologies in the
+  2026-07-15 external release review.
+
 ## [v0.32.0] - 2026-07-15
 
 Breaking (library API): `NetworkNode::new` now takes an
