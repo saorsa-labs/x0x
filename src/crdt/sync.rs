@@ -277,25 +277,31 @@ impl TaskListSync {
                             }
                             list.full_delta()
                         };
+                        // The StateServed marker is published ONLY alongside
+                        // an actual full-delta publish: a marker must
+                        // witness a real broadcast — one sent for a
+                        // cooldown-suppressed response could convince a
+                        // requester that never received the state to stop
+                        // asking (round-3 review). A requester inside the
+                        // window is served by its next scheduled attempt.
                         let cooled_down = last_full_response.is_some_and(|t| {
                             t.elapsed()
                                 < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
                         });
-                        if !cooled_down {
-                            if let Ok(serialized) = encode_delta(local_peer_id, &full) {
-                                if let Err(e) = responder_pubsub
-                                    .publish(
-                                        responder_topic.clone(),
-                                        bytes::Bytes::from(serialized),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!("TaskList state-response publish failed: {e}");
-                                } else {
-                                    last_full_response = Some(tokio::time::Instant::now());
-                                }
-                            }
+                        if cooled_down {
+                            continue;
                         }
+                        let Ok(serialized) = encode_delta(local_peer_id, &full) else {
+                            continue;
+                        };
+                        if let Err(e) = responder_pubsub
+                            .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
+                            .await
+                        {
+                            tracing::warn!("TaskList state-response publish failed: {e}");
+                            continue;
+                        }
+                        last_full_response = Some(tokio::time::Instant::now());
                         let marker = TaskListSyncMessage::StateServed {
                             responder: local_peer_id,
                         };
@@ -413,11 +419,26 @@ impl TaskListSync {
         // Arm the requester kill flag FIRST: the bootstrap requester's
         // schedule is infinite while the list is empty (issue #238), and
         // unsubscribing does not end that loop (it holds no subscription).
-        self.stopped
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.silence_bootstrap();
         self.pubsub.unsubscribe(&self.topic).await;
         self.pubsub.unsubscribe(&self.state_sync_topic()).await;
         Ok(())
+    }
+
+    /// Silence this sync's bootstrap requester (its schedule is infinite
+    /// while unconverged — issue #238) WITHOUT touching topic
+    /// subscriptions.
+    ///
+    /// This is the correct teardown for a discarded handle inside a daemon:
+    /// `PubSubManager::unsubscribe` (what [`stop`](Self::stop) does) removes
+    /// the ENTIRE topic — including subscriptions owned by other components
+    /// that legally share the topic string — so a registration-rollback
+    /// must never unsubscribe, only stop generating traffic. The passive
+    /// listener loops end at `Agent::shutdown()` like every other tracked
+    /// task.
+    pub fn silence_bootstrap(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Apply a delta received from a remote peer.

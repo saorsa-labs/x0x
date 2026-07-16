@@ -15954,7 +15954,7 @@ async fn create_kv_store(
                 // chatter until daemon shutdown.
                 tracing::error!("failed to persist kv store registration {id}: {e}");
                 if let Some(h) = state.kv_stores.write().await.remove(&id) {
-                    h.stop_sync().await;
+                    h.silence_bootstrap();
                 }
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -16049,7 +16049,7 @@ async fn join_kv_store(
                 // chatter until daemon shutdown.
                 tracing::error!("failed to persist kv store join {id}: {e}");
                 if let Some(h) = state.kv_stores.write().await.remove(&id) {
-                    h.stop_sync().await;
+                    h.silence_bootstrap();
                 }
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,

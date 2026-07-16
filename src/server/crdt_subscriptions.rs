@@ -195,11 +195,21 @@ async fn write_manifest_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()>
     let mut temp = TempFile::new(temp_path.clone());
 
     let result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .await?;
+        // Create the temp file SYNCHRONOUSLY (one fast syscall, same pattern
+        // as `sync_parent_dir`), not via tokio::fs: the async open dispatches
+        // to the blocking pool, and if this future is cancelled while the
+        // open is in flight, the file can be created AFTER the TempFile
+        // guard's drop already ran its cleanup — orphaned `.tmp` debris.
+        // Creating before the first await point means the guard always sees
+        // the file; a blocking write still in flight at cancellation goes to
+        // the unlinked inode and is freed on close.
+        let mut file = {
+            let std_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            tokio::fs::File::from_std(std_file)
+        };
         file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
@@ -1290,15 +1300,27 @@ mod tests {
             );
         };
 
-        // After cancellation: live memory and disk must both be clean. The OLD
-        // code left the entry in live memory here (mutated before the write).
+        // After cancellation: live memory must be clean — the invariant the
+        // fix guarantees unconditionally (memory is only ever committed AFTER
+        // a durable write). The OLD code left the entry in memory here.
         assert!(
             manifest.read().await.entries.is_empty(),
             "cancellation mid-write must not leave an un-persisted entry in memory"
         );
+        // Disk may land in either honest state: usually empty (cancelled
+        // before the rename), but the rename op runs on the blocking pool
+        // and is not revoked by dropping the future — if it was already in
+        // flight, the fully-written, fsync'd manifest lands even though the
+        // caller saw cancellation. That is NOT a durability lie (nothing was
+        // acknowledged; memory is behind disk, and the identical retry
+        // converges them). A PARTIAL manifest is impossible either way — the
+        // rename only ever installs a complete synced file.
+        let disk = read_manifest(&path).await;
         assert!(
-            read_manifest(&path).await.entries.is_empty(),
-            "cancellation mid-write must not leave a partial manifest on disk"
+            disk.entries.is_empty()
+                || (disk.entries.len() == 1 && disk.entries[0].id == "cancel-store"),
+            "post-cancellation disk must be empty or the complete staged \
+             manifest, never a blend: {disk:?}"
         );
         // No temp-file debris from the aborted rename (TempFile guard).
         let debris = std::fs::read_dir(dir.path())

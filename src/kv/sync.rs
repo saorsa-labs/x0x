@@ -511,61 +511,75 @@ impl KvStoreSync {
                             }
                         }
                         // Snapshot state once for the full-delta and the
-                        // StateServed marker below.
+                        // StateServed marker below. A full response is
+                        // served when the store is non-empty, OR when it is
+                        // empty but holds an owner checkpoint: the
+                        // checkpoint-adopt merge path is a full REPLACE
+                        // (keys absent from the signed set are removed), so
+                        // a checkpoint-bearing empty delta is exactly how a
+                        // deleted-to-empty store cold-syncs to a stale
+                        // replica (round-3 review — an empty owner must not
+                        // be silent while stale holders keep advertising
+                        // obsolete state).
                         let (full, is_empty, is_owner, checkpoint_seq) = {
                             let s = responder_store.read().await;
                             let is_owner =
                                 local_agent_id.is_some() && s.owner() == local_agent_id.as_ref();
                             let cp =
                                 (s.highest_checkpoint_seq > 0).then_some(s.highest_checkpoint_seq);
-                            let full = (!s.is_empty()).then(|| s.full_delta());
+                            let full = (!s.is_empty() || s.latest_checkpoint.is_some())
+                                .then(|| s.full_delta());
                             (full, s.is_empty(), is_owner, cp)
                         };
-                        // Cooldown gates only the (potentially large)
-                        // full-state broadcast — the OwnerAnnounce above and
-                        // the StateServed marker below are tiny and always
-                        // answered. A requester that lands inside the window
-                        // still receives the marker, so its convergence
-                        // check runs against state served moments ago.
+                        // Cooldown gates the full-state broadcast. The
+                        // StateServed marker is published ONLY alongside an
+                        // actual full-delta publish (or for an owner's
+                        // checkpoint-less empty store, which has no payload
+                        // at all): a marker must witness a real broadcast —
+                        // a marker for a cooldown-suppressed response could
+                        // convince a requester that never received the state
+                        // to stop asking (round-3 review).
                         let cooled_down = last_full_response.is_some_and(|t| {
                             t.elapsed()
                                 < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
                         });
-                        if let Some(full) = full.filter(|_| !cooled_down) {
-                            if let Ok(serialized) = encode_delta(local_peer_id, &full) {
-                                if let Err(e) = responder_pubsub
-                                    .publish(
-                                        responder_topic.clone(),
-                                        bytes::Bytes::from(serialized),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!("KvStore state-response publish failed: {e}");
-                                } else {
-                                    last_full_response = Some(tokio::time::Instant::now());
+                        let mut marker = None;
+                        if let Some(full) = full {
+                            if !cooled_down {
+                                if let Ok(serialized) = encode_delta(local_peer_id, &full) {
+                                    if let Err(e) = responder_pubsub
+                                        .publish(
+                                            responder_topic.clone(),
+                                            bytes::Bytes::from(serialized),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "KvStore state-response publish failed: {e}"
+                                        );
+                                    } else {
+                                        last_full_response = Some(tokio::time::Instant::now());
+                                        marker = Some(KvSyncMessage::StateServed {
+                                            responder: local_peer_id,
+                                            empty: is_empty,
+                                            checkpoint_seq,
+                                        });
+                                    }
                                 }
                             }
-                        }
-                        // StateServed marker: non-empty holders always
-                        // declare; an EMPTY store is declared only by its
-                        // owner (authoritative emptiness) — an empty
-                        // non-owner replica stays silent so bootstrapping
-                        // replicas can never talk each other into a false
-                        // "converged empty".
-                        //
-                        // Known residual (issue #238 review, follow-up
-                        // filed): full responses carry only live entries —
-                        // no tombstones — so deletions cannot cold-sync to
-                        // a stale replica; deletion-aware recovery needs
-                        // checkpoint-frontier state transfer. AppendOnly
-                        // stores (the integrity-critical case) cannot
-                        // delete.
-                        if !is_empty || is_owner {
-                            let marker = KvSyncMessage::StateServed {
+                        } else if is_owner {
+                            // Checkpoint-less empty owner: nothing to serve,
+                            // and only the OWNER may declare emptiness — an
+                            // empty non-owner replica stays silent so
+                            // bootstrapping replicas can never talk each
+                            // other into a false "converged empty".
+                            marker = Some(KvSyncMessage::StateServed {
                                 responder: local_peer_id,
-                                empty: is_empty,
-                                checkpoint_seq,
-                            };
+                                empty: true,
+                                checkpoint_seq: None,
+                            });
+                        }
+                        if let Some(marker) = marker {
                             match bincode::serialize(&marker) {
                                 Ok(serialized) => {
                                     if let Err(e) = responder_pubsub
@@ -597,15 +611,24 @@ impl KvStoreSync {
                         // requester stops asking — never store content, and
                         // convergence is re-checked against local state
                         // (`bootstrap_converged`), so a forged marker cannot
-                        // inject state. A forged non-empty/checkpoint marker
-                        // at worst prolongs the capped-cadence tail or stops
-                        // it no earlier than a real holder could (the
-                        // any-holder-answers trust the protocol already
-                        // has). A forged EMPTY marker, however, would stop
-                        // an empty replica's recovery outright — so
-                        // emptiness is trusted only from the pub/sub-
-                        // verified anchored owner.
-                        let owner_verified_empty = empty && {
+                        // inject state. A forged NON-EMPTY marker at worst
+                        // stops the tail no earlier than a real holder could
+                        // (the any-holder-answers trust the protocol already
+                        // has). The two evidence classes that could do real
+                        // damage are trusted only from the pub/sub-verified
+                        // anchored owner:
+                        // - EMPTY would stop an empty replica's recovery
+                        //   outright;
+                        // - CHECKPOINT_SEQ is the exact convergence gate,
+                        //   and a forged u64::MAX would pin the requester
+                        //   at capped cadence forever while a forged low
+                        //   value could retire a stale replica early
+                        //   (round-3 review).
+                        // Owner-marker checkpoints also self-correlate: the
+                        // local high-water mark only rises by MERGING the
+                        // checkpoint-bearing full delta, so satisfying the
+                        // gate proves the state actually arrived.
+                        let owner_verified = {
                             let anchored = responder_store.read().await.owner().copied();
                             anchored.is_some() && msg.sender.as_ref() == anchored.as_ref()
                         };
@@ -613,13 +636,13 @@ impl KvStoreSync {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if empty {
-                            if owner_verified_empty {
+                            if owner_verified {
                                 ev.saw_owner_empty = true;
                             }
                         } else {
                             ev.saw_nonempty = true;
                         }
-                        if let Some(seq) = checkpoint_seq {
+                        if let Some(seq) = checkpoint_seq.filter(|_| owner_verified) {
                             ev.max_checkpoint_seq = ev.max_checkpoint_seq.max(seq);
                         }
                     }
@@ -755,13 +778,34 @@ impl KvStoreSync {
         Ok(())
     }
 
+    /// Silence this sync's bootstrap requester (its schedule is infinite
+    /// while unconverged — issue #238) WITHOUT touching topic
+    /// subscriptions.
+    ///
+    /// This is the correct teardown for a discarded handle inside a daemon:
+    /// `PubSubManager::unsubscribe` (what [`stop`](Self::stop) does) removes
+    /// the ENTIRE topic — including subscriptions owned by other components
+    /// that legally share the topic string — so a registration-rollback
+    /// must never unsubscribe, only stop generating traffic. The passive
+    /// listener loops end at `Agent::shutdown()` like every other tracked
+    /// task.
+    pub fn silence_bootstrap(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Stop background synchronization.
+    ///
+    /// Topic-wide: unsubscribes the main and state-sync topics for the
+    /// WHOLE process (every subscriber of those topic strings), which is
+    /// only appropriate when this sync is the topics' sole consumer.
+    /// In-process daemons discarding one handle should use
+    /// [`silence_bootstrap`](Self::silence_bootstrap) instead.
     pub async fn stop(&self) -> Result<()> {
         // Arm the requester kill flag FIRST: the bootstrap requester's
         // schedule is infinite while the store is empty (issue #238), and
         // unsubscribing does not end that loop (it holds no subscription).
-        self.stopped
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.silence_bootstrap();
         self.pubsub.unsubscribe(&self.topic).await;
         self.pubsub.unsubscribe(&self.state_sync_topic()).await;
         Ok(())
@@ -1531,6 +1575,129 @@ mod tests {
             recovered,
             "a restored non-empty replica must keep requesting until a \
              holder serves it — non-emptiness alone is not convergence"
+        );
+    }
+
+    /// WHY (round-3 review — deleted-to-empty must cold-sync): an owner
+    /// whose store is legitimately empty but checkpointed (everything
+    /// deleted) must still serve state requests: the checkpoint-adopt merge
+    /// path is a full REPLACE, so its checkpoint-bearing EMPTY full delta
+    /// is exactly what removes a stale replica's obsolete keys. Before this
+    /// fix the empty owner was silent while stale holders kept advertising
+    /// old state; convergence was also unreachable (the marker declared a
+    /// checkpoint the replica could never adopt).
+    #[tokio::test(start_paused = true)]
+    async fn checkpointed_empty_owner_deletes_stale_replica_state() {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-238-deleted-to-empty";
+
+        // Owner: EMPTY store carrying an owner-signed checkpoint over the
+        // empty set (the state after deleting everything).
+        let mut owned = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner_id,
+            AccessPolicy::Signed,
+        );
+        let (pub_bytes, sec_bytes) = kp.to_bytes();
+        let public_key =
+            ant_quic::MlDsaPublicKey::from_bytes(&pub_bytes).expect("public key bytes");
+        let secret_key =
+            ant_quic::MlDsaSecretKey::from_bytes(&sec_bytes).expect("secret key bytes");
+        let pairs = owned.checkpoint_pairs();
+        let root = crate::kv::store::content_root(owned.id(), owned.name(), &pairs);
+        let cp = crate::kv::store::make_owner_checkpoint(crate::kv::store::OwnerCheckpointParams {
+            topic,
+            store_id: &store_id(1),
+            secret_key: &secret_key,
+            public_key: &public_key,
+            policy: &AccessPolicy::Signed,
+            policy_version: owned.policy_version(),
+            checkpoint_seq: 3,
+            content_root: root,
+            timestamp: 1,
+        })
+        .expect("sign empty checkpoint");
+        owned.latest_checkpoint = Some(cp);
+        owned.highest_checkpoint_seq = 3;
+        // Stale replica: still holds a key the owner deleted (hwm 0).
+        // Started FIRST so its subscriptions are fully registered before
+        // any response can be published (in-process paused-time harness:
+        // a response racing the main-topic registration is silently
+        // missed; production requesters simply retry, but the poll loop
+        // below burns virtual time much faster than real deliveries).
+        let mut replica = KvStore::new_replica(
+            store_id(1),
+            String::new(),
+            Some(owner_id),
+            crate::kv::store::AnchorChannel::Persistence,
+        );
+        replica
+            .put(
+                "k_stale".to_string(),
+                b"obsolete".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed stale key");
+        let joiner = KvStoreSync::new(
+            replica,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+
+        let owner_sync = KvStoreSync::new(
+            owned,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner_id),
+        )
+        .expect("owner sync");
+        // Harness artifact: both syncs share ONE signing identity (the
+        // pubsub ctx), so the stale joiner's responses arrive signed AS THE
+        // OWNER — the empty owner's own bootstrap requester (empty ⇒
+        // snapshot-loss recovery) would adopt the stale key back and its
+        // checkpoint root would never match again. Production daemons have
+        // distinct identities (a stale replica's response is not
+        // owner-authorized), so silence the owner's requester: it is not
+        // the machinery under test.
+        owner_sync.silence_bootstrap();
+        owner_sync.start().await.expect("start owner");
+
+        // The replica's request must be answered with the checkpoint-bearing
+        // empty full delta; adopting it removes the stale key and raises the
+        // high-water mark to the served checkpoint (convergence reachable).
+        // Poll generously: virtual time advances the requester schedule, but
+        // the signing/delivery pipeline runs in REAL time (blocking-pool
+        // ML-DSA ops) — each iteration donates a real scheduling window, so
+        // under CPU contention more iterations are needed, not more virtual
+        // seconds.
+        let mut cleaned = false;
+        for _ in 0..400 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let s = joiner.read().await;
+            if s.get("k_stale").is_none() && s.highest_checkpoint_seq == 3 {
+                cleaned = true;
+                break;
+            }
+        }
+        assert!(
+            cleaned,
+            "the checkpointed empty owner's response must full-replace the \
+             stale replica (key removed, checkpoint HWM adopted)"
+        );
+        assert!(
+            joiner.read().await.is_empty(),
+            "replica converges to the owner's (empty) state"
         );
     }
 

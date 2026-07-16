@@ -320,7 +320,7 @@ pub(in crate::server) async fn create_task_list(
                 // bootstrap requester is infinite while unconverged
                 // (issue #238) and would otherwise chatter until shutdown.
                 if let Some(h) = state.task_lists.write().await.remove(&id) {
-                    h.stop_sync().await;
+                    h.silence_bootstrap();
                 }
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,

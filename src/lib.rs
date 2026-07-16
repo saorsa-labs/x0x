@@ -10240,18 +10240,19 @@ impl std::fmt::Debug for TaskListHandle {
 }
 
 impl TaskListHandle {
-    /// Tear down this replica's background synchronization: unsubscribes
-    /// the main and state-sync topics and arms the bootstrap requester's
-    /// kill flag (its schedule is infinite while unconverged — issue #238 —
-    /// so a discarded handle must silence it explicitly).
+    /// Silence this replica's bootstrap requester — its schedule is
+    /// infinite while unconverged (issue #238), so a discarded handle must
+    /// silence it explicitly or it publishes state requests until
+    /// `Agent::shutdown()`.
     ///
-    /// Callers that remove a handle without keeping any other clone (e.g.
-    /// the daemon's registration-rollback paths) MUST call this, or the
-    /// sync loops keep running until `Agent::shutdown()`.
-    pub async fn stop_sync(&self) {
-        // TaskListSync::stop only unsubscribes (infallible today); a failure
-        // would mean the pubsub layer is gone, which is strictly "stopped".
-        let _ = self.sync.stop().await;
+    /// Deliberately does NOT unsubscribe: `PubSubManager::unsubscribe` is
+    /// topic-wide and would tear down every other subscriber sharing the
+    /// topic string (round-3 review). The passive listener loops end at
+    /// shutdown like every other tracked task. Callers that remove a handle
+    /// without keeping any other clone (e.g. the daemon's
+    /// registration-rollback paths) MUST call this.
+    pub fn silence_bootstrap(&self) {
+        self.sync.silence_bootstrap();
     }
 
     /// Generate a fresh per-replica epoch at handle construction.
@@ -10992,18 +10993,19 @@ impl KvStoreHandle {
         self.peer_id
     }
 
-    /// Tear down this replica's background synchronization: unsubscribes
-    /// the main and state-sync topics and arms the bootstrap requester's
-    /// kill flag (its schedule is infinite while unconverged — issue #238 —
-    /// so a discarded handle must silence it explicitly).
+    /// Silence this replica's bootstrap requester — its schedule is
+    /// infinite while unconverged (issue #238), so a discarded handle must
+    /// silence it explicitly or it publishes state requests until
+    /// `Agent::shutdown()`.
     ///
-    /// Callers that remove a handle without keeping any other clone (e.g.
-    /// the daemon's registration-rollback paths) MUST call this, or the
-    /// sync loops keep running until `Agent::shutdown()`.
-    pub async fn stop_sync(&self) {
-        // KvStoreSync::stop only unsubscribes (infallible today); a failure
-        // would mean the pubsub layer is gone, which is strictly "stopped".
-        let _ = self.sync.stop().await;
+    /// Deliberately does NOT unsubscribe: `PubSubManager::unsubscribe` is
+    /// topic-wide and would tear down every other subscriber sharing the
+    /// topic string (round-3 review). The passive listener loops end at
+    /// shutdown like every other tracked task. Callers that remove a handle
+    /// without keeping any other clone (e.g. the daemon's
+    /// registration-rollback paths) MUST call this.
+    pub fn silence_bootstrap(&self) {
+        self.sync.silence_bootstrap();
     }
 
     /// Return the store's ownership/policy/version metadata for auditability.
