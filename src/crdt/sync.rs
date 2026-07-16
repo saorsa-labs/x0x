@@ -57,6 +57,21 @@ fn state_request_delays() -> impl Iterator<Item = u64> {
     STATE_REQUEST_RETRY_SECS.into_iter().chain(tail)
 }
 
+/// Minimum spacing between full-state responses from ONE holder for ONE
+/// list — the same response-storm damping as `KvStoreSync` (issue #238
+/// review): the response is a broadcast on the main topic, so one response
+/// per window serves every concurrently-bootstrapping replica.
+const STATE_RESPONSE_COOLDOWN_SECS: u64 = 15;
+
+/// Sleep duration for a scheduled delay with ±20% jitter, so a fleet of
+/// replicas restarted together does not phase-lock its request (and thus
+/// full-state response) schedule. Mirrors the reconnect-backoff jitter in
+/// `lib.rs`.
+fn jittered_secs(secs: u64) -> std::time::Duration {
+    let factor = 0.8 + rand::random::<f64>() * 0.4;
+    std::time::Duration::from_secs_f64(secs as f64 * factor)
+}
+
 /// Message exchanged on the state-sync side topic.
 #[derive(Debug, Serialize, Deserialize)]
 enum TaskListSyncMessage {
@@ -82,6 +97,12 @@ pub struct TaskListSync {
     /// This node's gossip peer id — identifies our deltas and state
     /// requests on the wire.
     local_peer_id: PeerId,
+
+    /// Set by [`stop`](Self::stop). The bootstrap requester checks it every
+    /// iteration: its schedule is infinite (issue #238), and the sibling
+    /// loops hold strong `Arc`s to the list, so without this flag an
+    /// explicitly stopped sync would keep publishing state requests forever.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TaskListSync {
@@ -127,6 +148,7 @@ impl TaskListSync {
             pubsub,
             topic,
             local_peer_id,
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -205,6 +227,12 @@ impl TaskListSync {
         let responder_topic = self.topic.clone();
         let local_peer_id = self.local_peer_id;
         spawn(Box::pin(async move {
+            // Response-storm damping (issue #238 review): one full-state
+            // response per cooldown window — the response is a broadcast,
+            // so it serves every concurrently-bootstrapping replica; a
+            // requester that lands inside the window is served by its next
+            // scheduled request.
+            let mut last_full_response: Option<tokio::time::Instant> = None;
             while let Some(msg) = sync_sub.recv().await {
                 let Ok(TaskListSyncMessage::StateRequest { requester }) =
                     bincode::deserialize::<TaskListSyncMessage>(&msg.payload)
@@ -212,6 +240,11 @@ impl TaskListSync {
                     continue;
                 };
                 if requester == local_peer_id {
+                    continue;
+                }
+                if last_full_response.is_some_and(|t| {
+                    t.elapsed() < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
+                }) {
                     continue;
                 }
                 let full = {
@@ -229,6 +262,8 @@ impl TaskListSync {
                     .await
                 {
                     tracing::warn!("TaskList state-response publish failed: {e}");
+                } else {
+                    last_full_response = Some(tokio::time::Instant::now());
                 }
             }
         }));
@@ -240,27 +275,39 @@ impl TaskListSync {
         // runs an INFINITE backoff tail (issue #238): holders answer only
         // reactively, so a hard-capped tail left a list that rehydrated
         // while every holder was offline permanently un-synced once the cap
-        // expired. The loop self-terminates the moment the local list
-        // becomes non-empty (converged); until then a genuinely-new list
-        // costs one tiny side-topic message per backoff interval. Requests
-        // and the full-delta responses they trigger are idempotent CRDT
-        // merges, so the extra chatter is harmless.
+        // expired. The FULL front burst always runs (aligned with
+        // `KvStoreSync`, round-1 review): a single incremental task arriving
+        // via live gossip before the first request must not cancel the
+        // request for the complete historical state. The tail then
+        // self-terminates the moment the local list is non-empty; until
+        // then a genuinely-new list costs one tiny side-topic message per
+        // backoff interval. Requests and the full-delta responses they
+        // trigger are idempotent CRDT merges, so the extra chatter is
+        // harmless.
         if self.task_list.read().await.task_count() == 0 {
             let requester_pubsub = Arc::clone(&self.pubsub);
-            // Weak: the requester must not keep the list alive on its own —
-            // if every other holder of the list is gone, the tail exits.
+            // Weak: the requester must not keep the list alive on its own.
+            // (Belt-and-braces — the sibling loops hold strong Arcs, so the
+            // authoritative kill switch is the `stopped` flag below.)
             let requester_list = Arc::downgrade(&self.task_list);
             let sync_topic = self.state_sync_topic();
+            let stopped = Arc::clone(&self.stopped);
             spawn(Box::pin(async move {
-                for delay_secs in state_request_delays() {
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                    let Some(list) = requester_list.upgrade() else {
-                        return; // sync torn down — nothing left to bootstrap
-                    };
-                    if list.read().await.task_count() > 0 {
-                        return; // converged — stop asking
+                for (attempt, delay_secs) in state_request_delays().enumerate() {
+                    tokio::time::sleep(jittered_secs(delay_secs)).await;
+                    if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                        return; // stop() called — never chatter for a dead sync
                     }
-                    drop(list);
+                    // Tail attempts stop on convergence; front attempts
+                    // always run (see above).
+                    if attempt >= STATE_REQUEST_RETRY_SECS.len() {
+                        let Some(list) = requester_list.upgrade() else {
+                            return; // sync torn down — nothing left to bootstrap
+                        };
+                        if list.read().await.task_count() > 0 {
+                            return; // converged — stop asking
+                        }
+                    }
                     let request = TaskListSyncMessage::StateRequest {
                         requester: local_peer_id,
                     };
@@ -292,6 +339,11 @@ impl TaskListSync {
     ///
     /// Returns an error if operations fail.
     pub async fn stop(&self) -> Result<()> {
+        // Arm the requester kill flag FIRST: the bootstrap requester's
+        // schedule is infinite while the list is empty (issue #238), and
+        // unsubscribing does not end that loop (it holds no subscription).
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.pubsub.unsubscribe(&self.topic).await;
         self.pubsub.unsubscribe(&self.state_sync_topic()).await;
         Ok(())
@@ -714,6 +766,25 @@ mod tests {
         // unsubscribe is infallible and tolerant of already-removed topics,
         // so a second stop() must remain Ok.
         sync.stop().await.expect("second stop (idempotent)");
+    }
+
+    /// WHY (round-1 review): the requester's schedule is now INFINITE while
+    /// the list is empty, and the sibling loops hold strong `Arc`s to the
+    /// list — so `stop()` arming this flag is the only thing that prevents
+    /// a stopped sync from publishing state requests forever. The requester
+    /// checks the flag on every iteration.
+    #[tokio::test]
+    async fn stop_arms_the_requester_kill_flag() {
+        let sync = make_sync("tasks/stopflag").await;
+        assert!(
+            !sync.stopped.load(std::sync::atomic::Ordering::Relaxed),
+            "flag must start disarmed"
+        );
+        sync.stop().await.expect("stop");
+        assert!(
+            sync.stopped.load(std::sync::atomic::Ordering::Relaxed),
+            "stop() must arm the requester kill flag"
+        );
     }
 
     // ------------------------------------------------------------------

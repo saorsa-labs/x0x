@@ -51,6 +51,25 @@ fn state_request_delays() -> impl Iterator<Item = u64> {
     STATE_REQUEST_RETRY_SECS.into_iter().chain(tail)
 }
 
+/// Minimum spacing between full-state responses from ONE holder for ONE
+/// store. Every empty replica's request would otherwise make every holder
+/// republish its complete state — after a fleet restart N replicas × M
+/// holders align on the same schedule and the amplification is N×M full
+/// publications per cadence. One response per window per holder serves all
+/// concurrently-bootstrapping replicas (the response is a broadcast on the
+/// main topic); a request that lands inside the window is served by the
+/// requester's next scheduled attempt.
+const STATE_RESPONSE_COOLDOWN_SECS: u64 = 15;
+
+/// Sleep duration for a scheduled delay with ±20% jitter, so a fleet of
+/// replicas restarted together does not phase-lock its request (and thus
+/// full-state response) schedule. Mirrors the reconnect-backoff jitter in
+/// `lib.rs`.
+fn jittered_secs(secs: u64) -> std::time::Duration {
+    let factor = 0.8 + rand::random::<f64>() * 0.4;
+    std::time::Duration::from_secs_f64(secs as f64 * factor)
+}
+
 /// Message exchanged on the state-sync side topic.
 ///
 /// Wire compatibility: `StateRequest` keeps its variant index and shape, so
@@ -120,6 +139,12 @@ pub struct KvStoreSync {
     /// restart: an owner (or replica) with amnesia would otherwise accept
     /// rewrites of keys it no longer remembers holding.
     persist: std::sync::Mutex<Option<Arc<PersistCtx>>>,
+
+    /// Set by [`stop`](Self::stop). The bootstrap requester checks it every
+    /// iteration: its schedule is infinite (issue #238), and the sibling
+    /// loops hold strong `Arc`s to the store, so without this flag an
+    /// explicitly stopped sync would keep publishing state requests forever.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Shared persistence context for one store's snapshot file.
@@ -166,6 +191,7 @@ impl KvStoreSync {
             local_peer_id,
             local_agent_id,
             persist: std::sync::Mutex::new(None),
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -275,11 +301,24 @@ impl KvStoreSync {
     {
         let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
         let store = Arc::clone(&self.store);
-        // Capture emptiness BEFORE any listener can merge a cached delta.
-        // Otherwise a partial cache replay landing between subscribe and this
-        // check would make the store non-empty and skip the bootstrap
-        // state-request schedule — aged/pruned keys would never arrive.
-        let bootstrap_needed = store.read().await.is_empty();
+        // Capture the bootstrap decision BEFORE any listener can merge a
+        // cached delta. Otherwise a partial cache replay landing between
+        // subscribe and this check could make the store non-empty and skip
+        // the bootstrap state-request schedule — aged/pruned keys would
+        // never arrive.
+        //
+        // Non-owner replicas ALWAYS bootstrap: a snapshot-restored replica
+        // may have missed deltas while it was offline, and emptiness cannot
+        // distinguish "fresh join" from "restored but stale" (the gossip
+        // cache only replays ~60s of history). Owners are authoritative and
+        // request only when EMPTY — that is snapshot-loss recovery from
+        // their replicas.
+        let bootstrap_needed = {
+            let s = store.read().await;
+            let local_is_owner =
+                self.local_agent_id.is_some() && s.owner() == self.local_agent_id.as_ref();
+            !local_is_owner || s.is_empty()
+        };
         // Defense in depth against cross-topic replay: the v2 signature covers
         // the embedded topic, but pub/sub delivery does not re-check it against
         // this subscription, so a raw-mesh participant could place a valid
@@ -355,6 +394,11 @@ impl KvStoreSync {
         let local_peer_id = self.local_peer_id;
         let local_agent_id = self.local_agent_id;
         spawn(Box::pin(async move {
+            // Response-storm damping (issue #238 review): one full-state
+            // response per cooldown window, regardless of how many replicas
+            // are requesting — the response is a broadcast, so it serves
+            // them all.
+            let mut last_full_response: Option<tokio::time::Instant> = None;
             while let Some(msg) = sync_sub.recv().await {
                 if msg.topic != sync_topic {
                     // Cross-topic replay defense (see start_with_spawner).
@@ -402,6 +446,26 @@ impl KvStoreSync {
                                 }
                             }
                         }
+                        // Cooldown gates only the (potentially large)
+                        // full-state broadcast — the OwnerAnnounce above is
+                        // tiny and always answered. A requester that lands
+                        // inside the window is served by its next scheduled
+                        // request (the requester schedule is infinite while
+                        // unconverged, so nothing is starved).
+                        if last_full_response.is_some_and(|t| {
+                            t.elapsed()
+                                < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
+                        }) {
+                            continue;
+                        }
+                        // Known residual (documented in issue #238 review):
+                        // an owner whose CURRENT state is legitimately empty
+                        // (all keys deleted) sends only the announce, so a
+                        // stale non-empty holder can win the response race.
+                        // Deletion-aware cold recovery needs checkpoint-
+                        // frontier convergence — tracked as follow-up work;
+                        // AppendOnly stores (the integrity-critical case)
+                        // cannot delete.
                         let full = {
                             let s = responder_store.read().await;
                             if s.is_empty() {
@@ -417,6 +481,8 @@ impl KvStoreSync {
                             .await
                         {
                             tracing::warn!("KvStore state-response publish failed: {e}");
+                        } else {
+                            last_full_response = Some(tokio::time::Instant::now());
                         }
                     }
                     KvSyncMessage::OwnerAnnounce {
@@ -497,12 +563,17 @@ impl KvStoreSync {
         if bootstrap_needed {
             let requester_pubsub = Arc::clone(&self.pubsub);
             let sync_topic = self.state_sync_topic();
-            // Weak: the requester must not keep the store alive on its own —
-            // if every other holder of the store is gone, the tail exits.
+            // Weak: the requester must not keep the store alive on its own.
+            // (Belt-and-braces — the sibling loops hold strong Arcs, so the
+            // authoritative kill switch is the `stopped` flag below.)
             let requester_store = Arc::downgrade(&self.store);
+            let stopped = Arc::clone(&self.stopped);
             spawn(Box::pin(async move {
                 for (attempt, delay_secs) in state_request_delays().enumerate() {
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    tokio::time::sleep(jittered_secs(delay_secs)).await;
+                    if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                        return; // stop() called — never chatter for a dead sync
+                    }
                     // Tail attempts stop on convergence; front attempts
                     // always run (see above — partial early state must not
                     // cancel the request for full history).
@@ -535,6 +606,11 @@ impl KvStoreSync {
 
     /// Stop background synchronization.
     pub async fn stop(&self) -> Result<()> {
+        // Arm the requester kill flag FIRST: the bootstrap requester's
+        // schedule is infinite while the store is empty (issue #238), and
+        // unsubscribing does not end that loop (it holds no subscription).
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.pubsub.unsubscribe(&self.topic).await;
         self.pubsub.unsubscribe(&self.state_sync_topic()).await;
         Ok(())
@@ -1116,6 +1192,25 @@ mod tests {
         sync.stop().await.expect("second stop (idempotent)");
     }
 
+    /// WHY (round-1 review): the requester's schedule is now INFINITE while
+    /// the store is empty, and the sibling loops hold strong `Arc`s to the
+    /// store — so `stop()` arming this flag is the only thing that prevents
+    /// a stopped sync from publishing state requests forever. The requester
+    /// checks the flag on every iteration.
+    #[tokio::test]
+    async fn stop_arms_the_requester_kill_flag() {
+        let sync = make_sync("store/stopflag", AccessPolicy::Signed).await;
+        assert!(
+            !sync.stopped.load(std::sync::atomic::Ordering::Relaxed),
+            "flag must start disarmed"
+        );
+        sync.stop().await.expect("stop");
+        assert!(
+            sync.stopped.load(std::sync::atomic::Ordering::Relaxed),
+            "stop() must arm the requester kill flag"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Issue #238: the bootstrap requester must never give up while empty
     // ------------------------------------------------------------------
@@ -1142,6 +1237,99 @@ mod tests {
             Some(STATE_REQUEST_TAIL_CAP_SECS),
             "the schedule is infinite — convergence, not the schedule, \
              is what ends the requester"
+        );
+    }
+
+    /// WHY (round-1 review — missed-delta recovery): a snapshot-restored
+    /// NON-OWNER replica is non-empty, but may have missed deltas written
+    /// while it was offline, and the gossip cache only replays ~60s. The
+    /// old `is_empty()` bootstrap gate meant such a replica NEVER requested
+    /// state — the missed keys were unrecoverable without another restart
+    /// race. Non-owner replicas must always run the front burst.
+    #[tokio::test(start_paused = true)]
+    async fn restored_non_empty_replica_still_requests_missed_state() {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-238-missed-delta";
+
+        // Owner holds k_old AND k_new (k_new written while the replica was
+        // "offline" — i.e. absent from the replica's restored snapshot).
+        let mut owned = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner_id,
+            AccessPolicy::Signed,
+        );
+        owned
+            .put(
+                "k_old".to_string(),
+                b"v_old".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner put k_old");
+        owned
+            .put(
+                "k_new".to_string(),
+                b"v_new".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner put k_new");
+        let owner_sync = KvStoreSync::new(
+            owned,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner_id),
+        )
+        .expect("owner sync");
+        owner_sync.start().await.expect("start owner");
+
+        // Snapshot-restored replica: NON-empty (has k_old), anchored on the
+        // owner, local agent is NOT the owner. Under the old gate this
+        // replica never requested anything.
+        let mut replica = KvStore::new_replica(
+            store_id(1),
+            String::new(),
+            Some(owner_id),
+            crate::kv::store::AnchorChannel::Persistence,
+        );
+        replica
+            .put(
+                "k_old".to_string(),
+                b"v_old".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed restored key");
+        let joiner = KvStoreSync::new(
+            replica,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+
+        // The front burst must fire despite the replica being non-empty,
+        // and the owner's full-state response must deliver the missed key.
+        let mut recovered = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if joiner.read().await.get("k_new").is_some() {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "a restored non-empty non-owner replica must still request \
+             state and recover deltas it missed while offline"
         );
     }
 

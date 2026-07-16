@@ -316,12 +316,23 @@ async fn concurrent_same_id_join_recreate_rehydrates_deterministically() {
         pair.bob.post(&join_path, join_body.clone()),
         pair.bob.post(&join_path, join_body.clone()),
     );
-    for (i, r) in [r0, r1, r2, r3].into_iter().enumerate() {
-        assert!(
-            r.status().is_success(),
-            "concurrent same-id join {i} succeeds"
-        );
-    }
+    // The per-(kind,id) reservation serialises the storm: exactly ONE join
+    // wins and installs the handle; every other request sees the handle
+    // present and gets 409 CONFLICT — same contract the sibling create test
+    // pins. (This assert originally required all four to succeed, which the
+    // 409 duplicate-join guard introduced in the same commit made
+    // impossible — the #[ignore] suite hid the contradiction.)
+    let statuses: Vec<_> = [r0, r1, r2, r3].into_iter().map(|r| r.status()).collect();
+    let winners = statuses.iter().filter(|s| s.is_success()).count();
+    let conflicts = statuses
+        .iter()
+        .filter(|s| **s == reqwest::StatusCode::CONFLICT)
+        .count();
+    assert_eq!(
+        (winners, conflicts),
+        (1, 3),
+        "exactly one concurrent join wins and the rest 409: {statuses:?}"
+    );
 
     // Determinism: exactly ONE kv_store entry for the topic survives in bob's
     // manifest, anchored on alice. A lost update would leave zero or many; a
