@@ -42,8 +42,9 @@ const STATE_REQUEST_TAIL_CAP_SECS: u64 = 300;
 /// schedule left a replica that rehydrated while the owner was offline
 /// permanently un-synced (a "zombie subscription" — even the owner
 /// returning did not revive it; only a full daemon restart did, by minting
-/// a fresh schedule). Convergence — the store turning non-empty — is the
-/// only legitimate stop condition, and the requester loop owns that check.
+/// a fresh schedule). Convergence — `StateServed` evidence matched against
+/// local state, see [`bootstrap_converged`] — is the only legitimate stop
+/// condition, and the requester loop owns that check.
 fn state_request_delays() -> impl Iterator<Item = u64> {
     let tail = std::iter::successors(Some(STATE_REQUEST_TAIL_START_SECS), |d| {
         Some(d.saturating_mul(2).min(STATE_REQUEST_TAIL_CAP_SECS))
@@ -104,6 +105,64 @@ enum KvSyncMessage {
         /// strictly greater than the receiver's current `policy_version`.
         policy_version: u64,
     },
+    /// A holder's declaration that it has answered a `StateRequest`: its
+    /// full state either was republished on the main topic (possibly
+    /// earlier, within the response cooldown) or there is nothing to serve.
+    /// Requesters match this against their OWN state to decide whether the
+    /// bootstrap tail may stop — mere non-emptiness is not convergence
+    /// evidence (a single incremental delta must not silence recovery).
+    ///
+    /// Wire compatibility: additive variant, same precedent as
+    /// `OwnerAnnounce` — v0.33.0 peers fail to deserialize it and skip the
+    /// message. Against a fleet of only-older responders no markers arrive
+    /// and the requester keeps its capped-cadence tail (bounded chatter,
+    /// never a zombie).
+    StateServed {
+        /// The declaring holder (receivers skip their own echo).
+        responder: PeerId,
+        /// True when the holder's store is empty. Only the OWNER ever
+        /// declares emptiness (an empty non-owner replica stays silent) —
+        /// otherwise two empty bootstrapping replicas would convince each
+        /// other the store is legitimately empty and re-create the zombie.
+        empty: bool,
+        /// The holder's owner-signed checkpoint high-water mark, when it
+        /// holds one. A requester whose own mark has reached this value has
+        /// provably absorbed at least this much owner history — the exact
+        /// convergence gate for checkpoint-bearing stores.
+        checkpoint_seq: Option<u64>,
+    },
+}
+
+/// Aggregated `StateServed` evidence observed by one replica's responder
+/// loop, consumed by its bootstrap requester to decide convergence.
+#[derive(Debug, Default, Clone, Copy)]
+struct ServedEvidence {
+    /// A holder declared non-empty state.
+    saw_nonempty: bool,
+    /// The OWNER declared the store legitimately empty.
+    saw_owner_empty: bool,
+    /// Highest checkpoint sequence any holder declared.
+    max_checkpoint_seq: u64,
+}
+
+/// Convergence rule for the bootstrap tail (pure for unit-testing).
+///
+/// Strongest available evidence wins:
+/// - a declared checkpoint sequence must be matched by this replica's own
+///   high-water mark (exact, survives partial/lost responses);
+/// - otherwise a declared non-empty holder requires local non-emptiness
+///   (best-effort — documented limit for checkpoint-less state);
+/// - otherwise only an owner-declared-empty store counts as converged.
+///
+/// No evidence at all (`ServedEvidence::default()`) is NEVER convergence.
+fn bootstrap_converged(ev: ServedEvidence, is_empty: bool, highest_checkpoint_seq: u64) -> bool {
+    if ev.max_checkpoint_seq > 0 {
+        highest_checkpoint_seq >= ev.max_checkpoint_seq
+    } else if ev.saw_nonempty {
+        !is_empty
+    } else {
+        ev.saw_owner_empty
+    }
 }
 
 /// Synchronization wrapper for a KvStore.
@@ -393,6 +452,11 @@ impl KvStoreSync {
         let sync_topic = self.state_sync_topic();
         let local_peer_id = self.local_peer_id;
         let local_agent_id = self.local_agent_id;
+        // StateServed evidence: written by the responder loop (which owns
+        // the side-topic subscription), read by the bootstrap requester to
+        // decide convergence.
+        let served_evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
+        let responder_served = Arc::clone(&served_evidence);
         spawn(Box::pin(async move {
             // Response-storm damping (issue #238 review): one full-state
             // response per cooldown window, regardless of how many replicas
@@ -446,43 +510,117 @@ impl KvStoreSync {
                                 }
                             }
                         }
+                        // Snapshot state once for the full-delta and the
+                        // StateServed marker below.
+                        let (full, is_empty, is_owner, checkpoint_seq) = {
+                            let s = responder_store.read().await;
+                            let is_owner =
+                                local_agent_id.is_some() && s.owner() == local_agent_id.as_ref();
+                            let cp =
+                                (s.highest_checkpoint_seq > 0).then_some(s.highest_checkpoint_seq);
+                            let full = (!s.is_empty()).then(|| s.full_delta());
+                            (full, s.is_empty(), is_owner, cp)
+                        };
                         // Cooldown gates only the (potentially large)
-                        // full-state broadcast — the OwnerAnnounce above is
-                        // tiny and always answered. A requester that lands
-                        // inside the window is served by its next scheduled
-                        // request (the requester schedule is infinite while
-                        // unconverged, so nothing is starved).
-                        if last_full_response.is_some_and(|t| {
+                        // full-state broadcast — the OwnerAnnounce above and
+                        // the StateServed marker below are tiny and always
+                        // answered. A requester that lands inside the window
+                        // still receives the marker, so its convergence
+                        // check runs against state served moments ago.
+                        let cooled_down = last_full_response.is_some_and(|t| {
                             t.elapsed()
                                 < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
-                        }) {
-                            continue;
-                        }
-                        // Known residual (documented in issue #238 review):
-                        // an owner whose CURRENT state is legitimately empty
-                        // (all keys deleted) sends only the announce, so a
-                        // stale non-empty holder can win the response race.
-                        // Deletion-aware cold recovery needs checkpoint-
-                        // frontier convergence — tracked as follow-up work;
-                        // AppendOnly stores (the integrity-critical case)
-                        // cannot delete.
-                        let full = {
-                            let s = responder_store.read().await;
-                            if s.is_empty() {
-                                continue;
+                        });
+                        if let Some(full) = full.filter(|_| !cooled_down) {
+                            if let Ok(serialized) = encode_delta(local_peer_id, &full) {
+                                if let Err(e) = responder_pubsub
+                                    .publish(
+                                        responder_topic.clone(),
+                                        bytes::Bytes::from(serialized),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("KvStore state-response publish failed: {e}");
+                                } else {
+                                    last_full_response = Some(tokio::time::Instant::now());
+                                }
                             }
-                            s.full_delta()
+                        }
+                        // StateServed marker: non-empty holders always
+                        // declare; an EMPTY store is declared only by its
+                        // owner (authoritative emptiness) — an empty
+                        // non-owner replica stays silent so bootstrapping
+                        // replicas can never talk each other into a false
+                        // "converged empty".
+                        //
+                        // Known residual (issue #238 review, follow-up
+                        // filed): full responses carry only live entries —
+                        // no tombstones — so deletions cannot cold-sync to
+                        // a stale replica; deletion-aware recovery needs
+                        // checkpoint-frontier state transfer. AppendOnly
+                        // stores (the integrity-critical case) cannot
+                        // delete.
+                        if !is_empty || is_owner {
+                            let marker = KvSyncMessage::StateServed {
+                                responder: local_peer_id,
+                                empty: is_empty,
+                                checkpoint_seq,
+                            };
+                            match bincode::serialize(&marker) {
+                                Ok(serialized) => {
+                                    if let Err(e) = responder_pubsub
+                                        .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "KvStore state-served marker publish failed: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "KvStore state-served marker serialize failed: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    KvSyncMessage::StateServed {
+                        responder,
+                        empty,
+                        checkpoint_seq,
+                    } => {
+                        if responder == local_peer_id {
+                            continue; // our own marker echoed back
+                        }
+                        // Trust note: markers steer only WHEN the bootstrap
+                        // requester stops asking — never store content, and
+                        // convergence is re-checked against local state
+                        // (`bootstrap_converged`), so a forged marker cannot
+                        // inject state. A forged non-empty/checkpoint marker
+                        // at worst prolongs the capped-cadence tail or stops
+                        // it no earlier than a real holder could (the
+                        // any-holder-answers trust the protocol already
+                        // has). A forged EMPTY marker, however, would stop
+                        // an empty replica's recovery outright — so
+                        // emptiness is trusted only from the pub/sub-
+                        // verified anchored owner.
+                        let owner_verified_empty = empty && {
+                            let anchored = responder_store.read().await.owner().copied();
+                            anchored.is_some() && msg.sender.as_ref() == anchored.as_ref()
                         };
-                        let Ok(serialized) = encode_delta(local_peer_id, &full) else {
-                            continue;
-                        };
-                        if let Err(e) = responder_pubsub
-                            .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
-                            .await
-                        {
-                            tracing::warn!("KvStore state-response publish failed: {e}");
+                        let mut ev = responder_served
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if empty {
+                            if owner_verified_empty {
+                                ev.saw_owner_empty = true;
+                            }
                         } else {
-                            last_full_response = Some(tokio::time::Instant::now());
+                            ev.saw_nonempty = true;
+                        }
+                        if let Some(seq) = checkpoint_seq {
+                            ev.max_checkpoint_seq = ev.max_checkpoint_seq.max(seq);
                         }
                     }
                     KvSyncMessage::OwnerAnnounce {
@@ -568,6 +706,7 @@ impl KvStoreSync {
             // authoritative kill switch is the `stopped` flag below.)
             let requester_store = Arc::downgrade(&self.store);
             let stopped = Arc::clone(&self.stopped);
+            let requester_served = Arc::clone(&served_evidence);
             spawn(Box::pin(async move {
                 for (attempt, delay_secs) in state_request_delays().enumerate() {
                     tokio::time::sleep(jittered_secs(delay_secs)).await;
@@ -576,13 +715,25 @@ impl KvStoreSync {
                     }
                     // Tail attempts stop on convergence; front attempts
                     // always run (see above — partial early state must not
-                    // cancel the request for full history).
+                    // cancel the request for full history). Convergence is
+                    // judged against StateServed evidence matched to local
+                    // state (`bootstrap_converged`) — NOT mere non-emptiness,
+                    // which a single incremental delta can fake while the
+                    // full historical state is still missing (round-2
+                    // review).
                     if attempt >= STATE_REQUEST_RETRY_SECS.len() {
                         let Some(store) = requester_store.upgrade() else {
                             return; // sync torn down — nothing left to bootstrap
                         };
-                        if !store.read().await.is_empty() {
-                            return; // converged — stop asking
+                        let ev = *requester_served
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let (is_empty, cp_hwm) = {
+                            let s = store.read().await;
+                            (s.is_empty(), s.highest_checkpoint_seq)
+                        };
+                        if bootstrap_converged(ev, is_empty, cp_hwm) {
+                            return; // a holder served us and local state matches
                         }
                     }
                     let request = KvSyncMessage::StateRequest {
@@ -1237,6 +1388,149 @@ mod tests {
             Some(STATE_REQUEST_TAIL_CAP_SECS),
             "the schedule is infinite — convergence, not the schedule, \
              is what ends the requester"
+        );
+    }
+
+    /// WHY (round-2 review): the convergence rule must weigh evidence
+    /// correctly — checkpoint match is exact; declared-non-empty requires
+    /// local state; emptiness counts only when the owner declared it; and
+    /// NO evidence is NEVER convergence (a replica that heard nothing keeps
+    /// asking, whatever its local state looks like).
+    #[test]
+    fn bootstrap_convergence_rule() {
+        let none = ServedEvidence::default();
+        // No evidence: never converged, empty or not.
+        assert!(!bootstrap_converged(none, true, 0));
+        assert!(!bootstrap_converged(none, false, 9));
+
+        // Checkpoint evidence is exact: local HWM must reach it.
+        let cp = ServedEvidence {
+            saw_nonempty: true,
+            saw_owner_empty: false,
+            max_checkpoint_seq: 5,
+        };
+        assert!(!bootstrap_converged(cp, false, 4), "behind the served HWM");
+        assert!(bootstrap_converged(cp, false, 5));
+        assert!(bootstrap_converged(cp, false, 7));
+
+        // Non-empty holder, no checkpoint: local non-emptiness required.
+        let nonempty = ServedEvidence {
+            saw_nonempty: true,
+            saw_owner_empty: false,
+            max_checkpoint_seq: 0,
+        };
+        assert!(!bootstrap_converged(nonempty, true, 0));
+        assert!(bootstrap_converged(nonempty, false, 0));
+
+        // Owner-declared empty (and nothing stronger): converged even empty.
+        let owner_empty = ServedEvidence {
+            saw_nonempty: false,
+            saw_owner_empty: true,
+            max_checkpoint_seq: 0,
+        };
+        assert!(bootstrap_converged(owner_empty, true, 0));
+        // A non-empty holder claim outranks owner-empty when both were seen.
+        let mixed = ServedEvidence {
+            saw_nonempty: true,
+            saw_owner_empty: true,
+            max_checkpoint_seq: 0,
+        };
+        assert!(
+            !bootstrap_converged(mixed, true, 0),
+            "divergent holders: the data-bearing claim must win, keep asking"
+        );
+    }
+
+    /// WHY (round-2 review — P1: restored non-empty replicas still became
+    /// zombies): round 1 made non-owner replicas run the front burst, but
+    /// the tail still exited on mere non-emptiness — a restored replica
+    /// whose owner stayed offline through the burst exited on its first
+    /// tail check and never asked again. Convergence now requires
+    /// StateServed evidence: the replica must keep asking until a holder
+    /// actually answers, however long the owner is away.
+    #[tokio::test(start_paused = true)]
+    async fn restored_replica_keeps_asking_until_a_holder_serves() {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-238-restored-late-owner";
+
+        // Snapshot-restored replica: non-empty, owner OFFLINE.
+        let mut replica = KvStore::new_replica(
+            store_id(1),
+            String::new(),
+            Some(owner_id),
+            crate::kv::store::AnchorChannel::Persistence,
+        );
+        replica
+            .put(
+                "k_old".to_string(),
+                b"v_old".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed restored key");
+        let joiner = KvStoreSync::new(
+            replica,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+
+        // The entire front burst fires with the owner away. The round-1
+        // code exited the tail right here (non-empty ⇒ "converged").
+        tokio::time::sleep(Duration::from_secs(90)).await;
+
+        // Owner returns much later, holding a key the replica missed.
+        let mut owned = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner_id,
+            AccessPolicy::Signed,
+        );
+        owned
+            .put(
+                "k_old".to_string(),
+                b"v_old".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner k_old");
+        owned
+            .put(
+                "k_new".to_string(),
+                b"v_new".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner k_new");
+        let owner_sync = KvStoreSync::new(
+            owned,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner_id),
+        )
+        .expect("owner sync");
+        owner_sync.start().await.expect("start owner");
+
+        let mut recovered = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.get("k_new").is_some() {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "a restored non-empty replica must keep requesting until a \
+             holder serves it — non-emptiness alone is not convergence"
         );
     }
 

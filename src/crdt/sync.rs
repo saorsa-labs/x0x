@@ -48,8 +48,9 @@ const STATE_REQUEST_TAIL_CAP_SECS: u64 = 300;
 /// reactively and never volunteer state to late subscribers, so a bounded
 /// schedule (the previous 20 × 30s ≈ 10 min hard cap) left a replica that
 /// rehydrated while every holder was offline permanently un-synced once the
-/// cap expired. Convergence — the list turning non-empty — is the only
-/// legitimate stop condition, and the requester loop owns that check.
+/// cap expired. Convergence — a `StateServed` marker plus local state — is
+/// the only legitimate stop condition, and the requester loop owns that
+/// check.
 fn state_request_delays() -> impl Iterator<Item = u64> {
     let tail = std::iter::successors(Some(STATE_REQUEST_TAIL_START_SECS), |d| {
         Some(d.saturating_mul(2).min(STATE_REQUEST_TAIL_CAP_SECS))
@@ -78,6 +79,24 @@ enum TaskListSyncMessage {
     /// A peer with no local state for the list asks holders to republish
     /// their full state (as a regular delta) on the main topic.
     StateRequest { requester: PeerId },
+    /// A NON-EMPTY holder's declaration that it has answered a
+    /// `StateRequest` (its full state was republished on the main topic,
+    /// possibly earlier within the response cooldown). Requesters exit their
+    /// bootstrap tail only after seeing a marker AND holding local state —
+    /// mere non-emptiness is not convergence evidence (a single incremental
+    /// delta must not silence recovery, round-2 review). Task lists have no
+    /// authoritative owner, so an empty holder NEVER declares (two empty
+    /// bootstrapping replicas must not talk each other into a false
+    /// "converged empty"); a genuinely-empty list keeps its capped-cadence
+    /// tail (~one tiny message per 5 minutes) until state exists.
+    ///
+    /// Wire compatibility: additive variant — older peers fail to
+    /// deserialize it and skip the message (same precedent as the kv-store
+    /// side channel).
+    StateServed {
+        /// The declaring holder (receivers skip their own echo).
+        responder: PeerId,
+    },
 }
 
 /// Synchronization wrapper for a TaskList.
@@ -225,45 +244,90 @@ impl TaskListSync {
         let responder_list = Arc::clone(&self.task_list);
         let responder_pubsub = Arc::clone(&self.pubsub);
         let responder_topic = self.topic.clone();
+        let sync_topic = self.state_sync_topic();
+        // StateServed evidence: written by the responder loop (which owns
+        // the side-topic subscription), read by the bootstrap requester to
+        // decide convergence.
+        let served_evidence = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let responder_served = Arc::clone(&served_evidence);
         let local_peer_id = self.local_peer_id;
         spawn(Box::pin(async move {
             // Response-storm damping (issue #238 review): one full-state
             // response per cooldown window — the response is a broadcast,
             // so it serves every concurrently-bootstrapping replica; a
-            // requester that lands inside the window is served by its next
-            // scheduled request.
+            // requester that lands inside the window still receives the
+            // (tiny) StateServed marker, so its convergence check runs
+            // against state served moments ago.
             let mut last_full_response: Option<tokio::time::Instant> = None;
             while let Some(msg) = sync_sub.recv().await {
-                let Ok(TaskListSyncMessage::StateRequest { requester }) =
-                    bincode::deserialize::<TaskListSyncMessage>(&msg.payload)
-                else {
+                let Ok(sync_msg) = bincode::deserialize::<TaskListSyncMessage>(&msg.payload) else {
                     continue;
                 };
-                if requester == local_peer_id {
-                    continue;
-                }
-                if last_full_response.is_some_and(|t| {
-                    t.elapsed() < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
-                }) {
-                    continue;
-                }
-                let full = {
-                    let list = responder_list.read().await;
-                    if list.task_count() == 0 {
-                        continue;
+                match sync_msg {
+                    TaskListSyncMessage::StateRequest { requester } => {
+                        if requester == local_peer_id {
+                            continue;
+                        }
+                        // Empty holders stay entirely silent — no response,
+                        // no marker (see StateServed docs).
+                        let full = {
+                            let list = responder_list.read().await;
+                            if list.task_count() == 0 {
+                                continue;
+                            }
+                            list.full_delta()
+                        };
+                        let cooled_down = last_full_response.is_some_and(|t| {
+                            t.elapsed()
+                                < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
+                        });
+                        if !cooled_down {
+                            if let Ok(serialized) = encode_delta(local_peer_id, &full) {
+                                if let Err(e) = responder_pubsub
+                                    .publish(
+                                        responder_topic.clone(),
+                                        bytes::Bytes::from(serialized),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("TaskList state-response publish failed: {e}");
+                                } else {
+                                    last_full_response = Some(tokio::time::Instant::now());
+                                }
+                            }
+                        }
+                        let marker = TaskListSyncMessage::StateServed {
+                            responder: local_peer_id,
+                        };
+                        match bincode::serialize(&marker) {
+                            Ok(serialized) => {
+                                if let Err(e) = responder_pubsub
+                                    .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "TaskList state-served marker publish failed: {e}"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "TaskList state-served marker serialize failed: {e}"
+                                );
+                            }
+                        }
                     }
-                    list.full_delta()
-                };
-                let Ok(serialized) = encode_delta(local_peer_id, &full) else {
-                    continue;
-                };
-                if let Err(e) = responder_pubsub
-                    .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
-                    .await
-                {
-                    tracing::warn!("TaskList state-response publish failed: {e}");
-                } else {
-                    last_full_response = Some(tokio::time::Instant::now());
+                    TaskListSyncMessage::StateServed { responder } => {
+                        if responder == local_peer_id {
+                            continue; // our own marker echoed back
+                        }
+                        // Trust note: the marker steers only WHEN the
+                        // requester stops asking, never list content, and
+                        // the requester still requires local non-emptiness
+                        // — a forged marker cannot inject state and stops
+                        // recovery no earlier than a real holder could.
+                        responder_served.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }));
@@ -292,6 +356,7 @@ impl TaskListSync {
             let requester_list = Arc::downgrade(&self.task_list);
             let sync_topic = self.state_sync_topic();
             let stopped = Arc::clone(&self.stopped);
+            let requester_served = Arc::clone(&served_evidence);
             spawn(Box::pin(async move {
                 for (attempt, delay_secs) in state_request_delays().enumerate() {
                     tokio::time::sleep(jittered_secs(delay_secs)).await;
@@ -299,13 +364,19 @@ impl TaskListSync {
                         return; // stop() called — never chatter for a dead sync
                     }
                     // Tail attempts stop on convergence; front attempts
-                    // always run (see above).
+                    // always run (see above). Convergence requires BOTH a
+                    // StateServed marker (a holder actually answered) AND
+                    // local state — mere non-emptiness can be faked by one
+                    // incremental delta while full history is still missing
+                    // (round-2 review).
                     if attempt >= STATE_REQUEST_RETRY_SECS.len() {
                         let Some(list) = requester_list.upgrade() else {
                             return; // sync torn down — nothing left to bootstrap
                         };
-                        if list.read().await.task_count() > 0 {
-                            return; // converged — stop asking
+                        if requester_served.load(std::sync::atomic::Ordering::Relaxed)
+                            && list.read().await.task_count() > 0
+                        {
+                            return; // a holder served us and we hold state
                         }
                     }
                     let request = TaskListSyncMessage::StateRequest {
@@ -812,6 +883,76 @@ mod tests {
             Some(STATE_REQUEST_TAIL_CAP_SECS),
             "the schedule is infinite — convergence, not the schedule, \
              is what ends the requester"
+        );
+    }
+
+    /// WHY (round-2 review — P1: one incremental delta must not silence
+    /// recovery): a live task arriving before any holder has actually
+    /// SERVED full state makes the list non-empty, and the round-1 tail
+    /// exited on non-emptiness alone — permanently missing all older
+    /// tasks. Convergence now additionally requires a StateServed marker,
+    /// so the bait delta leaves the requester alive and a late full holder
+    /// still gets asked.
+    #[tokio::test(start_paused = true)]
+    async fn single_incremental_delta_does_not_stop_recovery() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let topic = "tasks-238-bait";
+
+        let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
+        let joiner =
+            TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
+                .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+
+        // Past the front burst with nobody online.
+        tokio::time::sleep(Duration::from_secs(70)).await;
+
+        // The bait: ONE live incremental delta (task 2) — no full response,
+        // no StateServed marker. The list becomes non-empty.
+        let bait_task = make_task(2, peer(3));
+        let bait_id = *bait_task.id();
+        let mut bait = TaskListDelta::new(1);
+        bait.added_tasks.insert(bait_id, (bait_task, (peer(3), 1)));
+        let encoded = encode_delta(peer(3), &bait).expect("encode bait");
+        pubsub
+            .publish(topic.to_string(), bytes::Bytes::from(encoded))
+            .await
+            .expect("publish bait");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            joiner.read().await.task_count(),
+            1,
+            "bait delta merged — the false-convergence precondition holds"
+        );
+
+        // A holder with the FULL history (task 1 and task 2) appears long
+        // after the bait. Only a still-alive requester can reach it.
+        let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        holder_list
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("holder task 1");
+        holder_list
+            .add_task(make_task(2, peer(1)), peer(1), 2)
+            .expect("holder task 2");
+        let holder =
+            TaskListSync::new(holder_list, Arc::clone(&pubsub), topic.to_string(), peer(1))
+                .expect("holder sync");
+        holder.start().await.expect("start holder");
+
+        let historical = TaskId::from_bytes([1; 32]);
+        let mut converged = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.get_task(&historical).is_some() {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the requester must survive the bait delta and recover the \
+             historical task from the late holder"
         );
     }
 

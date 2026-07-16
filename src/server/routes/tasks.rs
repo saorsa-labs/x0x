@@ -316,7 +316,12 @@ pub(in crate::server) async fn create_task_list(
                     topic = %req.topic,
                     "failed to persist task-list subscription registration: {e}"
                 );
-                state.task_lists.write().await.remove(&id);
+                // Roll back AND stop the discarded handle's sync — its
+                // bootstrap requester is infinite while unconverged
+                // (issue #238) and would otherwise chatter until shutdown.
+                if let Some(h) = state.task_lists.write().await.remove(&id) {
+                    h.stop_sync().await;
+                }
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "failed to persist subscription registration",

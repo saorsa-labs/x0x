@@ -10240,6 +10240,20 @@ impl std::fmt::Debug for TaskListHandle {
 }
 
 impl TaskListHandle {
+    /// Tear down this replica's background synchronization: unsubscribes
+    /// the main and state-sync topics and arms the bootstrap requester's
+    /// kill flag (its schedule is infinite while unconverged — issue #238 —
+    /// so a discarded handle must silence it explicitly).
+    ///
+    /// Callers that remove a handle without keeping any other clone (e.g.
+    /// the daemon's registration-rollback paths) MUST call this, or the
+    /// sync loops keep running until `Agent::shutdown()`.
+    pub async fn stop_sync(&self) {
+        // TaskListSync::stop only unsubscribes (infallible today); a failure
+        // would mean the pubsub layer is gone, which is strictly "stopped".
+        let _ = self.sync.stop().await;
+    }
+
     /// Generate a fresh per-replica epoch at handle construction.
     ///
     /// Uses a CSPRNG incarnation nonce (64-bit random from `OsRng`) so a
@@ -10976,6 +10990,20 @@ impl KvStoreHandle {
     #[must_use]
     pub fn peer_id(&self) -> saorsa_gossip_types::PeerId {
         self.peer_id
+    }
+
+    /// Tear down this replica's background synchronization: unsubscribes
+    /// the main and state-sync topics and arms the bootstrap requester's
+    /// kill flag (its schedule is infinite while unconverged — issue #238 —
+    /// so a discarded handle must silence it explicitly).
+    ///
+    /// Callers that remove a handle without keeping any other clone (e.g.
+    /// the daemon's registration-rollback paths) MUST call this, or the
+    /// sync loops keep running until `Agent::shutdown()`.
+    pub async fn stop_sync(&self) {
+        // KvStoreSync::stop only unsubscribes (infallible today); a failure
+        // would mean the pubsub layer is gone, which is strictly "stopped".
+        let _ = self.sync.stop().await;
     }
 
     /// Return the store's ownership/policy/version metadata for auditability.

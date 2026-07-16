@@ -425,6 +425,13 @@ async fn persist_recorded(
 pub(super) async fn handle_reservation(state: &AppState, kind: &str, id: &str) -> Arc<Mutex<()>> {
     let key = format!("{kind}:{id}");
     let mut locks = state.crdt_handle_locks.write().await;
+    // Opportunistic pruning (issue #238 round-2 review): without it every
+    // distinct (kind,id) ever requested pins an Arc<Mutex> forever — an
+    // unbounded-growth vector for authenticated callers minting unique ids.
+    // An entry with strong count 1 is held ONLY by this map: a live guard
+    // implies a cloned Arc, and clones are only ever minted under this same
+    // write lock, so removal cannot race a concurrent acquisition.
+    locks.retain(|k, v| *k == key || Arc::strong_count(v) > 1);
     locks
         .entry(key)
         .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -1229,41 +1236,59 @@ mod tests {
     /// the disk write) leaves memory == disk == pre-call state and an identical
     /// retry re-stages and re-writes.
     ///
-    /// Deterministic — no sleeps, no timing: `biased` select! polls
+    /// No sleeps, no wall-clock timing: `biased` select! polls
     /// `persist_recorded` first. It advances synchronously through the
     /// uncontended locks and the in-memory stage until its FIRST blocking
-    /// await (the `tokio::fs` disk op, which dispatches to the blocking pool
-    /// and returns `Pending`). At that suspension point the OLD code had
-    /// already mutated live memory; the fixed code has not. `yield_now` then
-    /// wins the select and drops the future mid-write — exactly the
+    /// await (the `tokio::fs` disk op, which dispatches to the blocking
+    /// pool). At that suspension point the OLD code had already mutated
+    /// live memory; the fixed code has not. `yield_now` then wins the
+    /// select and drops the future mid-write — exactly the
     /// cancellation-before-rename window.
+    ///
+    /// One scheduling hazard remains: `tokio::fs` is `spawn_blocking`
+    /// underneath, so on a loaded machine the blocking thread can finish
+    /// the op BEFORE this task's first poll — persist then completes
+    /// without ever suspending and no cancellation happens. Such attempts
+    /// prove nothing (not a pass, not a failure), so the scenario retries
+    /// with fresh state until a genuine mid-write cancellation is observed,
+    /// bounded so a real change in suspension behaviour still fails loudly.
     #[tokio::test]
     async fn cancel_before_rename_leaves_memory_clean_and_retry_writes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("crdt-subscriptions.json");
-        let manifest = Arc::new(RwLock::new(CrdtSubscriptionManifest::default()));
-        let lock = Arc::new(Mutex::new(()));
         let make_entry = || entry(KIND_KV_STORE, "cancel-store", ROLE_CREATED);
 
         // Drive persist_recorded until it suspends at its first disk await,
         // then cancel (drop) it — the cancellation-before-rename hole.
-        let cancelled = tokio::select! {
-            biased;
-            // Polled first: runs through the locks + in-memory stage and
-            // suspends at the blocking `tokio::fs` write.
-            res = persist_recorded(&manifest, &lock, &path, make_entry()) => {
-                // A genuine completion is not the scenario under test; assert
-                // it at least succeeded so the assertions below stay coherent.
-                assert!(res.is_ok(), "if persist completed it must succeed");
-                false
+        let mut observed = None;
+        for _ in 0..64 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("crdt-subscriptions.json");
+            let manifest = Arc::new(RwLock::new(CrdtSubscriptionManifest::default()));
+            let lock = Arc::new(Mutex::new(()));
+            let cancelled = tokio::select! {
+                biased;
+                // Polled first: runs through the locks + in-memory stage and
+                // suspends at the blocking `tokio::fs` write.
+                res = persist_recorded(&manifest, &lock, &path, make_entry()) => {
+                    // A genuine completion is not the scenario under test;
+                    // assert it at least succeeded so the retry stays sound.
+                    assert!(res.is_ok(), "if persist completed it must succeed");
+                    false
+                }
+                _ = tokio::task::yield_now() => true,
+            };
+            if cancelled {
+                observed = Some((dir, path, manifest, lock));
+                break;
             }
-            _ = tokio::task::yield_now() => true,
+        }
+        let Some((dir, path, manifest, lock)) = observed else {
+            panic!(
+                "no attempt out of 64 was still suspended in its disk write \
+                 when cancelled — persist_recorded's first blocking await \
+                 has changed and this test no longer exercises the \
+                 cancellation-before-rename hole"
+            );
         };
-        assert!(
-            cancelled,
-            "persist_recorded must still be suspended in its disk write when \
-             cancelled; if it completed, the cancellation hole was not exercised"
-        );
 
         // After cancellation: live memory and disk must both be clean. The OLD
         // code left the entry in live memory here (mutated before the write).

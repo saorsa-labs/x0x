@@ -15948,9 +15948,14 @@ async fn create_kv_store(
             .await
             {
                 // Durable write failed: roll back the live handle so success is
-                // not acknowledged for an un-persisted registration.
+                // not acknowledged for an un-persisted registration, and STOP
+                // its sync — the discarded handle's bootstrap requester is
+                // infinite while unconverged (issue #238) and would otherwise
+                // chatter until daemon shutdown.
                 tracing::error!("failed to persist kv store registration {id}: {e}");
-                state.kv_stores.write().await.remove(&id);
+                if let Some(h) = state.kv_stores.write().await.remove(&id) {
+                    h.stop_sync().await;
+                }
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("failed to persist subscription registration: {e}"),
@@ -16038,9 +16043,14 @@ async fn join_kv_store(
             .await
             {
                 // Durable write failed: roll back the live handle so success is
-                // not acknowledged for an un-persisted registration.
+                // not acknowledged for an un-persisted registration, and STOP
+                // its sync — the discarded handle's bootstrap requester is
+                // infinite while unconverged (issue #238) and would otherwise
+                // chatter until daemon shutdown.
                 tracing::error!("failed to persist kv store join {id}: {e}");
-                state.kv_stores.write().await.remove(&id);
+                if let Some(h) = state.kv_stores.write().await.remove(&id) {
+                    h.stop_sync().await;
+                }
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("failed to persist subscription registration: {e}"),
