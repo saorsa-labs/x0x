@@ -1100,6 +1100,10 @@ enum StoreSub {
         name: String,
         /// Gossip topic for sync.
         topic: String,
+        /// Access policy: "signed" (default) or "append_only" (existing keys
+        /// are immutable — no update, no delete, even by the owner).
+        #[arg(long)]
+        policy: Option<String>,
     },
     /// Join an existing store by topic.
     ///
@@ -1770,9 +1774,11 @@ async fn run(
         Commands::Store { sub } => match sub {
             None => commands::store::list(&client).await,
             Some(StoreSub::List) => commands::store::list(&client).await,
-            Some(StoreSub::Create { name, topic }) => {
-                commands::store::create(&client, &name, &topic).await
-            }
+            Some(StoreSub::Create {
+                name,
+                topic,
+                policy,
+            }) => commands::store::create(&client, &name, &topic, policy.as_deref()).await,
             Some(StoreSub::Join { topic, owner }) => {
                 commands::store::join(&client, &topic, &owner).await
             }

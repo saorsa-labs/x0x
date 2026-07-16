@@ -74,6 +74,13 @@ pub enum IdentityError {
     /// maps this to HTTP 403.
     #[error("not authorized: {0}")]
     Unauthorized(String),
+
+    /// A local write was rejected because the store's `AppendOnly` policy
+    /// makes existing keys immutable (no update to different content, no
+    /// delete), even for the owner. The API layer maps this to HTTP 409
+    /// Conflict.
+    #[error("immutable key: {0} — append-only store; existing keys cannot be updated or deleted")]
+    ImmutableKey(String),
 }
 
 /// Standard Result type for x0x identity operations.

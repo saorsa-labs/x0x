@@ -2,6 +2,76 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- `AccessPolicy::AppendOnly` for KV stores (tracker-integrity-v2 WP-X,
+  x0x-symphony #10): owner-signed like `Signed`, but existing keys are
+  IMMUTABLE — frozen in full (value, content type, metadata, timestamps),
+  no update, no delete, even by the owner. Enforced at every path: local
+  put/remove (`KvError::ImmutableKey`), remote deltas (violating
+  entries/removals are skipped and logged, the rest of the delta still
+  applies), full-state `KvStore::merge` (transactional reject), and
+  owner-signed checkpoint adoption (a checkpoint that shrinks the keyset,
+  rewrites an existing key, or downgrades the policy is rejected outright;
+  fresh-joiner cold-start adoption is unaffected). The policy is TERMINAL:
+  no announce, checkpoint, or manifest entry can transition a replica away
+  from append_only once known. Checkpoint adoption also rejects any delta
+  carrying the same key in both `added` and `updated` (ambiguous-multiset
+  tamper), for all policies. Byte-identical re-puts are accepted as true
+  idempotent no-ops (no version bump, no checkpoint-sequence advance, no
+  publish). REST: `POST /stores` accepts `"policy": "append_only"`;
+  `PUT`/`DELETE` on an existing key of an append-only store return 409
+  Conflict. CLI: `x0x store create --policy append_only`.
+  **Guarantee scope**: keys are immutable after first observation by a
+  continuously-persistent replica; a fresh joiner with no prior state
+  necessarily trusts the owner's current signed snapshot. Fresh-joiner
+  rewrite detection requires content chaining above the store
+  (x0x-symphony tracker-integrity-v2, saorsa-labs/x0x-symphony#10).
+  Wire/storage compat: the variant is appended at the END of the
+  bincode-positional `AccessPolicy` enum, so existing stores, deltas, and
+  checkpoints are unaffected.
+- KV store state snapshots: the daemon now persists every KV store's full
+  state (policy, keyset, entries, latest adopted checkpoint, checkpoint
+  high-water mark, and the OR-Set sequence-counter ceiling) to
+  `<data_dir>/kv-stores/<store-id-hex>.bin` after every local mutation,
+  merged remote delta — gossip AND the direct-delivery side channel — and
+  policy refresh, restoring it on restart BEFORE any write is accepted
+  (`Agent::create_kv_store_persistent` / `Agent::join_kv_store_persistent`).
+  This closes the restart-amnesia hole where an append-only owner or replica
+  came back empty and would have re-accepted (and, for an owner, re-signed)
+  rewrites of keys it no longer remembered. Corrupt snapshots,
+  store-id/owner mismatches, policy conflicts, and malformed manifest policy
+  strings all FAIL CLOSED (loud skip/startup error, never a silent Signed
+  downgrade). Legacy manifest entries without a policy field remain Signed
+  (documented compatibility default).
+  Durability contract: snapshot format v1 (`X0XKVS1` magic + bincode body;
+  introduced unreleased, no compat read path — unrecognized files fail
+  closed); writes are atomic (unique temp file + fsync + rename + parent
+  directory fsync on Unix; on non-Unix the parent fsync is skipped — the
+  rename stays atomic but its power-loss durability is not guaranteed
+  there); commits are serialized per store and version-gated so a
+  concurrent persist burst can never rename an older snapshot over a newer
+  one; a FAILED snapshot write on the local write path errors the write
+  (REST 500), does NOT publish the delta (durability before announcement —
+  the in-memory mutation stays applied and is recovered by the next
+  successful persist), flags the store `durability_degraded` (surfaced in
+  `GET /stores` and store create/join responses), and refuses further LOCAL
+  writes until a persist succeeds; remote-delta persist failures degrade
+  but never wedge replication. SIGKILL/power loss beyond the parent-dir
+  fsync (e.g. hardware write caches) is out of scope.
+
+### Compatibility caveats
+
+- Binaries older than this release cannot decode an `AccessPolicy` value of
+  `append_only` (bincode positional variant 3): they skip checkpoints and
+  announces carrying it. Rolling BACK to an older x0xd after creating an
+  append-only store leaves that store's snapshot and manifest entry
+  undecodable/unenforced on the old binary — do not roll back daemons that
+  host append-only stores (the immutability guarantee does not exist on
+  pre-AppendOnly binaries).
+
 ## [v0.32.1] - 2026-07-15
 
 ### Changed

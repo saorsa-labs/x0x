@@ -721,6 +721,20 @@ unconditional (still advisory).
 | GET | `/stores/:id/:key` | `x0x store get <store_id> <key>` | Get a value |
 | DELETE | `/stores/:id/:key` | `x0x store rm <store_id> <key>` | Remove a value |
 
+### Store create request body
+
+```json
+{
+  "name": "events",
+  "topic": "my-app/events",
+  "policy": "append_only"
+}
+```
+
+`policy` is optional: `"signed"` (default) or `"append_only"`. Any other
+value is a **400**. CLI: `x0x store create <name> <topic> --policy append_only`.
+`GET /stores` and the create/join responses report the store's policy string.
+
 ### Store put request body
 
 ```json
@@ -739,6 +753,39 @@ when this daemon's agent is not authorized — including on a joined replica
 that has not yet learned the store's authoritative owner from the
 owner-signed announcement (`"not authorized: store owner unknown: ..."`).
 Reads are always allowed.
+
+### Append-only stores
+
+A store created with `"policy": "append_only"` behaves like `Signed`
+(owner-only writes) with one addition: **existing keys are immutable, even
+to the owner**. `PUT` on an existing key with different content and `DELETE`
+on any existing key return **409 Conflict** with
+`{"ok":false,"error":"immutable key: <key> — append-only store; ..."}`.
+Re-putting byte-identical content (same value and content type) is accepted
+as an idempotent no-op, so retries are safe (and no new owner checkpoint is
+produced). The policy is terminal: once a replica knows a store is
+append-only, no owner announce or checkpoint can transition it back to
+`signed`. The daemon snapshots every store's full state to
+`<data_dir>/kv-stores/<store-id-hex>.bin` after each mutation (local
+writes, gossip deltas, and direct-delivery deltas alike), so immutability
+knowledge survives restarts; a corrupt or conflicting snapshot fails closed
+at startup rather than silently starting empty. If a snapshot write FAILS,
+the local write returns **500**, the delta is NOT published (durability
+before announcement), the store reports `"durability_degraded": true` in
+`GET /stores` and create/join responses, and further local writes are
+refused until a snapshot succeeds; remote replication continues.
+
+**Exact guarantee**: keys are immutable *after first observation by a
+continuously-persistent replica*. Such a replica rejects every rewrite or
+removal — including owner-signed deltas and owner-signed checkpoints. A
+**fresh joiner with no prior state necessarily trusts the owner's current
+signed snapshot**: signatures alone cannot prove that snapshot is the
+original history rather than a rewrite, and two fresh joiners fed different
+owner-signed snapshots will diverge (detectable by comparing adopted
+checkpoint content roots). Applications that need fresh-joiner rewrite
+detection must layer content chaining above the store (per-author sequence
+numbers + previous-entry hashes) — x0x-symphony's tracker-integrity-v2 does
+exactly this (saorsa-labs/x0x-symphony#10).
 
 ## File transfers
 

@@ -41,6 +41,12 @@ quick-check: fmt-check lint test
 
 check: fmt-check lint build test doc
 
+# KV append-only REST/e2e suite (#[ignore] — boots real x0xd daemons, so it
+# needs a built binary and cannot run hermetically under plain `just test`).
+test-kv-e2e:
+    cargo build --release --bin x0xd
+    cargo nextest run --all-features --test kv_append_only_rest -- --ignored
+
 # ── Test coverage (line/region) ───────────────────────────────────────────
 #
 # Uses cargo-llvm-cov + nextest. Install once with:

@@ -10,6 +10,7 @@ use crate::kv::store::AccessPolicy;
 use crate::kv::{KvStore, KvStoreDelta, Result};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -83,6 +84,33 @@ pub struct KvStoreSync {
     /// is the store owner (and should answer state requests with an
     /// [`KvSyncMessage::OwnerAnnounce`]) and to ignore its own announces.
     local_agent_id: Option<AgentId>,
+
+    /// Optional persistence context. When armed (see
+    /// [`set_persist_path`](Self::set_persist_path)), the full store state is
+    /// snapshotted atomically after every local mutation and every merged
+    /// remote delta, so a restart restores policy, keyset, entry contents,
+    /// the latest adopted checkpoint, the checkpoint high-water mark, and the
+    /// OR-Set sequence-counter ceiling instead of coming back as an empty
+    /// replica. This is what makes `AppendOnly` immutability survive a
+    /// restart: an owner (or replica) with amnesia would otherwise accept
+    /// rewrites of keys it no longer remembers holding.
+    persist: std::sync::Mutex<Option<Arc<PersistCtx>>>,
+}
+
+/// Shared persistence context for one store's snapshot file.
+struct PersistCtx {
+    /// Snapshot file path.
+    path: PathBuf,
+    /// Serializes snapshot commits AND records the last durably-persisted
+    /// store version. `(version, bytes)` are captured under this lock, so
+    /// commit order equals capture order — a concurrent persist burst can
+    /// never rename an older snapshot over a newer one — and the version
+    /// gate skips writes that would not advance durable state.
+    gate: tokio::sync::Mutex<Option<u64>>,
+    /// True after a failed snapshot write; cleared by the next success.
+    /// While set, LOCAL writes are refused (fail-closed for what this node
+    /// controls); remote-delta merges continue (replication is not wedged).
+    degraded: std::sync::atomic::AtomicBool,
 }
 
 impl KvStoreSync {
@@ -112,7 +140,77 @@ impl KvStoreSync {
             topic,
             local_peer_id,
             local_agent_id,
+            persist: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Enable on-disk snapshot persistence at `path`.
+    ///
+    /// Call before [`start`](Self::start) so no merged delta can land
+    /// unpersisted. The caller is responsible for loading any existing
+    /// snapshot BEFORE constructing this sync (see
+    /// [`load_snapshot`]); this method only arms writes.
+    pub fn set_persist_path(&self, path: PathBuf) {
+        if let Ok(mut guard) = self.persist.lock() {
+            *guard = Some(Arc::new(PersistCtx {
+                path,
+                gate: tokio::sync::Mutex::new(None),
+                degraded: std::sync::atomic::AtomicBool::new(false),
+            }));
+        }
+    }
+
+    /// Clone the armed persistence context, if any.
+    fn persist_ctx(&self) -> Option<Arc<PersistCtx>> {
+        self.persist.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Snapshot the store to the configured persist path (`Ok` no-op when
+    /// persistence is not armed).
+    ///
+    /// Durability contract:
+    /// - Commits are serialized per store and version-gated, so concurrent
+    ///   persists can never regress durable state.
+    /// - On failure the store is flagged **durability-degraded**
+    ///   ([`durability_degraded`](Self::durability_degraded)): callers on the
+    ///   LOCAL write path must propagate the error to the writer and MUST NOT
+    ///   publish the mutation (durability before announcement); callers on
+    ///   the REMOTE merge path log and continue (replication is not wedged —
+    ///   peers hold the data; only this node's disk is behind).
+    /// - The next successful persist (including via
+    ///   [`ensure_durable`](Self::ensure_durable)) clears the flag.
+    ///
+    /// # Errors
+    ///
+    /// I/O or serialization failure writing the snapshot.
+    pub async fn persist(&self) -> Result<()> {
+        match self.persist_ctx() {
+            Some(ctx) => persist_snapshot(&self.store, &ctx).await,
+            None => Ok(()),
+        }
+    }
+
+    /// True while the last snapshot attempt failed and no retry has
+    /// succeeded. Local writes are refused in this state (fail-closed).
+    pub fn durability_degraded(&self) -> bool {
+        self.persist_ctx()
+            .is_some_and(|c| c.degraded.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// If the store is durability-degraded, retry persisting the CURRENT
+    /// state before any new mutation is accepted. `Ok` when not degraded,
+    /// not persistent, or the retry succeeded.
+    ///
+    /// # Errors
+    ///
+    /// The retry failed — the caller must refuse the local write.
+    pub async fn ensure_durable(&self) -> Result<()> {
+        match self.persist_ctx() {
+            Some(ctx) if ctx.degraded.load(std::sync::atomic::Ordering::Relaxed) => {
+                persist_snapshot(&self.store, &ctx).await
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The state-sync side topic for this store.
@@ -163,7 +261,12 @@ impl KvStoreSync {
         // owner-signed envelope from store A under topic B. Each listener binds
         // to the exact topic it subscribed to.
         let main_topic = self.topic.clone();
+        // Snapshot the persist context once: it is armed before start() by
+        // construction (set_persist_path docs), so the loops never observe a
+        // late change.
+        let persist_ctx = self.persist_ctx();
 
+        let loop_persist_ctx = persist_ctx.clone();
         spawn(Box::pin(async move {
             while let Some(msg) = sub.recv().await {
                 if msg.topic != main_topic {
@@ -174,12 +277,28 @@ impl KvStoreSync {
                 let decoded = decode_delta::<KvStoreDelta>(&msg.payload);
                 match decoded {
                     Ok((peer_id, delta)) => {
-                        let mut s = store.write().await;
-                        // Pass sender identity for access control enforcement.
-                        // The gossip V2 wire format includes a verified AgentId.
-                        let writer = msg.sender.as_ref();
-                        if let Err(e) = s.merge_delta(&delta, peer_id, writer) {
-                            tracing::warn!("Failed to merge KvStore delta: {e}");
+                        let merged = {
+                            let mut s = store.write().await;
+                            // Pass sender identity for access control enforcement.
+                            // The gossip V2 wire format includes a verified AgentId.
+                            let writer = msg.sender.as_ref();
+                            match s.merge_delta(&delta, peer_id, writer) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    tracing::warn!("Failed to merge KvStore delta: {e}");
+                                    false
+                                }
+                            }
+                        };
+                        // Persist OUTSIDE the write guard so disk latency
+                        // never blocks other writers. A failure flags the
+                        // store durability-degraded (persist_snapshot logs);
+                        // remote merges continue — replication must not
+                        // wedge on this node's disk.
+                        if merged {
+                            if let Some(ctx) = loop_persist_ctx.as_ref() {
+                                let _ = persist_snapshot(&store, ctx).await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -204,6 +323,7 @@ impl KvStoreSync {
         // sender is the claimed owner itself (see KvSyncMessage docs).
         let mut sync_sub = self.pubsub.subscribe(self.state_sync_topic()).await;
         let responder_store = Arc::clone(&self.store);
+        let responder_persist_ctx = persist_ctx.clone();
         let responder_pubsub = Arc::clone(&self.pubsub);
         let responder_topic = self.topic.clone();
         let sync_topic = self.state_sync_topic();
@@ -292,25 +412,39 @@ impl KvStoreSync {
                         if local_agent_id.is_some_and(|me| me == sender) {
                             continue; // our own announce echoed back
                         }
-                        let mut s = responder_store.write().await;
-                        // learn_ownership can only refresh policy (when the
-                        // owner matches and policy_version is forward) or
-                        // record a conflict; it never establishes ownership.
-                        match s.learn_ownership(owner, policy, policy_version, &sender) {
-                            Ok(()) => {
-                                tracing::info!(
-                                    "KvStore {} processed owner announce from {} (policy {}, version {})",
-                                    s.id(),
-                                    hex::encode(owner.as_bytes()),
-                                    s.policy(),
-                                    s.policy_version()
-                                );
+                        let learned = {
+                            let mut s = responder_store.write().await;
+                            // learn_ownership can only refresh policy (when the
+                            // owner matches and policy_version is forward) or
+                            // record a conflict; it never establishes ownership.
+                            // AppendOnly is terminal: a downgrade announce is
+                            // rejected inside learn_ownership regardless of
+                            // policy_version.
+                            match s.learn_ownership(owner, policy, policy_version, &sender) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "KvStore {} processed owner announce from {} (policy {}, version {})",
+                                        s.id(),
+                                        hex::encode(owner.as_bytes()),
+                                        s.policy(),
+                                        s.policy_version()
+                                    );
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "rejected KvStore ownership announcement from {}: {e}",
+                                        hex::encode(sender.as_bytes())
+                                    );
+                                    false
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "rejected KvStore ownership announcement from {}: {e}",
-                                    hex::encode(sender.as_bytes())
-                                );
+                        };
+                        // A policy refresh mutates durable state — persist it
+                        // (outside the write guard).
+                        if learned {
+                            if let Some(ctx) = responder_persist_ctx.as_ref() {
+                                let _ = persist_snapshot(&responder_store, ctx).await;
                             }
                         }
                     }
@@ -391,6 +525,159 @@ impl KvStoreSync {
     }
 }
 
+/// Monotonic counter for unique snapshot temp-file names — concurrent
+/// persists (receive loop vs. local write) must never clobber each other's
+/// temp file mid-rename.
+static SNAPSHOT_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Magic prefix of the v1 snapshot file format.
+///
+/// Format: `MAGIC(8) || bincode(SnapshotBody { store, seq_counter })`.
+/// The envelope exists so the OR-Set sequence-counter ceiling (which is
+/// `serde(skip)` on `KvStore` for wire/legacy-layout reasons) survives a
+/// restart exactly. The format is introduced unreleased — no shipped binary
+/// ever wrote a bare-`KvStore` snapshot — so there is no compat read path:
+/// a file without the magic is rejected (fail closed) rather than guessed at.
+const SNAPSHOT_MAGIC: &[u8; 8] = b"X0XKVS1\0";
+
+/// Owned snapshot body (decode side).
+#[derive(Deserialize)]
+struct SnapshotBody {
+    store: KvStore,
+    seq_counter: u64,
+}
+
+/// Borrowing snapshot body (encode side — avoids cloning the store).
+#[derive(Serialize)]
+struct SnapshotBodyRef<'a> {
+    store: &'a KvStore,
+    seq_counter: u64,
+}
+
+/// Encode a store into v1 snapshot bytes (magic + body).
+fn encode_snapshot(store: &KvStore) -> Result<Vec<u8>> {
+    let body = SnapshotBodyRef {
+        store,
+        seq_counter: store.seq_counter_value(),
+    };
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(SNAPSHOT_MAGIC);
+    out.extend_from_slice(&bincode::serialize(&body)?);
+    Ok(out)
+}
+
+/// Snapshot the store to the persistence context's path.
+///
+/// Serialized per store via `ctx.gate`: `(version, bytes)` are captured
+/// under the gate, so commit order equals capture order and a slow persist
+/// can never rename an older snapshot over a newer one; the recorded
+/// last-persisted version additionally skips writes that would not advance
+/// durable state. Success clears the degraded flag; failure sets it and is
+/// error-logged here (callers decide whether to propagate — local writes
+/// must, remote merges must not).
+///
+/// # Errors
+///
+/// Serialization or I/O failure writing the snapshot.
+async fn persist_snapshot(store: &Arc<RwLock<KvStore>>, ctx: &PersistCtx) -> Result<()> {
+    let result = async {
+        let mut last = ctx.gate.lock().await;
+        let (version, bytes) = {
+            let s = store.read().await;
+            (s.current_version(), encode_snapshot(&s)?)
+        };
+        if last.is_some_and(|l| l >= version) {
+            // Durable state already at (or beyond) this version.
+            return Ok(());
+        }
+        write_snapshot_atomic(&ctx.path, &bytes)?;
+        *last = Some(version);
+        Ok(())
+    }
+    .await;
+    ctx.degraded
+        .store(result.is_err(), std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = &result {
+        tracing::error!(
+            "kv snapshot persist failed for {}: {e} — store is durability-degraded; \
+             local writes are refused until a snapshot succeeds",
+            ctx.path.display()
+        );
+    }
+    result
+}
+
+/// Durable atomic file write: unique temp file in the same directory,
+/// fsync, rename over the destination, then (Unix) fsync the parent
+/// directory so the rename itself survives power loss.
+///
+/// Platform note: on non-Unix targets the parent-directory fsync is skipped
+/// (std cannot fsync a directory handle there); the rename is still atomic,
+/// but its durability across power loss is not guaranteed. SIGKILL/power
+/// loss beyond the parent fsync (e.g. hardware write caches) is out of
+/// scope.
+fn write_snapshot_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let n = SNAPSHOT_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Load a previously persisted store snapshot from `path`.
+///
+/// Returns:
+/// - `Ok(Some(store))` — snapshot present and valid.
+/// - `Ok(None)` — no snapshot at `path` (first run).
+/// - `Err(_)` — snapshot present but unreadable, undecodable, or not in the
+///   v1 format. Callers MUST fail closed on this (refuse to start an empty
+///   replica over a corrupt snapshot): silently discarding it would reopen
+///   the restart-amnesia window (an `AppendOnly` owner that forgets its keys
+///   will re-accept rewrites of them).
+///
+/// The restored store's in-memory `seq_counter` is set to the persisted
+/// counter (floored by `version` as defense in depth), so freshly minted
+/// OR-Set `(peer, seq)` tags can never collide with tags issued before the
+/// restart — including the extra per-put delta tag minted by
+/// `KvStoreHandle::put_with_delta`.
+///
+/// # Errors
+///
+/// [`crate::kv::KvError::Io`]/[`crate::kv::KvError::Serialization`] as above.
+pub fn load_snapshot(path: &Path) -> Result<Option<KvStore>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(body_bytes) = bytes.strip_prefix(SNAPSHOT_MAGIC.as_slice()) else {
+        return Err(std::io::Error::other(
+            "unrecognized kv snapshot format (missing v1 magic) — corrupt or foreign file; \
+             refusing to start with amnesia",
+        )
+        .into());
+    };
+    let body: SnapshotBody = bincode::deserialize(body_bytes)?;
+    let store = body.store;
+    store.restore_seq_counter(body.seq_counter.max(store.current_version()));
+    Ok(Some(store))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +697,85 @@ mod tests {
 
     fn store_id(n: u8) -> KvStoreId {
         KvStoreId::new([n; 32])
+    }
+
+    #[test]
+    fn snapshot_roundtrip_missing_and_corrupt() {
+        // WHY: snapshot restore is what makes AppendOnly immutability
+        // survive a restart. Missing file = clean first run (Ok(None));
+        // a valid snapshot must round-trip policy, entries, and the
+        // checkpoint high-water mark; a corrupt file must be an Err so
+        // callers FAIL CLOSED instead of silently starting empty (amnesia).
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("kv").join("snap.bin");
+
+        assert!(
+            matches!(load_snapshot(&path), Ok(None)),
+            "missing snapshot is a clean first run"
+        );
+
+        let mut store = KvStore::new(
+            store_id(7),
+            "log".to_string(),
+            agent(1),
+            AccessPolicy::AppendOnly,
+        );
+        store
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        store.highest_checkpoint_seq = 5;
+        // Simulate the handle-layer double seq mint: the counter can run
+        // ahead of `version`. The persisted counter — not a version-derived
+        // floor — must be the restore ceiling.
+        let _ = store.next_seq();
+        let _ = store.next_seq();
+        let counter_before = store.seq_counter_value();
+        let bytes = encode_snapshot(&store).expect("encode");
+        write_snapshot_atomic(&path, &bytes).expect("atomic write");
+
+        let restored = load_snapshot(&path)
+            .expect("load ok")
+            .expect("snapshot present");
+        assert_eq!(*restored.policy(), AccessPolicy::AppendOnly);
+        assert_eq!(
+            restored.get("k1").map(|e| e.value.clone()),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(restored.highest_checkpoint_seq, 5);
+        // Exact tag ceiling restored: the next minted seq is strictly above
+        // every pre-restart seq (no OR-Set (peer, seq) tag reuse).
+        assert!(
+            restored.next_seq() > counter_before,
+            "restored seq counter must exceed every pre-restart seq"
+        );
+
+        // A file without the v1 magic (e.g. a bare-bincode or foreign file)
+        // fails closed.
+        std::fs::write(&path, bincode::serialize(&store).expect("serialize")).expect("write bare");
+        assert!(
+            load_snapshot(&path).is_err(),
+            "missing-magic snapshot must be an error (fail closed)"
+        );
+
+        std::fs::write(&path, b"not a snapshot").expect("corrupt");
+        assert!(
+            load_snapshot(&path).is_err(),
+            "corrupt snapshot must be an error (fail closed), not a silent fresh start"
+        );
+
+        // Truncated/garbage body AFTER a valid magic also fails closed.
+        let mut evil = SNAPSHOT_MAGIC.to_vec();
+        evil.extend_from_slice(b"\x01\x02\x03");
+        std::fs::write(&path, evil).expect("write garbage body");
+        assert!(
+            load_snapshot(&path).is_err(),
+            "garbage body must be an error (fail closed)"
+        );
     }
 
     /// Construct an isolated network node (mirrors the helper in

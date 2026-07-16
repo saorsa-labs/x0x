@@ -434,6 +434,30 @@ pub(super) async fn handle_reservation(state: &AppState, kind: &str, id: &str) -
 /// Parse a hex-encoded `AgentId` (64 hex chars → 32 bytes) from a manifest
 /// `expected_owner` field. Returns `None` if the value is not valid hex or not
 /// exactly 32 bytes — the caller treats that as migration-required.
+/// Resolve the persisted access policy from a manifest entry's `extra` map.
+///
+/// - `"append_only"` → `AppendOnly`; `"signed"` → `Signed`.
+/// - Absent key → `Signed` (legacy entries predate the policy field and were
+///   all created Signed — this is a documented compatibility default, not a
+///   downgrade).
+/// - Present but unrecognized → `None`: the caller must FAIL CLOSED (skip the
+///   rehydration loudly). Mapping garbage to `Signed` would silently strip a
+///   possibly-append-only store of its immutability.
+fn manifest_policy(
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Option<crate::kv::AccessPolicy> {
+    match extra.get("policy") {
+        None => Some(crate::kv::AccessPolicy::Signed),
+        Some(serde_json::Value::String(s)) if s == "signed" => {
+            Some(crate::kv::AccessPolicy::Signed)
+        }
+        Some(serde_json::Value::String(s)) if s == "append_only" => {
+            Some(crate::kv::AccessPolicy::AppendOnly)
+        }
+        Some(_) => None,
+    }
+}
+
 fn parse_owner_hex(hex_str: &str) -> Option<crate::identity::AgentId> {
     let bytes = hex::decode(hex_str).ok()?;
     if bytes.len() == crate::identity::PEER_ID_LENGTH {
@@ -592,14 +616,43 @@ async fn rehydrate_one(state: Arc<AppState>, entry: CrdtSubscriptionEntry) -> Re
                     };
                     state
                         .agent
-                        .join_kv_store(
+                        .join_kv_store_persistent(
                             &entry.topic,
                             owner,
                             crate::kv::store::AnchorChannel::Persistence,
+                            &state.kv_store_state_dir,
                         )
                         .await
                 }
-                ROLE_CREATED => state.agent.create_kv_store(&entry.name, &entry.topic).await,
+                ROLE_CREATED => {
+                    // Restore the persisted policy: an append-only store must
+                    // never rehydrate as plain Signed (that would silently
+                    // drop its immutability guarantees). A malformed policy
+                    // string FAILS CLOSED (skip loudly) — defaulting it to
+                    // Signed would be a silent downgrade. The state snapshot
+                    // (restored inside create_kv_store_persistent) is the
+                    // final authority and itself fails closed on conflicts.
+                    let policy = match manifest_policy(&entry.extra) {
+                        Some(policy) => policy,
+                        None => {
+                            tracing::warn!(
+                                id = %entry.id,
+                                "stored kv-store policy is malformed; \
+                                 skipping rehydration (migration_required)"
+                            );
+                            return RehydrateOutcome::Skipped;
+                        }
+                    };
+                    state
+                        .agent
+                        .create_kv_store_persistent(
+                            &entry.name,
+                            &entry.topic,
+                            policy,
+                            &state.kv_store_state_dir,
+                        )
+                        .await
+                }
                 other => {
                     tracing::warn!(
                         id = %entry.id,
@@ -642,6 +695,40 @@ async fn rehydrate_one(state: Arc<AppState>, entry: CrdtSubscriptionEntry) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_policy_parses_and_fails_closed() {
+        // WHY: a malformed policy string must NEVER silently become Signed —
+        // that would strip a possibly-append-only store of its immutability
+        // on restart. Absent = legacy Signed (compat default); garbage =
+        // None (caller skips loudly).
+        let mut extra = serde_json::Map::new();
+        assert_eq!(
+            manifest_policy(&extra),
+            Some(crate::kv::AccessPolicy::Signed),
+            "legacy entry without a policy field is Signed"
+        );
+        extra.insert("policy".into(), serde_json::Value::String("signed".into()));
+        assert_eq!(
+            manifest_policy(&extra),
+            Some(crate::kv::AccessPolicy::Signed)
+        );
+        extra.insert(
+            "policy".into(),
+            serde_json::Value::String("append_only".into()),
+        );
+        assert_eq!(
+            manifest_policy(&extra),
+            Some(crate::kv::AccessPolicy::AppendOnly)
+        );
+        extra.insert(
+            "policy".into(),
+            serde_json::Value::String("immutable".into()),
+        );
+        assert_eq!(manifest_policy(&extra), None, "garbage fails closed");
+        extra.insert("policy".into(), serde_json::Value::Bool(true));
+        assert_eq!(manifest_policy(&extra), None, "non-string fails closed");
+    }
 
     fn entry(kind: &str, id: &str, role: &str) -> CrdtSubscriptionEntry {
         CrdtSubscriptionEntry {

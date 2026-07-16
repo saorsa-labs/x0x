@@ -10656,42 +10656,113 @@ impl Agent {
     ///
     /// Returns an error if the gossip runtime is not initialized.
     pub async fn create_kv_store(&self, name: &str, topic: &str) -> error::Result<KvStoreHandle> {
-        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
-            error::IdentityError::Storage(std::io::Error::other(
-                "gossip runtime not initialized - configure agent with network first",
-            ))
-        })?;
-
-        let peer_id = runtime.peer_id();
-        let store_id = kv::KvStoreId::for_topic_owner(topic, &self.agent_id());
-        let store = kv::KvStore::new(
-            store_id,
-            name.to_string(),
-            self.agent_id(),
-            kv::AccessPolicy::Signed,
-        );
-
-        let sync = kv::KvStoreSync::new(
-            store,
-            std::sync::Arc::clone(runtime.pubsub()),
-            topic.to_string(),
-            peer_id,
-            Some(self.agent_id()),
-        )
-        .map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "kv store sync creation failed: {e}",
-            )))
-        })?;
-
-        let sync = std::sync::Arc::new(sync);
-        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
+        self.create_kv_store_with_policy(name, topic, kv::AccessPolicy::Signed)
             .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "kv store sync start failed: {e}",
-                )))
-            })?;
+    }
+
+    /// Create a new key-value store with an explicit access policy.
+    ///
+    /// Like [`create_kv_store`](Self::create_kv_store) (which uses
+    /// [`kv::AccessPolicy::Signed`]), but lets the creator choose the policy —
+    /// e.g. [`kv::AccessPolicy::AppendOnly`] for tamper-evident event logs
+    /// whose existing keys are immutable even to the owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized.
+    pub async fn create_kv_store_with_policy(
+        &self,
+        name: &str,
+        topic: &str,
+        policy: kv::AccessPolicy,
+    ) -> error::Result<KvStoreHandle> {
+        self.create_kv_store_inner(name, topic, policy, None).await
+    }
+
+    /// Create (or restore) a key-value store with an on-disk state snapshot.
+    ///
+    /// Like [`create_kv_store_with_policy`](Self::create_kv_store_with_policy)
+    /// but the full store state (policy, keyset, entry contents, latest
+    /// adopted checkpoint, and the checkpoint high-water mark) is snapshotted
+    /// to `state_dir/<store-id-hex>.bin` after every mutation and restored
+    /// here on restart — BEFORE any network or local write is accepted. This
+    /// closes the restart-amnesia hole for [`kv::AccessPolicy::AppendOnly`]:
+    /// an owner that forgot its keys would otherwise re-accept (and re-sign)
+    /// rewrites of them.
+    ///
+    /// # Errors
+    ///
+    /// - Gossip runtime not initialized.
+    /// - A snapshot exists but is corrupt/undecodable, belongs to a different
+    ///   store, is owned by a different agent, or its policy conflicts with
+    ///   `policy` (requesting `AppendOnly` over a non-`AppendOnly` snapshot).
+    ///   All of these FAIL CLOSED — silently starting empty would reopen the
+    ///   amnesia window.
+    pub async fn create_kv_store_persistent(
+        &self,
+        name: &str,
+        topic: &str,
+        policy: kv::AccessPolicy,
+        state_dir: &std::path::Path,
+    ) -> error::Result<KvStoreHandle> {
+        self.create_kv_store_inner(name, topic, policy, Some(state_dir))
+            .await
+    }
+
+    async fn create_kv_store_inner(
+        &self,
+        name: &str,
+        topic: &str,
+        policy: kv::AccessPolicy,
+        state_dir: Option<&std::path::Path>,
+    ) -> error::Result<KvStoreHandle> {
+        let store_id = kv::KvStoreId::for_topic_owner(topic, &self.agent_id());
+        let persist_path = state_dir.map(|d| kv_snapshot_path(d, &store_id));
+        let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
+            Some(Ok(Some(snap))) => {
+                if snap.id() != &store_id {
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot store-id mismatch for topic {topic}"
+                    )));
+                }
+                if snap.owner() != Some(&self.agent_id()) {
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot for topic {topic} is owned by a different agent"
+                    )));
+                }
+                if matches!(policy, kv::AccessPolicy::AppendOnly)
+                    && !matches!(snap.policy(), kv::AccessPolicy::AppendOnly)
+                {
+                    // The registration says append-only but the snapshot says
+                    // otherwise: tamper or corruption. Fail closed rather
+                    // than silently downgrading immutability.
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot for topic {topic} is not append_only but the store was registered append_only; refusing to downgrade"
+                    )));
+                }
+                if matches!(snap.policy(), kv::AccessPolicy::AppendOnly)
+                    && !matches!(policy, kv::AccessPolicy::AppendOnly)
+                {
+                    // AppendOnly is terminal: the snapshot's knowledge wins.
+                    tracing::warn!(
+                        "kv store {topic}: snapshot policy is terminal append_only; ignoring requested policy {policy}"
+                    );
+                }
+                snap
+            }
+            Some(Ok(None)) | None => {
+                kv::KvStore::new(store_id, name.to_string(), self.agent_id(), policy)
+            }
+            Some(Err(e)) => {
+                // Corrupt snapshot: fail closed, loudly. Starting an empty
+                // replica here would silently discard append-only history.
+                return Err(kv_storage_err(format!(
+                    "kv snapshot for topic {topic} is unreadable ({e}); refusing to start with amnesia — repair or remove the snapshot file explicitly"
+                )));
+            }
+        };
+
+        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
 
         // The creator is the owner: capture signing material so each write
         // produces an owner-signed content checkpoint (cold-recovery provenance).
@@ -10705,6 +10776,51 @@ impl Agent {
                 secret_key_bytes: sk_bytes,
             })),
         })
+    }
+
+    /// Construct, arm persistence for, and start a `KvStoreSync`.
+    async fn spawn_kv_sync(
+        &self,
+        store: kv::KvStore,
+        topic: &str,
+        persist_path: Option<std::path::PathBuf>,
+    ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        let peer_id = runtime.peer_id();
+        let sync = kv::KvStoreSync::new(
+            store,
+            std::sync::Arc::clone(runtime.pubsub()),
+            topic.to_string(),
+            peer_id,
+            Some(self.agent_id()),
+        )
+        .map_err(|e| kv_storage_err(format!("kv store sync creation failed: {e}")))?;
+        // Arm persistence BEFORE start so no merged delta can land
+        // unpersisted, and write an initial snapshot so the file exists from
+        // the first moment the store does.
+        let persistent = persist_path.is_some();
+        if let Some(path) = persist_path {
+            sync.set_persist_path(path);
+        }
+        let sync = std::sync::Arc::new(sync);
+        if persistent {
+            // Fail closed at registration: refuse to run a "persistent"
+            // store whose snapshot cannot even be written once.
+            sync.persist().await.map_err(|e| {
+                kv_storage_err(format!(
+                    "kv store snapshot dir is not writable ({e}); refusing to start a \
+                     persistent store without durability"
+                ))
+            })?;
+        }
+        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
+            .await
+            .map_err(|e| kv_storage_err(format!("kv store sync start failed: {e}")))?;
+        Ok((sync, peer_id))
     }
 
     /// Join an existing key-value store by topic, anchoring ownership on the
@@ -10732,39 +10848,73 @@ impl Agent {
         owner: identity::AgentId,
         channel: kv::store::AnchorChannel,
     ) -> error::Result<KvStoreHandle> {
-        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
-            error::IdentityError::Storage(std::io::Error::other(
-                "gossip runtime not initialized - configure agent with network first",
-            ))
-        })?;
+        self.join_kv_store_inner(topic, owner, channel, None).await
+    }
 
-        let peer_id = runtime.peer_id();
+    /// Join (or restore) a key-value store replica with an on-disk snapshot.
+    ///
+    /// Like [`join_kv_store`](Self::join_kv_store) but the replica's full
+    /// state — including a learned `AppendOnly` policy, the keyset, entry
+    /// contents, and the checkpoint high-water mark — is snapshotted to
+    /// `state_dir/<store-id-hex>.bin` and restored here on restart, BEFORE
+    /// any delta is merged. Without this, a restarted joiner comes back as an
+    /// empty `Signed` replica and cannot detect an owner rewriting keys it
+    /// used to hold.
+    ///
+    /// # Errors
+    ///
+    /// As [`join_kv_store`](Self::join_kv_store), plus fail-closed snapshot
+    /// errors (corrupt file, store-id mismatch, or an anchored owner in the
+    /// snapshot that differs from `owner`).
+    pub async fn join_kv_store_persistent(
+        &self,
+        topic: &str,
+        owner: identity::AgentId,
+        channel: kv::store::AnchorChannel,
+        state_dir: &std::path::Path,
+    ) -> error::Result<KvStoreHandle> {
+        self.join_kv_store_inner(topic, owner, channel, Some(state_dir))
+            .await
+    }
+
+    async fn join_kv_store_inner(
+        &self,
+        topic: &str,
+        owner: identity::AgentId,
+        channel: kv::store::AnchorChannel,
+        state_dir: Option<&std::path::Path>,
+    ) -> error::Result<KvStoreHandle> {
         // The store id is the verifiable topic→owner binding; it agrees with
         // the creator's id (both derive for_topic_owner(topic, owner)).
         let store_id = kv::KvStoreId::for_topic_owner(topic, &owner);
-        let store = kv::KvStore::new_replica(store_id, String::new(), Some(owner), channel);
+        let persist_path = state_dir.map(|d| kv_snapshot_path(d, &store_id));
+        let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
+            Some(Ok(Some(snap))) => {
+                if snap.id() != &store_id {
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot store-id mismatch for topic {topic}"
+                    )));
+                }
+                if snap.owner() != Some(&owner) {
+                    // The snapshot is anchored on a different owner than the
+                    // caller supplied: identity confusion. Fail closed.
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot for topic {topic} is anchored on a different owner"
+                    )));
+                }
+                snap
+            }
+            Some(Ok(None)) | None => {
+                kv::KvStore::new_replica(store_id, String::new(), Some(owner), channel)
+            }
+            Some(Err(e)) => {
+                return Err(kv_storage_err(format!(
+                    "kv snapshot for topic {topic} is unreadable ({e}); refusing to start with amnesia — repair or remove the snapshot file explicitly"
+                )));
+            }
+        };
 
-        let sync = kv::KvStoreSync::new(
-            store,
-            std::sync::Arc::clone(runtime.pubsub()),
-            topic.to_string(),
-            peer_id,
-            Some(self.agent_id()),
-        )
-        .map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "kv store sync creation failed: {e}",
-            )))
-        })?;
-
-        let sync = std::sync::Arc::new(sync);
-        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
-            .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "kv store sync start failed: {e}",
-                )))
-            })?;
+        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
 
         Ok(KvStoreHandle {
             sync,
@@ -10775,6 +10925,16 @@ impl Agent {
             owner_signing: None,
         })
     }
+}
+
+/// Snapshot file path for a store: `<dir>/<store-id-hex>.bin`.
+fn kv_snapshot_path(dir: &std::path::Path, id: &kv::KvStoreId) -> std::path::PathBuf {
+    dir.join(format!("{}.bin", hex::encode(id.as_bytes())))
+}
+
+/// Shorthand for the storage-flavoured [`error::IdentityError`].
+fn kv_storage_err(msg: String) -> error::IdentityError {
+    error::IdentityError::Storage(std::io::Error::other(msg))
 }
 
 /// Handle for interacting with a replicated key-value store.
@@ -10845,6 +11005,7 @@ impl KvStoreHandle {
             policy_version: s.policy_version(),
             ownership_status: status,
             announced_owner: announced,
+            durability_degraded: self.sync.durability_degraded(),
         }
     }
 
@@ -10939,9 +11100,20 @@ impl KvStoreHandle {
         value: Vec<u8>,
         content_type: String,
     ) -> error::Result<kv::KvStoreDelta> {
+        // Durability gate: while the store is durability-degraded (a prior
+        // snapshot write failed), refuse NEW local mutations until a retry
+        // persist of the current state succeeds — otherwise unpersisted
+        // writes pile up behind a dead disk.
+        self.sync.ensure_durable().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "kv store durability degraded: snapshot persistence failing ({e}); \
+                 local writes refused until a snapshot succeeds"
+            )))
+        })?;
         let delta = {
             let mut store = self.sync.write().await;
             Self::check_local_write(&store, &self.agent_id)?;
+            let version_before = store.current_version();
             store
                 .put(
                     key.clone(),
@@ -10949,15 +11121,43 @@ impl KvStoreHandle {
                     content_type.clone(),
                     self.peer_id,
                 )
-                .map_err(|e| {
-                    error::IdentityError::Storage(std::io::Error::other(format!(
-                        "kv put failed: {e}",
-                    )))
+                .map_err(|e| match e {
+                    // AppendOnly immutability violation — surfaced distinctly
+                    // so the API layer can map it to HTTP 409 Conflict.
+                    kv::KvError::ImmutableKey(k) => error::IdentityError::ImmutableKey(k),
+                    other => error::IdentityError::Storage(std::io::Error::other(format!(
+                        "kv put failed: {other}",
+                    ))),
                 })?;
+            // An AppendOnly idempotent re-put is a TRUE no-op: the store
+            // version did not move, so produce no checkpoint (the sequence
+            // must not advance for a non-mutation), publish nothing, and
+            // persist nothing. Retries stay observationally silent.
+            if store.current_version() == version_before {
+                return Ok(kv::KvStoreDelta::new(version_before));
+            }
             let entry = store.get(&key).cloned();
             let version = store.current_version();
             let mut delta = match entry {
                 Some(e) => {
+                    // NOTE: this next_seq() is the SECOND seq minted for this
+                    // put (KvStore::put minted one for the local OR-Set tag),
+                    // so the published delta tag differs from the local tag.
+                    // That divergence is benign, precisely because of how the
+                    // two remove paths treat tags: a LOCAL remove
+                    // (KvStore::remove) calls OrSet::remove, which tombstones
+                    // every tag the local set has OBSERVED for the key
+                    // (observed-remove — tags ARE consulted there, but only
+                    // locally-observed ones, which always include the local
+                    // tag); the WIRE remove path (merge_delta's `removed`
+                    // loop) is key-scoped — receivers remove by key and never
+                    // consult the delta's tag sets — so a receiver drops its
+                    // divergent tag too. Neither side can strand or resurrect
+                    // a key on account of the mismatch. The snapshot persists
+                    // the real counter, so neither tag can ever be re-minted
+                    // after a restart. Deliberately not "fixed": returning
+                    // the tag from KvStore::put would change its public
+                    // signature for no behavioral gain.
                     kv::KvStoreDelta::for_put(key, e, (self.peer_id, store.next_seq()), version)
                 }
                 None => {
@@ -10976,6 +11176,20 @@ impl KvStoreHandle {
             }
             delta
         };
+        // Durability before announcement: persist the committed mutation and
+        // DO NOT publish if the snapshot fails — announcing state the disk
+        // never saw is how an owner ends up re-signing rewritten history
+        // after a crash. The in-memory mutation stays applied (CRDT state
+        // cannot be safely unwound); the caller sees the error, the store is
+        // flagged degraded, and further local writes are refused until a
+        // persist succeeds. Anti-entropy re-publishes the state later once
+        // durable.
+        self.sync.persist().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "kv write applied locally but snapshot persistence FAILED ({e}); \
+                 delta not published; store is durability-degraded"
+            )))
+        })?;
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv put delta: {e}");
         }
@@ -11020,13 +11234,23 @@ impl KvStoreHandle {
     /// [`error::IdentityError::Unauthorized`] if this agent is not permitted
     /// to write under the store's access policy.
     pub async fn remove_with_delta(&self, key: &str) -> error::Result<kv::KvStoreDelta> {
+        // Durability gate — see put_with_delta.
+        self.sync.ensure_durable().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "kv store durability degraded: snapshot persistence failing ({e}); \
+                 local writes refused until a snapshot succeeds"
+            )))
+        })?;
         let delta = {
             let mut store = self.sync.write().await;
             Self::check_local_write(&store, &self.agent_id)?;
-            store.remove(key).map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "kv remove failed: {e}",
-                )))
+            store.remove(key).map_err(|e| match e {
+                // AppendOnly immutability violation — surfaced distinctly
+                // so the API layer can map it to HTTP 409 Conflict.
+                kv::KvError::ImmutableKey(k) => error::IdentityError::ImmutableKey(k),
+                other => error::IdentityError::Storage(std::io::Error::other(format!(
+                    "kv remove failed: {other}",
+                ))),
             })?;
             let mut d = kv::KvStoreDelta::new(store.current_version());
             d.removed
@@ -11040,6 +11264,13 @@ impl KvStoreHandle {
             }
             d
         };
+        // Durability before announcement — see put_with_delta.
+        self.sync.persist().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "kv remove applied locally but snapshot persistence FAILED ({e}); \
+                 delta not published; store is durability-degraded"
+            )))
+        })?;
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv remove delta: {e}");
         }
@@ -11057,14 +11288,23 @@ impl KvStoreHandle {
         delta: &kv::KvStoreDelta,
         writer: Option<identity::AgentId>,
     ) -> error::Result<()> {
-        let mut store = self.sync.write().await;
-        store
-            .merge_delta(delta, peer_id, writer.as_ref())
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "kv direct delta merge failed: {e}",
-                )))
-            })
+        {
+            let mut store = self.sync.write().await;
+            store
+                .merge_delta(delta, peer_id, writer.as_ref())
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "kv direct delta merge failed: {e}",
+                    )))
+                })?;
+        }
+        // Direct-delivery deltas mutate state just like the gossip receive
+        // loop — persist with the same semantics (an attacker who can steer
+        // deltas onto this side channel must not gain an unpersisted-merge
+        // window). Remote-path failure degrades durability (persist logs and
+        // flags it) but does not wedge replication.
+        let _ = self.sync.persist().await;
+        Ok(())
     }
 
     /// List all active keys in the store.
@@ -11128,7 +11368,8 @@ pub struct KvStoreOwnershipInfo {
     /// Hex-encoded anchored owner, or `None` when no owner is anchored
     /// (read-only by design).
     pub owner: Option<String>,
-    /// Access policy (`"signed"` / `"allowlisted"` / `"encrypted"`).
+    /// Access policy (`"signed"` / `"allowlisted"` / `"encrypted"` /
+    /// `"append_only"`).
     pub policy: String,
     /// Store version (monotonic, bumped on every mutation).
     pub version: u64,
@@ -11139,6 +11380,11 @@ pub struct KvStoreOwnershipInfo {
     pub ownership_status: kv::OwnershipStatus,
     /// Hex-encoded owner claimed by a rejected announce (`conflict` only).
     pub announced_owner: Option<String>,
+    /// True while the last state-snapshot write failed and no retry has
+    /// succeeded. Local writes are refused in this state (fail-closed);
+    /// remote replication continues. Always `false` for non-persistent
+    /// stores.
+    pub durability_degraded: bool,
 }
 
 /// Read-only snapshot of a task's current state.
@@ -12086,6 +12332,510 @@ mod tests {
                 "a CRDT/KV sync task did not terminate after shutdown"
             );
         }
+    }
+
+    /// AppendOnly end-to-end at the handle layer: an idempotent re-put must
+    /// be a TRUE no-op (no checkpoint-sequence advance — a non-mutation must
+    /// not consume owner-signature freshness), and an owner restart restored
+    /// from the state snapshot must retain entries, the terminal append_only
+    /// policy, and the checkpoint high-water mark — otherwise the owner
+    /// forgets its keys and re-signs rewrites of them (the P0-C amnesia
+    /// attack).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_only_idempotent_seq_and_owner_restart_persistence() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let build_agent = || async {
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(loopback_network_config())
+                .build()
+                .await
+                .expect("agent")
+        };
+
+        let agent = build_agent().await;
+        let store = agent
+            .create_kv_store_persistent(
+                "log",
+                "ao-persist-topic",
+                kv::AccessPolicy::AppendOnly,
+                &state_dir,
+            )
+            .await
+            .expect("create persistent append_only store");
+
+        store
+            .put("k".to_string(), b"v1".to_vec(), "text/plain".to_string())
+            .await
+            .expect("first append");
+        assert_eq!(store.sync.read().await.highest_checkpoint_seq, 1);
+
+        // Idempotent re-put: checkpoint sequence must NOT advance.
+        store
+            .put("k".to_string(), b"v1".to_vec(), "text/plain".to_string())
+            .await
+            .expect("idempotent re-put accepted");
+        assert_eq!(
+            store.sync.read().await.highest_checkpoint_seq,
+            1,
+            "idempotent re-put must not advance the checkpoint sequence"
+        );
+
+        // Rewrite rejected with the distinct error the API maps to 409.
+        let err = store
+            .put("k".to_string(), b"v2".to_vec(), "text/plain".to_string())
+            .await
+            .expect_err("rewrite rejected");
+        assert!(matches!(err, error::IdentityError::ImmutableKey(_)));
+
+        store
+            .put("k2".to_string(), b"v2".to_vec(), "text/plain".to_string())
+            .await
+            .expect("second append");
+        assert_eq!(store.sync.read().await.highest_checkpoint_seq, 2);
+        agent.shutdown().await;
+
+        // Restart (same identity, same state dir). Request Signed on purpose:
+        // the snapshot's terminal append_only must win.
+        let agent2 = build_agent().await;
+        let restored = agent2
+            .create_kv_store_persistent(
+                "log",
+                "ao-persist-topic",
+                kv::AccessPolicy::Signed,
+                &state_dir,
+            )
+            .await
+            .expect("restore from snapshot");
+        {
+            let s = restored.sync.read().await;
+            assert_eq!(
+                *s.policy(),
+                kv::AccessPolicy::AppendOnly,
+                "snapshot's terminal append_only policy wins over the request"
+            );
+            assert_eq!(s.highest_checkpoint_seq, 2, "HWM survives restart");
+            assert!(s.get("k").is_some() && s.get("k2").is_some());
+            // OR-Set tag ceiling: each handle put mints TWO seqs (local tag +
+            // published delta tag) while version moves by one, so after two
+            // puts the counter is 4 with version 2. The snapshot must restore
+            // the REAL counter — the old version-derived floor (2) would let
+            // the restarted owner re-mint the already-published tags 3 and 4.
+            assert!(
+                s.seq_counter_value() >= 4,
+                "persisted seq-counter ceiling restored exactly (got {}, need >= 4)",
+                s.seq_counter_value()
+            );
+            assert!(
+                s.seq_counter_value() > s.current_version(),
+                "counter must exceed version (double mint per put) — a \
+                 version floor would reuse tags"
+            );
+        }
+        // The restarted owner still cannot rewrite its own history.
+        let err = restored
+            .put(
+                "k".to_string(),
+                b"REWRITE".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect_err("post-restart rewrite rejected");
+        assert!(matches!(err, error::IdentityError::ImmutableKey(_)));
+        agent2.shutdown().await;
+
+        // Fail-closed checks: corrupt snapshot and policy-conflict requests
+        // must refuse to start, never silently start empty.
+        let agent3 = build_agent().await;
+        let store_id = kv::KvStoreId::for_topic_owner("ao-persist-topic", &agent3.agent_id());
+        let snap_path = kv_snapshot_path(&state_dir, &store_id);
+        let good_bytes = std::fs::read(&snap_path).expect("snapshot exists");
+        std::fs::write(&snap_path, b"garbage").expect("corrupt");
+        assert!(
+            agent3
+                .create_kv_store_persistent(
+                    "log",
+                    "ao-persist-topic",
+                    kv::AccessPolicy::AppendOnly,
+                    &state_dir,
+                )
+                .await
+                .is_err(),
+            "corrupt snapshot must fail closed, not start empty"
+        );
+        std::fs::write(&snap_path, good_bytes).expect("restore snapshot");
+
+        // Requesting append_only over a Signed snapshot fails closed.
+        let signed_store = agent3
+            .create_kv_store_persistent(
+                "plain",
+                "signed-persist-topic",
+                kv::AccessPolicy::Signed,
+                &state_dir,
+            )
+            .await
+            .expect("create signed persistent store");
+        drop(signed_store);
+        assert!(
+            agent3
+                .create_kv_store_persistent(
+                    "plain",
+                    "signed-persist-topic",
+                    kv::AccessPolicy::AppendOnly,
+                    &state_dir,
+                )
+                .await
+                .is_err(),
+            "append_only requested over a Signed snapshot must fail closed"
+        );
+        agent3.shutdown().await;
+    }
+
+    /// Durability blockers (round-3 review): (1) the direct-delivery path
+    /// (`apply_remote_delta`, used by the daemon's delta side channel) must
+    /// persist like the gossip receive loop — otherwise an attacker who
+    /// suppresses gossip and feeds direct deltas gets an unpersisted-merge
+    /// window that a crash rolls back; (2) a concurrent mutation burst must
+    /// never leave the snapshot behind the store (commit order == capture
+    /// order under the persist gate).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_snapshot_covers_direct_delivery_and_concurrent_bursts() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+
+        // Source store produces an authorized (owner-signed identity) delta.
+        let src = agent
+            .create_kv_store_persistent(
+                "src",
+                "dd-src-topic",
+                kv::AccessPolicy::AppendOnly,
+                &state_dir,
+            )
+            .await
+            .expect("create src");
+        let mut delta = src
+            .put_with_delta("k".to_string(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect("owner put");
+        // Strip the checkpoint (it is bound to the src store id) so the
+        // replica takes the plain sender-auth path.
+        delta.owner_checkpoint = None;
+
+        // Replica on a DIFFERENT topic + state dir, fed ONLY via the
+        // direct-delivery path — the gossip loop never sees this delta, so
+        // if the snapshot contains the key, apply_remote_delta persisted it.
+        let replica_dir = dir.path().join("kv-stores-replica");
+        let replica = agent
+            .join_kv_store_persistent(
+                "dd-replica-topic",
+                agent.agent_id(),
+                kv::store::AnchorChannel::RestParam,
+                &replica_dir,
+            )
+            .await
+            .expect("join replica");
+        replica
+            .apply_remote_delta(replica.peer_id(), &delta, Some(agent.agent_id()))
+            .await
+            .expect("direct delivery merge");
+        let replica_path = kv_snapshot_path(
+            &replica_dir,
+            &kv::KvStoreId::for_topic_owner("dd-replica-topic", &agent.agent_id()),
+        );
+        let snap = kv::sync::load_snapshot(&replica_path)
+            .expect("load replica snapshot")
+            .expect("replica snapshot present");
+        assert_eq!(
+            snap.get("k").map(|e| e.value.clone()),
+            Some(b"v".to_vec()),
+            "direct-delivery mutation must be persisted (no unpersisted-merge window)"
+        );
+
+        // Concurrent bursts: after every round the snapshot version must
+        // equal the store version — the serialized persist gate makes a
+        // regression (older snapshot renamed over newer) impossible.
+        let src_path = kv_snapshot_path(
+            &state_dir,
+            &kv::KvStoreId::for_topic_owner("dd-src-topic", &agent.agent_id()),
+        );
+        for round in 0..3u8 {
+            let mut tasks = Vec::new();
+            for i in 0..20u8 {
+                let s = src.clone();
+                tasks.push(tokio::spawn(async move {
+                    s.put(
+                        format!("burst-{round}-{i}"),
+                        vec![round, i],
+                        "application/octet-stream".to_string(),
+                    )
+                    .await
+                }));
+            }
+            for t in tasks {
+                t.await.expect("join").expect("burst put");
+            }
+            let store_version = src.sync.read().await.current_version();
+            let snap = kv::sync::load_snapshot(&src_path)
+                .expect("load src snapshot")
+                .expect("src snapshot present");
+            assert_eq!(
+                snap.current_version(),
+                store_version,
+                "round {round}: snapshot must not lag or regress the store version"
+            );
+        }
+        agent.shutdown().await;
+    }
+
+    /// Durability blocker (round-3 review): a failing snapshot write must
+    /// FAIL CLOSED on the local write path — error to the caller, no delta
+    /// published, store flagged durability-degraded, further local writes
+    /// refused BEFORE mutating — and recover cleanly once the disk heals.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_persist_failure_fails_closed_and_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+        let store = agent
+            .create_kv_store_persistent(
+                "degrade",
+                "degrade-topic",
+                kv::AccessPolicy::AppendOnly,
+                &state_dir,
+            )
+            .await
+            .expect("create");
+        store
+            .put("k1".to_string(), b"v1".to_vec(), "text/plain".to_string())
+            .await
+            .expect("healthy put");
+        assert!(!store.ownership_info().await.durability_degraded);
+
+        // Observe the store's main topic directly so publish suppression can
+        // be asserted, not merely inferred. (k1's delta was published before
+        // this subscription; the state-request/announce chatter uses the
+        // /state-sync side topic and cannot land here.)
+        let mut topic_sub = agent
+            .subscribe("degrade-topic")
+            .await
+            .expect("subscribe main topic");
+
+        // Break the disk: the snapshot dir becomes unwritable.
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod ro");
+
+        let err = store
+            .put("k2".to_string(), b"v2".to_vec(), "text/plain".to_string())
+            .await
+            .expect_err("persist failure must fail the local write");
+        assert!(
+            format!("{err}").contains("durability-degraded"),
+            "error names the durability failure; got: {err}"
+        );
+        assert!(
+            store.ownership_info().await.durability_degraded,
+            "degraded flag surfaced in store info"
+        );
+        // While degraded, the NEXT local write is refused before mutating.
+        let err = store
+            .put("k3".to_string(), b"v3".to_vec(), "text/plain".to_string())
+            .await
+            .expect_err("degraded store refuses further local writes");
+        assert!(
+            format!("{err}").contains("durability degraded"),
+            "gate error names degradation; got: {err}"
+        );
+        assert!(
+            store.get("k3").await.expect("read").is_none(),
+            "fail-closed BEFORE mutation: k3 must not exist even in memory"
+        );
+
+        // Publish suppression, asserted DIRECTLY: neither the failed k2 put
+        // nor the refused k3 put may have announced anything on the topic.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(800), topic_sub.recv())
+                .await
+                .is_err(),
+            "failed-persist local writes must not publish a delta (durability before announcement)"
+        );
+
+        // Degrade-not-wedge: REMOTE merges continue while degraded. The
+        // owner-authored delta applies (state converges) even though its
+        // persist attempt fails; the store stays degraded but replication is
+        // never refused.
+        let mut remote = kv::KvStoreDelta::new(50);
+        remote.added.insert(
+            "remote-k".to_string(),
+            (
+                kv::KvEntry::new(
+                    "remote-k".to_string(),
+                    b"rv".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (store.peer_id(), 999),
+            ),
+        );
+        store
+            .apply_remote_delta(store.peer_id(), &remote, Some(agent.agent_id()))
+            .await
+            .expect("remote merge must CONTINUE while durability-degraded");
+        assert!(
+            store.get("remote-k").await.expect("read").is_some(),
+            "remote delta applied while degraded"
+        );
+        assert!(
+            store.ownership_info().await.durability_degraded,
+            "still degraded after the remote merge (its persist also failed) — degraded, not wedged"
+        );
+
+        // Heal the disk: the retry persists the full pending state (k2 and
+        // remote-k included), clears the flag, and writes flow again.
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod rw");
+        store
+            .put("k4".to_string(), b"v4".to_vec(), "text/plain".to_string())
+            .await
+            .expect("recovered put");
+        assert!(!store.ownership_info().await.durability_degraded);
+
+        // Positive control for the suppression assert above: the recovered
+        // put DOES publish, proving the subscription observes this topic.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(15), topic_sub.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_some(),
+            "recovered put must publish its delta (subscription sees the topic)"
+        );
+        let snap_path = kv_snapshot_path(
+            &state_dir,
+            &kv::KvStoreId::for_topic_owner("degrade-topic", &agent.agent_id()),
+        );
+        let snap = kv::sync::load_snapshot(&snap_path)
+            .expect("load")
+            .expect("present");
+        for k in ["k1", "k2", "k4", "remote-k"] {
+            assert!(
+                snap.get(k).is_some(),
+                "recovered snapshot must contain {k} (k2/remote-k were applied in \
+                 memory while degraded and are captured by the recovery persist)"
+            );
+        }
+        assert!(snap.get("k3").is_none(), "refused write never existed");
+        agent.shutdown().await;
+    }
+
+    /// Nit-1 (round-3 review): the remove path has the identical durability
+    /// contract as put — a failed snapshot errors the remove (mutation stays
+    /// in memory), the NEXT remove is refused BEFORE mutating, and healing
+    /// the disk recovers the pending tombstone and clears the flag. Uses a
+    /// Signed store because AppendOnly rejects removes outright.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_remove_persist_failure_fails_closed_and_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+        let store = agent
+            .create_kv_store_persistent(
+                "rm-degrade",
+                "rm-degrade-topic",
+                kv::AccessPolicy::Signed,
+                &state_dir,
+            )
+            .await
+            .expect("create");
+        for k in ["k1", "k2", "k3"] {
+            store
+                .put(k.to_string(), b"v".to_vec(), "text/plain".to_string())
+                .await
+                .expect("seed put");
+        }
+
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod ro");
+
+        // Failing persist errors the remove; the tombstone is already in
+        // memory (mutation precedes persist, same as put).
+        let err = store
+            .remove("k1")
+            .await
+            .expect_err("persist failure must fail the local remove");
+        assert!(
+            format!("{err}").contains("durability-degraded"),
+            "error names the durability failure; got: {err}"
+        );
+        assert!(store.ownership_info().await.durability_degraded);
+        assert!(
+            store.get("k1").await.expect("read").is_none(),
+            "k1 tombstone applied in memory before the failed persist"
+        );
+
+        // While degraded, the NEXT remove is refused BEFORE mutating.
+        let err = store
+            .remove("k2")
+            .await
+            .expect_err("degraded store refuses further local removes");
+        assert!(
+            format!("{err}").contains("durability degraded"),
+            "gate error names degradation; got: {err}"
+        );
+        assert!(
+            store.get("k2").await.expect("read").is_some(),
+            "fail-closed BEFORE mutation: k2 still present"
+        );
+
+        // Heal: the retry persists the pending k1 tombstone, then the remove
+        // of k2 proceeds and the flag clears.
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod rw");
+        store.remove("k2").await.expect("recovered remove");
+        assert!(!store.ownership_info().await.durability_degraded);
+
+        let snap_path = kv_snapshot_path(
+            &state_dir,
+            &kv::KvStoreId::for_topic_owner("rm-degrade-topic", &agent.agent_id()),
+        );
+        let snap = kv::sync::load_snapshot(&snap_path)
+            .expect("load")
+            .expect("present");
+        assert!(snap.get("k1").is_none(), "pending tombstone recovered");
+        assert!(snap.get("k2").is_none(), "post-recovery remove persisted");
+        assert!(snap.get("k3").is_some(), "untouched key retained");
+        agent.shutdown().await;
     }
 
     /// P1 fence (restart-ABA): a fence token captured before an incarnation

@@ -79,6 +79,15 @@ pub enum KvError {
     /// stale/replayed policy refresh. The store state is unchanged.
     #[error("invalid ownership token: {0}")]
     OwnerTokenInvalid(String),
+
+    /// Write rejected by the `AppendOnly` policy: the key already exists and
+    /// existing keys are immutable — no update to different content, no
+    /// delete — even for the store owner. This is what makes append-only
+    /// event logs tamper-evident against their own author retroactively
+    /// rewriting history. (A re-put of byte-identical content is accepted as
+    /// an idempotent no-op and never raises this error.)
+    #[error("immutable key: {0} — append-only store; existing keys cannot be updated or deleted")]
+    ImmutableKey(String),
 }
 
 #[cfg(test)]
@@ -113,6 +122,15 @@ mod tests {
     fn test_error_display_gossip() {
         let error = KvError::Gossip("timeout".to_string());
         assert!(format!("{error}").contains("gossip error"));
+    }
+
+    #[test]
+    fn test_error_display_immutable_key() {
+        let error = KvError::ImmutableKey("evt-0001".to_string());
+        let display = format!("{error}");
+        assert!(display.contains("immutable key"));
+        assert!(display.contains("evt-0001"));
+        assert!(display.contains("append-only"));
     }
 
     #[test]
