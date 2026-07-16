@@ -1139,7 +1139,23 @@ pub async fn serve_with_options(
         dm_inbox_kv_store_delta_route_tx,
     )));
 
+    // Restart-amnesia fix: re-register every persisted task-list/kv-store
+    // subscription via the same Agent create/join paths the REST handlers
+    // use, so the topic subscription + empty-replica state-request happen
+    // and offline mutations arrive from peers.
+    //
+    // Runs CONCURRENTLY with join_network (issue #238): rehydration needs
+    // only the local gossip runtime, which exists at Agent build time —
+    // subscriptions register locally and the per-CRDT state-request tail
+    // keeps re-requesting until peers appear, so nothing here depends on
+    // the mesh being formed. Sequencing rehydration AFTER join_network
+    // wedged the daemon's OWN stores (restored from local snapshots, no
+    // network needed) behind an unreachable bootstrap peer's full dial
+    // schedule (~70s of "store not found").
     let crdt_rehydrate_state = Arc::clone(&state);
+    bg_tasks.push(tokio::spawn(async move {
+        crdt_subscriptions::rehydrate(crdt_rehydrate_state).await;
+    }));
     bg_tasks.push(tokio::spawn(async move {
         match join_agent.join_network().await {
             Ok(()) => {
@@ -1156,13 +1172,6 @@ pub async fn serve_with_options(
                 tracing::error!("Failed to join network: {e}");
             }
         }
-        // Restart-amnesia fix: re-register every persisted task-list/kv-store
-        // subscription via the same Agent create/join paths the REST handlers
-        // use, so the topic subscription + empty-replica state-request happen
-        // and offline mutations arrive from peers. Runs on BOTH join arms:
-        // even when join_network errors, the local gossip runtime exists and
-        // the subscription is what lets state recover once peers appear.
-        crdt_subscriptions::rehydrate(crdt_rehydrate_state).await;
     }));
 
     let self_published_release_manifests =

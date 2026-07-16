@@ -96,6 +96,9 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 profile-heap = ["dep:dhat"]
 
 [dev-dependencies]
+# `start_paused` virtual-clock tests for the state-request bootstrap tail
+# (issue #238) — multi-minute retry schedules run in milliseconds.
+tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 criterion = "0.5"

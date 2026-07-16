@@ -472,10 +472,13 @@ fn parse_owner_hex(hex_str: &str) -> Option<crate::identity::AgentId> {
 /// Rehydrate every persisted subscription by driving the same `Agent`
 /// create/join paths the REST handlers use.
 ///
-/// Runs after `join_network` returns so the gossip mesh is (re)forming; the
-/// per-CRDT empty-replica state-request retry schedule then recovers state —
-/// including mutations made while this daemon was offline — from peer
-/// replicas. A failed entry is logged (warn) and skipped, never fatal, and
+/// Runs concurrently with `join_network` (issue #238) — it must NOT wait for
+/// bootstrap: a daemon's own stores restore from local snapshots and joined
+/// stores only register subscriptions, so an unreachable bootstrap peer must
+/// never delay them. The per-CRDT state-request schedule (front burst plus a
+/// persistent while-empty tail) recovers state — including mutations made
+/// while this daemon was offline — from peer replicas whenever they become
+/// reachable. A failed entry is logged (warn) and skipped, never fatal, and
 /// stays in the manifest so the next restart retries it.
 ///
 /// Entries are rehydrated CONCURRENTLY (not sequentially) so that a slow or

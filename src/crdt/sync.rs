@@ -33,18 +33,29 @@ const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
 /// flooding.
 const STATE_REQUEST_RETRY_SECS: [u64; 4] = [1, 5, 15, 30];
 
-/// Persistent tail interval for the state-request bootstrap. After the
-/// aggressive front-loaded schedule exhausts (~51s), a first-time joiner
-/// whose list is STILL empty keeps asking at this interval so a slow mesh
-/// reformation — e.g. a post-restart rejoin while sibling CRDTs also recover
-/// — still converges. The loop self-terminates the moment the local list
-/// becomes non-empty.
-const STATE_REQUEST_TAIL_SECS: u64 = 30;
+/// First persistent-tail delay after the front-loaded schedule exhausts.
+const STATE_REQUEST_TAIL_START_SECS: u64 = 30;
 
-/// Hard cap on persistent-tail state requests so a genuinely-new (forever-
-/// empty) list stops after a bounded window instead of chattering
-/// indefinitely. 20 × 30s ≈ 10 min, ample for any realistic reformation.
-const STATE_REQUEST_MAX_TAIL_ATTEMPTS: usize = 20;
+/// Ceiling for the persistent tail's exponential backoff. While a list is
+/// still empty it keeps requesting at most this often — the steady-state
+/// cost is one ~50-byte side-topic message per list per 5 minutes.
+const STATE_REQUEST_TAIL_CAP_SECS: u64 = 300;
+
+/// The complete state-request delay schedule: the front-loaded burst, then
+/// an infinite exponential tail (30s doubling to a 300s ceiling).
+///
+/// Infinite BY DESIGN (issue #238): holders answer state requests only
+/// reactively and never volunteer state to late subscribers, so a bounded
+/// schedule (the previous 20 × 30s ≈ 10 min hard cap) left a replica that
+/// rehydrated while every holder was offline permanently un-synced once the
+/// cap expired. Convergence — the list turning non-empty — is the only
+/// legitimate stop condition, and the requester loop owns that check.
+fn state_request_delays() -> impl Iterator<Item = u64> {
+    let tail = std::iter::successors(Some(STATE_REQUEST_TAIL_START_SECS), |d| {
+        Some(d.saturating_mul(2).min(STATE_REQUEST_TAIL_CAP_SECS))
+    });
+    STATE_REQUEST_RETRY_SECS.into_iter().chain(tail)
+}
 
 /// Message exchanged on the state-sync side topic.
 #[derive(Debug, Serialize, Deserialize)]
@@ -226,46 +237,30 @@ impl TaskListSync {
         // and has no other way to learn tasks written before it subscribed
         // (the gossip message cache only replays recent deltas). Ask holders
         // to republish. The schedule is front-loaded for a fast mesh, then
-        // runs a persistent tail so a SLOW mesh reformation still converges —
-        // e.g. a post-restart rejoin while sibling CRDTs also recover may not
-        // finish within the aggressive window. The loop self-terminates the
-        // moment the local list becomes non-empty (converged) and is hard-
-        // capped, so a genuinely-new list (no holder answers) stops after a
-        // bounded window instead of chattering forever. Requests and the
-        // full-delta responses they trigger are idempotent CRDT merges, so the
-        // extra chatter is harmless.
+        // runs an INFINITE backoff tail (issue #238): holders answer only
+        // reactively, so a hard-capped tail left a list that rehydrated
+        // while every holder was offline permanently un-synced once the cap
+        // expired. The loop self-terminates the moment the local list
+        // becomes non-empty (converged); until then a genuinely-new list
+        // costs one tiny side-topic message per backoff interval. Requests
+        // and the full-delta responses they trigger are idempotent CRDT
+        // merges, so the extra chatter is harmless.
         if self.task_list.read().await.task_count() == 0 {
             let requester_pubsub = Arc::clone(&self.pubsub);
-            let requester_list = Arc::clone(&self.task_list);
+            // Weak: the requester must not keep the list alive on its own —
+            // if every other holder of the list is gone, the tail exits.
+            let requester_list = Arc::downgrade(&self.task_list);
             let sync_topic = self.state_sync_topic();
             spawn(Box::pin(async move {
-                // Aggressive front-loaded schedule for a fast mesh.
-                for delay_secs in STATE_REQUEST_RETRY_SECS {
+                for delay_secs in state_request_delays() {
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                    if requester_list.read().await.task_count() > 0 {
+                    let Some(list) = requester_list.upgrade() else {
+                        return; // sync torn down — nothing left to bootstrap
+                    };
+                    if list.read().await.task_count() > 0 {
                         return; // converged — stop asking
                     }
-                    let request = TaskListSyncMessage::StateRequest {
-                        requester: local_peer_id,
-                    };
-                    let Ok(serialized) = bincode::serialize(&request) else {
-                        return;
-                    };
-                    if let Err(e) = requester_pubsub
-                        .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
-                        .await
-                    {
-                        tracing::debug!("TaskList state-request publish failed: {e}");
-                    }
-                }
-                // Persistent tail: keep asking until convergence or the cap,
-                // so a slow mesh reformation still recovers state.
-                for _ in 0..STATE_REQUEST_MAX_TAIL_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_secs(STATE_REQUEST_TAIL_SECS))
-                        .await;
-                    if requester_list.read().await.task_count() > 0 {
-                        return; // converged — stop asking
-                    }
+                    drop(list);
                     let request = TaskListSyncMessage::StateRequest {
                         requester: local_peer_id,
                     };
@@ -719,5 +714,88 @@ mod tests {
         // unsubscribe is infallible and tolerant of already-removed topics,
         // so a second stop() must remain Ok.
         sync.stop().await.expect("second stop (idempotent)");
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #238: the bootstrap requester must never give up while empty
+    // ------------------------------------------------------------------
+
+    /// WHY: holders answer state requests reactively and never volunteer
+    /// state to a late subscriber, so the request schedule is the only
+    /// recovery trigger. The previous hard cap (20 × 30s ≈ 10 min) left a
+    /// list that rehydrated while every holder was offline permanently
+    /// empty once the cap expired. The schedule must be front-loaded, then
+    /// an infinite capped tail — convergence is the only stop condition.
+    #[test]
+    fn state_request_schedule_never_terminates_while_unconverged() {
+        let front: Vec<u64> = state_request_delays().take(4).collect();
+        assert_eq!(front, STATE_REQUEST_RETRY_SECS, "front burst unchanged");
+        let tail: Vec<u64> = state_request_delays().skip(4).take(8).collect();
+        assert_eq!(
+            tail,
+            [30, 60, 120, 240, 300, 300, 300, 300],
+            "tail doubles to the cap, then holds it"
+        );
+        assert_eq!(
+            state_request_delays().nth(10_000),
+            Some(STATE_REQUEST_TAIL_CAP_SECS),
+            "the schedule is infinite — convergence, not the schedule, \
+             is what ends the requester"
+        );
+    }
+
+    /// WHY (issue #238 — zombie subscription): a joiner whose every request
+    /// fired while all holders were offline must still converge when a
+    /// holder returns — even long after the OLD hard cap (front ~51s +
+    /// 20 × 30s ≈ 651s) would have silenced the requester forever. Paused
+    /// time drives the virtual clock, so the >10-minute scenario runs in
+    /// moments.
+    #[tokio::test(start_paused = true)]
+    async fn requester_recovers_when_holder_returns_after_old_hard_cap() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let topic = "tasks-238-zombie";
+
+        // Empty joiner: subscribes and starts requesting into the void.
+        let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
+        let joiner =
+            TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
+                .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+
+        // Sail PAST the old hard cap with no holder online. The old code is
+        // permanently silent from here on — this is the zombie window.
+        tokio::time::sleep(Duration::from_secs(700)).await;
+        assert_eq!(
+            joiner.read().await.task_count(),
+            0,
+            "nobody was online to answer"
+        );
+
+        // A holder with state appears. It only answers when ASKED, so the
+        // joiner's tail must still be alive to ask.
+        let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        holder_list
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("add task");
+        let holder =
+            TaskListSync::new(holder_list, Arc::clone(&pubsub), topic.to_string(), peer(1))
+                .expect("holder sync");
+        holder.start().await.expect("start holder");
+
+        // The next tail request is at most STATE_REQUEST_TAIL_CAP_SECS away.
+        let mut converged = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.task_count() > 0 {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the infinite tail must recover state from a holder that \
+             returns after the old hard cap (zombie subscription, issue #238)"
+        );
     }
 }

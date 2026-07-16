@@ -26,6 +26,31 @@ const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
 /// subscription propagation) still converges without flooding.
 const STATE_REQUEST_RETRY_SECS: [u64; 4] = [1, 5, 15, 30];
 
+/// First persistent-tail delay after the front-loaded schedule exhausts.
+const STATE_REQUEST_TAIL_START_SECS: u64 = 30;
+
+/// Ceiling for the persistent tail's exponential backoff. While a replica
+/// is still empty it keeps requesting at most this often — the steady-state
+/// cost is one ~50-byte side-topic message per store per 5 minutes.
+const STATE_REQUEST_TAIL_CAP_SECS: u64 = 300;
+
+/// The complete state-request delay schedule: the front-loaded burst, then
+/// an infinite exponential tail (30s doubling to a 300s ceiling).
+///
+/// Infinite BY DESIGN (issue #238): the owner answers state requests only
+/// reactively and never volunteers state to late subscribers, so a finite
+/// schedule left a replica that rehydrated while the owner was offline
+/// permanently un-synced (a "zombie subscription" — even the owner
+/// returning did not revive it; only a full daemon restart did, by minting
+/// a fresh schedule). Convergence — the store turning non-empty — is the
+/// only legitimate stop condition, and the requester loop owns that check.
+fn state_request_delays() -> impl Iterator<Item = u64> {
+    let tail = std::iter::successors(Some(STATE_REQUEST_TAIL_START_SECS), |d| {
+        Some(d.saturating_mul(2).min(STATE_REQUEST_TAIL_CAP_SECS))
+    });
+    STATE_REQUEST_RETRY_SECS.into_iter().chain(tail)
+}
+
 /// Message exchanged on the state-sync side topic.
 ///
 /// Wire compatibility: `StateRequest` keeps its variant index and shape, so
@@ -456,19 +481,39 @@ impl KvStoreSync {
         // store and has no other way to learn keys written before it
         // subscribed (the gossip message cache only replays ~60s, and
         // pruning on busy topics removes older deltas entirely). Ask
-        // holders to republish over a short retry schedule. The full
-        // schedule always runs — a partial state arriving early (for
-        // example fresh keys via cache replay) must not stop the
-        // request for the complete historical state. Requests and the
-        // full-delta responses they trigger are idempotent CRDT merges,
-        // so the extra chatter is bounded and harmless. A creator of a
-        // genuinely new store also sends these — nobody answers.
+        // holders to republish. The full FRONT schedule always runs — a
+        // partial state arriving early (for example fresh keys via cache
+        // replay) must not stop the request for the complete historical
+        // state. After the front schedule, an infinite backoff tail keeps
+        // asking while the store is STILL EMPTY (issue #238): holders
+        // answer only reactively, so a replica whose requests all fired
+        // while the owner was offline would otherwise stay a zombie
+        // forever. The tail self-terminates the moment any state merges
+        // (the owner's full-delta response also carries its checkpoint,
+        // so policy converges with the data). Requests and the full-delta
+        // responses they trigger are idempotent CRDT merges, so the
+        // chatter is harmless; a genuinely-new empty store costs one tiny
+        // side-topic message per backoff interval until its first write.
         if bootstrap_needed {
             let requester_pubsub = Arc::clone(&self.pubsub);
             let sync_topic = self.state_sync_topic();
+            // Weak: the requester must not keep the store alive on its own —
+            // if every other holder of the store is gone, the tail exits.
+            let requester_store = Arc::downgrade(&self.store);
             spawn(Box::pin(async move {
-                for delay_secs in STATE_REQUEST_RETRY_SECS {
+                for (attempt, delay_secs) in state_request_delays().enumerate() {
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    // Tail attempts stop on convergence; front attempts
+                    // always run (see above — partial early state must not
+                    // cancel the request for full history).
+                    if attempt >= STATE_REQUEST_RETRY_SECS.len() {
+                        let Some(store) = requester_store.upgrade() else {
+                            return; // sync torn down — nothing left to bootstrap
+                        };
+                        if !store.read().await.is_empty() {
+                            return; // converged — stop asking
+                        }
+                    }
                     let request = KvSyncMessage::StateRequest {
                         requester: local_peer_id,
                     };
@@ -1069,5 +1114,149 @@ mod tests {
         // unsubscribe is infallible and tolerant of already-removed topics,
         // so a second stop() must remain Ok.
         sync.stop().await.expect("second stop (idempotent)");
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #238: the bootstrap requester must never give up while empty
+    // ------------------------------------------------------------------
+
+    /// WHY: the request schedule is the ONLY trigger for state recovery —
+    /// holders answer reactively and never volunteer state to a late
+    /// subscriber. A finite schedule therefore turned "owner offline while
+    /// the schedule ran" into a permanent zombie: the replica stayed empty
+    /// forever, even after the owner returned. The schedule must be
+    /// front-loaded (a fast mesh converges in seconds) and then an
+    /// infinite capped tail (bounded chatter, unbounded patience).
+    #[test]
+    fn state_request_schedule_never_terminates_while_unconverged() {
+        let front: Vec<u64> = state_request_delays().take(4).collect();
+        assert_eq!(front, STATE_REQUEST_RETRY_SECS, "front burst unchanged");
+        let tail: Vec<u64> = state_request_delays().skip(4).take(8).collect();
+        assert_eq!(
+            tail,
+            [30, 60, 120, 240, 300, 300, 300, 300],
+            "tail doubles to the cap, then holds it"
+        );
+        assert_eq!(
+            state_request_delays().nth(10_000),
+            Some(STATE_REQUEST_TAIL_CAP_SECS),
+            "the schedule is infinite — convergence, not the schedule, \
+             is what ends the requester"
+        );
+    }
+
+    /// WHY (issue #238 — zombie subscription + transient policy misreport):
+    /// a replica that joins while the store owner is offline must still
+    /// converge when the owner returns AFTER the front-loaded request
+    /// schedule has exhausted. Before the fix the requester died at ~51s
+    /// and nothing ever asked again; the replica stayed permanently empty
+    /// (and permanently reported the `signed` replica-default policy) until
+    /// a full daemon restart minted a fresh schedule. Paused time drives
+    /// the virtual clock, so the multi-minute scenario runs in moments.
+    #[tokio::test(start_paused = true)]
+    async fn requester_tail_recovers_when_owner_returns_after_front_schedule() {
+        let node = make_node().await;
+        // Sign as the owner so the OwnerAnnounce path (policy refresh) is
+        // exercised: v2 delivery exposes the verified sender AgentId, which
+        // learn_ownership requires to equal the claimed owner.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-238-zombie";
+
+        // Empty replica anchored on the (offline) owner — exactly what the
+        // daemon's rehydration path builds for a joined store.
+        let replica = KvStore::new_replica(
+            store_id(1),
+            String::new(),
+            Some(owner_id),
+            crate::kv::store::AnchorChannel::RestParam,
+        );
+        let joiner = KvStoreSync::new(
+            replica,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+
+        // The entire front schedule (~51s) fires into the void.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            joiner.read().await.is_empty(),
+            "nobody was online to answer the front schedule"
+        );
+        assert_eq!(
+            *joiner.read().await.policy(),
+            AccessPolicy::Signed,
+            "replica still reports its construction-default policy while \
+             the owner is away (the transient misreport under test)"
+        );
+
+        // The owner comes online only AFTER the front schedule exhausted —
+        // the window in which the old requester was already dead.
+        let mut owned = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner_id,
+            AccessPolicy::AppendOnly,
+        );
+        owned
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner put");
+        let owner_sync = KvStoreSync::new(
+            owned,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner_id),
+        )
+        .expect("owner sync");
+        owner_sync.start().await.expect("start owner");
+
+        // The persistent tail must ask again and converge the data.
+        let mut converged = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if !joiner.read().await.is_empty() {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the tail requester must recover the store once the owner \
+             returns (zombie subscription, issue #238)"
+        );
+        assert_eq!(
+            joiner.read().await.get("k1").map(|e| e.value.clone()),
+            Some(b"v1".to_vec()),
+            "the owner's key must arrive via the state response"
+        );
+
+        // Defect 3: the owner's announce rides the same recovery, so the
+        // policy misreport heals with the data (poll — the announce and the
+        // full-delta response are separate messages).
+        let mut policy_ok = false;
+        for _ in 0..60 {
+            if *joiner.read().await.policy() == AccessPolicy::AppendOnly {
+                policy_ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(
+            policy_ok,
+            "the owner announce must refresh the replica policy \
+             (transient `signed` misreport, issue #238)"
+        );
     }
 }
