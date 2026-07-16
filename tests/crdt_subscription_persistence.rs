@@ -316,12 +316,23 @@ async fn concurrent_same_id_join_recreate_rehydrates_deterministically() {
         pair.bob.post(&join_path, join_body.clone()),
         pair.bob.post(&join_path, join_body.clone()),
     );
-    for (i, r) in [r0, r1, r2, r3].into_iter().enumerate() {
-        assert!(
-            r.status().is_success(),
-            "concurrent same-id join {i} succeeds"
-        );
-    }
+    // The per-(kind,id) reservation serialises the storm: exactly ONE join
+    // wins and installs the handle; every other request sees the handle
+    // present and gets 409 CONFLICT — same contract the sibling create test
+    // pins. (This assert originally required all four to succeed, which the
+    // 409 duplicate-join guard introduced in the same commit made
+    // impossible — the #[ignore] suite hid the contradiction.)
+    let statuses: Vec<_> = [r0, r1, r2, r3].into_iter().map(|r| r.status()).collect();
+    let winners = statuses.iter().filter(|s| s.is_success()).count();
+    let conflicts = statuses
+        .iter()
+        .filter(|s| **s == reqwest::StatusCode::CONFLICT)
+        .count();
+    assert_eq!(
+        (winners, conflicts),
+        (1, 3),
+        "exactly one concurrent join wins and the rest 409: {statuses:?}"
+    );
 
     // Determinism: exactly ONE kv_store entry for the topic survives in bob's
     // manifest, anchored on alice. A lost update would leave zero or many; a
@@ -822,6 +833,163 @@ async fn killed_named_peer_reconnects_on_new_port_via_proactive_path() {
         "bob still has T1 (state intact)",
         60,
         |json| tasks_contain(json, "T1-pre-kill"),
+    )
+    .await;
+}
+
+/// WHY (issue #238 — rehydration wedge): rehydration must NOT wait for
+/// `join_network`'s bootstrap dial schedule. With bob's only bootstrap peer
+/// (alice) down, the old daemon sequenced `rehydrate()` AFTER the full ~70s
+/// dial schedule (3 rounds × 15s connect timeout + inter-round sleeps), so
+/// `GET /stores` stayed empty for 30s+ — including bob's OWN created store,
+/// which needs no network at all (it restores from the local snapshot).
+/// Rehydration now runs concurrently with join_network: both registrations
+/// must be listed — and the own store's key readable — within seconds of the
+/// API coming up, while alice is still down.
+#[tokio::test]
+#[ignore]
+async fn own_and_joined_stores_surface_while_bootstrap_peer_is_down() {
+    let mut pair = cluster::pair().await;
+    let suffix = rand::random::<u32>();
+    let own_topic = format!("wedge-own-{suffix}");
+    let joined_topic = format!("wedge-joined-{suffix}");
+
+    // Alice creates a store; bob joins it anchored on alice's owner id.
+    let r = pair
+        .alice
+        .post(
+            "/stores",
+            serde_json::json!({ "name": "wedge-joined", "topic": joined_topic }),
+        )
+        .await;
+    assert!(r.status().is_success(), "alice creates store");
+    let alice_id = pair.alice.agent_id().await;
+    let r = pair
+        .bob
+        .post(
+            &format!("/stores/{joined_topic}/join"),
+            serde_json::json!({ "expected_owner": alice_id }),
+        )
+        .await;
+    assert!(r.status().is_success(), "bob joins alice's store");
+
+    // Bob creates his OWN store and writes a key (snapshot on bob's disk).
+    let r = pair
+        .bob
+        .post(
+            "/stores",
+            serde_json::json!({ "name": "wedge-own", "topic": own_topic }),
+        )
+        .await;
+    assert!(r.status().is_success(), "bob creates own store");
+    let r = pair
+        .bob
+        .put(
+            &format!("/stores/{own_topic}/mykey"),
+            serde_json::json!({ "value": b64(b"mine") }),
+        )
+        .await;
+    assert!(r.status().is_success(), "bob writes own key");
+
+    // Kill BOTH; restart bob only. His sole bootstrap peer (alice) is down,
+    // so join_network's dial schedule runs its full ~70s course — which must
+    // no longer gate rehydration.
+    pair.bob.stop();
+    pair.alice.stop();
+    pair.bob.start().await;
+
+    // Both stores surface long before the dial schedule could complete.
+    // 20s is generous for snapshot restore + subscribe, and far below the
+    // ~70s wedge this test regresses against.
+    poll_until(
+        &pair.bob,
+        "/stores",
+        "both stores listed with alice down",
+        20,
+        |json| {
+            json["stores"].as_array().is_some_and(|stores| {
+                let has = |t: &str| stores.iter().any(|s| s["topic"] == t || s["id"] == t);
+                has(&own_topic) && has(&joined_topic)
+            })
+        },
+    )
+    .await;
+
+    // Own-store content is local: readable without any peer.
+    poll_until(
+        &pair.bob,
+        &format!("/stores/{own_topic}/mykey"),
+        "own key readable from local snapshot with alice down",
+        10,
+        |json| json["value"] == b64(b"mine"),
+    )
+    .await;
+}
+
+/// WHY (issue #238 — zombie subscription): a joined store that rehydrates
+/// while its owner is offline must still converge when the owner returns
+/// AFTER the front-loaded state-request schedule (~51s) has exhausted.
+/// Before the fix, the requester fired its last request into the void and
+/// nothing ever asked again — the owner answers only reactively — so bob's
+/// replica stayed permanently empty (>300s observed) and even an explicit
+/// re-join (409) could not revive it; only another full restart did.
+#[tokio::test]
+#[ignore]
+async fn joined_store_syncs_after_owner_returns_late() {
+    let mut pair = cluster::pair().await;
+    let suffix = rand::random::<u32>();
+    let store_topic = format!("zombie-{suffix}");
+
+    // Alice creates the store (no keys yet); bob joins anchored on alice.
+    let r = pair
+        .alice
+        .post(
+            "/stores",
+            serde_json::json!({ "name": "zombie-store", "topic": store_topic }),
+        )
+        .await;
+    assert!(r.status().is_success(), "alice creates store");
+    let alice_id = pair.alice.agent_id().await;
+    let r = pair
+        .bob
+        .post(
+            &format!("/stores/{store_topic}/join"),
+            serde_json::json!({ "expected_owner": alice_id }),
+        )
+        .await;
+    assert!(r.status().is_success(), "bob joins alice's store");
+
+    // Bob goes down; alice writes k1 while bob is offline; alice goes down.
+    pair.bob.stop();
+    let r = pair
+        .alice
+        .put(
+            &format!("/stores/{store_topic}/k1"),
+            serde_json::json!({ "value": b64(b"offline-write") }),
+        )
+        .await;
+    assert!(r.status().is_success(), "alice writes k1 while bob is down");
+    pair.alice.stop();
+
+    // Bob restarts with the owner offline and rehydrates an EMPTY replica;
+    // let the entire front-loaded request schedule (~51s) fire into the
+    // void — the window in which the old requester died permanently.
+    pair.bob.start().await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    // The owner returns. Bob's persistent tail must ask again (next request
+    // ≤ the backoff ceiling away) and recover k1 — no re-join, no restart.
+    // Deadline covers the worst jittered envelope: a request missed during
+    // reconnection pushes recovery to the following tail attempt, and tail
+    // delays carry ±20% jitter (a 201s pass was observed against the old
+    // 240s bound — round-4 review).
+    pair.alice.start().await;
+    poll_until(
+        &pair.bob,
+        &format!("/stores/{store_topic}/k1"),
+        "bob recovers k1 after the owner returns late (no re-join/restart)",
+        360,
+        |json| json["value"] == b64(b"offline-write"),
     )
     .await;
 }

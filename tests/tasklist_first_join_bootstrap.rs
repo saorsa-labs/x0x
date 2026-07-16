@@ -87,8 +87,11 @@ async fn first_time_late_joiner_bootstraps_historical_tasks() {
     assert!(r.status().is_success(), "bob subscribes to the task list");
 
     // The historical task must arrive via the state-sync bootstrap. The
-    // requester retries at 1/5/15/30s; allow the full schedule plus slack.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // requester's front burst is 1/5/15/30s with ±20% jitter (issue #238:
+    // worst-case cumulative ~61s), and if the mesh forms slowly the first
+    // TAIL attempt lands at up to ~97s jittered — allow that envelope plus
+    // propagation slack.
+    let deadline = Instant::now() + Duration::from_secs(150);
     loop {
         let titles = task_titles(&bob, &topic).await;
         if titles.iter().any(|t| t == "written-before-bob-existed") {

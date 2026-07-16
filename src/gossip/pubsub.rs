@@ -452,7 +452,32 @@ impl PubSubManager {
         let sub_topic = topic.clone();
         let stats = Arc::clone(&self.stats);
         tokio::spawn(async move {
-            while let Some((_peer, encoded_payload)) = plumtree_rx.recv().await {
+            loop {
+                let received = tokio::select! {
+                    // The subscriber dropping its receiver must end this
+                    // forwarding task PROMPTLY, even on a forever-quiet
+                    // topic — parking on recv() alone only notices the
+                    // closed downstream when the next message arrives, so
+                    // every discarded subscription would pin a task and its
+                    // PlumTree registration indefinitely (issue #238
+                    // round-5 review: registration rollbacks on unique
+                    // topics leaked these unboundedly). Both arms are
+                    // cancel-safe.
+                    () = tx.closed() => {
+                        stats
+                            .subscriber_channel_closed
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            topic = %sub_topic,
+                            "[4/6 pubsub] subscriber receiver dropped — ending forwarding task"
+                        );
+                        return;
+                    }
+                    received = plumtree_rx.recv() => received,
+                };
+                let Some((_peer, encoded_payload)) = received else {
+                    return;
+                };
                 stats.incoming_total.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     topic = %sub_topic,
@@ -1766,6 +1791,43 @@ mod tests {
         let manager = PubSubManager::new(node, None).expect("manager");
         let sub = manager.subscribe("test-topic".to_string()).await;
         assert_eq!(sub.topic(), "test-topic");
+    }
+
+    /// WHY (issue #238 round-5 review): dropping a `Subscription` must end
+    /// its forwarding task PROMPTLY — on a forever-QUIET topic, with no
+    /// message ever arriving to surface the closed downstream channel.
+    /// Before the fix the task parked on `plumtree_rx.recv()` indefinitely,
+    /// so every discarded subscription (e.g. a daemon registration
+    /// rollback on a unique topic) pinned a ghost task and its PlumTree
+    /// registration until process exit. The `subscriber_channel_closed`
+    /// counter is the task's exit breadcrumb — it must tick WITHOUT any
+    /// publish.
+    #[tokio::test]
+    async fn dropping_subscription_ends_forwarding_task_on_quiet_topic() {
+        let node = test_node().await;
+        let manager = PubSubManager::new(node, None).expect("manager");
+        let before = manager.stats().subscriber_channel_closed;
+
+        let sub = manager
+            .subscribe("quiet-topic-238-teardown".to_string())
+            .await;
+        drop(sub);
+
+        // No publish ever happens on the topic; the forwarding task must
+        // still notice the dropped receiver via tx.closed() and exit.
+        let mut ended = false;
+        for _ in 0..200 {
+            if manager.stats().subscriber_channel_closed > before {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            ended,
+            "forwarding task must exit promptly when its subscriber is \
+             dropped on a quiet topic (ghost-task leak)"
+        );
     }
 
     #[tokio::test]

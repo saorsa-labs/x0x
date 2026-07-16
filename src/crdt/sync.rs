@@ -33,18 +33,45 @@ const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
 /// flooding.
 const STATE_REQUEST_RETRY_SECS: [u64; 4] = [1, 5, 15, 30];
 
-/// Persistent tail interval for the state-request bootstrap. After the
-/// aggressive front-loaded schedule exhausts (~51s), a first-time joiner
-/// whose list is STILL empty keeps asking at this interval so a slow mesh
-/// reformation — e.g. a post-restart rejoin while sibling CRDTs also recover
-/// — still converges. The loop self-terminates the moment the local list
-/// becomes non-empty.
-const STATE_REQUEST_TAIL_SECS: u64 = 30;
+/// First persistent-tail delay after the front-loaded schedule exhausts.
+const STATE_REQUEST_TAIL_START_SECS: u64 = 30;
 
-/// Hard cap on persistent-tail state requests so a genuinely-new (forever-
-/// empty) list stops after a bounded window instead of chattering
-/// indefinitely. 20 × 30s ≈ 10 min, ample for any realistic reformation.
-const STATE_REQUEST_MAX_TAIL_ATTEMPTS: usize = 20;
+/// Ceiling for the persistent tail's exponential backoff. While a list is
+/// still empty it keeps requesting at most this often — the steady-state
+/// cost is one ~50-byte side-topic message per list per 5 minutes.
+const STATE_REQUEST_TAIL_CAP_SECS: u64 = 300;
+
+/// The complete state-request delay schedule: the front-loaded burst, then
+/// an infinite exponential tail (30s doubling to a 300s ceiling).
+///
+/// Infinite BY DESIGN (issue #238): holders answer state requests only
+/// reactively and never volunteer state to late subscribers, so a bounded
+/// schedule (the previous 20 × 30s ≈ 10 min hard cap) left a replica that
+/// rehydrated while every holder was offline permanently un-synced once the
+/// cap expired. Convergence — a `StateServed` marker plus local state — is
+/// the only legitimate stop condition, and the requester loop owns that
+/// check.
+fn state_request_delays() -> impl Iterator<Item = u64> {
+    let tail = std::iter::successors(Some(STATE_REQUEST_TAIL_START_SECS), |d| {
+        Some(d.saturating_mul(2).min(STATE_REQUEST_TAIL_CAP_SECS))
+    });
+    STATE_REQUEST_RETRY_SECS.into_iter().chain(tail)
+}
+
+/// Minimum spacing between full-state responses from ONE holder for ONE
+/// list — the same response-storm damping as `KvStoreSync` (issue #238
+/// review): the response is a broadcast on the main topic, so one response
+/// per window serves every concurrently-bootstrapping replica.
+const STATE_RESPONSE_COOLDOWN_SECS: u64 = 15;
+
+/// Sleep duration for a scheduled delay with ±20% jitter, so a fleet of
+/// replicas restarted together does not phase-lock its request (and thus
+/// full-state response) schedule. Mirrors the reconnect-backoff jitter in
+/// `lib.rs`.
+fn jittered_secs(secs: u64) -> std::time::Duration {
+    let factor = 0.8 + rand::random::<f64>() * 0.4;
+    std::time::Duration::from_secs_f64(secs as f64 * factor)
+}
 
 /// Message exchanged on the state-sync side topic.
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,6 +79,24 @@ enum TaskListSyncMessage {
     /// A peer with no local state for the list asks holders to republish
     /// their full state (as a regular delta) on the main topic.
     StateRequest { requester: PeerId },
+    /// A NON-EMPTY holder's declaration that it has answered a
+    /// `StateRequest` (its full state was republished on the main topic,
+    /// possibly earlier within the response cooldown). Requesters exit their
+    /// bootstrap tail only after seeing a marker AND holding local state —
+    /// mere non-emptiness is not convergence evidence (a single incremental
+    /// delta must not silence recovery, round-2 review). Task lists have no
+    /// authoritative owner, so an empty holder NEVER declares (two empty
+    /// bootstrapping replicas must not talk each other into a false
+    /// "converged empty"); a genuinely-empty list keeps its capped-cadence
+    /// tail (~one tiny message per 5 minutes) until state exists.
+    ///
+    /// Wire compatibility: additive variant — older peers fail to
+    /// deserialize it and skip the message (same precedent as the kv-store
+    /// side channel).
+    StateServed {
+        /// The declaring holder (receivers skip their own echo).
+        responder: PeerId,
+    },
 }
 
 /// Synchronization wrapper for a TaskList.
@@ -71,6 +116,32 @@ pub struct TaskListSync {
     /// This node's gossip peer id — identifies our deltas and state
     /// requests on the wire.
     local_peer_id: PeerId,
+
+    /// Set by [`silence_bootstrap`](Self::silence_bootstrap). The bootstrap
+    /// requester checks it every iteration: its schedule is infinite (issue
+    /// #238), so a sync that should stop generating traffic — but keep
+    /// serving — arms this without ending the listener/responder loops.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Cancelled by [`cancel_sync`](Self::cancel_sync) / [`stop`](Self::stop).
+    /// ALL background loops (delta listener, responder, requester) select on
+    /// it, so a discarded sync tears down completely without the topic-wide
+    /// `unsubscribe` that would kill unrelated subscribers sharing the topic
+    /// string (round-4 review: flag-only teardown left ghost listeners and a
+    /// live responder until daemon shutdown).
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+/// Structural teardown (parallel-review finding): the background loops hold
+/// clones of the token, the list, and the pubsub — never the sync itself —
+/// so when the last `TaskListSync` reference drops, every loop (including
+/// the INFINITE bootstrap requester, issue #238) is cancelled without any
+/// caller having to remember `cancel_sync()`. The explicit rollback calls
+/// remain as belt-and-braces.
+impl Drop for TaskListSync {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl TaskListSync {
@@ -116,6 +187,8 @@ impl TaskListSync {
             pubsub,
             topic,
             local_peer_id,
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -166,9 +239,27 @@ impl TaskListSync {
         // Subscribe to topic — received messages will contain serialized deltas.
         let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
         let task_list = Arc::clone(&self.task_list);
+        let listener_cancel = self.cancel.clone();
 
         spawn(Box::pin(async move {
-            while let Some(msg) = sub.recv().await {
+            loop {
+                let msg = tokio::select! {
+                    // cancel_sync tears down every loop (round-4 review) —
+                    // recv alone would keep this listener alive until
+                    // daemon shutdown.
+                    () = listener_cancel.cancelled() => return,
+                    msg = sub.recv() => msg,
+                };
+                let Some(msg) = msg else {
+                    // The main-topic subscription is gone: this sync can no
+                    // longer replicate, so it is half-dead — self-cancel so
+                    // the sibling loops (in particular the INFINITE
+                    // bootstrap requester) never outlive it (parallel-review
+                    // finding: a dead sibling must not leave the requester
+                    // chattering at capped cadence forever).
+                    listener_cancel.cancel();
+                    return;
+                };
                 match decode_delta::<TaskListDelta>(&msg.payload) {
                     Ok((peer_id, delta)) => {
                         let mut list = task_list.write().await;
@@ -192,32 +283,113 @@ impl TaskListSync {
         let responder_list = Arc::clone(&self.task_list);
         let responder_pubsub = Arc::clone(&self.pubsub);
         let responder_topic = self.topic.clone();
+        let sync_topic = self.state_sync_topic();
+        // StateServed evidence: written by the responder loop (which owns
+        // the side-topic subscription), read by the bootstrap requester to
+        // decide convergence.
+        let served_evidence = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let responder_served = Arc::clone(&served_evidence);
+        let responder_cancel = self.cancel.clone();
         let local_peer_id = self.local_peer_id;
         spawn(Box::pin(async move {
-            while let Some(msg) = sync_sub.recv().await {
-                let Ok(TaskListSyncMessage::StateRequest { requester }) =
-                    bincode::deserialize::<TaskListSyncMessage>(&msg.payload)
-                else {
+            // Response-storm damping (issue #238 review): one full-state
+            // response per cooldown window — the response is a broadcast,
+            // so it serves every concurrently-bootstrapping replica. A
+            // request landing inside the window gets NOTHING (no response,
+            // no marker — markers must witness a real broadcast, round-3
+            // review); the requester is served by its next scheduled
+            // attempt.
+            let mut last_full_response: Option<tokio::time::Instant> = None;
+            loop {
+                let msg = tokio::select! {
+                    // cancel_sync tears down every loop (round-4 review).
+                    () = responder_cancel.cancelled() => return,
+                    msg = sync_sub.recv() => msg,
+                };
+                let Some(msg) = msg else {
+                    // The side-topic subscription is gone: this sync can no
+                    // longer receive StateServed evidence, so the requester
+                    // could never legitimately stop — self-cancel so it
+                    // (and the sibling loops) never outlive the responder.
+                    responder_cancel.cancel();
+                    return;
+                };
+                let Ok(sync_msg) = bincode::deserialize::<TaskListSyncMessage>(&msg.payload) else {
                     continue;
                 };
-                if requester == local_peer_id {
-                    continue;
-                }
-                let full = {
-                    let list = responder_list.read().await;
-                    if list.task_count() == 0 {
-                        continue;
+                match sync_msg {
+                    TaskListSyncMessage::StateRequest { requester } => {
+                        if requester == local_peer_id {
+                            continue;
+                        }
+                        // The StateServed marker is published ONLY alongside
+                        // an actual full-delta publish: a marker must
+                        // witness a real broadcast — one sent for a
+                        // cooldown-suppressed response could convince a
+                        // requester that never received the state to stop
+                        // asking (round-3 review). A requester inside the
+                        // window is served by its next scheduled attempt.
+                        // Checked BEFORE building the full delta — no point
+                        // cloning the whole list for a suppressed response.
+                        let cooled_down = last_full_response.is_some_and(|t| {
+                            t.elapsed()
+                                < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
+                        });
+                        if cooled_down {
+                            continue;
+                        }
+                        // Empty holders stay entirely silent — no response,
+                        // no marker (see StateServed docs).
+                        let full = {
+                            let list = responder_list.read().await;
+                            if list.task_count() == 0 {
+                                continue;
+                            }
+                            list.full_delta()
+                        };
+                        let Ok(serialized) = encode_delta(local_peer_id, &full) else {
+                            continue;
+                        };
+                        if let Err(e) = responder_pubsub
+                            .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
+                            .await
+                        {
+                            tracing::warn!("TaskList state-response publish failed: {e}");
+                            continue;
+                        }
+                        last_full_response = Some(tokio::time::Instant::now());
+                        let marker = TaskListSyncMessage::StateServed {
+                            responder: local_peer_id,
+                        };
+                        match bincode::serialize(&marker) {
+                            Ok(serialized) => {
+                                if let Err(e) = responder_pubsub
+                                    .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "TaskList state-served marker publish failed: {e}"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "TaskList state-served marker serialize failed: {e}"
+                                );
+                            }
+                        }
                     }
-                    list.full_delta()
-                };
-                let Ok(serialized) = encode_delta(local_peer_id, &full) else {
-                    continue;
-                };
-                if let Err(e) = responder_pubsub
-                    .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
-                    .await
-                {
-                    tracing::warn!("TaskList state-response publish failed: {e}");
+                    TaskListSyncMessage::StateServed { responder } => {
+                        if responder == local_peer_id {
+                            continue; // our own marker echoed back
+                        }
+                        // Trust note: the marker steers only WHEN the
+                        // requester stops asking, never list content, and
+                        // the requester still requires local non-emptiness
+                        // — a forged marker cannot inject state and stops
+                        // recovery no earlier than a real holder could.
+                        responder_served.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }));
@@ -226,45 +398,54 @@ impl TaskListSync {
         // and has no other way to learn tasks written before it subscribed
         // (the gossip message cache only replays recent deltas). Ask holders
         // to republish. The schedule is front-loaded for a fast mesh, then
-        // runs a persistent tail so a SLOW mesh reformation still converges —
-        // e.g. a post-restart rejoin while sibling CRDTs also recover may not
-        // finish within the aggressive window. The loop self-terminates the
-        // moment the local list becomes non-empty (converged) and is hard-
-        // capped, so a genuinely-new list (no holder answers) stops after a
-        // bounded window instead of chattering forever. Requests and the
-        // full-delta responses they trigger are idempotent CRDT merges, so the
-        // extra chatter is harmless.
+        // runs an INFINITE backoff tail (issue #238): holders answer only
+        // reactively, so a hard-capped tail left a list that rehydrated
+        // while every holder was offline permanently un-synced once the cap
+        // expired. The FULL front burst always runs (aligned with
+        // `KvStoreSync`, round-1 review): a single incremental task arriving
+        // via live gossip before the first request must not cancel the
+        // request for the complete historical state. The tail then
+        // self-terminates the moment the local list is non-empty; until
+        // then a genuinely-new list costs one tiny side-topic message per
+        // backoff interval. Requests and the full-delta responses they
+        // trigger are idempotent CRDT merges, so the extra chatter is
+        // harmless.
         if self.task_list.read().await.task_count() == 0 {
             let requester_pubsub = Arc::clone(&self.pubsub);
-            let requester_list = Arc::clone(&self.task_list);
+            // Weak: the requester must not keep the list alive on its own.
+            // (Belt-and-braces — the sibling loops hold strong Arcs, so the
+            // authoritative kill switch is the `stopped` flag below.)
+            let requester_list = Arc::downgrade(&self.task_list);
             let sync_topic = self.state_sync_topic();
+            let stopped = Arc::clone(&self.stopped);
+            let requester_cancel = self.cancel.clone();
+            let requester_served = Arc::clone(&served_evidence);
             spawn(Box::pin(async move {
-                // Aggressive front-loaded schedule for a fast mesh.
-                for delay_secs in STATE_REQUEST_RETRY_SECS {
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                    if requester_list.read().await.task_count() > 0 {
-                        return; // converged — stop asking
+                for (attempt, delay_secs) in state_request_delays().enumerate() {
+                    tokio::select! {
+                        // cancel_sync tears down every loop promptly, even
+                        // mid-sleep (round-4 review).
+                        () = requester_cancel.cancelled() => return,
+                        () = tokio::time::sleep(jittered_secs(delay_secs)) => {}
                     }
-                    let request = TaskListSyncMessage::StateRequest {
-                        requester: local_peer_id,
-                    };
-                    let Ok(serialized) = bincode::serialize(&request) else {
-                        return;
-                    };
-                    if let Err(e) = requester_pubsub
-                        .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
-                        .await
-                    {
-                        tracing::debug!("TaskList state-request publish failed: {e}");
+                    if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                        return; // silenced — never chatter for a dead sync
                     }
-                }
-                // Persistent tail: keep asking until convergence or the cap,
-                // so a slow mesh reformation still recovers state.
-                for _ in 0..STATE_REQUEST_MAX_TAIL_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_secs(STATE_REQUEST_TAIL_SECS))
-                        .await;
-                    if requester_list.read().await.task_count() > 0 {
-                        return; // converged — stop asking
+                    // Tail attempts stop on convergence; front attempts
+                    // always run (see above). Convergence requires BOTH a
+                    // StateServed marker (a holder actually answered) AND
+                    // local state — mere non-emptiness can be faked by one
+                    // incremental delta while full history is still missing
+                    // (round-2 review).
+                    if attempt >= STATE_REQUEST_RETRY_SECS.len() {
+                        let Some(list) = requester_list.upgrade() else {
+                            return; // sync torn down — nothing left to bootstrap
+                        };
+                        if requester_served.load(std::sync::atomic::Ordering::Relaxed)
+                            && list.read().await.task_count() > 0
+                        {
+                            return; // a holder served us and we hold state
+                        }
                     }
                     let request = TaskListSyncMessage::StateRequest {
                         requester: local_peer_id,
@@ -297,9 +478,36 @@ impl TaskListSync {
     ///
     /// Returns an error if operations fail.
     pub async fn stop(&self) -> Result<()> {
+        // End the loops FIRST: the bootstrap requester's schedule is
+        // infinite while the list is empty (issue #238), and unsubscribing
+        // does not end that loop (it holds no subscription).
+        self.cancel_sync();
         self.pubsub.unsubscribe(&self.topic).await;
         self.pubsub.unsubscribe(&self.state_sync_topic()).await;
         Ok(())
+    }
+
+    /// Silence ONLY this sync's bootstrap requester (its schedule is
+    /// infinite while unconverged — issue #238), leaving the listener and
+    /// responder loops serving. Discarded handles want
+    /// [`cancel_sync`](Self::cancel_sync).
+    pub fn silence_bootstrap(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Tear down ALL of this sync's background loops (delta listener,
+    /// state-request responder, bootstrap requester) WITHOUT touching topic
+    /// subscriptions.
+    ///
+    /// This is the correct teardown for a discarded handle inside a daemon:
+    /// `PubSubManager::unsubscribe` (what [`stop`](Self::stop) does) removes
+    /// the ENTIRE topic — including subscriptions owned by other components
+    /// that legally share the topic string. Ending the loops drops their
+    /// `Subscription` receivers, so the pub/sub layer prunes the closed
+    /// senders on its next delivery.
+    pub fn cancel_sync(&self) {
+        self.cancel.cancel();
     }
 
     /// Apply a delta received from a remote peer.
@@ -719,5 +927,202 @@ mod tests {
         // unsubscribe is infallible and tolerant of already-removed topics,
         // so a second stop() must remain Ok.
         sync.stop().await.expect("second stop (idempotent)");
+    }
+
+    /// WHY (rounds 1+4 review): the requester's schedule is INFINITE while
+    /// the list is empty, and the sibling loops hold strong `Arc`s to the
+    /// list — so the cancellation token (all loops) and the
+    /// silence_bootstrap flag (requester only) are the only things that end
+    /// a discarded sync's background work before daemon shutdown.
+    #[tokio::test]
+    async fn stop_and_silence_arm_their_kill_switches() {
+        let sync = make_sync("tasks/stopflag").await;
+        assert!(
+            !sync.cancel.is_cancelled() && !sync.stopped.load(std::sync::atomic::Ordering::Relaxed),
+            "both switches must start disarmed"
+        );
+        sync.silence_bootstrap();
+        assert!(
+            sync.stopped.load(std::sync::atomic::Ordering::Relaxed),
+            "silence_bootstrap() arms the requester-only flag"
+        );
+        assert!(
+            !sync.cancel.is_cancelled(),
+            "silence_bootstrap() must NOT cancel the listener/responder loops"
+        );
+        sync.stop().await.expect("stop");
+        assert!(
+            sync.cancel.is_cancelled(),
+            "stop() must cancel ALL background loops via the token"
+        );
+    }
+
+    /// WHY (parallel-review finding): teardown must be STRUCTURAL — a
+    /// caller that discards its last reference without remembering
+    /// cancel_sync() must still end all background loops (the requester is
+    /// infinite while unconverged), so Drop cancels the token.
+    #[tokio::test]
+    async fn dropping_the_sync_cancels_all_loops() {
+        let sync = make_sync("tasks/dropcancel").await;
+        let token = sync.cancel.clone();
+        assert!(!token.is_cancelled());
+        drop(sync);
+        assert!(
+            token.is_cancelled(),
+            "dropping the last sync reference must cancel every loop"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #238: the bootstrap requester must never give up while empty
+    // ------------------------------------------------------------------
+
+    /// WHY: holders answer state requests reactively and never volunteer
+    /// state to a late subscriber, so the request schedule is the only
+    /// recovery trigger. The previous hard cap (20 × 30s ≈ 10 min) left a
+    /// list that rehydrated while every holder was offline permanently
+    /// empty once the cap expired. The schedule must be front-loaded, then
+    /// an infinite capped tail — convergence is the only stop condition.
+    #[test]
+    fn state_request_schedule_never_terminates_while_unconverged() {
+        let front: Vec<u64> = state_request_delays().take(4).collect();
+        assert_eq!(front, STATE_REQUEST_RETRY_SECS, "front burst unchanged");
+        let tail: Vec<u64> = state_request_delays().skip(4).take(8).collect();
+        assert_eq!(
+            tail,
+            [30, 60, 120, 240, 300, 300, 300, 300],
+            "tail doubles to the cap, then holds it"
+        );
+        assert_eq!(
+            state_request_delays().nth(10_000),
+            Some(STATE_REQUEST_TAIL_CAP_SECS),
+            "the schedule is infinite — convergence, not the schedule, \
+             is what ends the requester"
+        );
+    }
+
+    /// WHY (round-2 review — P1: one incremental delta must not silence
+    /// recovery): a live task arriving before any holder has actually
+    /// SERVED full state makes the list non-empty, and the round-1 tail
+    /// exited on non-emptiness alone — permanently missing all older
+    /// tasks. Convergence now additionally requires a StateServed marker,
+    /// so the bait delta leaves the requester alive and a late full holder
+    /// still gets asked.
+    #[tokio::test(start_paused = true)]
+    async fn single_incremental_delta_does_not_stop_recovery() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let topic = "tasks-238-bait";
+
+        let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
+        let joiner =
+            TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
+                .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+
+        // Past the front burst with nobody online.
+        tokio::time::sleep(Duration::from_secs(70)).await;
+
+        // The bait: ONE live incremental delta (task 2) — no full response,
+        // no StateServed marker. The list becomes non-empty.
+        let bait_task = make_task(2, peer(3));
+        let bait_id = *bait_task.id();
+        let mut bait = TaskListDelta::new(1);
+        bait.added_tasks.insert(bait_id, (bait_task, (peer(3), 1)));
+        let encoded = encode_delta(peer(3), &bait).expect("encode bait");
+        pubsub
+            .publish(topic.to_string(), bytes::Bytes::from(encoded))
+            .await
+            .expect("publish bait");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            joiner.read().await.task_count(),
+            1,
+            "bait delta merged — the false-convergence precondition holds"
+        );
+
+        // A holder with the FULL history (task 1 and task 2) appears long
+        // after the bait. Only a still-alive requester can reach it.
+        let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        holder_list
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("holder task 1");
+        holder_list
+            .add_task(make_task(2, peer(1)), peer(1), 2)
+            .expect("holder task 2");
+        let holder =
+            TaskListSync::new(holder_list, Arc::clone(&pubsub), topic.to_string(), peer(1))
+                .expect("holder sync");
+        holder.start().await.expect("start holder");
+
+        let historical = TaskId::from_bytes([1; 32]);
+        let mut converged = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.get_task(&historical).is_some() {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the requester must survive the bait delta and recover the \
+             historical task from the late holder"
+        );
+    }
+
+    /// WHY (issue #238 — zombie subscription): a joiner whose every request
+    /// fired while all holders were offline must still converge when a
+    /// holder returns — even long after the OLD hard cap (front ~51s +
+    /// 20 × 30s ≈ 651s) would have silenced the requester forever. Paused
+    /// time drives the virtual clock, so the >10-minute scenario runs in
+    /// moments.
+    #[tokio::test(start_paused = true)]
+    async fn requester_recovers_when_holder_returns_after_old_hard_cap() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let topic = "tasks-238-zombie";
+
+        // Empty joiner: subscribes and starts requesting into the void.
+        let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
+        let joiner =
+            TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
+                .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+
+        // Sail PAST the old hard cap with no holder online. The old code is
+        // permanently silent from here on — this is the zombie window.
+        tokio::time::sleep(Duration::from_secs(700)).await;
+        assert_eq!(
+            joiner.read().await.task_count(),
+            0,
+            "nobody was online to answer"
+        );
+
+        // A holder with state appears. It only answers when ASKED, so the
+        // joiner's tail must still be alive to ask.
+        let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        holder_list
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("add task");
+        let holder =
+            TaskListSync::new(holder_list, Arc::clone(&pubsub), topic.to_string(), peer(1))
+                .expect("holder sync");
+        holder.start().await.expect("start holder");
+
+        // The next tail request is at most STATE_REQUEST_TAIL_CAP_SECS away.
+        let mut converged = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.task_count() > 0 {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the infinite tail must recover state from a holder that \
+             returns after the old hard cap (zombie subscription, issue #238)"
+        );
     }
 }

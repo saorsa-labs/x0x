@@ -10240,6 +10240,21 @@ impl std::fmt::Debug for TaskListHandle {
 }
 
 impl TaskListHandle {
+    /// Tear down this replica's background sync loops (delta listener,
+    /// responder, and the bootstrap requester — whose schedule is infinite
+    /// while unconverged, issue #238). A discarded handle must call this or
+    /// its loops run until `Agent::shutdown()`.
+    ///
+    /// Deliberately does NOT unsubscribe: `PubSubManager::unsubscribe` is
+    /// topic-wide and would tear down every other subscriber sharing the
+    /// topic string (round-3 review); ending the loops instead drops their
+    /// receivers, which the pub/sub layer prunes on its next delivery.
+    /// Callers that remove a handle without keeping any other clone (e.g.
+    /// the daemon's registration-rollback paths) MUST call this.
+    pub fn cancel_sync(&self) {
+        self.sync.cancel_sync();
+    }
+
     /// Generate a fresh per-replica epoch at handle construction.
     ///
     /// Uses a CSPRNG incarnation nonce (64-bit random from `OsRng`) so a
@@ -10976,6 +10991,21 @@ impl KvStoreHandle {
     #[must_use]
     pub fn peer_id(&self) -> saorsa_gossip_types::PeerId {
         self.peer_id
+    }
+
+    /// Tear down this replica's background sync loops (delta listener,
+    /// responder, and the bootstrap requester — whose schedule is infinite
+    /// while unconverged, issue #238). A discarded handle must call this or
+    /// its loops run until `Agent::shutdown()`.
+    ///
+    /// Deliberately does NOT unsubscribe: `PubSubManager::unsubscribe` is
+    /// topic-wide and would tear down every other subscriber sharing the
+    /// topic string (round-3 review); ending the loops instead drops their
+    /// receivers, which the pub/sub layer prunes on its next delivery.
+    /// Callers that remove a handle without keeping any other clone (e.g.
+    /// the daemon's registration-rollback paths) MUST call this.
+    pub fn cancel_sync(&self) {
+        self.sync.cancel_sync();
     }
 
     /// Return the store's ownership/policy/version metadata for auditability.

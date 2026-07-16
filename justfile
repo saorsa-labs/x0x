@@ -47,6 +47,13 @@ test-kv-e2e:
     cargo build --release --bin x0xd
     cargo nextest run --all-features --test kv_append_only_rest -- --ignored
 
+# CRDT-subscription restart-recovery suite (#[ignore] — boots real x0xd
+# daemons; covers the issue #238 rehydration-wedge and zombie-subscription
+# regressions plus the original restart-amnesia tests).
+test-recovery-e2e:
+    cargo build --bin x0xd
+    cargo nextest run --all-features --test crdt_subscription_persistence --run-ignored all
+
 # ── Test coverage (line/region) ───────────────────────────────────────────
 #
 # Uses cargo-llvm-cov + nextest. Install once with:
