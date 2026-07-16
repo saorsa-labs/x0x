@@ -215,6 +215,18 @@ pub struct KvStoreSync {
     cancel: tokio_util::sync::CancellationToken,
 }
 
+/// Structural teardown (parallel-review finding): the background loops hold
+/// clones of the token, the store, and the pubsub — never the sync itself —
+/// so when the last `KvStoreSync` reference drops, every loop (including the
+/// INFINITE bootstrap requester, issue #238) is cancelled without any caller
+/// having to remember `cancel_sync()`. The explicit rollback calls remain as
+/// belt-and-braces.
+impl Drop for KvStoreSync {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 /// Shared persistence context for one store's snapshot file.
 struct PersistCtx {
     /// Snapshot file path.
@@ -410,7 +422,16 @@ impl KvStoreSync {
                     () = listener_cancel.cancelled() => return,
                     msg = sub.recv() => msg,
                 };
-                let Some(msg) = msg else { return };
+                let Some(msg) = msg else {
+                    // The main-topic subscription is gone: this sync can no
+                    // longer replicate, so it is half-dead — self-cancel so
+                    // the sibling loops (in particular the INFINITE
+                    // bootstrap requester) never outlive it (parallel-review
+                    // finding: a dead sibling must not leave the requester
+                    // chattering at capped cadence forever).
+                    listener_cancel.cancel();
+                    return;
+                };
                 if msg.topic != main_topic {
                     // Cross-topic replay defense: ignore envelopes not on our
                     // subscribed topic (see start_with_spawner).
@@ -489,7 +510,14 @@ impl KvStoreSync {
                     () = responder_cancel.cancelled() => return,
                     msg = sync_sub.recv() => msg,
                 };
-                let Some(msg) = msg else { return };
+                let Some(msg) = msg else {
+                    // The side-topic subscription is gone: this sync can no
+                    // longer receive StateServed evidence, so the requester
+                    // could never legitimately stop — self-cancel so it
+                    // (and the sibling loops) never outlive the responder.
+                    responder_cancel.cancel();
+                    return;
+                };
                 if msg.topic != sync_topic {
                     // Cross-topic replay defense (see start_with_spawner).
                     continue;
@@ -536,6 +564,20 @@ impl KvStoreSync {
                                 }
                             }
                         }
+                        // Cooldown gates the full-state broadcast. The
+                        // StateServed marker is published ONLY alongside an
+                        // actual full-delta publish (or for an owner's
+                        // checkpoint-less empty store, which has no payload
+                        // at all): a marker must witness a real broadcast —
+                        // a marker for a cooldown-suppressed response could
+                        // convince a requester that never received the state
+                        // to stop asking (round-3 review). Checked BEFORE
+                        // building the full delta — no point cloning the
+                        // whole store for a suppressed response.
+                        let cooled_down = last_full_response.is_some_and(|t| {
+                            t.elapsed()
+                                < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
+                        });
                         // Snapshot state once for the full-delta and the
                         // StateServed marker below. A full response is
                         // served when the store is non-empty, OR when it is
@@ -547,53 +589,37 @@ impl KvStoreSync {
                         // replica (round-3 review — an empty owner must not
                         // be silent while stale holders keep advertising
                         // obsolete state).
-                        let (full, is_empty, is_owner, checkpoint_seq) = {
+                        let (full, is_empty, is_owner, checkpoint_seq, has_payload) = {
                             let s = responder_store.read().await;
                             let is_owner =
                                 local_agent_id.is_some() && s.owner() == local_agent_id.as_ref();
                             let cp =
                                 (s.highest_checkpoint_seq > 0).then_some(s.highest_checkpoint_seq);
-                            let full = (!s.is_empty() || s.latest_checkpoint.is_some())
-                                .then(|| s.full_delta());
-                            (full, s.is_empty(), is_owner, cp)
+                            let has_payload = !s.is_empty() || s.latest_checkpoint.is_some();
+                            let full = (has_payload && !cooled_down).then(|| s.full_delta());
+                            (full, s.is_empty(), is_owner, cp, has_payload)
                         };
-                        // Cooldown gates the full-state broadcast. The
-                        // StateServed marker is published ONLY alongside an
-                        // actual full-delta publish (or for an owner's
-                        // checkpoint-less empty store, which has no payload
-                        // at all): a marker must witness a real broadcast —
-                        // a marker for a cooldown-suppressed response could
-                        // convince a requester that never received the state
-                        // to stop asking (round-3 review).
-                        let cooled_down = last_full_response.is_some_and(|t| {
-                            t.elapsed()
-                                < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
-                        });
                         let mut marker = None;
                         if let Some(full) = full {
-                            if !cooled_down {
-                                if let Ok(serialized) = encode_delta(local_peer_id, &full) {
-                                    if let Err(e) = responder_pubsub
-                                        .publish(
-                                            responder_topic.clone(),
-                                            bytes::Bytes::from(serialized),
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            "KvStore state-response publish failed: {e}"
-                                        );
-                                    } else {
-                                        last_full_response = Some(tokio::time::Instant::now());
-                                        marker = Some(KvSyncMessage::StateServed {
-                                            responder: local_peer_id,
-                                            empty: is_empty,
-                                            checkpoint_seq,
-                                        });
-                                    }
+                            if let Ok(serialized) = encode_delta(local_peer_id, &full) {
+                                if let Err(e) = responder_pubsub
+                                    .publish(
+                                        responder_topic.clone(),
+                                        bytes::Bytes::from(serialized),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("KvStore state-response publish failed: {e}");
+                                } else {
+                                    last_full_response = Some(tokio::time::Instant::now());
+                                    marker = Some(KvSyncMessage::StateServed {
+                                        responder: local_peer_id,
+                                        empty: is_empty,
+                                        checkpoint_seq,
+                                    });
                                 }
                             }
-                        } else if is_owner {
+                        } else if !has_payload && is_owner {
                             // Checkpoint-less empty owner: nothing to serve,
                             // and only the OWNER may declare emptiness — an
                             // empty non-owner replica stays silent so
@@ -842,7 +868,8 @@ impl KvStoreSync {
     /// WHOLE process (every subscriber of those topic strings), which is
     /// only appropriate when this sync is the topics' sole consumer.
     /// In-process daemons discarding one handle should use
-    /// [`cancel_sync`](Self::cancel_sync) instead.
+    /// [`cancel_sync`](Self::cancel_sync) — or simply drop every handle
+    /// clone: the [`Drop`] impl cancels structurally.
     pub async fn stop(&self) -> Result<()> {
         // End the loops FIRST: the bootstrap requester's schedule is
         // infinite while the store is empty (issue #238), and unsubscribing
@@ -1454,6 +1481,22 @@ mod tests {
         assert!(
             sync.cancel.is_cancelled(),
             "stop() must cancel ALL background loops via the token"
+        );
+    }
+
+    /// WHY (parallel-review finding): teardown must be STRUCTURAL — a
+    /// caller that discards its last reference without remembering
+    /// cancel_sync() must still end all background loops (the requester is
+    /// infinite while unconverged), so Drop cancels the token.
+    #[tokio::test]
+    async fn dropping_the_sync_cancels_all_loops() {
+        let sync = make_sync("store/dropcancel", AccessPolicy::Signed).await;
+        let token = sync.cancel.clone();
+        assert!(!token.is_cancelled());
+        drop(sync);
+        assert!(
+            token.is_cancelled(),
+            "dropping the last sync reference must cancel every loop"
         );
     }
 

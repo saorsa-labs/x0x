@@ -132,6 +132,18 @@ pub struct TaskListSync {
     cancel: tokio_util::sync::CancellationToken,
 }
 
+/// Structural teardown (parallel-review finding): the background loops hold
+/// clones of the token, the list, and the pubsub — never the sync itself —
+/// so when the last `TaskListSync` reference drops, every loop (including
+/// the INFINITE bootstrap requester, issue #238) is cancelled without any
+/// caller having to remember `cancel_sync()`. The explicit rollback calls
+/// remain as belt-and-braces.
+impl Drop for TaskListSync {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 impl TaskListSync {
     /// Create a new TaskList synchronization manager.
     ///
@@ -238,7 +250,16 @@ impl TaskListSync {
                     () = listener_cancel.cancelled() => return,
                     msg = sub.recv() => msg,
                 };
-                let Some(msg) = msg else { return };
+                let Some(msg) = msg else {
+                    // The main-topic subscription is gone: this sync can no
+                    // longer replicate, so it is half-dead — self-cancel so
+                    // the sibling loops (in particular the INFINITE
+                    // bootstrap requester) never outlive it (parallel-review
+                    // finding: a dead sibling must not leave the requester
+                    // chattering at capped cadence forever).
+                    listener_cancel.cancel();
+                    return;
+                };
                 match decode_delta::<TaskListDelta>(&msg.payload) {
                     Ok((peer_id, delta)) => {
                         let mut list = task_list.write().await;
@@ -273,10 +294,11 @@ impl TaskListSync {
         spawn(Box::pin(async move {
             // Response-storm damping (issue #238 review): one full-state
             // response per cooldown window — the response is a broadcast,
-            // so it serves every concurrently-bootstrapping replica; a
-            // requester that lands inside the window still receives the
-            // (tiny) StateServed marker, so its convergence check runs
-            // against state served moments ago.
+            // so it serves every concurrently-bootstrapping replica. A
+            // request landing inside the window gets NOTHING (no response,
+            // no marker — markers must witness a real broadcast, round-3
+            // review); the requester is served by its next scheduled
+            // attempt.
             let mut last_full_response: Option<tokio::time::Instant> = None;
             loop {
                 let msg = tokio::select! {
@@ -284,13 +306,36 @@ impl TaskListSync {
                     () = responder_cancel.cancelled() => return,
                     msg = sync_sub.recv() => msg,
                 };
-                let Some(msg) = msg else { return };
+                let Some(msg) = msg else {
+                    // The side-topic subscription is gone: this sync can no
+                    // longer receive StateServed evidence, so the requester
+                    // could never legitimately stop — self-cancel so it
+                    // (and the sibling loops) never outlive the responder.
+                    responder_cancel.cancel();
+                    return;
+                };
                 let Ok(sync_msg) = bincode::deserialize::<TaskListSyncMessage>(&msg.payload) else {
                     continue;
                 };
                 match sync_msg {
                     TaskListSyncMessage::StateRequest { requester } => {
                         if requester == local_peer_id {
+                            continue;
+                        }
+                        // The StateServed marker is published ONLY alongside
+                        // an actual full-delta publish: a marker must
+                        // witness a real broadcast — one sent for a
+                        // cooldown-suppressed response could convince a
+                        // requester that never received the state to stop
+                        // asking (round-3 review). A requester inside the
+                        // window is served by its next scheduled attempt.
+                        // Checked BEFORE building the full delta — no point
+                        // cloning the whole list for a suppressed response.
+                        let cooled_down = last_full_response.is_some_and(|t| {
+                            t.elapsed()
+                                < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
+                        });
+                        if cooled_down {
                             continue;
                         }
                         // Empty holders stay entirely silent — no response,
@@ -302,20 +347,6 @@ impl TaskListSync {
                             }
                             list.full_delta()
                         };
-                        // The StateServed marker is published ONLY alongside
-                        // an actual full-delta publish: a marker must
-                        // witness a real broadcast — one sent for a
-                        // cooldown-suppressed response could convince a
-                        // requester that never received the state to stop
-                        // asking (round-3 review). A requester inside the
-                        // window is served by its next scheduled attempt.
-                        let cooled_down = last_full_response.is_some_and(|t| {
-                            t.elapsed()
-                                < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
-                        });
-                        if cooled_down {
-                            continue;
-                        }
                         let Ok(serialized) = encode_delta(local_peer_id, &full) else {
                             continue;
                         };
@@ -923,6 +954,22 @@ mod tests {
         assert!(
             sync.cancel.is_cancelled(),
             "stop() must cancel ALL background loops via the token"
+        );
+    }
+
+    /// WHY (parallel-review finding): teardown must be STRUCTURAL — a
+    /// caller that discards its last reference without remembering
+    /// cancel_sync() must still end all background loops (the requester is
+    /// infinite while unconverged), so Drop cancels the token.
+    #[tokio::test]
+    async fn dropping_the_sync_cancels_all_loops() {
+        let sync = make_sync("tasks/dropcancel").await;
+        let token = sync.cancel.clone();
+        assert!(!token.is_cancelled());
+        drop(sync);
+        assert!(
+            token.is_cancelled(),
+            "dropping the last sync reference must cancel every loop"
         );
     }
 
