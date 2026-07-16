@@ -873,3 +873,5 @@ MIT OR Apache-2.0
 [Saorsa Labs](https://saorsalabs.com) — *Saorsa: Freedom*
 
 From Barr, Scotland. For every agent, everywhere.
+
+<!-- CI probe: no-op change to run the Test Suite against main (flake investigation, issue #241) -->
