@@ -979,12 +979,16 @@ async fn joined_store_syncs_after_owner_returns_late() {
 
     // The owner returns. Bob's persistent tail must ask again (next request
     // ≤ the backoff ceiling away) and recover k1 — no re-join, no restart.
+    // Deadline covers the worst jittered envelope: a request missed during
+    // reconnection pushes recovery to the following tail attempt, and tail
+    // delays carry ±20% jitter (a 201s pass was observed against the old
+    // 240s bound — round-4 review).
     pair.alice.start().await;
     poll_until(
         &pair.bob,
         &format!("/stores/{store_topic}/k1"),
         "bob recovers k1 after the owner returns late (no re-join/restart)",
-        240,
+        360,
         |json| json["value"] == b64(b"offline-write"),
     )
     .await;

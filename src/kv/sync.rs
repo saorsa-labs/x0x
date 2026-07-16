@@ -199,11 +199,20 @@ pub struct KvStoreSync {
     /// rewrites of keys it no longer remembers holding.
     persist: std::sync::Mutex<Option<Arc<PersistCtx>>>,
 
-    /// Set by [`stop`](Self::stop). The bootstrap requester checks it every
-    /// iteration: its schedule is infinite (issue #238), and the sibling
-    /// loops hold strong `Arc`s to the store, so without this flag an
-    /// explicitly stopped sync would keep publishing state requests forever.
+    /// Set by [`silence_bootstrap`](Self::silence_bootstrap). The bootstrap
+    /// requester checks it every iteration: its schedule is infinite (issue
+    /// #238), so a sync that should stop generating traffic — but keep
+    /// serving (e.g. the deletion-test harness) — arms this without ending
+    /// the listener/responder loops.
     stopped: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Cancelled by [`cancel_sync`](Self::cancel_sync) / [`stop`](Self::stop).
+    /// ALL background loops (delta listener, responder, requester) select on
+    /// it, so a discarded sync tears down completely without the topic-wide
+    /// `unsubscribe` that would kill unrelated subscribers sharing the topic
+    /// string (round-4 review: flag-only teardown left ghost listeners and a
+    /// live responder until daemon shutdown).
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Shared persistence context for one store's snapshot file.
@@ -251,6 +260,7 @@ impl KvStoreSync {
             local_agent_id,
             persist: std::sync::Mutex::new(None),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -390,8 +400,17 @@ impl KvStoreSync {
         let persist_ctx = self.persist_ctx();
 
         let loop_persist_ctx = persist_ctx.clone();
+        let listener_cancel = self.cancel.clone();
         spawn(Box::pin(async move {
-            while let Some(msg) = sub.recv().await {
+            loop {
+                let msg = tokio::select! {
+                    // cancel_sync tears down every loop (round-4 review) —
+                    // recv alone would keep this listener alive until
+                    // daemon shutdown.
+                    () = listener_cancel.cancelled() => return,
+                    msg = sub.recv() => msg,
+                };
+                let Some(msg) = msg else { return };
                 if msg.topic != main_topic {
                     // Cross-topic replay defense: ignore envelopes not on our
                     // subscribed topic (see start_with_spawner).
@@ -457,13 +476,20 @@ impl KvStoreSync {
         // decide convergence.
         let served_evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
         let responder_served = Arc::clone(&served_evidence);
+        let responder_cancel = self.cancel.clone();
         spawn(Box::pin(async move {
             // Response-storm damping (issue #238 review): one full-state
             // response per cooldown window, regardless of how many replicas
             // are requesting — the response is a broadcast, so it serves
             // them all.
             let mut last_full_response: Option<tokio::time::Instant> = None;
-            while let Some(msg) = sync_sub.recv().await {
+            loop {
+                let msg = tokio::select! {
+                    // cancel_sync tears down every loop (round-4 review).
+                    () = responder_cancel.cancelled() => return,
+                    msg = sync_sub.recv() => msg,
+                };
+                let Some(msg) = msg else { return };
                 if msg.topic != sync_topic {
                     // Cross-topic replay defense (see start_with_spawner).
                     continue;
@@ -729,12 +755,18 @@ impl KvStoreSync {
             // authoritative kill switch is the `stopped` flag below.)
             let requester_store = Arc::downgrade(&self.store);
             let stopped = Arc::clone(&self.stopped);
+            let requester_cancel = self.cancel.clone();
             let requester_served = Arc::clone(&served_evidence);
             spawn(Box::pin(async move {
                 for (attempt, delay_secs) in state_request_delays().enumerate() {
-                    tokio::time::sleep(jittered_secs(delay_secs)).await;
+                    tokio::select! {
+                        // cancel_sync tears down every loop promptly, even
+                        // mid-sleep (round-4 review).
+                        () = requester_cancel.cancelled() => return,
+                        () = tokio::time::sleep(jittered_secs(delay_secs)) => {}
+                    }
                     if stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                        return; // stop() called — never chatter for a dead sync
+                        return; // silenced — never chatter for a dead sync
                     }
                     // Tail attempts stop on convergence; front attempts
                     // always run (see above — partial early state must not
@@ -778,20 +810,30 @@ impl KvStoreSync {
         Ok(())
     }
 
-    /// Silence this sync's bootstrap requester (its schedule is infinite
-    /// while unconverged — issue #238) WITHOUT touching topic
+    /// Silence ONLY this sync's bootstrap requester (its schedule is
+    /// infinite while unconverged — issue #238), leaving the listener and
+    /// responder loops serving.
+    ///
+    /// Use when the replica should keep replicating but never generate
+    /// bootstrap chatter (e.g. an authoritative holder in a single-identity
+    /// test harness). Discarded handles want [`cancel_sync`](Self::cancel_sync).
+    pub fn silence_bootstrap(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Tear down ALL of this sync's background loops (delta listener,
+    /// state-request responder, bootstrap requester) WITHOUT touching topic
     /// subscriptions.
     ///
     /// This is the correct teardown for a discarded handle inside a daemon:
     /// `PubSubManager::unsubscribe` (what [`stop`](Self::stop) does) removes
     /// the ENTIRE topic — including subscriptions owned by other components
-    /// that legally share the topic string — so a registration-rollback
-    /// must never unsubscribe, only stop generating traffic. The passive
-    /// listener loops end at `Agent::shutdown()` like every other tracked
-    /// task.
-    pub fn silence_bootstrap(&self) {
-        self.stopped
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+    /// that legally share the topic string. Ending the loops drops their
+    /// `Subscription` receivers, so the pub/sub layer prunes the closed
+    /// senders on its next delivery.
+    pub fn cancel_sync(&self) {
+        self.cancel.cancel();
     }
 
     /// Stop background synchronization.
@@ -800,12 +842,12 @@ impl KvStoreSync {
     /// WHOLE process (every subscriber of those topic strings), which is
     /// only appropriate when this sync is the topics' sole consumer.
     /// In-process daemons discarding one handle should use
-    /// [`silence_bootstrap`](Self::silence_bootstrap) instead.
+    /// [`cancel_sync`](Self::cancel_sync) instead.
     pub async fn stop(&self) -> Result<()> {
-        // Arm the requester kill flag FIRST: the bootstrap requester's
-        // schedule is infinite while the store is empty (issue #238), and
-        // unsubscribing does not end that loop (it holds no subscription).
-        self.silence_bootstrap();
+        // End the loops FIRST: the bootstrap requester's schedule is
+        // infinite while the store is empty (issue #238), and unsubscribing
+        // does not end that loop (it holds no subscription).
+        self.cancel_sync();
         self.pubsub.unsubscribe(&self.topic).await;
         self.pubsub.unsubscribe(&self.state_sync_topic()).await;
         Ok(())
@@ -1387,22 +1429,31 @@ mod tests {
         sync.stop().await.expect("second stop (idempotent)");
     }
 
-    /// WHY (round-1 review): the requester's schedule is now INFINITE while
+    /// WHY (rounds 1+4 review): the requester's schedule is INFINITE while
     /// the store is empty, and the sibling loops hold strong `Arc`s to the
-    /// store — so `stop()` arming this flag is the only thing that prevents
-    /// a stopped sync from publishing state requests forever. The requester
-    /// checks the flag on every iteration.
+    /// store — so the cancellation token (all loops) and the
+    /// silence_bootstrap flag (requester only) are the only things that end
+    /// a discarded sync's background work before daemon shutdown.
     #[tokio::test]
-    async fn stop_arms_the_requester_kill_flag() {
+    async fn stop_and_silence_arm_their_kill_switches() {
         let sync = make_sync("store/stopflag", AccessPolicy::Signed).await;
         assert!(
-            !sync.stopped.load(std::sync::atomic::Ordering::Relaxed),
-            "flag must start disarmed"
+            !sync.cancel.is_cancelled() && !sync.stopped.load(std::sync::atomic::Ordering::Relaxed),
+            "both switches must start disarmed"
+        );
+        sync.silence_bootstrap();
+        assert!(
+            sync.stopped.load(std::sync::atomic::Ordering::Relaxed),
+            "silence_bootstrap() arms the requester-only flag"
+        );
+        assert!(
+            !sync.cancel.is_cancelled(),
+            "silence_bootstrap() must NOT cancel the listener/responder loops"
         );
         sync.stop().await.expect("stop");
         assert!(
-            sync.stopped.load(std::sync::atomic::Ordering::Relaxed),
-            "stop() must arm the requester kill flag"
+            sync.cancel.is_cancelled(),
+            "stop() must cancel ALL background loops via the token"
         );
     }
 

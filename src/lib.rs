@@ -10240,19 +10240,19 @@ impl std::fmt::Debug for TaskListHandle {
 }
 
 impl TaskListHandle {
-    /// Silence this replica's bootstrap requester — its schedule is
-    /// infinite while unconverged (issue #238), so a discarded handle must
-    /// silence it explicitly or it publishes state requests until
-    /// `Agent::shutdown()`.
+    /// Tear down this replica's background sync loops (delta listener,
+    /// responder, and the bootstrap requester — whose schedule is infinite
+    /// while unconverged, issue #238). A discarded handle must call this or
+    /// its loops run until `Agent::shutdown()`.
     ///
     /// Deliberately does NOT unsubscribe: `PubSubManager::unsubscribe` is
     /// topic-wide and would tear down every other subscriber sharing the
-    /// topic string (round-3 review). The passive listener loops end at
-    /// shutdown like every other tracked task. Callers that remove a handle
-    /// without keeping any other clone (e.g. the daemon's
-    /// registration-rollback paths) MUST call this.
-    pub fn silence_bootstrap(&self) {
-        self.sync.silence_bootstrap();
+    /// topic string (round-3 review); ending the loops instead drops their
+    /// receivers, which the pub/sub layer prunes on its next delivery.
+    /// Callers that remove a handle without keeping any other clone (e.g.
+    /// the daemon's registration-rollback paths) MUST call this.
+    pub fn cancel_sync(&self) {
+        self.sync.cancel_sync();
     }
 
     /// Generate a fresh per-replica epoch at handle construction.
@@ -10993,19 +10993,19 @@ impl KvStoreHandle {
         self.peer_id
     }
 
-    /// Silence this replica's bootstrap requester — its schedule is
-    /// infinite while unconverged (issue #238), so a discarded handle must
-    /// silence it explicitly or it publishes state requests until
-    /// `Agent::shutdown()`.
+    /// Tear down this replica's background sync loops (delta listener,
+    /// responder, and the bootstrap requester — whose schedule is infinite
+    /// while unconverged, issue #238). A discarded handle must call this or
+    /// its loops run until `Agent::shutdown()`.
     ///
     /// Deliberately does NOT unsubscribe: `PubSubManager::unsubscribe` is
     /// topic-wide and would tear down every other subscriber sharing the
-    /// topic string (round-3 review). The passive listener loops end at
-    /// shutdown like every other tracked task. Callers that remove a handle
-    /// without keeping any other clone (e.g. the daemon's
-    /// registration-rollback paths) MUST call this.
-    pub fn silence_bootstrap(&self) {
-        self.sync.silence_bootstrap();
+    /// topic string (round-3 review); ending the loops instead drops their
+    /// receivers, which the pub/sub layer prunes on its next delivery.
+    /// Callers that remove a handle without keeping any other clone (e.g.
+    /// the daemon's registration-rollback paths) MUST call this.
+    pub fn cancel_sync(&self) {
+        self.sync.cancel_sync();
     }
 
     /// Return the store's ownership/policy/version metadata for auditability.
