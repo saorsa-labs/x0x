@@ -18,6 +18,7 @@ mod messaging;
 mod network;
 mod presence;
 mod status;
+mod stores;
 mod tasks;
 mod trust;
 mod upgrade;
@@ -75,6 +76,10 @@ pub(super) use trust::evaluate_trust;
 pub(super) use upgrade::{
     SelfPublishedReleaseManifests, apply_upgrade, broadcast_current_manifest, check_upgrade,
     run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+};
+pub(super) use stores::{
+    KV_STORE_DELTA_DM_PREFIX, KvStoreDirectDelta, apply_direct_kv_store_delta, create_kv_store,
+    delete_kv_value, get_kv_value, join_kv_store, list_kv_keys, list_kv_stores, put_kv_value,
 };
 pub(super) use tasks::{
     add_task, apply_group_authorization, create_task_list, list_task_lists, list_tasks, update_task,
