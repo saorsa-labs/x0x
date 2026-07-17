@@ -384,6 +384,17 @@ fn lp_bytes(buf: &mut Vec<u8>, data: &[u8]) {
 /// byte-for-byte on identical content. The empty set's digest is universally
 /// computable — that is what lets an EMPTY holder declare authoritative
 /// emptiness to an empty requester.
+///
+/// Unlike [`content_root`] it also EXCLUDES `created_at` (F1, fix-loop):
+/// [`KvEntry::merge`] preserves the EARLIEST `created_at`, so when an owner
+/// deletes and re-creates a key, a replica holding the original entry keeps
+/// `T1` while the owner commits `T2` — a digest committing `created_at`
+/// would NEVER match and the bootstrap would wedge at capped cadence
+/// forever. `created_at` is display provenance, not merge-converged content
+/// (`updated_at` IS merge-stable: max-wins, so both sides agree on it after
+/// the serve merges). The checkpoint `content_root` keeps `created_at`
+/// because checkpoint adoption is a full REPLACE verified byte-for-byte —
+/// no merge semantics, so the commitment there is exact.
 #[must_use]
 pub(crate) fn served_content_digest(
     store_id: &KvStoreId,
@@ -395,9 +406,31 @@ pub(crate) fn served_content_digest(
     let mut sorted = entries.to_vec();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     for (outer_key, entry) in &sorted {
-        h.update(&entry_commitment_bytes(outer_key, entry));
+        h.update(&served_entry_commitment_bytes(outer_key, entry));
     }
     *h.finalize().as_bytes()
+}
+
+/// Canonical length-delimited encoding of one entry's merge-converged
+/// fields for the served-state digest. Identical to
+/// [`entry_commitment_bytes`] MINUS `created_at` — see
+/// [`served_content_digest`] for why.
+fn served_entry_commitment_bytes(outer_key: &str, entry: &KvEntry) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+    lp_bytes(&mut buf, outer_key.as_bytes());
+    lp_bytes(&mut buf, entry.key.as_bytes());
+    lp_bytes(&mut buf, &entry.value);
+    lp_bytes(&mut buf, &entry.content_hash);
+    lp_bytes(&mut buf, entry.content_type.as_bytes());
+    let mut meta: Vec<_> = entry.metadata.iter().collect();
+    meta.sort_by(|a, b| a.0.cmp(b.0));
+    buf.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+    for (mk, mv) in &meta {
+        lp_bytes(&mut buf, mk.as_bytes());
+        lp_bytes(&mut buf, mv.as_bytes());
+    }
+    buf.extend_from_slice(&entry.updated_at.to_le_bytes());
+    buf
 }
 
 /// Full-field entry equality for the AppendOnly freeze.
@@ -1666,7 +1699,18 @@ impl KvStore {
         // cloning the whole key set into an intermediate HashSet first.
         for key in self.keys.elements() {
             if let Some(entry) = self.entries.get(key) {
-                let tag = (PeerId::new([0u8; 32]), 0);
+                // Synthetic tags must be FRESH per entry (F3, fix-loop):
+                // the digest-verified adopt prunes stale keys with a local
+                // observe-remove, which tombstones the tags a previous full
+                // delta used. A hardcoded tag would then be silently
+                // rejected on a later serve that re-adds the key — a
+                // permanent re-add deadlock. Minting from the store's own
+                // counter guarantees a re-serve's tag is never one this
+                // store has issued before (snapshot persistence floors the
+                // counter across restarts, so that holds after a restart
+                // too). The zero peer id is fine: tags are scoped per key,
+                // and uniqueness over time is what the tombstones require.
+                let tag = (PeerId::new([0u8; 32]), self.next_seq());
                 delta.added.insert(key.clone(), (entry.clone(), tag));
             }
         }

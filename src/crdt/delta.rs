@@ -159,7 +159,12 @@ impl TaskList {
     /// with `merge_delta`, whose upsert/LWW semantics make a full snapshot a
     /// safe superset of any incremental change — this is the producer used to
     /// answer cold-start state requests (see `TaskListSync`). The OR-Set tags
-    /// are synthetic because the receiver re-derives membership on merge.
+    /// are synthetic because the receiver re-derives membership on merge —
+    /// but they must be FRESH per entry (F3, fix-loop): the digest-verified
+    /// adopt prunes stale tasks with a local observe-remove, which
+    /// tombstones the tags a previous full delta used, and a hardcoded tag
+    /// would then be silently rejected on a later serve that re-adds the
+    /// task — a permanent re-add deadlock.
     #[must_use]
     pub fn full_delta(&self) -> TaskListDelta {
         let mut delta = TaskListDelta::new(self.version());
@@ -167,7 +172,7 @@ impl TaskList {
         let ordered = self.tasks_ordered();
         for task in &ordered {
             let task_id = *task.id();
-            let tag = (PeerId::new([0u8; 32]), 0);
+            let tag = (PeerId::new([0u8; 32]), self.next_seq());
             delta.added_tasks.insert(task_id, ((*task).clone(), tag));
         }
 

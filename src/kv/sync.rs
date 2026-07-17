@@ -558,9 +558,49 @@ impl KvStoreSync {
                                             .get(&peer_id)
                                             .copied();
                                         if let Some(declared) = declared {
-                                            let authorized =
-                                                writer.is_some_and(|w| s.is_authorized(w));
-                                            if authorized
+                                            // Prune authority (F2,
+                                            // fix-loop): absence from a
+                                            // verified serve proves
+                                            // deletion ONLY when the
+                                            // sender is the SOLE possible
+                                            // content author. Under
+                                            // Signed that is the anchored
+                                            // owner — and every key this
+                                            // replica can hold was
+                                            // admitted under that same
+                                            // auth (or an owner-signed
+                                            // checkpoint), so the owner's
+                                            // serve is complete about all
+                                            // of them. Under Allowlisted
+                                            // the owner's serve can be
+                                            // legitimately incomplete
+                                            // about co-writers' keys (an
+                                            // owner that has not merged
+                                            // an allowlisted write would
+                                            // otherwise TRUNCATE it), so
+                                            // pruning is disabled there —
+                                            // deletions still propagate
+                                            // via live `removed` deltas,
+                                            // and the digest mismatch
+                                            // resolves when the owner
+                                            // absorbs the co-write and
+                                            // re-serves. (The review's
+                                            // alternative count guard —
+                                            // prune only when local-count
+                                            // <= declared-count — was
+                                            // rejected: the residual-2
+                                            // stale replica is exactly a
+                                            // local SUPERSET of the serve,
+                                            // so that rule disables
+                                            // pruning precisely where
+                                            // deletion cold-sync needs
+                                            // it.)
+                                            let sole_author = matches!(
+                                                s.policy(),
+                                                AccessPolicy::Signed
+                                            ) && writer.is_some()
+                                                && s.owner() == writer;
+                                            if sole_author
                                                 && delta.added.len()
                                                     == declared.entry_count as usize
                                                 && delta
@@ -2820,5 +2860,304 @@ mod tests {
             recovered,
             "a tampered marker must not wedge recovery from a genuine holder"
         );
+    }
+
+    /// WHY (F1, fix-loop — delete+recreate wedge): `KvEntry::merge`
+    /// preserves the EARLIEST `created_at`, so a replica holding the
+    /// original entry and an owner that deleted+re-created the key
+    /// permanently disagree on `created_at`. A served digest committing it
+    /// could never match and the requester would wedge at capped cadence
+    /// forever. The digest excludes `created_at` (merge-converged fields
+    /// only), so the re-created key converges.
+    #[tokio::test(start_paused = true)]
+    async fn recreated_key_converges_after_owner_delete_and_recreate() {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-240-recreate";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        // The ORIGINAL entry, as the replica synced it before going offline.
+        let mut owned = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner_id,
+            AccessPolicy::Signed,
+        );
+        owned
+            .put("k".to_string(), b"v1".to_vec(), "text/plain".to_string(), peer(1))
+            .expect("original put");
+        // Age the replica's copy deterministically: even in the same
+        // wall-clock millisecond, the replica's created/updated timestamps
+        // are strictly older than the re-created entry's.
+        let mut aged = owned.get("k").expect("original entry").clone();
+        aged.created_at -= 10_000;
+        aged.updated_at -= 10_000;
+
+        // The owner DELETES and RE-CREATES the key while the replica is
+        // away: the owner's entry now carries a fresh created_at.
+        owned.remove("k").expect("owner delete");
+        owned
+            .put("k".to_string(), b"v2".to_vec(), "text/plain".to_string(), peer(1))
+            .expect("owner recreate");
+
+        // The replica returns holding the ORIGINAL (aged) entry.
+        let mut replica = KvStore::new_replica(
+            store_id(1),
+            String::new(),
+            Some(owner_id),
+            crate::kv::store::AnchorChannel::Persistence,
+        );
+        let mut seed = KvStoreDelta::new(1);
+        seed.added.insert("k".to_string(), (aged, (peer(1), 1)));
+        replica
+            .merge_delta(&seed, peer(1), Some(&owner_id))
+            .expect("seed original entry");
+        let joiner = KvStoreSync::new(
+            replica,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+        let owner_sync = KvStoreSync::new(
+            owned,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner_id),
+        )
+        .expect("owner sync");
+        owner_sync.start().await.expect("start owner");
+
+        // The re-created value must arrive…
+        let mut recovered = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.get("k").map(|e| e.value.clone())
+                == Some(b"v2".to_vec())
+            {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered, "the re-created entry must merge");
+
+        // …and the requester must CONVERGE, not wedge on the created_at
+        // mismatch (the pre-fix failure mode).
+        tokio::time::sleep(Duration::from_secs(160)).await;
+        drain_state_requests(&mut probe, peer(2)).await;
+        let mut relapse = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            relapse += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert_eq!(
+            relapse, 0,
+            "a delete+recreate must not wedge the requester on created_at"
+        );
+    }
+
+    /// WHY (F2, fix-loop — multi-writer truncation): absence from a
+    /// verified serve proves deletion ONLY when the sender is the sole
+    /// possible content author. In an Allowlisted store the owner's serve
+    /// can be legitimately incomplete about co-writers' keys, so the adopt
+    /// must NOT prune there — otherwise an owner-only serve truncates an
+    /// allowlisted writer's legitimate key during the bootstrap window.
+    #[tokio::test(start_paused = true)]
+    async fn allowlisted_writer_key_survives_owner_only_serve() {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-240-allowlisted";
+        let writer = agent(7);
+
+        // Owner: Allowlisted, holding only k_owner.
+        let mut owned = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner_id,
+            AccessPolicy::Allowlisted,
+        );
+        owned.allow_writer(writer, &owner_id).expect("allow writer");
+        owned
+            .put(
+                "k_owner".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner put");
+
+        // Replica: anchored on the owner and already POLICY-AWARE (a
+        // restored replica has the allowlist persisted; the merge below
+        // requires it — under the Signed default the writer's key would be
+        // rejected outright). It holds k_owner (aged copy from the owner's
+        // own delta — the serve must refresh its updated_at, proving the
+        // verified adopt path actually ran) and k_writer, written by the
+        // allowlisted writer, which the owner has NOT merged.
+        let mut replica = KvStore::new_replica(
+            store_id(1),
+            String::new(),
+            Some(owner_id),
+            crate::kv::store::AnchorChannel::Persistence,
+        );
+        replica
+            .learn_ownership(
+                owner_id,
+                AccessPolicy::Allowlisted,
+                owned.policy_version(),
+                &owner_id,
+            )
+            .expect("learn policy");
+        // The replica must also know the allowlist itself (learned via
+        // owner-gated deltas in production) or the writer's key merge is
+        // rejected by access control.
+        replica.allow_writer(writer, &owner_id).expect("learn allowlist");
+        let k_owner_seed = {
+            let full = owned.full_delta();
+            let (key, (entry, tag)) = full
+                .added
+                .iter()
+                .find(|(k, _)| k.as_str() == "k_owner")
+                .expect("k_owner in full delta");
+            let mut aged = entry.clone();
+            aged.created_at -= 10_000;
+            aged.updated_at -= 10_000;
+            let mut d = KvStoreDelta::new(1);
+            d.added.insert(key.clone(), (aged, *tag));
+            d
+        };
+        replica
+            .merge_delta(&k_owner_seed, peer(1), Some(&owner_id))
+            .expect("seed k_owner");
+        let writer_entry = KvEntry::new(
+            "k_writer".to_string(),
+            b"w".to_vec(),
+            "text/plain".to_string(),
+        );
+        let mut writer_delta = KvStoreDelta::new(2);
+        writer_delta
+            .added
+            .insert("k_writer".to_string(), (writer_entry, (peer(7), 1)));
+        replica
+            .merge_delta(&writer_delta, peer(7), Some(&writer))
+            .expect("seed k_writer");
+        let owner_updated_at = owned
+            .get("k_owner")
+            .expect("owner entry")
+            .updated_at;
+
+        let joiner = KvStoreSync::new(
+            replica,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+        let owner_sync = KvStoreSync::new(
+            owned,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner_id),
+        )
+        .expect("owner sync");
+        owner_sync.start().await.expect("start owner");
+
+        // Drive several serve windows (the requester keeps asking — its
+        // digest {k_owner,k_writer} never matches the owner's {k_owner}
+        // declaration until the owner absorbs the co-write).
+        let mut serve_landed = false;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let s = joiner.read().await;
+            assert!(
+                s.get("k_writer").is_some(),
+                "an owner-only serve must NOT prune an allowlisted writer's key"
+            );
+            if s.get("k_owner").map(|e| e.updated_at) == Some(owner_updated_at)
+            {
+                serve_landed = true;
+            }
+        }
+        assert!(
+            serve_landed,
+            "the owner's verified serve must have merged (aged entry refreshed)"
+        );
+    }
+
+    /// WHY (F3, fix-loop — tombstone + hardcoded-tag deadlock): the adopt's
+    /// prune is a local observe-remove, tombstoning the tags a previous
+    /// full delta used. With a hardcoded synthetic tag, a later serve
+    /// re-adding the same key would be silently rejected forever. Full
+    /// deltas now mint FRESH tags, so a re-served key is accepted.
+    #[test]
+    fn pruned_key_is_accepted_when_re_served_with_fresh_tags() {
+        let owner = agent(1);
+        let mut holder = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner,
+            AccessPolicy::Signed,
+        );
+        holder
+            .put("k_live".to_string(), b"v".to_vec(), "text/plain".to_string(), peer(1))
+            .expect("put live");
+        holder
+            .put("k_doomed".to_string(), b"x".to_vec(), "text/plain".to_string(), peer(1))
+            .expect("put doomed");
+
+        // The replica absorbs a first full serve (both keys).
+        let mut replica = KvStore::new_replica(
+            store_id(1),
+            String::new(),
+            Some(owner),
+            crate::kv::store::AnchorChannel::RestParam,
+        );
+        let s1 = holder.full_delta();
+        replica
+            .merge_delta(&s1, peer(1), Some(&owner))
+            .expect("serve 1");
+        assert!(replica.get("k_doomed").is_some());
+
+        // The holder deletes the key; the next VERIFIED serve prunes it
+        // (tombstoning the first serve's synthetic tag locally).
+        holder.remove("k_doomed").expect("delete");
+        let s2 = holder.full_delta();
+        assert_eq!(
+            s2.served_digest(&store_id(1)),
+            Some(holder.served_digest()),
+            "the serve must carry the holder's declared digest"
+        );
+        replica
+            .merge_delta(&s2, peer(1), Some(&owner))
+            .expect("serve 2");
+        assert_eq!(replica.prune_to_served_set(&s2), 1);
+        assert!(replica.get("k_doomed").is_none());
+
+        // The holder RE-ADDS the key: a later serve must be accepted —
+        // pre-fix, its synthetic tag was tombstoned by the prune and the
+        // re-add silently dropped.
+        holder
+            .put("k_doomed".to_string(), b"y".to_vec(), "text/plain".to_string(), peer(1))
+            .expect("re-add");
+        let s3 = holder.full_delta();
+        replica
+            .merge_delta(&s3, peer(1), Some(&owner))
+            .expect("serve 3");
+        let entry = replica
+            .get("k_doomed")
+            .expect("a re-served key must be accepted after a prune");
+        assert_eq!(entry.value, b"y");
     }
 }

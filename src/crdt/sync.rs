@@ -1847,4 +1847,53 @@ mod tests {
             "a tampered marker must not wedge recovery from a genuine holder"
         );
     }
+
+    /// WHY (F3, fix-loop — tombstone + hardcoded-tag deadlock): the adopt's
+    /// prune is a local observe-remove, tombstoning the tags a previous
+    /// full delta used. With a hardcoded synthetic tag, a later serve
+    /// re-adding the same task would be silently rejected forever. Full
+    /// deltas now mint FRESH tags, so a re-served task is accepted.
+    #[test]
+    fn pruned_task_is_accepted_when_re_served_with_fresh_tags() {
+        let mut holder = TaskList::new(list_id(1), "List".to_string(), peer(1));
+        holder
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("add t1");
+        holder
+            .add_task(make_task(2, peer(1)), peer(1), 2)
+            .expect("add t2");
+
+        // The replica absorbs a first full serve (both tasks).
+        let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
+        let s1 = holder.full_delta();
+        replica.merge_delta(&s1, peer(1)).expect("serve 1");
+        assert_eq!(replica.task_count(), 2);
+
+        // The holder deletes the task; the next VERIFIED serve prunes it
+        // (tombstoning the first serve's synthetic tag locally).
+        let doomed = TaskId::from_bytes([2; 32]);
+        holder.remove_task(&doomed).expect("delete");
+        let s2 = holder.full_delta();
+        assert_eq!(
+            s2.served_digest(&list_id(1)),
+            Some(holder.served_digest()),
+            "the serve must carry the holder's declared digest"
+        );
+        replica.merge_delta(&s2, peer(1)).expect("serve 2");
+        assert_eq!(replica.prune_to_served_set(&s2), 1);
+        assert!(replica.get_task(&doomed).is_none());
+
+        // The holder RE-ADDS the task: a later serve must be accepted —
+        // pre-fix, its synthetic tag was tombstoned by the prune and the
+        // re-add silently dropped.
+        holder
+            .add_task(make_task(2, peer(1)), peer(1), 3)
+            .expect("re-add");
+        let s3 = holder.full_delta();
+        replica.merge_delta(&s3, peer(1)).expect("serve 3");
+        assert!(
+            replica.get_task(&doomed).is_some(),
+            "a re-served task must be accepted after a prune"
+        );
+    }
 }
