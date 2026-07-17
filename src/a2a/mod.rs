@@ -6,7 +6,7 @@
 //!
 //! This is the *discovery* half of A2A interop (ADR-0017,
 //! `docs/design/a2a-agent-card-adapter.md`). The *delivery* half — the
-//! A2A-over-x0x message binding — lives in [`binding`] (issue #112):
+//! A2A-over-x0x message binding — lives in the `binding` submodule (issue #112):
 //! increment 1 ships the envelope codec + unary request/response
 //! correlation; streaming, push notifications, and large artifacts are
 //! later increments, so `capabilities.streaming` / `pushNotifications`

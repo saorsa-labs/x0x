@@ -26,7 +26,7 @@
 //!   additive.
 //!
 //! Delivery uses `send_direct_with_config` preferring the `RawQuicAcked`
-//! path (design §4 delivery proof), falling back per [`DmSendConfig`]
+//! path (design §4 delivery proof), falling back per `DmSendConfig`
 //! policy when no live raw connection exists.
 //!
 //! Streaming (`message/stream`), push notifications, and large-artifact
