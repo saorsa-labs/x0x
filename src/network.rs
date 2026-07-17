@@ -1844,7 +1844,7 @@ impl NetworkNode {
     }
 
     /// Issue #120: transport-observed origin token for a connected peer —
-    /// the same live connection-table data [`Self::connected_peer_snapshot`]
+    /// the same live connection-table data `Self::connected_peer_snapshot`
     /// reads (and `add_from_connection` enriches the bootstrap cache from),
     /// coarsened via [`crate::connectivity::ObservedOrigin`].
     ///
