@@ -11,6 +11,7 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -19,7 +20,6 @@ use x0x::a2a::binding::{
 };
 use x0x::network::NetworkConfig;
 use x0x::{Agent, DiscoveredAgent};
-use serde_json::Value;
 
 fn loopback_network_config() -> NetworkConfig {
     NetworkConfig {
@@ -259,7 +259,10 @@ async fn unary_round_trip_over_dm() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     assert_eq!(message["kind"], Value::String("message".to_string()));
     assert_eq!(message["role"], Value::String("agent".to_string()));
-    assert_eq!(message["parts"][0]["text"], Value::String("ack:hello-a2a".to_string()));
+    assert_eq!(
+        message["parts"][0]["text"],
+        Value::String("ack:hello-a2a".to_string())
+    );
 
     let task = pair
         .alice_session
@@ -324,8 +327,8 @@ async fn unknown_method_returns_jsonrpc_error() -> Result<(), Box<dyn std::error
 /// in-flight entry is removed, and the session stays healthy for a
 /// follow-up call (no cross-talk with the stalled request).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn request_timeout_fires_and_session_stays_healthy(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn request_timeout_fires_and_session_stays_healthy() -> Result<(), Box<dyn std::error::Error>>
+{
     let temp_dir = TempDir::new().unwrap();
     let Some(pair) = setup_pair(&temp_dir, Duration::from_millis(500)).await? else {
         return Ok(());
@@ -356,7 +359,11 @@ async fn request_timeout_fires_and_session_stays_healthy(
     // still round-trips.
     let message = pair
         .alice_session
-        .call(&pair.bob_id, "message/send", Some(message_send_params("after-timeout")))
+        .call(
+            &pair.bob_id,
+            "message/send",
+            Some(message_send_params("after-timeout")),
+        )
         .await?;
     assert_eq!(
         message["parts"][0]["text"],
@@ -369,8 +376,7 @@ async fn request_timeout_fires_and_session_stays_healthy(
 /// (HTTP-client-disconnect shape) and the peer never responds — the
 /// in-flight entry MUST be removed, not leaked for the session's life.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dropped_call_future_cleans_in_flight_entry(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn dropped_call_future_cleans_in_flight_entry() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new().unwrap();
     let Some(pair) = setup_pair(&temp_dir, Duration::from_secs(30)).await? else {
         return Ok(());
@@ -393,7 +399,9 @@ async fn dropped_call_future_cleans_in_flight_entry(
     // Caller "disconnects": the call future is dropped while awaiting a
     // response that will never come.
     handle.abort();
-    let join_err = handle.await.expect_err("aborted task must join as cancelled");
+    let join_err = handle
+        .await
+        .expect_err("aborted task must join as cancelled");
     assert!(join_err.is_cancelled());
 
     assert_eq!(
@@ -414,16 +422,17 @@ async fn concurrent_calls_do_not_cross_correlation() -> Result<(), Box<dyn std::
         return Ok(());
     };
     register_a2a_handlers(&pair.bob_session);
-    pair.bob_session.register_handler("work/echo", |params| async move {
-        let i = params
-            .as_ref()
-            .and_then(|p| p.get("i"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        // Deterministic scatter so responses arrive out of order.
-        tokio::time::sleep(Duration::from_millis(((i * 37) % 5) * 10)).await;
-        Ok(serde_json::json!({"i": i, "echoed": true}))
-    });
+    pair.bob_session
+        .register_handler("work/echo", |params| async move {
+            let i = params
+                .as_ref()
+                .and_then(|p| p.get("i"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            // Deterministic scatter so responses arrive out of order.
+            tokio::time::sleep(Duration::from_millis(((i * 37) % 5) * 10)).await;
+            Ok(serde_json::json!({"i": i, "echoed": true}))
+        });
 
     let mut set = tokio::task::JoinSet::new();
     for lane in 0..4u64 {

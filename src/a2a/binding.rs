@@ -115,8 +115,7 @@ impl BindingEnvelope {
 
 /// Serialize an envelope for the DM wire, enforcing the DM payload cap.
 pub fn encode_envelope(envelope: &BindingEnvelope) -> Result<Vec<u8>, BindingError> {
-    let bytes =
-        serde_json::to_vec(envelope).map_err(|e| BindingError::Encode(e.to_string()))?;
+    let bytes = serde_json::to_vec(envelope).map_err(|e| BindingError::Encode(e.to_string()))?;
     if bytes.len() > crate::direct::MAX_DIRECT_PAYLOAD_SIZE {
         return Err(BindingError::PayloadTooLarge {
             len: bytes.len(),
@@ -318,9 +317,8 @@ pub enum BindingError {
 /// Application handler for one A2A method: params in, JSON-RPC result or
 /// error out. Handlers run in their own tasks so a slow handler never
 /// blocks the receive loop.
-pub type BindingHandler = Arc<
-    dyn Fn(Option<Value>) -> BoxFuture<'static, Result<Value, JsonRpcError>> + Send + Sync,
->;
+pub type BindingHandler =
+    Arc<dyn Fn(Option<Value>) -> BoxFuture<'static, Result<Value, JsonRpcError>> + Send + Sync>;
 
 /// Per-session configuration.
 #[derive(Debug, Clone)]
@@ -650,9 +648,8 @@ mod tests {
 
     #[test]
     fn envelope_round_trips_request() {
-        let envelope =
-            BindingEnvelope::new(KIND_REQUEST, "corr-1".to_string(), &sample_request())
-                .expect("build envelope");
+        let envelope = BindingEnvelope::new(KIND_REQUEST, "corr-1".to_string(), &sample_request())
+            .expect("build envelope");
         assert_eq!(envelope.binding, X0X_BINDING_VERSION);
         let bytes = encode_envelope(&envelope).expect("encode");
         let decoded = decode_envelope(&bytes).expect("decode");
@@ -669,11 +666,10 @@ mod tests {
             JsonRpcError::method_not_found("tasks/resubscribe"),
             Value::String("corr-9".to_string()),
         );
-        let envelope =
-            BindingEnvelope::new(KIND_RESPONSE, "corr-9".to_string(), &response)
-                .expect("build envelope");
-        let decoded = decode_envelope(&encode_envelope(&envelope).expect("encode"))
-            .expect("decode");
+        let envelope = BindingEnvelope::new(KIND_RESPONSE, "corr-9".to_string(), &response)
+            .expect("build envelope");
+        let decoded =
+            decode_envelope(&encode_envelope(&envelope).expect("encode")).expect("decode");
         let parsed: JsonRpcResponse =
             serde_json::from_value(decoded.jsonrpc).expect("parse jsonrpc");
         let error = parsed.error.expect("error object");
@@ -683,9 +679,8 @@ mod tests {
 
     #[test]
     fn wire_shape_matches_design_sketch() {
-        let envelope =
-            BindingEnvelope::new(KIND_REQUEST, "corr-1".to_string(), &sample_request())
-                .expect("build envelope");
+        let envelope = BindingEnvelope::new(KIND_REQUEST, "corr-1".to_string(), &sample_request())
+            .expect("build envelope");
         let value: Value =
             serde_json::from_slice(&encode_envelope(&envelope).expect("encode")).expect("json");
         assert_eq!(value["x0xBinding"], json!("a2a/1"));
