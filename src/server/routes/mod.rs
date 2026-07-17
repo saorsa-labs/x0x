@@ -10,6 +10,7 @@ mod identity;
 mod machines;
 mod status;
 mod tasks;
+mod upgrade;
 
 #[cfg(test)]
 pub(super) use contacts::UpdateContactRequest;
@@ -28,6 +29,10 @@ pub(super) use status::{get_constitution, get_constitution_json, health, shutdow
 pub(super) use machines::{
     add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,
     machines_by_user_handler, pin_machine, unpin_machine,
+};
+pub(super) use upgrade::{
+    SelfPublishedReleaseManifests, apply_upgrade, broadcast_current_manifest, check_upgrade,
+    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
 };
 pub(super) use tasks::{
     add_task, apply_group_authorization, create_task_list, list_task_lists, list_tasks, update_task,
