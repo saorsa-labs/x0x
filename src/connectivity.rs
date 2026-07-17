@@ -207,13 +207,96 @@ fn is_vpn_egress(ip: IpAddr) -> bool {
 }
 
 /// Whether `ip` is in the RFC 6598 CGNAT range.
-fn is_cgnat(ip: IpAddr) -> bool {
+pub(crate) fn is_cgnat(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let (net, prefix) = CGNAT_V4_RANGE;
             v4_in_cidr(v4, net, prefix)
         }
         IpAddr::V6(_) => false,
+    }
+}
+
+/// Fixed coarsening mask applied to observed IPv4 peer addresses for the
+/// opt-in observed-origin token (issue #120). Host bits below /24 are zeroed.
+pub const OBSERVED_PREFIX_V4_MASK: u8 = 24;
+
+/// Fixed coarsening mask applied to observed IPv6 peer addresses for the
+/// opt-in observed-origin token (issue #120). Host bits below /48 are zeroed.
+pub const OBSERVED_PREFIX_V6_MASK: u8 = 48;
+
+/// Coarsen an observed peer IP into a fixed-width prefix string
+/// (`"203.0.113.0/24"` / `"2001:db8::/48"`) for the issue #120 origin token.
+///
+/// Never returns a raw IP: the host bits are zeroed before formatting.
+/// Returns `None` for loopback and unspecified addresses — those carry no
+/// origin information and must surface as *absence of the token*, not as a
+/// prefix.
+#[must_use]
+pub fn mask_observed_prefix(ip: IpAddr) -> Option<String> {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() || v4.is_unspecified() {
+                return None;
+            }
+            let masked = u32::from(v4) & (u32::MAX << (32 - OBSERVED_PREFIX_V4_MASK));
+            Some(format!(
+                "{}/{}",
+                Ipv4Addr::from(masked),
+                OBSERVED_PREFIX_V4_MASK
+            ))
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return None;
+            }
+            let masked = u128::from(v6) & (u128::MAX << (128 - OBSERVED_PREFIX_V6_MASK));
+            Some(format!(
+                "{}/{}",
+                Ipv6Addr::from(masked),
+                OBSERVED_PREFIX_V6_MASK
+            ))
+        }
+    }
+}
+
+/// Opt-in, coarse origin token surfaced on point-to-point DM surfaces only
+/// (issue #120): the transport-observed peer address, coarsened to a fixed
+/// prefix, plus directness and CGNAT markers.
+///
+/// Hard constraints (all enforced structurally):
+/// - Populated only from the live transport connection table — never from
+///   gossip, announcements, or address hints, and never serialized onto
+///   `/peers`.
+/// - Default OFF (`observed_prefix_enabled` in the daemon TOML); surfaces
+///   wrap it in `Option` with `skip_serializing_if`, so when disabled the
+///   field is entirely absent and wire output is byte-identical.
+/// - `observed_prefix` is always masked ([`mask_observed_prefix`]) — never a
+///   raw IP, no GeoIP, no new dependencies.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ObservedOrigin {
+    /// Coarsened observed address prefix (`"203.0.113.0/24"` /
+    /// `"2001:db8::/48"`). Never a raw IP.
+    pub observed_prefix: String,
+    /// `false` marks a relayed observation (the connection to the peer is
+    /// via a relay, so the address is the relay-observed one).
+    pub direct: bool,
+    /// The observed address is in the RFC 6598 CGNAT range (100.64.0.0/10).
+    pub cgnat: bool,
+}
+
+impl ObservedOrigin {
+    /// Build the token from a transport-observed IP and whether the
+    /// connection carrying it is relayed. Returns `None` when the IP yields
+    /// no maskable prefix (loopback / unspecified) — surfaces then omit the
+    /// token entirely.
+    #[must_use]
+    pub fn from_observed(ip: IpAddr, relayed: bool) -> Option<Self> {
+        Some(Self {
+            observed_prefix: mask_observed_prefix(ip)?,
+            direct: !relayed,
+            cgnat: is_cgnat(ip),
+        })
     }
 }
 
@@ -700,5 +783,104 @@ mod tests {
         assert!(env.degraded);
         assert!(!env.vpn_suspected && !env.cgnat_suspected);
         assert!(env.guidance.unwrap().contains("UDP/443"));
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #120 — observed-origin token masking
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn mask_observed_prefix_v4_zeroes_host_bits_below_24() {
+        // Boundary: the last octet is always zeroed, including 0 and 255.
+        assert_eq!(
+            mask_observed_prefix("203.0.113.129".parse().unwrap()),
+            Some("203.0.113.0/24".to_string())
+        );
+        assert_eq!(
+            mask_observed_prefix("203.0.113.0".parse().unwrap()),
+            Some("203.0.113.0/24".to_string())
+        );
+        assert_eq!(
+            mask_observed_prefix("203.0.113.255".parse().unwrap()),
+            Some("203.0.113.0/24".to_string())
+        );
+        // Bits above /24 survive untouched.
+        assert_eq!(
+            mask_observed_prefix("8.8.8.8".parse().unwrap()),
+            Some("8.8.8.0/24".to_string())
+        );
+    }
+
+    #[test]
+    fn mask_observed_prefix_v6_zeroes_host_bits_below_48() {
+        assert_eq!(
+            mask_observed_prefix("2001:db8::1".parse().unwrap()),
+            Some("2001:db8::/48".to_string())
+        );
+        // Segments past the third are zeroed; the /48 network survives.
+        assert_eq!(
+            mask_observed_prefix("2001:db8:abcd:1234:5678:9abc:def0:1234".parse().unwrap()),
+            Some("2001:db8:abcd::/48".to_string())
+        );
+        // All-ones host portion still masks to the network.
+        assert_eq!(
+            mask_observed_prefix("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()),
+            Some("2001:db8:ffff::/48".to_string())
+        );
+    }
+
+    #[test]
+    fn mask_observed_prefix_loopback_and_unspecified_are_absent() {
+        // Loopback/unspecified carry no origin information: absence, not a
+        // prefix (a "127.0.0.0/24" token would be noise, not signal).
+        assert_eq!(mask_observed_prefix("127.0.0.1".parse().unwrap()), None);
+        assert_eq!(mask_observed_prefix("127.0.0.53".parse().unwrap()), None);
+        assert_eq!(mask_observed_prefix("::1".parse().unwrap()), None);
+        assert_eq!(mask_observed_prefix("0.0.0.0".parse().unwrap()), None);
+        assert_eq!(mask_observed_prefix("::".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn observed_origin_direct_flag_marks_relayed_observation() {
+        let direct = ObservedOrigin::from_observed("203.0.113.9".parse().unwrap(), false)
+            .expect("public v4 masks");
+        assert!(direct.direct);
+        assert!(!direct.cgnat);
+        assert_eq!(direct.observed_prefix, "203.0.113.0/24");
+
+        // A relayed observation must report direct=false (issue #120).
+        let relayed = ObservedOrigin::from_observed("203.0.113.9".parse().unwrap(), true)
+            .expect("public v4 masks");
+        assert!(!relayed.direct);
+    }
+
+    #[test]
+    fn observed_origin_cgnat_flag_uses_rfc6598_range() {
+        // 100.64.0.0/10 membership is delegated to the existing is_cgnat
+        // check — cover both range boundaries here.
+        let cgnat = ObservedOrigin::from_observed("100.64.0.1".parse().unwrap(), false)
+            .expect("CGNAT v4 still masks");
+        assert!(cgnat.cgnat);
+        assert_eq!(cgnat.observed_prefix, "100.64.0.0/24");
+
+        let top = ObservedOrigin::from_observed("100.127.255.255".parse().unwrap(), false)
+            .expect("top of CGNAT range masks");
+        assert!(top.cgnat);
+
+        let below = ObservedOrigin::from_observed("100.63.255.255".parse().unwrap(), false)
+            .expect("just below CGNAT range masks");
+        assert!(!below.cgnat);
+
+        // CGNAT is a v4 concept; v6 observations never carry the flag.
+        let v6 =
+            ObservedOrigin::from_observed("2001:db8::1".parse().unwrap(), false).expect("v6 masks");
+        assert!(!v6.cgnat);
+        assert_eq!(v6.observed_prefix, "2001:db8::/48");
+    }
+
+    #[test]
+    fn observed_origin_none_for_loopback() {
+        assert!(ObservedOrigin::from_observed("127.0.0.1".parse().unwrap(), false).is_none());
+        assert!(ObservedOrigin::from_observed("::1".parse().unwrap(), true).is_none());
     }
 }

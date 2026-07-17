@@ -94,6 +94,13 @@ enum WsOutbound {
         received_at: u64,
         verified: bool,
         trust_decision: Option<String>,
+        /// Issue #120: opt-in coarsened origin token. Entirely absent
+        /// (never `null`) unless the daemon opted in via
+        /// `observed_prefix_enabled` AND the message arrived over the live
+        /// point-to-point transport connection with a maskable observed
+        /// address. Never gossiped, never announced, never on `/peers`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        observed_origin: Option<crate::connectivity::ObservedOrigin>,
     },
     #[serde(rename = "subscribed")]
     Subscribed { topics: Vec<String> },
@@ -427,6 +434,7 @@ async fn handle_ws_connection(
                     received_at: msg.received_at,
                     verified: msg.verified,
                     trust_decision: msg.trust_decision.map(|d| d.to_string()),
+                    observed_origin: msg.observed_origin,
                 };
                 // DMs are fire-and-forget (DirectSubscriberQueue, drop-oldest,
                 // 8192 deep — no retaining inbox behind subscribe_direct), so a
@@ -853,6 +861,64 @@ mod tests {
             1,
             "the dropped frame must be counted"
         );
+    }
+
+    // ========================================================================
+    // Issue #120 — WS `direct_message` observed-origin serialization.
+    // ========================================================================
+
+    fn ws_dm_frame(observed_origin: Option<crate::connectivity::ObservedOrigin>) -> WsOutbound {
+        WsOutbound::DirectMessage {
+            sender: hex::encode([0x8a; 32]),
+            machine_id: hex::encode([0xb2; 32]),
+            payload: "aGVsbG8=".to_string(),
+            received_at: 1_774_860_000,
+            verified: true,
+            trust_decision: None,
+            observed_origin,
+        }
+    }
+
+    #[test]
+    fn ws_direct_message_frame_is_byte_identical_without_origin() {
+        // Issue #120 acceptance: default-off (no token) wire bytes are
+        // identical to the pre-#120 frame — no `observed_origin` key, not
+        // even as null.
+        let s = serde_json::to_string(&ws_dm_frame(None)).expect("serialize frame");
+        assert!(
+            !s.contains("observed_origin"),
+            "absent token must not serialize: {s}"
+        );
+        assert_eq!(
+            s,
+            format!(
+                "{{\"type\":\"direct_message\",\"sender\":\"{}\",\"machine_id\":\"{}\",\"payload\":\"aGVsbG8=\",\"received_at\":1774860000,\"verified\":true,\"trust_decision\":null}}",
+                hex::encode([0x8a; 32]),
+                hex::encode([0xb2; 32]),
+            )
+        );
+    }
+
+    #[test]
+    fn ws_direct_message_frame_carries_masked_origin_when_present() {
+        // Opted-in nodes emit the masked token; relayed => direct=false,
+        // CGNAT => cgnat=true.
+        let origin = crate::connectivity::ObservedOrigin {
+            observed_prefix: "2001:db8::/48".to_string(),
+            direct: false,
+            cgnat: true,
+        };
+        let v = serde_json::to_value(ws_dm_frame(Some(origin))).expect("serialize frame");
+        assert_eq!(
+            v["observed_origin"],
+            serde_json::json!({
+                "observed_prefix": "2001:db8::/48",
+                "direct": false,
+                "cgnat": true
+            })
+        );
+        assert_eq!(v["type"], "direct_message");
+        assert_eq!(v["payload"], "aGVsbG8=");
     }
 
     #[tokio::test]

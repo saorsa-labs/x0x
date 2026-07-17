@@ -637,6 +637,9 @@ impl InboxPipeline {
                     plaintext.payload,
                     true,
                     Some(decision),
+                    // Gossip-inbox deliveries carry no point-to-point
+                    // transport observation (issue #120).
+                    None,
                 )
                 .await;
 

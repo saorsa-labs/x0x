@@ -245,6 +245,16 @@ pub struct NetworkConfig {
     /// `[peer_relay] enabled = true` in TOML.
     #[serde(default)]
     pub peer_relay: PeerRelayConfig,
+
+    /// Issue #120: opt-in surfacing of the transport-observed peer address
+    /// as a coarse, masked origin token (`/24` v4, `/48` v6) on
+    /// point-to-point DM surfaces only (DM-receive WS/SSE event + per-peer
+    /// `GET /diagnostics/dm`). Default `false`: when disabled the fields are
+    /// entirely absent and wire behaviour is byte-identical to before. The
+    /// token is never gossiped, never announced, and never appears on
+    /// `/peers`.
+    #[serde(default)]
+    pub observed_prefix_enabled: bool,
 }
 
 /// X0X-0070b: TOML-shaped configuration for the peer-relay fallback
@@ -459,6 +469,7 @@ impl Default for NetworkConfig {
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
             peer_relay: PeerRelayConfig::default(),
+            observed_prefix_enabled: false,
         }
     }
 }
@@ -1834,6 +1845,37 @@ impl NetworkNode {
                     _ => None,
                 };
                 (addr, now.saturating_duration_since(conn.last_activity))
+            })
+    }
+
+    /// Issue #120: transport-observed origin token for a connected peer —
+    /// the same live connection-table data `Self::connected_peer_snapshot`
+    /// reads (and `add_from_connection` enriches the bootstrap cache from),
+    /// coarsened via [`crate::connectivity::ObservedOrigin`].
+    ///
+    /// Returns `None` when the peer is not in the live table, when the
+    /// connection is not UDP, or when the observed IP carries no origin
+    /// information (loopback / unspecified). Callers MUST gate on
+    /// `observed_prefix_enabled` before invoking; the token is surfaced only
+    /// on point-to-point DM surfaces, never on gossip/announce/`/peers`.
+    pub async fn observed_peer_origin(
+        &self,
+        peer_id: &AntPeerId,
+    ) -> Option<crate::connectivity::ObservedOrigin> {
+        let node = self.require_node().await.ok()?;
+        node.connected_peers()
+            .await
+            .into_iter()
+            .find(|conn| conn.peer_id == *peer_id)
+            .and_then(|conn| {
+                let addr = match conn.remote_addr {
+                    TransportAddr::Udp(addr) => addr,
+                    _ => return None,
+                };
+                crate::connectivity::ObservedOrigin::from_observed(
+                    addr.ip(),
+                    matches!(conn.traversal_method, ant_quic::TraversalMethod::Relay),
+                )
             })
     }
 
@@ -4125,6 +4167,7 @@ async fn test_mesh_connections_are_bidirectional() {
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
             peer_relay: PeerRelayConfig::default(),
+            observed_prefix_enabled: false,
         };
 
         let node = NetworkNode::new(config, None, None).await.unwrap();
