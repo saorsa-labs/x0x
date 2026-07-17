@@ -13897,6 +13897,116 @@ mod tests {
         }
     }
 
+    /// Issue #228: a reconnect-suppressed peer must not re-enter through the
+    /// INBOUND accept path. ant-quic's symmetric transport can reverse-open a
+    /// connection back to alice immediately after she closes hers (the CI
+    /// flake: the tombstoned peer reappeared inside the backoff window), and
+    /// a revoked/rejected peer can equally just dial back in. The accept loop
+    /// is the last x0x-controlled gate: it must close the suppressed inbound
+    /// connection immediately — no `PeerConnected`, no cache success, no pool
+    /// admission — and leave the tombstone intact.
+    ///
+    /// Deterministic version of the CI race: instead of relying on ant-quic's
+    /// reverse-open timing, bob dials alice back explicitly after she
+    /// policy-rejects him — the exact accept-loop decision the flake
+    /// exercised.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn suppressed_peer_inbound_redial_is_rejected() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let alice_network = alice.network().expect("alice network");
+        let alice_addr = normalize_loopback_addr(
+            alice_network
+                .bound_addr()
+                .await
+                .expect("alice bound"),
+        );
+
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let bob_id = bob.machine_id().0;
+
+        let connected = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects bob");
+        assert_eq!(connected.0, bob.machine_id().0);
+        let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < reg {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "bob connected before rejection"
+        );
+
+        alice_network
+            .disconnect_with_reason(&bob_peer, network::DisconnectReason::PolicyRejection)
+            .await
+            .expect("policy reject");
+        assert!(
+            alice_network.is_reconnect_suppressed(bob_id),
+            "PolicyRejection sets a permanent tombstone"
+        );
+
+        // Watch for any `PeerConnected` for bob: the gate must suppress it.
+        let mut events = alice_network.subscribe();
+
+        // bob dials alice back — the deterministic stand-in for ant-quic's
+        // reverse-open (and for a revoked peer simply dialing back in). The
+        // handshake completes on bob's side (loopback is fast and alice's
+        // accept loop must be scheduled before her close lands); alice's
+        // accept loop must then close it immediately and never surface it.
+        // Asserting the dial reached alice keeps the test non-vacuous.
+        let dialed = bob_network
+            .connect_addr(alice_addr)
+            .await
+            .expect("bob redials alice after rejection");
+        assert_eq!(dialed.0, alice.machine_id().0, "bob dialed alice");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            assert!(
+                !alice_network.is_connected(&bob_peer).await,
+                "suppressed bob must not re-enter via the inbound accept path"
+            );
+            while let Ok(event) = events.try_recv() {
+                if let network::NetworkEvent::PeerConnected { peer_id, .. } = event {
+                    assert_ne!(
+                        peer_id, bob_id,
+                        "suppressed bob must not surface a PeerConnected event"
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_reconnect_suppressed(bob_id),
+            "rejecting the inbound redial must not clear the tombstone"
+        );
+    }
+
     /// A connection-pool eviction (LRU over `max_connections`) must not
     /// trigger a redial that immediately reconnects the evicted peer — the
     /// evict/redial churn loop flagged in the final review. This exercises the
