@@ -27,17 +27,18 @@ use routes::{
     connect_machine, connectivity_diagnostics, create_mls_group, create_mls_welcome,
     create_task_list, delete_contact, delete_machine, direct_connections,
     direct_message_send_config, direct_send, discovered_agent, discovered_agents,
-    discovered_machine, discovered_machines, dm_diagnostics, exec_cancel, exec_diagnostics,
-    exec_run, exec_sessions, file_accept_handler, file_reject_handler, file_send_handler,
-    file_transfer_send_config, file_transfer_status_handler, file_transfers_handler,
-    FileChunkAckSlot, find_agent, forward_add, forward_list, forward_remove,
-    get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json, get_mls_group,
-    gossip_diagnostics, groups_diagnostics, handle_file_message, health, identity_revocations,
-    identity_revoke, import_agent_card, introduction, list_contacts, list_machines,
-    list_mls_groups, list_revocations, list_task_lists, list_tasks, machine_for_agent_handler,
-    machines_by_user_handler, mls_decrypt, mls_encrypt, network_status, peer_health_handler,
-    peers, pin_machine, populate_invite_base_state_from_group_info, presence, presence_find,
-    presence_foaf, presence_online, presence_status, probe_peer_handler, publish, quick_trust,
+    discovered_machine, discovered_machines, dm_diagnostics, evaluate_trust, exec_cancel,
+    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
+    file_send_handler, file_transfer_send_config, file_transfer_status_handler,
+    file_transfers_handler, FileChunkAckSlot, find_agent, forward_add, forward_list,
+    forward_remove, get_a2a_agent_card, get_agent_card, get_constitution,
+    get_constitution_json, get_mls_group, gossip_diagnostics, groups_diagnostics,
+    handle_file_message, health, identity_revocations, identity_revoke, import_agent_card,
+    introduction, list_contacts, list_machines, list_mls_groups, list_revocations,
+    list_task_lists, list_tasks, machine_for_agent_handler, machines_by_user_handler,
+    mls_decrypt, mls_encrypt, network_status, peer_health_handler, peers, pin_machine,
+    populate_invite_base_state_from_group_info, presence, presence_find, presence_foaf,
+    presence_online, presence_status, probe_peer_handler, publish, quick_trust,
     remove_mls_member, RestSubscription, revoke_contact, run_fallback_github_poll,
     run_gossip_update_listener, run_startup_update_check, save_mls_groups,
     SelfPublishedReleaseManifests, shutdown_handler, status, streams_diagnostics, subscribe,
@@ -384,15 +385,6 @@ fn apply_withdrawn_group_card_to_group_info(
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
-
-/// POST /trust/evaluate request body.
-#[derive(Debug, Deserialize)]
-struct EvaluateTrustRequest {
-    /// Agent ID as hex string.
-    agent_id: String,
-    /// Machine ID as hex string.
-    machine_id: String,
-}
 
 /// Run the daemon HTTP/WebSocket server to completion.
 ///
@@ -14304,56 +14296,6 @@ async fn delete_kv_value(
 
 // ---------------------------------------------------------------------------
 // Direct messaging handlers
-// ---------------------------------------------------------------------------
-
-/// POST /trust/evaluate — evaluate trust decision for an (agent, machine) pair.
-async fn evaluate_trust(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<EvaluateTrustRequest>,
-) -> impl IntoResponse {
-    let agent_id = match parse_agent_id_hex(&req.agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": e })),
-            );
-        }
-    };
-
-    let machine_bytes = match hex::decode(&req.machine_id) {
-        Ok(bytes) if bytes.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            arr
-        }
-        _ => {
-            return bad_request("invalid machine_id hex");
-        }
-    };
-    let machine_id = MachineId(machine_bytes);
-
-    let store = state.contacts.read().await;
-    let evaluator = x0x::trust::TrustEvaluator::new(&store);
-    let ctx = x0x::trust::TrustContext {
-        agent_id: &agent_id,
-        machine_id: &machine_id,
-    };
-    let decision = evaluator.evaluate(&ctx);
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "decision": format!("{:?}", decision)
-        })),
-    )
-}
-
-// Note: task deletion not exposed — TaskListHandle doesn't have remove_task().
-
-// ---------------------------------------------------------------------------
-// MLS welcome handler
 // ---------------------------------------------------------------------------
 
 /// Derive this agent's per-group TreeKEM identity seed from its long-term

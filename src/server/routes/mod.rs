@@ -19,6 +19,7 @@ mod network;
 mod presence;
 mod status;
 mod tasks;
+mod trust;
 mod upgrade;
 
 #[cfg(test)]
@@ -70,6 +71,7 @@ pub(super) use machines::{
     add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,
     machines_by_user_handler, pin_machine, unpin_machine,
 };
+pub(super) use trust::evaluate_trust;
 pub(super) use upgrade::{
     SelfPublishedReleaseManifests, apply_upgrade, broadcast_current_manifest, check_upgrade,
     run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
