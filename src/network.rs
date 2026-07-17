@@ -245,6 +245,16 @@ pub struct NetworkConfig {
     /// `[peer_relay] enabled = true` in TOML.
     #[serde(default)]
     pub peer_relay: PeerRelayConfig,
+
+    /// Issue #120: opt-in surfacing of the transport-observed peer address
+    /// as a coarse, masked origin token (`/24` v4, `/48` v6) on
+    /// point-to-point DM surfaces only (DM-receive WS/SSE event + per-peer
+    /// `GET /diagnostics/dm`). Default `false`: when disabled the fields are
+    /// entirely absent and wire behaviour is byte-identical to before. The
+    /// token is never gossiped, never announced, and never appears on
+    /// `/peers`.
+    #[serde(default)]
+    pub observed_prefix_enabled: bool,
 }
 
 /// X0X-0070b: TOML-shaped configuration for the peer-relay fallback
@@ -459,6 +469,7 @@ impl Default for NetworkConfig {
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
             peer_relay: PeerRelayConfig::default(),
+            observed_prefix_enabled: false,
         }
     }
 }
@@ -1370,10 +1381,10 @@ pub struct NetworkNode {
     /// Reconnect-suppression tombstones, keyed by peer id. Set when a peer is
     /// disconnected for a non-transport reason (policy rejection, pool
     /// eviction, admin, revocation, shutdown) so neither the proactive
-    /// reconnect scheduler nor the ant-quic lifecycle `Closed` watcher redials
-    /// it — undoing a security rejection, churning an LRU eviction, or
-    /// ignoring an operator teardown. See [`DisconnectReason`] and
-    /// [`NetworkNode::is_reconnect_suppressed`].
+    /// reconnect scheduler, nor the ant-quic lifecycle `Closed` watcher, nor
+    /// the inbound accept loop (re)admits it — undoing a security rejection,
+    /// churning an LRU eviction, or ignoring an operator teardown. See
+    /// [`DisconnectReason`] and [`NetworkNode::is_reconnect_suppressed`].
     reconnect_suppressions: Arc<Mutex<HashMap<[u8; 32], ReconnectSuppression>>>,
     /// Handles to the background tasks spawned at construction (receiver, accept
     /// loop, connection-pool eviction).
@@ -1736,7 +1747,12 @@ impl NetworkNode {
             total_connections: status.direct_connections + status.relayed_connections,
             active_connections: status.active_connections as u32,
             bytes_sent: status.relay_bytes_forwarded,
-            bytes_received: 0, // TODO: Track in future
+            // `ant_quic::NodeStatus` (ant-quic 0.27.33) exposes no
+            // inbound byte counter — its only byte-related field is
+            // `relay_bytes_forwarded` (bytes this node forwarded as a relay
+            // for other peers). bytes_received stays zero until upstream
+            // adds one. Wiring a fake value here would silently misreport.
+            bytes_received: 0,
             peer_count: status.connected_peers,
         }
     }
@@ -1829,6 +1845,37 @@ impl NetworkNode {
                     _ => None,
                 };
                 (addr, now.saturating_duration_since(conn.last_activity))
+            })
+    }
+
+    /// Issue #120: transport-observed origin token for a connected peer —
+    /// the same live connection-table data `Self::connected_peer_snapshot`
+    /// reads (and `add_from_connection` enriches the bootstrap cache from),
+    /// coarsened via [`crate::connectivity::ObservedOrigin`].
+    ///
+    /// Returns `None` when the peer is not in the live table, when the
+    /// connection is not UDP, or when the observed IP carries no origin
+    /// information (loopback / unspecified). Callers MUST gate on
+    /// `observed_prefix_enabled` before invoking; the token is surfaced only
+    /// on point-to-point DM surfaces, never on gossip/announce/`/peers`.
+    pub async fn observed_peer_origin(
+        &self,
+        peer_id: &AntPeerId,
+    ) -> Option<crate::connectivity::ObservedOrigin> {
+        let node = self.require_node().await.ok()?;
+        node.connected_peers()
+            .await
+            .into_iter()
+            .find(|conn| conn.peer_id == *peer_id)
+            .and_then(|conn| {
+                let addr = match conn.remote_addr {
+                    TransportAddr::Udp(addr) => addr,
+                    _ => return None,
+                };
+                crate::connectivity::ObservedOrigin::from_observed(
+                    addr.ip(),
+                    matches!(conn.traversal_method, ant_quic::TraversalMethod::Relay),
+                )
             })
     }
 
@@ -2489,16 +2536,7 @@ impl NetworkNode {
     /// revocation, shutdown) never expire.
     #[must_use]
     pub fn is_reconnect_suppressed(&self, peer_id: [u8; 32]) -> bool {
-        let mut map = match self.reconnect_suppressions.lock() {
-            Ok(m) => m,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let now = Instant::now();
-        let live = map.get(&peer_id).is_some_and(|s| s.is_live(now));
-        if !live {
-            map.remove(&peer_id);
-        }
-        live
+        reconnect_suppression_is_live(self.reconnect_suppressions.as_ref(), peer_id)
     }
 
     /// Get list of connected peer IDs.
@@ -3168,6 +3206,37 @@ impl NetworkNode {
                             continue;
                         }
 
+                        // Reject peers carrying a live reconnect-suppression
+                        // tombstone. ant-quic's symmetric transport can
+                        // reverse-open a connection back to us immediately
+                        // after we closed ours (observed as the #228 CI
+                        // flake: a policy-rejected peer reappearing inside
+                        // the backoff window), and a revoked/evicted peer can
+                        // simply dial back in. ant-quic registers the inbound
+                        // connection inside `accept()` before x0x can gate,
+                        // so the last x0x-controlled point is right here:
+                        // close it immediately — without recording cache
+                        // success, emitting `PeerConnected`, touching the
+                        // connection pool, or touching the tombstone itself
+                        // (`Node::disconnect` maps to a plain transport close
+                        // and never mutates x0x suppressions).
+                        if reconnect_suppression_is_live(
+                            reconnect_suppressions.as_ref(),
+                            peer_conn.peer_id.0,
+                        ) {
+                            tracing::warn!(
+                                "SECURITY: Rejecting inbound connection from reconnect-suppressed peer {:?}",
+                                peer_conn.peer_id
+                            );
+                            if let Err(e) = node_ref.disconnect(&peer_conn.peer_id).await {
+                                debug!(
+                                    "disconnect of suppressed inbound peer {:?} failed: {}",
+                                    peer_conn.peer_id, e
+                                );
+                            }
+                            continue;
+                        }
+
                         tracing::info!(
                             "Accepted inbound connection from peer {:?} at {:?}",
                             peer_conn.peer_id,
@@ -3538,6 +3607,28 @@ impl ReconnectSuppression {
             Some(ttl) => now.duration_since(self.set_at) < ttl,
         }
     }
+}
+
+/// Returns `true` iff a live suppression tombstone for `peer_id` exists in
+/// `map`, pruning an expired bounded tombstone as observed.
+///
+/// Shared by [`NetworkNode::is_reconnect_suppressed`] and the inbound accept
+/// loop: both must observe the exact same liveness semantics or a tombstoned
+/// peer could re-enter through whichever path checked the stale copy (#228).
+fn reconnect_suppression_is_live(
+    map: &Mutex<HashMap<[u8; 32], ReconnectSuppression>>,
+    peer_id: [u8; 32],
+) -> bool {
+    let mut map = match map.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    let live = map.get(&peer_id).is_some_and(|s| s.is_live(now));
+    if !live {
+        map.remove(&peer_id);
+    }
+    live
 }
 
 /// Events emitted by the network node.
@@ -4076,6 +4167,7 @@ async fn test_mesh_connections_are_bidirectional() {
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
             peer_relay: PeerRelayConfig::default(),
+            observed_prefix_enabled: false,
         };
 
         let node = NetworkNode::new(config, None, None).await.unwrap();

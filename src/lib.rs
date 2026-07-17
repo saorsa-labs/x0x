@@ -274,6 +274,13 @@ pub struct Agent {
     network_event_listener_started: std::sync::atomic::AtomicBool,
     /// Ensures direct message listener is spawned once.
     direct_listener_started: std::sync::atomic::AtomicBool,
+    /// Issue #120: opt-in gate for surfacing the transport-observed peer
+    /// address as a coarsened origin token on point-to-point DM surfaces.
+    /// Sourced from `NetworkConfig::observed_prefix_enabled` (daemon TOML
+    /// `observed_prefix_enabled`, default `false`). When `false` the raw
+    /// DM listener never computes the token and every surface stays
+    /// byte-identical to before the feature existed.
+    observed_prefix_enabled: bool,
     /// Presence system wrapper for beacons, FOAF discovery, and events.
     presence: Option<std::sync::Arc<presence::PresenceWrapper>>,
     /// Whether the user has consented to disclosing their identity in
@@ -332,6 +339,15 @@ pub struct Agent {
     /// surfacing inbound [`streams::PeerStream`]s that have cleared the
     /// identity gate, plus an idempotent started-flag for the accept loop.
     stream_accept: std::sync::Arc<streams::StreamAccept>,
+    /// Connect ACL (#131) consulted by the inbound byte-stream accept loop
+    /// (#132): with an `Enabled` policy, every announced agent on the peer
+    /// machine must be pair-listed or the stream is reset
+    /// ([`error::NetworkError::PeerNotInConnectAcl`]). Defaults to
+    /// [`connect::ConnectPolicy::default`] (Disabled ⇒ no ACL constraint);
+    /// the daemon installs the loaded policy at startup via
+    /// [`Agent::set_connect_policy`]. `std` RwLock: gate reads are a brief
+    /// clone of the inner `Arc`, never held across an await.
+    connect_policy: std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -4223,6 +4239,20 @@ impl Agent {
                 phi,
                 last_seen_ms_ago,
             });
+        }
+
+        // Issue #188: a non-empty but undecodable cached KEM key means our
+        // view of the recipient's capability state has not converged (or is
+        // corrupt). Fail with a retryable, distinctly-named error here rather
+        // than letting envelope construction surface it downstream as an
+        // opaque 400-class `EnvelopeConstruction`.
+        if gossip_ok {
+            if let Some(caps) = &cap {
+                if let Err(reason) = dm::validate_recipient_kem_key(&caps.kem_public_key) {
+                    self.direct_messaging.record_outgoing_failed(*to);
+                    return Err(dm::DmError::RecipientKeyInvalid(reason));
+                }
+            }
         }
 
         let mut preferred_raw_err = None;
@@ -8311,6 +8341,7 @@ impl Agent {
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let token = self.shutdown_token.clone();
+        let observed_prefix_enabled = self.observed_prefix_enabled;
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
@@ -8456,9 +8487,28 @@ impl Agent {
                 // Register and mark the sender as connected for future reverse direct sends.
                 dm.mark_connected(sender, machine_id).await;
 
+                // Issue #120: opt-in coarsened origin token from the live
+                // connection table (the same source add_from_connection()
+                // enriches the bootstrap cache from). Computed after the
+                // drop gates so revoked/expired senders never trigger a
+                // table scan; entirely skipped when the daemon has not
+                // opted in, keeping default wire output byte-identical.
+                let observed_origin = if observed_prefix_enabled {
+                    network.observed_peer_origin(&ant_peer_id).await
+                } else {
+                    None
+                };
+
                 // Fan out to all subscribe_direct() receivers with verification info.
                 let delivered = dm
-                    .handle_incoming(machine_id, sender, data, verified, trust_decision)
+                    .handle_incoming(
+                        machine_id,
+                        sender,
+                        data,
+                        verified,
+                        trust_decision,
+                        observed_origin,
+                    )
                     .await;
 
                 tracing::debug!(
@@ -8559,13 +8609,74 @@ impl Agent {
         ))
     }
 
-    /// Await the next inbound byte-stream that has cleared the identity gate.
+    /// Await the next inbound byte-stream that has cleared the identity gate
+    /// **and whose protocol has no registered acceptor**.
     ///
     /// Returns `None` when the accept loop has stopped (e.g. after shutdown).
-    /// The T4 forwarder consumes accepted streams through this method.
+    /// Protocols with a registered acceptor
+    /// ([`Self::register_stream_acceptor`]) are routed there instead — this
+    /// default sink never sees them.
     pub async fn next_incoming_stream(&self) -> Option<streams::PeerStream> {
         let mut rx = self.stream_accept.receiver().lock().await;
         rx.recv().await
+    }
+
+    /// Register the single consumer for one stream protocol.
+    ///
+    /// Returns a bounded [`streams::StreamAcceptor`] (capacity
+    /// [`streams::STREAM_ACCEPTOR_CAPACITY`]) that surfaces inbound
+    /// [`streams::PeerStream`]s for `protocol` after they have cleared the
+    /// identity gate, the connect-ACL gate, and the protocol handshake.
+    /// The T4 forwarder owns `ForwardV1`/`ForwardV2` this way; a T5 SOCKS5
+    /// listener would register `SocksV1`.
+    ///
+    /// Exactly one acceptor may be live per protocol: a duplicate
+    /// registration fails with
+    /// [`error::NetworkError::StreamAcceptorConflict`]. Dropping the
+    /// acceptor deregisters it — subsequent streams for the protocol fall
+    /// back to the default sink ([`Self::next_incoming_stream`]).
+    ///
+    /// # Errors
+    /// [`error::NetworkError::StreamAcceptorConflict`] if an acceptor is
+    /// already registered for `protocol`.
+    pub fn register_stream_acceptor(
+        &self,
+        protocol: streams::StreamProtocol,
+    ) -> error::NetworkResult<streams::StreamAcceptor> {
+        self.stream_accept.register(protocol)
+    }
+
+    /// Install the connect ACL policy (#131) consulted by the inbound
+    /// byte-stream accept loop.
+    ///
+    /// With [`connect::ConnectPolicy::Enabled`], an inbound stream is only
+    /// surfaced when **every** announced agent on the peer machine is
+    /// `(AgentId, MachineId)`-listed in the ACL (fail-closed, mirroring the
+    /// forwarder's every-agent rule, #192); an unlisted peer's stream is
+    /// reset with zero application bytes exchanged. With
+    /// [`connect::ConnectPolicy::Disabled`] (the default) no ACL constraint
+    /// applies and the identity gate remains the sole stream boundary —
+    /// connect-forwarding itself stays default-deny at the T4 forwarder.
+    ///
+    /// The daemon calls this once at startup with the loaded policy; library
+    /// embedders that want ACL-gated streams do the same.
+    pub fn set_connect_policy(&self, policy: std::sync::Arc<connect::ConnectPolicy>) {
+        let mut guard = self
+            .connect_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = policy;
+    }
+
+    /// The currently installed connect ACL policy (defaults to
+    /// [`connect::ConnectPolicy::Disabled`] — see [`Self::set_connect_policy`]).
+    #[must_use]
+    pub fn connect_policy(&self) -> std::sync::Arc<connect::ConnectPolicy> {
+        let guard = self
+            .connect_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::sync::Arc::clone(&guard)
     }
 
     /// Start the inbound byte-stream accept loop (idempotent).
@@ -8573,9 +8684,13 @@ impl Agent {
     /// Called automatically by [`Agent::join_network`]. The loop is the SOLE
     /// consumer of [`network::NetworkNode::accept_bi`]; every inbound stream
     /// clears the identity gate (machine has a known agent → not revoked →
-    /// trust `Accept`) and the protocol handshake before being surfaced via
-    /// [`Self::next_incoming_stream`]. A stream that fails the gate is reset
-    /// (its halves are dropped) with zero application bytes exchanged.
+    /// trust `Accept`), then the connect-ACL gate ([`Self::set_connect_policy`]
+    /// — every announced agent pair-listed when the policy is `Enabled`),
+    /// then the protocol handshake, before being routed by protocol byte to
+    /// the registered acceptor ([`Self::register_stream_acceptor`]) or the
+    /// default sink ([`Self::next_incoming_stream`]). A stream that fails a
+    /// gate is reset (its halves are dropped) with zero application bytes
+    /// exchanged.
     fn start_stream_accept_loop(&self) {
         if !self.stream_accept.start_once() {
             return;
@@ -8586,6 +8701,7 @@ impl Agent {
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
+        let connect_policy = std::sync::Arc::clone(&self.connect_policy);
         let incoming = std::sync::Arc::clone(&self.stream_accept);
         let token = self.shutdown_token.clone();
 
@@ -8684,6 +8800,30 @@ impl Agent {
                 let agents: Vec<identity::AgentId> =
                     agents.into_iter().map(|(a, _)| a).collect();
 
+                // Connect-ACL gate (#131 × #132): with an Enabled policy every
+                // announced agent on this machine must be pair-listed in the
+                // ACL; an unlisted peer's stream is reset here with zero
+                // application bytes exchanged (fail-closed second layer,
+                // mirrors forward::decide_inbound's every-agent rule, #192).
+                // A Disabled policy adds no constraint.
+                let policy = {
+                    let guard = connect_policy
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::sync::Arc::clone(&guard)
+                };
+                if let Err(e) = streams::stream_acl_gate(&policy, &agents, &machine_id) {
+                    tracing::info!(
+                        target: "x0x::streams",
+                        machine = %hex::encode(machine_id.as_bytes()),
+                        agent_count = agents.len(),
+                        outcome = "deny_acl",
+                        error = %e,
+                        "inbound stream denied at connect-ACL gate (unlisted peer)"
+                    );
+                    continue;
+                }
+
                 // DISPATCH (DoS hardening, issue #132): the protocol-prefix
                 // read + surfacing run in a per-stream task so a peer that
                 // opens a stream and never sends the prefix cannot block this
@@ -8723,11 +8863,18 @@ impl Agent {
                     };
                     let peer_stream =
                         streams::PeerStream::new(agents, machine_id, protocol, send, recv);
-                    // try_send so a slow consumer cannot pile up accepted
-                    // streams in memory; a full channel drops the stream.
-                    if incoming_for_task.sender().try_send(peer_stream).is_err() {
+                    // Route by protocol byte to the registered acceptor (or
+                    // the default sink), then try_send so a slow consumer
+                    // cannot pile up accepted streams in memory; a full
+                    // channel drops (resets) the stream.
+                    if incoming_for_task
+                        .sender_for(protocol)
+                        .try_send(peer_stream)
+                        .is_err()
+                    {
                         tracing::debug!(
                             target: "x0x::streams",
+                            protocol = ?protocol,
                             "incoming-stream channel full; dropping accepted stream"
                         );
                     }
@@ -10036,6 +10183,16 @@ impl AgentBuilder {
         let relay_candidates =
             std::sync::Arc::new(tokio::sync::RwLock::new(parsed_relay_candidates));
 
+        // Issue #120: extract the opt-in observed-prefix gate before
+        // `self.network_config` is moved into `NetworkNode::new` (same
+        // pattern as `peer_relay_config` above). With no network config the
+        // feature is off.
+        let observed_prefix_enabled = self
+            .network_config
+            .as_ref()
+            .map(|cfg| cfg.observed_prefix_enabled)
+            .unwrap_or(false);
+
         // X0X-0070b: discovery cache is hoisted out of the `Agent` literal so
         // the relay-DM listener (spawned below) can hold an `Arc` clone of it
         // without going through `&self` - the listener is a sibling task to
@@ -10213,6 +10370,7 @@ impl AgentBuilder {
             direct_messaging,
             network_event_listener_started: std::sync::atomic::AtomicBool::new(false),
             direct_listener_started: std::sync::atomic::AtomicBool::new(false),
+            observed_prefix_enabled,
             presence,
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
@@ -10234,6 +10392,9 @@ impl AgentBuilder {
             peer_relay,
             relay_candidates,
             stream_accept: std::sync::Arc::new(streams::StreamAccept::new(256)),
+            connect_policy: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+                connect::ConnectPolicy::default(),
+            ))),
         })
     }
 }
@@ -12277,6 +12438,106 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn observed_prefix_gate_defaults_off_and_follows_network_config() {
+        // Issue #120: the Agent-side gate must track the NetworkConfig flag —
+        // off with no network config, off by default, on when opted in.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let identity_only = Agent::builder()
+            .with_machine_key(dir.path().join("m1.key"))
+            .with_agent_key_path(dir.path().join("a1.key"))
+            .with_contact_store_path(dir.path().join("c1.json"))
+            .build()
+            .await
+            .expect("identity-only agent");
+        assert!(!identity_only.observed_prefix_enabled);
+        identity_only.shutdown().await;
+
+        let defaulted = Agent::builder()
+            .with_machine_key(dir.path().join("m2.key"))
+            .with_agent_key_path(dir.path().join("a2.key"))
+            .with_contact_store_path(dir.path().join("c2.json"))
+            .with_peer_cache_dir(dir.path().join("p2"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("defaulted-network agent");
+        assert!(!defaulted.observed_prefix_enabled);
+        defaulted.shutdown().await;
+
+        let mut opted_in_cfg = loopback_network_config();
+        opted_in_cfg.observed_prefix_enabled = true;
+        let opted_in = Agent::builder()
+            .with_machine_key(dir.path().join("m3.key"))
+            .with_agent_key_path(dir.path().join("a3.key"))
+            .with_contact_store_path(dir.path().join("c3.json"))
+            .with_peer_cache_dir(dir.path().join("p3"))
+            .with_network_config(opted_in_cfg)
+            .build()
+            .await
+            .expect("opted-in agent");
+        assert!(opted_in.observed_prefix_enabled);
+        opted_in.shutdown().await;
+    }
+
+    /// Scaling factor for wall-clock deadlines in scheduling-dependent tests
+    /// (issue #241).
+    ///
+    /// These deadlines are panic-on-never guards: the asserted invariant is
+    /// EVENTUAL behaviour (a reconnect fires, a completed dial registers),
+    /// never the wall-clock bound itself. Under full-suite CPU contention
+    /// every timer, lock acquisition, and event hop stretches, so a deadline
+    /// sized for an idle machine flakes even when the behaviour is correct.
+    /// Set `X0X_TEST_TIME_MULTIPLIER=3..5` on loaded CI runners to scale the
+    /// guard with the environment; defaults to 1 (unloaded local runs).
+    fn test_time_multiplier() -> u32 {
+        std::env::var("X0X_TEST_TIME_MULTIPLIER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&m| m >= 1)
+            .unwrap_or(1)
+    }
+
+    /// Wait until `peer` has been CONTINUOUSLY connected for `window` — i.e.
+    /// the connection has quiesced — before returning (issue #241).
+    ///
+    /// WHY: the initial dial can leave duplicate/zombie connection legs
+    /// (mutual-dial rendezvous) whose PeerConnected event is emitted by the
+    /// connection-watcher task with a load-dependent DELAY. If the test
+    /// disconnects while such an event is still in flight, it arrives after
+    /// the disconnect, the event listener reads it as "connection recovered"
+    /// and ABORTS the just-scheduled proactive reconnect — and when the
+    /// zombie leg dies (silently: duplicate/locally-initiated closes are
+    /// invisible to both event streams) no reconnect remains and none is
+    /// re-triggered. That is the #241 flake mechanism, verified with
+    /// instrumentation: the tests were racing setup churn, not measuring
+    /// transport-drop recovery. Disconnecting only from a settled connection
+    /// guarantees any post-disconnect PeerConnected is a GENUINE recovery.
+    async fn await_quiesced_connection(
+        network: &network::NetworkNode,
+        peer: &ant_quic::PeerId,
+        window: std::time::Duration,
+    ) {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(10) * test_time_multiplier();
+        let mut stable_since: Option<tokio::time::Instant> = None;
+        loop {
+            if network.is_connected(peer).await {
+                let since = stable_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() >= window {
+                    return;
+                }
+            } else {
+                stable_since = None;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "connection never quiesced"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     fn normalize_loopback_addr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
         if addr.ip().is_unspecified() {
             std::net::SocketAddr::new(
@@ -13295,8 +13556,11 @@ mod tests {
             .expect("alice connects to bob");
         assert_eq!(connected_peer.0, bob.machine_id().0);
 
-        // Wait for the connection to register on both sides.
-        let connected_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Wait for the connection to register on both sides. The dial
+        // already completed above; this deadline is a panic-on-never guard,
+        // scaled for loaded runners (issue #241).
+        let connected_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(5) * test_time_multiplier();
         while tokio::time::Instant::now() < connected_deadline {
             if alice_network.is_connected(&bob_peer).await {
                 break;
@@ -13308,6 +13572,16 @@ mod tests {
             "alice should be connected to bob after initial dial"
         );
 
+        // Let the connection quiesce before the explicit drop (issue #241):
+        // a delayed PeerConnected from a duplicate dial leg would otherwise
+        // arrive after the disconnect and abort the just-scheduled reconnect.
+        await_quiesced_connection(
+            alice_network,
+            &bob_peer,
+            std::time::Duration::from_secs(1) * test_time_multiplier(),
+        )
+        .await;
+
         // Phase 2: force a disconnect (simulates the QUIC transport drop
         // that occurs when the remote daemon restarts or the idle timeout
         // fires). This emits PeerDisconnected, which triggers
@@ -13317,17 +13591,36 @@ mod tests {
             .await
             .expect("disconnect bob");
 
-        // Give the disconnect time to propagate.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(
-            !alice_network.is_connected(&bob_peer).await,
-            "alice should be disconnected after explicit disconnect"
-        );
+        // The disconnect must register in alice's connection view. Poll
+        // rather than sleep-then-assert: `disconnect()` awaits the transport
+        // close, but the registry reflects it on its own schedule, and a
+        // fixed sleep is load-racy in BOTH directions — too short and the
+        // registry lags; task-starved past the first 1s reconnect backoff
+        // and the successful recovery reads as a false failure (issue #241).
+        // Polling exits the moment the drop lands; our 25ms wakeups are
+        // timer-ordered ahead of the reconnect task's >=1s backoff expiry,
+        // so the drop is always observed before any redial can complete.
+        let drop_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(5) * test_time_multiplier();
+        while alice_network.is_connected(&bob_peer).await {
+            assert!(
+                tokio::time::Instant::now() < drop_deadline,
+                "alice should observe the disconnect promptly"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
 
         // Phase 3: wait for the proactive reconnect to recover the
-        // connection. The first backoff delay is 1 s; allow generous
-        // headroom for CI scheduling jitter.
-        let reconnect_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        // connection. The invariant is EVENTUAL recovery via the backoff
+        // machinery, not the wall-clock bound — the deadline is a
+        // panic-on-never guard sized to the full reconnect envelope:
+        // RECONNECT_BACKOFF_DELAYS cumulative 31s (±20% jitter → ~37s) plus
+        // up to 5 × 5s per-attempt connect timeouts (~62s total), plus
+        // headroom, scaled by X0X_TEST_TIME_MULTIPLIER for loaded CI
+        // runners. (Issue #241: 20s sat INSIDE the envelope and flaked
+        // under full-suite CPU contention.)
+        let reconnect_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(90) * test_time_multiplier();
         while tokio::time::Instant::now() < reconnect_deadline {
             if alice_network.is_connected(&bob_peer).await {
                 break;
@@ -13421,8 +13714,11 @@ mod tests {
             .expect("alice connects to bob");
         assert_eq!(connected.0, bob.machine_id().0);
 
-        // Wait for connection to register.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Wait for connection to register. The dial already completed
+        // above; this deadline is a panic-on-never guard, scaled for loaded
+        // runners (issue #241).
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(5) * test_time_multiplier();
         while tokio::time::Instant::now() < deadline {
             if alice_network.is_connected(&bob_peer).await {
                 break;
@@ -13463,19 +13759,44 @@ mod tests {
              confirms bootstrap cache does not scope-filter (got {cached_addr})"
         );
 
+        // Let the connection quiesce before the explicit drop (issue #241,
+        // see await_quiesced_connection): a delayed PeerConnected from a
+        // duplicate dial leg would otherwise abort the scheduled reconnect.
+        await_quiesced_connection(
+            alice_network,
+            &bob_peer,
+            std::time::Duration::from_secs(1) * test_time_multiplier(),
+        )
+        .await;
+
         // Force disconnect (simulates transport drop / restart).
         alice_network
             .disconnect(&bob_peer)
             .await
             .expect("disconnect bob");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(
-            !alice_network.is_connected(&bob_peer).await,
-            "alice should be disconnected"
-        );
+        // Poll for the drop to register rather than sleep-then-assert — a
+        // fixed sleep is load-racy in both directions (registry lag vs.
+        // task starvation past the first 1s reconnect backoff letting the
+        // successful recovery read as a false failure; issue #241). See the
+        // sibling test above for the full rationale.
+        let drop_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(5) * test_time_multiplier();
+        while alice_network.is_connected(&bob_peer).await {
+            assert!(
+                tokio::time::Instant::now() < drop_deadline,
+                "alice should observe the disconnect promptly"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
 
         // Wait for proactive reconnect via Phase 2 (bootstrap cache).
-        let reconnect_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        // EVENTUAL recovery is the invariant; the deadline is a
+        // panic-on-never guard sized to the full reconnect envelope
+        // (~62s worst case: 31s cumulative backoff ±20% jitter, plus 5 ×
+        // 5s per-attempt connect timeouts) with headroom, scaled by
+        // X0X_TEST_TIME_MULTIPLIER (issue #241: 20s flaked under load).
+        let reconnect_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(90) * test_time_multiplier();
         while tokio::time::Instant::now() < reconnect_deadline {
             if alice_network.is_connected(&bob_peer).await {
                 break;
@@ -13559,7 +13880,8 @@ mod tests {
             .await
             .expect("alice connects to bob");
         assert_eq!(connected.0, bob.machine_id().0);
-        let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reg = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(5) * test_time_multiplier();
         while tokio::time::Instant::now() < reg {
             if alice_network.is_connected(&bob_peer).await {
                 break;
@@ -13576,6 +13898,16 @@ mod tests {
             "Transport is the only reconnect-eligible reason"
         );
 
+        // Let the connection quiesce before the explicit drop (issue #241,
+        // see await_quiesced_connection): a delayed PeerConnected from a
+        // duplicate dial leg would otherwise abort the scheduled reconnect.
+        await_quiesced_connection(
+            alice_network,
+            &bob_peer,
+            std::time::Duration::from_secs(1) * test_time_multiplier(),
+        )
+        .await;
+
         alice_network
             .disconnect_with_reason(&bob_peer, network::DisconnectReason::Transport)
             .await
@@ -13589,8 +13921,11 @@ mod tests {
             "bob disconnected after transport disconnect"
         );
 
-        // Proactive reconnect must recover bob within the backoff window.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        // Proactive reconnect must recover bob EVENTUALLY — the deadline is
+        // a panic-on-never guard sized to the full backoff envelope (~62s
+        // worst case) with headroom, scaled for loaded runners (issue #241).
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(90) * test_time_multiplier();
         while tokio::time::Instant::now() < deadline {
             if alice_network.is_connected(&bob_peer).await {
                 break;
@@ -13932,6 +14267,112 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
+    }
+
+    /// Issue #228: a reconnect-suppressed peer must not re-enter through the
+    /// INBOUND accept path. ant-quic's symmetric transport can reverse-open a
+    /// connection back to alice immediately after she closes hers (the CI
+    /// flake: the tombstoned peer reappeared inside the backoff window), and
+    /// a revoked/rejected peer can equally just dial back in. The accept loop
+    /// is the last x0x-controlled gate: it must close the suppressed inbound
+    /// connection immediately — no `PeerConnected`, no cache success, no pool
+    /// admission — and leave the tombstone intact.
+    ///
+    /// Deterministic version of the CI race: instead of relying on ant-quic's
+    /// reverse-open timing, bob dials alice back explicitly after she
+    /// policy-rejects him — the exact accept-loop decision the flake
+    /// exercised.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn suppressed_peer_inbound_redial_is_rejected() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let alice_network = alice.network().expect("alice network");
+        let alice_addr =
+            normalize_loopback_addr(alice_network.bound_addr().await.expect("alice bound"));
+
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let bob_id = bob.machine_id().0;
+
+        let connected = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects bob");
+        assert_eq!(connected.0, bob.machine_id().0);
+        let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < reg {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "bob connected before rejection"
+        );
+
+        alice_network
+            .disconnect_with_reason(&bob_peer, network::DisconnectReason::PolicyRejection)
+            .await
+            .expect("policy reject");
+        assert!(
+            alice_network.is_reconnect_suppressed(bob_id),
+            "PolicyRejection sets a permanent tombstone"
+        );
+
+        // Watch for any `PeerConnected` for bob: the gate must suppress it.
+        let mut events = alice_network.subscribe();
+
+        // bob dials alice back — the deterministic stand-in for ant-quic's
+        // reverse-open (and for a revoked peer simply dialing back in). The
+        // handshake completes on bob's side (loopback is fast and alice's
+        // accept loop must be scheduled before her close lands); alice's
+        // accept loop must then close it immediately and never surface it.
+        // Asserting the dial reached alice keeps the test non-vacuous.
+        let dialed = bob_network
+            .connect_addr(alice_addr)
+            .await
+            .expect("bob redials alice after rejection");
+        assert_eq!(dialed.0, alice.machine_id().0, "bob dialed alice");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            assert!(
+                !alice_network.is_connected(&bob_peer).await,
+                "suppressed bob must not re-enter via the inbound accept path"
+            );
+            while let Ok(event) = events.try_recv() {
+                if let network::NetworkEvent::PeerConnected { peer_id, .. } = event {
+                    assert_ne!(
+                        peer_id, bob_id,
+                        "suppressed bob must not surface a PeerConnected event"
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_reconnect_suppressed(bob_id),
+            "rejecting the inbound redial must not clear the tombstone"
+        );
     }
 
     /// A connection-pool eviction (LRU over `max_connections`) must not

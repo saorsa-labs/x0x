@@ -97,6 +97,90 @@ enum TaskListSyncMessage {
         /// The declaring holder (receivers skip their own echo).
         responder: PeerId,
     },
+    /// A holder's digest-committed declaration that it has answered a
+    /// `StateRequest` (issue #240): `digest` commits to the FULL served
+    /// task set (see `TaskList::served_digest`), so a requester can verify
+    /// "served us, completely" against its OWN state instead of trusting
+    /// that the full delta and the marker both arrived (the v1 cross-topic
+    /// loss window). A requester stops only when its local digest matches a
+    /// declared digest — a lost full delta leaves the local digest
+    /// different, so it keeps asking.
+    ///
+    /// Empty holders declare the digest of the empty set, which any empty
+    /// requester can compute locally — two empty replicas verifiably agree
+    /// on the empty state, so converging on empty is now CORRECT (not the
+    /// false convergence the v1 silence rule defended against), and the
+    /// genuinely-empty chatter tail terminates. Because the digest is
+    /// self-verifying, an empty declaration needs no full-delta broadcast
+    /// to witness.
+    ///
+    /// Wire compatibility: additive variant, same precedent as the v1
+    /// marker — older peers fail to deserialize it and skip the message;
+    /// new peers treat v1 markers as weaker evidence when no v2 digest has
+    /// been seen. The marker rides along with the full-state broadcast
+    /// (never separately) when there is state to serve.
+    StateServedV2 {
+        /// The declaring holder (receivers skip their own echo).
+        responder: PeerId,
+        /// Canonical BLAKE3 digest over the served task set.
+        digest: [u8; 32],
+        /// Number of tasks in the served set — a cheap shape check for the
+        /// verified full-replace adopt path (and useful in logs).
+        entry_count: u32,
+    },
+}
+
+/// One responder's latest v2 digest declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServedState {
+    /// The declared content digest.
+    digest: [u8; 32],
+    /// The declared number of tasks.
+    entry_count: u32,
+}
+
+/// Aggregated `StateServed`/`StateServedV2` evidence observed by one
+/// replica's responder loop, consumed by its bootstrap requester to decide
+/// convergence.
+#[derive(Debug, Default)]
+struct TaskServedEvidence {
+    /// A v1 marker from some holder (weak evidence — old peers).
+    saw_v1: bool,
+    /// Latest digest declaration per responder (bounded by mesh size — a
+    /// responder's newer declaration REPLACES its older one, so a replayed
+    /// stale serve can never roll a verified full-replace adopt backwards).
+    digests: std::collections::HashMap<PeerId, ServedState>,
+}
+
+/// Convergence rule for the bootstrap tail (pure for unit-testing).
+///
+/// When any v2 digest declarations exist, the local digest must match one
+/// of them — with the data-bearing-claim-wins rule: if any declaration is
+/// non-empty, only a non-empty match converges (an empty holder's
+/// declaration must not retire a requester while a full holder advertised
+/// content). Otherwise (only v1 markers seen — old peers) the legacy weak
+/// rule: a marker AND local non-emptiness. No evidence is NEVER
+/// convergence.
+fn tasklist_converged(ev: &TaskServedEvidence, task_count: usize, local_digest: [u8; 32]) -> bool {
+    if !ev.digests.is_empty() {
+        let any_nonempty = ev.digests.values().any(|d| d.entry_count > 0);
+        return ev
+            .digests
+            .values()
+            .any(|d| d.digest == local_digest && (d.entry_count > 0 || !any_nonempty));
+    }
+    ev.saw_v1 && task_count > 0
+}
+
+/// Disarms the bootstrap-active flag on ANY requester exit path (converged,
+/// silenced, cancelled, torn down) so the listener's digest-verified
+/// full-replace adopt can never fire outside the bootstrap window.
+struct BootstrapGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BootstrapGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Synchronization wrapper for a TaskList.
@@ -240,6 +324,18 @@ impl TaskListSync {
         let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
         let task_list = Arc::clone(&self.task_list);
         let listener_cancel = self.cancel.clone();
+        // StateServed evidence: written by the responder loop (which owns
+        // the side-topic subscription), read by the listener (verified
+        // full-replace adopt, issue #240) and the bootstrap requester
+        // (convergence). Created BEFORE the loops so all three share it.
+        let served_evidence = Arc::new(std::sync::Mutex::new(TaskServedEvidence::default()));
+        // Armed only while the bootstrap requester runs: the verified
+        // full-replace adopt fires exclusively in that window — a converged
+        // replica must never let a divergent holder's serve truncate state
+        // it legitimately holds.
+        let bootstrap_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener_served = Arc::clone(&served_evidence);
+        let listener_bootstrap_active = Arc::clone(&bootstrap_active);
 
         spawn(Box::pin(async move {
             loop {
@@ -265,6 +361,41 @@ impl TaskListSync {
                         let mut list = task_list.write().await;
                         if let Err(e) = list.merge_delta(&delta, peer_id) {
                             tracing::warn!("Failed to merge remote delta: {}", e);
+                        } else if listener_bootstrap_active
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            // Digest-verified full-replace adopt (issue
+                            // #240, deletion cold-sync): while
+                            // bootstrapping, when the sender's latest v2
+                            // declaration matches this delta's served
+                            // content (digest AND task count), the delta IS
+                            // that holder's complete state — prune local
+                            // tasks it does not carry. Without verification
+                            // any holder could truncate local state at
+                            // will.
+                            let declared = listener_served
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .digests
+                                .get(&peer_id)
+                                .copied();
+                            if let Some(declared) = declared {
+                                let list_id = *list.id();
+                                if delta.added_tasks.len() == declared.entry_count as usize
+                                    && delta
+                                        .served_digest(&list_id)
+                                        .is_some_and(|dg| dg == declared.digest)
+                                {
+                                    let pruned = list.prune_to_served_set(&delta);
+                                    if pruned > 0 {
+                                        tracing::info!(
+                                            "pruned {pruned} stale task(s) after \
+                                             digest-verified full serve for list {}",
+                                            list.id()
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -284,10 +415,6 @@ impl TaskListSync {
         let responder_pubsub = Arc::clone(&self.pubsub);
         let responder_topic = self.topic.clone();
         let sync_topic = self.state_sync_topic();
-        // StateServed evidence: written by the responder loop (which owns
-        // the side-topic subscription), read by the bootstrap requester to
-        // decide convergence.
-        let served_evidence = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let responder_served = Arc::clone(&served_evidence);
         let responder_cancel = self.cancel.clone();
         let local_peer_id = self.local_peer_id;
@@ -322,60 +449,93 @@ impl TaskListSync {
                         if requester == local_peer_id {
                             continue;
                         }
-                        // The StateServed marker is published ONLY alongside
-                        // an actual full-delta publish: a marker must
-                        // witness a real broadcast — one sent for a
-                        // cooldown-suppressed response could convince a
-                        // requester that never received the state to stop
-                        // asking (round-3 review). A requester inside the
-                        // window is served by its next scheduled attempt.
-                        // Checked BEFORE building the full delta — no point
-                        // cloning the whole list for a suppressed response.
-                        let cooled_down = last_full_response.is_some_and(|t| {
-                            t.elapsed()
-                                < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
-                        });
-                        if cooled_down {
-                            continue;
-                        }
-                        // Empty holders stay entirely silent — no response,
-                        // no marker (see StateServed docs).
-                        let full = {
-                            let list = responder_list.read().await;
-                            if list.task_count() == 0 {
+                        let mut markers: Vec<TaskListSyncMessage> = Vec::new();
+                        if responder_list.read().await.task_count() == 0 {
+                            // Empty holder: the v2 digest of the empty set
+                            // is universally computable, so an empty
+                            // requester verifies it locally and stops
+                            // (issue #240; no broadcast to witness because
+                            // there is nothing to serve, and no cooldown —
+                            // damping exists to bound FULL-state storms).
+                            // v1 behavior is preserved for old peers:
+                            // silence (two empty replicas must not talk
+                            // each other into a false converged-empty under
+                            // the unverifiable v1 rule).
+                            let digest = responder_list.read().await.served_digest();
+                            markers.push(TaskListSyncMessage::StateServedV2 {
+                                responder: local_peer_id,
+                                digest,
+                                entry_count: 0,
+                            });
+                        } else {
+                            // The StateServed markers are published ONLY
+                            // alongside an actual full-delta publish: a
+                            // marker must witness a real broadcast — one
+                            // sent for a cooldown-suppressed response could
+                            // convince a requester that never received the
+                            // state to stop asking (round-3 review). A
+                            // requester inside the window is served by its
+                            // next scheduled attempt. Checked BEFORE
+                            // building the full delta — no point cloning
+                            // the whole list for a suppressed response.
+                            let cooled_down = last_full_response.is_some_and(|t| {
+                                t.elapsed()
+                                    < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
+                            });
+                            if cooled_down {
                                 continue;
                             }
-                            list.full_delta()
-                        };
-                        let Ok(serialized) = encode_delta(local_peer_id, &full) else {
-                            continue;
-                        };
-                        if let Err(e) = responder_pubsub
-                            .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
-                            .await
-                        {
-                            tracing::warn!("TaskList state-response publish failed: {e}");
-                            continue;
+                            // One snapshot for the full delta AND the v2
+                            // digest, so the declaration commits to exactly
+                            // what was broadcast.
+                            let (full, digest, count) = {
+                                let list = responder_list.read().await;
+                                (
+                                    list.full_delta(),
+                                    list.served_digest(),
+                                    list.task_count() as u32,
+                                )
+                            };
+                            let Ok(serialized) = encode_delta(local_peer_id, &full) else {
+                                continue;
+                            };
+                            if let Err(e) = responder_pubsub
+                                .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
+                                .await
+                            {
+                                tracing::warn!("TaskList state-response publish failed: {e}");
+                                continue;
+                            }
+                            last_full_response = Some(tokio::time::Instant::now());
+                            markers.push(TaskListSyncMessage::StateServed {
+                                responder: local_peer_id,
+                            });
+                            // The v2 marker rides along with the broadcast
+                            // it commits to — never separately
+                            // (response-storm damping, issue #240).
+                            markers.push(TaskListSyncMessage::StateServedV2 {
+                                responder: local_peer_id,
+                                digest,
+                                entry_count: count,
+                            });
                         }
-                        last_full_response = Some(tokio::time::Instant::now());
-                        let marker = TaskListSyncMessage::StateServed {
-                            responder: local_peer_id,
-                        };
-                        match bincode::serialize(&marker) {
-                            Ok(serialized) => {
-                                if let Err(e) = responder_pubsub
-                                    .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
-                                    .await
-                                {
+                        for marker in markers {
+                            match bincode::serialize(&marker) {
+                                Ok(serialized) => {
+                                    if let Err(e) = responder_pubsub
+                                        .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "TaskList state-served marker publish failed: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
                                     tracing::warn!(
-                                        "TaskList state-served marker publish failed: {e}"
+                                        "TaskList state-served marker serialize failed: {e}"
                                     );
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "TaskList state-served marker serialize failed: {e}"
-                                );
                             }
                         }
                     }
@@ -388,7 +548,35 @@ impl TaskListSync {
                         // the requester still requires local non-emptiness
                         // — a forged marker cannot inject state and stops
                         // recovery no earlier than a real holder could.
-                        responder_served.store(true, std::sync::atomic::Ordering::Relaxed);
+                        responder_served
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .saw_v1 = true;
+                    }
+                    TaskListSyncMessage::StateServedV2 {
+                        responder,
+                        digest,
+                        entry_count,
+                    } => {
+                        if responder == local_peer_id {
+                            continue; // our own marker echoed back
+                        }
+                        // Trust note: the digest is SELF-VERIFYING — a
+                        // forged declaration can only match local state
+                        // that actually equals the declared content, so a
+                        // forgery's worst case is the requester keeps
+                        // asking (the same bound as a forged v1 marker).
+                        responder_served
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .digests
+                            .insert(
+                                responder,
+                                ServedState {
+                                    digest,
+                                    entry_count,
+                                },
+                            );
                     }
                 }
             }
@@ -420,7 +608,13 @@ impl TaskListSync {
             let stopped = Arc::clone(&self.stopped);
             let requester_cancel = self.cancel.clone();
             let requester_served = Arc::clone(&served_evidence);
+            let requester_bootstrap_active = Arc::clone(&bootstrap_active);
+            bootstrap_active.store(true, std::sync::atomic::Ordering::Relaxed);
             spawn(Box::pin(async move {
+                // Disarms the adopt window on ANY exit (converged, silenced,
+                // cancelled, torn down) — the listener's verified
+                // full-replace adopt must never fire outside bootstrap.
+                let _guard = BootstrapGuard(requester_bootstrap_active);
                 for (attempt, delay_secs) in state_request_delays().enumerate() {
                     tokio::select! {
                         // cancel_sync tears down every loop promptly, even
@@ -436,15 +630,27 @@ impl TaskListSync {
                     // StateServed marker (a holder actually answered) AND
                     // local state — mere non-emptiness can be faked by one
                     // incremental delta while full history is still missing
-                    // (round-2 review).
+                    // (round-2 review). v2 digest evidence makes the check
+                    // exact (issue #240): the requester stops only when its
+                    // OWN content digest matches a holder's declaration —
+                    // including the universally-computable empty digest,
+                    // which lets a genuinely-empty list fall silent.
                     if attempt >= STATE_REQUEST_RETRY_SECS.len() {
                         let Some(list) = requester_list.upgrade() else {
                             return; // sync torn down — nothing left to bootstrap
                         };
-                        if requester_served.load(std::sync::atomic::Ordering::Relaxed)
-                            && list.read().await.task_count() > 0
-                        {
-                            return; // a holder served us and we hold state
+                        let (count, local_digest) = {
+                            let l = list.read().await;
+                            (l.task_count(), l.served_digest())
+                        };
+                        let converged = {
+                            let ev = requester_served
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            tasklist_converged(&ev, count, local_digest)
+                        };
+                        if converged {
+                            return; // a holder served us and local state matches
                         }
                     }
                     let request = TaskListSyncMessage::StateRequest {
@@ -1123,6 +1329,566 @@ mod tests {
             converged,
             "the infinite tail must recover state from a holder that \
              returns after the old hard cap (zombie subscription, issue #238)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #240: digest-verified convergence evidence
+    // ------------------------------------------------------------------
+
+    /// Drain every side-topic `StateRequest` from `from` already queued on
+    /// `probe` without blocking (the 1ms virtual timeout yields immediately
+    /// under the paused clock when the queue is empty).
+    async fn drain_state_requests(probe: &mut crate::gossip::Subscription, from: PeerId) -> usize {
+        let mut n = 0;
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(1), probe.recv()).await
+        {
+            if let Ok(TaskListSyncMessage::StateRequest { requester }) =
+                bincode::deserialize::<TaskListSyncMessage>(&msg.payload)
+            {
+                if requester == from {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// WHY (issue #240): the convergence rule must weigh v2 digest evidence
+    /// above the weak v1 rule, with the data-bearing-claim-wins tiebreak —
+    /// and NO evidence is NEVER convergence.
+    #[test]
+    fn tasklist_convergence_rule() {
+        const D1: [u8; 32] = [1u8; 32];
+        const D2: [u8; 32] = [2u8; 32];
+        const D_EMPTY: [u8; 32] = [9u8; 32];
+        let none = TaskServedEvidence::default();
+        assert!(!tasklist_converged(&none, 0, D1));
+        assert!(!tasklist_converged(&none, 5, D1));
+
+        // v1 weak rule: marker + local non-emptiness.
+        let v1 = TaskServedEvidence {
+            saw_v1: true,
+            digests: std::collections::HashMap::new(),
+        };
+        assert!(!tasklist_converged(&v1, 0, D1));
+        assert!(tasklist_converged(&v1, 3, D1));
+
+        // v2 digest gate: match stops, mismatch keeps asking, and v2
+        // outranks the weak v1 rule.
+        let mut ev = TaskServedEvidence::default();
+        ev.digests.insert(
+            peer(9),
+            ServedState {
+                digest: D1,
+                entry_count: 2,
+            },
+        );
+        assert!(tasklist_converged(&ev, 2, D1));
+        assert!(!tasklist_converged(&ev, 1, D2));
+        ev.saw_v1 = true;
+        assert!(
+            !tasklist_converged(&ev, 1, D2),
+            "v2 declarations outrank weak v1 evidence"
+        );
+
+        // Empty-holder declarations converge an empty requester only when
+        // every declaration is empty (data-bearing claim wins).
+        let mut ev_empty = TaskServedEvidence::default();
+        ev_empty.digests.insert(
+            peer(9),
+            ServedState {
+                digest: D_EMPTY,
+                entry_count: 0,
+            },
+        );
+        assert!(tasklist_converged(&ev_empty, 0, D_EMPTY));
+        ev_empty.digests.insert(
+            peer(10),
+            ServedState {
+                digest: D1,
+                entry_count: 2,
+            },
+        );
+        assert!(
+            !tasklist_converged(&ev_empty, 0, D_EMPTY),
+            "a data-bearing declaration outranks the empty one — keep asking"
+        );
+        assert!(tasklist_converged(&ev_empty, 2, D1));
+    }
+
+    /// WHY: the v2 digest commits to the served task set so a requester can
+    /// verify completeness LOCALLY. It must be deterministic across
+    /// replicas, sensitive to membership, insensitive to name/ordering
+    /// metadata, and bound to the list id; a full delta's carried digest
+    /// must equal the serving list's local digest.
+    #[test]
+    fn served_digest_is_deterministic_content_bound_and_metadata_independent() {
+        let mut a = TaskList::new(list_id(1), "alpha".to_string(), peer(1));
+        let mut b = TaskList::new(list_id(1), "beta".to_string(), peer(2));
+        assert_eq!(
+            a.served_digest(),
+            b.served_digest(),
+            "empty lists with the same id digest alike (name is not content)"
+        );
+        let c = TaskList::new(list_id(2), "alpha".to_string(), peer(1));
+        assert_ne!(
+            a.served_digest(),
+            c.served_digest(),
+            "the list id binds the digest (cross-list replay defense)"
+        );
+
+        // The same task in both lists ⇒ the same digest, however it got
+        // there (OR-Set writer tags are transport, not content).
+        let task = make_task(7, peer(3));
+        a.add_task(task.clone(), peer(1), 1).expect("add a");
+        b.add_task(task, peer(2), 1).expect("add b");
+        assert_eq!(a.served_digest(), b.served_digest());
+
+        // A full delta's served digest equals the local digest; an
+        // incremental delta is not full-state-shaped and must not
+        // impersonate a serve.
+        let full = a.full_delta();
+        assert_eq!(full.served_digest(&list_id(1)), Some(a.served_digest()));
+        let inc = TaskListDelta::for_add(
+            TaskId::from_bytes([8; 32]),
+            make_task(8, peer(1)),
+            (peer(1), 1),
+            2,
+        );
+        assert_eq!(inc.served_digest(&list_id(1)), None);
+
+        // Different membership ⇒ different digest.
+        b.add_task(make_task(9, peer(2)), peer(2), 2)
+            .expect("add b2");
+        assert_ne!(a.served_digest(), b.served_digest());
+    }
+
+    /// WHY (issue #240, residual 1 — the cross-topic loss window): the full
+    /// delta travels on the main topic, its marker on the side topic, with
+    /// no delivery coupling. If the delta is lost while the marker
+    /// survives, the v1 rule stopped a non-empty requester with incomplete
+    /// history. With the v2 digest the requester detects the mismatch
+    /// (local {t2} vs declared {t1,t2}) and keeps asking until the real
+    /// state arrives.
+    #[tokio::test(start_paused = true)]
+    async fn lost_full_delta_with_surviving_marker_keeps_requester_asking() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let topic = "tasks-240-lost-broadcast";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        // The full holder state (offline for now): {t1, t2}.
+        let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        holder_list
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("holder t1");
+        holder_list
+            .add_task(make_task(2, peer(1)), peer(1), 2)
+            .expect("holder t2");
+
+        // The joiner starts EMPTY (a non-empty task list never bootstraps
+        // — only empty lists run the requester).
+        let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
+        let joiner =
+            TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
+                .expect("joiner sync");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+        joiner.start().await.expect("start joiner");
+
+        // "One live incremental delta": the joiner ends up holding only t2,
+        // cloned out of the holder's own full delta so the resolved fields
+        // are byte-identical and the post-recovery digests can match
+        // exactly. Merged directly into the store — this is the state the
+        // live-gossip bait leaves behind.
+        let t2_only = {
+            let full = holder_list.full_delta();
+            let (id, (task, tag)) = full
+                .added_tasks
+                .iter()
+                .find(|(id, _)| *id.as_bytes() == [2; 32])
+                .expect("t2 in full delta");
+            let mut d = TaskListDelta::new(1);
+            d.added_tasks.insert(*id, (task.clone(), *tag));
+            d
+        };
+        joiner
+            .write()
+            .await
+            .merge_delta(&t2_only, peer(1))
+            .expect("seed t2");
+
+        // The loss window: the marker survives, the full delta does not.
+        let marker = TaskListSyncMessage::StateServedV2 {
+            responder: peer(1),
+            digest: holder_list.served_digest(),
+            entry_count: 2,
+        };
+        let bytes = bincode::serialize(&marker).expect("serialize marker");
+        pubsub
+            .publish(side.clone(), bytes::Bytes::from(bytes))
+            .await
+            .expect("publish marker");
+
+        // Well past the front burst the requester must STILL be asking —
+        // its local digest ({t2}) does not match the declaration ({t1,t2}).
+        let mut requests = 0;
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            requests += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert!(
+            requests > 0,
+            "a requester whose full delta was lost must keep asking (digest mismatch)"
+        );
+        assert_eq!(
+            joiner.read().await.task_count(),
+            1,
+            "the lost broadcast never arrived"
+        );
+
+        // The real holder returns: the next serve delivers {t1,t2}, the
+        // local digest then matches the declaration, and the tail stops.
+        let holder =
+            TaskListSync::new(holder_list, Arc::clone(&pubsub), topic.to_string(), peer(1))
+                .expect("holder sync");
+        holder.start().await.expect("start holder");
+
+        let historical = TaskId::from_bytes([1; 32]);
+        let mut recovered = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.get_task(&historical).is_some() {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "the still-alive requester must recover the lost task"
+        );
+
+        // Convergence is terminal: no further requests.
+        tokio::time::sleep(Duration::from_secs(160)).await;
+        drain_state_requests(&mut probe, peer(2)).await;
+        let mut relapse = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            relapse += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert_eq!(relapse, 0, "a digest-matched requester must fall silent");
+    }
+
+    /// WHY (issue #240, residual 2 — deletion cold-sync): a full delta
+    /// carries only live tasks, so a plain merge could never delete a stale
+    /// replica's obsolete tasks. The digest-verified full-replace adopt
+    /// closes that: the serve's delta content is bound to the holder's
+    /// declared digest, so pruning local tasks it omits is safe.
+    #[tokio::test(start_paused = true)]
+    async fn digest_verified_full_serve_prunes_stale_tasks() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let topic = "tasks-240-prune-stale";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        // Holder: only t1.
+        let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        holder_list
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("holder t1");
+
+        // Stale joiner: starts EMPTY (only empty lists run the requester),
+        // then state lands the way it would in production — t1 (from the
+        // holder's full delta, byte-identical) and t_stale (an obsolete
+        // task the holder deleted while this replica was away) merge
+        // directly into the store before the holder ever comes online.
+        let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
+        let joiner =
+            TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
+                .expect("joiner sync");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+        joiner.start().await.expect("start joiner");
+        let t1_only = {
+            let full = holder_list.full_delta();
+            let (id, (task, tag)) = full
+                .added_tasks
+                .iter()
+                .find(|(id, _)| *id.as_bytes() == [1; 32])
+                .expect("t1 in full delta");
+            let mut d = TaskListDelta::new(1);
+            d.added_tasks.insert(*id, (task.clone(), *tag));
+            d
+        };
+        {
+            let mut l = joiner.write().await;
+            l.merge_delta(&t1_only, peer(1)).expect("seed t1");
+            l.add_task(make_task(9, peer(2)), peer(2), 1)
+                .expect("seed stale task");
+        }
+
+        let holder =
+            TaskListSync::new(holder_list, Arc::clone(&pubsub), topic.to_string(), peer(1))
+                .expect("holder sync");
+        holder.start().await.expect("start holder");
+
+        // The verified adopt must remove the stale task while t1 stays.
+        let stale = TaskId::from_bytes([9; 32]);
+        let mut pruned = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let l = joiner.read().await;
+            if l.get_task(&stale).is_none() && l.task_count() == 1 {
+                pruned = true;
+                break;
+            }
+        }
+        assert!(
+            pruned,
+            "the digest-verified full serve must prune the stale task \
+             (deletion cold-sync)"
+        );
+
+        // And convergence follows: local state now equals the declared
+        // digest, so the requester falls silent.
+        tokio::time::sleep(Duration::from_secs(160)).await;
+        drain_state_requests(&mut probe, peer(2)).await;
+        let mut relapse = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            relapse += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert_eq!(relapse, 0, "the requester must stop once the digests match");
+    }
+
+    /// WHY (issue #240, residual 3 — genuinely-empty chatter): the v1 rule
+    /// kept every empty list requesting forever (~1 side-topic message per
+    /// 5 minutes) because an empty holder had to stay silent (two empty
+    /// replicas must not talk each other into a FALSE converged-empty).
+    /// The v2 digest of the empty set is universally computable, so an
+    /// empty holder can now declare authoritative emptiness any empty
+    /// requester verifies locally — converging on empty is verifiably
+    /// CORRECT, and the chatter tail terminates.
+    #[tokio::test(start_paused = true)]
+    async fn empty_holder_v2_marker_terminates_empty_requester() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let topic = "tasks-240-empty-silence";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        // Both lists genuinely EMPTY.
+        let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
+        let joiner =
+            TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
+                .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+        let holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        let holder =
+            TaskListSync::new(holder_list, Arc::clone(&pubsub), topic.to_string(), peer(1))
+                .expect("holder sync");
+        holder.start().await.expect("start holder");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+
+        // Warm-up: the front burst fires and the empty holder's v2
+        // declarations arrive; convergence should follow within a few tail
+        // checks.
+        tokio::time::sleep(Duration::from_secs(160)).await;
+        drain_state_requests(&mut probe, peer(2)).await;
+        let mut late = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            late += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert_eq!(
+            late, 0,
+            "an empty holder's verifiable digest must terminate the empty \
+             requester's tail (genuinely-empty lists converge silently)"
+        );
+    }
+
+    /// WHY: wire compatibility is additive — a fleet with only v1 (older)
+    /// responders must behave exactly as before: a v1 marker plus local
+    /// state converges the requester. The v2 machinery must not require
+    /// v2 markers to make progress against old peers.
+    #[tokio::test(start_paused = true)]
+    async fn v1_marker_from_old_peer_still_converges() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let topic = "tasks-240-v1-compat";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
+        let joiner =
+            TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
+                .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+
+        // An "old peer" answers a request: full delta on the main topic,
+        // v1 StateServed marker on the side topic — never a v2 marker.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        holder_list
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("holder t1");
+        let full = holder_list.full_delta();
+        let encoded = encode_delta(peer(1), &full).expect("encode full");
+        pubsub
+            .publish(topic.to_string(), bytes::Bytes::from(encoded))
+            .await
+            .expect("publish full delta");
+        let marker = TaskListSyncMessage::StateServed { responder: peer(1) };
+        let marker_bytes = bincode::serialize(&marker).expect("serialize v1 marker");
+        pubsub
+            .publish(side.clone(), bytes::Bytes::from(marker_bytes))
+            .await
+            .expect("publish v1 marker");
+
+        let historical = TaskId::from_bytes([1; 32]);
+        let mut recovered = false;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.get_task(&historical).is_some() {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered, "the old peer's full delta must merge");
+
+        // Weak-evidence convergence: v1 marker + local state ⇒ the tail stops.
+        tokio::time::sleep(Duration::from_secs(160)).await;
+        drain_state_requests(&mut probe, peer(2)).await;
+        let mut late = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            late += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert_eq!(
+            late, 0,
+            "v1 evidence from an old peer must still converge the requester"
+        );
+    }
+
+    /// WHY: a v2 marker whose digest does not correspond to any state the
+    /// requester can hold (forged or corrupt) must NEVER converge it — the
+    /// digest is self-verifying, so a bad declaration can only delay, never
+    /// cause, convergence. Nor may it wedge later recovery: a genuine
+    /// holder's fresh declaration replaces the bad one (per-responder
+    /// latest-wins).
+    #[tokio::test(start_paused = true)]
+    async fn tampered_digest_is_rejected_and_does_not_wedge_recovery() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let topic = "tasks-240-tampered";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
+        let joiner =
+            TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
+                .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+
+        // The tampered marker: a random digest no real state can match.
+        let marker = TaskListSyncMessage::StateServedV2 {
+            responder: peer(1),
+            digest: [0xAB; 32],
+            entry_count: 2,
+        };
+        let bytes = bincode::serialize(&marker).expect("serialize marker");
+        pubsub
+            .publish(side.clone(), bytes::Bytes::from(bytes))
+            .await
+            .expect("publish tampered marker");
+
+        // The requester keeps asking: its (empty) local digest can never
+        // equal the forged declaration.
+        let mut requests = 0;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            requests += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert!(
+            requests > 0,
+            "a tampered digest must not converge the requester"
+        );
+        assert_eq!(
+            joiner.read().await.task_count(),
+            0,
+            "no state can have been adopted from a forged declaration"
+        );
+
+        // The genuine holder appears; its fresh declaration replaces the
+        // tampered one (per-responder latest-wins) and recovery completes.
+        let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        holder_list
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("holder t1");
+        let holder =
+            TaskListSync::new(holder_list, Arc::clone(&pubsub), topic.to_string(), peer(1))
+                .expect("holder sync");
+        holder.start().await.expect("start holder");
+
+        let historical = TaskId::from_bytes([1; 32]);
+        let mut recovered = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.get_task(&historical).is_some() {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "a tampered marker must not wedge recovery from a genuine holder"
+        );
+    }
+
+    /// WHY (F3, fix-loop — tombstone + hardcoded-tag deadlock): the adopt's
+    /// prune is a local observe-remove, tombstoning the tags a previous
+    /// full delta used. With a hardcoded synthetic tag, a later serve
+    /// re-adding the same task would be silently rejected forever. Full
+    /// deltas now mint FRESH tags, so a re-served task is accepted.
+    #[test]
+    fn pruned_task_is_accepted_when_re_served_with_fresh_tags() {
+        let mut holder = TaskList::new(list_id(1), "List".to_string(), peer(1));
+        holder
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("add t1");
+        holder
+            .add_task(make_task(2, peer(1)), peer(1), 2)
+            .expect("add t2");
+
+        // The replica absorbs a first full serve (both tasks).
+        let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
+        let s1 = holder.full_delta();
+        replica.merge_delta(&s1, peer(1)).expect("serve 1");
+        assert_eq!(replica.task_count(), 2);
+
+        // The holder deletes the task; the next VERIFIED serve prunes it
+        // (tombstoning the first serve's synthetic tag locally).
+        let doomed = TaskId::from_bytes([2; 32]);
+        holder.remove_task(&doomed).expect("delete");
+        let s2 = holder.full_delta();
+        assert_eq!(
+            s2.served_digest(&list_id(1)),
+            Some(holder.served_digest()),
+            "the serve must carry the holder's declared digest"
+        );
+        replica.merge_delta(&s2, peer(1)).expect("serve 2");
+        assert_eq!(replica.prune_to_served_set(&s2), 1);
+        assert!(replica.get_task(&doomed).is_none());
+
+        // The holder RE-ADDS the task: a later serve must be accepted —
+        // pre-fix, its synthetic tag was tombstoned by the prune and the
+        // re-add silently dropped.
+        holder
+            .add_task(make_task(2, peer(1)), peer(1), 3)
+            .expect("re-add");
+        let s3 = holder.full_delta();
+        replica.merge_delta(&s3, peer(1)).expect("serve 3");
+        assert!(
+            replica.get_task(&doomed).is_some(),
+            "a re-served task must be accepted after a prune"
         );
     }
 }

@@ -226,6 +226,9 @@ const CHECKPOINT_SIG_DOMAIN: &[u8] = b"x0x.store.checkpoint.sig.v1";
 /// Domain-separation tag for content-root hashing.
 const CHECKPOINT_ROOT_DOMAIN: &[u8] = b"x0x.store.checkpoint.root.v2";
 
+/// Domain-separation tag for served-state digest hashing (issue #240).
+const SERVED_DIGEST_DOMAIN: &[u8] = b"x0x.store.served.digest.v1";
+
 /// Owner-signed content provenance for a store snapshot.
 ///
 /// Decouples "who relays" from "who authored": the signature is content-level
@@ -364,6 +367,70 @@ fn entry_commitment_bytes(outer_key: &str, entry: &KvEntry) -> Vec<u8> {
 fn lp_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
     buf.extend_from_slice(data);
+}
+
+/// Deterministic canonical BLAKE3 digest over the active entry set alone.
+///
+/// This is the content commitment carried by `StateServedV2` markers (issue
+/// #240): a serving holder declares it, and a bootstrapping requester
+/// recomputes it over its OWN state, stopping only when they match. Unlike
+/// [`content_root`] it deliberately EXCLUDES the store name — a fresh joiner
+/// constructs its replica with a placeholder name, so a name-binding digest
+/// could never match (and the name is LWW metadata, not entry history; it
+/// rides every delta anyway). The store id binds the digest to one logical
+/// store, so a marker replayed onto another store's side topic can never
+/// verify. Entries are sorted by outer key and committed with the same
+/// canonical encoding as [`content_root`], so holder and requester agree
+/// byte-for-byte on identical content. The empty set's digest is universally
+/// computable — that is what lets an EMPTY holder declare authoritative
+/// emptiness to an empty requester.
+///
+/// Unlike [`content_root`] it also EXCLUDES `created_at` (F1, fix-loop):
+/// [`KvEntry::merge`] preserves the EARLIEST `created_at`, so when an owner
+/// deletes and re-creates a key, a replica holding the original entry keeps
+/// `T1` while the owner commits `T2` — a digest committing `created_at`
+/// would NEVER match and the bootstrap would wedge at capped cadence
+/// forever. `created_at` is display provenance, not merge-converged content
+/// (`updated_at` IS merge-stable: max-wins, so both sides agree on it after
+/// the serve merges). The checkpoint `content_root` keeps `created_at`
+/// because checkpoint adoption is a full REPLACE verified byte-for-byte —
+/// no merge semantics, so the commitment there is exact.
+#[must_use]
+pub(crate) fn served_content_digest(
+    store_id: &KvStoreId,
+    entries: &[(&str, &KvEntry)],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(SERVED_DIGEST_DOMAIN);
+    h.update(store_id.as_bytes());
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (outer_key, entry) in &sorted {
+        h.update(&served_entry_commitment_bytes(outer_key, entry));
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Canonical length-delimited encoding of one entry's merge-converged
+/// fields for the served-state digest. Identical to
+/// [`entry_commitment_bytes`] MINUS `created_at` — see
+/// [`served_content_digest`] for why.
+fn served_entry_commitment_bytes(outer_key: &str, entry: &KvEntry) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+    lp_bytes(&mut buf, outer_key.as_bytes());
+    lp_bytes(&mut buf, entry.key.as_bytes());
+    lp_bytes(&mut buf, &entry.value);
+    lp_bytes(&mut buf, &entry.content_hash);
+    lp_bytes(&mut buf, entry.content_type.as_bytes());
+    let mut meta: Vec<_> = entry.metadata.iter().collect();
+    meta.sort_by(|a, b| a.0.cmp(b.0));
+    buf.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+    for (mk, mv) in &meta {
+        lp_bytes(&mut buf, mk.as_bytes());
+        lp_bytes(&mut buf, mv.as_bytes());
+    }
+    buf.extend_from_slice(&entry.updated_at.to_le_bytes());
+    buf
 }
 
 /// Full-field entry equality for the AppendOnly freeze.
@@ -1632,7 +1699,18 @@ impl KvStore {
         // cloning the whole key set into an intermediate HashSet first.
         for key in self.keys.elements() {
             if let Some(entry) = self.entries.get(key) {
-                let tag = (PeerId::new([0u8; 32]), 0);
+                // Synthetic tags must be FRESH per entry (F3, fix-loop):
+                // the digest-verified adopt prunes stale keys with a local
+                // observe-remove, which tombstones the tags a previous full
+                // delta used. A hardcoded tag would then be silently
+                // rejected on a later serve that re-adds the key — a
+                // permanent re-add deadlock. Minting from the store's own
+                // counter guarantees a re-serve's tag is never one this
+                // store has issued before (snapshot persistence floors the
+                // counter across restarts, so that holds after a restart
+                // too). The zero peer id is fine: tags are scoped per key,
+                // and uniqueness over time is what the tombstones require.
+                let tag = (PeerId::new([0u8; 32]), self.next_seq());
                 delta.added.insert(key.clone(), (entry.clone(), tag));
             }
         }
@@ -1648,6 +1726,48 @@ impl KvStore {
         // (the checkpoint's owner signature survives re-wrap).
         delta.owner_checkpoint = self.latest_checkpoint.clone();
         delta
+    }
+
+    /// The content digest this store declares in a `StateServedV2` marker
+    /// when it serves its full state (issue #240). Computed over the active
+    /// entry set — see [`served_content_digest`].
+    pub(crate) fn served_digest(&self) -> [u8; 32] {
+        served_content_digest(&self.id, &self.checkpoint_pairs())
+    }
+
+    /// Remove local keys absent from a digest-verified full-state serve
+    /// (`delta.added` is then the verified complete entry set).
+    ///
+    /// This is the checkpoint-less deletion cold-sync path (issue #240): a
+    /// plain full-delta merge only upserts, so keys the holder deleted while
+    /// this replica was away would otherwise linger forever. Each stale key
+    /// is removed with a LOCAL observe-remove (its current tags are
+    /// tombstoned, so a later re-add with fresh tags still wins) and dropped
+    /// from `entries` — the same semantics the `delta.removed` merge path
+    /// applies. Never for AppendOnly stores: keys are immutable there
+    /// (mirrors the `removed` guard in `merge_delta`).
+    ///
+    /// Callers MUST have verified the delta against the serving holder's
+    /// declared digest (and its sender authorization) first — without that
+    /// binding, any holder could truncate local state at will.
+    pub(crate) fn prune_to_served_set(&mut self, delta: &KvStoreDelta) -> usize {
+        if matches!(self.policy, AccessPolicy::AppendOnly) {
+            return 0;
+        }
+        let stale: Vec<String> = self
+            .keys
+            .elements()
+            .into_iter()
+            .filter(|k| !delta.added.contains_key(k.as_str()))
+            .cloned()
+            .collect();
+        let mut pruned = 0;
+        for key in stale {
+            let _ = self.keys.remove(&key);
+            self.entries.remove(key.as_str());
+            pruned += 1;
+        }
+        pruned
     }
 }
 
