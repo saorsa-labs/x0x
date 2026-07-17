@@ -7,6 +7,7 @@
 
 mod connect;
 mod contacts;
+mod direct;
 mod exec;
 mod files;
 mod identity;
@@ -23,6 +24,9 @@ pub(super) use connect::{
 pub(super) use contacts::{
     add_contact, delete_contact, list_contacts, list_revocations, quick_trust, revoke_contact,
     update_contact,
+};
+pub(super) use direct::{
+    connect_agent, connect_machine, direct_connections, direct_message_send_config, direct_send,
 };
 pub(super) use exec::{exec_cancel, exec_diagnostics, exec_run, exec_sessions};
 pub(super) use files::{
