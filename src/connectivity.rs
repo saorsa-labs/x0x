@@ -824,11 +824,7 @@ mod tests {
         );
         // All-ones host portion still masks to the network.
         assert_eq!(
-            mask_observed_prefix(
-                "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"
-                    .parse()
-                    .unwrap()
-            ),
+            mask_observed_prefix("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()),
             Some("2001:db8:ffff::/48".to_string())
         );
     }
@@ -876,8 +872,8 @@ mod tests {
         assert!(!below.cgnat);
 
         // CGNAT is a v4 concept; v6 observations never carry the flag.
-        let v6 = ObservedOrigin::from_observed("2001:db8::1".parse().unwrap(), false)
-            .expect("v6 masks");
+        let v6 =
+            ObservedOrigin::from_observed("2001:db8::1".parse().unwrap(), false).expect("v6 masks");
         assert!(!v6.cgnat);
         assert_eq!(v6.observed_prefix, "2001:db8::/48");
     }

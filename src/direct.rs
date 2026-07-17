@@ -1606,8 +1606,15 @@ mod tests {
         let machine_id = MachineId([6u8; 32]);
 
         for idx in 0_u64..=2 {
-            dm.handle_incoming(machine_id, sender, idx.to_be_bytes().to_vec(), true, None, None)
-                .await;
+            dm.handle_incoming(
+                machine_id,
+                sender,
+                idx.to_be_bytes().to_vec(),
+                true,
+                None,
+                None,
+            )
+            .await;
         }
 
         let snap = dm.diagnostics_snapshot();
@@ -1821,18 +1828,14 @@ mod tests {
 
         // And when present, the row carries the masked token.
         let origin = test_observed_origin();
-        dm.handle_incoming(
-            machine_id,
-            sender,
-            b"y".to_vec(),
-            true,
-            None,
-            Some(origin),
-        )
-        .await;
+        dm.handle_incoming(machine_id, sender, b"y".to_vec(), true, None, Some(origin))
+            .await;
         let snap = dm.diagnostics_snapshot();
         let json = serde_json::to_string(&snap.per_peer).expect("serialize per_peer");
         let needle = "\"observed_origin\":{\"observed_prefix\":\"203.0.113.0/24\",\"direct\":true,\"cgnat\":false}";
-        assert!(json.contains(needle), "present token serializes masked: {json}");
+        assert!(
+            json.contains(needle),
+            "present token serializes masked: {json}"
+        );
     }
 }
