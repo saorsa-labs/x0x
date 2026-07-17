@@ -1370,10 +1370,10 @@ pub struct NetworkNode {
     /// Reconnect-suppression tombstones, keyed by peer id. Set when a peer is
     /// disconnected for a non-transport reason (policy rejection, pool
     /// eviction, admin, revocation, shutdown) so neither the proactive
-    /// reconnect scheduler nor the ant-quic lifecycle `Closed` watcher redials
-    /// it — undoing a security rejection, churning an LRU eviction, or
-    /// ignoring an operator teardown. See [`DisconnectReason`] and
-    /// [`NetworkNode::is_reconnect_suppressed`].
+    /// reconnect scheduler, nor the ant-quic lifecycle `Closed` watcher, nor
+    /// the inbound accept loop (re)admits it — undoing a security rejection,
+    /// churning an LRU eviction, or ignoring an operator teardown. See
+    /// [`DisconnectReason`] and [`NetworkNode::is_reconnect_suppressed`].
     reconnect_suppressions: Arc<Mutex<HashMap<[u8; 32], ReconnectSuppression>>>,
     /// Handles to the background tasks spawned at construction (receiver, accept
     /// loop, connection-pool eviction).
@@ -1736,7 +1736,12 @@ impl NetworkNode {
             total_connections: status.direct_connections + status.relayed_connections,
             active_connections: status.active_connections as u32,
             bytes_sent: status.relay_bytes_forwarded,
-            bytes_received: 0, // TODO: Track in future
+            // `ant_quic::NodeStatus` (ant-quic 0.27.33) exposes no
+            // inbound byte counter — its only byte-related field is
+            // `relay_bytes_forwarded` (bytes this node forwarded as a relay
+            // for other peers). bytes_received stays zero until upstream
+            // adds one. Wiring a fake value here would silently misreport.
+            bytes_received: 0,
             peer_count: status.connected_peers,
         }
     }
@@ -2489,16 +2494,7 @@ impl NetworkNode {
     /// revocation, shutdown) never expire.
     #[must_use]
     pub fn is_reconnect_suppressed(&self, peer_id: [u8; 32]) -> bool {
-        let mut map = match self.reconnect_suppressions.lock() {
-            Ok(m) => m,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let now = Instant::now();
-        let live = map.get(&peer_id).is_some_and(|s| s.is_live(now));
-        if !live {
-            map.remove(&peer_id);
-        }
-        live
+        reconnect_suppression_is_live(self.reconnect_suppressions.as_ref(), peer_id)
     }
 
     /// Get list of connected peer IDs.
@@ -3168,6 +3164,37 @@ impl NetworkNode {
                             continue;
                         }
 
+                        // Reject peers carrying a live reconnect-suppression
+                        // tombstone. ant-quic's symmetric transport can
+                        // reverse-open a connection back to us immediately
+                        // after we closed ours (observed as the #228 CI
+                        // flake: a policy-rejected peer reappearing inside
+                        // the backoff window), and a revoked/evicted peer can
+                        // simply dial back in. ant-quic registers the inbound
+                        // connection inside `accept()` before x0x can gate,
+                        // so the last x0x-controlled point is right here:
+                        // close it immediately — without recording cache
+                        // success, emitting `PeerConnected`, touching the
+                        // connection pool, or touching the tombstone itself
+                        // (`Node::disconnect` maps to a plain transport close
+                        // and never mutates x0x suppressions).
+                        if reconnect_suppression_is_live(
+                            reconnect_suppressions.as_ref(),
+                            peer_conn.peer_id.0,
+                        ) {
+                            tracing::warn!(
+                                "SECURITY: Rejecting inbound connection from reconnect-suppressed peer {:?}",
+                                peer_conn.peer_id
+                            );
+                            if let Err(e) = node_ref.disconnect(&peer_conn.peer_id).await {
+                                debug!(
+                                    "disconnect of suppressed inbound peer {:?} failed: {}",
+                                    peer_conn.peer_id, e
+                                );
+                            }
+                            continue;
+                        }
+
                         tracing::info!(
                             "Accepted inbound connection from peer {:?} at {:?}",
                             peer_conn.peer_id,
@@ -3538,6 +3565,28 @@ impl ReconnectSuppression {
             Some(ttl) => now.duration_since(self.set_at) < ttl,
         }
     }
+}
+
+/// Returns `true` iff a live suppression tombstone for `peer_id` exists in
+/// `map`, pruning an expired bounded tombstone as observed.
+///
+/// Shared by [`NetworkNode::is_reconnect_suppressed`] and the inbound accept
+/// loop: both must observe the exact same liveness semantics or a tombstoned
+/// peer could re-enter through whichever path checked the stale copy (#228).
+fn reconnect_suppression_is_live(
+    map: &Mutex<HashMap<[u8; 32], ReconnectSuppression>>,
+    peer_id: [u8; 32],
+) -> bool {
+    let mut map = match map.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    let live = map.get(&peer_id).is_some_and(|s| s.is_live(now));
+    if !live {
+        map.remove(&peer_id);
+    }
+    live
 }
 
 /// Events emitted by the network node.

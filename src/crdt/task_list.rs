@@ -14,7 +14,7 @@
 //!
 //! This provides eventual consistency with deterministic conflict resolution.
 
-use crate::crdt::{CrdtError, Result, TaskId, TaskItem};
+use crate::crdt::{CrdtError, Result, TaskId, TaskItem, TaskListDelta};
 use crate::identity::AgentId;
 use saorsa_gossip_crdt_sync::{LwwRegister, OrSet};
 use saorsa_gossip_types::PeerId;
@@ -88,6 +88,9 @@ impl std::fmt::Display for TaskListId {
 fn default_seq_counter() -> Arc<AtomicU64> {
     Arc::new(AtomicU64::new(0))
 }
+
+/// Domain-separation tag for served-state digest hashing (issue #240).
+pub(crate) const SERVED_DIGEST_DOMAIN: &[u8] = b"x0x.tasklist.served.digest.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskList {
@@ -247,6 +250,65 @@ impl TaskList {
         if self.state_fingerprint() != before_fingerprint {
             self.version += 1;
         }
+    }
+
+    /// The content digest this list declares in a `StateServedV2` marker
+    /// when it serves its full state (issue #240).
+    ///
+    /// Canonical BLAKE3 over the list id and every live task's RESOLVED
+    /// observable fields (sorted by task id — see
+    /// [`TaskItem::hash_resolved_fields`]). Deliberately EXCLUDES the name
+    /// and ordering registers: a fresh joiner constructs its replica with a
+    /// placeholder name, so a name-binding digest could never match, and
+    /// both registers ride every full delta (LWW) so they converge with the
+    /// task set anyway. The list id binds the digest to one logical list, so
+    /// a marker replayed onto another list's side topic can never verify.
+    /// The empty set's digest is universally computable — that is what lets
+    /// an EMPTY holder authoritatively terminate an empty requester's
+    /// bootstrap tail: two empty replicas verifiably agree on the empty
+    /// state, so converging on empty is now CORRECT, not false convergence.
+    #[must_use]
+    pub(crate) fn served_digest(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(SERVED_DIGEST_DOMAIN);
+        h.update(self.id.as_bytes());
+        let mut ids: Vec<&TaskId> = self.task_data.keys().collect();
+        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for id in ids {
+            h.update(id.as_bytes());
+            self.task_data[id].hash_resolved_fields(&mut h);
+        }
+        *h.finalize().as_bytes()
+    }
+
+    /// Remove local tasks absent from a digest-verified full-state serve
+    /// (`delta.added_tasks` is then the verified complete task set).
+    ///
+    /// This is the deletion cold-sync path (issue #240): a plain full-delta
+    /// merge only upserts, so tasks the holder deleted while this replica
+    /// was away would otherwise linger forever. Each stale task is removed
+    /// via [`delta_remove_task`](Self::delta_remove_task) — a LOCAL
+    /// observe-remove (its current tags are tombstoned, so a later re-add
+    /// with fresh tags still wins; the tombstones also reject cache replays
+    /// of the pre-delete adds) — the same semantics as merging a removal
+    /// delta.
+    ///
+    /// Callers MUST have verified the delta against the serving holder's
+    /// declared digest first — without that binding, any holder could
+    /// truncate local state at will.
+    pub(crate) fn prune_to_served_set(&mut self, delta: &TaskListDelta) -> usize {
+        let stale: Vec<TaskId> = self
+            .task_data
+            .keys()
+            .filter(|id| !delta.added_tasks.contains_key(*id))
+            .copied()
+            .collect();
+        let mut pruned = 0;
+        for id in stale {
+            self.delta_remove_task(&id);
+            pruned += 1;
+        }
+        pruned
     }
 
     /// Return the next monotonically-increasing sequence number.
