@@ -43,7 +43,7 @@ pub(in crate::server) struct StatusData {
 }
 
 // ---------------------------------------------------------------------------
-// Direct messaging request / response types
+// Health + status handlers
 // ---------------------------------------------------------------------------
 
 /// GET /health
@@ -158,7 +158,7 @@ pub(in crate::server) async fn shutdown_handler(State(state): State<Arc<AppState
 }
 
 // ---------------------------------------------------------------------------
-// File transfer endpoints
+// Constitution handler
 // ---------------------------------------------------------------------------
 
 /// GET /constitution — returns the raw markdown text.
@@ -179,7 +179,3 @@ pub(in crate::server) async fn get_constitution_json() -> impl IntoResponse {
         "content": x0x::constitution::CONSTITUTION_MD,
     }))
 }
-
-// ---------------------------------------------------------------------------
-// Upgrade check handler
-// ---------------------------------------------------------------------------

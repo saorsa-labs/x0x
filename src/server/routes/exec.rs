@@ -46,7 +46,7 @@ pub(in crate::server) struct ExecCancelRequest {
 }
 
 // ---------------------------------------------------------------------------
-// MLS request / response types
+// Exec handlers
 // ---------------------------------------------------------------------------
 
 /// POST /exec/run — run a strictly allowlisted command on a remote daemon.

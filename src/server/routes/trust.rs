@@ -66,9 +66,3 @@ pub(in crate::server) async fn evaluate_trust(
         })),
     )
 }
-
-// Note: task deletion not exposed — TaskListHandle doesn't have remove_task().
-
-// ---------------------------------------------------------------------------
-// MLS welcome handler
-// ---------------------------------------------------------------------------
