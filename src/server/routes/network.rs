@@ -3,18 +3,18 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
-use super::super::{api_error, bad_request};
 use super::super::state::AppState;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use super::super::{api_error, bad_request};
+use crate as x0x;
 use anyhow::Result;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Peer entry.
 #[derive(Debug, Serialize)]
@@ -27,7 +27,9 @@ pub(in crate::server) struct PeerEntry {
 // ---------------------------------------------------------------------------
 
 /// GET /network/status — NAT traversal diagnostics and connection stats.
-pub(in crate::server) async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn network_status(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let Some(network) = state.agent.network() else {
         return api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized");
     };
@@ -135,7 +137,9 @@ pub(in crate::server) async fn peers(State(state): State<Arc<AppState>>) -> impl
 }
 
 /// GET /network/bootstrap-cache — bootstrap peer cache statistics.
-pub(in crate::server) async fn bootstrap_cache_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn bootstrap_cache_stats(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     // Access bootstrap cache via the network node if available
     match state.agent.network() {
         Some(network) => {
@@ -340,7 +344,9 @@ where
 ///
 /// This is the primary observability surface for the 100%-connectivity
 /// guarantee ant-quic is responsible for.
-pub(in crate::server) async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn connectivity_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let Some(network) = state.agent.network() else {
         return api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized");
     };
@@ -535,7 +541,9 @@ pub(in crate::server) async fn connectivity_diagnostics(State(state): State<Arc<
 }
 
 /// GET /diagnostics/ack — ACK-v2 per-stage latency and outcome diagnostics.
-pub(in crate::server) async fn ack_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn ack_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let Some(network) = state.agent.network() else {
         return api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized");
     };
@@ -560,7 +568,9 @@ pub(in crate::server) async fn ack_diagnostics(State(state): State<Arc<AppState>
 /// The delta between stages proves per-daemon 100% delivery (or surfaces
 /// where drops occur). Used by e2e_full_audit / e2e_stress to assert zero
 /// drops under load.
-pub(in crate::server) async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn gossip_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     match state.agent.gossip_stats() {
         Some(snap) => {
             let pubsub_stages =
@@ -599,7 +609,9 @@ pub(in crate::server) async fn gossip_diagnostics(State(state): State<Arc<AppSta
 /// the join-roster-propagation regression: a non-zero value on the
 /// owner side means joiners' messages are reaching the listener but
 /// `members_v2` is stale.
-pub(in crate::server) async fn groups_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn groups_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let metadata_keys: std::collections::HashSet<String> = state
         .group_metadata_tasks
         .read()
@@ -635,7 +647,9 @@ pub(in crate::server) async fn groups_diagnostics(State(state): State<Arc<AppSta
 }
 
 /// GET /diagnostics/dm — direct-message send/receive diagnostics.
-pub(in crate::server) async fn dm_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn dm_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let x0x::direct::DmDiagnosticsSnapshot {
         stats,
         per_peer,

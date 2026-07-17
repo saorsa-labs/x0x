@@ -3,15 +3,15 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
-use super::super::{bad_request, parse_agent_id_hex};
 use super::super::state::AppState;
-use std::sync::Arc;
+use super::super::{bad_request, parse_agent_id_hex};
+use crate as x0x;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
+use std::sync::Arc;
 use x0x::identity::MachineId;
 
 /// POST /trust/evaluate request body.

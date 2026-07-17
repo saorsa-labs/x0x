@@ -3,15 +3,15 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
-use super::super::{api_error, bad_request, not_found, parse_agent_id_hex};
 use super::super::state::AppState;
-use std::sync::Arc;
+use super::super::{api_error, bad_request, not_found, parse_agent_id_hex};
+use crate as x0x;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Discovered identity entry from gossip announcements.
 #[derive(Debug, Serialize)]
@@ -58,7 +58,9 @@ pub(in crate::server) struct DiscoveredAgentQuery {
     pub(in crate::server) wait: bool,
 }
 
-pub(in crate::server) fn discovered_agent_entry(agent: x0x::DiscoveredAgent) -> DiscoveredAgentEntry {
+pub(in crate::server) fn discovered_agent_entry(
+    agent: x0x::DiscoveredAgent,
+) -> DiscoveredAgentEntry {
     DiscoveredAgentEntry {
         agent_id: hex::encode(agent.agent_id.as_bytes()),
         machine_id: hex::encode(agent.machine_id.as_bytes()),
@@ -69,7 +71,9 @@ pub(in crate::server) fn discovered_agent_entry(agent: x0x::DiscoveredAgent) -> 
     }
 }
 
-pub(in crate::server) fn discovered_machine_entry(machine: x0x::DiscoveredMachine) -> DiscoveredMachineEntry {
+pub(in crate::server) fn discovered_machine_entry(
+    machine: x0x::DiscoveredMachine,
+) -> DiscoveredMachineEntry {
     DiscoveredMachineEntry {
         machine_id: hex::encode(machine.machine_id.as_bytes()),
         addresses: machine

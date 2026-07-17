@@ -3,11 +3,10 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
-use super::super::{api_error, bad_request, not_found};
-use super::super::state::AppState;
 use super::super::sse::SseEvent;
-use std::sync::Arc;
+use super::super::state::AppState;
+use super::super::{api_error, bad_request, not_found};
+use crate as x0x;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -15,6 +14,7 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::Deserialize;
+use std::sync::Arc;
 use x0x::logging::LogHexId;
 
 /// A live REST `/subscribe` stream tracked so `DELETE /subscribe/:id` can stop it.

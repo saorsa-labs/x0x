@@ -3,19 +3,21 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
-use super::super::{api_error, bad_request, not_found, parse_agent_id_hex, direct_message_send_config};
-use super::named_groups::GROUP_BACKGROUND_PUBLISH_DELAY;
-use super::super::state::AppState;
 use super::super::crdt_subscriptions;
-use std::sync::Arc;
-use std::time::Duration;
+use super::super::state::AppState;
+use super::super::{
+    api_error, bad_request, direct_message_send_config, not_found, parse_agent_id_hex,
+};
+use super::named_groups::GROUP_BACKGROUND_PUBLISH_DELAY;
+use crate as x0x;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
 use x0x::contacts::TrustLevel;
 use x0x::identity::AgentId;
 use x0x::logging::LogHexId;
@@ -220,7 +222,9 @@ pub(in crate::server) struct StoreListEntry {
 }
 
 /// GET /stores
-pub(in crate::server) async fn list_kv_stores(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn list_kv_stores(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     // Snapshot (id, handle) pairs without holding the read lock across the
     // per-store ownership_info() awaits.
     let pairs: Vec<(String, x0x::KvStoreHandle)> = {

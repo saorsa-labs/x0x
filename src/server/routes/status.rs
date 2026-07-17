@@ -3,14 +3,14 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
 use super::super::state::AppState;
-use std::sync::Arc;
+use crate as x0x;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
+use std::sync::Arc;
 
 /// Generic JSON response wrapper.
 #[derive(Debug, Serialize)]
@@ -47,7 +47,9 @@ pub(in crate::server) struct StatusData {
 // ---------------------------------------------------------------------------
 
 /// GET /health
-pub(in crate::server) async fn health(State(state): State<Arc<AppState>>) -> Json<ApiResponse<HealthData>> {
+pub(in crate::server) async fn health(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<HealthData>> {
     let peers = state.agent.peers().await.map(|p| p.len()).unwrap_or(0);
 
     Json(ApiResponse {
@@ -62,7 +64,9 @@ pub(in crate::server) async fn health(State(state): State<Arc<AppState>>) -> Jso
 }
 
 /// GET /status — rich runtime status with connectivity state machine.
-pub(in crate::server) async fn status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<StatusData>> {
+pub(in crate::server) async fn status(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<StatusData>> {
     let uptime_secs = state.start_time.elapsed().as_secs();
     let mut warnings = Vec::new();
 
@@ -147,7 +151,9 @@ pub(in crate::server) async fn status(State(state): State<Arc<AppState>>) -> Jso
 }
 
 /// POST /shutdown — trigger graceful daemon shutdown.
-pub(in crate::server) async fn shutdown_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn shutdown_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     tracing::info!("Shutdown requested via API");
     let _ = state.shutdown_notify.send(true);
     let _ = state.shutdown_tx.send(()).await;

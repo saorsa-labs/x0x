@@ -14,8 +14,8 @@ mod files;
 mod groups;
 mod identity;
 mod machines;
-mod named_groups;
 mod messaging;
+mod named_groups;
 mod network;
 mod presence;
 mod status;
@@ -35,13 +35,13 @@ pub(super) use direct::{
     connect_agent, connect_machine, direct_connections, direct_message_send_config, direct_send,
 };
 pub(super) use discovery::{
-    DiscoveredAgentEntry, agent_reachability, agents_by_user_handler, discovered_agent,
-    discovered_agent_entry, discovered_agents, find_agent, machine_for_agent_handler,
+    agent_reachability, agents_by_user_handler, discovered_agent, discovered_agent_entry,
+    discovered_agents, find_agent, machine_for_agent_handler, DiscoveredAgentEntry,
 };
 pub(super) use exec::{exec_cancel, exec_diagnostics, exec_run, exec_sessions};
 pub(super) use files::{
-    FileChunkAckSlot, file_accept_handler, file_reject_handler, file_send_handler,
-    file_transfer_status_handler, file_transfers_handler, handle_file_message,
+    file_accept_handler, file_reject_handler, file_send_handler, file_transfer_status_handler,
+    file_transfers_handler, handle_file_message, FileChunkAckSlot,
 };
 pub(super) use groups::{
     add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
@@ -52,14 +52,12 @@ pub(super) use identity::{
     get_a2a_agent_card, get_agent_card, identity_revocations, identity_revoke, import_agent_card,
     introduction,
 };
-pub(super) use status::{get_constitution, get_constitution_json, health, shutdown_handler, status};
-pub(super) use messaging::{RestSubscription, publish, subscribe, unsubscribe};
+pub(super) use machines::{
+    add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,
+    machines_by_user_handler, pin_machine, unpin_machine,
+};
+pub(super) use messaging::{publish, subscribe, unsubscribe, RestSubscription};
 pub(super) use named_groups::{
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS, ExpectedJoinResultInviter,
-    TreeKemCatchupRequest, TreeKemCatchupResponse,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, JoinResultMessage,
-    NamedGroupMetadataEvent, PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome,
-    PendingWelcomeReceive, TreeKemMemberKeyPackageCache, WelcomeBlobMessage, WelcomeFetchWaiter,
     add_named_group_member, apply_named_group_metadata_event, approve_join_request,
     ban_group_member, cancel_join_request, create_discovery_subscription, create_group_invite,
     create_join_request, create_named_group, delete_discovery_subscription, discover_groups,
@@ -74,9 +72,13 @@ pub(super) use named_groups::{
     restore_treekem_groups, seal_group_state, secure_group_decrypt, secure_group_encrypt,
     secure_group_reseal, secure_open_envelope_adversarial, send_group_public_message,
     set_group_display_name, spawn_directory_resubscribe, spawn_global_discovery_listener,
-    spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
-    unban_group_member, update_group_policy, update_member_role,
-    update_named_group, withdraw_group_state,
+    spawn_global_public_message_listener, spawn_listed_to_contacts_listener, unban_group_member,
+    update_group_policy, update_member_role, update_named_group, withdraw_group_state,
+    ExpectedJoinResultInviter, JoinResultMessage, NamedGroupMetadataEvent, PendingJoinResult,
+    PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive, TreeKemCatchupRequest,
+    TreeKemCatchupResponse, TreeKemMemberKeyPackageCache, WelcomeBlobMessage, WelcomeFetchWaiter,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX,
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
@@ -86,19 +88,18 @@ pub(super) use network::{
 pub(super) use presence::{
     presence, presence_find, presence_foaf, presence_online, presence_status,
 };
-pub(super) use machines::{
-    add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,
-    machines_by_user_handler, pin_machine, unpin_machine,
-};
-pub(super) use trust::evaluate_trust;
-pub(super) use upgrade::{
-    SelfPublishedReleaseManifests, apply_upgrade, broadcast_current_manifest, check_upgrade,
-    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+pub(super) use status::{
+    get_constitution, get_constitution_json, health, shutdown_handler, status,
 };
 pub(super) use stores::{
-    KV_STORE_DELTA_DM_PREFIX, KvStoreDirectDelta, apply_direct_kv_store_delta, create_kv_store,
-    delete_kv_value, get_kv_value, join_kv_store, list_kv_keys, list_kv_stores, put_kv_value,
+    apply_direct_kv_store_delta, create_kv_store, delete_kv_value, get_kv_value, join_kv_store,
+    list_kv_keys, list_kv_stores, put_kv_value, KvStoreDirectDelta, KV_STORE_DELTA_DM_PREFIX,
 };
 pub(super) use tasks::{
     add_task, apply_group_authorization, create_task_list, list_task_lists, list_tasks, update_task,
+};
+pub(super) use trust::evaluate_trust;
+pub(super) use upgrade::{
+    apply_upgrade, broadcast_current_manifest, check_upgrade, run_fallback_github_poll,
+    run_gossip_update_listener, run_startup_update_check, SelfPublishedReleaseManifests,
 };

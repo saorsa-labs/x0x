@@ -3,14 +3,10 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
-use super::super::{api_error, bad_request, not_found, parse_agent_id_hex};
-use super::super::state::AppState;
 use super::super::sse::SseEvent;
-use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use super::super::state::AppState;
+use super::super::{api_error, bad_request, not_found, parse_agent_id_hex};
+use crate as x0x;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -18,6 +14,10 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use x0x::contacts::TrustLevel;
 use x0x::identity::AgentId;
 
@@ -129,7 +129,10 @@ impl FileChunkAckSlot {
 /// until the sender's in-flight count would drop back to (or below) the
 /// window. For the first `FILE_CHUNK_WINDOW` chunks this returns immediately
 /// because the window isn't yet saturated.
-pub(in crate::server) async fn wait_for_chunk_window(slot: &FileChunkAckSlot, n: u64) -> std::result::Result<(), String> {
+pub(in crate::server) async fn wait_for_chunk_window(
+    slot: &FileChunkAckSlot,
+    n: u64,
+) -> std::result::Result<(), String> {
     if n < FILE_CHUNK_WINDOW {
         return Ok(());
     }
@@ -324,7 +327,9 @@ pub(in crate::server) async fn file_send_handler(
 }
 
 /// GET /files/transfers — list all file transfers.
-pub(in crate::server) async fn file_transfers_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn file_transfers_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let transfers = state.file_transfers.read().await;
     let list: Vec<&x0x::files::TransferState> = transfers.values().collect();
     (

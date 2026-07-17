@@ -3,16 +3,16 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
-use super::super::{api_error, bad_request};
 use super::super::state::AppState;
+use super::super::{api_error, bad_request};
 use super::discovery::discovered_agent_entry;
-use std::sync::Arc;
+use crate as x0x;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
+use std::sync::Arc;
 
 /// Query parameters for presence endpoints that accept TTL and timeout.
 #[derive(Debug, Deserialize)]
@@ -51,7 +51,9 @@ pub(in crate::server) async fn presence(State(state): State<Arc<AppState>>) -> i
 ///
 /// List all agents currently online (network view: all non-blocked agents from
 /// the local discovery cache).
-pub(in crate::server) async fn presence_online(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn presence_online(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     match state.agent.online_agents().await {
         Ok(agents) => {
             let contacts = state.agent.contacts().read().await;

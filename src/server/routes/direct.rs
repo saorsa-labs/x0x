@@ -3,16 +3,18 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
-use super::super::{api_error, forbidden, decode_base64_payload, parse_agent_id_hex, parse_machine_id_hex};
 use super::super::state::AppState;
-use std::sync::Arc;
-use std::time::Duration;
+use super::super::{
+    api_error, decode_base64_payload, forbidden, parse_agent_id_hex, parse_machine_id_hex,
+};
+use crate as x0x;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
+use std::sync::Arc;
+use std::time::Duration;
 use x0x::contacts::TrustLevel;
 
 pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
@@ -380,7 +382,9 @@ pub(in crate::server) async fn direct_send(
 }
 
 /// GET /direct/connections — list connected agents.
-pub(in crate::server) async fn direct_connections(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn direct_connections(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let connected = state.agent.connected_agents().await;
     let dm = state.agent.direct_messaging();
 

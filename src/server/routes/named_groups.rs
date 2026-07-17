@@ -6,17 +6,26 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
+use super::super::state::AppState;
 use super::super::{
     api_error, bad_request, forbidden, not_found, parse_agent_id_hex, parse_optional_json,
 };
 use super::direct::direct_message_send_config;
 use super::files::{
-    FileChunkAckSlot, file_transfer_send_config, wait_for_chunk_window, wait_for_final_acks,
+    file_transfer_send_config, wait_for_chunk_window, wait_for_final_acks, FileChunkAckSlot,
 };
 use super::groups::save_mls_groups;
 use super::identity::populate_invite_base_state_from_group_info;
-use super::super::state::AppState;
+use crate as x0x;
+use anyhow::{Context, Result};
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use axum::Json;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,18 +33,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
-use anyhow::{Context, Result};
-use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse};
-use axum::Json;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use x0x::contacts::TrustLevel;
-use x0x::identity::{AgentId};
+use x0x::identity::AgentId;
 use x0x::logging::LogHexId;
 use x0x::Agent;
 
@@ -473,7 +473,9 @@ pub(in crate::server) enum JoinResultMessage {
     },
 }
 
-pub(in crate::server) fn named_group_metadata_event_kind(event: &NamedGroupMetadataEvent) -> &'static str {
+pub(in crate::server) fn named_group_metadata_event_kind(
+    event: &NamedGroupMetadataEvent,
+) -> &'static str {
     match event {
         NamedGroupMetadataEvent::MemberAdded { .. } => "member_added",
         NamedGroupMetadataEvent::MemberRemoved { .. } => "member_removed",
@@ -1129,7 +1131,9 @@ async fn publish_group_card_to_discovery_inner(
 
 /// Subscribe to the global discovery topic and insert incoming cards into the cache.
 /// Listener lives for the daemon's lifetime.
-pub(in crate::server) async fn spawn_global_discovery_listener(state: Arc<AppState>) -> Vec<tokio::task::JoinHandle<()>> {
+pub(in crate::server) async fn spawn_global_discovery_listener(
+    state: Arc<AppState>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let mut sub = match state.agent.subscribe(GLOBAL_GROUP_DISCOVERY_TOPIC).await {
         Ok(s) => s,
         Err(e) => {
@@ -1550,7 +1554,9 @@ async fn handle_directory_message(
 
 /// Spawn all persisted shard subscriptions at startup, with jitter so the
 /// mesh doesn't storm on restart.
-pub(in crate::server) async fn spawn_directory_resubscribe(state: Arc<AppState>) -> Vec<tokio::task::JoinHandle<()>> {
+pub(in crate::server) async fn spawn_directory_resubscribe(
+    state: Arc<AppState>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     load_directory_subscriptions(&state).await;
     let subs = state.directory_subscriptions.read().await.clone();
     if subs.is_empty() {
@@ -1589,7 +1595,7 @@ const LTC_CARD_FRAME_PREFIX: &[u8; 16] = b"X0X-LTC-CARD-V1\n";
 /// `ListedToContacts` groups: no public topic is touched. Delivery is
 /// O(N contacts), acceptable for the cardinality of this feature.
 async fn publish_listed_to_contacts_card(state: &AppState, card: x0x::groups::GroupCard) {
-        let contacts = state.contacts.read().await;
+    let contacts = state.contacts.read().await;
     let my_hex = hex::encode(state.agent.agent_id().as_bytes());
     let json = match serde_json::to_vec(&card) {
         Ok(b) => b,
@@ -6756,7 +6762,9 @@ pub(in crate::server) async fn create_named_group(
 }
 
 /// GET /groups — list all named groups.
-pub(in crate::server) async fn list_named_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn list_named_groups(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let entries: Vec<serde_json::Value> = groups
         .values()
@@ -11212,7 +11220,9 @@ pub(in crate::server) async fn discover_groups(
 /// synthesised cards, so a hit here is attributable to C.2 discovery
 /// rather than local ownership or bridge dual-publish. Tighter
 /// FOAF-based weighting is follow-up work.
-pub(in crate::server) async fn discover_groups_nearby(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn discover_groups_nearby(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let mut seen = std::collections::HashSet::<String>::new();
     let mut out: Vec<x0x::groups::GroupCard> = Vec::new();
     let shard_cache = state.directory_cache.read().await;
@@ -11235,7 +11245,9 @@ pub(in crate::server) async fn discover_groups_nearby(State(state): State<Arc<Ap
 }
 
 /// GET /groups/discover/subscriptions — list active shard subscriptions.
-pub(in crate::server) async fn list_discovery_subscriptions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn list_discovery_subscriptions(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let subs = state.directory_subscriptions.read().await.clone();
     (
         StatusCode::OK,
@@ -13757,26 +13769,24 @@ async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, w
 // File transfer message handling
 // ---------------------------------------------------------------------------
 
-pub(in crate::server) type WelcomeFetchWaiter = oneshot::Sender<std::result::Result<Vec<u8>, String>>;
+pub(in crate::server) type WelcomeFetchWaiter =
+    oneshot::Sender<std::result::Result<Vec<u8>, String>>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use super::super::super::state::DaemonUpdateConfig;
     use super::super::super::sse::SseEvent;
+    use super::super::super::state::DaemonUpdateConfig;
     use super::super::super::ws::WsOutboundStats;
     use super::super::super::{auth, crdt_subscriptions};
-    use super::super::contacts::{UpdateContactRequest, update_contact};
-    use super::super::groups::{MlsDecryptRequest, MlsEncryptRequest, mls_decrypt, mls_encrypt};
-    use super::super::identity::{
-        CardQuery, ImportCardRequest, get_agent_card, import_agent_card,
-    };
+    use super::super::contacts::{update_contact, UpdateContactRequest};
+    use super::super::groups::{mls_decrypt, mls_encrypt, MlsDecryptRequest, MlsEncryptRequest};
+    use super::super::identity::{get_agent_card, import_agent_card, CardQuery, ImportCardRequest};
     use axum::response::Response;
     use tokio::sync::{broadcast, mpsc, watch};
 
     mod cache_hardening_followup;
-
 
     fn fake_group_state_commit(
         group_id: &str,

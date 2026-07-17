@@ -3,19 +3,19 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
 use super::super::api_error;
 use super::super::state::{AppState, CachedUpgradeCheck, DaemonConfig, DaemonUpdateConfig};
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use crate as x0x;
 use anyhow::Result;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
@@ -691,7 +691,9 @@ async fn store_upgrade_response(
 /// the background update workers, performs the verified binary swap, returns a
 /// JSON result, then schedules restart/exec after the response has a chance to
 /// flush.
-pub(in crate::server) async fn apply_upgrade(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn apply_upgrade(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     if !state.self_update_enabled {
         // Embed path: never replace/restart the host process via the API.
         return (

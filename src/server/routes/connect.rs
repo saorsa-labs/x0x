@@ -3,16 +3,16 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
 use super::super::api_error;
 use super::super::state::AppState;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use crate as x0x;
 use anyhow::Result;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 // ── Tailnet forwarding (#132 T6) ──────────────────────────────────────────
 
@@ -83,7 +83,9 @@ pub(in crate::server) async fn forward_add(
 }
 
 /// GET /forwards — list registered forwards.
-pub(in crate::server) async fn forward_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn forward_list(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let forwards: Vec<serde_json::Value> = state
         .forward_service
         .as_ref()
@@ -137,7 +139,9 @@ pub(in crate::server) async fn forward_remove(
 }
 
 /// GET /streams — active forward-stream count + connect-ACL counters.
-pub(in crate::server) async fn streams_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn streams_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let (active, connect_failed) = state
         .forward_service
         .as_ref()
@@ -165,6 +169,8 @@ pub(in crate::server) async fn streams_diagnostics(State(state): State<Arc<AppSt
 /// per-reason denial breakdown. Counters reflect live forwards when connect
 /// is enabled (forwarder shipped in #183) and read 0 when it is disabled; the
 /// ACL summary is always populated.
-pub(in crate::server) async fn connect_diagnostics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn connect_diagnostics_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     Json(state.connect_diagnostics.snapshot())
 }

@@ -15,11 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate as x0x;
 
 use super::super::state::AppState;
-use super::super::{
-    api_error, bad_request, not_found, parse_agent_id_hex, parse_machine_id_hex,
-};
+use super::super::{api_error, bad_request, not_found, parse_agent_id_hex, parse_machine_id_hex};
 use super::discovery::{
-    DiscoveredAgentQuery, DiscoveredAgentsQuery, DiscoveredMachineEntry, discovered_machine_entry,
+    discovered_machine_entry, DiscoveredAgentQuery, DiscoveredAgentsQuery, DiscoveredMachineEntry,
 };
 use crate::contacts::MachineRecord;
 use crate::identity::MachineId;

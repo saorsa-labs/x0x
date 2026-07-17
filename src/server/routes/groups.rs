@@ -3,11 +3,10 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
+use super::super::state::AppState;
 use super::super::{api_error, bad_request, decode_base64_payload, not_found, parse_agent_id_hex};
 use super::named_groups::secure_group_effect_response_after_terminality_recheck;
-use super::super::state::AppState;
-use std::sync::Arc;
+use crate as x0x;
 use anyhow::Result;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -16,6 +15,7 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::Deserialize;
+use std::sync::Arc;
 
 /// POST /mls/groups request body.
 #[derive(Debug, Deserialize)]
@@ -111,7 +111,9 @@ pub(in crate::server) async fn create_mls_group(
 }
 
 /// GET /mls/groups — list all MLS groups.
-pub(in crate::server) async fn list_mls_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn list_mls_groups(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let groups = state.mls_groups.read().await;
     let entries: Vec<serde_json::Value> = groups
         .iter()

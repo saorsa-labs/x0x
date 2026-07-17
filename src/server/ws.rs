@@ -24,8 +24,8 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::contacts::TrustLevel;
 
-use super::state::AppState;
 use super::routes::direct_message_send_config;
+use super::state::AppState;
 use super::{decode_base64_payload, parse_agent_id_hex};
 
 /// Per-WebSocket-outbound-queue observability counters (WS1.1 / #122).

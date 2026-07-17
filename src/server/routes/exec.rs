@@ -3,10 +3,9 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
-use crate as x0x;
-use super::super::{api_error, bad_request, parse_agent_id_hex};
 use super::super::state::AppState;
-use std::sync::Arc;
+use super::super::{api_error, bad_request, parse_agent_id_hex};
+use crate as x0x;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -14,6 +13,7 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::Deserialize;
+use std::sync::Arc;
 
 /// POST /exec/run request body.
 #[derive(Debug, Deserialize)]
@@ -155,11 +155,15 @@ pub(in crate::server) async fn exec_cancel(
 }
 
 /// GET /exec/sessions — list local pending client sessions and remote active sessions.
-pub(in crate::server) async fn exec_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn exec_sessions(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     Json(state.exec_service.sessions_snapshot().await)
 }
 
 /// GET /diagnostics/exec — exec counters, active sessions, and safe ACL summary.
-pub(in crate::server) async fn exec_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(in crate::server) async fn exec_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     Json(state.exec_service.diagnostics_snapshot().await)
 }
