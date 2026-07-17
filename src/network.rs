@@ -3404,7 +3404,7 @@ impl NetworkNode {
                         // bypass this gate — the DM plane is authenticated
                         // agent-to-agent traffic, out of #206's gossip-plane
                         // scope (see docs/trust-and-connectivity.md).
-                        if matches!(GossipStreamType::from_byte(type_byte), Some(_))
+                        if GossipStreamType::from_byte(type_byte).is_some()
                             && !plane_node.plane_gate_allows(&peer_id)
                         {
                             continue;
