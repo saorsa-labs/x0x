@@ -6,13 +6,13 @@ use crate::contacts::ContactStore;
 use crate::direct::DirectMessaging;
 use crate::dm::{
     decrypt_payload, dm_inbox_topic, now_unix_ms, validate_timestamp_window, DmAckOutcome, DmBody,
-    DmEnvelope, DmPayload, EnvelopeBuilder, InFlightAcks, RecentDeliveryCache, DM_PROTOCOL_VERSION,
-    MAX_ENVELOPE_BYTES,
+    DmEnvelope, DmOriginAttestation, DmPayload, EnvelopeBuilder, InFlightAcks, RecentDeliveryCache,
+    DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES,
 };
 use crate::error::{NetworkError, NetworkResult};
 use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
 use crate::groups::kem_envelope::AgentKemKeypair;
-use crate::identity::{AgentId, MachineId};
+use crate::identity::{AgentId, MachineId, MachineKeypair};
 use crate::revocation::RevocationSet;
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use bytes::Bytes;
@@ -233,6 +233,7 @@ impl DmInboxService {
         signing: Arc<SigningContext>,
         self_agent_id: AgentId,
         self_machine_id: MachineId,
+        machine_keypair: Arc<MachineKeypair>,
         kem_keypair: Arc<AgentKemKeypair>,
         dm: Arc<DirectMessaging>,
         contacts: Arc<RwLock<ContactStore>>,
@@ -253,6 +254,7 @@ impl DmInboxService {
             signing,
             self_agent_id,
             self_machine_id,
+            machine_keypair,
             kem_keypair,
             dm,
             contacts,
@@ -318,6 +320,10 @@ struct InboxPipeline {
     signing: Arc<SigningContext>,
     self_agent_id: AgentId,
     self_machine_id: MachineId,
+    /// This machine's keypair — signs the #213 origin attestation embedded
+    /// in outbound ACK envelopes, so ACK receivers authenticate the
+    /// acking machine exactly like payload-DM receivers do.
+    machine_keypair: Arc<MachineKeypair>,
     kem_keypair: Arc<AgentKemKeypair>,
     dm: Arc<DirectMessaging>,
     contacts: Arc<RwLock<ContactStore>>,
@@ -417,40 +423,86 @@ impl InboxPipeline {
         }
 
         // Enforcement point 3 — authenticated-origin revocation gate.
-        // The envelope machine is sender-controlled even though the agent signs
-        // it. Prefer the retained machine from an accepted, verified identity
-        // announcement; the claim is only a best-effort fallback for agents
-        // with no authenticated binding.
+        //
+        // Issue #213: prefer the fresh per-DM origin-machine attestation —
+        // a machine-key signature covering this envelope, verifiable with
+        // ZERO prior cache state. When present and valid it supersedes (and
+        // refreshes) the retained binding; when present but invalid the DM
+        // is a hard drop (never fall back — a bad attestation is an attack
+        // signal, not a legacy peer). Only when the attestation is ABSENT
+        // (pre-#213 peer) do we degrade to the #184 retained-binding check,
+        // where the envelope machine claim is sender-controlled: prefer the
+        // retained machine from an accepted, verified identity announcement;
+        // the claim is only a best-effort fallback for agents with no
+        // authenticated binding. See docs/adr/0021-dm-origin-machine-attestation.md.
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let claimed_machine_id = MachineId(envelope.sender_machine_id);
-        let authenticated_machine_id = self
-            .authenticated_machine_bindings
-            .write()
-            .await
-            .resolve(&sender_agent_id);
-        let sender_machine_id = match authenticated_machine_id {
-            Some(authenticated) if authenticated != claimed_machine_id => {
+        let sender_machine_id = match envelope.verify_origin_attestation() {
+            Ok(Some(attested_machine)) => {
+                tracing::info!(
+                    target: "dm.trace",
+                    stage = "inbound_origin_attested",
+                    sender = %hex::encode(envelope.sender_agent_id),
+                    machine = %hex::encode(attested_machine.as_bytes()),
+                    "DM origin machine authenticated by fresh machine-key attestation"
+                );
+                // Refresh the retained binding so later UNATTESTED DMs from
+                // this agent are checked against the freshest authenticated
+                // machine — this is what lets a portable move A→B displace a
+                // stale binding. Convert ms→s: announcement-sourced bindings
+                // are seconds-granularity and the cache orders by timestamp.
+                record_authenticated_machine_binding(
+                    &self.authenticated_machine_bindings,
+                    sender_agent_id,
+                    attested_machine,
+                    envelope.created_at_unix_ms / 1000,
+                )
+                .await;
+                attested_machine
+            }
+            Err(rejection) => {
                 self.dm.record_incoming_trust_rejected(sender_agent_id);
                 tracing::warn!(
                     target: "dm.trace",
-                    stage = "inbound_origin_machine_mismatch",
+                    stage = "inbound_origin_attestation_invalid",
                     sender = %hex::encode(envelope.sender_agent_id),
                     claimed_machine = %hex::encode(claimed_machine_id.as_bytes()),
-                    authenticated_machine = %hex::encode(authenticated.as_bytes()),
-                    "DM dropped: envelope machine does not match authenticated origin"
+                    rejection = %rejection,
+                    "DM dropped: origin-machine attestation invalid"
                 );
                 return;
             }
-            Some(authenticated) => authenticated,
-            None => {
-                tracing::info!(
-                    target: "dm.trace",
-                    stage = "inbound_origin_machine_claim_fallback",
-                    sender = %hex::encode(envelope.sender_agent_id),
-                    claimed_machine = %hex::encode(claimed_machine_id.as_bytes()),
-                    "DM origin has no authenticated machine binding; checking sender claim only"
-                );
-                claimed_machine_id
+            Ok(None) => {
+                let authenticated_machine_id = self
+                    .authenticated_machine_bindings
+                    .write()
+                    .await
+                    .resolve(&sender_agent_id);
+                match authenticated_machine_id {
+                    Some(authenticated) if authenticated != claimed_machine_id => {
+                        self.dm.record_incoming_trust_rejected(sender_agent_id);
+                        tracing::warn!(
+                            target: "dm.trace",
+                            stage = "inbound_origin_machine_mismatch",
+                            sender = %hex::encode(envelope.sender_agent_id),
+                            claimed_machine = %hex::encode(claimed_machine_id.as_bytes()),
+                            authenticated_machine = %hex::encode(authenticated.as_bytes()),
+                            "DM dropped: envelope machine does not match authenticated origin"
+                        );
+                        return;
+                    }
+                    Some(authenticated) => authenticated,
+                    None => {
+                        tracing::info!(
+                            target: "dm.trace",
+                            stage = "inbound_origin_machine_claim_fallback",
+                            sender = %hex::encode(envelope.sender_agent_id),
+                            claimed_machine = %hex::encode(claimed_machine_id.as_bytes()),
+                            "DM origin has no attestation and no authenticated binding; checking sender claim only"
+                        );
+                        claimed_machine_id
+                    }
+                }
             }
         };
 
@@ -683,11 +735,22 @@ impl InboxPipeline {
             expires_at_unix_ms: expires,
             body,
             signature: Vec::new(),
+            origin_attestation: None,
         };
         let signed = envelope
             .signed_bytes()
             .map_err(|e| NetworkError::SerializationError(format!("ack sign-bytes: {e}")))?;
         envelope.signature = self.signing.sign(&signed)?;
+        // #213: attest the acking machine too — a fake `Accepted` ACK from
+        // a revoked machine would otherwise forge a delivery receipt.
+        let mut attestation = DmOriginAttestation::for_envelope(
+            &envelope,
+            self.machine_keypair.public_key().as_bytes().to_vec(),
+        );
+        attestation.sign(&self.machine_keypair).map_err(|e| {
+            NetworkError::SerializationError(format!("ack origin attestation: {e}"))
+        })?;
+        envelope.origin_attestation = Some(attestation);
         let encoded = envelope
             .to_wire_bytes()
             .map_err(|e| NetworkError::SerializationError(format!("ack encode: {e}")))?;
@@ -787,6 +850,7 @@ mod tests {
                 outcome: crate::dm::DmAckOutcome::Accepted,
             }),
             signature: Vec::new(),
+            origin_attestation: None,
         }
     }
 
@@ -861,6 +925,9 @@ mod tests {
             signing: Arc::new(SigningContext::from_keypair(&recipient)),
             self_agent_id: recipient_agent_id,
             self_machine_id: recipient_machine_id,
+            machine_keypair: Arc::new(
+                MachineKeypair::generate().expect("recipient machine keygen"),
+            ),
             kem_keypair: Arc::clone(&recipient_kem),
             dm,
             contacts: Arc::new(RwLock::new(contacts)),
@@ -881,26 +948,52 @@ mod tests {
         }
     }
 
-    fn payload_message(
+    /// Build a signed-but-unattested payload envelope, simulating a
+    /// pre-#213 (legacy) sender: agent signature only, no origin attestation.
+    fn craft_unsigned_payload_envelope(
         harness: &InboxHarness,
         sender: &AgentKeypair,
         claimed_machine: MachineId,
         request_byte: u8,
-    ) -> PubSubMessage {
-        let signing = SigningContext::from_keypair(sender);
+    ) -> DmEnvelope {
         let created_at = now_unix_ms();
-        let envelope = EnvelopeBuilder::build_payload_envelope(
-            [request_byte; 16],
-            &sender.agent_id(),
-            &claimed_machine,
-            &harness.recipient_agent_id,
-            &harness.recipient_kem.public_bytes,
+        let body = EnvelopeBuilder::build_payload_body(
+            &[request_byte; 16],
+            sender.agent_id().as_bytes(),
+            harness.recipient_agent_id.as_bytes(),
             created_at,
-            created_at + 60_000,
             b"security regression payload".to_vec(),
-            |bytes| signing.sign(bytes).map_err(|error| error.to_string()),
+            None,
+            &harness.recipient_kem.public_bytes,
         )
-        .expect("build signed payload envelope");
+        .expect("build payload body");
+        DmEnvelope {
+            protocol_version: DM_PROTOCOL_VERSION,
+            request_id: [request_byte; 16],
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *claimed_machine.as_bytes(),
+            recipient_agent_id: *harness.recipient_agent_id.as_bytes(),
+            created_at_unix_ms: created_at,
+            expires_at_unix_ms: created_at + 60_000,
+            body,
+            signature: Vec::new(),
+            origin_attestation: None,
+        }
+    }
+
+    fn sign_envelope_with_agent(envelope: &mut DmEnvelope, sender: &AgentKeypair) {
+        let signed = envelope.signed_bytes().expect("signed_bytes");
+        let sig =
+            ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(sender.secret_key(), &signed)
+                .expect("agent sign");
+        envelope.signature = sig.as_bytes().to_vec();
+    }
+
+    fn wrap_in_pubsub(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        envelope: &DmEnvelope,
+    ) -> PubSubMessage {
         PubSubMessage {
             topic: DmInboxService::inbox_topic_name(&harness.recipient_agent_id),
             payload: Bytes::from(envelope.to_wire_bytes().expect("encode envelope")),
@@ -909,6 +1002,37 @@ mod tests {
             verified: true,
             trust_level: Some(TrustLevel::Trusted),
         }
+    }
+
+    /// Legacy (pre-#213) sender: signed envelope, NO origin attestation.
+    fn payload_message(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        claimed_machine: MachineId,
+        request_byte: u8,
+    ) -> PubSubMessage {
+        let mut envelope =
+            craft_unsigned_payload_envelope(harness, sender, claimed_machine, request_byte);
+        sign_envelope_with_agent(&mut envelope, sender);
+        wrap_in_pubsub(harness, sender, &envelope)
+    }
+
+    /// #213 sender: signed envelope WITH a valid origin attestation from
+    /// `machine` (which therefore owns `sender_machine_id`).
+    fn attested_payload_message(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        machine: &MachineKeypair,
+        request_byte: u8,
+    ) -> PubSubMessage {
+        let mut envelope =
+            craft_unsigned_payload_envelope(harness, sender, machine.machine_id(), request_byte);
+        sign_envelope_with_agent(&mut envelope, sender);
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
+        attestation.sign(machine).expect("machine attest");
+        envelope.origin_attestation = Some(attestation);
+        wrap_in_pubsub(harness, sender, &envelope)
     }
 
     async fn assert_no_delivery(receiver: &mut crate::direct::DirectMessageReceiver) {
@@ -1173,6 +1297,328 @@ mod tests {
             .expect("delivery stream closed");
         assert_eq!(delivered.machine_id, clean_claim);
         assert_eq!(delivered.trust_decision, Some(TrustDecision::Accept));
+    }
+
+    // ── Issue #213: origin-machine attestation acceptance tests ─────────────
+
+    /// #213 SPOOF: an attacker holding the agent key (but NOT machine B's
+    /// key) claims unrevoked machine B in the envelope. The attestation they
+    /// can produce (signed by their own machine A's key) fails the
+    /// key↔machine-id hash binding — hard drop, even with NO retained
+    /// binding and B unrevoked. This is the core #213 acceptance criterion:
+    /// a revoked origin cannot hide behind an unrevoked claim.
+    #[tokio::test]
+    async fn spoof_agent_key_holder_claiming_unrevoked_machine_is_rejected() {
+        let sender = test_keypair();
+        let attacker_machine = MachineKeypair::generate().expect("attacker machine keygen");
+        let unrevoked_b = MachineId([0xB9; 32]);
+        // No retained binding, no revocations: ONLY the attestation gate can
+        // catch this (the #184 fallback alone would accept the claim).
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+
+        let mut envelope = craft_unsigned_payload_envelope(&harness, &sender, unrevoked_b, 0x51);
+        sign_envelope_with_agent(&mut envelope, &sender);
+        // Attacker attaches the best attestation they can mint: their OWN
+        // machine key over fields claiming machine B.
+        let mut attestation = DmOriginAttestation::for_envelope(
+            &envelope,
+            attacker_machine.public_key().as_bytes().to_vec(),
+        );
+        attestation
+            .sign(&attacker_machine)
+            .expect("attacker attest");
+        envelope.origin_attestation = Some(attestation);
+        assert_eq!(
+            envelope.verify_origin_attestation(),
+            Err(crate::dm::OriginAttestationError::KeyBindingMismatch)
+        );
+
+        let message = wrap_in_pubsub(&harness, &sender, &envelope);
+        harness.pipeline.handle_incoming(message, false).await;
+
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_trust_rejected,
+            1,
+            "an invalid attestation must be an observable hard rejection"
+        );
+    }
+
+    /// #213 SPOOF (variant): a forged/garbage attestation signature is a
+    /// hard drop, never a fallback to the claimed machine.
+    #[tokio::test]
+    async fn spoof_forged_attestation_signature_is_rejected() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("machine keygen");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+
+        let mut envelope =
+            craft_unsigned_payload_envelope(&harness, &sender, machine.machine_id(), 0x52);
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
+        // Garbage signature of the right length class: parses or not, it
+        // must never verify.
+        attestation.signature = vec![0xAB; 3309];
+        envelope.origin_attestation = Some(attestation);
+
+        let message = wrap_in_pubsub(&harness, &sender, &envelope);
+        harness.pipeline.handle_incoming(message, false).await;
+
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_trust_rejected,
+            1
+        );
+    }
+
+    /// #213 TRANSITION-WINDOW RESIDUAL — pinned, documented behavior (ADR
+    /// 0021 "Downgrade / mixed-version"). An attacker holding the agent key
+    /// STRIPS the attestation entirely: the envelope degrades to the legacy
+    /// claim path, and on a cold receiver with no retained binding the
+    /// claim of unrevoked machine B is accepted even though the true origin
+    /// A is revoked. Under the transition policy (accept-with-binding-
+    /// fallback for unattested DMs) this DM IS delivered — the exact
+    /// residual #213 narrows to unattested senders only.
+    ///
+    /// This test intentionally asserts the residual EXISTS: when the
+    /// `DmCapabilities` attestation hard-require follow-up lands, delivery
+    /// stops and this test must be flipped to `assert_no_delivery` — it
+    /// fails-positive the day the residual actually closes.
+    #[tokio::test]
+    async fn strip_downgrade_residual_delivered_under_transition_policy() {
+        let sender = test_keypair();
+        let true_origin_a = MachineKeypair::generate().expect("origin machine keygen");
+        let unrevoked_b = MachineId([0xB8; 32]);
+        // Cold receiver: NO retained binding. True origin A IS revoked.
+        let mut harness = make_inbox_harness(&sender, None, Some(&true_origin_a)).await;
+
+        // Stripped envelope: agent-signed, no attestation, claims B.
+        let stripped = payload_message(&harness, &sender, unrevoked_b, 0x53);
+        harness.pipeline.handle_incoming(stripped, false).await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect(
+                "transition policy accepts unattested DMs on the claim path — \
+                 flip this to assert_no_delivery when the hard-require lands",
+            )
+            .expect("delivery stream closed");
+        assert_eq!(
+            delivered.machine_id, unrevoked_b,
+            "strip residual: the unattested claim of B is accepted (ADR 0021 residual)"
+        );
+    }
+
+    /// #213 REPLAY: an attestation captured from DM-1 (request R1) is
+    /// re-presented inside DM-2 (request R2) — the attacker re-signs the
+    /// envelope with the (stolen) agent key but cannot mint a fresh machine
+    /// attestation. The request-id field match fails → hard drop.
+    #[tokio::test]
+    async fn replay_captured_attestation_with_new_request_id_is_rejected() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("machine keygen");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+
+        // Capture: a valid attested DM (request 0x61).
+        let first = attested_payload_message(&harness, &sender, &machine, 0x61);
+        let first_envelope =
+            DmEnvelope::from_wire_bytes(&first.payload).expect("decode first envelope");
+        let captured = first_envelope
+            .origin_attestation
+            .clone()
+            .expect("first envelope attested");
+
+        // Replay: same agent, NEW request id, envelope re-signed by the
+        // agent key — but the captured attestation still names request 0x61.
+        let mut envelope =
+            craft_unsigned_payload_envelope(&harness, &sender, machine.machine_id(), 0x62);
+        sign_envelope_with_agent(&mut envelope, &sender);
+        envelope.origin_attestation = Some(captured);
+        assert_eq!(
+            envelope.verify_origin_attestation(),
+            Err(crate::dm::OriginAttestationError::EnvelopeMismatch)
+        );
+
+        let message = wrap_in_pubsub(&harness, &sender, &envelope);
+        harness.pipeline.handle_incoming(message, false).await;
+
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_trust_rejected,
+            1
+        );
+    }
+
+    /// #213 REPLAY (variant): an attestation re-presented past its expiry
+    /// window is dropped — the envelope timestamp window covers the
+    /// attestation because the fields must match exactly.
+    #[tokio::test]
+    async fn replay_expired_attestation_is_rejected() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("machine keygen");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+
+        // Build an honestly-signed envelope + attestation whose window
+        // already closed (created 10 min ago, 60 s lifetime).
+        let created = now_unix_ms().saturating_sub(600_000);
+        let body = EnvelopeBuilder::build_payload_body(
+            &[0x63; 16],
+            sender.agent_id().as_bytes(),
+            harness.recipient_agent_id.as_bytes(),
+            created,
+            b"stale replay".to_vec(),
+            None,
+            &harness.recipient_kem.public_bytes,
+        )
+        .expect("build payload body");
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_VERSION,
+            request_id: [0x63; 16],
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *machine.machine_id().as_bytes(),
+            recipient_agent_id: *harness.recipient_agent_id.as_bytes(),
+            created_at_unix_ms: created,
+            expires_at_unix_ms: created + 60_000,
+            body,
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
+        attestation.sign(&machine).expect("machine attest");
+        envelope.origin_attestation = Some(attestation);
+        // The attestation itself verifies — only the expiry window rejects.
+        assert!(envelope.verify_origin_attestation().is_ok());
+
+        let message = wrap_in_pubsub(&harness, &sender, &envelope);
+        harness.pipeline.handle_incoming(message, false).await;
+
+        assert_no_delivery(&mut harness.receiver).await;
+    }
+
+    /// #213 REVOCATION: the origin machine is revoked mid-flight — the
+    /// envelope + attestation are both honestly signed by machine A, but A
+    /// enters the receiver's revocation set before the DM arrives. EP3 drops
+    /// on the ATTESTED machine id (not the claim).
+    #[tokio::test]
+    async fn revocation_of_origin_machine_mid_flight_is_rejected() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("machine keygen");
+        // Harness revocation set already holds machine A's self-revocation.
+        let mut harness = make_inbox_harness(&sender, None, Some(&machine)).await;
+
+        let message = attested_payload_message(&harness, &sender, &machine, 0x64);
+        harness.pipeline.handle_incoming(message, false).await;
+
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            1,
+            "a validly-attested DM from a revoked origin machine must hit EP3"
+        );
+    }
+
+    /// #213 OFFLINE RECEIVER: a completely cold receiver — no retained
+    /// binding, no discovery cache, nothing — authenticates the DM's origin
+    /// machine purely from envelope-carried material and delivers.
+    #[tokio::test]
+    async fn offline_cold_receiver_authenticates_origin_with_zero_cache_state() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("machine keygen");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+
+        let message = attested_payload_message(&harness, &sender, &machine, 0x65);
+        harness.pipeline.handle_incoming(message, false).await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("delivery timeout")
+            .expect("delivery stream closed");
+        assert_eq!(delivered.sender, sender.agent_id());
+        assert_eq!(
+            delivered.machine_id,
+            machine.machine_id(),
+            "delivery must carry the ATTESTED machine, not just the claim"
+        );
+        assert_eq!(delivered.trust_decision, Some(TrustDecision::Accept));
+    }
+
+    /// #213 A→B MOVE: the agent legitimately moves from machine A to
+    /// machine B. The retained binding still says A, but B's fresh
+    /// attestation supersedes it — the DM is delivered with machine B and
+    /// the binding refreshes. A later A-attested DM (stale origin, A now
+    /// revoked) is rejected. Revoking A does NOT block the valid move.
+    #[tokio::test]
+    async fn portable_move_fresh_b_attestation_accepted_stale_revoked_a_rejected() {
+        let sender = test_keypair();
+        let machine_a = MachineKeypair::generate().expect("machine A keygen");
+        let machine_b = MachineKeypair::generate().expect("machine B keygen");
+        // Retained binding says A (stale announcement); A is then revoked
+        // (compromised) — the move to B must still authenticate.
+        let mut harness =
+            make_inbox_harness(&sender, Some(machine_a.machine_id()), Some(&machine_a)).await;
+
+        // 1. Fresh B attestation: accepted even though the binding says A.
+        let message = attested_payload_message(&harness, &sender, &machine_b, 0x66);
+        harness.pipeline.handle_incoming(message, false).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("delivery timeout")
+            .expect("delivery stream closed");
+        assert_eq!(
+            delivered.machine_id,
+            machine_b.machine_id(),
+            "a valid fresh attestation from B supersedes the stale A binding"
+        );
+
+        // 2. The retained binding refreshes to B (seconds-granularity
+        //    ordering: the fresh attestation outranks the old announcement).
+        assert_eq!(
+            authenticated_machine_binding_for_testing(
+                &harness.pipeline.authenticated_machine_bindings,
+                &sender.agent_id(),
+            )
+            .await,
+            Some(machine_b.machine_id()),
+            "the attested move must refresh the retained binding to B"
+        );
+
+        // 3. Stale A attestation: A is revoked → EP3 rejects.
+        let stale = attested_payload_message(&harness, &sender, &machine_a, 0x67);
+        harness.pipeline.handle_incoming(stale, false).await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            1,
+            "a stale attestation from revoked machine A must hit EP3"
+        );
+        assert_no_delivery(&mut harness.receiver).await;
     }
 
     #[tokio::test]
