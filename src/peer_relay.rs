@@ -1018,6 +1018,7 @@ mod tests {
                 body_ciphertext: vec![0u8; 8],
             }),
             signature: vec![0u8; 8],
+            origin_attestation: None,
         }
     }
 

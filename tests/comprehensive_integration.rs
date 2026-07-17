@@ -246,6 +246,7 @@ fn unsigned_ack_envelope(sender_keypair: &AgentKeypair, recipient: AgentId) -> D
             outcome: DmAckOutcome::Accepted,
         }),
         signature: Vec::new(),
+        origin_attestation: None,
     }
 }
 

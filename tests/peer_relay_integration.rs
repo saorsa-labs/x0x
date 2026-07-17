@@ -761,6 +761,7 @@ fn opaque_inner(
             body_ciphertext: vec![0u8; 8],
         }),
         signature,
+        origin_attestation: None,
     }
 }
 
