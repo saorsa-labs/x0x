@@ -4188,6 +4188,20 @@ impl Agent {
             });
         }
 
+        // Issue #188: a non-empty but undecodable cached KEM key means our
+        // view of the recipient's capability state has not converged (or is
+        // corrupt). Fail with a retryable, distinctly-named error here rather
+        // than letting envelope construction surface it downstream as an
+        // opaque 400-class `EnvelopeConstruction`.
+        if gossip_ok {
+            if let Some(caps) = &cap {
+                if let Err(reason) = dm::validate_recipient_kem_key(&caps.kem_public_key) {
+                    self.direct_messaging.record_outgoing_failed(*to);
+                    return Err(dm::DmError::RecipientKeyInvalid(reason));
+                }
+            }
+        }
+
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected && !config.require_gossip
