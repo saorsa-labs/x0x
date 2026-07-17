@@ -10835,7 +10835,18 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
         .insert(group_id, handle);
 }
 
-/// POST /groups/:id/invite — generate an invite link (body optional).
+/// POST /groups/:id/invite — generate an invite link (admin+; body optional).
+///
+/// Authority follows ADR-0016: any active Admin-or-higher member may mint
+/// invites (issue #107 — invite minting is an admission/routing act, not a
+/// creator-cryptographic one). The route checks the caller's role against
+/// its daemon's LOCAL roster view, which may lag convergence (a just-demoted
+/// admin can still mint until the demotion applies locally). That is safe,
+/// not a bypass: the joiner's `MemberJoined` routes to the minting admin,
+/// which authors the authority-signed `MemberAdded` commit, and every
+/// receiver's `validate_apply` enforces `AdminOrHigher` against ITS
+/// converged roster — a commit signed by a no-longer-admin fails group-wide,
+/// so a stale invite never produces unauthorized membership.
 async fn create_group_invite(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -13485,7 +13496,12 @@ async fn update_group_policy(
     )
 }
 
-/// PATCH /groups/:id/members/:agent_id/role — change a member's role.
+/// PATCH /groups/:id/members/:agent_id/role — change a member's role (admin+).
+///
+/// Only the flat ADR-0016 vocabulary (`admin`, `member`) is assignable.
+/// Ownership transfer is deliberately unsupported: ADR-0016 §4 dissolved
+/// the distinct Owner role, so `role=owner` returns a 400 naming the legacy
+/// role rather than a partial-transfer stub (issue #107 item (d)).
 async fn update_member_role(
     State(state): State<Arc<AppState>>,
     Path((id, agent_id_hex)): Path<(String, String)>,
