@@ -922,7 +922,9 @@ mod tests {
             signing: Arc::new(SigningContext::from_keypair(&recipient)),
             self_agent_id: recipient_agent_id,
             self_machine_id: recipient_machine_id,
-            machine_keypair: Arc::new(MachineKeypair::generate().expect("recipient machine keygen")),
+            machine_keypair: Arc::new(
+                MachineKeypair::generate().expect("recipient machine keygen"),
+            ),
             kem_keypair: Arc::clone(&recipient_kem),
             dm,
             contacts: Arc::new(RwLock::new(contacts)),
@@ -978,11 +980,9 @@ mod tests {
 
     fn sign_envelope_with_agent(envelope: &mut DmEnvelope, sender: &AgentKeypair) {
         let signed = envelope.signed_bytes().expect("signed_bytes");
-        let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-            sender.secret_key(),
-            &signed,
-        )
-        .expect("agent sign");
+        let sig =
+            ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(sender.secret_key(), &signed)
+                .expect("agent sign");
         envelope.signature = sig.as_bytes().to_vec();
     }
 
@@ -1022,17 +1022,11 @@ mod tests {
         machine: &MachineKeypair,
         request_byte: u8,
     ) -> PubSubMessage {
-        let mut envelope = craft_unsigned_payload_envelope(
-            harness,
-            sender,
-            machine.machine_id(),
-            request_byte,
-        );
+        let mut envelope =
+            craft_unsigned_payload_envelope(harness, sender, machine.machine_id(), request_byte);
         sign_envelope_with_agent(&mut envelope, sender);
-        let mut attestation = DmOriginAttestation::for_envelope(
-            &envelope,
-            machine.public_key().as_bytes().to_vec(),
-        );
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
         attestation.sign(machine).expect("machine attest");
         envelope.origin_attestation = Some(attestation);
         wrap_in_pubsub(harness, sender, &envelope)
@@ -1319,8 +1313,7 @@ mod tests {
         // catch this (the #184 fallback alone would accept the claim).
         let mut harness = make_inbox_harness(&sender, None, None).await;
 
-        let mut envelope =
-            craft_unsigned_payload_envelope(&harness, &sender, unrevoked_b, 0x51);
+        let mut envelope = craft_unsigned_payload_envelope(&harness, &sender, unrevoked_b, 0x51);
         sign_envelope_with_agent(&mut envelope, &sender);
         // Attacker attaches the best attestation they can mint: their OWN
         // machine key over fields claiming machine B.
@@ -1328,7 +1321,9 @@ mod tests {
             &envelope,
             attacker_machine.public_key().as_bytes().to_vec(),
         );
-        attestation.sign(&attacker_machine).expect("attacker attest");
+        attestation
+            .sign(&attacker_machine)
+            .expect("attacker attest");
         envelope.origin_attestation = Some(attestation);
         assert_eq!(
             envelope.verify_origin_attestation(),
@@ -1362,10 +1357,8 @@ mod tests {
         let mut envelope =
             craft_unsigned_payload_envelope(&harness, &sender, machine.machine_id(), 0x52);
         sign_envelope_with_agent(&mut envelope, &sender);
-        let mut attestation = DmOriginAttestation::for_envelope(
-            &envelope,
-            machine.public_key().as_bytes().to_vec(),
-        );
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
         // Garbage signature of the right length class: parses or not, it
         // must never verify.
         attestation.signature = vec![0xAB; 3309];
@@ -1504,10 +1497,8 @@ mod tests {
             origin_attestation: None,
         };
         sign_envelope_with_agent(&mut envelope, &sender);
-        let mut attestation = DmOriginAttestation::for_envelope(
-            &envelope,
-            machine.public_key().as_bytes().to_vec(),
-        );
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
         attestation.sign(&machine).expect("machine attest");
         envelope.origin_attestation = Some(attestation);
         // The attestation itself verifies — only the expiry window rejects.

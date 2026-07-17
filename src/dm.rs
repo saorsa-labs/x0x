@@ -344,8 +344,14 @@ impl DmOriginAttestation {
     #[must_use]
     pub fn signed_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
-            DM_ORIGIN_ATTESTATION_DOMAIN.len() + 2 + 2 + 16 + 32 * 3 + 4
-                + self.machine_public_key.len() + 8 * 2,
+            DM_ORIGIN_ATTESTATION_DOMAIN.len()
+                + 2
+                + 2
+                + 16
+                + 32 * 3
+                + 4
+                + self.machine_public_key.len()
+                + 8 * 2,
         );
         out.extend_from_slice(DM_ORIGIN_ATTESTATION_DOMAIN);
         out.extend_from_slice(&self.attestation_version.to_be_bytes());
@@ -367,9 +373,14 @@ impl DmOriginAttestation {
     ///
     /// # Errors
     /// Returns [`DmError::EnvelopeConstruction`] if ML-DSA-65 signing fails.
-    pub fn sign(&mut self, machine_keypair: &crate::identity::MachineKeypair) -> std::result::Result<(), DmError> {
-        let sig = sign_with_ml_dsa(machine_keypair.secret_key(), &self.signed_bytes())
-            .map_err(|e| DmError::EnvelopeConstruction(format!("origin attestation sign: {e:?}")))?;
+    pub fn sign(
+        &mut self,
+        machine_keypair: &crate::identity::MachineKeypair,
+    ) -> std::result::Result<(), DmError> {
+        let sig =
+            sign_with_ml_dsa(machine_keypair.secret_key(), &self.signed_bytes()).map_err(|e| {
+                DmError::EnvelopeConstruction(format!("origin attestation sign: {e:?}"))
+            })?;
         self.signature = sig.as_bytes().to_vec();
         Ok(())
     }
@@ -384,7 +395,10 @@ impl DmOriginAttestation {
     /// # Errors
     /// One of [`OriginAttestationError`]; every failure is a hard drop at
     /// the receiver.
-    pub fn verify(&self, envelope: &DmEnvelope) -> std::result::Result<MachineId, OriginAttestationError> {
+    pub fn verify(
+        &self,
+        envelope: &DmEnvelope,
+    ) -> std::result::Result<MachineId, OriginAttestationError> {
         if self.attestation_version != DM_ORIGIN_ATTESTATION_VERSION {
             return Err(OriginAttestationError::UnsupportedVersion(
                 self.attestation_version,
@@ -1659,7 +1673,11 @@ mod tests {
     }
 
     /// Build a fully-signed, attested payload envelope + the owning keys.
-    fn attested_fixture() -> (DmEnvelope, crate::identity::AgentKeypair, crate::identity::MachineKeypair) {
+    fn attested_fixture() -> (
+        DmEnvelope,
+        crate::identity::AgentKeypair,
+        crate::identity::MachineKeypair,
+    ) {
         use crate::gossip::SigningContext;
         use crate::groups::kem_envelope::AgentKemKeypair;
         use crate::identity::{AgentKeypair, MachineKeypair};
@@ -1811,18 +1829,13 @@ mod tests {
             out.extend_from_slice(&body_bytes);
             out
         };
-        let pubkey = ant_quic::MlDsaPublicKey::from_bytes(agent_kp.public_key().as_bytes())
-            .expect("pubkey");
-        let sig = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
-            &legacy.signature,
-        )
-        .expect("sig");
-        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
-            &pubkey,
-            &legacy_signed,
-            &sig,
-        )
-        .expect("old-shape signed bytes must verify against the agent key");
+        let pubkey =
+            ant_quic::MlDsaPublicKey::from_bytes(agent_kp.public_key().as_bytes()).expect("pubkey");
+        let sig =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&legacy.signature)
+                .expect("sig");
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pubkey, &legacy_signed, &sig)
+            .expect("old-shape signed bytes must verify against the agent key");
     }
 
     /// Mixed-version reverse: OLD wire bytes (no trailing attestation) MUST
@@ -1841,8 +1854,8 @@ mod tests {
             signature: vec![0u8; 32],
         };
         let wire = postcard::to_stdvec(&legacy).expect("encode legacy");
-        let decoded = DmEnvelope::from_wire_bytes(&wire)
-            .expect("new receivers must decode old envelopes");
+        let decoded =
+            DmEnvelope::from_wire_bytes(&wire).expect("new receivers must decode old envelopes");
         assert_eq!(decoded.origin_attestation, None);
         assert_eq!(decoded.request_id, [9u8; 16]);
     }

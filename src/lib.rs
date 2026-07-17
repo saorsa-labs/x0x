@@ -7151,12 +7151,13 @@ impl Agent {
         // `try_relay_fallback` uses for the agent key.
         let (machine_pub_bytes, machine_sec_bytes) = self.identity.machine_keypair().to_bytes();
         let machine_keypair = std::sync::Arc::new(
-            identity::MachineKeypair::from_bytes(&machine_pub_bytes, &machine_sec_bytes)
-                .map_err(|e| {
+            identity::MachineKeypair::from_bytes(&machine_pub_bytes, &machine_sec_bytes).map_err(
+                |e| {
                     error::IdentityError::Storage(std::io::Error::other(format!(
                         "DM inbox machine key copy: {e}"
                     )))
-                })?,
+                },
+            )?,
         );
         let service = dm_inbox::DmInboxService::spawn(
             std::sync::Arc::clone(runtime.pubsub()),
