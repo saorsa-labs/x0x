@@ -1024,6 +1024,16 @@ pub const MAX_PLANE_ID_LEN: usize = 64;
 /// only ever gates truly legacy peers.
 const PLANE_LEGACY_GRACE: Duration = Duration::from_secs(10);
 
+/// How long a successful plane verification stays trusted across connection
+/// generations (issue #206). Connection churn (mutual-dial supersedes,
+/// proactive reconnects) replaces connections many times per minute under
+/// load; a peer whose hello already matched our plane must not lose gossip
+/// eligibility — and have its in-flight gossip frames (including DM-inbox
+/// delivery) dropped — on every generation. A mismatched hello still refuses
+/// the peer immediately and purges this cache; a plane change in practice
+/// requires a daemon restart, well outside this window's risk envelope.
+const PLANE_REVERIFY_TTL: Duration = Duration::from_secs(600);
+
 /// Per-peer gossip-plane state, tracked only when plane isolation is
 /// configured (`NetworkConfig::network_id` is `Some`).
 #[derive(Debug, Clone, Copy)]
@@ -1467,6 +1477,13 @@ pub struct NetworkNode {
     /// grace expiry. Mismatched peers are tombstoned + disconnected and
     /// removed here.
     plane_peers: Arc<Mutex<HashMap<AntPeerId, PlanePeerState>>>,
+    /// Last successful plane verification per peer (issue #206). Unlike
+    /// [`Self::plane_peers`] this survives disconnects and connection
+    /// replacement: within [`PLANE_REVERIFY_TTL`] a reconnecting peer is
+    /// re-admitted as [`PlanePeerState::Cleared`] instead of re-gated, so
+    /// connection churn cannot black-hole its gossip frames. Purged on a
+    /// mismatched hello.
+    plane_cleared_at: Arc<Mutex<HashMap<AntPeerId, Instant>>>,
     /// Handles to the background tasks spawned at construction (receiver, accept
     /// loop, connection-pool eviction).
     ///
@@ -1633,6 +1650,7 @@ impl NetworkNode {
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
             reconnect_suppressions: Arc::new(Mutex::new(HashMap::new())),
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
+            plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -2624,10 +2642,15 @@ impl NetworkNode {
         };
         let now = Instant::now();
         // A peer with no recorded connect event (e.g. the gatekeeper task has
-        // not dequeued it yet) enters as pending-from-now.
-        let entry = map
-            .entry(*peer)
-            .or_insert(PlanePeerState::Pending { since: now });
+        // not dequeued it yet) enters as pending-from-now — unless its plane
+        // was verified within [`PLANE_REVERIFY_TTL`], in which case it stays
+        // cleared across the connection generation (issue #206 churn fix).
+        let seed = if plane_recently_cleared(&self.plane_cleared_at, peer) {
+            PlanePeerState::Cleared
+        } else {
+            PlanePeerState::Pending { since: now }
+        };
+        let entry = map.entry(*peer).or_insert(seed);
         match entry {
             PlanePeerState::Cleared => true,
             PlanePeerState::Pending { since } => {
@@ -2671,11 +2694,14 @@ impl NetworkNode {
             return;
         };
         if their_plane == our_plane {
-            let mut map = match self.plane_peers.lock() {
-                Ok(m) => m,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            map.insert(peer, PlanePeerState::Cleared);
+            {
+                let mut map = match self.plane_peers.lock() {
+                    Ok(m) => m,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                map.insert(peer, PlanePeerState::Cleared);
+            }
+            record_plane_cleared(&self.plane_cleared_at, peer);
             tracing::debug!(
                 target: "x0x::connect",
                 peer_id_prefix = %hex_prefix(&peer.0, 4),
@@ -2697,6 +2723,13 @@ impl NetworkNode {
                 Err(poisoned) => poisoned.into_inner(),
             };
             map.remove(&peer);
+        }
+        {
+            let mut cleared = match self.plane_cleared_at.lock() {
+                Ok(m) => m,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            cleared.remove(&peer);
         }
         if let Some(cache) = &self.bootstrap_cache {
             cache.remove(&peer).await;
@@ -2732,6 +2765,7 @@ impl NetworkNode {
             return tokio::spawn(async {});
         };
         let plane_peers = Arc::clone(&self.plane_peers);
+        let plane_cleared_at = Arc::clone(&self.plane_cleared_at);
         let node = Arc::clone(&self.node);
         let mut events = self.event_sender.subscribe();
 
@@ -2774,7 +2808,15 @@ impl NetworkNode {
                         ant_quic::PeerId(peer_id),
                         ant_quic::PeerLifecycleEvent::Established { .. },
                     ) => {
-                        plane_note_connected(&plane_id, &plane_peers, &node, peer_id, false).await;
+                        plane_note_connected(
+                            &plane_id,
+                            &plane_peers,
+                            &plane_cleared_at,
+                            &node,
+                            peer_id,
+                            false,
+                        )
+                        .await;
                     }
                     GatekeeperEvent::Lifecycle(
                         ant_quic::PeerId(peer_id),
@@ -2783,7 +2825,15 @@ impl NetworkNode {
                         // A fresh connection generation for a peer we may
                         // already have cleared: re-gate until its hello on
                         // the new connection re-verifies the plane.
-                        plane_note_connected(&plane_id, &plane_peers, &node, peer_id, true).await;
+                        plane_note_connected(
+                            &plane_id,
+                            &plane_peers,
+                            &plane_cleared_at,
+                            &node,
+                            peer_id,
+                            true,
+                        )
+                        .await;
                     }
                     GatekeeperEvent::Network(NetworkEvent::PeerDisconnected {
                         peer_id, ..
@@ -3653,30 +3703,63 @@ enum GatekeeperEvent {
 /// entry is kept (the peer's hello may have raced ahead and already cleared
 /// it); with `reset = true` (lifecycle `Replaced`) the peer is re-gated
 /// until its hello on the new connection generation re-verifies the plane.
+/// Record a successful plane verification for `peer` (issue #206), pruning
+/// expired entries opportunistically so the map stays bounded.
+fn record_plane_cleared(cleared_at: &Arc<Mutex<HashMap<AntPeerId, Instant>>>, peer: AntPeerId) {
+    let mut map = match cleared_at.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    if map.len() >= 1024 {
+        map.retain(|_, at| now.duration_since(*at) < PLANE_REVERIFY_TTL);
+    }
+    map.insert(peer, now);
+}
+
+/// True if `peer`'s plane was verified within [`PLANE_REVERIFY_TTL`].
+fn plane_recently_cleared(
+    cleared_at: &Arc<Mutex<HashMap<AntPeerId, Instant>>>,
+    peer: &AntPeerId,
+) -> bool {
+    let map = match cleared_at.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.get(peer)
+        .is_some_and(|at| at.elapsed() < PLANE_REVERIFY_TTL)
+}
+
 async fn plane_note_connected(
     plane_id: &str,
     plane_peers: &Arc<Mutex<HashMap<AntPeerId, PlanePeerState>>>,
+    plane_cleared_at: &Arc<Mutex<HashMap<AntPeerId, Instant>>>,
     node: &Arc<RwLock<Option<Node>>>,
     peer_id: [u8; 32],
     reset: bool,
 ) {
     let peer = ant_quic::PeerId(peer_id);
+    // A peer whose plane was verified within PLANE_REVERIFY_TTL keeps its
+    // clearance across connection generations: churn (supersedes, proactive
+    // reconnects) must not re-gate it and black-hole its gossip frames. The
+    // hello is still (re)sent below, so a genuine plane change is refused by
+    // the mismatch path, which also purges the clearance.
+    let seed = if plane_recently_cleared(plane_cleared_at, &peer) {
+        PlanePeerState::Cleared
+    } else {
+        PlanePeerState::Pending {
+            since: Instant::now(),
+        }
+    };
     {
         let mut map = match plane_peers.lock() {
             Ok(m) => m,
             Err(poisoned) => poisoned.into_inner(),
         };
         if reset {
-            map.insert(
-                peer,
-                PlanePeerState::Pending {
-                    since: Instant::now(),
-                },
-            );
+            map.insert(peer, seed);
         } else {
-            map.entry(peer).or_insert(PlanePeerState::Pending {
-                since: Instant::now(),
-            });
+            map.entry(peer).or_insert(seed);
         }
     }
     let frame = build_plane_hello_frame(plane_id);
