@@ -13,6 +13,7 @@ mod exec;
 mod files;
 mod identity;
 mod machines;
+mod network;
 mod presence;
 mod status;
 mod tasks;
@@ -48,6 +49,11 @@ pub(super) use identity::{
 #[cfg(test)]
 pub(super) use identity::{CardQuery, ImportCardRequest};
 pub(super) use status::{get_constitution, get_constitution_json, health, shutdown_handler, status};
+pub(super) use network::{
+    ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
+    gossip_diagnostics, groups_diagnostics, network_status, peer_health_handler, peers,
+    probe_peer_handler,
+};
 pub(super) use presence::{
     presence, presence_find, presence_foaf, presence_online, presence_status,
 };
