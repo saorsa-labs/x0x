@@ -1,5 +1,10 @@
 # x0x Transport & Identity Protocol — Internet-Draft Skeleton
 
+> **SUPERSEDED (2026-07-17, issue #113):** the full submission-ready draft
+> is now [`draft-saorsa-x0x-agent-transport-00.md`](./draft-saorsa-x0x-agent-transport-00.md).
+> This skeleton is retained for history; the draft is authoritative and
+> matches the implementation byte-for-byte.
+
 > **Status:** Draft skeleton for an Independent Submission Internet-Draft.
 > **Intended filename:** `draft-saorsa-x0x-agent-transport-00`
 > **Date:** 2026-06-15

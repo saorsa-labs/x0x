@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -185,6 +186,12 @@ pub(super) async fn write_manifest(
 async fn write_manifest_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
+    // #231: reclaim `.tmp` debris left by a process kill/crash mid-write —
+    // the TempFile guard cannot run when destructors are skipped. Runs
+    // BEFORE we mint our own temp below; age-bounded so a live concurrent
+    // writer's temp is never touched.
+    sweep_stale_temp_files(path, SystemTime::now());
+
     // Same directory as the target so the rename is atomic on one filesystem.
     let mut temp_os = path.as_os_str().to_owned();
     temp_os.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
@@ -240,6 +247,76 @@ async fn write_manifest_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()>
             Ok(())
         }
         Err(e) => Err(e), // guard drops and removes the temp file
+    }
+}
+
+/// Maximum age of a manifest temp file before it is treated as abandoned
+/// debris. A live write holds its temp for only a few milliseconds
+/// (create → write → fsync → rename), so 60s is far beyond any legitimate
+/// in-flight write — even under heavy blocking-pool scheduling delay —
+/// while bounding crash debris lifetime to the next manifest write.
+const STALE_TEMP_FILE_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// Best-effort removal of abandoned `.{uuid}.tmp` siblings of `path` older
+/// than [`STALE_TEMP_FILE_MAX_AGE`].
+///
+/// WHY (#231): the [`TempFile`] guard reclaims the temp file on every
+/// error/cancellation path, but a process kill (SIGKILL, abort, power loss)
+/// mid-write skips ALL destructors, leaking one `.tmp` per crash — and
+/// nothing else ever removes those, so they would accumulate forever.
+///
+/// Crash-safety: temp names are minted with a random UUID per write, and
+/// the sweep is AGE-bounded rather than "not ours" — so it cannot remove a
+/// temp held by a live concurrent writer in this process, including writers
+/// NOT serialised by the persistence lock (see
+/// `concurrent_manifest_writes_never_corrupt`). Anything provably younger
+/// than the bound — or of unknowable age (metadata/future-mtime errors) —
+/// is conservatively kept.
+///
+/// Synchronous `std::fs`, same pattern as the temp-file create above: one
+/// small directory scan before the write's first await. Every failure is
+/// logged-and-skipped — hygiene must never fail the actual write.
+fn sweep_stale_temp_files(path: &Path, now: SystemTime) {
+    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    // Temp names are minted as `{manifest_file_name}.{uuid}.tmp`.
+    let prefix = format!("{}.", file_name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        // Regular files only — never touch a directory or symlink that
+        // happens to match the name shape.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        // Keep anything not PROVABLY stale (future mtime → Err → keep).
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < STALE_TEMP_FILE_MAX_AGE {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            tracing::warn!(
+                "failed to remove stale temp file {}: {e}",
+                entry.path().display()
+            );
+        } else {
+            tracing::debug!("removed stale temp file {}", entry.path().display());
+        }
     }
 }
 
@@ -1345,6 +1422,81 @@ mod tests {
             1,
             "memory and disk must agree after retry"
         );
+    }
+
+    /// WHY (#231): a process kill (SIGKILL, abort, power loss) mid-write
+    /// skips every destructor, so the TempFile guard never runs and one
+    /// `.tmp` per crash leaks forever — nothing else ever removes it. The
+    /// next manifest write must sweep temp siblings older than
+    /// STALE_TEMP_FILE_MAX_AGE.
+    #[tokio::test]
+    async fn stale_temp_debris_is_swept_on_next_manifest_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crdt-subscriptions.json");
+
+        // Plant debris exactly as a crashed write would leave it: the same
+        // naming scheme write_manifest_atomic mints, mtime far in the past.
+        let mut stale_os = path.as_os_str().to_owned();
+        stale_os.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let stale_path = PathBuf::from(stale_os);
+        let stale = std::fs::File::create(&stale_path).expect("plant stale temp");
+        stale
+            .set_modified(SystemTime::now() - 2 * STALE_TEMP_FILE_MAX_AGE)
+            .expect("backdate mtime");
+        drop(stale);
+
+        let mut manifest = CrdtSubscriptionManifest::default();
+        manifest.upsert(entry(KIND_KV_STORE, "sweeper", ROLE_CREATED));
+        write_manifest(&path, &manifest)
+            .await
+            .expect("write manifest");
+
+        assert!(
+            !stale_path.exists(),
+            "stale .tmp debris must be reclaimed by the next manifest write"
+        );
+        // The write itself still landed correctly and left no debris of its
+        // own.
+        assert_eq!(read_manifest(&path).await, manifest);
+        let debris = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(debris, 0, "fresh write must leave no temp debris");
+    }
+
+    /// WHY (#231): the sweep must NEVER remove a temp file a live concurrent
+    /// write is using. Production writes are serialised by the persistence
+    /// lock, but `write_manifest` itself is not (see
+    /// `concurrent_manifest_writes_never_corrupt`), so the sweep is
+    /// age-bounded: a temp younger than STALE_TEMP_FILE_MAX_AGE is
+    /// definitionally still in flight (a manifest write holds its temp for
+    /// milliseconds) and must be left alone.
+    #[tokio::test]
+    async fn in_flight_temp_of_concurrent_write_is_not_swept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crdt-subscriptions.json");
+
+        // A fresh temp file is indistinguishable from one a concurrent
+        // writer created microseconds ago: same minting scheme, current
+        // mtime.
+        let mut live_os = path.as_os_str().to_owned();
+        live_os.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let live_path = PathBuf::from(live_os);
+        std::fs::write(&live_path, b"in-flight partial write").expect("plant live temp");
+
+        let mut manifest = CrdtSubscriptionManifest::default();
+        manifest.upsert(entry(KIND_KV_STORE, "writer", ROLE_CREATED));
+        write_manifest(&path, &manifest)
+            .await
+            .expect("write manifest");
+
+        assert!(
+            live_path.exists(),
+            "a fresh (in-flight) temp file must survive the sweep"
+        );
+        assert_eq!(read_manifest(&path).await, manifest);
     }
 
     /// WHY (P1 parent-directory fsync failure → refused durability): a rename

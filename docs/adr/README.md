@@ -26,3 +26,4 @@ This directory contains architecture decision records for x0x.
 ## Proposed
 
 - [ADR 0020: Tailnet Phase 1 — per-peer byte-streams + local port-forwarding](./0020-tailnet-phase-1-byte-streams-and-forwarding.md) — PeerStream over `Node::open_bi`/`accept_bi` with the identity gate inside open/accept; `src/forward/` local port-forwarder gated by the connect ACL (#131/ADR-0019) + key lifecycle (#130); loopback-only Phase 1
+- [ADR 0022: Tailnet stream API — per-protocol acceptors, connect-ACL gate, bounded backpressure](./0022-tailnet-stream-api.md) — protocol-byte routing to single-owner acceptors (bounded, drop-on-full), stream-layer connect-ACL pair gate after the identity gate, QUIC flow-control backpressure with asserted bounds; issue #132 deliverable 1

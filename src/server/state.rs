@@ -248,6 +248,16 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) peer_relay: x0x::network::PeerRelayConfig,
 
+    /// Issue #120: opt-in surfacing of the transport-observed peer address
+    /// as a coarse, masked origin token (`/24` IPv4, `/48` IPv6) on
+    /// point-to-point DM surfaces only — the DM-receive WS/SSE event and
+    /// per-peer `GET /diagnostics/dm`. Default `false`; when disabled the
+    /// fields are entirely absent and wire behaviour is byte-identical. The
+    /// token is never gossiped, never announced, and never on `/peers`.
+    /// Like `[peer_relay]` (opt-in), there is intentionally no CLI flag.
+    #[serde(default)]
+    pub(super) observed_prefix_enabled: bool,
+
     /// Update configuration.
     #[serde(default)]
     pub(super) update: DaemonUpdateConfig,
@@ -535,6 +545,7 @@ impl Default for DaemonConfig {
             bootstrap_peers: None,
             port_mapping_enabled: default_port_mapping_enabled(),
             peer_relay: x0x::network::PeerRelayConfig::default(),
+            observed_prefix_enabled: false,
             update: DaemonUpdateConfig::default(),
             gossip: x0x::gossip::GossipConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
@@ -1031,5 +1042,20 @@ mod tests {
             .filter_map(|s| s.parse().ok())
             .collect();
         assert_eq!(config.resolved_bootstrap_peers(), embedded);
+    }
+
+    #[test]
+    fn observed_prefix_enabled_defaults_off_and_parses_opt_in() {
+        // Issue #120: the gate is default-OFF in every construction path —
+        // absent TOML key, empty TOML, and `DaemonConfig::default()` — so
+        // unconfigured daemons keep byte-identical DM wire output.
+        let config: DaemonConfig = toml::from_str("").expect("empty config parses");
+        assert!(!config.observed_prefix_enabled);
+        assert!(!DaemonConfig::default().observed_prefix_enabled);
+
+        // Explicit opt-in parses through.
+        let config: DaemonConfig =
+            toml::from_str("observed_prefix_enabled = true").expect("opt-in parses");
+        assert!(config.observed_prefix_enabled);
     }
 }

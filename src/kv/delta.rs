@@ -106,6 +106,26 @@ impl KvStoreDelta {
             && self.allowlist_removals.is_none()
             && self.owner_checkpoint.is_none()
     }
+
+    /// Digest over the full-state content this delta serves, when the delta
+    /// is full-state-shaped (issue #240).
+    ///
+    /// A `KvStore::full_delta` always carries `name_update`; incremental
+    /// puts/updates do not, so `None` cleanly excludes them. (Owner
+    /// remove-deltas DO carry `name_update` when a checkpoint rides along —
+    /// which is why callers MUST additionally require the added-entry count
+    /// to equal the holder's declared `entry_count` before treating a digest
+    /// match as a verified full serve: a remove-delta's empty `added` set
+    /// could otherwise impersonate a declared empty state.)
+    pub(crate) fn served_digest(&self, store_id: &crate::kv::KvStoreId) -> Option<[u8; 32]> {
+        self.name_update.as_ref()?;
+        let pairs: Vec<(&str, &KvEntry)> = self
+            .added
+            .iter()
+            .map(|(k, (e, _))| (k.as_str(), e))
+            .collect();
+        Some(crate::kv::store::served_content_digest(store_id, &pairs))
+    }
 }
 
 /// Implement `DeltaCrdt` trait for KvStore.

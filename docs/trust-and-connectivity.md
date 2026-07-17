@@ -174,3 +174,40 @@ x0x can map `network_id` → mDNS namespace (cross-plane peers are then
 never dial candidates at all) and/or disable mDNS entirely for
 server-class daemons. Filed as a doc note here until an ant-quic release
 ships the surface.
+## Observed-Origin Token (issue #120, `connectivity.rs`, opt-in)
+
+The transport already observes every connected peer's remote address (the same
+live connection-table data `connected_peer_snapshot()` reads and
+`add_from_connection()` enriches the bootstrap cache from). Issue #120 surfaces
+that observation as a coarse, masked *origin token* on **point-to-point DM
+surfaces only**:
+
+```json
+{ "observed_prefix": "203.0.113.0/24", "direct": true, "cgnat": false }
+```
+
+- `observed_prefix` — the observed IP with host bits zeroed at a fixed mask
+  (`/24` IPv4, `/48` IPv6). Never a raw IP; no GeoIP; no new dependencies.
+  Loopback/unspecified observations yield no token at all.
+- `direct` — `false` marks a relayed observation (the connection is via a
+  relay, per the transport's `TraversalMethod`).
+- `cgnat` — the observed address is in the RFC 6598 range (100.64.0.0/10),
+  reusing the existing `connectivity.rs` check.
+
+**Default-off.** Set `observed_prefix_enabled = true` in the daemon TOML to
+opt in (no CLI flag — same pattern as `[peer_relay]`). When disabled the
+token is never computed and every surface is byte-identical to before.
+
+**Surfaces** (each carries the token as an optional field, entirely absent —
+not `null` — when disabled or unobserved):
+
+- DM-receive WS (`/ws`, `/ws/direct`) and SSE (`/direct/events`)
+  `direct_message` events, as `observed_origin` — populated only for
+  messages that arrived over the live point-to-point transport connection
+  (gossip-inbox, relay-injected, and loopback deliveries never carry it).
+- Per-peer rows of `GET /diagnostics/dm`, as `observed_origin` (latest
+  captured token per sender agent).
+
+The token is **never gossiped, never announced, and never on `/peers`**: it
+is populated only in the raw-QUIC DM receive path and serialized only on the
+DM surfaces above.

@@ -7,7 +7,7 @@ use crate::dm::{
 use crate::dm_inbox::{DmInboxService, DM_BUS_TOPIC};
 use crate::error::IdentityError;
 use crate::gossip::{PubSubManager, SigningContext};
-use crate::identity::{AgentId, MachineId};
+use crate::identity::{AgentId, MachineId, MachineKeypair};
 
 use bytes::Bytes;
 use std::sync::Arc;
@@ -44,12 +44,15 @@ const ACK_LEGACY_BUS_FALLBACK_DELAY: Duration = Duration::from_millis(250);
 pub struct DmSendContext<'a> {
     /// PlumTree pub/sub manager used to publish the envelope.
     pub pubsub: Arc<PubSubManager>,
-    /// Sender signing context (ML-DSA-65).
+    /// Sender signing context (ML-DSA-65 agent key).
     pub signing: &'a SigningContext,
     /// This agent's `AgentId`.
     pub self_agent_id: AgentId,
     /// This agent's `MachineId`.
     pub self_machine_id: MachineId,
+    /// This machine's keypair — signs the #213 origin-machine attestation
+    /// embedded in every envelope. MUST own `self_machine_id`.
+    pub machine_keypair: &'a MachineKeypair,
     /// Shared in-flight ACK registry.
     pub inflight: Arc<InFlightAcks>,
 }
@@ -67,14 +70,17 @@ pub async fn send_via_gossip(
         signing,
         self_agent_id,
         self_machine_id,
+        machine_keypair,
         inflight,
     } = ctx;
     if payload.len() > MAX_PAYLOAD_BYTES {
-        return Err(DmError::EnvelopeConstruction(format!(
-            "payload exceeds MAX_PAYLOAD_BYTES ({} > {})",
-            payload.len(),
-            MAX_PAYLOAD_BYTES
-        )));
+        // 413-class rejection, not `EnvelopeConstruction`: the API layer must
+        // be able to distinguish an oversized payload from a crypto/build
+        // failure (issue #188).
+        return Err(DmError::PayloadTooLarge {
+            len: payload.len(),
+            max: MAX_PAYLOAD_BYTES,
+        });
     }
     if recipient_kem_public_key.is_empty() {
         return Err(DmError::RecipientKeyUnavailable(
@@ -90,6 +96,7 @@ pub async fn send_via_gossip(
         request_id,
         &self_agent_id,
         &self_machine_id,
+        machine_keypair,
         &recipient_agent_id,
         recipient_kem_public_key,
         created,
