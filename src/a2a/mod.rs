@@ -6,9 +6,15 @@
 //!
 //! This is the *discovery* half of A2A interop (ADR-0017,
 //! `docs/design/a2a-agent-card-adapter.md`). The *delivery* half — the
-//! A2A-over-x0x message binding — is a tracked follow-up and is intentionally
-//! NOT implemented here; `capabilities.streaming` / `pushNotifications` stay
-//! `false` until that lands.
+//! A2A-over-x0x message binding — lives in [`binding`] (issue #112):
+//! increment 1 ships the envelope codec + unary request/response
+//! correlation; streaming, push notifications, and large artifacts are
+//! later increments, so `capabilities.streaming` / `pushNotifications`
+//! stay `false` until those land.
+
+/// A2A-over-x0x transport binding (issue #112): envelope codec + unary
+/// request/response over the DM channel.
+pub mod binding;
 
 use crate::groups::card::AgentCard;
 use serde::{Deserialize, Serialize};
@@ -307,6 +313,17 @@ mod tests {
         // Enabled: exec appears.
         let enabled = a2a_card_from(&card, &ctx(true));
         assert!(enabled.skills.iter().any(|s| s.id == "exec"));
+    }
+
+    #[test]
+    fn capability_flags_stay_disabled_until_streaming_and_push_ship() {
+        // Issue #112 increment 1 lands the unary binding only — the served
+        // card MUST stay honest: streaming / push are not implemented.
+        let kp = AgentKeypair::generate().expect("kp");
+        let card = signed_card(&kp);
+        let a2a = a2a_card_from(&card, &ctx(false));
+        assert!(!a2a.capabilities.streaming);
+        assert!(!a2a.capabilities.push_notifications);
     }
 
     #[test]
