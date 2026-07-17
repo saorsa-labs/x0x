@@ -22,11 +22,11 @@ pub const DEFAULT_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
 ///
 /// The gossip-inbox DM path caps user payloads at
 /// [`crate::dm::MAX_PAYLOAD_BYTES`] (49 152). Invite links travel as the bulk
-/// of the `group_join` cmd-DM, so a link near that cap guarantees the DM is
-/// rejected at the sender with `envelope_construction` (issue #188). 40 KiB
-/// leaves room for the cmd-DM envelope wrapper while flagging roster growth at
-/// the mint site instead of as a mysterious cross-node 400. See issues #188 /
-/// #205.
+/// of the `group_join` cmd-DM, so a link near that cap used to be rejected at
+/// the sender with an opaque `envelope_construction` 400 (issue #188; now a
+/// truthful `payload_too_large` 413). 40 KiB leaves room for the cmd-DM
+/// envelope wrapper while flagging roster growth at the mint site instead of
+/// as a mysterious cross-node rejection. See issues #188 / #205.
 pub const INVITE_LINK_MAX_BYTES: usize = 40 * 1024;
 
 /// A signed invite token for joining a group.
@@ -99,8 +99,9 @@ pub struct SignedInvite {
 /// Error returned when an encoded invite link exceeds the safe DM budget.
 ///
 /// Carries the measured and limit sizes so callers can surface a structured
-/// error at the mint site (issue #205) instead of letting the link 400 later
-/// at `/direct/send` with an opaque `envelope_construction`.
+/// error at the mint site (issue #205) instead of letting the link fail later
+/// at `/direct/send` with `payload_too_large` (issue #188 — formerly an
+/// opaque `envelope_construction` 400).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteLinkTooLarge {
     /// Measured encoded link length in bytes.

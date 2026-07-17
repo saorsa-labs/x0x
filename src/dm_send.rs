@@ -70,11 +70,13 @@ pub async fn send_via_gossip(
         inflight,
     } = ctx;
     if payload.len() > MAX_PAYLOAD_BYTES {
-        return Err(DmError::EnvelopeConstruction(format!(
-            "payload exceeds MAX_PAYLOAD_BYTES ({} > {})",
-            payload.len(),
-            MAX_PAYLOAD_BYTES
-        )));
+        // 413-class rejection, not `EnvelopeConstruction`: the API layer must
+        // be able to distinguish an oversized payload from a crypto/build
+        // failure (issue #188).
+        return Err(DmError::PayloadTooLarge {
+            len: payload.len(),
+            max: MAX_PAYLOAD_BYTES,
+        });
     }
     if recipient_kem_public_key.is_empty() {
         return Err(DmError::RecipientKeyUnavailable(
