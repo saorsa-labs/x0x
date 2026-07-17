@@ -768,6 +768,7 @@ pub async fn serve_with_options(
         // single invocation without editing the config file.
         port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
         peer_relay: config.peer_relay.clone(),
+        observed_prefix_enabled: config.observed_prefix_enabled,
     };
 
     let contacts_path = config.data_dir.join("contacts.json");

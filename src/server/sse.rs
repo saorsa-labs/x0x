@@ -132,6 +132,30 @@ pub(super) async fn presence_events(
     Sse::new(stream)
 }
 
+/// Serialize a received [`crate::direct::DirectMessage`] into the JSON
+/// payload carried by the `/direct/events` SSE `direct_message` event.
+///
+/// Issue #120: `observed_origin` is inserted only when the message carries
+/// the opt-in coarsened origin token — when the token is absent the output
+/// is byte-identical to the pre-#120 shape (the key never appears, not even
+/// as `null`). The token never reaches gossip, announcements, or `/peers`.
+fn direct_message_event_data(msg: &crate::direct::DirectMessage) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "sender": hex::encode(msg.sender.as_bytes()),
+        "machine_id": hex::encode(msg.machine_id.as_bytes()),
+        "payload": BASE64.encode(&msg.payload),
+        "received_at": msg.received_at,
+        "verified": msg.verified,
+        "trust_decision": msg.trust_decision.as_ref().map(|d| d.to_string())
+    });
+    if let Some(origin) = &msg.observed_origin {
+        if let (Some(obj), Ok(value)) = (data.as_object_mut(), serde_json::to_value(origin)) {
+            obj.insert("observed_origin".to_string(), value);
+        }
+    }
+    data
+}
+
 /// GET /direct/events — SSE stream of incoming direct messages.
 pub(super) async fn direct_events_sse(
     State(state): State<Arc<AppState>>,
@@ -158,14 +182,7 @@ pub(super) async fn direct_events_sse(
                         machine_id = %hex::encode(msg.machine_id.as_bytes()),
                         bytes = msg.payload.len(),
                     );
-                    let data = serde_json::json!({
-                        "sender": hex::encode(msg.sender.as_bytes()),
-                        "machine_id": hex::encode(msg.machine_id.as_bytes()),
-                        "payload": BASE64.encode(&msg.payload),
-                        "received_at": msg.received_at,
-                        "verified": msg.verified,
-                        "trust_decision": msg.trust_decision.map(|d| d.to_string())
-                    });
+                    let data = direct_message_event_data(&msg);
                     let event = Event::default()
                         .event("direct_message")
                         .data(data.to_string());
@@ -227,4 +244,70 @@ pub(super) async fn peer_events_handler(
         }
     };
     Sse::new(stream).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectivity::ObservedOrigin;
+    use crate::direct::DirectMessage;
+    use crate::identity::{AgentId, MachineId};
+
+    fn dm_with_origin(origin: Option<ObservedOrigin>) -> DirectMessage {
+        let mut msg = DirectMessage::new(
+            AgentId([0x8a; 32]),
+            MachineId([0xb2; 32]),
+            b"hello".to_vec(),
+        );
+        msg.received_at = 1_774_860_000;
+        msg.verified = true;
+        msg.observed_origin = origin;
+        msg
+    }
+
+    #[test]
+    fn direct_message_event_data_is_byte_identical_without_origin() {
+        // Issue #120 acceptance: with the token absent (the default — the
+        // daemon has not opted in) the serialized event is byte-identical to
+        // the pre-#120 shape. No `observed_origin` key, not even as null.
+        let data = direct_message_event_data(&dm_with_origin(None));
+        let s = data.to_string();
+        assert!(
+            !s.contains("observed_origin"),
+            "absent token must not serialize: {s}"
+        );
+        assert_eq!(
+            s,
+            format!(
+                "{{\"machine_id\":\"{}\",\"payload\":\"aGVsbG8=\",\"received_at\":1774860000,\"sender\":\"{}\",\"trust_decision\":null,\"verified\":true}}",
+                hex::encode([0xb2; 32]),
+                hex::encode([0x8a; 32]),
+            )
+        );
+    }
+
+    #[test]
+    fn direct_message_event_data_inserts_masked_origin_when_present() {
+        // Opted-in nodes emit the masked token on the DM-receive event;
+        // relayed observation => direct=false, CGNAT => cgnat=true.
+        let origin = ObservedOrigin {
+            observed_prefix: "203.0.113.0/24".to_string(),
+            direct: false,
+            cgnat: true,
+        };
+        let data = direct_message_event_data(&dm_with_origin(Some(origin)));
+        assert_eq!(
+            data["observed_origin"],
+            serde_json::json!({
+                "observed_prefix": "203.0.113.0/24",
+                "direct": false,
+                "cgnat": true
+            })
+        );
+        // The pre-existing fields are untouched by the insertion.
+        assert_eq!(data["payload"], "aGVsbG8=");
+        assert_eq!(data["verified"], true);
+        assert_eq!(data["received_at"], 1_774_860_000);
+        assert!(data["trust_decision"].is_null());
+    }
 }

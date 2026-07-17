@@ -66,6 +66,7 @@
 //! assert_eq!(msg.payload, b"hello");
 //! ```
 
+use crate::connectivity::ObservedOrigin;
 use crate::dm::DmPath;
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
@@ -226,6 +227,17 @@ pub struct DirectMessage {
     /// When present, reflects the full trust evaluation including contact
     /// store trust level and machine pinning.
     pub trust_decision: Option<TrustDecision>,
+    /// Issue #120: opt-in coarsened origin token — the transport-observed
+    /// peer address masked to a fixed prefix, with directness and CGNAT
+    /// markers.
+    ///
+    /// Populated ONLY when (a) the daemon opted in via
+    /// `observed_prefix_enabled`, (b) the message arrived over the live
+    /// point-to-point transport connection (gossip-inbox, relay-injected,
+    /// and loopback deliveries always carry `None`), and (c) the observed
+    /// IP yields a maskable prefix (loopback/unspecified do not). Never
+    /// gossiped, never announced, never on `/peers`.
+    pub observed_origin: Option<ObservedOrigin>,
 }
 
 impl DirectMessage {
@@ -256,6 +268,7 @@ impl DirectMessage {
             received_at,
             verified,
             trust_decision,
+            observed_origin: None,
         }
     }
 
@@ -500,6 +513,11 @@ struct DirectPeerDiagnosticsState {
     send_failed: u64,
     recv_count: u64,
     preferred_path: Option<&'static str>,
+    /// Issue #120: latest observed-origin token captured at receive time.
+    /// `None` unless the daemon opted in and a point-to-point delivery
+    /// carried a maskable observation; gossip/loopback deliveries never
+    /// overwrite an existing token.
+    observed_origin: Option<ObservedOrigin>,
 }
 
 impl DirectPeerDiagnosticsState {
@@ -562,6 +580,11 @@ pub struct DmPeerDiagnostics {
     pub send_failed: u64,
     pub recv_count: u64,
     pub preferred_path: String,
+    /// Issue #120: opt-in coarsened origin token. Entirely absent unless the
+    /// daemon opted in (`observed_prefix_enabled`) AND a point-to-point
+    /// delivery from this peer carried a maskable observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_origin: Option<ObservedOrigin>,
 }
 
 /// Snapshot of the direct-message diagnostics surface.
@@ -1044,6 +1067,7 @@ impl DirectMessaging {
                             send_failed: peer.send_failed,
                             recv_count: peer.recv_count,
                             preferred_path: peer.preferred_path.unwrap_or("unknown").to_string(),
+                            observed_origin: peer.observed_origin.clone(),
                         },
                     )
                 })
@@ -1079,6 +1103,8 @@ impl DirectMessaging {
             payload,
             true,
             Some(TrustDecision::Accept),
+            // Loopback never carries a transport observation (issue #120).
+            None,
         )
         .await
     }
@@ -1088,6 +1114,12 @@ impl DirectMessaging {
     /// Called by the network layer when a direct message is received.
     /// The `verified` and `trust_decision` fields are populated by the
     /// caller based on the identity discovery cache and contact store.
+    ///
+    /// `observed_origin` (issue #120) is the opt-in coarsened origin token
+    /// captured by the point-to-point raw-QUIC listener when the daemon has
+    /// enabled `observed_prefix_enabled`; every other delivery path
+    /// (gossip-inbox, relay-injected, loopback) passes `None`, and a `None`
+    /// never erases a previously captured token in the per-peer diagnostics.
     ///
     /// Returns the number of subscribers that successfully received the
     /// message. Slow subscribers keep their streams open, but when a queue
@@ -1100,6 +1132,7 @@ impl DirectMessaging {
         payload: Vec<u8>,
         verified: bool,
         trust_decision: Option<TrustDecision>,
+        observed_origin: Option<ObservedOrigin>,
     ) -> u64 {
         self.diagnostics
             .incoming_envelopes_total
@@ -1108,15 +1141,19 @@ impl DirectMessaging {
         self.with_peer_diagnostics(sender_agent_id, |peer| {
             peer.last_recv_at_ms = Some(now_ms);
             peer.recv_count = peer.recv_count.saturating_add(1);
+            if observed_origin.is_some() {
+                peer.observed_origin = observed_origin.clone();
+            }
         });
 
-        let msg = DirectMessage::new_verified(
+        let mut msg = DirectMessage::new_verified(
             sender_agent_id,
             machine_id,
             payload,
             verified,
             trust_decision,
         );
+        msg.observed_origin = observed_origin;
 
         let subscribers = self.subscriber_snapshot();
         let mut delivered = 0_u64;
@@ -1527,7 +1564,7 @@ mod tests {
         let machine_id = MachineId([2u8; 32]);
         let payload = b"test message".to_vec();
 
-        dm.handle_incoming(machine_id, sender, payload.clone(), true, None)
+        dm.handle_incoming(machine_id, sender, payload.clone(), true, None, None)
             .await;
 
         let msg = rx.recv().await.unwrap();
@@ -1553,7 +1590,7 @@ mod tests {
         let machine_id = MachineId([4u8; 32]);
         let payload = b"fanout".to_vec();
 
-        dm.handle_incoming(machine_id, sender, payload.clone(), true, None)
+        dm.handle_incoming(machine_id, sender, payload.clone(), true, None, None)
             .await;
 
         assert_eq!(rx1.recv().await.unwrap().payload, payload);
@@ -1569,7 +1606,7 @@ mod tests {
         let machine_id = MachineId([6u8; 32]);
 
         for idx in 0_u64..=2 {
-            dm.handle_incoming(machine_id, sender, idx.to_be_bytes().to_vec(), true, None)
+            dm.handle_incoming(machine_id, sender, idx.to_be_bytes().to_vec(), true, None, None)
                 .await;
         }
 
@@ -1689,5 +1726,113 @@ mod tests {
         let binary_msg =
             DirectMessage::new(AgentId([1u8; 32]), MachineId([2u8; 32]), vec![0xff, 0xfe]);
         assert!(binary_msg.payload_str().is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #120 — opt-in observed-origin token plumbing
+    // ------------------------------------------------------------------
+
+    fn test_observed_origin() -> ObservedOrigin {
+        ObservedOrigin {
+            observed_prefix: "203.0.113.0/24".to_string(),
+            direct: true,
+            cgnat: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_observed_origin_reaches_subscriber_and_diagnostics() {
+        let dm = DirectMessaging::new();
+        let mut rx = dm.subscribe();
+        let sender = AgentId([7u8; 32]);
+        let machine_id = MachineId([8u8; 32]);
+        let origin = test_observed_origin();
+
+        dm.handle_incoming(
+            machine_id,
+            sender,
+            b"hello".to_vec(),
+            true,
+            None,
+            Some(origin.clone()),
+        )
+        .await;
+
+        // The fan-out message carries the token …
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.observed_origin, Some(origin.clone()));
+
+        // … and the per-peer diagnostics row exposes it for /diagnostics/dm.
+        let snap = dm.diagnostics_snapshot();
+        let row = snap
+            .per_peer
+            .get(&hex::encode(sender.as_bytes()))
+            .expect("sender diagnostics row");
+        assert_eq!(row.observed_origin, Some(origin));
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_none_origin_never_clobbers_existing_token() {
+        // WHY: gossip-inbox and loopback deliveries always pass None; a later
+        // gossip-path DM from the same agent must not erase the token a
+        // point-to-point delivery captured.
+        let dm = DirectMessaging::new();
+        let sender = AgentId([9u8; 32]);
+        let machine_id = MachineId([10u8; 32]);
+        let origin = test_observed_origin();
+
+        dm.handle_incoming(
+            machine_id,
+            sender,
+            b"p2p".to_vec(),
+            true,
+            None,
+            Some(origin.clone()),
+        )
+        .await;
+        dm.handle_incoming(machine_id, sender, b"gossip".to_vec(), true, None, None)
+            .await;
+
+        let snap = dm.diagnostics_snapshot();
+        let row = snap
+            .per_peer
+            .get(&hex::encode(sender.as_bytes()))
+            .expect("sender diagnostics row");
+        assert_eq!(row.observed_origin, Some(origin));
+    }
+
+    #[tokio::test]
+    async fn dm_peer_diagnostics_omits_observed_origin_key_when_absent() {
+        // WHY (issue #120 acceptance): with the token absent the serialized
+        // per-peer row must be byte-identical to before the field existed —
+        // no `"observed_origin": null`.
+        let dm = DirectMessaging::new();
+        let sender = AgentId([11u8; 32]);
+        let machine_id = MachineId([12u8; 32]);
+        dm.handle_incoming(machine_id, sender, b"x".to_vec(), true, None, None)
+            .await;
+
+        let snap = dm.diagnostics_snapshot();
+        let json = serde_json::to_string(&snap.per_peer).expect("serialize per_peer");
+        assert!(
+            !json.contains("observed_origin"),
+            "absent token must not serialize: {json}"
+        );
+
+        // And when present, the row carries the masked token.
+        let origin = test_observed_origin();
+        dm.handle_incoming(
+            machine_id,
+            sender,
+            b"y".to_vec(),
+            true,
+            None,
+            Some(origin),
+        )
+        .await;
+        let snap = dm.diagnostics_snapshot();
+        let json = serde_json::to_string(&snap.per_peer).expect("serialize per_peer");
+        let needle = "\"observed_origin\":{\"observed_prefix\":\"203.0.113.0/24\",\"direct\":true,\"cgnat\":false}";
+        assert!(json.contains(needle), "present token serializes masked: {json}");
     }
 }
