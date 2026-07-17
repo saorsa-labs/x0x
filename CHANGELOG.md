@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.33.1] - 2026-07-17
+
+### Fixed
+
+- **CRDT-subscription restart recovery (#238)** — three coupled recovery
+  defects found by the x0x-symphony two-daemon harness:
+  - *Rehydration wedge:* subscription rehydration ran AFTER `join_network`
+    returned, so a daemon restarted while a joined store's owner was offline
+    wedged behind the ~70s bootstrap dial schedule and even its OWN stores
+    never surfaced in `GET /stores`. Rehydration now runs concurrently with
+    `join_network` — own stores restore from local snapshots at t+0.
+  - *Zombie subscription:* the empty-replica state-request schedule was
+    bounded (front burst + 20×30s cap ≈ 10 min); a replica that rehydrated
+    while every holder was offline stopped asking forever and never
+    converged when the owner returned. The requester tail is now infinite
+    with jittered exponential backoff (30s → 300s cap), stopped ONLY by
+    convergence — an owner-verified `StateServed` marker plus local state —
+    or explicit teardown. Empty holders never declare `StateServed`, so two
+    empty replicas cannot talk each other into false convergence.
+  - *Policy misreport + resource leaks:* sync teardown is now structural —
+    every background loop (delta listener, responder, bootstrap requester)
+    selects on a shared `CancellationToken` (`cancel_sync()`), rollback
+    paths on registration-persist failure stop the discarded handle's sync,
+    dropped pubsub subscribers end their forwarding task promptly even on
+    quiet topics (`tx.closed()`), dead side-topic subscriptions self-cancel
+    their sibling loops, and per-(kind,id) reservation locks are pruned
+    instead of growing unboundedly. Response-storm damping: one full-state
+    response per holder per 15s window; `write_manifest_atomic` creates its
+    temp file synchronously so cancellation can no longer orphan `.tmp`
+    debris.
+- Recovery e2e suite: restart with bootstrap peer down surfaces both own
+  and joined stores in seconds; a store joined before shutdown converges
+  after the owner returns past the front-loaded schedule.
+
 ## [v0.33.0] - 2026-07-16
 
 ### Added
