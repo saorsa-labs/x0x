@@ -212,8 +212,7 @@ async fn test_agent_lookup_via_shard() -> TestResult {
         }
     };
     let (lookup_outcome, _) = tokio::join!(lookup, republish);
-    let found = lookup_outcome
-        .expect("seeker find_agent_rendezvous did not return within 15s")?;
+    let found = lookup_outcome.expect("seeker find_agent_rendezvous did not return within 15s")?;
     assert!(
         found.is_some(),
         "find_agent_rendezvous should return the advertiser's addresses from its shard topic"
@@ -337,7 +336,8 @@ async fn test_concurrent_shard_queries() -> TestResult {
 
     for handle in handles {
         let outcome = handle.await.expect("query task must join");
-        let resolved = outcome.expect("query exceeded per-query budget; query path hung under fan-out");
+        let resolved =
+            outcome.expect("query exceeded per-query budget; query path hung under fan-out");
         // find_agent returns Result<Option<Vec<SocketAddr>>, x0x::Error>; propagate any
         // error as a test failure. Ok(None) is acceptable (target not present
         // on the testnet) — only the no-hang + no-error contract is asserted.
