@@ -13336,7 +13336,7 @@ mod tests {
         // a delayed PeerConnected from a duplicate dial leg would otherwise
         // arrive after the disconnect and abort the just-scheduled reconnect.
         await_quiesced_connection(
-            &alice_network,
+            alice_network,
             &bob_peer,
             std::time::Duration::from_secs(1) * test_time_multiplier(),
         )
@@ -13523,7 +13523,7 @@ mod tests {
         // see await_quiesced_connection): a delayed PeerConnected from a
         // duplicate dial leg would otherwise abort the scheduled reconnect.
         await_quiesced_connection(
-            &alice_network,
+            alice_network,
             &bob_peer,
             std::time::Duration::from_secs(1) * test_time_multiplier(),
         )
@@ -13662,7 +13662,7 @@ mod tests {
         // see await_quiesced_connection): a delayed PeerConnected from a
         // duplicate dial leg would otherwise abort the scheduled reconnect.
         await_quiesced_connection(
-            &alice_network,
+            alice_network,
             &bob_peer,
             std::time::Duration::from_secs(1) * test_time_multiplier(),
         )
