@@ -13923,12 +13923,8 @@ mod tests {
             .await
             .expect("alice");
         let alice_network = alice.network().expect("alice network");
-        let alice_addr = normalize_loopback_addr(
-            alice_network
-                .bound_addr()
-                .await
-                .expect("alice bound"),
-        );
+        let alice_addr =
+            normalize_loopback_addr(alice_network.bound_addr().await.expect("alice bound"));
 
         let bob = Agent::builder()
             .with_machine_key(dir.path().join("bob-machine.key"))
