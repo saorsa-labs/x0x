@@ -8,6 +8,7 @@
 mod contacts;
 mod identity;
 mod machines;
+mod status;
 mod tasks;
 
 #[cfg(test)]
@@ -23,6 +24,7 @@ pub(super) use identity::{
 };
 #[cfg(test)]
 pub(super) use identity::{CardQuery, ImportCardRequest};
+pub(super) use status::{get_constitution, get_constitution_json, health, shutdown_handler, status};
 pub(super) use machines::{
     add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,
     machines_by_user_handler, pin_machine, unpin_machine,

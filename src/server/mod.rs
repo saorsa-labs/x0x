@@ -23,10 +23,11 @@ use routes::{
     add_contact, add_machine, add_task, agent_info, agent_sign, agent_user_id_handler,
     agent_verify, announce_identity, create_task_list, delete_contact, delete_machine,
     discovered_machine, discovered_machines, get_a2a_agent_card, get_agent_card,
-    identity_revocations, identity_revoke, import_agent_card, introduction, list_contacts,
-    list_machines, list_revocations, list_task_lists, list_tasks, machines_by_user_handler,
-    pin_machine, populate_invite_base_state_from_group_info, quick_trust, revoke_contact,
-    unpin_machine, update_contact, update_task,
+    get_constitution, get_constitution_json, health, identity_revocations, identity_revoke,
+    import_agent_card, introduction, list_contacts, list_machines, list_revocations,
+    list_task_lists, list_tasks, machines_by_user_handler, pin_machine,
+    populate_invite_base_state_from_group_info, quick_trust, revoke_contact, shutdown_handler,
+    status, unpin_machine, update_contact, update_task,
 };
 #[cfg(test)]
 use routes::{CardQuery, ImportCardRequest, UpdateContactRequest};
@@ -394,40 +395,6 @@ struct PublishRequest {
 struct SubscribeRequest {
     topic: String,
 }
-
-/// Generic JSON response wrapper.
-#[derive(Debug, Serialize)]
-struct ApiResponse<T: Serialize> {
-    ok: bool,
-    #[serde(flatten)]
-    data: T,
-}
-
-/// Health response.
-#[derive(Debug, Serialize)]
-struct HealthData {
-    status: String,
-    version: String,
-    peers: usize,
-    uptime_secs: u64,
-}
-
-/// Rich runtime status response.
-#[derive(Debug, Serialize)]
-struct StatusData {
-    status: String,
-    version: String,
-    uptime_secs: u64,
-    api_address: String,
-    external_addrs: Vec<String>,
-    agent_id: String,
-    peers: usize,
-    warnings: Vec<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Direct messaging request / response types
-// ---------------------------------------------------------------------------
 
 /// POST /agents/connect request body.
 #[derive(Debug, Deserialize)]
@@ -1984,21 +1951,6 @@ pub async fn list_instances() -> Result<()> {
     Ok(())
 }
 
-/// POST /shutdown — trigger graceful daemon shutdown.
-async fn shutdown_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    tracing::info!("Shutdown requested via API");
-    let _ = state.shutdown_notify.send(true);
-    let _ = state.shutdown_tx.send(()).await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"ok": true, "message": "shutting down"})),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// File transfer endpoints
-// ---------------------------------------------------------------------------
-
 fn file_transfer_now() -> (u64, u64) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3083,106 +3035,6 @@ async fn update_skill_if_changed(manifest: &ReleaseManifest, data_dir: &std::pat
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
-
-/// GET /health
-async fn health(State(state): State<Arc<AppState>>) -> Json<ApiResponse<HealthData>> {
-    let peers = state.agent.peers().await.map(|p| p.len()).unwrap_or(0);
-
-    Json(ApiResponse {
-        ok: true,
-        data: HealthData {
-            status: "healthy".to_string(),
-            version: x0x::VERSION.to_string(),
-            peers,
-            uptime_secs: state.start_time.elapsed().as_secs(),
-        },
-    })
-}
-
-/// GET /status — rich runtime status with connectivity state machine.
-async fn status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<StatusData>> {
-    let uptime_secs = state.start_time.elapsed().as_secs();
-    let mut warnings = Vec::new();
-
-    let peers = match state.agent.peers().await {
-        Ok(peer_list) => peer_list.len(),
-        Err(err) => {
-            warnings.push(format!("failed to query peers: {err}"));
-            0
-        }
-    };
-
-    // Get external addresses: ant-quic observed + local IPv4/IPv6 discovery.
-    let mut external_addrs = Vec::new();
-    if let Some(network) = state.agent.network() {
-        if let Some(ns) = network.node_status().await {
-            external_addrs = ns.external_addrs.iter().map(|a| a.to_string()).collect();
-
-            let port = ns.local_addr.port();
-
-            // Discover global IPv4 via UDP socket trick (no data sent).
-            if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                if sock.connect("8.8.8.8:80").is_ok() {
-                    if let Ok(local) = sock.local_addr() {
-                        if let std::net::IpAddr::V4(v4) = local.ip() {
-                            if !v4.is_loopback() && !v4.is_unspecified() {
-                                let addr_str = format!("{v4}:{port}");
-                                if !external_addrs.contains(&addr_str) {
-                                    external_addrs.push(addr_str);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Discover global IPv6 via UDP socket trick.
-            if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
-                if sock.connect("[2001:4860:4860::8888]:80").is_ok() {
-                    if let Ok(local) = sock.local_addr() {
-                        if let std::net::IpAddr::V6(v6) = local.ip() {
-                            let segs = v6.segments();
-                            let is_global = (segs[0] & 0xffc0) != 0xfe80
-                                && (segs[0] & 0xff00) != 0xfd00
-                                && !v6.is_loopback();
-                            if is_global {
-                                let addr_str = format!("[{v6}]:{port}");
-                                if !external_addrs.contains(&addr_str) {
-                                    external_addrs.push(addr_str);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let connectivity = if !warnings.is_empty() {
-        "degraded"
-    } else if peers > 0 {
-        "connected"
-    } else if uptime_secs < 45 {
-        "connecting"
-    } else {
-        "isolated"
-    }
-    .to_string();
-
-    Json(ApiResponse {
-        ok: true,
-        data: StatusData {
-            status: connectivity,
-            version: x0x::VERSION.to_string(),
-            uptime_secs,
-            api_address: state.api_address.to_string(),
-            external_addrs,
-            agent_id: hex::encode(state.agent.agent_id().as_bytes()),
-            peers,
-            warnings,
-        },
-    })
-}
 
 /// GET /network/status — NAT traversal diagnostics and connection stats.
 async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -17271,29 +17123,6 @@ async fn create_mls_welcome(
 
 // ---------------------------------------------------------------------------
 // Constitution handlers
-// ---------------------------------------------------------------------------
-
-/// GET /constitution — returns the raw markdown text.
-async fn get_constitution() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("content-type", "text/markdown; charset=utf-8")],
-        x0x::constitution::CONSTITUTION_MD,
-    )
-}
-
-/// GET /constitution/json — returns structured JSON with version metadata.
-async fn get_constitution_json() -> impl IntoResponse {
-    Json(serde_json::json!({
-        "ok": true,
-        "version": x0x::constitution::CONSTITUTION_VERSION,
-        "status": x0x::constitution::CONSTITUTION_STATUS,
-        "content": x0x::constitution::CONSTITUTION_MD,
-    }))
-}
-
-// ---------------------------------------------------------------------------
-// Upgrade check handler
 // ---------------------------------------------------------------------------
 
 /// GET /upgrade — check for available updates.
