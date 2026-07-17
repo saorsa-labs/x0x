@@ -12,10 +12,12 @@
 //!   identity gate), writes the `ForwardHeader`, waits for the peer's
 //!   response, and on `connected` bridges the two with `tokio::io::copy`.
 //! - **Inbound (the peer's accept side — security-critical):** consumes
-//!   `ForwardV1` streams from [`crate::Agent::next_incoming_stream`], reads
+//!   `ForwardV1`/`ForwardV2` streams from its registered protocol acceptors
+//!   ([`crate::Agent::register_stream_acceptor`]), reads
 //!   the header, and calls [`crate::connect::evaluate_connect_gate`] BEFORE
 //!   any `TcpStream::connect`. The stream already cleared the T1 identity
-//!   gate (verified + trust `Accept` + not revoked), so the connect gate is
+//!   gate (verified + trust `Accept` + not revoked) and the stream-layer
+//!   connect-ACL pair gate, so the connect gate is
 //!   passed `verified=true, trust=Some(Accept)`; its job is the ACL
 //!   target-match + loopback re-check. The gate checks **every** agent on
 //!   the peer machine (the QUIC transport authenticates the machine, not
@@ -1099,10 +1101,13 @@ struct ForwardEntry {
     cancel: CancellationToken,
 }
 
-/// Owns the inbound forward consumer + the outbound local listeners.
+/// Owns the inbound forward consumers + the outbound local listeners.
 ///
-/// The inbound loop is the sole consumer of `ForwardV1` streams surfaced by
-/// [`crate::Agent::next_incoming_stream`]; each is gated by `handle_inbound`
+/// The forwarder is the registered acceptor for the `ForwardV1` and
+/// `ForwardV2` stream protocols
+/// ([`crate::Agent::register_stream_acceptor`]): the accept loop routes
+/// identity-gated, ACL-gated forward streams straight to this service's
+/// bounded acceptor channels, and each is gated again by `handle_inbound`
 /// (resolve → `evaluate_connect_gate` → connect loopback → bridge). Outbound
 /// listeners (`add_forward`) accept local TCP, open a peer stream, write the
 /// `ForwardHeader`, and bridge on `connected`.
@@ -1115,6 +1120,16 @@ pub struct ForwardService {
     /// tear down individual listeners and `list` can return them.
     forwards: std::sync::Mutex<Vec<ForwardEntry>>,
     inbound_token: CancellationToken,
+    /// The forwarder-owned protocol acceptors (`ForwardV1`, `ForwardV2`),
+    /// moved into their consumer loops by `spawn_inbound`. `None` once the
+    /// consumers are running (or after shutdown, when dropping the loops'
+    /// acceptor handles deregisters them).
+    inbound_acceptors: std::sync::Mutex<
+        Option<(
+            crate::streams::StreamAcceptor,
+            crate::streams::StreamAcceptor,
+        )>,
+    >,
     /// FIX 3: global + per-peer concurrency caps. Admission requires a global
     /// permit (held for the stream's lifetime) AND a per-peer slot; a stream
     /// beyond either cap is reset + counted rather than spawned unbounded.
@@ -1204,26 +1219,40 @@ fn try_peer_slot(
 impl ForwardService {
     /// Construct a forwarder over a loaded connect policy + its diagnostics.
     ///
+    /// Registers the forwarder as the single acceptor for the `ForwardV1` and
+    /// `ForwardV2` stream protocols ([`crate::Agent::register_stream_acceptor`])
+    /// — inbound forward streams are routed to this service by the accept
+    /// loop, never through a shared demux.
+    ///
     /// `require_attestation` (default `true`) denies inbound ForwardV1 streams
     /// and gates the outbound V1 fallback — set `false` for mixed-version
     /// deployments (#204 must-fix 1).
-    #[must_use]
+    ///
+    /// # Errors
+    /// [`NetworkError::StreamAcceptorConflict`] if another consumer already
+    /// owns one of the forward protocols on this agent (a second
+    /// `ForwardService` on the same agent is refused).
     pub fn new(
         agent: Arc<crate::Agent>,
         policy: Arc<ConnectPolicy>,
         connect_diag: Arc<ConnectDiagnostics>,
         require_attestation: bool,
-    ) -> Self {
+    ) -> NetworkResult<Self> {
+        let acceptor_v1 =
+            agent.register_stream_acceptor(crate::streams::StreamProtocol::ForwardV1)?;
+        let acceptor_v2 =
+            agent.register_stream_acceptor(crate::streams::StreamProtocol::ForwardV2)?;
         let revocation_set = agent.revocation_set();
         let discovery_cache = agent.identity_discovery_cache();
         let contact_store = agent.contact_store();
-        Self {
+        Ok(Self {
             agent,
             policy,
             connect_diag,
             fwd_diag: Arc::new(ForwardDiagnostics::default()),
             forwards: std::sync::Mutex::new(Vec::new()),
             inbound_token: CancellationToken::new(),
+            inbound_acceptors: std::sync::Mutex::new(Some((acceptor_v1, acceptor_v2))),
             inbound_permits: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_STREAMS)),
             outbound_permits: Arc::new(tokio::sync::Semaphore::new(MAX_OUTBOUND_STREAMS)),
             per_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1231,7 +1260,7 @@ impl ForwardService {
             discovery_cache,
             contact_store,
             require_attestation,
-        }
+        })
     }
 
     /// Forwarder-owned diagnostics (connect-failed + active-stream counters).
@@ -1254,67 +1283,84 @@ impl ForwardService {
         admit_to(permits, &self.per_peer, peer)
     }
 
-    /// Start the inbound consumer loop. Spawns a task that surfaces
-    /// `ForwardV1` streams to `handle_inbound`. Returns immediately.
+    /// Start the inbound consumer loops — one per registered forward-protocol
+    /// acceptor (`ForwardV1`, `ForwardV2`). Idempotent: a second call finds
+    /// the acceptors already moved into their loops and returns without
+    /// spawning duplicates. Returns immediately.
     pub fn spawn_inbound(self: &Arc<Self>) {
+        let acceptors = self
+            .inbound_acceptors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some((acceptor_v1, acceptor_v2)) = acceptors else {
+            tracing::debug!(
+                target: "x0x::forward",
+                "inbound forward consumers already started — ignoring duplicate spawn"
+            );
+            return;
+        };
+        self.spawn_acceptor_loop(acceptor_v1);
+        self.spawn_acceptor_loop(acceptor_v2);
+    }
+
+    /// Drain one protocol acceptor until shutdown or accept-loop stop,
+    /// handing each surfaced stream to [`Self::spawn_stream_handler`].
+    fn spawn_acceptor_loop(self: &Arc<Self>, mut acceptor: crate::streams::StreamAcceptor) {
         let this = Arc::clone(self);
         let token = self.inbound_token.clone();
         tokio::spawn(async move {
-            tracing::info!(target: "x0x::forward", "inbound forward consumer started");
+            tracing::info!(
+                target: "x0x::forward",
+                protocol = ?acceptor.protocol(),
+                "inbound forward consumer started"
+            );
             loop {
                 let stream = tokio::select! {
                     _ = token.cancelled() => break,
-                    s = this.agent.next_incoming_stream() => match s {
+                    s = acceptor.next() => match s {
                         Some(s) => s,
                         None => break,
                     },
                 };
-                if !matches!(
-                    stream.protocol(),
-                    crate::streams::StreamProtocol::ForwardV1
-                        | crate::streams::StreamProtocol::ForwardV2
-                ) {
-                    // T5 (SOCKS5) owns 0x02; drop non-forward streams.
-                    tracing::debug!(
-                        target: "x0x::forward",
-                        protocol = ?stream.protocol(),
-                        "non-forward inbound stream — not handled by the forwarder"
-                    );
-                    continue;
-                }
-                // FIX 3: cap admission before spawning. Over-cap streams are
-                // reset (dropped) + counted rather than spawning unbounded.
-                let peer_agent = stream.agent();
-                let admission = match this.admit(peer_agent, true) {
-                    Some(a) => a,
-                    None => {
-                        this.fwd_diag.record_over_cap();
-                        tracing::info!(
-                            target: "x0x::forward",
-                            agent = %hex::encode(peer_agent.as_bytes()),
-                            "inbound forward refused: concurrency cap reached — resetting"
-                        );
-                        continue;
-                    }
-                };
-                let this = Arc::clone(&this);
-                tokio::spawn(async move {
-                    let _admission = admission;
-                    this.fwd_diag.enter_stream();
-                    let _leave = StreamLeaveGuard(Arc::clone(&this.fwd_diag));
-                    let inbound_ctx = InboundCtx {
-                        policy: Arc::clone(&this.policy),
-                        connect_diag: Arc::clone(&this.connect_diag),
-                        fwd_diag: Arc::clone(&this.fwd_diag),
-                        revocation_set: Arc::clone(&this.revocation_set),
-                        discovery_cache: Arc::clone(&this.discovery_cache),
-                        contact_store: Arc::clone(&this.contact_store),
-                        own_machine_id: this.agent.machine_id(),
-                        require_attestation: this.require_attestation,
-                    };
-                    handle_inbound(stream, &inbound_ctx).await;
-                });
+                this.spawn_stream_handler(stream);
             }
+        });
+    }
+
+    /// Admit one inbound forward stream (FIX 3 concurrency caps) and spawn
+    /// its `handle_inbound` task. Over-cap streams are reset (dropped) +
+    /// counted rather than spawning unbounded.
+    fn spawn_stream_handler(self: &Arc<Self>, stream: PeerStream) {
+        let peer_agent = stream.agent();
+        let admission = match self.admit(peer_agent, true) {
+            Some(a) => a,
+            None => {
+                self.fwd_diag.record_over_cap();
+                tracing::info!(
+                    target: "x0x::forward",
+                    agent = %hex::encode(peer_agent.as_bytes()),
+                    "inbound forward refused: concurrency cap reached — resetting"
+                );
+                return;
+            }
+        };
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let _admission = admission;
+            this.fwd_diag.enter_stream();
+            let _leave = StreamLeaveGuard(Arc::clone(&this.fwd_diag));
+            let inbound_ctx = InboundCtx {
+                policy: Arc::clone(&this.policy),
+                connect_diag: Arc::clone(&this.connect_diag),
+                fwd_diag: Arc::clone(&this.fwd_diag),
+                revocation_set: Arc::clone(&this.revocation_set),
+                discovery_cache: Arc::clone(&this.discovery_cache),
+                contact_store: Arc::clone(&this.contact_store),
+                own_machine_id: this.agent.machine_id(),
+                require_attestation: this.require_attestation,
+            };
+            handle_inbound(stream, &inbound_ctx).await;
         });
     }
     /// Register a local forward: bind `local_addr`, and for each accepted TCP
