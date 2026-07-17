@@ -131,11 +131,51 @@ enum KvSyncMessage {
         /// convergence gate for checkpoint-bearing stores.
         checkpoint_seq: Option<u64>,
     },
+    /// A holder's digest-committed declaration that it has answered a
+    /// `StateRequest` (issue #240): `digest` commits to the FULL served
+    /// entry set (see `served_content_digest`), so a requester can verify
+    /// "served us, completely" against its OWN state instead of trusting
+    /// that the full delta and the marker both arrived (the v1 cross-topic
+    /// loss window). A requester stops only when its local digest matches a
+    /// declared digest — a lost full delta leaves the local digest
+    /// different, so it keeps asking.
+    ///
+    /// Empty holders (owner or not) declare the digest of the empty set,
+    /// which any empty requester can compute locally — authoritative
+    /// emptiness without an owner, terminating the genuinely-empty chatter
+    /// tail (v1 behavior for old peers is unchanged: only the OWNER declares
+    /// emptiness there). Because the digest is self-verifying, an empty
+    /// declaration needs no full-delta broadcast to witness.
+    ///
+    /// Wire compatibility: additive variant, same precedent as
+    /// `OwnerAnnounce`/`StateServed` — older peers fail to deserialize it
+    /// and skip the message; new peers treat v1 markers as weaker evidence
+    /// when no v2 digest has been seen. The marker rides along with the
+    /// full-state broadcast (never separately) when there is state to serve.
+    StateServedV2 {
+        /// The declaring holder (receivers skip their own echo).
+        responder: PeerId,
+        /// Canonical BLAKE3 digest over the served entry set.
+        digest: [u8; 32],
+        /// Number of entries in the served set — a cheap shape check for the
+        /// verified full-replace adopt path (and useful in logs).
+        entry_count: u32,
+    },
 }
 
-/// Aggregated `StateServed` evidence observed by one replica's responder
-/// loop, consumed by its bootstrap requester to decide convergence.
-#[derive(Debug, Default, Clone, Copy)]
+/// One responder's latest v2 digest declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServedState {
+    /// The declared content digest.
+    digest: [u8; 32],
+    /// The declared number of entries.
+    entry_count: u32,
+}
+
+/// Aggregated `StateServed`/`StateServedV2` evidence observed by one
+/// replica's responder loop, consumed by its bootstrap requester to decide
+/// convergence.
+#[derive(Debug, Default, Clone)]
 struct ServedEvidence {
     /// A holder declared non-empty state.
     saw_nonempty: bool,
@@ -143,6 +183,21 @@ struct ServedEvidence {
     saw_owner_empty: bool,
     /// Highest checkpoint sequence any holder declared.
     max_checkpoint_seq: u64,
+    /// Latest digest declaration per responder (bounded by mesh size — a
+    /// responder's newer declaration REPLACES its older one, so a replayed
+    /// stale serve can never roll a verified full-replace adopt backwards).
+    digests: std::collections::HashMap<PeerId, ServedState>,
+}
+
+/// Disarms the bootstrap-active flag on ANY requester exit path (converged,
+/// silenced, cancelled, torn down) so the listener's digest-verified
+/// full-replace adopt can never fire outside the bootstrap window.
+struct BootstrapGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BootstrapGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Convergence rule for the bootstrap tail (pure for unit-testing).
@@ -150,15 +205,32 @@ struct ServedEvidence {
 /// Strongest available evidence wins:
 /// - a declared checkpoint sequence must be matched by this replica's own
 ///   high-water mark (exact, survives partial/lost responses);
-/// - otherwise a declared non-empty holder requires local non-emptiness
-///   (best-effort — documented limit for checkpoint-less state);
-/// - otherwise only an owner-declared-empty store counts as converged.
+/// - otherwise, when any v2 digest declarations exist, the local digest
+///   must match one of them — with the data-bearing-claim-wins rule: if any
+///   declaration is non-empty, only a non-empty match converges (an empty
+///   holder's declaration must not retire a requester while a full holder
+///   advertised content);
+/// - otherwise (only v1 markers seen — old peers) the legacy weak rules:
+///   declared non-empty requires local non-emptiness; emptiness counts only
+///   when the owner declared it.
 ///
 /// No evidence at all (`ServedEvidence::default()`) is NEVER convergence.
-fn bootstrap_converged(ev: ServedEvidence, is_empty: bool, highest_checkpoint_seq: u64) -> bool {
+fn bootstrap_converged(
+    ev: &ServedEvidence,
+    is_empty: bool,
+    highest_checkpoint_seq: u64,
+    local_digest: [u8; 32],
+) -> bool {
     if ev.max_checkpoint_seq > 0 {
-        highest_checkpoint_seq >= ev.max_checkpoint_seq
-    } else if ev.saw_nonempty {
+        return highest_checkpoint_seq >= ev.max_checkpoint_seq;
+    }
+    if !ev.digests.is_empty() {
+        let any_nonempty = ev.digests.values().any(|d| d.entry_count > 0);
+        return ev.digests.values().any(|d| {
+            d.digest == local_digest && (d.entry_count > 0 || !any_nonempty)
+        });
+    }
+    if ev.saw_nonempty {
         !is_empty
     } else {
         ev.saw_owner_empty
@@ -413,6 +485,19 @@ impl KvStoreSync {
 
         let loop_persist_ctx = persist_ctx.clone();
         let listener_cancel = self.cancel.clone();
+        // StateServed evidence: written by the responder loop (which owns
+        // the side-topic subscription), read by the listener (verified
+        // full-replace adopt, issue #240) and the bootstrap requester
+        // (convergence). Created BEFORE the loops so all three share it.
+        let served_evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
+        // Armed only while the bootstrap requester runs: the verified
+        // full-replace adopt fires exclusively in that window — a converged
+        // replica must never let a divergent holder's serve truncate state
+        // it legitimately holds.
+        let bootstrap_active =
+            Arc::new(std::sync::atomic::AtomicBool::new(bootstrap_needed));
+        let listener_served = Arc::clone(&served_evidence);
+        let listener_bootstrap_active = Arc::clone(&bootstrap_active);
         spawn(Box::pin(async move {
             loop {
                 let msg = tokio::select! {
@@ -446,7 +531,55 @@ impl KvStoreSync {
                             // The gossip V2 wire format includes a verified AgentId.
                             let writer = msg.sender.as_ref();
                             match s.merge_delta(&delta, peer_id, writer) {
-                                Ok(()) => true,
+                                Ok(()) => {
+                                    // Digest-verified full-replace adopt
+                                    // (issue #240, checkpoint-less deletion
+                                    // cold-sync): while bootstrapping, when
+                                    // the sender's latest v2 declaration
+                                    // matches this delta's served content
+                                    // (digest AND entry count), the delta IS
+                                    // that holder's complete state — prune
+                                    // local keys it does not carry. Gated on
+                                    // the sender being an AUTHORIZED writer:
+                                    // merge_delta silently ignores
+                                    // unauthorized deltas, and the prune
+                                    // must not apply what the merge would
+                                    // not. Without verification any holder
+                                    // could truncate local state at will.
+                                    if listener_bootstrap_active
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        let declared = listener_served
+                                            .lock()
+                                            .unwrap_or_else(
+                                                std::sync::PoisonError::into_inner,
+                                            )
+                                            .digests
+                                            .get(&peer_id)
+                                            .copied();
+                                        if let Some(declared) = declared {
+                                            let authorized =
+                                                writer.is_some_and(|w| s.is_authorized(w));
+                                            if authorized
+                                                && delta.added.len()
+                                                    == declared.entry_count as usize
+                                                && delta
+                                                    .served_digest(s.id())
+                                                    .is_some_and(|dg| dg == declared.digest)
+                                            {
+                                                let pruned = s.prune_to_served_set(&delta);
+                                                if pruned > 0 {
+                                                    tracing::info!(
+                                                        "pruned {pruned} stale key(s) after \
+                                                         digest-verified full serve for store {}",
+                                                        s.id()
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    true
+                                }
                                 Err(e) => {
                                     tracing::warn!("Failed to merge KvStore delta: {e}");
                                     false
@@ -492,10 +625,6 @@ impl KvStoreSync {
         let sync_topic = self.state_sync_topic();
         let local_peer_id = self.local_peer_id;
         let local_agent_id = self.local_agent_id;
-        // StateServed evidence: written by the responder loop (which owns
-        // the side-topic subscription), read by the bootstrap requester to
-        // decide convergence.
-        let served_evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
         let responder_served = Arc::clone(&served_evidence);
         let responder_cancel = self.cancel.clone();
         spawn(Box::pin(async move {
@@ -579,7 +708,7 @@ impl KvStoreSync {
                                 < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
                         });
                         // Snapshot state once for the full-delta and the
-                        // StateServed marker below. A full response is
+                        // StateServed markers below. A full response is
                         // served when the store is non-empty, OR when it is
                         // empty but holds an owner checkpoint: the
                         // checkpoint-adopt merge path is a full REPLACE
@@ -588,8 +717,11 @@ impl KvStoreSync {
                         // deleted-to-empty store cold-syncs to a stale
                         // replica (round-3 review — an empty owner must not
                         // be silent while stale holders keep advertising
-                        // obsolete state).
-                        let (full, is_empty, is_owner, checkpoint_seq, has_payload) = {
+                        // obsolete state). The v2 digest is computed over
+                        // the SAME snapshot as the full delta, so the
+                        // declaration always commits to exactly what was
+                        // broadcast.
+                        let (full, is_empty, is_owner, checkpoint_seq, has_payload, served) = {
                             let s = responder_store.read().await;
                             let is_owner =
                                 local_agent_id.is_some() && s.owner() == local_agent_id.as_ref();
@@ -597,9 +729,13 @@ impl KvStoreSync {
                                 (s.highest_checkpoint_seq > 0).then_some(s.highest_checkpoint_seq);
                             let has_payload = !s.is_empty() || s.latest_checkpoint.is_some();
                             let full = (has_payload && !cooled_down).then(|| s.full_delta());
-                            (full, s.is_empty(), is_owner, cp, has_payload)
+                            let served = (
+                                s.served_digest(),
+                                s.checkpoint_pairs().len() as u32,
+                            );
+                            (full, s.is_empty(), is_owner, cp, has_payload, served)
                         };
-                        let mut marker = None;
+                        let mut markers: Vec<KvSyncMessage> = Vec::new();
                         if let Some(full) = full {
                             if let Ok(serialized) = encode_delta(local_peer_id, &full) {
                                 if let Err(e) = responder_pubsub
@@ -612,26 +748,49 @@ impl KvStoreSync {
                                     tracing::warn!("KvStore state-response publish failed: {e}");
                                 } else {
                                     last_full_response = Some(tokio::time::Instant::now());
-                                    marker = Some(KvSyncMessage::StateServed {
+                                    markers.push(KvSyncMessage::StateServed {
                                         responder: local_peer_id,
                                         empty: is_empty,
                                         checkpoint_seq,
                                     });
+                                    // The v2 marker rides along with the
+                                    // broadcast it commits to — never
+                                    // separately (response-storm damping,
+                                    // issue #240).
+                                    markers.push(KvSyncMessage::StateServedV2 {
+                                        responder: local_peer_id,
+                                        digest: served.0,
+                                        entry_count: served.1,
+                                    });
                                 }
                             }
-                        } else if !has_payload && is_owner {
-                            // Checkpoint-less empty owner: nothing to serve,
-                            // and only the OWNER may declare emptiness — an
-                            // empty non-owner replica stays silent so
-                            // bootstrapping replicas can never talk each
-                            // other into a false "converged empty".
-                            marker = Some(KvSyncMessage::StateServed {
+                        } else if !has_payload {
+                            // Checkpoint-less empty. The v2 digest of the
+                            // empty set is universally computable, so ANY
+                            // empty holder may declare it — an empty
+                            // requester verifies locally and stops (issue
+                            // #240; no broadcast to witness because there
+                            // is nothing to serve).
+                            markers.push(KvSyncMessage::StateServedV2 {
                                 responder: local_peer_id,
-                                empty: true,
-                                checkpoint_seq: None,
+                                digest: served.0,
+                                entry_count: 0,
                             });
+                            if is_owner {
+                                // v1 behavior for older peers is unchanged:
+                                // only the OWNER declares emptiness — an
+                                // empty non-owner replica stays silent on
+                                // v1 so bootstrapping replicas can never
+                                // talk each other into a false "converged
+                                // empty".
+                                markers.push(KvSyncMessage::StateServed {
+                                    responder: local_peer_id,
+                                    empty: true,
+                                    checkpoint_seq: None,
+                                });
+                            }
                         }
-                        if let Some(marker) = marker {
+                        for marker in markers {
                             match bincode::serialize(&marker) {
                                 Ok(serialized) => {
                                     if let Err(e) = responder_pubsub
@@ -697,6 +856,35 @@ impl KvStoreSync {
                         if let Some(seq) = checkpoint_seq.filter(|_| owner_verified) {
                             ev.max_checkpoint_seq = ev.max_checkpoint_seq.max(seq);
                         }
+                    }
+                    KvSyncMessage::StateServedV2 {
+                        responder,
+                        digest,
+                        entry_count,
+                    } => {
+                        if responder == local_peer_id {
+                            continue; // our own marker echoed back
+                        }
+                        // Trust note: the digest is SELF-VERIFYING — a
+                        // forged declaration can only match local state
+                        // that actually equals the declared content, so a
+                        // forgery's worst case is the requester keeps
+                        // asking (the same bound as a forged v1 marker).
+                        // The verified full-replace adopt additionally
+                        // requires the full-delta SENDER to be an
+                        // authorized writer (see the listener), so a
+                        // marker alone can never truncate anything.
+                        responder_served
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .digests
+                            .insert(
+                                responder,
+                                ServedState {
+                                    digest,
+                                    entry_count,
+                                },
+                            );
                     }
                     KvSyncMessage::OwnerAnnounce {
                         owner,
@@ -783,7 +971,12 @@ impl KvStoreSync {
             let stopped = Arc::clone(&self.stopped);
             let requester_cancel = self.cancel.clone();
             let requester_served = Arc::clone(&served_evidence);
+            let requester_bootstrap_active = Arc::clone(&bootstrap_active);
             spawn(Box::pin(async move {
+                // Disarms the adopt window on ANY exit (converged, silenced,
+                // cancelled, torn down) — the listener's verified
+                // full-replace adopt must never fire outside bootstrap.
+                let _guard = BootstrapGuard(requester_bootstrap_active);
                 for (attempt, delay_secs) in state_request_delays().enumerate() {
                     tokio::select! {
                         // cancel_sync tears down every loop promptly, even
@@ -801,19 +994,23 @@ impl KvStoreSync {
                     // state (`bootstrap_converged`) — NOT mere non-emptiness,
                     // which a single incremental delta can fake while the
                     // full historical state is still missing (round-2
-                    // review).
+                    // review). v2 digest evidence makes the check exact for
+                    // checkpoint-less state (issue #240): the requester
+                    // stops only when its OWN content digest matches a
+                    // holder's declaration.
                     if attempt >= STATE_REQUEST_RETRY_SECS.len() {
                         let Some(store) = requester_store.upgrade() else {
                             return; // sync torn down — nothing left to bootstrap
                         };
-                        let ev = *requester_served
+                        let ev = requester_served
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let (is_empty, cp_hwm) = {
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        let (is_empty, cp_hwm, local_digest) = {
                             let s = store.read().await;
-                            (s.is_empty(), s.highest_checkpoint_seq)
+                            (s.is_empty(), s.highest_checkpoint_seq, s.served_digest())
                         };
-                        if bootstrap_converged(ev, is_empty, cp_hwm) {
+                        if bootstrap_converged(&ev, is_empty, cp_hwm, local_digest) {
                             return; // a holder served us and local state matches
                         }
                     }
@@ -1533,50 +1730,101 @@ mod tests {
     /// correctly — checkpoint match is exact; declared-non-empty requires
     /// local state; emptiness counts only when the owner declared it; and
     /// NO evidence is NEVER convergence (a replica that heard nothing keeps
-    /// asking, whatever its local state looks like).
+    /// asking, whatever its local state looks like). Issue #240 adds the
+    /// digest gate: when v2 declarations exist they OUTRANK the weak v1
+    /// rules, and a data-bearing declaration outranks an empty one.
     #[test]
     fn bootstrap_convergence_rule() {
+        const D1: [u8; 32] = [1u8; 32];
+        const D2: [u8; 32] = [2u8; 32];
+        const D_EMPTY: [u8; 32] = [9u8; 32];
         let none = ServedEvidence::default();
         // No evidence: never converged, empty or not.
-        assert!(!bootstrap_converged(none, true, 0));
-        assert!(!bootstrap_converged(none, false, 9));
+        assert!(!bootstrap_converged(&none, true, 0, D1));
+        assert!(!bootstrap_converged(&none, false, 9, D1));
 
         // Checkpoint evidence is exact: local HWM must reach it.
         let cp = ServedEvidence {
             saw_nonempty: true,
             saw_owner_empty: false,
             max_checkpoint_seq: 5,
+            digests: std::collections::HashMap::new(),
         };
-        assert!(!bootstrap_converged(cp, false, 4), "behind the served HWM");
-        assert!(bootstrap_converged(cp, false, 5));
-        assert!(bootstrap_converged(cp, false, 7));
+        assert!(!bootstrap_converged(&cp, false, 4, D1), "behind the served HWM");
+        assert!(bootstrap_converged(&cp, false, 5, D1));
+        assert!(bootstrap_converged(&cp, false, 7, D1));
 
         // Non-empty holder, no checkpoint: local non-emptiness required.
         let nonempty = ServedEvidence {
             saw_nonempty: true,
             saw_owner_empty: false,
             max_checkpoint_seq: 0,
+            digests: std::collections::HashMap::new(),
         };
-        assert!(!bootstrap_converged(nonempty, true, 0));
-        assert!(bootstrap_converged(nonempty, false, 0));
+        assert!(!bootstrap_converged(&nonempty, true, 0, D1));
+        assert!(bootstrap_converged(&nonempty, false, 0, D1));
 
         // Owner-declared empty (and nothing stronger): converged even empty.
         let owner_empty = ServedEvidence {
             saw_nonempty: false,
             saw_owner_empty: true,
             max_checkpoint_seq: 0,
+            digests: std::collections::HashMap::new(),
         };
-        assert!(bootstrap_converged(owner_empty, true, 0));
+        assert!(bootstrap_converged(&owner_empty, true, 0, D1));
         // A non-empty holder claim outranks owner-empty when both were seen.
         let mixed = ServedEvidence {
             saw_nonempty: true,
             saw_owner_empty: true,
             max_checkpoint_seq: 0,
+            digests: std::collections::HashMap::new(),
         };
         assert!(
-            !bootstrap_converged(mixed, true, 0),
+            !bootstrap_converged(&mixed, true, 0, D1),
             "divergent holders: the data-bearing claim must win, keep asking"
         );
+
+        // ---- v2 digest evidence (issue #240) ----
+        let digest_ev = |decls: &[(&[u8; 32], u32)]| ServedEvidence {
+            saw_nonempty: false,
+            saw_owner_empty: false,
+            max_checkpoint_seq: 0,
+            digests: decls
+                .iter()
+                .enumerate()
+                .map(|(i, (d, c))| {
+                    (
+                        peer(i as u8 + 10),
+                        ServedState {
+                            digest: **d,
+                            entry_count: *c,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        // Match stops: local digest equals a declared non-empty digest.
+        let ev = digest_ev(&[(&D1, 3)]);
+        assert!(bootstrap_converged(&ev, false, 0, D1));
+        // Mismatch keeps asking — the lost-full-delta window is closed.
+        assert!(!bootstrap_converged(&ev, false, 0, D2));
+        // Weak v1 evidence must NOT rescue a digest mismatch.
+        let mut ev_v1_too = digest_ev(&[(&D1, 3)]);
+        ev_v1_too.saw_nonempty = true;
+        assert!(
+            !bootstrap_converged(&ev_v1_too, false, 0, D2),
+            "v2 declarations outrank weak v1 evidence"
+        );
+        // Empty-holder declarations converge an empty requester (and ONLY
+        // when every declaration is empty).
+        let ev_empty = digest_ev(&[(&D_EMPTY, 0)]);
+        assert!(bootstrap_converged(&ev_empty, true, 0, D_EMPTY));
+        let ev_divergent = digest_ev(&[(&D_EMPTY, 0), (&D1, 2)]);
+        assert!(
+            !bootstrap_converged(&ev_divergent, true, 0, D_EMPTY),
+            "a data-bearing declaration outranks the empty one — keep asking"
+        );
+        assert!(bootstrap_converged(&ev_divergent, false, 0, D1));
     }
 
     /// WHY (round-2 review — P1: restored non-empty replicas still became
@@ -2000,6 +2248,577 @@ mod tests {
             policy_ok,
             "the owner announce must refresh the replica policy \
              (transient `signed` misreport, issue #238)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #240: digest-verified convergence evidence
+    // ------------------------------------------------------------------
+
+    /// Drain every side-topic `StateRequest` from `from` already queued on
+    /// `probe` without blocking (the 1ms virtual timeout yields immediately
+    /// under the paused clock when the queue is empty).
+    async fn drain_state_requests(probe: &mut crate::gossip::Subscription, from: PeerId) -> usize {
+        let mut n = 0;
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(1), probe.recv()).await
+        {
+            if let Ok(KvSyncMessage::StateRequest { requester }) =
+                bincode::deserialize::<KvSyncMessage>(&msg.payload)
+            {
+                if requester == from {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// WHY: the v2 digest commits to the served entry set so a requester
+    /// can verify completeness LOCALLY. It must be deterministic across
+    /// replicas, sensitive to content, insensitive to the (placeholder)
+    /// name, and bound to the store id; a full delta's carried digest must
+    /// equal the serving store's local digest.
+    #[test]
+    fn served_digest_is_deterministic_content_bound_and_name_independent() {
+        let owner = agent(1);
+        let mut a = KvStore::new(
+            store_id(1),
+            "alpha".to_string(),
+            owner,
+            AccessPolicy::Signed,
+        );
+        let mut b = KvStore::new(
+            store_id(1),
+            "beta".to_string(),
+            owner,
+            AccessPolicy::Signed,
+        );
+        // Empty stores: same id ⇒ same digest; the name is not content.
+        assert_eq!(a.served_digest(), b.served_digest());
+        let c = KvStore::new(
+            store_id(2),
+            "alpha".to_string(),
+            owner,
+            AccessPolicy::Signed,
+        );
+        assert_ne!(
+            a.served_digest(),
+            c.served_digest(),
+            "the store id binds the digest (cross-store replay defense)"
+        );
+
+        // The same entry bytes in both stores ⇒ the same digest, however
+        // they got there (writer tags are transport, not content).
+        let entry = KvEntry::new("k".to_string(), b"v".to_vec(), "text/plain".to_string());
+        let mut d1 = KvStoreDelta::new(1);
+        d1.added.insert("k".to_string(), (entry, (peer(1), 1)));
+        a.merge_delta(&d1, peer(1), Some(&owner)).expect("merge a");
+        b.merge_delta(&d1, peer(1), Some(&owner)).expect("merge b");
+        assert_eq!(a.served_digest(), b.served_digest());
+
+        // A delta's served digest exists only for full-state shapes
+        // (name_update present), and then equals the local digest.
+        assert_eq!(
+            d1.served_digest(&store_id(1)),
+            None,
+            "incremental shape must not impersonate a full serve"
+        );
+        d1.name_update = Some(a.name_register().clone());
+        assert_eq!(d1.served_digest(&store_id(1)), Some(a.served_digest()));
+
+        // Different membership ⇒ different digest.
+        let entry2 = KvEntry::new("k2".to_string(), b"w".to_vec(), "text/plain".to_string());
+        let mut d2 = KvStoreDelta::new(2);
+        d2.added.insert("k2".to_string(), (entry2, (peer(1), 2)));
+        b.merge_delta(&d2, peer(1), Some(&owner)).expect("merge b2");
+        assert_ne!(a.served_digest(), b.served_digest());
+    }
+
+    /// WHY (issue #240, residual 1 — the cross-topic loss window): the full
+    /// delta travels on the main topic, its marker on the side topic, with
+    /// no delivery coupling. If the delta is lost while the marker
+    /// survives, the v1 rule stopped a non-empty requester with incomplete
+    /// history. With the v2 digest the requester detects the mismatch
+    /// (local {k2} vs declared {k1,k2}) and keeps asking until the real
+    /// state arrives.
+    #[tokio::test(start_paused = true)]
+    async fn lost_full_delta_with_surviving_marker_keeps_requester_asking() {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-240-lost-broadcast";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        // The full holder state (owner offline for now): {k1, k2}.
+        let mut owned = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner_id,
+            AccessPolicy::Signed,
+        );
+        owned
+            .put("k1".to_string(), b"v1".to_vec(), "text/plain".to_string(), peer(1))
+            .expect("k1");
+        owned
+            .put("k2".to_string(), b"v2".to_vec(), "text/plain".to_string(), peer(1))
+            .expect("k2");
+
+        // The joiner holds only k2 — "one live incremental delta" — with
+        // entry bytes IDENTICAL to the holder's (merged out of the holder's
+        // own full delta), so the post-recovery digests can match exactly.
+        let mut replica = KvStore::new_replica(
+            store_id(1),
+            String::new(),
+            Some(owner_id),
+            crate::kv::store::AnchorChannel::RestParam,
+        );
+        let k2_only = {
+            let full = owned.full_delta();
+            let (key, (entry, tag)) = full
+                .added
+                .iter()
+                .find(|(k, _)| k.as_str() == "k2")
+                .expect("k2 in full delta");
+            let mut d = KvStoreDelta::new(1);
+            d.added.insert(key.clone(), (entry.clone(), *tag));
+            d
+        };
+        replica
+            .merge_delta(&k2_only, peer(1), Some(&owner_id))
+            .expect("seed k2");
+        let joiner = KvStoreSync::new(
+            replica,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+
+        // The loss window: the marker survives, the full delta does not.
+        // Publish ONLY the v2 marker the holder would have sent.
+        let marker = KvSyncMessage::StateServedV2 {
+            responder: peer(1),
+            digest: owned.served_digest(),
+            entry_count: 2,
+        };
+        let bytes = bincode::serialize(&marker).expect("serialize marker");
+        pubsub
+            .publish(side.clone(), bytes::Bytes::from(bytes))
+            .await
+            .expect("publish marker");
+
+        // Well past the front burst the requester must STILL be asking —
+        // its local digest ({k2}) does not match the declaration ({k1,k2}).
+        let mut requests = 0;
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            requests += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert!(
+            requests > 0,
+            "a requester whose full delta was lost must keep asking (digest mismatch)"
+        );
+        assert!(
+            joiner.read().await.get("k1").is_none(),
+            "the lost broadcast never arrived"
+        );
+
+        // The real holder returns: the next serve delivers {k1,k2}, the
+        // local digest then matches the declaration, and the tail stops.
+        let owner_sync = KvStoreSync::new(
+            owned,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner_id),
+        )
+        .expect("owner sync");
+        owner_sync.start().await.expect("start owner");
+
+        let mut recovered = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.get("k1").is_some() {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "the still-alive requester must recover the lost key"
+        );
+
+        // Convergence is terminal: no further requests.
+        tokio::time::sleep(Duration::from_secs(160)).await;
+        drain_state_requests(&mut probe, peer(2)).await;
+        let mut relapse = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            relapse += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert_eq!(relapse, 0, "a digest-matched requester must fall silent");
+    }
+
+    /// WHY (issue #240, residual 2 — deletion cold-sync): a checkpoint-less
+    /// full delta carries only live entries, so a plain merge could never
+    /// delete a stale replica's obsolete keys. The digest-verified
+    /// full-replace adopt closes that: the serve's delta content is bound
+    /// to the holder's declared digest, so pruning local keys it omits is
+    /// safe. A plain v1-era merge leaves the stale key in place (the
+    /// pre-#240 behavior the issue describes).
+    #[tokio::test(start_paused = true)]
+    async fn digest_verified_full_serve_prunes_stale_keys() {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-240-prune-stale";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        // Owner: checkpoint-less, holding only k_live.
+        let mut owned = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner_id,
+            AccessPolicy::Signed,
+        );
+        owned
+            .put(
+                "k_live".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("owner put");
+
+        // Stale replica: k_live (byte-identical, from the owner's own full
+        // delta) PLUS k_stale, an obsolete key the owner deleted while the
+        // replica was away. Started FIRST so its subscriptions are fully
+        // registered before any response can be published (in-process
+        // paused-time harness).
+        let mut replica = KvStore::new_replica(
+            store_id(1),
+            String::new(),
+            Some(owner_id),
+            crate::kv::store::AnchorChannel::Persistence,
+        );
+        let live_only = {
+            let full = owned.full_delta();
+            let (key, (entry, tag)) = full
+                .added
+                .iter()
+                .find(|(k, _)| k.as_str() == "k_live")
+                .expect("k_live in full delta");
+            let mut d = KvStoreDelta::new(1);
+            d.added.insert(key.clone(), (entry.clone(), *tag));
+            d
+        };
+        replica
+            .merge_delta(&live_only, peer(1), Some(&owner_id))
+            .expect("seed k_live");
+        replica
+            .put(
+                "k_stale".to_string(),
+                b"obsolete".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed stale key");
+        let joiner = KvStoreSync::new(
+            replica,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+
+        let owner_sync = KvStoreSync::new(
+            owned,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner_id),
+        )
+        .expect("owner sync");
+        owner_sync.start().await.expect("start owner");
+
+        // The verified adopt must remove the stale key while k_live stays.
+        let mut pruned = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let s = joiner.read().await;
+            if s.get("k_stale").is_none() && s.get("k_live").is_some() {
+                pruned = true;
+                break;
+            }
+        }
+        assert!(
+            pruned,
+            "the digest-verified full serve must prune the stale key \
+             (checkpoint-less deletion cold-sync)"
+        );
+
+        // And convergence follows: local state now equals the declared
+        // digest, so the requester falls silent.
+        tokio::time::sleep(Duration::from_secs(160)).await;
+        drain_state_requests(&mut probe, peer(2)).await;
+        let mut relapse = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            relapse += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert_eq!(relapse, 0, "the requester must stop once the digests match");
+    }
+
+    /// WHY (issue #240, residual 3 — genuinely-empty chatter): the v1 rule
+    /// kept every empty checkpoint-less replica requesting forever (~1
+    /// side-topic message per 5 minutes) because an empty non-owner holder
+    /// had to stay silent. The v2 digest of the empty set is universally
+    /// computable, so an empty holder can now declare authoritative
+    /// emptiness ANY empty requester verifies locally — two empty replicas
+    /// converging on empty is verifiably CORRECT, not false convergence.
+    #[tokio::test(start_paused = true)]
+    async fn empty_holder_v2_marker_terminates_empty_requester() {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-240-empty-silence";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        // Both EMPTY non-owner replicas anchored on the (offline) owner.
+        let joiner = KvStoreSync::new(
+            KvStore::new_replica(
+                store_id(1),
+                String::new(),
+                Some(owner_id),
+                crate::kv::store::AnchorChannel::RestParam,
+            ),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+        let holder = KvStoreSync::new(
+            KvStore::new_replica(
+                store_id(1),
+                String::new(),
+                Some(owner_id),
+                crate::kv::store::AnchorChannel::RestParam,
+            ),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(agent(3)),
+        )
+        .expect("holder sync");
+        holder.start().await.expect("start holder");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+
+        // Warm-up: the front burst fires and the empty holder's v2
+        // declarations arrive; convergence should follow within a few tail
+        // checks.
+        tokio::time::sleep(Duration::from_secs(160)).await;
+        drain_state_requests(&mut probe, peer(2)).await;
+        let mut late = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            late += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert_eq!(
+            late, 0,
+            "an empty holder's verifiable digest must terminate the empty \
+             requester's tail (genuinely-empty stores converge silently)"
+        );
+    }
+
+    /// WHY: wire compatibility is additive — a fleet with only v1 (older)
+    /// responders must behave exactly as before: a v1 marker plus local
+    /// state converges the requester. The v2 machinery must not require
+    /// v2 markers to make progress against old peers.
+    #[tokio::test(start_paused = true)]
+    async fn v1_marker_from_old_peer_still_converges() {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-240-v1-compat";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        let joiner = KvStoreSync::new(
+            KvStore::new_replica(
+                store_id(1),
+                String::new(),
+                Some(owner_id),
+                crate::kv::store::AnchorChannel::RestParam,
+            ),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+
+        // An "old peer" answers a request: full delta on the main topic,
+        // v1 StateServed marker on the side topic — never a v2 marker.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let mut owned = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner_id,
+            AccessPolicy::Signed,
+        );
+        owned
+            .put("k1".to_string(), b"v1".to_vec(), "text/plain".to_string(), peer(1))
+            .expect("k1");
+        let full = owned.full_delta();
+        let encoded = encode_delta(peer(1), &full).expect("encode full");
+        pubsub
+            .publish(topic.to_string(), bytes::Bytes::from(encoded))
+            .await
+            .expect("publish full delta");
+        let marker = KvSyncMessage::StateServed {
+            responder: peer(1),
+            empty: false,
+            checkpoint_seq: None,
+        };
+        let marker_bytes = bincode::serialize(&marker).expect("serialize v1 marker");
+        pubsub
+            .publish(side.clone(), bytes::Bytes::from(marker_bytes))
+            .await
+            .expect("publish v1 marker");
+
+        let mut recovered = false;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.get("k1").is_some() {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered, "the old peer's full delta must merge");
+
+        // Weak-evidence convergence: v1 marker + local state ⇒ the tail stops.
+        tokio::time::sleep(Duration::from_secs(160)).await;
+        drain_state_requests(&mut probe, peer(2)).await;
+        let mut late = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            late += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert_eq!(
+            late, 0,
+            "v1 evidence from an old peer must still converge the requester"
+        );
+    }
+
+    /// WHY: a v2 marker whose digest does not correspond to any state the
+    /// requester can hold (forged or corrupt) must NEVER converge it — the
+    /// digest is self-verifying, so a bad declaration can only delay, never
+    /// cause, convergence. Nor may it wedge later recovery: a genuine
+    /// holder's fresh declaration replaces the bad one (per-responder
+    /// latest-wins).
+    #[tokio::test(start_paused = true)]
+    async fn tampered_digest_is_rejected_and_does_not_wedge_recovery() {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner_id = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let topic = "kv-240-tampered";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+
+        let joiner = KvStoreSync::new(
+            KvStore::new_replica(
+                store_id(1),
+                String::new(),
+                Some(owner_id),
+                crate::kv::store::AnchorChannel::RestParam,
+            ),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(agent(2)),
+        )
+        .expect("joiner sync");
+        joiner.start().await.expect("start joiner");
+        let mut probe = pubsub.subscribe(side.clone()).await;
+
+        // The tampered marker: a random digest no real state can match.
+        let marker = KvSyncMessage::StateServedV2 {
+            responder: peer(1),
+            digest: [0xAB; 32],
+            entry_count: 2,
+        };
+        let bytes = bincode::serialize(&marker).expect("serialize marker");
+        pubsub
+            .publish(side.clone(), bytes::Bytes::from(bytes))
+            .await
+            .expect("publish tampered marker");
+
+        // The requester keeps asking: its (empty) local digest can never
+        // equal the forged declaration.
+        let mut requests = 0;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            requests += drain_state_requests(&mut probe, peer(2)).await;
+        }
+        assert!(
+            requests > 0,
+            "a tampered digest must not converge the requester"
+        );
+        assert!(
+            joiner.read().await.is_empty(),
+            "no state can have been adopted from a forged declaration"
+        );
+
+        // The genuine holder appears; its fresh declaration replaces the
+        // tampered one (per-responder latest-wins) and recovery completes.
+        let mut owned = KvStore::new(
+            store_id(1),
+            "log".to_string(),
+            owner_id,
+            AccessPolicy::Signed,
+        );
+        owned
+            .put("k1".to_string(), b"v1".to_vec(), "text/plain".to_string(), peer(1))
+            .expect("k1");
+        let owner_sync = KvStoreSync::new(
+            owned,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner_id),
+        )
+        .expect("owner sync");
+        owner_sync.start().await.expect("start owner");
+
+        let mut recovered = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if joiner.read().await.get("k1").is_some() {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "a tampered marker must not wedge recovery from a genuine holder"
         );
     }
 }

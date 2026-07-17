@@ -226,6 +226,9 @@ const CHECKPOINT_SIG_DOMAIN: &[u8] = b"x0x.store.checkpoint.sig.v1";
 /// Domain-separation tag for content-root hashing.
 const CHECKPOINT_ROOT_DOMAIN: &[u8] = b"x0x.store.checkpoint.root.v2";
 
+/// Domain-separation tag for served-state digest hashing (issue #240).
+const SERVED_DIGEST_DOMAIN: &[u8] = b"x0x.store.served.digest.v1";
+
 /// Owner-signed content provenance for a store snapshot.
 ///
 /// Decouples "who relays" from "who authored": the signature is content-level
@@ -364,6 +367,37 @@ fn entry_commitment_bytes(outer_key: &str, entry: &KvEntry) -> Vec<u8> {
 fn lp_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
     buf.extend_from_slice(data);
+}
+
+/// Deterministic canonical BLAKE3 digest over the active entry set alone.
+///
+/// This is the content commitment carried by `StateServedV2` markers (issue
+/// #240): a serving holder declares it, and a bootstrapping requester
+/// recomputes it over its OWN state, stopping only when they match. Unlike
+/// [`content_root`] it deliberately EXCLUDES the store name — a fresh joiner
+/// constructs its replica with a placeholder name, so a name-binding digest
+/// could never match (and the name is LWW metadata, not entry history; it
+/// rides every delta anyway). The store id binds the digest to one logical
+/// store, so a marker replayed onto another store's side topic can never
+/// verify. Entries are sorted by outer key and committed with the same
+/// canonical encoding as [`content_root`], so holder and requester agree
+/// byte-for-byte on identical content. The empty set's digest is universally
+/// computable — that is what lets an EMPTY holder declare authoritative
+/// emptiness to an empty requester.
+#[must_use]
+pub(crate) fn served_content_digest(
+    store_id: &KvStoreId,
+    entries: &[(&str, &KvEntry)],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(SERVED_DIGEST_DOMAIN);
+    h.update(store_id.as_bytes());
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (outer_key, entry) in &sorted {
+        h.update(&entry_commitment_bytes(outer_key, entry));
+    }
+    *h.finalize().as_bytes()
 }
 
 /// Full-field entry equality for the AppendOnly freeze.
@@ -1648,6 +1682,48 @@ impl KvStore {
         // (the checkpoint's owner signature survives re-wrap).
         delta.owner_checkpoint = self.latest_checkpoint.clone();
         delta
+    }
+
+    /// The content digest this store declares in a `StateServedV2` marker
+    /// when it serves its full state (issue #240). Computed over the active
+    /// entry set — see [`served_content_digest`].
+    pub(crate) fn served_digest(&self) -> [u8; 32] {
+        served_content_digest(&self.id, &self.checkpoint_pairs())
+    }
+
+    /// Remove local keys absent from a digest-verified full-state serve
+    /// (`delta.added` is then the verified complete entry set).
+    ///
+    /// This is the checkpoint-less deletion cold-sync path (issue #240): a
+    /// plain full-delta merge only upserts, so keys the holder deleted while
+    /// this replica was away would otherwise linger forever. Each stale key
+    /// is removed with a LOCAL observe-remove (its current tags are
+    /// tombstoned, so a later re-add with fresh tags still wins) and dropped
+    /// from `entries` — the same semantics the `delta.removed` merge path
+    /// applies. Never for AppendOnly stores: keys are immutable there
+    /// (mirrors the `removed` guard in `merge_delta`).
+    ///
+    /// Callers MUST have verified the delta against the serving holder's
+    /// declared digest (and its sender authorization) first — without that
+    /// binding, any holder could truncate local state at will.
+    pub(crate) fn prune_to_served_set(&mut self, delta: &KvStoreDelta) -> usize {
+        if matches!(self.policy, AccessPolicy::AppendOnly) {
+            return 0;
+        }
+        let stale: Vec<String> = self
+            .keys
+            .elements()
+            .into_iter()
+            .filter(|k| !delta.added.contains_key(k.as_str()))
+            .cloned()
+            .collect();
+        let mut pruned = 0;
+        for key in stale {
+            let _ = self.keys.remove(&key);
+            self.entries.remove(key.as_str());
+            pruned += 1;
+        }
+        pruned
     }
 }
 

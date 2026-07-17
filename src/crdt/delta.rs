@@ -12,7 +12,7 @@
 //!
 //! This significantly reduces bandwidth usage in collaborative scenarios.
 
-use crate::crdt::{Result, TaskId, TaskItem, TaskList};
+use crate::crdt::{Result, TaskId, TaskItem, TaskList, TaskListId};
 use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
@@ -104,6 +104,34 @@ impl TaskListDelta {
             && self.task_updates.is_empty()
             && self.ordering_update.is_none()
             && self.name_update.is_none()
+    }
+
+    /// Digest over the full-state content this delta serves, when the delta
+    /// is full-state-shaped (issue #240).
+    ///
+    /// A `TaskList::full_delta` always carries BOTH the ordering and name
+    /// registers; incremental deltas carry at most one of them, so `None`
+    /// cleanly excludes non-full-state shapes. Callers MUST additionally
+    /// require the added-task count to equal the holder's declared
+    /// `entry_count` before treating a digest match as a verified full
+    /// serve. The digest commits to the carried tasks' RESOLVED observable
+    /// fields in sorted task-id order (see
+    /// [`TaskItem::hash_resolved_fields`]) — identical to what
+    /// [`TaskList::served_digest`] computes over local state, so a receiver
+    /// holding exactly the served content produces the same digest.
+    pub(crate) fn served_digest(&self, list_id: &TaskListId) -> Option<[u8; 32]> {
+        self.ordering_update.as_ref()?;
+        self.name_update.as_ref()?;
+        let mut h = blake3::Hasher::new();
+        h.update(crate::crdt::task_list::SERVED_DIGEST_DOMAIN);
+        h.update(list_id.as_bytes());
+        let mut ids: Vec<&TaskId> = self.added_tasks.keys().collect();
+        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for id in ids {
+            h.update(id.as_bytes());
+            self.added_tasks[id].0.hash_resolved_fields(&mut h);
+        }
+        Some(*h.finalize().as_bytes())
     }
 }
 

@@ -598,6 +598,74 @@ impl TaskItem {
             })
     }
 
+    /// Feed this task's RESOLVED observable fields into `h` in a canonical
+    /// length-delimited encoding (issue #240 served-state digest).
+    ///
+    /// Covers exactly the fields [`TaskList::state_fingerprint`] resolves —
+    /// title, description, priority, current checkbox state, claim and
+    /// completion winners, assignee — so two replicas with identical
+    /// RESOLVED state hash identically even when their raw OR-Set element
+    /// sets differ (e.g. after one of them compacted a delivery). Every
+    /// variable-length field is length-prefixed (64-bit LE) so the encoding
+    /// is unambiguous; options carry a 1-byte presence tag; enum variants a
+    /// 1-byte discriminant. Deterministic across platforms and builds: no
+    /// `Hash` impls, no HashMap iteration.
+    pub(crate) fn hash_resolved_fields(&self, h: &mut blake3::Hasher) {
+        fn lp(h: &mut blake3::Hasher, data: &[u8]) {
+            h.update(&(data.len() as u64).to_le_bytes());
+            h.update(data);
+        }
+        fn record(h: &mut blake3::Hasher, rec: Option<(&crate::identity::AgentId, u64)>) {
+            match rec {
+                Some((agent, ts)) => {
+                    h.update(&[1u8]);
+                    h.update(agent.as_bytes());
+                    h.update(&ts.to_le_bytes());
+                }
+                None => {
+                    h.update(&[0u8]);
+                }
+            }
+        }
+        lp(h, self.title().as_bytes());
+        lp(h, self.description().as_bytes());
+        h.update(&[self.priority()]);
+        match self.current_state() {
+            CheckboxState::Empty => {
+                h.update(&[0u8]);
+            }
+            CheckboxState::Claimed {
+                agent_id,
+                timestamp,
+            } => {
+                h.update(&[1u8]);
+                h.update(agent_id.as_bytes());
+                h.update(&timestamp.to_le_bytes());
+            }
+            CheckboxState::Done {
+                agent_id,
+                timestamp,
+            } => {
+                h.update(&[2u8]);
+                h.update(agent_id.as_bytes());
+                h.update(&timestamp.to_le_bytes());
+            }
+        };
+        let claim = self.claim_record();
+        record(h, claim.as_ref().map(|(a, t)| (a, *t)));
+        let done = self.completion_record();
+        record(h, done.as_ref().map(|(a, t)| (a, *t)));
+        match self.assignee() {
+            Some(agent) => {
+                h.update(&[1u8]);
+                h.update(agent.as_bytes());
+            }
+            None => {
+                h.update(&[0u8]);
+            }
+        }
+    }
+
     /// Merge another TaskItem into this one.
     ///
     /// Combines the OR-Sets and LWW-Registers according to their
