@@ -677,6 +677,194 @@ async fn d4_mls_ban_commit_advances_binding_and_converges() {
         .await;
 }
 
+/// Issue #107: a promoted, NON-creator Admin bans a member on a
+/// `private_secure` (TreeKEM) group. The signed state-commit chain's
+/// `AdminOrHigher` authority is the contract, so the admin-authored ban must
+/// (a) pass the route's role gate on the admin's own daemon, (b) produce a
+/// verified TreeKEM removal commit that advances the epoch on every
+/// remaining member INCLUDING the acting admin (actor-side convergence), and
+/// (c) converge the target to `banned` in all remaining rosters.
+///
+/// The ban route resolves the target's TreeKEM KeyPackage from the local
+/// roster, falling back to the issue-#205 member-keyed catch-up with a
+/// retryable 424; in a fully converged trio the acting admin already holds
+/// the target's package from the join-time delivery, so the ban succeeds
+/// without a retry storm. The loop below still honors the documented
+/// `retry: true` contract so a transient catch-up window cannot flake the
+/// proof — a persistent 424 fails the test.
+#[tokio::test]
+#[ignore = "daemon-trio admin-ban convergence (gossip wait window) flakes the always-on Test Suite under CI load; runs in the integration tier"]
+async fn d4_non_creator_admin_ban_commit_advances_binding_and_converges() {
+    let _guard = suite_lock().await;
+    // Owned trio, not the shared singleton — same loopback-contention
+    // reasoning as `d4_mls_ban_commit_advances_binding_and_converges`.
+    let cluster = cluster::trio_with_extra_config("").await;
+    let alice = &cluster.alice; // creator
+    let bob = &cluster.bob; // promoted admin (ban actor)
+    let charlie = &cluster.charlie; // ban target
+    bootstrap_agent_cards(&[alice, bob, charlie]).await;
+
+    let group_id = create_group_preset(
+        alice,
+        "D4 Admin Ban",
+        "non-creator admin ban",
+        "private_secure",
+    )
+    .await;
+
+    // Bob (future admin) and charlie (target) join via creator invites.
+    let bob_invite = create_invite(alice, &group_id).await;
+    let bob_join = join_via_invite(bob, &bob_invite, "bob-admin-actor").await;
+    assert_eq!(bob_join["ok"], true, "bob join response: {bob_join:?}");
+    let bob_group_id = bob_join["group_id"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
+    let _ = wait_state_available(bob, &bob_group_id).await;
+
+    let charlie_invite = create_invite(alice, &group_id).await;
+    let charlie_join = join_via_invite(charlie, &charlie_invite, "charlie-ban-target").await;
+    assert_eq!(
+        charlie_join["ok"], true,
+        "charlie join response: {charlie_join:?}"
+    );
+    let charlie_group_id = charlie_join["group_id"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
+    let _ = wait_state_available(charlie, &charlie_group_id).await;
+
+    let bob_agent_id = bob.agent_id().await;
+    let charlie_agent_id = charlie.agent_id().await;
+    assert_ne!(bob_agent_id, charlie_agent_id, "distinct ban actor/target");
+
+    // Converge: both members Active in every roster before the promotion.
+    let active = wait_until(Duration::from_secs(90), || async {
+        let alice_members = get_members(alice, &group_id).await;
+        let bob_members = get_members(bob, &bob_group_id).await;
+        member_state(&alice_members, &bob_agent_id).as_deref() == Some("active")
+            && member_state(&alice_members, &charlie_agent_id).as_deref() == Some("active")
+            && member_state(&bob_members, &bob_agent_id).as_deref() == Some("active")
+            && member_state(&bob_members, &charlie_agent_id).as_deref() == Some("active")
+    })
+    .await;
+    assert!(active, "bob and charlie did not converge to active rosters");
+
+    // The creator promotes bob to Admin; the promotion commit must converge
+    // so bob's OWN daemon observes bob as Admin at the same state hash — the
+    // ban route gates on the converged roster, not on creator identity.
+    let role_resp = authed_client(alice)
+        .patch(alice.url(&format!("/groups/{group_id}/members/{bob_agent_id}/role")))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .send()
+        .await
+        .expect("promote bob");
+    assert_eq!(role_resp.status(), StatusCode::OK, "promote status");
+    let promoted = wait_until(Duration::from_secs(90), || async {
+        let alice_members = get_members(alice, &group_id).await;
+        let bob_members = get_members(bob, &bob_group_id).await;
+        let alice_hash = get_state(alice, &group_id).await;
+        let bob_hash = get_state(bob, &bob_group_id).await;
+        member_role(&alice_members, &bob_agent_id).as_deref() == Some("admin")
+            && member_role(&bob_members, &bob_agent_id).as_deref() == Some("admin")
+            && state_commit_keys(&alice_hash).is_some()
+            && state_commit_keys(&alice_hash) == state_commit_keys(&bob_hash)
+    })
+    .await;
+    assert!(promoted, "bob's admin promotion did not converge to bob");
+
+    // The TreeKEM plane is live on creator and admin before the ban.
+    let alice_pre = get_state(alice, &group_id).await;
+    let alice_pre_binding = alice_pre["security_binding"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        alice_pre_binding.starts_with("treekem:epoch="),
+        "pre-ban alice binding should be on the treekem plane, got {alice_pre_binding:?}"
+    );
+    let bob_pre = get_state(bob, &bob_group_id).await;
+    let bob_pre_binding = bob_pre["security_binding"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        bob_pre_binding.starts_with("treekem:epoch="),
+        "pre-ban bob binding should be on the treekem plane, got {bob_pre_binding:?}"
+    );
+
+    // Bob (non-creator Admin) bans charlie. Honor the route's documented
+    // retry contract (`424 member_key_package_pending` with `retry: true`)
+    // for the on-demand KeyPackage catch-up window; any other failure, or a
+    // window that never closes, fails the proof.
+    let ban_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let ban_body: Value = loop {
+        let resp = authed_client(bob)
+            .post(bob.url(&format!("/groups/{bob_group_id}/ban/{charlie_agent_id}")))
+            .send()
+            .await
+            .expect("admin ban request");
+        let status = resp.status();
+        let body: Value = resp.json().await.expect("admin ban json");
+        if status == StatusCode::OK {
+            assert_eq!(body["ok"], true, "admin ban body: {body:?}");
+            break body;
+        }
+        let retryable = status == StatusCode::FAILED_DEPENDENCY && body["retry"] == true;
+        assert!(
+            retryable,
+            "admin ban must succeed or ask for a documented retry, got {status}: {body:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < ban_deadline,
+            "admin ban KeyPackage catch-up never closed; last response: {body:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let ban_revision = ban_body["revision"].as_u64().expect("ban revision");
+
+    // Actor-side convergence: the acting admin's own epoch binding advances.
+    let actor_advanced = wait_until(Duration::from_secs(90), || async {
+        let bob_state = get_state(bob, &bob_group_id).await;
+        let binding = bob_state["security_binding"].as_str().unwrap_or_default();
+        binding.starts_with("treekem:epoch=") && binding != bob_pre_binding
+    })
+    .await;
+    assert!(
+        actor_advanced,
+        "admin-authored ban should advance the ACTOR's treekem epoch binding from {bob_pre_binding:?}"
+    );
+
+    // Cross-daemon convergence: the creator observes the same advanced epoch
+    // and the same state chain head as the acting admin, and charlie is
+    // `banned` in both remaining rosters.
+    let converged = wait_until(Duration::from_secs(90), || async {
+        let alice_state = get_state(alice, &group_id).await;
+        let bob_state = get_state(bob, &bob_group_id).await;
+        let alice_binding = alice_state["security_binding"].as_str().unwrap_or_default();
+        let bob_binding = bob_state["security_binding"].as_str().unwrap_or_default();
+        let alice_members = get_members(alice, &group_id).await;
+        let bob_members = get_members(bob, &bob_group_id).await;
+        alice_binding.starts_with("treekem:epoch=")
+            && alice_binding != alice_pre_binding
+            && alice_binding == bob_binding
+            && state_commit_keys(&alice_state).is_some()
+            && state_commit_keys(&alice_state) == state_commit_keys(&bob_state)
+            && member_state(&alice_members, &charlie_agent_id).as_deref() == Some("banned")
+            && member_state(&bob_members, &charlie_agent_id).as_deref() == Some("banned")
+    })
+    .await;
+    assert!(
+        converged,
+        "admin-authored ban (rev {ban_revision}) did not converge coherently across creator and acting admin"
+    );
+
+    let _ = authed_client(alice)
+        .delete(alice.url(&format!("/groups/{group_id}")))
+        .send()
+        .await;
+}
+
 /// issue #111: the retained state-commit history endpoint serves applied
 /// commits paired with independently-verifiable roster projections, ordered by
 /// revision, with working pagination. Members-only (the local owner is a
