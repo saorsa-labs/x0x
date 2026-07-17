@@ -743,7 +743,9 @@ fn build_aead_aad(
 /// [`DmError::RecipientKeyInvalid`] instead of an opaque
 /// [`DmError::EnvelopeConstruction`] deep inside envelope building (issue
 /// #188). Cheap: a length/format check only, no crypto.
-pub fn validate_recipient_kem_key(recipient_kem_pubkey_bytes: &[u8]) -> std::result::Result<(), String> {
+pub fn validate_recipient_kem_key(
+    recipient_kem_pubkey_bytes: &[u8],
+) -> std::result::Result<(), String> {
     MlKemPublicKey::from_bytes(KEM_VARIANT, recipient_kem_pubkey_bytes)
         .map(|_| ())
         .map_err(|e| format!("recipient KEM pubkey decode: {e}"))
