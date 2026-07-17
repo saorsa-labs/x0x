@@ -167,12 +167,12 @@ async fn test_concurrent_add_task() {
 /// Still failing on the pinned saorsa-gossip-crdt-sync 0.5.67 (Cargo.toml).
 /// That crate's `LwwRegister::merge` resolves concurrent (vector-clock-
 /// incomparable) writes with a `hash_clock` tiebreaker — `DefaultHasher`
-/// over the sorted vector-clock entries, smaller hash wins — not the
-/// AgentId comparison this test expected. Confirmed failing when run
-/// with `cargo test -- --ignored` on 0.5.67. Un-ignoring needs an
-/// upstream change (AgentId-based deterministic tiebreak, or a
-/// documented earliest/latest-wins resolver this test is aligned with)
-/// plus a test-expectation review.
+/// over the sorted vector-clock entries, smaller hash wins — ignoring
+/// wall-clock timestamps entirely, so this test's latest-timestamp-wins
+/// expectation cannot hold for concurrent writes. Confirmed failing when
+/// run with `cargo test -- --ignored` on 0.5.67. Un-ignoring needs an
+/// upstream change (deterministic tiebreak aligned with the test's
+/// documented expectation) plus a test-expectation review.
 #[ignore = "Flaky: needs LWW tie-breaking fix in saorsa-gossip"]
 #[tokio::test]
 async fn test_concurrent_claim_same_task() {
@@ -317,12 +317,12 @@ async fn test_same_task_claim_conflict_different_timestamps_converges() {
 /// Still failing on the pinned saorsa-gossip-crdt-sync 0.5.67 (Cargo.toml).
 /// That crate's `LwwRegister::merge` resolves concurrent (vector-clock-
 /// incomparable) writes with a `hash_clock` tiebreaker — `DefaultHasher`
-/// over the sorted vector-clock entries, smaller hash wins — not the
-/// AgentId comparison this test expected. Confirmed failing when run
-/// with `cargo test -- --ignored` on 0.5.67. Un-ignoring needs an
-/// upstream change (AgentId-based deterministic tiebreak, or a
-/// documented earliest/latest-wins resolver this test is aligned with)
-/// plus a test-expectation review.
+/// over the sorted vector-clock entries, smaller hash wins — ignoring
+/// wall-clock timestamps entirely, so this test's latest-timestamp-wins
+/// expectation cannot hold for concurrent writes. Confirmed failing when
+/// run with `cargo test -- --ignored` on 0.5.67. Un-ignoring needs an
+/// upstream change (deterministic tiebreak aligned with the test's
+/// documented expectation) plus a test-expectation review.
 #[ignore = "Flaky: needs LWW tie-breaking fix in saorsa-gossip"]
 #[tokio::test]
 async fn test_concurrent_metadata_updates() {

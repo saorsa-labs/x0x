@@ -1736,10 +1736,10 @@ impl NetworkNode {
             total_connections: status.direct_connections + status.relayed_connections,
             active_connections: status.active_connections as u32,
             bytes_sent: status.relay_bytes_forwarded,
-            // `ant_quic::NodeStatus` (ant-quic 0.27.33) exposes only
-            // `relay_bytes_forwarded` — bytes this node forwarded as a relay
-            // for other peers. There is no inbound/received byte counter on
-            // the status struct, so bytes_received stays zero until upstream
+            // `ant_quic::NodeStatus` (ant-quic 0.27.33) exposes no
+            // inbound byte counter — its only byte-related field is
+            // `relay_bytes_forwarded` (bytes this node forwarded as a relay
+            // for other peers). bytes_received stays zero until upstream
             // adds one. Wiring a fake value here would silently misreport.
             bytes_received: 0,
             peer_count: status.connected_peers,
