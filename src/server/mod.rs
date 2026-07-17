@@ -36,10 +36,11 @@ use routes::{
     list_revocations, list_task_lists, list_tasks, machine_for_agent_handler,
     machines_by_user_handler, network_status, peer_health_handler, peers, pin_machine,
     populate_invite_base_state_from_group_info, presence, presence_find, presence_foaf,
-    presence_online, presence_status, probe_peer_handler, quick_trust, revoke_contact,
-    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
-    SelfPublishedReleaseManifests, shutdown_handler, status, streams_diagnostics,
-    unpin_machine, update_contact, update_task, wait_for_chunk_window, wait_for_final_acks,
+    presence_online, presence_status, probe_peer_handler, publish, quick_trust,
+    RestSubscription, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
+    run_startup_update_check, SelfPublishedReleaseManifests, shutdown_handler, status,
+    streams_diagnostics, subscribe, unpin_machine, unsubscribe, update_contact, update_task,
+    wait_for_chunk_window, wait_for_final_acks,
 };
 #[cfg(test)]
 use routes::{
@@ -236,17 +237,6 @@ fn take_treekem_cache_writer_hook_for_test(path: &FsPath) -> Option<TreeKemCache
 
 type WelcomeFetchWaiter = oneshot::Sender<std::result::Result<Vec<u8>, String>>;
 
-/// A live REST `/subscribe` stream tracked so `DELETE /subscribe/:id` can stop it.
-struct RestSubscription {
-    /// Topic the subscription the subscription is for (retained for diagnostics/logging).
-    topic: String,
-    /// Forwarder task draining the gossip subscription into the SSE broadcast.
-    /// Aborting it drops the underlying `Subscription`, which releases the
-    /// gossip topic ref-count and ends delivery — without this, an
-    /// unsubscribed stream would keep forwarding messages to SSE forever.
-    forwarder: tokio::task::JoinHandle<()>,
-}
-
 /// Hard upper bound for the discoverable group-card bridge cache. This cache
 /// is populated from untrusted discovery surfaces, so it must not grow without
 /// bound even if every incoming card is syntactically valid.
@@ -392,20 +382,6 @@ fn apply_withdrawn_group_card_to_group_info(
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
-
-/// POST /publish request body.
-#[derive(Debug, Deserialize)]
-struct PublishRequest {
-    topic: String,
-    /// Base64-encoded payload.
-    payload: String,
-}
-
-/// POST /subscribe request body.
-#[derive(Debug, Deserialize)]
-struct SubscribeRequest {
-    topic: String,
-}
 
 /// POST /mls/groups request body.
 #[derive(Debug, Deserialize)]
@@ -1905,122 +1881,6 @@ async fn start_dm_inbox_when_gossip_ready(
                 return;
             }
         }
-    }
-}
-
-/// POST /publish
-async fn publish(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<PublishRequest>,
-) -> impl IntoResponse {
-    // Reject empty topic
-    if req.topic.is_empty() {
-        return bad_request("topic must not be empty");
-    }
-
-    // Decode base64 payload
-    let payload = match BASE64.decode(&req.payload) {
-        Ok(p) => p,
-        Err(e) => {
-            return bad_request(format!(
-                "invalid base64 in payload field: {e}. \
-                         The payload must be base64-encoded \
-                         (e.g., use `echo -n \"hello\" | base64`)"
-            ));
-        }
-    };
-
-    match state.agent.publish(&req.topic, payload).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
-    }
-}
-
-/// POST /subscribe
-async fn subscribe(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SubscribeRequest>,
-) -> impl IntoResponse {
-    match state.agent.subscribe(&req.topic).await {
-        Ok(sub) => {
-            let id = format!("{:016x}", rand::random::<u64>());
-            // Spawn background task to forward messages to SSE broadcast
-            let broadcast_tx = state.broadcast_tx.clone();
-            let topic = req.topic.clone();
-            let mut recv_sub = sub;
-            let sub_id = id.clone();
-            let forwarder = tokio::spawn(async move {
-                while let Some(msg) = recv_sub.recv().await {
-                    tracing::info!(
-                        topic = %topic,
-                        sub_id = %sub_id,
-                        payload_len = msg.payload.len(),
-                        "[5/6 x0xd] received from subscriber channel, broadcasting to SSE"
-                    );
-                    let event = SseEvent {
-                        event_type: "message".to_string(),
-                        data: serde_json::json!({
-                            "subscription_id": sub_id,
-                            "topic": topic,
-                            "payload": BASE64.encode(&msg.payload),
-                            "sender": msg.sender.map(|s| hex::encode(s.0)),
-                            "verified": msg.verified,
-                            "trust_level": msg.trust_level.map(|t| t.to_string()),
-                        }),
-                    };
-                    match broadcast_tx.send(event) {
-                        Ok(n) => tracing::info!(
-                            topic = %topic,
-                            receivers = n,
-                            "[5/6 x0xd] broadcast sent to {n} SSE receivers"
-                        ),
-                        Err(_) => tracing::warn!(
-                            topic = %LogHexId::topic(&topic),
-                            "[5/6 x0xd] broadcast send failed (no SSE receivers)"
-                        ),
-                    }
-                }
-            });
-
-            // Track the forwarder task so the DELETE handler can abort it.
-            // Aborting drops the underlying `Subscription`, releasing the
-            // gossip topic ref-count and stopping SSE delivery.
-            let mut subs = state.subscriptions.write().await;
-            subs.insert(
-                id.clone(),
-                RestSubscription {
-                    topic: req.topic.clone(),
-                    forwarder,
-                },
-            );
-
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "subscription_id": id })),
-            )
-        }
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
-    }
-}
-
-/// DELETE /subscribe/:id
-async fn unsubscribe(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let mut subs = state.subscriptions.write().await;
-    if let Some(sub) = subs.remove(&id) {
-        // Stop the forwarder task. Dropping its `Subscription` releases the
-        // gossip topic ref-count and ends message delivery for this stream.
-        sub.forwarder.abort();
-        tracing::info!(
-            sub_id = %id,
-            topic = %sub.topic,
-            "unsubscribed: forwarder aborted, gossip subscription released"
-        );
-        (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
-    } else {
-        not_found("subscription not found")
     }
 }
 
