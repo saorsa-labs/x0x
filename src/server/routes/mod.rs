@@ -8,10 +8,12 @@
 mod connect;
 mod contacts;
 mod direct;
+mod discovery;
 mod exec;
 mod files;
 mod identity;
 mod machines;
+mod presence;
 mod status;
 mod tasks;
 mod upgrade;
@@ -28,6 +30,10 @@ pub(super) use contacts::{
 pub(super) use direct::{
     connect_agent, connect_machine, direct_connections, direct_message_send_config, direct_send,
 };
+pub(super) use discovery::{
+    DiscoveredAgentEntry, agent_reachability, agents_by_user_handler, discovered_agent,
+    discovered_agent_entry, discovered_agents, find_agent, machine_for_agent_handler,
+};
 pub(super) use exec::{exec_cancel, exec_diagnostics, exec_run, exec_sessions};
 pub(super) use files::{
     FileChunkAckSlot, file_accept_handler, file_reject_handler, file_send_handler,
@@ -42,6 +48,9 @@ pub(super) use identity::{
 #[cfg(test)]
 pub(super) use identity::{CardQuery, ImportCardRequest};
 pub(super) use status::{get_constitution, get_constitution_json, health, shutdown_handler, status};
+pub(super) use presence::{
+    presence, presence_find, presence_foaf, presence_online, presence_status,
+};
 pub(super) use machines::{
     add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,
     machines_by_user_handler, pin_machine, unpin_machine,

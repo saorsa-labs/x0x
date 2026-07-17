@@ -16,7 +16,8 @@ use base64::Engine;
 use serde::Serialize;
 
 use super::state::AppState;
-use super::{api_error, discovered_agent_entry, DiscoveredAgentEntry};
+use super::api_error;
+use super::routes::{DiscoveredAgentEntry, discovered_agent_entry};
 
 /// SSE event broadcast to connected clients.
 #[derive(Debug, Clone, Serialize)]
