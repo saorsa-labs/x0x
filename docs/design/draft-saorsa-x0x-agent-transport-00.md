@@ -966,8 +966,8 @@ this document; src/server/mod.rs:1547.)
 
 Registration request per RFC 7301 for the identification sequence
 `x0x` ("x0x Agent Transport") in the TLS ALPN registry. The ant-quic
-0.27.33 reference transport negotiates **no** ALPN today (verified: no
-ALPN configuration exists in the crate); this registration reserves the
+0.27.33 reference transport negotiates **no** ALPN today (verified: x0x
+configures no ALPN; the crate's only ALPN use is an HTTP/3 test binary); this registration reserves the
 identifier so future revisions can discriminate x0x traffic co-resident
 with other QUIC protocols on shared ports. Implementations of this
 revision MUST NOT require an ALPN match.
