@@ -331,7 +331,7 @@ pub struct DaemonConfig {
     /// Gossip-plane identifier (issue #206, TOML: `network_id`).
     ///
     /// - Unset → the daemon joins the well-known prod plane
-    ///   ([`PROD_PLANE_ID`]) and refuses gossip traffic with peers that
+    ///   (`PROD_PLANE_ID`) and refuses gossip traffic with peers that
     ///   declare a different plane. This is the safe default: co-located
     ///   daemons are only same-plane if they are *both* undeclared, which
     ///   mirrors today's shared-bootstrap deployments (prod, `x0xd-443`,
@@ -507,7 +507,7 @@ impl DaemonConfig {
 
     /// Resolve `network_id` to the effective gossip-plane id (issue #206).
     ///
-    /// - `None` (unset) → `Some(`[`PROD_PLANE_ID`]`)` — planes isolated by
+    /// - `None` (unset) → `Some(PROD_PLANE_ID)` — planes isolated by
     ///   default: any daemon declaring a different plane is refused.
     /// - `Some("")` → `None` — explicit opt-out (open plane, pre-#206
     ///   behaviour).
