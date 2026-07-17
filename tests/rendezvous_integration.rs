@@ -149,43 +149,105 @@ async fn test_agent_registers_to_shard() -> TestResult {
     agent.join_network().await?;
     sleep(Duration::from_secs(5)).await;
 
-    // TODO: Verify agent registered to correct shard coordinator
-    // let shard_id = compute_shard_id(&agent.agent_id());
-    // let coordinator = agent.get_shard_coordinator(shard_id).await?;
-    // assert!(coordinator.has_agent(&agent.agent_id()));
+    // No x0x API exposes "which shard coordinator holds my registration".
+    // `Agent::get_shard_coordinator` / `coordinator.has_agent` do not exist:
+    // rendezvous in x0x is publish-only. The agent pushes a signed
+    // `ProviderSummary` to its shard topic via `advertise_identity`; seekers
+    // consume it via `find_agent` / `find_agent_rendezvous` (see
+    // `test_agent_lookup_via_shard`). Successful `join_network` plus the
+    // settle window above is the strongest registration signal x0x surfaces.
     Ok(())
 }
 
 /// Test 4: Agent lookup via shard query
 #[tokio::test]
 #[ignore = "requires Phase 1.3 and VPS testnet"]
-async fn test_agent_lookup_via_shard() {
-    // TODO: Create 2 agents
-    // TODO: Agent A queries shard for Agent B
-    // Expected: Query returns Agent B's network address
-    // Expected: Query latency < 1 second
+async fn test_agent_lookup_via_shard() -> TestResult {
+    // Advertiser joins the mesh and publishes a rendezvous `ProviderSummary`
+    // to its shard topic; the seeker subscribes to that shard topic via
+    // `find_agent_rendezvous` and expects to observe the advertiser's
+    // ProviderSummary-encoded addresses within the lookup window.
+    let bootstrap_addrs: Vec<_> = VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
+
+    let advertiser_dir = TempDir::new()?;
+    let advertiser = Agent::builder()
+        .with_machine_key(advertiser_dir.path().join("machine.key"))
+        .with_network_config(NetworkConfig {
+            bind_addr: Some("0.0.0.0:0".parse()?),
+            bootstrap_nodes: bootstrap_addrs.clone(),
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    advertiser.join_network().await?;
+
+    let seeker_dir = TempDir::new()?;
+    let seeker = Agent::builder()
+        .with_machine_key(seeker_dir.path().join("machine.key"))
+        .with_network_config(NetworkConfig {
+            bind_addr: Some("0.0.0.0:0".parse()?),
+            bootstrap_nodes: bootstrap_addrs,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    seeker.join_network().await?;
+
+    // Let both agents settle on the mesh before the lookup.
+    sleep(Duration::from_secs(3)).await;
+
+    let target = advertiser.agent_id();
+    // Run the seeker's shard lookup concurrently with a fresh re-publish by
+    // the advertiser so the subscriber catches a ProviderSummary even if the
+    // first advertisement raced ahead of the subscription. 24h validity
+    // matches the daemon's rendezvous re-advertise cadence.
+    let lookup = tokio::time::timeout(
+        Duration::from_secs(15),
+        seeker.find_agent_rendezvous(target, 10),
+    );
+    let republish = async {
+        for _ in 0..4 {
+            let _ = advertiser.advertise_identity(86_400_000).await;
+            sleep(Duration::from_secs(2)).await;
+        }
+    };
+    let (lookup_outcome, _) = tokio::join!(lookup, republish);
+    let found = lookup_outcome
+        .expect("seeker find_agent_rendezvous did not return within 15s")?;
+    assert!(
+        found.is_some(),
+        "find_agent_rendezvous should return the advertiser's addresses from its shard topic"
+    );
+    Ok(())
 }
 
 /// Test 5: Coordinator advert propagation
 #[tokio::test]
 #[ignore = "requires Phase 1.3 and VPS testnet"]
 async fn test_coordinator_advert_propagation() {
-    // TODO: VPS nodes should advertise as coordinators
-    // TODO: Verify ML-DSA signed adverts propagate globally
-    // Expected: All 6 VPS nodes advertise as coordinators
-    // Expected: Adverts have 24h TTL
-    // Expected: Adverts propagate within 10 seconds
+    // Not wired in x0x. The daemon never publishes the ML-DSA-signed
+    // `saorsa_gossip_coordinator::CoordinatorAdvert` (0.5.67): that type
+    // exists in the dependency and `GossipCacheAdapter` consumes it on
+    // ingest, but no x0x code path produces or broadcasts one. The only
+    // signed adverts x0x emits are `CapabilityAdvert` (DM caps,
+    // `x0x/caps/v1`; 5-min republish / 15-min cache TTL) and the rendezvous
+    // `ProviderSummary`. The "24h-TTL coordinator advert with 10s global
+    // propagation" this test described is a feature the application does
+    // not exercise.
 }
 
 /// Test 6: Coordinator failover
 #[tokio::test]
 #[ignore = "requires Phase 1.3 and VPS testnet with coordinator shutdown"]
 async fn test_coordinator_failover() {
-    // TODO: Identify primary coordinator for a shard
-    // TODO: Simulate coordinator going offline
-    // TODO: Verify backup coordinator takes over
-    // Expected: Failover within 30 seconds
-    // Expected: No data loss during failover
+    // No failover API exists. Neither x0x nor saorsa-gossip-coordinator
+    // 0.5.67 exposes a primary/backup coordinator role, leader election, or
+    // takeover hook for a shard: `CoordinatorAdvert` is a capability
+    // advertisement with a validity window, and
+    // `GossipCacheAdapter::select_coordinators` ranks candidates by score
+    // but does not elect or fail over. The "identify primary, kill it,
+    // verify backup takes over within 30s" flow this test described would
+    // require a coordination/election layer that is absent upstream.
 }
 
 /// Test 7: Shard load balancing
@@ -231,10 +293,55 @@ fn test_shard_load_balancing() -> TestResult {
 /// Test 8: Concurrent shard queries
 #[tokio::test]
 #[ignore = "requires Phase 1.3 and VPS testnet"]
-async fn test_concurrent_shard_queries() {
-    // TODO: Launch 100 concurrent shard queries
-    // TODO: Verify all queries succeed
-    // Expected: No query timeouts
-    // Expected: Mean latency < 500ms
-    // Expected: p99 latency < 2s
+async fn test_concurrent_shard_queries() -> TestResult {
+    // Fire 100 concurrent lookups via the real `find_agent` API and verify
+    // the query path stays responsive under fan-out: every query completes
+    // within its budget, none hang or error. Targets are deterministic agent
+    // ids; on a live testnet some may resolve and some may not, so success
+    // here is "every query returns an Ok outcome within the per-query
+    // budget", not "every query finds an agent". (The mean/p99 latency
+    // bounds originally listed assumed a warm, populated testnet and cannot
+    // be asserted without 100 known-live advertisers, so they are replaced
+    // by the honest completion/no-hang assertion.)
+    let bootstrap_addrs: Vec<_> = VPS_NODES.iter().filter_map(|s| s.parse().ok()).collect();
+    let seeker_dir = TempDir::new()?;
+    let seeker = Agent::builder()
+        .with_machine_key(seeker_dir.path().join("machine.key"))
+        .with_network_config(NetworkConfig {
+            bind_addr: Some("0.0.0.0:0".parse()?),
+            bootstrap_nodes: bootstrap_addrs,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    seeker.join_network().await?;
+    // Settle before fanning out so the gossip runtime is ready.
+    sleep(Duration::from_secs(3)).await;
+
+    const QUERY_COUNT: usize = 100;
+    // find_agent's internal budget is ~10s (5s shard + 5s rendezvous); add margin.
+    const PER_QUERY_BUDGET: Duration = Duration::from_secs(15);
+    let seeker = std::sync::Arc::new(seeker);
+
+    let mut handles = Vec::with_capacity(QUERY_COUNT);
+    for seed in 0..QUERY_COUNT as u32 {
+        let seeker = std::sync::Arc::clone(&seeker);
+        handles.push(tokio::spawn(async move {
+            tokio::time::timeout(
+                PER_QUERY_BUDGET,
+                seeker.find_agent(deterministic_agent_id(seed)),
+            )
+            .await
+        }));
+    }
+
+    for handle in handles {
+        let outcome = handle.await.expect("query task must join");
+        let resolved = outcome.expect("query exceeded per-query budget; query path hung under fan-out");
+        // find_agent returns Result<Option<Vec<SocketAddr>>, x0x::Error>; propagate any
+        // error as a test failure. Ok(None) is acceptable (target not present
+        // on the testnet) — only the no-hang + no-error contract is asserted.
+        let _ = resolved?;
+    }
+    Ok(())
 }
