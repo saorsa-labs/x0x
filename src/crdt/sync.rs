@@ -161,11 +161,7 @@ struct TaskServedEvidence {
 /// content). Otherwise (only v1 markers seen — old peers) the legacy weak
 /// rule: a marker AND local non-emptiness. No evidence is NEVER
 /// convergence.
-fn tasklist_converged(
-    ev: &TaskServedEvidence,
-    task_count: usize,
-    local_digest: [u8; 32],
-) -> bool {
+fn tasklist_converged(ev: &TaskServedEvidence, task_count: usize, local_digest: [u8; 32]) -> bool {
     if !ev.digests.is_empty() {
         let any_nonempty = ev.digests.values().any(|d| d.entry_count > 0);
         return ev
@@ -1463,7 +1459,8 @@ mod tests {
         assert_eq!(inc.served_digest(&list_id(1)), None);
 
         // Different membership ⇒ different digest.
-        b.add_task(make_task(9, peer(2)), peer(2), 2).expect("add b2");
+        b.add_task(make_task(9, peer(2)), peer(2), 2)
+            .expect("add b2");
         assert_ne!(a.served_digest(), b.served_digest());
     }
 
@@ -1739,9 +1736,7 @@ mod tests {
             .publish(topic.to_string(), bytes::Bytes::from(encoded))
             .await
             .expect("publish full delta");
-        let marker = TaskListSyncMessage::StateServed {
-            responder: peer(1),
-        };
+        let marker = TaskListSyncMessage::StateServed { responder: peer(1) };
         let marker_bytes = bincode::serialize(&marker).expect("serialize v1 marker");
         pubsub
             .publish(side.clone(), bytes::Bytes::from(marker_bytes))

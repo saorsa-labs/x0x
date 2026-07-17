@@ -226,9 +226,10 @@ fn bootstrap_converged(
     }
     if !ev.digests.is_empty() {
         let any_nonempty = ev.digests.values().any(|d| d.entry_count > 0);
-        return ev.digests.values().any(|d| {
-            d.digest == local_digest && (d.entry_count > 0 || !any_nonempty)
-        });
+        return ev
+            .digests
+            .values()
+            .any(|d| d.digest == local_digest && (d.entry_count > 0 || !any_nonempty));
     }
     if ev.saw_nonempty {
         !is_empty
@@ -494,8 +495,7 @@ impl KvStoreSync {
         // full-replace adopt fires exclusively in that window — a converged
         // replica must never let a divergent holder's serve truncate state
         // it legitimately holds.
-        let bootstrap_active =
-            Arc::new(std::sync::atomic::AtomicBool::new(bootstrap_needed));
+        let bootstrap_active = Arc::new(std::sync::atomic::AtomicBool::new(bootstrap_needed));
         let listener_served = Arc::clone(&served_evidence);
         let listener_bootstrap_active = Arc::clone(&bootstrap_active);
         spawn(Box::pin(async move {
@@ -551,9 +551,7 @@ impl KvStoreSync {
                                     {
                                         let declared = listener_served
                                             .lock()
-                                            .unwrap_or_else(
-                                                std::sync::PoisonError::into_inner,
-                                            )
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                                             .digests
                                             .get(&peer_id)
                                             .copied();
@@ -595,11 +593,10 @@ impl KvStoreSync {
                                             // pruning precisely where
                                             // deletion cold-sync needs
                                             // it.)
-                                            let sole_author = matches!(
-                                                s.policy(),
-                                                AccessPolicy::Signed
-                                            ) && writer.is_some()
-                                                && s.owner() == writer;
+                                            let sole_author =
+                                                matches!(s.policy(), AccessPolicy::Signed)
+                                                    && writer.is_some()
+                                                    && s.owner() == writer;
                                             if sole_author
                                                 && delta.added.len()
                                                     == declared.entry_count as usize
@@ -769,10 +766,7 @@ impl KvStoreSync {
                                 (s.highest_checkpoint_seq > 0).then_some(s.highest_checkpoint_seq);
                             let has_payload = !s.is_empty() || s.latest_checkpoint.is_some();
                             let full = (has_payload && !cooled_down).then(|| s.full_delta());
-                            let served = (
-                                s.served_digest(),
-                                s.checkpoint_pairs().len() as u32,
-                            );
+                            let served = (s.served_digest(), s.checkpoint_pairs().len() as u32);
                             (full, s.is_empty(), is_owner, cp, has_payload, served)
                         };
                         let mut markers: Vec<KvSyncMessage> = Vec::new();
@@ -1790,7 +1784,10 @@ mod tests {
             max_checkpoint_seq: 5,
             digests: std::collections::HashMap::new(),
         };
-        assert!(!bootstrap_converged(&cp, false, 4, D1), "behind the served HWM");
+        assert!(
+            !bootstrap_converged(&cp, false, 4, D1),
+            "behind the served HWM"
+        );
         assert!(bootstrap_converged(&cp, false, 5, D1));
         assert!(bootstrap_converged(&cp, false, 7, D1));
 
@@ -2327,12 +2324,7 @@ mod tests {
             owner,
             AccessPolicy::Signed,
         );
-        let mut b = KvStore::new(
-            store_id(1),
-            "beta".to_string(),
-            owner,
-            AccessPolicy::Signed,
-        );
+        let mut b = KvStore::new(store_id(1), "beta".to_string(), owner, AccessPolicy::Signed);
         // Empty stores: same id ⇒ same digest; the name is not content.
         assert_eq!(a.served_digest(), b.served_digest());
         let c = KvStore::new(
@@ -2399,10 +2391,20 @@ mod tests {
             AccessPolicy::Signed,
         );
         owned
-            .put("k1".to_string(), b"v1".to_vec(), "text/plain".to_string(), peer(1))
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
             .expect("k1");
         owned
-            .put("k2".to_string(), b"v2".to_vec(), "text/plain".to_string(), peer(1))
+            .put(
+                "k2".to_string(),
+                b"v2".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
             .expect("k2");
 
         // The joiner holds only k2 — "one live incremental delta" — with
@@ -2724,7 +2726,12 @@ mod tests {
             AccessPolicy::Signed,
         );
         owned
-            .put("k1".to_string(), b"v1".to_vec(), "text/plain".to_string(), peer(1))
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
             .expect("k1");
         let full = owned.full_delta();
         let encoded = encode_delta(peer(1), &full).expect("encode full");
@@ -2836,7 +2843,12 @@ mod tests {
             AccessPolicy::Signed,
         );
         owned
-            .put("k1".to_string(), b"v1".to_vec(), "text/plain".to_string(), peer(1))
+            .put(
+                "k1".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
             .expect("k1");
         let owner_sync = KvStoreSync::new(
             owned,
@@ -2887,7 +2899,12 @@ mod tests {
             AccessPolicy::Signed,
         );
         owned
-            .put("k".to_string(), b"v1".to_vec(), "text/plain".to_string(), peer(1))
+            .put(
+                "k".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
             .expect("original put");
         // Age the replica's copy deterministically: even in the same
         // wall-clock millisecond, the replica's created/updated timestamps
@@ -2900,7 +2917,12 @@ mod tests {
         // away: the owner's entry now carries a fresh created_at.
         owned.remove("k").expect("owner delete");
         owned
-            .put("k".to_string(), b"v2".to_vec(), "text/plain".to_string(), peer(1))
+            .put(
+                "k".to_string(),
+                b"v2".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
             .expect("owner recreate");
 
         // The replica returns holding the ORIGINAL (aged) entry.
@@ -2939,9 +2961,7 @@ mod tests {
         let mut recovered = false;
         for _ in 0..200 {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            if joiner.read().await.get("k").map(|e| e.value.clone())
-                == Some(b"v2".to_vec())
-            {
+            if joiner.read().await.get("k").map(|e| e.value.clone()) == Some(b"v2".to_vec()) {
                 recovered = true;
                 break;
             }
@@ -3020,7 +3040,9 @@ mod tests {
         // The replica must also know the allowlist itself (learned via
         // owner-gated deltas in production) or the writer's key merge is
         // rejected by access control.
-        replica.allow_writer(writer, &owner_id).expect("learn allowlist");
+        replica
+            .allow_writer(writer, &owner_id)
+            .expect("learn allowlist");
         let k_owner_seed = {
             let full = owned.full_delta();
             let (key, (entry, tag)) = full
@@ -3050,10 +3072,7 @@ mod tests {
         replica
             .merge_delta(&writer_delta, peer(7), Some(&writer))
             .expect("seed k_writer");
-        let owner_updated_at = owned
-            .get("k_owner")
-            .expect("owner entry")
-            .updated_at;
+        let owner_updated_at = owned.get("k_owner").expect("owner entry").updated_at;
 
         let joiner = KvStoreSync::new(
             replica,
@@ -3085,8 +3104,7 @@ mod tests {
                 s.get("k_writer").is_some(),
                 "an owner-only serve must NOT prune an allowlisted writer's key"
             );
-            if s.get("k_owner").map(|e| e.updated_at) == Some(owner_updated_at)
-            {
+            if s.get("k_owner").map(|e| e.updated_at) == Some(owner_updated_at) {
                 serve_landed = true;
             }
         }
@@ -3104,17 +3122,22 @@ mod tests {
     #[test]
     fn pruned_key_is_accepted_when_re_served_with_fresh_tags() {
         let owner = agent(1);
-        let mut holder = KvStore::new(
-            store_id(1),
-            "log".to_string(),
-            owner,
-            AccessPolicy::Signed,
-        );
+        let mut holder = KvStore::new(store_id(1), "log".to_string(), owner, AccessPolicy::Signed);
         holder
-            .put("k_live".to_string(), b"v".to_vec(), "text/plain".to_string(), peer(1))
+            .put(
+                "k_live".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
             .expect("put live");
         holder
-            .put("k_doomed".to_string(), b"x".to_vec(), "text/plain".to_string(), peer(1))
+            .put(
+                "k_doomed".to_string(),
+                b"x".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
             .expect("put doomed");
 
         // The replica absorbs a first full serve (both keys).
@@ -3149,7 +3172,12 @@ mod tests {
         // pre-fix, its synthetic tag was tombstoned by the prune and the
         // re-add silently dropped.
         holder
-            .put("k_doomed".to_string(), b"y".to_vec(), "text/plain".to_string(), peer(1))
+            .put(
+                "k_doomed".to_string(),
+                b"y".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
             .expect("re-add");
         let s3 = holder.full_delta();
         replica
