@@ -442,6 +442,14 @@ impl BindingSession {
         // Insert BEFORE sending: a fast peer can answer before the send
         // returns, and the receive loop must find the waiter.
         self.inner.in_flight.insert(corr_id.clone(), tx);
+        // Every exit path other than successful delivery — send failure,
+        // timeout, or the caller dropping this future mid-flight — removes
+        // the waiter via the guard. After successful delivery the receive
+        // loop already consumed the entry, so the removal is a no-op.
+        let _cleanup = InFlightCleanup {
+            in_flight: &self.inner.in_flight,
+            corr_id: corr_id.clone(),
+        };
 
         if let Err(err) = self
             .inner
@@ -449,7 +457,6 @@ impl BindingSession {
             .send_direct_with_config(peer, bytes, self.inner.config.send_config.clone())
             .await
         {
-            self.inner.in_flight.remove(&corr_id);
             return Err(BindingError::Send(err));
         }
         debug!(%corr_id, method, "a2a request sent");
@@ -458,7 +465,6 @@ impl BindingSession {
             Ok(Ok(response)) => response,
             Ok(Err(_sender_dropped)) => return Err(BindingError::Closed),
             Err(_elapsed) => {
-                self.inner.in_flight.remove(&corr_id);
                 return Err(BindingError::Timeout(self.inner.config.request_timeout));
             }
         };
@@ -474,6 +480,26 @@ impl Drop for BindingSession {
         if let Ok(mut tasks) = self.inner.handler_tasks.lock() {
             tasks.abort_all();
         }
+    }
+}
+
+/// RAII cleanup for one in-flight `call`.
+///
+/// Removes the corrId from the in-flight map on EVERY exit path of
+/// [`BindingSession::call`]: send failure, timeout, and — critically —
+/// caller cancellation (the caller dropping the `call` future, e.g. an
+/// HTTP client disconnect) when the peer never responds. After successful
+/// delivery the receive loop has already consumed the entry, so the
+/// removal is a no-op. Without this, cancelled calls leak waiters and the
+/// map grows unboundedly.
+struct InFlightCleanup<'a> {
+    in_flight: &'a DashMap<String, oneshot::Sender<JsonRpcResponse>>,
+    corr_id: String,
+}
+
+impl Drop for InFlightCleanup<'_> {
+    fn drop(&mut self) {
+        self.in_flight.remove(&self.corr_id);
     }
 }
 
@@ -522,6 +548,11 @@ async fn receive_loop(inner: Arc<SessionInner>, mut rx: crate::direct::DirectMes
                 };
                 // Reap completed handler tasks so the set stays bounded.
                 while tasks.try_join_next().is_some() {}
+                // TODO(#112 streaming increment): handler tasks are
+                // spawned uncapped — a flood of inbound requests spawns a
+                // task each. Add a semaphore cap on concurrent handlers
+                // (backpressure for chatty streams, design §10.3) when the
+                // streaming increment lands.
                 tasks.spawn(async move {
                     handler_inner.handle_request(sender, envelope).await;
                 });

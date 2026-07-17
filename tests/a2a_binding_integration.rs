@@ -365,6 +365,45 @@ async fn request_timeout_fires_and_session_stays_healthy(
     Ok(())
 }
 
+/// Caller cancellation: the caller drops the `call` future mid-flight
+/// (HTTP-client-disconnect shape) and the peer never responds — the
+/// in-flight entry MUST be removed, not leaked for the session's life.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_call_future_cleans_in_flight_entry(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new().unwrap();
+    let Some(pair) = setup_pair(&temp_dir, Duration::from_secs(30)).await? else {
+        return Ok(());
+    };
+    pair.bob_session.register_handler("work/stall", |_params| {
+        std::future::pending::<Result<Value, JsonRpcError>>()
+    });
+
+    let session = Arc::clone(&pair.alice_session);
+    let bob_id = pair.bob_id;
+    let handle = tokio::spawn(async move { session.call(&bob_id, "work/stall", None).await });
+
+    // Wait until the request is registered in-flight.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pair.alice_session.in_flight_len() == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(pair.alice_session.in_flight_len(), 1);
+
+    // Caller "disconnects": the call future is dropped while awaiting a
+    // response that will never come.
+    handle.abort();
+    let join_err = handle.await.expect_err("aborted task must join as cancelled");
+    assert!(join_err.is_cancelled());
+
+    assert_eq!(
+        pair.alice_session.in_flight_len(),
+        0,
+        "dropped call future must not leak its in-flight waiter"
+    );
+    Ok(())
+}
+
 /// Concurrent interleaving: many in-flight unary calls across all three A2A
 /// methods (plus a delayed echo method) must each receive their own
 /// correlated response — corrIds never cross.
