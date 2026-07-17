@@ -690,9 +690,11 @@ impl PubSubManager {
     /// for existing topics. Without this, a peer that connects after a topic
     /// is subscribed would never receive messages on that topic from this node.
     pub async fn refresh_topic_peers(&self) {
+        // Issue #206: plane-gated peer view — only plane-cleared peers may
+        // enter PlumTree eager sets.
         let peers: Vec<PeerId> = self
             .network
-            .connected_peers()
+            .gossip_plane_peers()
             .await
             .into_iter()
             .map(|peer| PeerId::new(peer.0))
@@ -748,9 +750,10 @@ impl PubSubManager {
 
     /// Initialize PlumTree peers for a topic from currently connected peers.
     async fn initialize_topic_peers(&self, topic: TopicId) {
+        // Issue #206: plane-gated peer view (see refresh_topic_peers).
         let peers: Vec<PeerId> = self
             .network
-            .connected_peers()
+            .gossip_plane_peers()
             .await
             .into_iter()
             .map(|peer| PeerId::new(peer.0))

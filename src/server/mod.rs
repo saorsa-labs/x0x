@@ -35,7 +35,7 @@ pub use state::{
     default_api_address, default_bind_address, default_data_dir, validate_instance_name,
     DaemonConfig, InstanceName, ServeOptions, ServerHandle, DEFAULT_QUIC_PORT,
 };
-use state::{shared_cache_dir, AppState, CachedUpgradeCheck, DaemonUpdateConfig};
+use state::{AppState, CachedUpgradeCheck, DaemonUpdateConfig};
 use ws::{ws_diagnostics, ws_direct_handler, ws_handler, ws_sessions, WsOutboundStats};
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -743,18 +743,29 @@ pub async fn serve_with_options(
 
     // Create agent
     //
-    // Peer cache is scoped per data_dir when a custom data_dir is configured
-    // (e.g., for named instances or test setups). This prevents VPS peer
-    // addresses from previous runs polluting local-only configurations.
-    // When using the default data_dir, the shared cache is used so that the
-    // main daemon benefits from cached peers across restarts.
-    let cache_dir = if config.data_dir != default_data_dir() {
+    // Peer cache is strictly per-data-dir (issue #206): co-located daemons
+    // must never share a bootstrap cache, or peers learned on one gossip
+    // plane leak into another plane's restart redials (the #189
+    // shared-default-path shape). The previous `shared_cache_dir()` arm
+    // collapsed to the same path when data_dir was default, but made the
+    // sharing explicit and silently reachable for embedders passing
+    // `DaemonConfig::default()` — removed, not rehabilitated. Multi-process
+    // collision on one cache dir is fenced by ant-quic's cache file locking.
+    let cache_dir = {
         let dir = config.data_dir.join("peers");
         let _ = std::fs::create_dir_all(&dir);
         dir
-    } else {
-        shared_cache_dir().join("peers")
     };
+    // Issue #206: resolve the effective gossip plane. Unset TOML
+    // `network_id` maps to the well-known prod plane so co-located daemons
+    // are isolated by default; an explicit empty string opts out (open).
+    let network_id = config.resolved_network_id();
+    match &network_id {
+        Some(id) => tracing::info!(network_id = %id, "Gossip plane isolation enabled"),
+        None => tracing::warn!(
+            "Gossip plane isolation DISABLED (network_id = \"\") — this daemon will \n             exchange gossip with every plane, including cross-plane mDNS peers"
+        ),
+    }
     let network_config = NetworkConfig {
         bind_addr: Some(bind_address),
         bootstrap_nodes: config.resolved_bootstrap_peers(),
@@ -768,6 +779,7 @@ pub async fn serve_with_options(
         // single invocation without editing the config file.
         port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
         peer_relay: config.peer_relay.clone(),
+        network_id,
         observed_prefix_enabled: config.observed_prefix_enabled,
     };
 
@@ -797,10 +809,15 @@ pub async fn serve_with_options(
     // NOTE: --no-hard-coded-bootstrap clears only the *embedded* global
     // bootstrap network; an explicit `bootstrap_peers` list in the config
     // file is honored verbatim (see DaemonConfig::resolved_bootstrap_peers).
-    // mDNS LAN discovery and the peer cache remain active by design so that:
+    // ant-quic's first-party mDNS LAN discovery and the peer cache remain
+    // active by design so that:
     //   - Local mesh (two laptops on WiFi) still works via mDNS
     //   - FOAF presence discovery still finds peers
     //   - Previously-seen peers can reconnect via cache
+    // mDNS-discovered co-located daemons can no longer bridge gossip
+    // planes, though: every connection exchanges a plane hello, and peers
+    // on a different `network_id` plane are refused at the gossip layer
+    // (issue #206).
 
     if let Some(ref id_dir) = identity_dir {
         builder = builder

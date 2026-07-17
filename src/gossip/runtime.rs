@@ -1021,7 +1021,9 @@ impl GossipRuntime {
             *guard = Some(peer_sync_handle);
         }
 
-        // Keepalive: send a SWIM Ping to every connected peer every 15 seconds.
+        // Keepalive: send a SWIM Ping to every connected plane-cleared peer
+        // every 15 seconds (issue #206: peers held at the plane gate get no
+        // keepalives — we want their QUIC to idle out, not stay warm).
         // This prevents QUIC idle timeout (30s) from dropping direct connections
         // that were established via auto-connect. Without this, connections with
         // no application traffic are closed by QUIC after 30s of inactivity.
@@ -1032,7 +1034,7 @@ impl GossipRuntime {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
-                let peers = keepalive_network.connected_peers().await;
+                let peers = keepalive_network.gossip_plane_peers().await;
                 for peer in peers {
                     let gossip_peer = PeerId::new(peer.0);
                     if let Err(e) = keepalive_membership.send_ping(gossip_peer).await {

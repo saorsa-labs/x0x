@@ -246,6 +246,25 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub peer_relay: PeerRelayConfig,
 
+    /// Gossip-plane identifier (issue #206).
+    ///
+    /// When `Some(id)`, this node exchanges a plane hello on every new
+    /// connection and refuses gossip traffic with peers on a different
+    /// plane: mismatched peers are disconnected with a
+    /// [`DisconnectReason::PolicyRejection`] tombstone (never proactively
+    /// redialed, evicted from the bootstrap cache), and every peer stays
+    /// ineligible as a gossip carrier — PlumTree eager sets, pubsub/CRDT
+    /// fanout, inbound gossip frames — until plane-cleared. Peers that
+    /// present no hello (pre-#206 code, open-plane embedders) are admitted
+    /// as legacy after a short grace window so rolling upgrades do not
+    /// partition the fleet.
+    ///
+    /// `None` (library default) = open plane: no hellos sent, no gating —
+    /// identical to pre-#206 behaviour. The x0xd daemon maps an unset TOML
+    /// `network_id` to the well-known prod plane instead; see
+    /// `server::DaemonConfig::resolved_network_id`.
+    #[serde(default)]
+    pub network_id: Option<String>,
     /// Issue #120: opt-in surfacing of the transport-observed peer address
     /// as a coarse, masked origin token (`/24` v4, `/48` v6) on
     /// point-to-point DM surfaces only (DM-receive WS/SSE event + per-peer
@@ -469,6 +488,7 @@ impl Default for NetworkConfig {
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
             peer_relay: PeerRelayConfig::default(),
+            network_id: None,
             observed_prefix_enabled: false,
         }
     }
@@ -995,6 +1015,89 @@ pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
 /// clean.
 pub const RELAYED_DM_STREAM_TYPE: u8 = 0x11;
 
+/// Stream type byte for the gossip-plane hello handshake (issue #206).
+///
+/// Sits in x0x's control region above the DM bytes. Frame layout:
+/// `[0x20][len: u8][plane_id: len bytes UTF-8]`. Older peers without this
+/// receiver arm hit the "Unknown stream type byte" path at the inbound
+/// parser and drop the frame — wire-additive demux, forward-compat clean
+/// (same pattern as [`RELAYED_DM_STREAM_TYPE`]).
+pub const PLANE_HELLO_STREAM_TYPE: u8 = 0x20;
+
+/// Maximum plane-id length accepted on the wire (bytes of UTF-8).
+pub const MAX_PLANE_ID_LEN: usize = 64;
+
+/// Grace window for peers that never send a plane hello (legacy pre-#206
+/// peers and open-plane embedders). A pending peer is admitted as legacy
+/// after this elapses. New-code cross-plane peers present a mismatched hello
+/// within milliseconds of connecting, long before grace expiry, so the grace
+/// only ever gates truly legacy peers.
+const PLANE_LEGACY_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a successful plane verification stays trusted across connection
+/// generations (issue #206). Connection churn (mutual-dial supersedes,
+/// proactive reconnects) replaces connections many times per minute under
+/// load; a peer whose hello already matched our plane must not lose gossip
+/// eligibility — and have its in-flight gossip frames (including DM-inbox
+/// delivery) dropped — on every generation. A mismatched hello still refuses
+/// the peer immediately and purges this cache; a plane change in practice
+/// requires a daemon restart, well outside this window's risk envelope.
+const PLANE_REVERIFY_TTL: Duration = Duration::from_secs(600);
+
+/// How often the gatekeeper re-sends our plane hello to peers still Pending
+/// (issue #206). The connect-time hello send is best-effort on a connection
+/// that may still be settling; without a retry, one lost hello leaves both
+/// sides Pending until [`PLANE_LEGACY_GRACE`] silently admits a NEW-code
+/// cross-plane peer as legacy. Retrying every 2s gives ~4 further chances
+/// inside the grace window, so legacy admission is reserved for peers that
+/// genuinely never speak the hello protocol.
+const PLANE_HELLO_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Per-peer gossip-plane state, tracked only when plane isolation is
+/// configured (`NetworkConfig::network_id` is `Some`).
+#[derive(Debug, Clone, Copy)]
+enum PlanePeerState {
+    /// Connected; awaiting the peer's plane hello. Gossip to and from this
+    /// peer is held until the peer is cleared.
+    Pending {
+        /// When the connection was registered (drives legacy grace).
+        since: Instant,
+    },
+    /// Plane verified: the peer's hello matched our plane, or the peer was
+    /// admitted as legacy after [`PLANE_LEGACY_GRACE`].
+    Cleared,
+}
+
+/// Validate a gossip-plane identifier (issue #206).
+///
+/// Plane ids ride the plane-hello frame length-prefixed with a `u8`, so they
+/// are bounded to [`MAX_PLANE_ID_LEN`] bytes of UTF-8. The character set is
+/// deliberately boring — ASCII alphanumerics plus `.`, `-`, `_` — so ids can
+/// double as config tokens, log labels, and future DNS-safe names.
+///
+/// # Errors
+///
+/// Returns a human-readable reason when the id is empty, too long, or
+/// contains characters outside the allowed set.
+pub fn validate_plane_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("plane id must not be empty".to_string());
+    }
+    if id.len() > MAX_PLANE_ID_LEN {
+        return Err(format!(
+            "plane id exceeds {MAX_PLANE_ID_LEN} bytes ({} given)",
+            id.len()
+        ));
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+    {
+        return Err(format!("plane id contains invalid character {bad:?}"));
+    }
+    Ok(())
+}
+
 /// X0X-0070b: triple shipped on the inbound RelayedDm channel.
 ///
 /// 1. `AntPeerId` - the ant-quic PeerId of the *relay* peer (the QUIC
@@ -1386,6 +1489,20 @@ pub struct NetworkNode {
     /// churning an LRU eviction, or ignoring an operator teardown. See
     /// [`DisconnectReason`] and [`NetworkNode::is_reconnect_suppressed`].
     reconnect_suppressions: Arc<Mutex<HashMap<[u8; 32], ReconnectSuppression>>>,
+    /// Gossip-plane bookkeeping per connected peer (issue #206). Populated
+    /// only when `config.network_id` is `Some`: peers start
+    /// [`PlanePeerState::Pending`] and are promoted to
+    /// [`PlanePeerState::Cleared`] by a matching plane hello or by legacy
+    /// grace expiry. Mismatched peers are tombstoned + disconnected and
+    /// removed here.
+    plane_peers: Arc<Mutex<HashMap<AntPeerId, PlanePeerState>>>,
+    /// Last successful plane verification per peer (issue #206). Unlike
+    /// [`Self::plane_peers`] this survives disconnects and connection
+    /// replacement: within [`PLANE_REVERIFY_TTL`] a reconnecting peer is
+    /// re-admitted as [`PlanePeerState::Cleared`] instead of re-gated, so
+    /// connection churn cannot black-hole its gossip frames. Purged on a
+    /// mismatched hello.
+    plane_cleared_at: Arc<Mutex<HashMap<AntPeerId, Instant>>>,
     /// Handles to the background tasks spawned at construction (receiver, accept
     /// loop, connection-pool eviction).
     ///
@@ -1489,6 +1606,13 @@ impl NetworkNode {
             builder = builder.bootstrap_cache(cache_config);
         }
 
+        // Issue #206: validate the gossip-plane id up front so a malformed
+        // value fails node construction loudly instead of silently disabling
+        // isolation.
+        if let Some(id) = &config.network_id {
+            validate_plane_id(id).map_err(NetworkError::NodeCreation)?;
+        }
+
         let node = Node::with_config(builder.build()).await.map_err(|e| {
             NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e))
         })?;
@@ -1544,20 +1668,27 @@ impl NetworkNode {
             liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
             reconnect_suppressions: Arc::new(Mutex::new(HashMap::new())),
+            plane_peers: Arc::new(Mutex::new(HashMap::new())),
+            plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
         };
 
         let receiver = network_node.spawn_receiver();
         let accept = network_node.spawn_accept_loop();
         let eviction = network_node.spawn_connection_pool_eviction();
+        let plane_gatekeeper = network_node.spawn_plane_gatekeeper();
         // Record the handles so `shutdown` can abort them (letting it take the
         // node write lock and shut the node down without deadlocking). This runs
         // at construction before the node is shared, so there is no contention;
         // if the lock is somehow poisoned, recover the guard rather than panic
         // (the handles are only used for clean teardown).
         match network_node.background_tasks.lock() {
-            Ok(mut tasks) => tasks.extend([receiver, accept, eviction]),
-            Err(poisoned) => poisoned.into_inner().extend([receiver, accept, eviction]),
+            Ok(mut tasks) => tasks.extend([receiver, accept, eviction, plane_gatekeeper]),
+            Err(poisoned) => {
+                poisoned
+                    .into_inner()
+                    .extend([receiver, accept, eviction, plane_gatekeeper])
+            }
         }
 
         Ok(network_node)
@@ -2539,6 +2670,266 @@ impl NetworkNode {
         reconnect_suppression_is_live(self.reconnect_suppressions.as_ref(), peer_id)
     }
 
+    /// Gossip-plane gate (issue #206).
+    ///
+    /// Returns `true` when gossip traffic with `peer` is plane-allowed:
+    /// always when isolation is off (`network_id` unset); only for
+    /// plane-cleared peers when on. Pending peers are promoted to
+    /// legacy-cleared once [`PLANE_LEGACY_GRACE`] elapses — peers running
+    /// pre-#206 code never send a hello, and refusing them forever would
+    /// partition a mixed-version fleet.
+    fn plane_gate_allows(&self, peer: &AntPeerId) -> bool {
+        if self.config.network_id.is_none() {
+            return true;
+        }
+        let mut map = match self.plane_peers.lock() {
+            Ok(m) => m,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        // A peer with no recorded connect event (e.g. the gatekeeper task has
+        // not dequeued it yet) enters as pending-from-now — unless its plane
+        // was verified within [`PLANE_REVERIFY_TTL`], in which case it stays
+        // cleared across the connection generation (issue #206 churn fix).
+        let seed = if plane_recently_cleared(&self.plane_cleared_at, peer) {
+            PlanePeerState::Cleared
+        } else {
+            PlanePeerState::Pending { since: now }
+        };
+        let entry = map.entry(*peer).or_insert(seed);
+        match entry {
+            PlanePeerState::Cleared => true,
+            PlanePeerState::Pending { since } => {
+                if now.duration_since(*since) >= PLANE_LEGACY_GRACE {
+                    *entry = PlanePeerState::Cleared;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Connected peers eligible as gossip carriers under plane isolation
+    /// (issue #206): all connected peers when isolation is off, only
+    /// plane-cleared peers when on. Use this instead of
+    /// [`Self::connected_peers`] when seeding gossip peer sets (PlumTree
+    /// eager sets, membership keepalives) so a cross-plane or not-yet-
+    /// verified peer never enters the gossip plane.
+    pub(crate) async fn gossip_plane_peers(&self) -> Vec<AntPeerId> {
+        let connected = self.connected_peers().await;
+        if self.config.network_id.is_none() {
+            return connected;
+        }
+        connected
+            .into_iter()
+            .filter(|peer| self.plane_gate_allows(peer))
+            .collect()
+    }
+
+    /// Handle an inbound plane hello (issue #206).
+    ///
+    /// Matching plane: the peer is cleared for gossip. Mismatched plane:
+    /// the peer is a cross-plane contaminant — it is evicted from the
+    /// bootstrap cache (so it cannot persist into the next restart's
+    /// Phase 0/1 redials) and disconnected with a
+    /// [`DisconnectReason::PolicyRejection`] tombstone so no reconnect
+    /// path re-dials it.
+    async fn plane_handle_hello(&self, peer: AntPeerId, their_plane: &str) {
+        let Some(our_plane) = &self.config.network_id else {
+            return;
+        };
+        if their_plane == our_plane {
+            {
+                let mut map = match self.plane_peers.lock() {
+                    Ok(m) => m,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                map.insert(peer, PlanePeerState::Cleared);
+            }
+            record_plane_cleared(&self.plane_cleared_at, peer);
+            tracing::debug!(
+                target: "x0x::connect",
+                peer_id_prefix = %hex_prefix(&peer.0, 4),
+                plane = %our_plane,
+                "gossip-plane peer cleared"
+            );
+            return;
+        }
+        tracing::warn!(
+            target: "x0x::connect",
+            peer_id_prefix = %hex_prefix(&peer.0, 4),
+            our_plane = %our_plane,
+            their_plane = %their_plane,
+            "gossip-plane mismatch: refusing cross-plane peer (issue #206)"
+        );
+        {
+            let mut map = match self.plane_peers.lock() {
+                Ok(m) => m,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            map.remove(&peer);
+        }
+        {
+            let mut cleared = match self.plane_cleared_at.lock() {
+                Ok(m) => m,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            cleared.remove(&peer);
+        }
+        if let Some(cache) = &self.bootstrap_cache {
+            cache.remove(&peer).await;
+        }
+        if let Err(e) = self
+            .disconnect_with_reason(&peer, DisconnectReason::PolicyRejection)
+            .await
+        {
+            tracing::debug!(
+                target: "x0x::connect",
+                peer_id_prefix = %hex_prefix(&peer.0, 4),
+                error = %e,
+                "cross-plane peer disconnect after plane mismatch failed"
+            );
+        }
+    }
+
+    /// Spawn the plane gatekeeper task (issue #206).
+    ///
+    /// Subscribes to BOTH connection signals:
+    /// - the x0x network event stream (outbound dials, inbound accepts,
+    ///   pool/admin disconnects), and
+    /// - ant-quic's peer-lifecycle stream, which additionally covers
+    ///   connections ant-quic creates internally — first-party mDNS
+    ///   auto-connect, the #206 contamination vector — without any x0x
+    ///   dial or accept passing through `NetworkEvent::PeerConnected`.
+    ///
+    /// On connect it registers the peer as plane-pending and sends our
+    /// plane hello; on disconnect it drops the bookkeeping so a later
+    /// reconnect re-verifies. A no-op task when isolation is off.
+    fn spawn_plane_gatekeeper(&self) -> tokio::task::JoinHandle<()> {
+        let Some(plane_id) = self.config.network_id.clone() else {
+            return tokio::spawn(async {});
+        };
+        let plane_peers = Arc::clone(&self.plane_peers);
+        let plane_cleared_at = Arc::clone(&self.plane_cleared_at);
+        let node = Arc::clone(&self.node);
+        let mut events = self.event_sender.subscribe();
+
+        tokio::spawn(async move {
+            debug!("NetworkNode plane gatekeeper started");
+            let mut lifecycle = {
+                let guard = node.read().await;
+                guard.as_ref().map(|node| node.subscribe_all_peer_events())
+            };
+            // Hello sends are best-effort on a connection that may still be
+            // settling; a lost hello must not degrade a new-code cross-plane
+            // peer into a legacy-grace admit. Re-send to every still-Pending
+            // peer on a short tick until it clears, is refused, or the grace
+            // admits it as genuinely legacy.
+            let mut rehello = tokio::time::interval(PLANE_HELLO_RETRY_INTERVAL);
+            rehello.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let event = tokio::select! {
+                    _ = rehello.tick() => {
+                        let pending: Vec<AntPeerId> = {
+                            let map = match plane_peers.lock() {
+                                Ok(m) => m,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            map.iter()
+                                .filter(|(_, s)| matches!(s, PlanePeerState::Pending { .. }))
+                                .map(|(p, _)| *p)
+                                .collect()
+                        };
+                        if !pending.is_empty() {
+                            let frame = build_plane_hello_frame(&plane_id);
+                            let guard = node.read().await;
+                            if let Some(node) = guard.as_ref() {
+                                for peer in pending {
+                                    let _ = node.send(&peer, &frame).await;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    event = events.recv() => {
+                        match event {
+                            Ok(event) => GatekeeperEvent::Network(event),
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    lifecycle_event = async {
+                        match lifecycle.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match lifecycle_event {
+                            Ok((peer, event)) => GatekeeperEvent::Lifecycle(peer, event),
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => {
+                                // Node is gone (shutdown): stop listening on
+                                // this arm but keep draining network events.
+                                lifecycle = None;
+                                continue;
+                            }
+                        }
+                    }
+                };
+                match event {
+                    GatekeeperEvent::Network(NetworkEvent::PeerConnected { peer_id, .. })
+                    | GatekeeperEvent::Lifecycle(
+                        ant_quic::PeerId(peer_id),
+                        ant_quic::PeerLifecycleEvent::Established { .. },
+                    ) => {
+                        plane_note_connected(
+                            &plane_id,
+                            &plane_peers,
+                            &plane_cleared_at,
+                            &node,
+                            peer_id,
+                            false,
+                        )
+                        .await;
+                    }
+                    GatekeeperEvent::Lifecycle(
+                        ant_quic::PeerId(peer_id),
+                        ant_quic::PeerLifecycleEvent::Replaced { .. },
+                    ) => {
+                        // A fresh connection generation for a peer we may
+                        // already have cleared: re-gate until its hello on
+                        // the new connection re-verifies the plane.
+                        plane_note_connected(
+                            &plane_id,
+                            &plane_peers,
+                            &plane_cleared_at,
+                            &node,
+                            peer_id,
+                            true,
+                        )
+                        .await;
+                    }
+                    GatekeeperEvent::Network(NetworkEvent::PeerDisconnected {
+                        peer_id, ..
+                    })
+                    | GatekeeperEvent::Lifecycle(
+                        ant_quic::PeerId(peer_id),
+                        ant_quic::PeerLifecycleEvent::Closed { .. },
+                    ) => {
+                        let mut map = match plane_peers.lock() {
+                            Ok(m) => m,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        map.remove(&ant_quic::PeerId(peer_id));
+                    }
+                    _ => {}
+                }
+            }
+            debug!("NetworkNode plane gatekeeper stopped");
+        })
+    }
+
     /// Get list of connected peer IDs.
     ///
     /// # Returns
@@ -2954,6 +3345,10 @@ impl NetworkNode {
         let recv_pump_diagnostics = Arc::clone(&self.recv_pump_diagnostics);
         let direct_tx = self.direct_tx.clone();
         let relayed_dm_tx = self.relayed_dm_tx.clone();
+        // Clone of the node for the plane-hello arm + plane gate (issue
+        // #206). The task is aborted before `shutdown` drops the ant-quic
+        // node, so the clone cannot outlive the transport.
+        let plane_node = self.clone();
 
         tokio::spawn(async move {
             debug!("NetworkNode receiver task started");
@@ -3087,6 +3482,47 @@ impl NetworkNode {
                                 error!("Failed to forward RelayedDm: {}", e);
                                 break;
                             }
+                            continue;
+                        }
+
+                        // Issue #206: plane hello handshake.
+                        //   [0x20][len: u8][plane_id: len bytes UTF-8]
+                        // A matching hello clears the peer for gossip; a
+                        // mismatched hello refuses it (disconnect +
+                        // tombstone). Malformed frames are dropped without
+                        // penalty — the peer simply stays pending.
+                        if type_byte == PLANE_HELLO_STREAM_TYPE {
+                            let len = data.get(1).map(|b| usize::from(*b));
+                            let plane_bytes = len.and_then(|n| data.get(2..2 + n));
+                            match plane_bytes.and_then(|b| std::str::from_utf8(b).ok()) {
+                                Some(their_plane) if validate_plane_id(their_plane).is_ok() => {
+                                    plane_node.plane_handle_hello(peer_id, their_plane).await;
+                                }
+                                _ => {
+                                    warn!(
+                                        "[1/6 network] dropping malformed plane hello: {} bytes from peer {:?}",
+                                        data.len(),
+                                        peer_id,
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Issue #206: gossip-plane gate. Peers that are not
+                        // plane-cleared (hello outstanding, legacy grace not
+                        // yet elapsed) may not carry gossip traffic in either
+                        // direction — this is what stops a cross-plane mDNS
+                        // auto-connect from contaminating revocation sets and
+                        // CRDT state during the handshake window.
+                        //
+                        // Note: the DM bytes (0x10/0x11) above deliberately
+                        // bypass this gate — the DM plane is authenticated
+                        // agent-to-agent traffic, out of #206's gossip-plane
+                        // scope (see docs/trust-and-connectivity.md).
+                        if GossipStreamType::from_byte(type_byte).is_some()
+                            && !plane_node.plane_gate_allows(&peer_id)
+                        {
                             continue;
                         }
 
@@ -3346,6 +3782,109 @@ pub(crate) fn hex_prefix(bytes: &[u8; 32], n: usize) -> String {
     s
 }
 
+/// Build a plane-hello frame (issue #206): `[0x20][len: u8][plane_id]`.
+/// `plane_id` is validated at node construction, so the length always fits
+/// the `u8` prefix.
+fn build_plane_hello_frame(plane_id: &str) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(2 + plane_id.len());
+    frame.push(PLANE_HELLO_STREAM_TYPE);
+    frame.push(plane_id.len() as u8);
+    frame.extend_from_slice(plane_id.as_bytes());
+    frame
+}
+
+/// Event union for the plane gatekeeper's two connection signals (issue
+/// #206): x0x network events and ant-quic peer-lifecycle events.
+enum GatekeeperEvent {
+    /// x0x-level network event (dials, accepts, disconnects).
+    Network(NetworkEvent),
+    /// ant-quic peer-lifecycle event — covers connections ant-quic creates
+    /// internally (mDNS auto-connect) that never surface as
+    /// [`NetworkEvent::PeerConnected`].
+    Lifecycle(ant_quic::PeerId, ant_quic::PeerLifecycleEvent),
+}
+
+/// Gatekeeper connect handler (issue #206): register the peer as
+/// plane-pending and send our plane hello. With `reset = false` an existing
+/// entry is kept (the peer's hello may have raced ahead and already cleared
+/// it); with `reset = true` (lifecycle `Replaced`) the peer is re-gated
+/// until its hello on the new connection generation re-verifies the plane.
+/// Record a successful plane verification for `peer` (issue #206), pruning
+/// expired entries opportunistically so the map stays bounded.
+fn record_plane_cleared(cleared_at: &Arc<Mutex<HashMap<AntPeerId, Instant>>>, peer: AntPeerId) {
+    let mut map = match cleared_at.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    if map.len() >= 1024 {
+        map.retain(|_, at| now.duration_since(*at) < PLANE_REVERIFY_TTL);
+    }
+    map.insert(peer, now);
+}
+
+/// True if `peer`'s plane was verified within [`PLANE_REVERIFY_TTL`].
+fn plane_recently_cleared(
+    cleared_at: &Arc<Mutex<HashMap<AntPeerId, Instant>>>,
+    peer: &AntPeerId,
+) -> bool {
+    let map = match cleared_at.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.get(peer)
+        .is_some_and(|at| at.elapsed() < PLANE_REVERIFY_TTL)
+}
+
+async fn plane_note_connected(
+    plane_id: &str,
+    plane_peers: &Arc<Mutex<HashMap<AntPeerId, PlanePeerState>>>,
+    plane_cleared_at: &Arc<Mutex<HashMap<AntPeerId, Instant>>>,
+    node: &Arc<RwLock<Option<Node>>>,
+    peer_id: [u8; 32],
+    reset: bool,
+) {
+    let peer = ant_quic::PeerId(peer_id);
+    // A peer whose plane was verified within PLANE_REVERIFY_TTL keeps its
+    // clearance across connection generations: churn (supersedes, proactive
+    // reconnects) must not re-gate it and black-hole its gossip frames. The
+    // hello is still (re)sent below, so a genuine plane change is refused by
+    // the mismatch path, which also purges the clearance.
+    let seed = if plane_recently_cleared(plane_cleared_at, &peer) {
+        PlanePeerState::Cleared
+    } else {
+        PlanePeerState::Pending {
+            since: Instant::now(),
+        }
+    };
+    {
+        let mut map = match plane_peers.lock() {
+            Ok(m) => m,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if reset {
+            map.insert(peer, seed);
+        } else {
+            map.entry(peer).or_insert(seed);
+        }
+    }
+    let frame = build_plane_hello_frame(plane_id);
+    let node = Arc::clone(node);
+    tokio::spawn(async move {
+        let guard = node.read().await;
+        if let Some(node) = guard.as_ref() {
+            if let Err(e) = node.send(&peer, &frame).await {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %hex_prefix(&peer.0, 4),
+                    error = %e,
+                    "plane hello send failed"
+                );
+            }
+        }
+    });
+}
+
 /// Convert ant-quic PeerId to saorsa-gossip PeerId
 fn ant_to_gossip_peer_id(ant_id: &AntPeerId) -> GossipPeerId {
     GossipPeerId::new(ant_id.0)
@@ -3446,6 +3985,21 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     ) -> anyhow::Result<()> {
         let ant_peer = gossip_to_ant_peer_id(&peer);
 
+        // Issue #206: hold gossip sends to peers that have not cleared the
+        // plane gate (hello outstanding / legacy grace). Reported as success
+        // so a briefly-pending same-plane peer is not pruned from overlay
+        // views for what is effectively a sub-second handshake delay; gossip
+        // is loss-tolerant and the frames flow once the peer clears.
+        if !self.plane_gate_allows(&ant_peer) {
+            debug!(
+                "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} not plane-cleared",
+                stream_type,
+                data.len(),
+                peer
+            );
+            return Ok(());
+        }
+
         // Prepare message: [stream_type_byte | data]
         let mut buf = Vec::with_capacity(1 + data.len());
         buf.push(stream_type.to_byte());
@@ -3478,7 +4032,9 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     }
 
     async fn connected_peer_ids(&self) -> Vec<GossipPeerId> {
-        self.connected_peers()
+        // Issue #206: only plane-cleared peers may enter gossip overlay
+        // state (membership views, CRDT sync targets).
+        self.gossip_plane_peers()
             .await
             .into_iter()
             .map(|peer| ant_to_gossip_peer_id(&peer))
@@ -4167,6 +4723,7 @@ async fn test_mesh_connections_are_bidirectional() {
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
             peer_relay: PeerRelayConfig::default(),
+            network_id: None,
             observed_prefix_enabled: false,
         };
 
