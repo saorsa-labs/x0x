@@ -340,8 +340,7 @@ pub struct Agent {
     /// the daemon installs the loaded policy at startup via
     /// [`Agent::set_connect_policy`]. `std` RwLock: gate reads are a brief
     /// clone of the inner `Arc`, never held across an await.
-    connect_policy:
-        std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+    connect_policy: std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.

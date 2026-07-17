@@ -99,9 +99,8 @@ pub(crate) struct StreamAccept {
     /// Live per-protocol acceptor senders, keyed by the protocol-prefix byte.
     /// A `std` mutex: registration/deregistration/route-lookup critical
     /// sections are a handful of pointer copies, never held across an await.
-    acceptors: std::sync::Mutex<
-        std::collections::HashMap<u8, tokio::sync::mpsc::Sender<PeerStream>>,
-    >,
+    acceptors:
+        std::sync::Mutex<std::collections::HashMap<u8, tokio::sync::mpsc::Sender<PeerStream>>>,
     started: std::sync::atomic::AtomicBool,
 }
 
@@ -716,7 +715,9 @@ mod tests {
         let dup = accept.register(StreamProtocol::SocksV1);
         assert!(matches!(
             dup,
-            Err(NetworkError::StreamAcceptorConflict { protocol_byte: 0x02 })
+            Err(NetworkError::StreamAcceptorConflict {
+                protocol_byte: 0x02
+            })
         ));
 
         // Registered protocol routes to the acceptor; unregistered routes to

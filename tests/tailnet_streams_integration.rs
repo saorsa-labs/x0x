@@ -425,7 +425,9 @@ async fn multiplexed_protocols_do_not_interleave() {
     // Single-owner invariant: a duplicate registration is a typed conflict.
     assert!(matches!(
         bob.register_stream_acceptor(StreamProtocol::SocksV1),
-        Err(x0x::error::NetworkError::StreamAcceptorConflict { protocol_byte: 0x02 })
+        Err(x0x::error::NetworkError::StreamAcceptorConflict {
+            protocol_byte: 0x02
+        })
     ));
 
     // alice opens one stream of each protocol over the same connection.
@@ -474,11 +476,7 @@ async fn multiplexed_protocols_do_not_interleave() {
         async { s_fwd.send_mut().write_all(&p_fwd).await },
         async {
             let mut buf = vec![0u8; p_socks.len()];
-            b_socks
-                .recv_mut()
-                .read_exact(&mut buf)
-                .await
-                .map(|_| buf)
+            b_socks.recv_mut().read_exact(&mut buf).await.map(|_| buf)
         },
         async {
             let mut buf = vec![0u8; p_fwd.len()];
@@ -487,7 +485,11 @@ async fn multiplexed_protocols_do_not_interleave() {
     );
     w_socks.expect("socks write");
     w_fwd.expect("fwd write");
-    assert_eq!(r_socks.expect("socks read"), p_socks, "socks stream integrity");
+    assert_eq!(
+        r_socks.expect("socks read"),
+        p_socks,
+        "socks stream integrity"
+    );
     assert_eq!(r_fwd.expect("fwd read"), p_fwd, "fwd stream integrity");
 }
 
@@ -569,7 +571,11 @@ async fn connect_acl_refuses_unlisted_peer_stream() {
     // a few times: the STOP_SENDING frame may lag the FIN by a packet.
     let mut write_error = None;
     for _ in 0..50 {
-        match carol_stream.send_mut().write_all(&[0xABu8; 64 * 1024]).await {
+        match carol_stream
+            .send_mut()
+            .write_all(&[0xABu8; 64 * 1024])
+            .await
+        {
             Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
             Err(e) => {
                 write_error = Some(e);
