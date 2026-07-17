@@ -5,6 +5,7 @@
 //! holds the verbatim handler bodies and request/response DTOs for one
 //! registry category; the router wiring stays in the parent module.
 
+mod connect;
 mod contacts;
 mod exec;
 mod files;
@@ -16,6 +17,9 @@ mod upgrade;
 
 #[cfg(test)]
 pub(super) use contacts::UpdateContactRequest;
+pub(super) use connect::{
+    connect_diagnostics_handler, forward_add, forward_list, forward_remove, streams_diagnostics,
+};
 pub(super) use contacts::{
     add_contact, delete_contact, list_contacts, list_revocations, quick_trust, revoke_contact,
     update_contact,

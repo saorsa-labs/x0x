@@ -22,17 +22,18 @@ mod ws;
 use routes::{
     add_contact, add_machine, add_task, agent_info, agent_sign, agent_user_id_handler,
     agent_verify, announce_identity, apply_upgrade, broadcast_current_manifest, check_upgrade,
-    create_task_list, delete_contact, delete_machine, discovered_machine, discovered_machines,
-    exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
-    file_reject_handler, file_send_handler, file_transfer_send_config,
-    file_transfer_status_handler, file_transfers_handler, FileChunkAckSlot, get_a2a_agent_card,
+    connect_diagnostics_handler, create_task_list, delete_contact, delete_machine,
+    discovered_machine, discovered_machines, exec_cancel, exec_diagnostics, exec_run,
+    exec_sessions, file_accept_handler, file_reject_handler, file_send_handler,
+    file_transfer_send_config, file_transfer_status_handler, file_transfers_handler,
+    FileChunkAckSlot, forward_add, forward_list, forward_remove, get_a2a_agent_card,
     get_agent_card, get_constitution, get_constitution_json, handle_file_message, health,
     identity_revocations, identity_revoke, import_agent_card, introduction, list_contacts,
     list_machines, list_revocations, list_task_lists, list_tasks, machines_by_user_handler,
     pin_machine, populate_invite_base_state_from_group_info, quick_trust, revoke_contact,
     run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
-    SelfPublishedReleaseManifests, shutdown_handler, status, unpin_machine, update_contact,
-    update_task, wait_for_chunk_window, wait_for_final_acks,
+    SelfPublishedReleaseManifests, shutdown_handler, status, streams_diagnostics,
+    unpin_machine, update_contact, update_task, wait_for_chunk_window, wait_for_final_acks,
 };
 #[cfg(test)]
 use routes::{
@@ -15166,161 +15167,6 @@ async fn connect_machine(
             )
         }
     }
-}
-
-/// GET /diagnostics/connect — connect-ACL policy summary and stream counters.
-///
-/// Returns the [`x0x::connect::ConnectDiagnosticsSnapshot`]: enabled flag,
-/// loaded-from path, allow-entry count, cumulative allow/deny counters, and
-/// per-reason denial breakdown. Counters reflect live forwards when connect
-/// is enabled (forwarder shipped in #183) and read 0 when it is disabled; the
-/// ACL summary is always populated.
-async fn connect_diagnostics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.connect_diagnostics.snapshot())
-}
-
-// ── Tailnet forwarding (#132 T6) ──────────────────────────────────────────
-
-/// POST /forwards — register a local port forward.
-#[derive(serde::Deserialize)]
-struct ForwardAddRequest {
-    /// Local bind, e.g. `127.0.0.1:8022`.
-    local_addr: String,
-    /// Peer agent id (hex).
-    peer_agent: String,
-    /// Loopback target host on the peer (numeric IP).
-    target_host: String,
-    /// Loopback target port.
-    target_port: u16,
-}
-
-async fn forward_add(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ForwardAddRequest>,
-) -> impl IntoResponse {
-    use x0x::forward::ForwardSpec;
-    use x0x::identity::AgentId;
-    let Some(forwarder) = state.forward_service.as_ref() else {
-        return api_error(
-            StatusCode::CONFLICT,
-            "connect forwarding is disabled (no connect ACL loaded)".to_string(),
-        )
-        .into_response();
-    };
-    let local_addr: SocketAddr = match req.local_addr.parse() {
-        Ok(a) => a,
-        Err(e) => {
-            return api_error(StatusCode::BAD_REQUEST, format!("local_addr: {e}")).into_response()
-        }
-    };
-    if !local_addr.ip().is_loopback() {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "local_addr must be loopback (Phase 1)".to_string(),
-        )
-        .into_response();
-    }
-    let peer_agent_bytes = match x0x::exec::acl::parse_agent_id(&req.peer_agent) {
-        Ok(id) => id,
-        Err(e) => {
-            return api_error(StatusCode::BAD_REQUEST, format!("peer_agent: {e}")).into_response()
-        }
-    };
-    let spec = ForwardSpec {
-        local_addr,
-        peer_agent: peer_agent_bytes,
-        target_host: req.target_host,
-        target_port: req.target_port,
-    };
-    let peer_agent: AgentId = spec.peer_agent;
-    match forwarder.add_forward(spec).await {
-        Ok(bound) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "local_addr": bound.to_string(),
-                "peer_agent": hex::encode(peer_agent.as_bytes()),
-            })),
-        )
-            .into_response(),
-        Err(e) => api_error(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-    }
-}
-
-/// GET /forwards — list registered forwards.
-async fn forward_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let forwards: Vec<serde_json::Value> = state
-        .forward_service
-        .as_ref()
-        .map(|f| {
-            f.list_forwards()
-                .into_iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "local_addr": s.local_addr.to_string(),
-                        "peer_agent": s.peer_agent_hex(),
-                        "target_host": s.target_host,
-                        "target_port": s.target_port,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "forwards": forwards })),
-    )
-}
-
-/// DELETE /forwards/:local_addr — tear down a forward by its local bind addr.
-async fn forward_remove(
-    State(state): State<Arc<AppState>>,
-    Path(local_addr): Path<String>,
-) -> impl IntoResponse {
-    let Some(forwarder) = state.forward_service.as_ref() else {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "ok": false, "removed": false })),
-        );
-    };
-    let Ok(addr): Result<SocketAddr, _> = local_addr.parse() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "removed": false })),
-        );
-    };
-    let removed = forwarder.remove_forward(addr);
-    let status = if removed {
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
-    };
-    (
-        status,
-        Json(serde_json::json!({ "ok": removed, "removed": removed })),
-    )
-}
-
-/// GET /streams — active forward-stream count + connect-ACL counters.
-async fn streams_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let (active, connect_failed) = state
-        .forward_service
-        .as_ref()
-        .map(|f| {
-            (
-                f.diagnostics().active_streams(),
-                f.diagnostics().connect_failed(),
-            )
-        })
-        .unwrap_or((0, 0));
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "active_streams": active,
-            "connect_failed": connect_failed,
-            "connect": state.connect_diagnostics.snapshot(),
-        })),
-    )
 }
 
 /// POST /direct/send — send a direct message to a connected agent.
