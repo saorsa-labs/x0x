@@ -157,7 +157,12 @@ async fn cross_plane_pair_does_not_exchange_gossip() {
     // both sides and keep it down (PolicyRejection tombstone).
     let prod_network = prod.network().expect("prod network");
     let testnet_peer = ant_quic::PeerId(testnet.machine_id().0);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Panic-on-never guard for EVENTUAL behaviour (the disconnect fires and
+    // sticks), not a latency bound: under loaded CI runners the hello
+    // round-trip, the PolicyRejection close, and ant-quic mDNS redial races
+    // all stretch, and a deadline sized for an idle machine flakes while the
+    // invariant holds (issue #241 pattern).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut disconnected = false;
     while tokio::time::Instant::now() < deadline {
         if !prod_network.is_connected(&testnet_peer).await {

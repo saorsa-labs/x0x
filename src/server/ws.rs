@@ -24,8 +24,9 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::contacts::TrustLevel;
 
+use super::routes::direct_message_send_config;
 use super::state::AppState;
-use super::{decode_base64_payload, direct_message_send_config, parse_agent_id_hex};
+use super::{decode_base64_payload, parse_agent_id_hex};
 
 /// Per-WebSocket-outbound-queue observability counters (WS1.1 / #122).
 ///
@@ -817,6 +818,26 @@ async fn handle_ws_command(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Embedded GUI
+// ---------------------------------------------------------------------------
+
+/// The embedded GUI HTML, compiled into the binary.
+const GUI_HTML: &str = include_str!("../gui/x0x-gui.html");
+
+/// GET /gui — serve the embedded GUI shell.
+pub(super) async fn serve_gui() -> impl IntoResponse {
+    axum::response::Html(render_gui_html())
+}
+
+fn render_gui_html() -> String {
+    GUI_HTML.replace("<!-- X0X_TOKEN_INJECTION_POINT -->", "")
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,5 +1258,13 @@ mod tests {
             )),
             "writer must attempt a Close(1013) after abandoning the blocked send"
         );
+    }
+
+    #[test]
+    fn rendered_gui_does_not_disclose_api_token() {
+        let html = render_gui_html();
+
+        assert!(!html.contains("super-secret-api-token"));
+        assert!(!html.contains("X0X_TOKEN"));
     }
 }

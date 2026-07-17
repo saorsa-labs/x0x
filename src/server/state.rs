@@ -24,13 +24,13 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 // name private items of its parent, so no `pub(super)` is needed on them —
 // they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
-use super::sse::SseEvent;
-use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
-use super::{
+use super::routes::{
     ExpectedJoinResultInviter, FileChunkAckSlot, NamedGroupMetadataEvent, PendingJoinResult,
     PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive, RestSubscription,
     WelcomeFetchWaiter,
 };
+use super::sse::SseEvent;
+use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
 
 fn validate_instance_name_grammar(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.len() > 64 {
@@ -660,7 +660,7 @@ pub(super) struct AppState {
     /// records and independently witnessed provisional records under the same
     /// global count/byte limits, and owns lifecycle pruning, serialized
     /// persistence, dirty retry state, and diagnostics.
-    pub(super) treekem_member_key_packages: super::TreeKemMemberKeyPackageCache,
+    pub(super) treekem_member_key_packages: super::routes::TreeKemMemberKeyPackageCache,
     /// Anti-spam throttle for outbound catch-up requests.
     pub(super) treekem_catchup_throttle: RwLock<HashMap<String, Instant>>,
     /// Per-group serialization for authoritative membership mutations. The
