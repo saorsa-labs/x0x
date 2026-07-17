@@ -60,7 +60,7 @@ pub use state::{
     DaemonConfig, InstanceName, ServeOptions, ServerHandle, DEFAULT_QUIC_PORT,
 };
 use state::{shared_cache_dir, AppState};
-use ws::{ws_diagnostics, ws_direct_handler, ws_handler, ws_sessions, WsOutboundStats};
+use ws::{serve_gui, ws_diagnostics, ws_direct_handler, ws_handler, ws_sessions, WsOutboundStats};
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -13717,22 +13717,6 @@ async fn secure_open_envelope_adversarial(
 // Embedded GUI
 // ---------------------------------------------------------------------------
 
-/// The embedded GUI HTML, compiled into the binary.
-const GUI_HTML: &str = include_str!("../gui/x0x-gui.html");
-
-/// GET /gui — serve the embedded GUI shell.
-async fn serve_gui() -> impl IntoResponse {
-    axum::response::Html(render_gui_html())
-}
-
-fn render_gui_html() -> String {
-    GUI_HTML.replace("<!-- X0X_TOKEN_INJECTION_POINT -->", "")
-}
-
-// ---------------------------------------------------------------------------
-// KvStore handlers
-// ---------------------------------------------------------------------------
-
 /// Derive this agent's per-group TreeKEM identity seed from its long-term
 /// ML-DSA secret key and the group's id bytes (ADR-0012). Centralised so the
 /// create path and the restore path always agree on the seed (and therefore on
@@ -15477,14 +15461,6 @@ mod tests {
 
         assert!(!cache.contains_key("expired"));
         assert!(cache.contains_key("fresh"));
-    }
-
-    #[test]
-    fn rendered_gui_does_not_disclose_api_token() {
-        let html = render_gui_html();
-
-        assert!(!html.contains("super-secret-api-token"));
-        assert!(!html.contains("X0X_TOKEN"));
     }
 
     #[test]
