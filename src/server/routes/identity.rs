@@ -19,9 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate as x0x;
 
 use super::super::state::AppState;
-use super::super::{
-    api_error, bad_request, has_withdrawn_same_stable_group_record, parse_optional_json,
-};
+use super::super::{api_error, bad_request, parse_optional_json};
+use super::named_groups::has_withdrawn_same_stable_group_record;
 use super::status::ApiResponse;
 
 /// POST /agent/sign request body — a caller payload to sign with the

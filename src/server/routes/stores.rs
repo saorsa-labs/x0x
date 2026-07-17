@@ -5,7 +5,7 @@
 
 use crate as x0x;
 use super::super::{api_error, bad_request, not_found, parse_agent_id_hex, direct_message_send_config};
-use super::super::GROUP_BACKGROUND_PUBLISH_DELAY;
+use super::named_groups::GROUP_BACKGROUND_PUBLISH_DELAY;
 use super::super::state::AppState;
 use super::super::crdt_subscriptions;
 use std::sync::Arc;

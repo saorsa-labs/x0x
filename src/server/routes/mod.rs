@@ -14,6 +14,7 @@ mod files;
 mod groups;
 mod identity;
 mod machines;
+mod named_groups;
 mod messaging;
 mod network;
 mod presence;
@@ -23,8 +24,6 @@ mod tasks;
 mod trust;
 mod upgrade;
 
-#[cfg(test)]
-pub(super) use contacts::UpdateContactRequest;
 pub(super) use connect::{
     connect_diagnostics_handler, forward_add, forward_list, forward_remove, streams_diagnostics,
 };
@@ -42,24 +41,43 @@ pub(super) use discovery::{
 pub(super) use exec::{exec_cancel, exec_diagnostics, exec_run, exec_sessions};
 pub(super) use files::{
     FileChunkAckSlot, file_accept_handler, file_reject_handler, file_send_handler,
-    file_transfer_send_config, file_transfer_status_handler, file_transfers_handler,
-    handle_file_message, wait_for_chunk_window, wait_for_final_acks,
+    file_transfer_status_handler, file_transfers_handler, handle_file_message,
 };
 pub(super) use groups::{
     add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
-    mls_decrypt, mls_encrypt, remove_mls_member, save_mls_groups,
+    mls_decrypt, mls_encrypt, remove_mls_member,
 };
-#[cfg(test)]
-pub(super) use groups::{MlsDecryptRequest, MlsEncryptRequest};
 pub(super) use identity::{
     agent_info, agent_sign, agent_user_id_handler, agent_verify, announce_identity,
     get_a2a_agent_card, get_agent_card, identity_revocations, identity_revoke, import_agent_card,
-    introduction, populate_invite_base_state_from_group_info,
+    introduction,
 };
-#[cfg(test)]
-pub(super) use identity::{CardQuery, ImportCardRequest};
 pub(super) use status::{get_constitution, get_constitution_json, health, shutdown_handler, status};
 pub(super) use messaging::{RestSubscription, publish, subscribe, unsubscribe};
+pub(super) use named_groups::{
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS, ExpectedJoinResultInviter,
+    TreeKemCatchupRequest, TreeKemCatchupResponse,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, JoinResultMessage,
+    NamedGroupMetadataEvent, PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome,
+    PendingWelcomeReceive, TreeKemMemberKeyPackageCache, WelcomeBlobMessage, WelcomeFetchWaiter,
+    add_named_group_member, apply_named_group_metadata_event, approve_join_request,
+    ban_group_member, cancel_join_request, create_discovery_subscription, create_group_invite,
+    create_join_request, create_named_group, delete_discovery_subscription, discover_groups,
+    discover_groups_nearby, ensure_named_group_listeners, get_group_card,
+    get_group_public_messages, get_group_state, get_group_state_commits, get_named_group,
+    get_named_group_members, handle_join_result_message, handle_treekem_catchup_request,
+    handle_treekem_catchup_response, handle_welcome_blob_message, import_group_card,
+    ingest_public_message, join_group_via_invite, leave_group, list_discovery_subscriptions,
+    list_join_requests, list_named_groups, load_named_groups, load_treekem_member_key_packages,
+    named_group_metadata_event_kind, publish_group_card_to_discovery,
+    recover_treekem_named_journals, reject_join_request, remove_named_group_member,
+    restore_treekem_groups, seal_group_state, secure_group_decrypt, secure_group_encrypt,
+    secure_group_reseal, secure_open_envelope_adversarial, send_group_public_message,
+    set_group_display_name, spawn_directory_resubscribe, spawn_global_discovery_listener,
+    spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
+    unban_group_member, update_group_policy, update_member_role,
+    update_named_group, withdraw_group_state,
+};
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
     gossip_diagnostics, groups_diagnostics, network_status, peer_health_handler, peers,

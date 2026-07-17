@@ -4,10 +4,8 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 use crate as x0x;
-use super::super::{
-    api_error, bad_request, decode_base64_payload, not_found, parse_agent_id_hex,
-    secure_group_effect_response_after_terminality_recheck,
-};
+use super::super::{api_error, bad_request, decode_base64_payload, not_found, parse_agent_id_hex};
+use super::named_groups::secure_group_effect_response_after_terminality_recheck;
 use super::super::state::AppState;
 use std::sync::Arc;
 use anyhow::Result;
