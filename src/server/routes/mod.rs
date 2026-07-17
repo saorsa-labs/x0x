@@ -11,6 +11,7 @@ mod direct;
 mod discovery;
 mod exec;
 mod files;
+mod groups;
 mod identity;
 mod machines;
 mod messaging;
@@ -42,6 +43,12 @@ pub(super) use files::{
     file_transfer_send_config, file_transfer_status_handler, file_transfers_handler,
     handle_file_message, wait_for_chunk_window, wait_for_final_acks,
 };
+pub(super) use groups::{
+    add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
+    mls_decrypt, mls_encrypt, remove_mls_member, save_mls_groups,
+};
+#[cfg(test)]
+pub(super) use groups::{MlsDecryptRequest, MlsEncryptRequest};
 pub(super) use identity::{
     agent_info, agent_sign, agent_user_id_handler, agent_verify, announce_identity,
     get_a2a_agent_card, get_agent_card, identity_revocations, identity_revoke, import_agent_card,

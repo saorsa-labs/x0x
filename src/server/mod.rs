@@ -20,31 +20,33 @@ mod ws;
 // unchanged after the #125 / WS1.4 extraction. Internal types (AppState,
 // DaemonUpdateConfig, CachedUpgradeCheck) stay private to the crate.
 use routes::{
-    ack_diagnostics, add_contact, add_machine, add_task, agent_info, agent_reachability,
-    agent_sign, agent_user_id_handler, agent_verify, agents_by_user_handler, announce_identity,
-    apply_upgrade, bootstrap_cache_stats, broadcast_current_manifest, check_upgrade,
-    connect_agent, connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
+    ack_diagnostics, add_contact, add_machine, add_mls_member, add_task, agent_info,
+    agent_reachability, agent_sign, agent_user_id_handler, agent_verify,
+    agents_by_user_handler, announce_identity, apply_upgrade, bootstrap_cache_stats,
+    broadcast_current_manifest, check_upgrade, connect_agent, connect_diagnostics_handler,
+    connect_machine, connectivity_diagnostics, create_mls_group, create_mls_welcome,
     create_task_list, delete_contact, delete_machine, direct_connections,
     direct_message_send_config, direct_send, discovered_agent, discovered_agents,
     discovered_machine, discovered_machines, dm_diagnostics, exec_cancel, exec_diagnostics,
     exec_run, exec_sessions, file_accept_handler, file_reject_handler, file_send_handler,
     file_transfer_send_config, file_transfer_status_handler, file_transfers_handler,
     FileChunkAckSlot, find_agent, forward_add, forward_list, forward_remove,
-    get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json,
+    get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json, get_mls_group,
     gossip_diagnostics, groups_diagnostics, handle_file_message, health, identity_revocations,
     identity_revoke, import_agent_card, introduction, list_contacts, list_machines,
-    list_revocations, list_task_lists, list_tasks, machine_for_agent_handler,
-    machines_by_user_handler, network_status, peer_health_handler, peers, pin_machine,
-    populate_invite_base_state_from_group_info, presence, presence_find, presence_foaf,
-    presence_online, presence_status, probe_peer_handler, publish, quick_trust,
-    RestSubscription, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, SelfPublishedReleaseManifests, shutdown_handler, status,
-    streams_diagnostics, subscribe, unpin_machine, unsubscribe, update_contact, update_task,
-    wait_for_chunk_window, wait_for_final_acks,
+    list_mls_groups, list_revocations, list_task_lists, list_tasks, machine_for_agent_handler,
+    machines_by_user_handler, mls_decrypt, mls_encrypt, network_status, peer_health_handler,
+    peers, pin_machine, populate_invite_base_state_from_group_info, presence, presence_find,
+    presence_foaf, presence_online, presence_status, probe_peer_handler, publish, quick_trust,
+    remove_mls_member, RestSubscription, revoke_contact, run_fallback_github_poll,
+    run_gossip_update_listener, run_startup_update_check, save_mls_groups,
+    SelfPublishedReleaseManifests, shutdown_handler, status, streams_diagnostics, subscribe,
+    unpin_machine, unsubscribe, update_contact, update_task, wait_for_chunk_window,
+    wait_for_final_acks,
 };
 #[cfg(test)]
 use routes::{
-    CardQuery, ImportCardRequest, UpdateContactRequest,
+    CardQuery, ImportCardRequest, MlsDecryptRequest, MlsEncryptRequest, UpdateContactRequest,
 };
 #[cfg(test)]
 use axum::response::Response;
@@ -383,36 +385,6 @@ fn apply_withdrawn_group_card_to_group_info(
 // Request / response types
 // ---------------------------------------------------------------------------
 
-/// POST /mls/groups request body.
-#[derive(Debug, Deserialize)]
-struct CreateMlsGroupRequest {
-    /// Optional group ID as hex string. Random if omitted.
-    group_id: Option<String>,
-}
-
-/// POST /mls/groups/:id/members request body.
-#[derive(Debug, Deserialize)]
-struct AddMlsMemberRequest {
-    /// Agent ID as 64-character hex string.
-    agent_id: String,
-}
-
-/// POST /mls/groups/:id/encrypt request body.
-#[derive(Debug, Deserialize)]
-struct MlsEncryptRequest {
-    /// Base64-encoded plaintext.
-    payload: String,
-}
-
-/// POST /mls/groups/:id/decrypt request body.
-#[derive(Debug, Deserialize)]
-struct MlsDecryptRequest {
-    /// Base64-encoded ciphertext.
-    ciphertext: String,
-    /// Epoch used for encryption.
-    epoch: u64,
-}
-
 /// POST /trust/evaluate request body.
 #[derive(Debug, Deserialize)]
 struct EvaluateTrustRequest {
@@ -420,13 +392,6 @@ struct EvaluateTrustRequest {
     agent_id: String,
     /// Machine ID as hex string.
     machine_id: String,
-}
-
-/// POST /mls/groups/:id/welcome request body.
-#[derive(Debug, Deserialize)]
-struct CreateWelcomeRequest {
-    /// Invitee agent ID as hex string.
-    agent_id: String,
 }
 
 /// Run the daemon HTTP/WebSocket server to completion.
@@ -11360,7 +11325,7 @@ fn secure_group_effect_response_after_terminality_recheck_from_groups(
     }
 }
 
-async fn secure_group_effect_response_after_terminality_recheck(
+pub(in crate::server) async fn secure_group_effect_response_after_terminality_recheck(
     state: &AppState,
     group_id: &str,
     stable_group_id: Option<&str>,
@@ -14341,284 +14306,6 @@ async fn delete_kv_value(
 // Direct messaging handlers
 // ---------------------------------------------------------------------------
 
-/// POST /mls/groups — create a new MLS group.
-async fn create_mls_group(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateMlsGroupRequest>,
-) -> impl IntoResponse {
-    let group_id_bytes = match req.group_id {
-        Some(hex_str) => match hex::decode(&hex_str) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return bad_request(format!("invalid hex: {e}"));
-            }
-        },
-        None => {
-            let mut bytes = vec![0u8; 32];
-            use rand::RngCore;
-            rand::thread_rng().fill_bytes(&mut bytes);
-            bytes
-        }
-    };
-
-    let agent_id = state.agent.agent_id();
-    let group_id_hex = hex::encode(&group_id_bytes);
-
-    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id).await {
-        Ok(group) => {
-            let epoch = group.current_epoch();
-            let members: Vec<String> = group
-                .members()
-                .keys()
-                .map(|id| hex::encode(id.as_bytes()))
-                .collect();
-
-            state
-                .mls_groups
-                .write()
-                .await
-                .insert(group_id_hex.clone(), group);
-            save_mls_groups(&state).await;
-
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "group_id": group_id_hex,
-                    "epoch": epoch,
-                    "members": members
-                })),
-            )
-        }
-        Err(e) => {
-            tracing::error!("operation failed: {e}");
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-        }
-    }
-}
-
-/// GET /mls/groups — list all MLS groups.
-async fn list_mls_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let groups = state.mls_groups.read().await;
-    let entries: Vec<serde_json::Value> = groups
-        .iter()
-        .map(|(id, group)| {
-            serde_json::json!({
-                "group_id": id,
-                "epoch": group.current_epoch(),
-                "member_count": group.members().len()
-            })
-        })
-        .collect();
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "groups": entries })),
-    )
-}
-
-/// GET /mls/groups/:id — get details of a specific MLS group.
-async fn get_mls_group(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let groups = state.mls_groups.read().await;
-    let Some(group) = groups.get(&id) else {
-        return not_found("group not found");
-    };
-
-    let members: Vec<String> = group
-        .members()
-        .keys()
-        .map(|id| hex::encode(id.as_bytes()))
-        .collect();
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "group_id": id,
-            "epoch": group.current_epoch(),
-            "members": members
-        })),
-    )
-}
-
-/// POST /mls/groups/:id/members — add a member to a group.
-async fn add_mls_member(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<AddMlsMemberRequest>,
-) -> impl IntoResponse {
-    let agent_id = match parse_agent_id_hex(&req.agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": e })),
-            );
-        }
-    };
-
-    let mut groups = state.mls_groups.write().await;
-    let Some(group) = groups.get_mut(&id) else {
-        return not_found("group not found");
-    };
-
-    // add_member() auto-applies the commit internally (increments epoch).
-    // Do NOT call apply_commit() again — it would fail with epoch mismatch.
-    match group.add_member(agent_id).await {
-        Ok(_commit) => {
-            let resp = (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "epoch": group.current_epoch(),
-                    "member_count": group.members().len()
-                })),
-            );
-            drop(groups);
-            save_mls_groups(&state).await;
-            resp
-        }
-        Err(e) => {
-            tracing::error!("add_mls_member failed: {e}");
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "operation failed")
-        }
-    }
-}
-
-/// DELETE /mls/groups/:id/members/:agent_id — remove a member from a group.
-async fn remove_mls_member(
-    State(state): State<Arc<AppState>>,
-    Path((id, agent_id_hex)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let agent_id = match parse_agent_id_hex(&agent_id_hex) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": e })),
-            );
-        }
-    };
-
-    let mut groups = state.mls_groups.write().await;
-    let Some(group) = groups.get_mut(&id) else {
-        return not_found("group not found");
-    };
-
-    // remove_member() auto-applies the commit internally.
-    match group.remove_member(agent_id).await {
-        Ok(_commit) => {
-            let resp = (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "epoch": group.current_epoch(),
-                    "member_count": group.members().len()
-                })),
-            );
-            drop(groups);
-            save_mls_groups(&state).await;
-            resp
-        }
-        Err(e) => {
-            tracing::error!("remove_mls_member failed: {e}");
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-        }
-    }
-}
-
-/// POST /mls/groups/:id/encrypt — encrypt data with group key.
-async fn mls_encrypt(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<MlsEncryptRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let plaintext = match decode_base64_payload(&req.payload) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
-
-    let groups = state.mls_groups.read().await;
-    let Some(group) = groups.get(&id) else {
-        return not_found("group not found");
-    };
-
-    let (cipher, epoch) = match make_mls_cipher(group) {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
-
-    match cipher.encrypt(&plaintext, &[], epoch) {
-        Ok(ciphertext) => {
-            drop(groups);
-            secure_group_effect_response_after_terminality_recheck(
-                state.as_ref(),
-                &id,
-                Some(&id),
-                serde_json::json!({
-                "ok": true,
-                "ciphertext": BASE64.encode(&ciphertext),
-                "epoch": epoch
-                }),
-            )
-            .await
-        }
-        Err(e) => {
-            tracing::error!("mls_encrypt failed: {e}");
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "encryption failed")
-        }
-    }
-}
-
-/// POST /mls/groups/:id/decrypt — decrypt data with group key.
-async fn mls_decrypt(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<MlsDecryptRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let ciphertext = match decode_base64_payload(&req.ciphertext) {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
-
-    let groups = state.mls_groups.read().await;
-    let Some(group) = groups.get(&id) else {
-        return not_found("group not found");
-    };
-
-    let (cipher, _epoch) = match make_mls_cipher(group) {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
-
-    match cipher.decrypt(&ciphertext, &[], req.epoch) {
-        Ok(plaintext) => {
-            drop(groups);
-            secure_group_effect_response_after_terminality_recheck(
-                state.as_ref(),
-                &id,
-                Some(&id),
-                serde_json::json!({
-                "ok": true,
-                "payload": BASE64.encode(&plaintext)
-                }),
-            )
-            .await
-        }
-        Err(e) => {
-            tracing::error!("mls_decrypt failed: {e}");
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "decryption failed")
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Agent discovery & connectivity handlers
-// ---------------------------------------------------------------------------
-
 /// POST /trust/evaluate — evaluate trust decision for an (agent, machine) pair.
 async fn evaluate_trust(
     State(state): State<Arc<AppState>>,
@@ -14668,64 +14355,6 @@ async fn evaluate_trust(
 // ---------------------------------------------------------------------------
 // MLS welcome handler
 // ---------------------------------------------------------------------------
-
-/// POST /mls/groups/:id/welcome — generate a welcome message for a new member.
-async fn create_mls_welcome(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<CreateWelcomeRequest>,
-) -> impl IntoResponse {
-    let invitee = match parse_agent_id_hex(&req.agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": e })),
-            );
-        }
-    };
-
-    let groups = state.mls_groups.read().await;
-    let Some(group) = groups.get(&id) else {
-        return not_found("group not found");
-    };
-
-    match x0x::mls::MlsWelcome::create(group, &invitee) {
-        Ok(welcome) => {
-            let welcome_bytes = match bincode::serialize(&welcome) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!("welcome serialization failed: {e}");
-                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, "serialization failed");
-                }
-            };
-
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "welcome": BASE64.encode(&welcome_bytes),
-                    "group_id": id,
-                    "epoch": welcome.epoch()
-                })),
-            )
-        }
-        Err(e) => {
-            tracing::error!("create_mls_welcome failed: {e}");
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "welcome creation failed")
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Constitution handlers
-// ---------------------------------------------------------------------------
-
-/// MLS groups are session-scoped — no persistence (saorsa-mls groups not serializable).
-async fn save_mls_groups(_state: &AppState) {
-    // MLS groups backed by saorsa-mls are not serializable.
-    // They are recreated each session.
-}
 
 /// Derive this agent's per-group TreeKEM identity seed from its long-term
 /// ML-DSA secret key and the group's id bytes (ADR-0012). Centralised so the
@@ -15458,29 +15087,6 @@ fn decode_base64_payload(encoded: &str) -> Result<Vec<u8>, (StatusCode, Json<ser
         .decode(encoded)
         .map_err(|e| bad_request(format!("invalid base64: {e}")))
 }
-
-/// Derive an MLS cipher from a group's current key schedule.
-fn make_mls_cipher(
-    group: &x0x::mls::MlsGroup,
-) -> Result<(x0x::mls::MlsCipher, u64), (StatusCode, Json<serde_json::Value>)> {
-    let key_schedule = x0x::mls::MlsKeySchedule::from_group(group).map_err(|e| {
-        tracing::error!("MLS key derivation failed: {e}");
-        api_error(StatusCode::INTERNAL_SERVER_ERROR, "key derivation failed")
-    })?;
-    let cipher = x0x::mls::MlsCipher::new(
-        key_schedule.encryption_key().to_vec(),
-        key_schedule.base_nonce().to_vec(),
-    );
-    Ok((cipher, group.current_epoch()))
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// TreeKEM join-result and Welcome blob pull handling
-// ---------------------------------------------------------------------------
 
 const PENDING_JOIN_RESULT_TTL: Duration = Duration::from_secs(10 * 60);
 const JOIN_RESULT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
