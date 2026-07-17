@@ -101,3 +101,76 @@ revoke that agent.
 (`relay_refused_not_a_contact`, `relay_refused_blocked`, `relay_refused_rate_limited`,
 `relay_refused_bandwidth_exceeded`) plus `relay_forward_bytes` (total bytes
 committed to forward) so operators can see and alert on refusals.
+
+## Gossip-plane isolation (#206)
+
+Co-located daemons (prod + testnet on one host) discovered each other via
+ant-quic's first-party mDNS (`_ant-quic._udp.local.`, no namespace) and
+auto-connected, regardless of `--no-hard-coded-bootstrap`. Every transport
+connection became a gossip carrier — PlumTree eager sets are seeded from
+the live connection table — so revocations and CRDT state crossed planes,
+and the cross-plane peer persisted in each plane's bootstrap cache, making
+the contamination survive restarts.
+
+### The plane hello
+
+`NetworkConfig.network_id = Some(id)` puts a node on a named gossip plane.
+Every new connection (any source: mDNS auto-connect, bootstrap dial, cache
+redial, inbound accept) then exchanges a one-frame plane hello
+(`[0x20][len][plane_id]` on the gossip data channel; unknown to older
+peers, who drop it harmlessly):
+
+- **Matching plane** → the peer is *cleared* and becomes gossip-eligible.
+- **Mismatched plane** → the peer is evicted from the bootstrap cache and
+  disconnected with a `PolicyRejection` tombstone (never proactively
+  redialed). Hard refusal.
+- **No hello** (pre-#206 code, open-plane embedders) → the peer is held
+  out of gossip sets for a 10 s legacy grace window, then admitted. This
+  keeps rolling upgrades from partitioning the fleet; full isolation
+  requires both sides on the new code.
+
+Until cleared, a peer is excluded from eager sets, membership keepalives,
+and CRDT sync targets, and its inbound gossip frames are dropped — the
+handshake window carries no gossip in either direction. The DM bytes
+(0x10/0x11) deliberately bypass the gate: direct messaging is
+authenticated agent-to-agent traffic, and an agent deliberately bridging
+planes is operator behaviour, not a discovery bug.
+
+### Configuration
+
+| TOML `network_id` | Effective plane |
+|---|---|
+| unset | `x0x.prod` (well-known default; prod, `x0xd-443`, and personal named instances all land here and keep meshing) |
+| `""` (empty) | open — no isolation (embedders/legacy rigs that deliberately bridge) |
+| any valid id | that plane, e.g. `"x0x.testnet"` |
+
+Plane ids are ≤64 bytes of ASCII alphanumerics plus `.`, `-`, `_`
+(`x0x::network::validate_plane_id`). The library default
+(`NetworkConfig::default()`) is open; the daemon maps unset to
+`x0x.prod`, so **planes are isolated by default once each declares its
+id** — the co-located testnet needs one line in
+`/etc/x0x/config-testnet.toml`:
+
+```toml
+network_id = "x0x.testnet"
+```
+
+The bootstrap peer cache is now strictly per-data-dir
+(`<data_dir>/peers`); the former shared-default arm (the #189 shape) is
+removed.
+
+### Downstream (ant-quic) need
+
+x0x cannot disable ant-quic's mDNS or set its namespace today:
+`ant-quic` 0.27.33's `NodeConfig` (the API x0x uses) exposes no mDNS
+knob — `MdnsConfig` (enabled / service / namespace / auto_connect) only
+exists on `P2pConfig`, which `Node::with_config` fills with
+`DiscoveryPolicy::current_default()` (mDNS on, `namespace: None`,
+auto-connect on). The gossip-layer plane hello above is therefore the
+enforcement point, and cross-plane mDNS auto-connects still happen and
+are refused after one frame (small connect/refuse churn per mDNS
+re-resolution). The proper downstream fix is a `NodeConfig` mDNS knob so
+x0x can map `network_id` → mDNS namespace (cross-plane peers are then
+never dial candidates at all) and/or disable mDNS entirely for
+server-class daemons. Filed as a doc note here until an ant-quic release
+ships the surface.

@@ -327,6 +327,22 @@ pub struct DaemonConfig {
     /// (#204 must-fix 1).
     #[serde(default)]
     pub(super) forward: x0x::forward::ForwardConfig,
+
+    /// Gossip-plane identifier (issue #206, TOML: `network_id`).
+    ///
+    /// - Unset → the daemon joins the well-known prod plane
+    ///   ([`PROD_PLANE_ID`]) and refuses gossip traffic with peers that
+    ///   declare a different plane. This is the safe default: co-located
+    ///   daemons are only same-plane if they are *both* undeclared, which
+    ///   mirrors today's shared-bootstrap deployments (prod, `x0xd-443`,
+    ///   personal named instances).
+    /// - `""` (explicit empty) → open plane: no isolation at all. Escape
+    ///   hatch for embedders and legacy test rigs that deliberately bridge.
+    /// - Any other value → that plane, e.g. `network_id = "x0x.testnet"`
+    ///   for the co-located testnet. Validated by
+    ///   [`x0x::network::validate_plane_id`].
+    #[serde(default)]
+    pub network_id: Option<String>,
 }
 
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
@@ -361,16 +377,11 @@ pub fn default_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/var/lib/x0x"))
 }
 
-/// Shared cache directory used by ALL instances (not per-instance).
-/// This is always the base `x0x` dir, never `x0x-<name>`.
-pub(super) fn shared_cache_dir() -> PathBuf {
-    let dir = dirs::data_dir()
-        .map(|d| d.join("x0x"))
-        .unwrap_or_else(|| PathBuf::from("/var/lib/x0x"));
-    // Ensure it exists
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
+/// The well-known gossip plane every x0xd joins when its TOML does not
+/// declare a `network_id` (issue #206). Prod, `x0xd-443`, and unnamed
+/// personal instances all land here, preserving today's mesh; a co-located
+/// second plane (testnet, experiments) declares its own id and is refused.
+pub const PROD_PLANE_ID: &str = "x0x.prod";
 
 fn default_log_level() -> String {
     // Privacy by default for operators outside our fleet (issue #85): without
@@ -493,6 +504,24 @@ impl DaemonConfig {
             .clone()
             .unwrap_or_else(default_bootstrap_peers)
     }
+
+    /// Resolve `network_id` to the effective gossip-plane id (issue #206).
+    ///
+    /// - `None` (unset) → `Some(`[`PROD_PLANE_ID`]`)` — planes isolated by
+    ///   default: any daemon declaring a different plane is refused.
+    /// - `Some("")` → `None` — explicit opt-out (open plane, pre-#206
+    ///   behaviour).
+    /// - `Some(id)` → `Some(id)` verbatim; validity is enforced at
+    ///   `NetworkNode` construction via
+    ///   [`x0x::network::validate_plane_id`].
+    #[must_use]
+    pub fn resolved_network_id(&self) -> Option<String> {
+        match &self.network_id {
+            None => Some(PROD_PLANE_ID.to_string()),
+            Some(id) if id.is_empty() => None,
+            Some(id) => Some(id.clone()),
+        }
+    }
 }
 
 impl Default for DaemonConfig {
@@ -522,6 +551,7 @@ impl Default for DaemonConfig {
             group_card_republish_interval_secs: None,
             directory_resubscribe_jitter_ms: None,
             forward: x0x::forward::ForwardConfig::default(),
+            network_id: None,
         }
     }
 }
@@ -713,6 +743,53 @@ pub(super) struct CachedUpgradeCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_network_id_maps_unset_to_prod_and_empty_to_open() {
+        // Issue #206: the daemon default must isolate planes — an unset
+        // TOML `network_id` joins the well-known prod plane (isolation
+        // ON), and only an explicit empty string opts out.
+        let unset = DaemonConfig::default();
+        assert_eq!(
+            unset.resolved_network_id().as_deref(),
+            Some(PROD_PLANE_ID),
+            "unset network_id must resolve to the well-known prod plane"
+        );
+
+        let open = DaemonConfig {
+            network_id: Some(String::new()),
+            ..DaemonConfig::default()
+        };
+        assert_eq!(
+            open.resolved_network_id(),
+            None,
+            "explicit empty network_id must opt out (open plane)"
+        );
+
+        let testnet = DaemonConfig {
+            network_id: Some("x0x.testnet".to_string()),
+            ..DaemonConfig::default()
+        };
+        assert_eq!(
+            testnet.resolved_network_id().as_deref(),
+            Some("x0x.testnet"),
+            "explicit network_id is honored verbatim"
+        );
+    }
+
+    #[test]
+    fn network_id_toml_roundtrip_defaults_to_unset() {
+        // A config file without the key must parse with network_id unset
+        // (serde default), so existing deployments upgrade cleanly onto
+        // the prod plane.
+        let cfg: DaemonConfig = toml::from_str("bind_address = '[::]:5483'")
+            .expect("minimal TOML parses");
+        assert_eq!(cfg.network_id, None);
+
+        let cfg: DaemonConfig = toml::from_str("network_id = 'x0x.testnet'")
+            .expect("network_id TOML parses");
+        assert_eq!(cfg.network_id.as_deref(), Some("x0x.testnet"));
+    }
 
     // The two canonical messages enforced by `InstanceName::try_from`.
     // `x0xd::resolve_instance_startup` propagates these verbatim (bare `?`,
