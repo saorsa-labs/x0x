@@ -332,6 +332,16 @@ pub struct Agent {
     /// surfacing inbound [`streams::PeerStream`]s that have cleared the
     /// identity gate, plus an idempotent started-flag for the accept loop.
     stream_accept: std::sync::Arc<streams::StreamAccept>,
+    /// Connect ACL (#131) consulted by the inbound byte-stream accept loop
+    /// (#132): with an `Enabled` policy, every announced agent on the peer
+    /// machine must be pair-listed or the stream is reset
+    /// ([`error::NetworkError::PeerNotInConnectAcl`]). Defaults to
+    /// [`connect::ConnectPolicy::default`] (Disabled ⇒ no ACL constraint);
+    /// the daemon installs the loaded policy at startup via
+    /// [`Agent::set_connect_policy`]. `std` RwLock: gate reads are a brief
+    /// clone of the inner `Arc`, never held across an await.
+    connect_policy:
+        std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -8522,13 +8532,74 @@ impl Agent {
         ))
     }
 
-    /// Await the next inbound byte-stream that has cleared the identity gate.
+    /// Await the next inbound byte-stream that has cleared the identity gate
+    /// **and whose protocol has no registered acceptor**.
     ///
     /// Returns `None` when the accept loop has stopped (e.g. after shutdown).
-    /// The T4 forwarder consumes accepted streams through this method.
+    /// Protocols with a registered acceptor
+    /// ([`Self::register_stream_acceptor`]) are routed there instead — this
+    /// default sink never sees them.
     pub async fn next_incoming_stream(&self) -> Option<streams::PeerStream> {
         let mut rx = self.stream_accept.receiver().lock().await;
         rx.recv().await
+    }
+
+    /// Register the single consumer for one stream protocol.
+    ///
+    /// Returns a bounded [`streams::StreamAcceptor`] (capacity
+    /// [`streams::STREAM_ACCEPTOR_CAPACITY`]) that surfaces inbound
+    /// [`streams::PeerStream`]s for `protocol` after they have cleared the
+    /// identity gate, the connect-ACL gate, and the protocol handshake.
+    /// The T4 forwarder owns `ForwardV1`/`ForwardV2` this way; a T5 SOCKS5
+    /// listener would register `SocksV1`.
+    ///
+    /// Exactly one acceptor may be live per protocol: a duplicate
+    /// registration fails with
+    /// [`error::NetworkError::StreamAcceptorConflict`]. Dropping the
+    /// acceptor deregisters it — subsequent streams for the protocol fall
+    /// back to the default sink ([`Self::next_incoming_stream`]).
+    ///
+    /// # Errors
+    /// [`error::NetworkError::StreamAcceptorConflict`] if an acceptor is
+    /// already registered for `protocol`.
+    pub fn register_stream_acceptor(
+        &self,
+        protocol: streams::StreamProtocol,
+    ) -> error::NetworkResult<streams::StreamAcceptor> {
+        self.stream_accept.register(protocol)
+    }
+
+    /// Install the connect ACL policy (#131) consulted by the inbound
+    /// byte-stream accept loop.
+    ///
+    /// With [`connect::ConnectPolicy::Enabled`], an inbound stream is only
+    /// surfaced when **every** announced agent on the peer machine is
+    /// `(AgentId, MachineId)`-listed in the ACL (fail-closed, mirroring the
+    /// forwarder's every-agent rule, #192); an unlisted peer's stream is
+    /// reset with zero application bytes exchanged. With
+    /// [`connect::ConnectPolicy::Disabled`] (the default) no ACL constraint
+    /// applies and the identity gate remains the sole stream boundary —
+    /// connect-forwarding itself stays default-deny at the T4 forwarder.
+    ///
+    /// The daemon calls this once at startup with the loaded policy; library
+    /// embedders that want ACL-gated streams do the same.
+    pub fn set_connect_policy(&self, policy: std::sync::Arc<connect::ConnectPolicy>) {
+        let mut guard = self
+            .connect_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = policy;
+    }
+
+    /// The currently installed connect ACL policy (defaults to
+    /// [`connect::ConnectPolicy::Disabled`] — see [`Self::set_connect_policy`]).
+    #[must_use]
+    pub fn connect_policy(&self) -> std::sync::Arc<connect::ConnectPolicy> {
+        let guard = self
+            .connect_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::sync::Arc::clone(&guard)
     }
 
     /// Start the inbound byte-stream accept loop (idempotent).
@@ -8536,9 +8607,13 @@ impl Agent {
     /// Called automatically by [`Agent::join_network`]. The loop is the SOLE
     /// consumer of [`network::NetworkNode::accept_bi`]; every inbound stream
     /// clears the identity gate (machine has a known agent → not revoked →
-    /// trust `Accept`) and the protocol handshake before being surfaced via
-    /// [`Self::next_incoming_stream`]. A stream that fails the gate is reset
-    /// (its halves are dropped) with zero application bytes exchanged.
+    /// trust `Accept`), then the connect-ACL gate ([`Self::set_connect_policy`]
+    /// — every announced agent pair-listed when the policy is `Enabled`),
+    /// then the protocol handshake, before being routed by protocol byte to
+    /// the registered acceptor ([`Self::register_stream_acceptor`]) or the
+    /// default sink ([`Self::next_incoming_stream`]). A stream that fails a
+    /// gate is reset (its halves are dropped) with zero application bytes
+    /// exchanged.
     fn start_stream_accept_loop(&self) {
         if !self.stream_accept.start_once() {
             return;
@@ -8549,6 +8624,7 @@ impl Agent {
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
+        let connect_policy = std::sync::Arc::clone(&self.connect_policy);
         let incoming = std::sync::Arc::clone(&self.stream_accept);
         let token = self.shutdown_token.clone();
 
@@ -8647,6 +8723,30 @@ impl Agent {
                 let agents: Vec<identity::AgentId> =
                     agents.into_iter().map(|(a, _)| a).collect();
 
+                // Connect-ACL gate (#131 × #132): with an Enabled policy every
+                // announced agent on this machine must be pair-listed in the
+                // ACL; an unlisted peer's stream is reset here with zero
+                // application bytes exchanged (fail-closed second layer,
+                // mirrors forward::decide_inbound's every-agent rule, #192).
+                // A Disabled policy adds no constraint.
+                let policy = {
+                    let guard = connect_policy
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::sync::Arc::clone(&guard)
+                };
+                if let Err(e) = streams::stream_acl_gate(&policy, &agents, &machine_id) {
+                    tracing::info!(
+                        target: "x0x::streams",
+                        machine = %hex::encode(machine_id.as_bytes()),
+                        agent_count = agents.len(),
+                        outcome = "deny_acl",
+                        error = %e,
+                        "inbound stream denied at connect-ACL gate (unlisted peer)"
+                    );
+                    continue;
+                }
+
                 // DISPATCH (DoS hardening, issue #132): the protocol-prefix
                 // read + surfacing run in a per-stream task so a peer that
                 // opens a stream and never sends the prefix cannot block this
@@ -8686,11 +8786,18 @@ impl Agent {
                     };
                     let peer_stream =
                         streams::PeerStream::new(agents, machine_id, protocol, send, recv);
-                    // try_send so a slow consumer cannot pile up accepted
-                    // streams in memory; a full channel drops the stream.
-                    if incoming_for_task.sender().try_send(peer_stream).is_err() {
+                    // Route by protocol byte to the registered acceptor (or
+                    // the default sink), then try_send so a slow consumer
+                    // cannot pile up accepted streams in memory; a full
+                    // channel drops (resets) the stream.
+                    if incoming_for_task
+                        .sender_for(protocol)
+                        .try_send(peer_stream)
+                        .is_err()
+                    {
                         tracing::debug!(
                             target: "x0x::streams",
+                            protocol = ?protocol,
                             "incoming-stream channel full; dropping accepted stream"
                         );
                     }
@@ -10197,6 +10304,9 @@ impl AgentBuilder {
             peer_relay,
             relay_candidates,
             stream_accept: std::sync::Arc::new(streams::StreamAccept::new(256)),
+            connect_policy: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+                connect::ConnectPolicy::default(),
+            ))),
         })
     }
 }

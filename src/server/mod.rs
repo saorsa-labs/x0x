@@ -922,20 +922,28 @@ pub async fn serve_with_options(
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
-    // Tailnet forwarder (#132 T4): build the connect-ACL diagnostics + the
-    // ForwardService. The inbound consumer is the sole reader of
-    // ForwardV1 streams and gates each at `evaluate_connect_gate` before any
-    // local connect. Only spawn when connect is enabled by policy.
+    // Tailnet streams + forwarder (#131 × #132): install the loaded connect
+    // policy on the agent so the inbound byte-stream accept loop refuses
+    // streams from ACL-unlisted peers (default-closed when the policy is
+    // Enabled; no ACL constraint when Disabled). Then build the connect-ACL
+    // diagnostics + the ForwardService, whose inbound consumers are the
+    // registered acceptors for the ForwardV1/ForwardV2 stream protocols and
+    // gate each stream at `evaluate_connect_gate` before any local connect.
+    // Only spawn the forwarder when connect is enabled by policy.
+    agent.set_connect_policy(Arc::new(connect_policy.clone()));
     let connect_diagnostics = Arc::new(x0x::connect::ConnectDiagnostics::new(
         connect_policy.summary(),
     ));
     let forward_service = if connect_policy.enabled() {
-        let fs = Arc::new(x0x::forward::ForwardService::new(
-            Arc::clone(&agent),
-            Arc::new(connect_policy.clone()),
-            Arc::clone(&connect_diagnostics),
-            config.forward.require_attestation,
-        ));
+        let fs = Arc::new(
+            x0x::forward::ForwardService::new(
+                Arc::clone(&agent),
+                Arc::new(connect_policy.clone()),
+                Arc::clone(&connect_diagnostics),
+                config.forward.require_attestation,
+            )
+            .context("failed to register forwarder stream acceptors")?,
+        );
         fs.spawn_inbound();
         Some(fs)
     } else {
