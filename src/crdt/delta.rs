@@ -12,7 +12,7 @@
 //!
 //! This significantly reduces bandwidth usage in collaborative scenarios.
 
-use crate::crdt::{Result, TaskId, TaskItem, TaskList};
+use crate::crdt::{Result, TaskId, TaskItem, TaskList, TaskListId};
 use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,34 @@ impl TaskListDelta {
             && self.ordering_update.is_none()
             && self.name_update.is_none()
     }
+
+    /// Digest over the full-state content this delta serves, when the delta
+    /// is full-state-shaped (issue #240).
+    ///
+    /// A `TaskList::full_delta` always carries BOTH the ordering and name
+    /// registers; incremental deltas carry at most one of them, so `None`
+    /// cleanly excludes non-full-state shapes. Callers MUST additionally
+    /// require the added-task count to equal the holder's declared
+    /// `entry_count` before treating a digest match as a verified full
+    /// serve. The digest commits to the carried tasks' RESOLVED observable
+    /// fields in sorted task-id order (see
+    /// [`TaskItem::hash_resolved_fields`]) — identical to what
+    /// [`TaskList::served_digest`] computes over local state, so a receiver
+    /// holding exactly the served content produces the same digest.
+    pub(crate) fn served_digest(&self, list_id: &TaskListId) -> Option<[u8; 32]> {
+        self.ordering_update.as_ref()?;
+        self.name_update.as_ref()?;
+        let mut h = blake3::Hasher::new();
+        h.update(crate::crdt::task_list::SERVED_DIGEST_DOMAIN);
+        h.update(list_id.as_bytes());
+        let mut ids: Vec<&TaskId> = self.added_tasks.keys().collect();
+        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for id in ids {
+            h.update(id.as_bytes());
+            self.added_tasks[id].0.hash_resolved_fields(&mut h);
+        }
+        Some(*h.finalize().as_bytes())
+    }
 }
 
 /// Extension to TaskList to support delta-based synchronization.
@@ -131,7 +159,12 @@ impl TaskList {
     /// with `merge_delta`, whose upsert/LWW semantics make a full snapshot a
     /// safe superset of any incremental change — this is the producer used to
     /// answer cold-start state requests (see `TaskListSync`). The OR-Set tags
-    /// are synthetic because the receiver re-derives membership on merge.
+    /// are synthetic because the receiver re-derives membership on merge —
+    /// but they must be FRESH per entry (F3, fix-loop): the digest-verified
+    /// adopt prunes stale tasks with a local observe-remove, which
+    /// tombstones the tags a previous full delta used, and a hardcoded tag
+    /// would then be silently rejected on a later serve that re-adds the
+    /// task — a permanent re-add deadlock.
     #[must_use]
     pub fn full_delta(&self) -> TaskListDelta {
         let mut delta = TaskListDelta::new(self.version());
@@ -139,7 +172,7 @@ impl TaskList {
         let ordered = self.tasks_ordered();
         for task in &ordered {
             let task_id = *task.id();
-            let tag = (PeerId::new([0u8; 32]), 0);
+            let tag = (PeerId::new([0u8; 32]), self.next_seq());
             delta.added_tasks.insert(task_id, ((*task).clone(), tag));
         }
 

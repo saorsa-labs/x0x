@@ -463,6 +463,15 @@ pub enum DmError {
     #[error("recipient key material unavailable: {0}")]
     RecipientKeyUnavailable(String),
 
+    /// The locally cached capability advert / contact card carries a KEM
+    /// public key that does not decode under the active KEM variant — the
+    /// sender's view of the recipient has not converged (or is corrupt).
+    /// Transient: a fresh advert/contact sync replaces the entry, so callers
+    /// should retry rather than treat this as a malformed request (issue
+    /// #188 — this used to surface as an opaque `envelope_construction` 400).
+    #[error("recipient key material invalid: {0}")]
+    RecipientKeyInvalid(String),
+
     /// No application-layer ACK received within the retry budget. The DM
     /// MAY or may not have been delivered; the sender cannot distinguish.
     /// Safe to retry (recipient dedupes on `request_id`).
@@ -974,6 +983,22 @@ fn build_aead_aad(
     aad
 }
 
+/// Validate that cached recipient KEM public-key bytes decode under the
+/// active [`KEM_VARIANT`].
+///
+/// Senders call this before committing to the gossip-inbox path so a
+/// stale/corrupt capability entry surfaces as the retryable
+/// [`DmError::RecipientKeyInvalid`] instead of an opaque
+/// [`DmError::EnvelopeConstruction`] deep inside envelope building (issue
+/// #188). Cheap: a length/format check only, no crypto.
+pub fn validate_recipient_kem_key(
+    recipient_kem_pubkey_bytes: &[u8],
+) -> std::result::Result<(), String> {
+    MlKemPublicKey::from_bytes(KEM_VARIANT, recipient_kem_pubkey_bytes)
+        .map(|_| ())
+        .map_err(|e| format!("recipient KEM pubkey decode: {e}"))
+}
+
 /// Encrypt an inner `DmPlaintext` into a `DmPayload` using the recipient's
 /// ML-KEM-768 public key.
 pub fn encrypt_payload(
@@ -1189,9 +1214,10 @@ impl EnvelopeBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`DmError::EnvelopeConstruction`] if KEM encapsulation,
-    /// AEAD encryption, signing-bytes serialisation, the `sign`
-    /// closure, or the attestation signature fail — or if
+    /// Returns [`DmError::PayloadTooLarge`] if `payload` exceeds
+    /// [`MAX_PAYLOAD_BYTES`], or [`DmError::EnvelopeConstruction`] if KEM
+    /// encapsulation, AEAD encryption, signing-bytes serialisation, the
+    /// `sign` closure, or the attestation signature fail — or if
     /// `machine_keypair` does not own `self_machine_id`.
     #[allow(clippy::too_many_arguments)]
     pub fn build_payload_envelope<F>(
@@ -1209,6 +1235,16 @@ impl EnvelopeBuilder {
     where
         F: FnOnce(&[u8]) -> std::result::Result<Vec<u8>, String>,
     {
+        // Classify the size cap with its dedicated variant so API layers can
+        // answer 413 instead of the opaque `envelope_construction` 400
+        // (issue #188). Covers the relay-fallback path, which has no earlier
+        // size gate.
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(DmError::PayloadTooLarge {
+                len: payload.len(),
+                max: MAX_PAYLOAD_BYTES,
+            });
+        }
         if machine_keypair.machine_id() != *self_machine_id {
             return Err(DmError::EnvelopeConstruction(
                 "machine keypair does not own self_machine_id".to_string(),
@@ -1427,6 +1463,47 @@ mod tests {
         cache.insert(k, DmAckOutcome::Accepted);
         std::thread::sleep(Duration::from_millis(100));
         assert!(cache.lookup(&k).is_none());
+    }
+
+    #[test]
+    fn build_payload_envelope_oversized_payload_is_payload_too_large() {
+        // Issue #188: the size cap must be classified with its dedicated
+        // variant (API answers 413), never `EnvelopeConstruction` (400).
+        // Covers the relay-fallback path, which has no earlier size gate.
+        let machine_kp = crate::identity::MachineKeypair::generate().expect("machine keypair");
+        let machine_id = machine_kp.machine_id();
+        let result = EnvelopeBuilder::build_payload_envelope(
+            [1u8; 16],
+            &AgentId([1u8; 32]),
+            &machine_id,
+            &machine_kp,
+            &AgentId([3u8; 32]),
+            // KEM key deliberately empty — the size check must fire first.
+            &[],
+            0,
+            0,
+            vec![0u8; MAX_PAYLOAD_BYTES + 1],
+            |bytes| Ok(bytes.to_vec()),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(DmError::PayloadTooLarge { len, max })
+                    if len == MAX_PAYLOAD_BYTES + 1 && max == MAX_PAYLOAD_BYTES
+            ),
+            "oversized payload must be PayloadTooLarge, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_recipient_kem_key_rejects_garbage_accepts_real_key() {
+        // Issue #188: empty / wrong-length cached keys are the transient
+        // not-converged case the sender must classify as retryable
+        // `RecipientKeyInvalid`, not `EnvelopeConstruction`.
+        assert!(validate_recipient_kem_key(&[]).is_err());
+        assert!(validate_recipient_kem_key(&[0xAAu8; 32]).is_err());
+        let keypair = AgentKemKeypair::generate().expect("kem keypair");
+        assert!(validate_recipient_kem_key(&keypair.public_bytes).is_ok());
     }
 
     #[test]

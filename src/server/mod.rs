@@ -768,6 +768,7 @@ pub async fn serve_with_options(
         // single invocation without editing the config file.
         port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
         peer_relay: config.peer_relay.clone(),
+        observed_prefix_enabled: config.observed_prefix_enabled,
     };
 
     let contacts_path = config.data_dir.join("contacts.json");
@@ -922,20 +923,28 @@ pub async fn serve_with_options(
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
-    // Tailnet forwarder (#132 T4): build the connect-ACL diagnostics + the
-    // ForwardService. The inbound consumer is the sole reader of
-    // ForwardV1 streams and gates each at `evaluate_connect_gate` before any
-    // local connect. Only spawn when connect is enabled by policy.
+    // Tailnet streams + forwarder (#131 × #132): install the loaded connect
+    // policy on the agent so the inbound byte-stream accept loop refuses
+    // streams from ACL-unlisted peers (default-closed when the policy is
+    // Enabled; no ACL constraint when Disabled). Then build the connect-ACL
+    // diagnostics + the ForwardService, whose inbound consumers are the
+    // registered acceptors for the ForwardV1/ForwardV2 stream protocols and
+    // gate each stream at `evaluate_connect_gate` before any local connect.
+    // Only spawn the forwarder when connect is enabled by policy.
+    agent.set_connect_policy(Arc::new(connect_policy.clone()));
     let connect_diagnostics = Arc::new(x0x::connect::ConnectDiagnostics::new(
         connect_policy.summary(),
     ));
     let forward_service = if connect_policy.enabled() {
-        let fs = Arc::new(x0x::forward::ForwardService::new(
-            Arc::clone(&agent),
-            Arc::new(connect_policy.clone()),
-            Arc::clone(&connect_diagnostics),
-            config.forward.require_attestation,
-        ));
+        let fs = Arc::new(
+            x0x::forward::ForwardService::new(
+                Arc::clone(&agent),
+                Arc::new(connect_policy.clone()),
+                Arc::clone(&connect_diagnostics),
+                config.forward.require_attestation,
+            )
+            .context("failed to register forwarder stream acceptors")?,
+        );
         fs.spawn_inbound();
         Some(fs)
     } else {
@@ -10835,7 +10844,18 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
         .insert(group_id, handle);
 }
 
-/// POST /groups/:id/invite — generate an invite link (body optional).
+/// POST /groups/:id/invite — generate an invite link (admin+; body optional).
+///
+/// Authority follows ADR-0016: any active Admin-or-higher member may mint
+/// invites (issue #107 — invite minting is an admission/routing act, not a
+/// creator-cryptographic one). The route checks the caller's role against
+/// its daemon's LOCAL roster view, which may lag convergence (a just-demoted
+/// admin can still mint until the demotion applies locally). That is safe,
+/// not a bypass: the joiner's `MemberJoined` routes to the minting admin,
+/// which authors the authority-signed `MemberAdded` commit, and every
+/// receiver's `validate_apply` enforces `AdminOrHigher` against ITS
+/// converged roster — a commit signed by a no-longer-admin fails group-wide,
+/// so a stale invite never produces unauthorized membership.
 async fn create_group_invite(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -10891,7 +10911,8 @@ async fn create_group_invite(
 
         // Issue #205: enforce the DM-safe budget at mint so a roster that
         // would blow the gossip-DM cap fails loudly here, not as an opaque
-        // `envelope_construction` 400 at /direct/send later (issue #188).
+        // `envelope_construction` rejection at /direct/send later (issue
+        // #188; that path now reports `payload_too_large` 413).
         let link = match invite.encode_link() {
             Ok(link) => link,
             Err(e) => {
@@ -11064,7 +11085,30 @@ async fn join_group_via_invite(
                 .values()
                 .any(|info| info.mls_group_id == group_id_hex)
         {
-            return api_error(StatusCode::CONFLICT, "group already joined");
+            // Issue #188: a duplicate/replayed join (retried cmd-DM,
+            // redelivered invite) for a group this node already joined — or
+            // is mid-join on, since the local stub lands in `named_groups`
+            // before TreeKEM convergence completes — is an idempotent
+            // success, not an error. No state is mutated and no MemberJoined
+            // is re-published; the membership lock above serializes the
+            // first-join/replay race.
+            let info = groups.get(&group_id_hex).or_else(|| {
+                groups
+                    .values()
+                    .find(|info| info.mls_group_id == group_id_hex)
+            });
+            if let Some(info) = info {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "already_joined": true,
+                        "group_id": group_id_hex,
+                        "group_name": info.name,
+                        "chat_topic": info.general_chat_topic(),
+                    })),
+                );
+            }
         }
     }
     let inviter = match parse_agent_id_hex(&invite.inviter) {
@@ -13461,7 +13505,12 @@ async fn update_group_policy(
     )
 }
 
-/// PATCH /groups/:id/members/:agent_id/role — change a member's role.
+/// PATCH /groups/:id/members/:agent_id/role — change a member's role (admin+).
+///
+/// Only the flat ADR-0016 vocabulary (`admin`, `member`) is assignable.
+/// Ownership transfer is deliberately unsupported: ADR-0016 §4 dissolved
+/// the distinct Owner role, so `role=owner` returns a 400 naming the legacy
+/// role rather than a partial-transfer stub (issue #107 item (d)).
 async fn update_member_role(
     State(state): State<Arc<AppState>>,
     Path((id, agent_id_hex)): Path<(String, String)>,
@@ -16745,6 +16794,12 @@ async fn direct_send(
                 x0x::dm::DmError::RecipientKeyUnavailable(_) => {
                     (StatusCode::NOT_FOUND, "recipient_key_unavailable")
                 }
+                // Issue #188: the cached capability advert / contact card is
+                // not converged (or corrupt) — transient, safe to retry. 409,
+                // NOT 400: the request itself was well-formed.
+                x0x::dm::DmError::RecipientKeyInvalid(_) => {
+                    (StatusCode::CONFLICT, "recipient_key_invalid")
+                }
                 x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
                 x0x::dm::DmError::PeerLikelyOffline { .. } => {
                     (StatusCode::BAD_GATEWAY, "peer_likely_offline")
@@ -16758,8 +16813,11 @@ async fn direct_send(
                 x0x::dm::DmError::LocalGossipUnavailable(_) => {
                     (StatusCode::SERVICE_UNAVAILABLE, "local_gossip_unavailable")
                 }
+                // Local envelope build/crypto failure (signing, AEAD, KEM
+                // encap, serialization). A well-formed client request cannot
+                // cause this — it is a server fault, never a 400 (issue #188).
                 x0x::dm::DmError::EnvelopeConstruction(_) => {
-                    (StatusCode::BAD_REQUEST, "envelope_construction")
+                    (StatusCode::INTERNAL_SERVER_ERROR, "envelope_construction")
                 }
                 x0x::dm::DmError::PayloadTooLarge { .. } => {
                     (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
@@ -27114,11 +27172,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_join_group_via_invite_for_present_group_returns_conflict_preserving_state(
+    async fn second_join_group_via_invite_for_present_group_returns_ok_idempotent_preserving_state(
     ) -> Result<()> {
-        // Codex blocker 2: a second join_group_via_invite for an already-present
-        // group must short-circuit with CONFLICT before mutating any GroupInfo or
-        // TreeKEM state.
+        // Issue #188: a duplicate/replayed join cmd (retried cmd-DM,
+        // redelivered invite) for an already-present group is an idempotent
+        // 200 no-op — it must not mutate GroupInfo / TreeKEM state and must
+        // not re-publish the MemberJoined event. Previously this returned
+        // 409, which the dogfood runner surfaced as a join failure.
         let fixture = member_joined_treekem_fixture(0xd1, 0xd2).await?;
         let state = Arc::clone(&fixture.state);
         let (pre_hash, pre_epoch) = {
@@ -27129,13 +27189,17 @@ mod tests {
         };
         let invite = x0x::groups::invite::SignedInvite::new(
             fixture.group_id.clone(),
-            "conflict-guard".to_string(),
+            "idempotent-replay".to_string(),
             &state.agent.agent_id(),
             3600,
         );
         let invite_link = invite
             .encode_link()
             .expect("minimal invite encodes under budget");
+        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .clear();
         let response = join_group_via_invite(
             State(Arc::clone(&state)),
             Json(JoinGroupRequest {
@@ -27148,8 +27212,25 @@ mod tests {
         let (status, body) = response_json(response).await?;
         assert_eq!(
             status,
-            StatusCode::CONFLICT,
-            "second join for present group returns CONFLICT, body: {body}"
+            StatusCode::OK,
+            "duplicate join for present group is an idempotent 200, body: {body}"
+        );
+        assert_eq!(body["ok"], true);
+        assert_eq!(
+            body["already_joined"], true,
+            "duplicate join is flagged as an idempotent no-op, body: {body}"
+        );
+        assert_eq!(body["group_id"], fixture.group_id);
+        assert!(
+            body["chat_topic"].as_str().is_some_and(|t| !t.is_empty()),
+            "idempotent response keeps the success shape, body: {body}"
+        );
+        assert!(
+            NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+                .lock()
+                .expect("publish-attempt recorder poisoned")
+                .is_empty(),
+            "duplicate join must not re-publish MemberJoined"
         );
         let (post_hash, post_epoch) = {
             let groups = state.named_groups.read().await;
@@ -27159,6 +27240,129 @@ mod tests {
         };
         assert_eq!(post_hash, pre_hash, "GroupInfo state hash preserved");
         assert_eq!(post_epoch, pre_epoch, "TreeKEM epoch preserved");
+        Ok(())
+    }
+
+    fn direct_send_test_request(agent_id: String, payload: String) -> DirectSendRequest {
+        DirectSendRequest {
+            agent_id,
+            payload,
+            prefer_raw_quic_if_connected: false,
+            raw_quic_receive_ack_ms: None,
+            stop_fallback_on_raw_error: false,
+            require_gossip: false,
+            require_gossip_ack: None,
+            require_ack_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_send_malformed_request_fields_stay_bad_request() -> Result<()> {
+        // Issue #188 acceptance: genuinely malformed payloads remain 400.
+        let (state, _dir) = secure_endpoint_test_state().await?;
+
+        // Non-hex agent_id.
+        let response = direct_send(
+            State(Arc::clone(&state)),
+            Json(direct_send_test_request(
+                "not-hex".to_string(),
+                BASE64.encode(b"hello"),
+            )),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "garbage agent_id stays 400, body: {body}"
+        );
+        assert_eq!(body["ok"], false);
+
+        // Well-formed agent_id, invalid base64 payload.
+        let response = direct_send(
+            State(state),
+            Json(direct_send_test_request(
+                "ab".repeat(32),
+                "!!!not-base64!!!".to_string(),
+            )),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "garbage base64 payload stays 400, body: {body}"
+        );
+        assert_eq!(body["ok"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_send_undecodable_recipient_key_is_retryable_conflict_not_bad_request(
+    ) -> Result<()> {
+        // Issue #188: a cached capability advert whose KEM key does not
+        // decode (the sender's not-yet-converged / corrupt view of the
+        // recipient) is a transient — 409 with a distinct error string,
+        // never the opaque `envelope_construction` 400 the dogfood hit.
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let recipient = AgentId([7u8; 32]);
+        state.agent.capability_store().insert(
+            recipient,
+            x0x::identity::MachineId([9u8; 32]),
+            x0x::dm::DmCapabilities::v1_gossip_ready(vec![0xAAu8; 32]),
+            x0x::dm::now_unix_ms(),
+        );
+        let response = direct_send(
+            State(state),
+            Json(direct_send_test_request(
+                hex::encode(recipient.as_bytes()),
+                BASE64.encode(b"hello"),
+            )),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "undecodable cached key must be a retryable 409, body: {body}"
+        );
+        assert_eq!(body["error"], "recipient_key_invalid");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_send_unready_gossip_runtime_is_retryable_503_not_bad_request() -> Result<()> {
+        // Issue #188: the recipient's capability is valid but the local
+        // gossip runtime is not up yet — a not-ready transient surfaced as
+        // 503, never 400.
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let recipient = AgentId([7u8; 32]);
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        state.agent.capability_store().insert(
+            recipient,
+            x0x::identity::MachineId([9u8; 32]),
+            x0x::dm::DmCapabilities::v1_gossip_ready(kem.public_bytes.clone()),
+            x0x::dm::now_unix_ms(),
+        );
+        let response = direct_send(
+            State(state),
+            Json(direct_send_test_request(
+                hex::encode(recipient.as_bytes()),
+                BASE64.encode(b"hello"),
+            )),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not-ready gossip runtime must be a retryable 503, body: {body}"
+        );
+        assert_eq!(body["error"], "local_gossip_unavailable");
         Ok(())
     }
 
