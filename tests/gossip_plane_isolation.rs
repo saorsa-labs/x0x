@@ -40,10 +40,7 @@ async fn build_agent(dir: &std::path::Path, name: &str, network_id: Option<&str>
 async fn connect_pair(a: &Agent, b: &Agent) {
     let b_addr = b.bound_addr().await.expect("b bound addr");
     let a_network = a.network().expect("a network");
-    let connected = a_network
-        .connect_addr(b_addr)
-        .await
-        .expect("a dials b");
+    let connected = a_network.connect_addr(b_addr).await.expect("a dials b");
     assert_eq!(connected.0, b.machine_id().0, "a connected to b's identity");
 
     let b_peer = ant_quic::PeerId(b.machine_id().0);
@@ -91,7 +88,9 @@ async fn open_plane_pair_exchanges_gossip() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let payload = b"open-plane carrier proof".to_vec();
-    bob.publish(TOPIC, payload.clone()).await.expect("bob publishes");
+    bob.publish(TOPIC, payload.clone())
+        .await
+        .expect("bob publishes");
     assert!(
         recv_payload(&mut alice_sub, &payload, Duration::from_secs(15)).await,
         "alice should receive from bob on the open plane"
@@ -138,7 +137,11 @@ async fn cross_plane_pair_does_not_exchange_gossip() {
         .expect("prod publishes");
 
     let (prod_saw_testnet, testnet_saw_prod) = tokio::join!(
-        recv_payload(&mut prod_sub, b"testnet junk payload", Duration::from_secs(6)),
+        recv_payload(
+            &mut prod_sub,
+            b"testnet junk payload",
+            Duration::from_secs(6)
+        ),
         recv_payload(&mut testnet_sub, b"prod payload", Duration::from_secs(6)),
     );
     assert!(
@@ -190,7 +193,9 @@ async fn same_plane_pair_converges() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let payload = b"same-plane convergence".to_vec();
-    two.publish(TOPIC, payload.clone()).await.expect("two publishes");
+    two.publish(TOPIC, payload.clone())
+        .await
+        .expect("two publishes");
     assert!(
         recv_payload(&mut one_sub, &payload, Duration::from_secs(15)).await,
         "same-plane peer should receive"

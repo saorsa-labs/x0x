@@ -2739,9 +2739,7 @@ impl NetworkNode {
             debug!("NetworkNode plane gatekeeper started");
             let mut lifecycle = {
                 let guard = node.read().await;
-                guard
-                    .as_ref()
-                    .map(|node| node.subscribe_all_peer_events())
+                guard.as_ref().map(|node| node.subscribe_all_peer_events())
             };
             loop {
                 let event = tokio::select! {
@@ -2776,8 +2774,7 @@ impl NetworkNode {
                         ant_quic::PeerId(peer_id),
                         ant_quic::PeerLifecycleEvent::Established { .. },
                     ) => {
-                        plane_note_connected(&plane_id, &plane_peers, &node, peer_id, false)
-                            .await;
+                        plane_note_connected(&plane_id, &plane_peers, &node, peer_id, false).await;
                     }
                     GatekeeperEvent::Lifecycle(
                         ant_quic::PeerId(peer_id),
@@ -2786,8 +2783,7 @@ impl NetworkNode {
                         // A fresh connection generation for a peer we may
                         // already have cleared: re-gate until its hello on
                         // the new connection re-verifies the plane.
-                        plane_note_connected(&plane_id, &plane_peers, &node, peer_id, true)
-                            .await;
+                        plane_note_connected(&plane_id, &plane_peers, &node, peer_id, true).await;
                     }
                     GatekeeperEvent::Network(NetworkEvent::PeerDisconnected {
                         peer_id, ..
@@ -3372,15 +3368,10 @@ impl NetworkNode {
                         // penalty — the peer simply stays pending.
                         if type_byte == PLANE_HELLO_STREAM_TYPE {
                             let len = data.get(1).map(|b| usize::from(*b));
-                            let plane_bytes =
-                                len.and_then(|n| data.get(2..2 + n));
+                            let plane_bytes = len.and_then(|n| data.get(2..2 + n));
                             match plane_bytes.and_then(|b| std::str::from_utf8(b).ok()) {
-                                Some(their_plane)
-                                    if validate_plane_id(their_plane).is_ok() =>
-                                {
-                                    plane_node
-                                        .plane_handle_hello(peer_id, their_plane)
-                                        .await;
+                                Some(their_plane) if validate_plane_id(their_plane).is_ok() => {
+                                    plane_node.plane_handle_hello(peer_id, their_plane).await;
                                 }
                                 _ => {
                                     warn!(

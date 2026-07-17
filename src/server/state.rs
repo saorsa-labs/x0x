@@ -782,12 +782,12 @@ mod tests {
         // A config file without the key must parse with network_id unset
         // (serde default), so existing deployments upgrade cleanly onto
         // the prod plane.
-        let cfg: DaemonConfig = toml::from_str("bind_address = '[::]:5483'")
-            .expect("minimal TOML parses");
+        let cfg: DaemonConfig =
+            toml::from_str("bind_address = '[::]:5483'").expect("minimal TOML parses");
         assert_eq!(cfg.network_id, None);
 
-        let cfg: DaemonConfig = toml::from_str("network_id = 'x0x.testnet'")
-            .expect("network_id TOML parses");
+        let cfg: DaemonConfig =
+            toml::from_str("network_id = 'x0x.testnet'").expect("network_id TOML parses");
         assert_eq!(cfg.network_id.as_deref(), Some("x0x.testnet"));
     }
 
