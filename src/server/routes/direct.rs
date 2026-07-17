@@ -54,33 +54,33 @@ pub(in crate::server) struct ConnectMachineRequest {
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct DirectSendRequest {
     /// Target agent ID as 64-character hex string.
-    agent_id: String,
+    pub(in crate::server) agent_id: String,
     /// Base64-encoded payload.
-    payload: String,
+    pub(in crate::server) payload: String,
     /// Prefer the raw-QUIC path when a live direct connection exists.
     #[serde(default)]
-    prefer_raw_quic_if_connected: bool,
+    pub(in crate::server) prefer_raw_quic_if_connected: bool,
     /// Optional raw-QUIC receive-pipeline ACK timeout for the message itself.
     #[serde(default)]
-    raw_quic_receive_ack_ms: Option<u64>,
+    pub(in crate::server) raw_quic_receive_ack_ms: Option<u64>,
     /// If true, do not fall back to gossip-inbox after a preferred raw-QUIC
     /// failure.
     #[serde(default)]
-    stop_fallback_on_raw_error: bool,
+    pub(in crate::server) stop_fallback_on_raw_error: bool,
     /// If true, require gossip-inbox delivery and reject recipients without a
     /// gossip DM capability.
     #[serde(default)]
-    require_gossip: bool,
+    pub(in crate::server) require_gossip: bool,
     /// If set, override whether gossip-inbox sends wait for the recipient's
     /// inbox ACK before returning success. When omitted, the daemon default is
     /// used.
     #[serde(default)]
-    require_gossip_ack: Option<bool>,
+    pub(in crate::server) require_gossip_ack: Option<bool>,
     /// Optional opt-in: after the DM path accepts the message, probe the
     /// recipient's ant-quic receive pipeline for liveness with this timeout.
     /// This does not force the message itself onto raw-QUIC receive-ACK.
     #[serde(default)]
-    require_ack_ms: Option<u64>,
+    pub(in crate::server) require_ack_ms: Option<u64>,
 }
 
 /// POST /agents/connect — connect to a discovered agent.
@@ -336,6 +336,12 @@ pub(in crate::server) async fn direct_send(
                 x0x::dm::DmError::RecipientKeyUnavailable(_) => {
                     (StatusCode::NOT_FOUND, "recipient_key_unavailable")
                 }
+                // Issue #188: the cached capability advert / contact card is
+                // not converged (or corrupt) — transient, safe to retry. 409,
+                // NOT 400: the request itself was well-formed.
+                x0x::dm::DmError::RecipientKeyInvalid(_) => {
+                    (StatusCode::CONFLICT, "recipient_key_invalid")
+                }
                 x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
                 x0x::dm::DmError::PeerLikelyOffline { .. } => {
                     (StatusCode::BAD_GATEWAY, "peer_likely_offline")
@@ -349,8 +355,11 @@ pub(in crate::server) async fn direct_send(
                 x0x::dm::DmError::LocalGossipUnavailable(_) => {
                     (StatusCode::SERVICE_UNAVAILABLE, "local_gossip_unavailable")
                 }
+                // Local envelope build/crypto failure (signing, AEAD, KEM
+                // encap, serialization). A well-formed client request cannot
+                // cause this — it is a server fault, never a 400 (issue #188).
                 x0x::dm::DmError::EnvelopeConstruction(_) => {
-                    (StatusCode::BAD_REQUEST, "envelope_construction")
+                    (StatusCode::INTERNAL_SERVER_ERROR, "envelope_construction")
                 }
                 x0x::dm::DmError::PayloadTooLarge { .. } => {
                     (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")

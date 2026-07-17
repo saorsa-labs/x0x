@@ -248,6 +248,16 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) peer_relay: x0x::network::PeerRelayConfig,
 
+    /// Issue #120: opt-in surfacing of the transport-observed peer address
+    /// as a coarse, masked origin token (`/24` IPv4, `/48` IPv6) on
+    /// point-to-point DM surfaces only — the DM-receive WS/SSE event and
+    /// per-peer `GET /diagnostics/dm`. Default `false`; when disabled the
+    /// fields are entirely absent and wire behaviour is byte-identical. The
+    /// token is never gossiped, never announced, and never on `/peers`.
+    /// Like `[peer_relay]` (opt-in), there is intentionally no CLI flag.
+    #[serde(default)]
+    pub(super) observed_prefix_enabled: bool,
+
     /// Update configuration.
     #[serde(default)]
     pub(super) update: DaemonUpdateConfig,
@@ -327,6 +337,22 @@ pub struct DaemonConfig {
     /// (#204 must-fix 1).
     #[serde(default)]
     pub(super) forward: x0x::forward::ForwardConfig,
+
+    /// Gossip-plane identifier (issue #206, TOML: `network_id`).
+    ///
+    /// - Unset → the daemon joins the well-known prod plane
+    ///   (`PROD_PLANE_ID`) and refuses gossip traffic with peers that
+    ///   declare a different plane. This is the safe default: co-located
+    ///   daemons are only same-plane if they are *both* undeclared, which
+    ///   mirrors today's shared-bootstrap deployments (prod, `x0xd-443`,
+    ///   personal named instances).
+    /// - `""` (explicit empty) → open plane: no isolation at all. Escape
+    ///   hatch for embedders and legacy test rigs that deliberately bridge.
+    /// - Any other value → that plane, e.g. `network_id = "x0x.testnet"`
+    ///   for the co-located testnet. Validated by
+    ///   [`x0x::network::validate_plane_id`].
+    #[serde(default)]
+    pub network_id: Option<String>,
 }
 
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
@@ -361,16 +387,11 @@ pub fn default_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/var/lib/x0x"))
 }
 
-/// Shared cache directory used by ALL instances (not per-instance).
-/// This is always the base `x0x` dir, never `x0x-<name>`.
-pub(super) fn shared_cache_dir() -> PathBuf {
-    let dir = dirs::data_dir()
-        .map(|d| d.join("x0x"))
-        .unwrap_or_else(|| PathBuf::from("/var/lib/x0x"));
-    // Ensure it exists
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
+/// The well-known gossip plane every x0xd joins when its TOML does not
+/// declare a `network_id` (issue #206). Prod, `x0xd-443`, and unnamed
+/// personal instances all land here, preserving today's mesh; a co-located
+/// second plane (testnet, experiments) declares its own id and is refused.
+pub const PROD_PLANE_ID: &str = "x0x.prod";
 
 fn default_log_level() -> String {
     // Privacy by default for operators outside our fleet (issue #85): without
@@ -493,6 +514,24 @@ impl DaemonConfig {
             .clone()
             .unwrap_or_else(default_bootstrap_peers)
     }
+
+    /// Resolve `network_id` to the effective gossip-plane id (issue #206).
+    ///
+    /// - `None` (unset) → `Some(PROD_PLANE_ID)` — planes isolated by
+    ///   default: any daemon declaring a different plane is refused.
+    /// - `Some("")` → `None` — explicit opt-out (open plane, pre-#206
+    ///   behaviour).
+    /// - `Some(id)` → `Some(id)` verbatim; validity is enforced at
+    ///   `NetworkNode` construction via
+    ///   [`x0x::network::validate_plane_id`].
+    #[must_use]
+    pub fn resolved_network_id(&self) -> Option<String> {
+        match &self.network_id {
+            None => Some(PROD_PLANE_ID.to_string()),
+            Some(id) if id.is_empty() => None,
+            Some(id) => Some(id.clone()),
+        }
+    }
 }
 
 impl Default for DaemonConfig {
@@ -506,6 +545,7 @@ impl Default for DaemonConfig {
             bootstrap_peers: None,
             port_mapping_enabled: default_port_mapping_enabled(),
             peer_relay: x0x::network::PeerRelayConfig::default(),
+            observed_prefix_enabled: false,
             update: DaemonUpdateConfig::default(),
             gossip: x0x::gossip::GossipConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
@@ -522,6 +562,7 @@ impl Default for DaemonConfig {
             group_card_republish_interval_secs: None,
             directory_resubscribe_jitter_ms: None,
             forward: x0x::forward::ForwardConfig::default(),
+            network_id: None,
         }
     }
 }
@@ -713,6 +754,53 @@ pub(super) struct CachedUpgradeCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_network_id_maps_unset_to_prod_and_empty_to_open() {
+        // Issue #206: the daemon default must isolate planes — an unset
+        // TOML `network_id` joins the well-known prod plane (isolation
+        // ON), and only an explicit empty string opts out.
+        let unset = DaemonConfig::default();
+        assert_eq!(
+            unset.resolved_network_id().as_deref(),
+            Some(PROD_PLANE_ID),
+            "unset network_id must resolve to the well-known prod plane"
+        );
+
+        let open = DaemonConfig {
+            network_id: Some(String::new()),
+            ..DaemonConfig::default()
+        };
+        assert_eq!(
+            open.resolved_network_id(),
+            None,
+            "explicit empty network_id must opt out (open plane)"
+        );
+
+        let testnet = DaemonConfig {
+            network_id: Some("x0x.testnet".to_string()),
+            ..DaemonConfig::default()
+        };
+        assert_eq!(
+            testnet.resolved_network_id().as_deref(),
+            Some("x0x.testnet"),
+            "explicit network_id is honored verbatim"
+        );
+    }
+
+    #[test]
+    fn network_id_toml_roundtrip_defaults_to_unset() {
+        // A config file without the key must parse with network_id unset
+        // (serde default), so existing deployments upgrade cleanly onto
+        // the prod plane.
+        let cfg: DaemonConfig =
+            toml::from_str("bind_address = '[::]:5483'").expect("minimal TOML parses");
+        assert_eq!(cfg.network_id, None);
+
+        let cfg: DaemonConfig =
+            toml::from_str("network_id = 'x0x.testnet'").expect("network_id TOML parses");
+        assert_eq!(cfg.network_id.as_deref(), Some("x0x.testnet"));
+    }
 
     // The two canonical messages enforced by `InstanceName::try_from`.
     // `x0xd::resolve_instance_startup` propagates these verbatim (bare `?`,
@@ -954,5 +1042,20 @@ mod tests {
             .filter_map(|s| s.parse().ok())
             .collect();
         assert_eq!(config.resolved_bootstrap_peers(), embedded);
+    }
+
+    #[test]
+    fn observed_prefix_enabled_defaults_off_and_parses_opt_in() {
+        // Issue #120: the gate is default-OFF in every construction path —
+        // absent TOML key, empty TOML, and `DaemonConfig::default()` — so
+        // unconfigured daemons keep byte-identical DM wire output.
+        let config: DaemonConfig = toml::from_str("").expect("empty config parses");
+        assert!(!config.observed_prefix_enabled);
+        assert!(!DaemonConfig::default().observed_prefix_enabled);
+
+        // Explicit opt-in parses through.
+        let config: DaemonConfig =
+            toml::from_str("observed_prefix_enabled = true").expect("opt-in parses");
+        assert!(config.observed_prefix_enabled);
     }
 }

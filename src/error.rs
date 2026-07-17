@@ -279,6 +279,24 @@ pub enum NetworkError {
         /// The revoked agent id.
         agent_id: [u8; 32],
     },
+    /// Tailnet byte-stream connect-ACL gate (#131/#132): the peer's
+    /// `(AgentId, MachineId)` pair is not listed in the local connect ACL
+    /// while a [`crate::connect::ConnectPolicy::Enabled`] policy is active
+    /// (default-closed inbound reachability). The stream is refused/reset
+    /// with zero application bytes exchanged.
+    #[error("stream peer not listed in connect ACL: agent {agent_id:?}")]
+    PeerNotInConnectAcl {
+        /// The unlisted agent id.
+        agent_id: [u8; 32],
+    },
+    /// Tailnet byte-stream acceptor registration: an acceptor is already
+    /// registered for the requested [`crate::streams::StreamProtocol`].
+    /// Exactly one consumer may own a protocol's inbound streams.
+    #[error("stream acceptor already registered for protocol byte 0x{protocol_byte:02x}")]
+    StreamAcceptorConflict {
+        /// The protocol prefix byte with a live acceptor.
+        protocol_byte: u8,
+    },
 
     /// Event broadcasting failed.
     #[error("event broadcast error: {0}")]
