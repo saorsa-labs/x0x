@@ -12455,6 +12455,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn observed_prefix_gate_defaults_off_and_follows_network_config() {
+        // Issue #120: the Agent-side gate must track the NetworkConfig flag —
+        // off with no network config, off by default, on when opted in.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let identity_only = Agent::builder()
+            .with_machine_key(dir.path().join("m1.key"))
+            .with_agent_key_path(dir.path().join("a1.key"))
+            .with_contact_store_path(dir.path().join("c1.json"))
+            .build()
+            .await
+            .expect("identity-only agent");
+        assert!(!identity_only.observed_prefix_enabled);
+        identity_only.shutdown().await;
+
+        let defaulted = Agent::builder()
+            .with_machine_key(dir.path().join("m2.key"))
+            .with_agent_key_path(dir.path().join("a2.key"))
+            .with_contact_store_path(dir.path().join("c2.json"))
+            .with_peer_cache_dir(dir.path().join("p2"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("defaulted-network agent");
+        assert!(!defaulted.observed_prefix_enabled);
+        defaulted.shutdown().await;
+
+        let mut opted_in_cfg = loopback_network_config();
+        opted_in_cfg.observed_prefix_enabled = true;
+        let opted_in = Agent::builder()
+            .with_machine_key(dir.path().join("m3.key"))
+            .with_agent_key_path(dir.path().join("a3.key"))
+            .with_contact_store_path(dir.path().join("c3.json"))
+            .with_peer_cache_dir(dir.path().join("p3"))
+            .with_network_config(opted_in_cfg)
+            .build()
+            .await
+            .expect("opted-in agent");
+        assert!(opted_in.observed_prefix_enabled);
+        opted_in.shutdown().await;
+    }
+
     /// Scaling factor for wall-clock deadlines in scheduling-dependent tests
     /// (issue #241).
     ///
@@ -12511,48 +12553,6 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-    }
-
-    #[tokio::test]
-    async fn observed_prefix_gate_defaults_off_and_follows_network_config() {
-        // Issue #120: the Agent-side gate must track the NetworkConfig flag —
-        // off with no network config, off by default, on when opted in.
-        let dir = tempfile::tempdir().expect("tmpdir");
-        let identity_only = Agent::builder()
-            .with_machine_key(dir.path().join("m1.key"))
-            .with_agent_key_path(dir.path().join("a1.key"))
-            .with_contact_store_path(dir.path().join("c1.json"))
-            .build()
-            .await
-            .expect("identity-only agent");
-        assert!(!identity_only.observed_prefix_enabled);
-        identity_only.shutdown().await;
-
-        let defaulted = Agent::builder()
-            .with_machine_key(dir.path().join("m2.key"))
-            .with_agent_key_path(dir.path().join("a2.key"))
-            .with_contact_store_path(dir.path().join("c2.json"))
-            .with_peer_cache_dir(dir.path().join("p2"))
-            .with_network_config(loopback_network_config())
-            .build()
-            .await
-            .expect("defaulted-network agent");
-        assert!(!defaulted.observed_prefix_enabled);
-        defaulted.shutdown().await;
-
-        let mut opted_in_cfg = loopback_network_config();
-        opted_in_cfg.observed_prefix_enabled = true;
-        let opted_in = Agent::builder()
-            .with_machine_key(dir.path().join("m3.key"))
-            .with_agent_key_path(dir.path().join("a3.key"))
-            .with_contact_store_path(dir.path().join("c3.json"))
-            .with_peer_cache_dir(dir.path().join("p3"))
-            .with_network_config(opted_in_cfg)
-            .build()
-            .await
-            .expect("opted-in agent");
-        assert!(opted_in.observed_prefix_enabled);
-        opted_in.shutdown().await;
     }
 
     fn normalize_loopback_addr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
