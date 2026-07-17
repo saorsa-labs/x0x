@@ -975,6 +975,43 @@ fn identity_announcement_timestamp_is_acceptable(announced_at: u64, now: u64) ->
     announced_at <= now.saturating_add(IDENTITY_ANNOUNCEMENT_CLOCK_SKEW_SECS)
 }
 
+/// True only when the pubsub envelope proves the announcement arrived directly
+/// from its origin agent: the message is signature-verified, its sender is the
+/// announcement's agent, and the sender's ML-DSA-65 public key derives that
+/// same agent ID.
+///
+/// # Invariant this depends on (issue #215)
+///
+/// This check is sound only because pubsub `msg.sender` / `msg.verified` are
+/// cryptographically origin-authenticated end to end — a relay cannot set
+/// `sender` to a foreign agent with `verified == true`:
+///
+/// - `decode_v2` (src/gossip/pubsub.rs:1080) parses the sender's 32-byte agent
+///   ID, ML-DSA-65 public key, and signature out of the v2 wire bytes and sets
+///   `verified` to the result of `verify_signature`
+///   (src/gossip/pubsub.rs:1114-1120), which requires
+///   `AgentId::from_public_key(sender_public_key) == agent_id`
+///   (src/gossip/pubsub.rs:1184-1188) and verifies the ML-DSA-65 signature
+///   over `b"x0x-msg-v2" || agent_id(32) || topic_bytes || payload`
+///   (`build_signing_payload`, src/gossip/pubsub.rs:1161-1167; prefix constant
+///   at src/gossip/pubsub.rs:104; verify call at src/gossip/pubsub.rs:1198-1202).
+///   `sender` is then set to `Some(agent_id)` and `verified` to that check's
+///   result (src/gossip/pubsub.rs:1129-1136).
+/// - Excluded spoof: a relay re-publishing the origin's announcement under its
+///   own v2 envelope yields `msg.sender == <relay agent>` !=
+///   `announcement.agent_id`, so this function returns false. A relay forging
+///   the origin's agent ID in the envelope must produce an ML-DSA-65 signature
+///   over the payload with a key that derives that agent ID — impossible
+///   without the origin's private key — so `verify_signature` fails,
+///   `verified == false`, the payload is dropped in `decode_for_delivery`
+///   (src/gossip/pubsub.rs:781-789), and even a hand-constructed message with
+///   `verified == false` fails this check: the binding is not retained.
+/// - The transport hop is never consulted for `sender`: saorsa-gossip-pubsub
+///   delivers `(transport_peer, payload)` and x0x discards the peer
+///   (src/gossip/pubsub.rs:478).
+///
+/// Audit of the dependency's sender-authentication path:
+/// docs/audit-wp-g-sender-auth.md.
 fn identity_announcement_has_direct_agent_origin(
     msg: &gossip::PubSubMessage,
     announcement: &IdentityAnnouncement,
