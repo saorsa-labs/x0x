@@ -1044,6 +1044,15 @@ const PLANE_LEGACY_GRACE: Duration = Duration::from_secs(10);
 /// requires a daemon restart, well outside this window's risk envelope.
 const PLANE_REVERIFY_TTL: Duration = Duration::from_secs(600);
 
+/// How often the gatekeeper re-sends our plane hello to peers still Pending
+/// (issue #206). The connect-time hello send is best-effort on a connection
+/// that may still be settling; without a retry, one lost hello leaves both
+/// sides Pending until [`PLANE_LEGACY_GRACE`] silently admits a NEW-code
+/// cross-plane peer as legacy. Retrying every 2s gives ~4 further chances
+/// inside the grace window, so legacy admission is reserved for peers that
+/// genuinely never speak the hello protocol.
+const PLANE_HELLO_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Per-peer gossip-plane state, tracked only when plane isolation is
 /// configured (`NetworkConfig::network_id` is `Some`).
 #[derive(Debug, Clone, Copy)]
@@ -2812,8 +2821,37 @@ impl NetworkNode {
                 let guard = node.read().await;
                 guard.as_ref().map(|node| node.subscribe_all_peer_events())
             };
+            // Hello sends are best-effort on a connection that may still be
+            // settling; a lost hello must not degrade a new-code cross-plane
+            // peer into a legacy-grace admit. Re-send to every still-Pending
+            // peer on a short tick until it clears, is refused, or the grace
+            // admits it as genuinely legacy.
+            let mut rehello = tokio::time::interval(PLANE_HELLO_RETRY_INTERVAL);
+            rehello.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 let event = tokio::select! {
+                    _ = rehello.tick() => {
+                        let pending: Vec<AntPeerId> = {
+                            let map = match plane_peers.lock() {
+                                Ok(m) => m,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            map.iter()
+                                .filter(|(_, s)| matches!(s, PlanePeerState::Pending { .. }))
+                                .map(|(p, _)| *p)
+                                .collect()
+                        };
+                        if !pending.is_empty() {
+                            let frame = build_plane_hello_frame(&plane_id);
+                            let guard = node.read().await;
+                            if let Some(node) = guard.as_ref() {
+                                for peer in pending {
+                                    let _ = node.send(&peer, &frame).await;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     event = events.recv() => {
                         match event {
                             Ok(event) => GatekeeperEvent::Network(event),
