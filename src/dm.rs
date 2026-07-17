@@ -8,6 +8,10 @@
 use crate::error::{IdentityError, Result};
 use crate::groups::kem_envelope::{AgentKemKeypair, KEM_VARIANT};
 use crate::identity::{AgentId, MachineId};
+use ant_quic::crypto::raw_public_keys::pqc::{
+    sign_with_ml_dsa, verify_with_ml_dsa, MlDsaSignature,
+};
+use ant_quic::MlDsaPublicKey;
 use saorsa_gossip_types::TopicId;
 use saorsa_pqc::api::kem::{MlKem, MlKemPublicKey};
 use serde::{Deserialize, Serialize};
@@ -153,6 +157,18 @@ pub struct DmEnvelope {
     /// ML-DSA-65 signature over the domain-separated envelope bytes
     /// computed via `build_signed_bytes()`.
     pub signature: Vec<u8>,
+
+    /// Fresh origin-machine attestation (issue #213). Signed by the
+    /// sender's **machine** ML-DSA-65 key; proves the claimed
+    /// `sender_machine_id` authorized THIS DM. Additive trailing field:
+    /// old receivers skip it (postcard ignores trailing bytes), new
+    /// receivers decode `None` for pre-#213 peers and fall back to the
+    /// retained-binding check. See `docs/adr/0021-dm-origin-machine-attestation.md`.
+    ///
+    /// Deliberately OUTSIDE the agent signature scope (`signed_bytes` is
+    /// unchanged) so mixed-version interop keeps verifying both ways.
+    #[serde(default, deserialize_with = "deserialize_origin_attestation")]
+    pub origin_attestation: Option<DmOriginAttestation>,
 }
 
 /// Envelope body — either a payload DM or an acknowledgement of a prior one.
@@ -217,6 +233,209 @@ pub enum DmAckOutcome {
     /// that prefer silent rejection can set `trust.silent_reject = true`
     /// and skip emitting this ACK entirely.
     RejectedByPolicy { reason: String },
+}
+
+// ─── Origin-machine attestation (issue #213) ──────────────────────────────
+
+/// Domain separator for DM origin-machine attestation signatures.
+///
+/// Mirrors `FORWARD_V2_ATTESTATION_DOMAIN` (#204): a distinct, versioned
+/// prefix so an attestation can never be reinterpreted as any other signed
+/// object in the crate, and a future layout change bumps the suffix so old
+/// attestations fail verification rather than silently re-binding.
+const DM_ORIGIN_ATTESTATION_DOMAIN: &[u8] = b"x0x-dm-origin-attestation.v1";
+
+/// Current [`DmOriginAttestation`] format version.
+pub const DM_ORIGIN_ATTESTATION_VERSION: u16 = 1;
+
+/// Fresh, per-DM proof that the claimed origin machine authorized this
+/// envelope (issue #213).
+///
+/// The sender's **machine** ML-DSA-65 key signs a struct mirroring the
+/// envelope's security-relevant fields. The machine public key travels
+/// with the attestation and is self-certifying —
+/// `MachineId::from_public_key(key)` MUST equal `sender_machine_id` — so
+/// verification needs ZERO prior discovery-cache state: no retained
+/// binding, no announcement, no reachability data.
+///
+/// See `docs/adr/0021-dm-origin-machine-attestation.md` for the full
+/// design, including the portable-move, replay, and downgrade policies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmOriginAttestation {
+    /// Attestation format version. Receivers fail closed on unknown
+    /// versions (a present-but-unverifiable attestation is never skipped).
+    pub attestation_version: u16,
+    /// DM protocol version this attestation was minted for — mirrors the
+    /// envelope field and binds the attestation to the protocol generation.
+    pub protocol_version: u16,
+    /// Sender's AgentId — MUST equal the envelope's.
+    pub sender_agent_id: [u8; 32],
+    /// Claimed origin machine — MUST equal the envelope's
+    /// `sender_machine_id` AND `MachineId::from_public_key(machine_public_key)`.
+    pub sender_machine_id: [u8; 32],
+    /// Sender machine's ML-DSA-65 public key. Self-certifying via the hash
+    /// binding to `sender_machine_id`; carried so verification is
+    /// cache-independent (offline / cold-restart receivers).
+    pub machine_public_key: Vec<u8>,
+    /// Recipient's AgentId — replay scope: an attestation captured from a
+    /// DM to Alice cannot be retargeted to Bob.
+    pub recipient_agent_id: [u8; 32],
+    /// The DM's request id — binds the attestation to exactly one logical
+    /// DM (retries of the same DM reuse `request_id`, so one attestation
+    /// covers all retry attempts).
+    pub request_id: [u8; 16],
+    /// Freshness window start — mirrors `DmEnvelope::created_at_unix_ms`.
+    pub created_at_unix_ms: u64,
+    /// Freshness window end — mirrors `DmEnvelope::expires_at_unix_ms`.
+    /// The receiver's timestamp-window check on the envelope covers this
+    /// attestation because the fields MUST match exactly.
+    pub expires_at_unix_ms: u64,
+    /// ML-DSA-65 signature over [`DmOriginAttestation::signed_bytes`],
+    /// produced by the machine secret key.
+    pub signature: Vec<u8>,
+}
+
+/// Why an origin-machine attestation failed verification.
+///
+/// Every variant is a **hard drop** at the receiver (no fallback to the
+/// claimed machine or the retained binding): a present-but-invalid
+/// attestation is an attack or corruption signal, never a legacy peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OriginAttestationError {
+    /// `attestation_version` is not one this build understands.
+    #[error("unsupported attestation version {0}")]
+    UnsupportedVersion(u16),
+    /// A mirrored field differs from the envelope (agent, machine,
+    /// recipient, request id, timestamps, or protocol version).
+    #[error("attestation fields do not match the envelope")]
+    EnvelopeMismatch,
+    /// `machine_public_key` does not parse as ML-DSA-65.
+    #[error("malformed machine public key")]
+    MalformedPublicKey,
+    /// `machine_public_key` does not hash to `sender_machine_id`.
+    #[error("machine public key does not hash to sender_machine_id")]
+    KeyBindingMismatch,
+    /// The signature is empty or fails ML-DSA-65 verification.
+    #[error("machine attestation signature invalid")]
+    SignatureInvalid,
+}
+
+impl DmOriginAttestation {
+    /// Build an unsigned attestation mirroring `envelope`'s fields, with
+    /// the given machine public key. Call [`Self::sign`] next.
+    #[must_use]
+    pub fn for_envelope(envelope: &DmEnvelope, machine_public_key: Vec<u8>) -> Self {
+        Self {
+            attestation_version: DM_ORIGIN_ATTESTATION_VERSION,
+            protocol_version: envelope.protocol_version,
+            sender_agent_id: envelope.sender_agent_id,
+            sender_machine_id: envelope.sender_machine_id,
+            machine_public_key,
+            recipient_agent_id: envelope.recipient_agent_id,
+            request_id: envelope.request_id,
+            created_at_unix_ms: envelope.created_at_unix_ms,
+            expires_at_unix_ms: envelope.expires_at_unix_ms,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Canonical signed bytes: domain-separated, fixed-layout encoding of
+    /// every field except `signature`. Both ends MUST agree byte-for-byte.
+    #[must_use]
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            DM_ORIGIN_ATTESTATION_DOMAIN.len() + 2 + 2 + 16 + 32 * 3 + 4
+                + self.machine_public_key.len() + 8 * 2,
+        );
+        out.extend_from_slice(DM_ORIGIN_ATTESTATION_DOMAIN);
+        out.extend_from_slice(&self.attestation_version.to_be_bytes());
+        out.extend_from_slice(&self.protocol_version.to_be_bytes());
+        out.extend_from_slice(&self.request_id);
+        out.extend_from_slice(&self.sender_agent_id);
+        out.extend_from_slice(&self.sender_machine_id);
+        out.extend_from_slice(&(self.machine_public_key.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.machine_public_key);
+        out.extend_from_slice(&self.recipient_agent_id);
+        out.extend_from_slice(&self.created_at_unix_ms.to_be_bytes());
+        out.extend_from_slice(&self.expires_at_unix_ms.to_be_bytes());
+        out
+    }
+
+    /// Sign with the sender's machine keypair. The keypair MUST own
+    /// `sender_machine_id`; a mismatch produces an attestation receivers
+    /// reject with [`OriginAttestationError::KeyBindingMismatch`].
+    ///
+    /// # Errors
+    /// Returns [`DmError::EnvelopeConstruction`] if ML-DSA-65 signing fails.
+    pub fn sign(&mut self, machine_keypair: &crate::identity::MachineKeypair) -> std::result::Result<(), DmError> {
+        let sig = sign_with_ml_dsa(machine_keypair.secret_key(), &self.signed_bytes())
+            .map_err(|e| DmError::EnvelopeConstruction(format!("origin attestation sign: {e:?}")))?;
+        self.signature = sig.as_bytes().to_vec();
+        Ok(())
+    }
+
+    /// Verify the attestation against the envelope it rides in.
+    ///
+    /// Self-contained: parses the carried machine key, checks the hash
+    /// binding to `sender_machine_id`, checks every mirrored field against
+    /// `envelope`, then verifies the ML-DSA-65 signature. Returns the
+    /// attested [`MachineId`] on success.
+    ///
+    /// # Errors
+    /// One of [`OriginAttestationError`]; every failure is a hard drop at
+    /// the receiver.
+    pub fn verify(&self, envelope: &DmEnvelope) -> std::result::Result<MachineId, OriginAttestationError> {
+        if self.attestation_version != DM_ORIGIN_ATTESTATION_VERSION {
+            return Err(OriginAttestationError::UnsupportedVersion(
+                self.attestation_version,
+            ));
+        }
+        if !self.matches_envelope(envelope) {
+            return Err(OriginAttestationError::EnvelopeMismatch);
+        }
+        let pubkey = MlDsaPublicKey::from_bytes(&self.machine_public_key)
+            .map_err(|_| OriginAttestationError::MalformedPublicKey)?;
+        // Hash binding: the carried key MUST own the claimed machine id —
+        // the same `from_public_key == claimed` binding used by ForwardV2
+        // (#204) and CRDT provenance.
+        let derived = MachineId::from_public_key(&pubkey);
+        if derived.as_bytes() != &self.sender_machine_id {
+            return Err(OriginAttestationError::KeyBindingMismatch);
+        }
+        if self.signature.is_empty() {
+            return Err(OriginAttestationError::SignatureInvalid);
+        }
+        let sig = MlDsaSignature::from_bytes(&self.signature)
+            .map_err(|_| OriginAttestationError::SignatureInvalid)?;
+        verify_with_ml_dsa(&pubkey, &self.signed_bytes(), &sig)
+            .map_err(|_| OriginAttestationError::SignatureInvalid)?;
+        Ok(derived)
+    }
+
+    /// True when every mirrored field equals the envelope's.
+    #[must_use]
+    pub fn matches_envelope(&self, envelope: &DmEnvelope) -> bool {
+        self.protocol_version == envelope.protocol_version
+            && self.sender_agent_id == envelope.sender_agent_id
+            && self.sender_machine_id == envelope.sender_machine_id
+            && self.recipient_agent_id == envelope.recipient_agent_id
+            && self.request_id == envelope.request_id
+            && self.created_at_unix_ms == envelope.created_at_unix_ms
+            && self.expires_at_unix_ms == envelope.expires_at_unix_ms
+    }
+}
+
+/// Tolerant deserializer for the trailing attestation field. Old envelopes
+/// end after `signature`; postcard then hits EOF reading the option tag,
+/// which we recover as `None` (legacy peer → retained-binding fallback).
+/// Mirrors the `deserialize_attestations` pattern in `crdt/task_item.rs`.
+fn deserialize_origin_attestation<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<DmOriginAttestation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<DmOriginAttestation>::deserialize(deserializer).unwrap_or(None))
 }
 
 // ─── Error model ───────────────────────────────────────────────────────────
@@ -533,10 +752,25 @@ pub struct CachedOutcome {
 }
 
 impl RecentDeliveryCache {
-    /// Construct with the recommended defaults (5 min TTL, 10 000 entries).
+    /// Construct with the recommended defaults (630 s TTL, 10 000 entries).
+    ///
+    /// The TTL MUST cover the full exact-replay window: an envelope stays
+    /// valid for `MAX_ENVELOPE_LIFETIME_MS` (600 s) plus up to
+    /// `CLOCK_SKEW_TOLERANCE_MS` (30 s) of accepted sender-ahead skew, and
+    /// the dedupe entry is the ONLY thing absorbing an identical
+    /// re-delivery while the timestamp window still passes (a shorter TTL
+    /// re-opens a replay hole in the 300–600 s band, issue #213 review F1).
+    ///
+    /// Capacity implication: entries now live ~2.1× longer, so the 10 000-
+    /// entry cap holds proportionally more live traffic — bounded at roughly
+    /// a few MiB even with worst-case `RejectedByPolicy` reason strings,
+    /// which is acceptable for the replay-safety invariant.
     #[must_use]
     pub fn with_defaults() -> Self {
-        Self::new(Duration::from_secs(300), 10_000)
+        Self::new(
+            Duration::from_millis(MAX_ENVELOPE_LIFETIME_MS + CLOCK_SKEW_TOLERANCE_MS),
+            10_000,
+        )
     }
 
     /// Custom cache bounds.
@@ -845,6 +1079,27 @@ impl DmEnvelope {
     pub fn dedupe_key(&self) -> DedupeKey {
         DedupeKey::new(self.sender_agent_id, self.request_id)
     }
+
+    /// Verify the origin-machine attestation (issue #213).
+    ///
+    /// - `Ok(None)` — no attestation (legacy pre-#213 peer): the caller
+    ///   falls back to the #184 retained-binding check.
+    /// - `Ok(Some(machine))` — fresh machine-key proof for this DM;
+    ///   supersedes any retained binding.
+    /// - `Err(_)` — present but invalid: hard drop, never fall back.
+    ///
+    /// Freshness is inherited from the envelope's timestamp-window check
+    /// (the attestation mirrors `created_at`/`expires_at` exactly), so the
+    /// caller MUST run `validate_timestamp_window` first — the inbox
+    /// pipeline already does.
+    pub fn verify_origin_attestation(
+        &self,
+    ) -> std::result::Result<Option<MachineId>, OriginAttestationError> {
+        self.origin_attestation
+            .as_ref()
+            .map(|attestation| attestation.verify(self))
+            .transpose()
+    }
 }
 
 // ─── Envelope builder ──────────────────────────────────────────────────────
@@ -905,24 +1160,31 @@ impl EnvelopeBuilder {
 
     /// Build a fully-signed [`DmEnvelope`] from the raw send-site inputs.
     ///
-    /// Wraps the four crypto ops every direct-DM send needs - KEM
+    /// Wraps the five crypto ops every direct-DM send needs - KEM
     /// encapsulation, AEAD encryption, domain-separated signing-bytes
-    /// build, ML-DSA-65 signature - behind one entry point. The `sign`
-    /// closure receives the signing bytes and returns the signature; in
+    /// build, ML-DSA-65 agent signature, and the #213 origin-machine
+    /// attestation - behind one entry point. The `sign`
+    /// closure receives the signing bytes and returns the agent signature; in
     /// production both `dm_send::send_via_gossip` and X0X-0070b's
     /// `try_relay_fallback` pass a closure backed by
     /// `gossip::SigningContext::sign`.
     ///
+    /// `machine_keypair` MUST own `self_machine_id` — it signs the
+    /// origin-machine attestation that lets zero-state receivers
+    /// authenticate this DM's physical origin (issue #213).
+    ///
     /// # Errors
     ///
     /// Returns [`DmError::EnvelopeConstruction`] if KEM encapsulation,
-    /// AEAD encryption, signing-bytes serialisation, or the `sign`
-    /// closure fail.
+    /// AEAD encryption, signing-bytes serialisation, the `sign`
+    /// closure, or the attestation signature fail — or if
+    /// `machine_keypair` does not own `self_machine_id`.
     #[allow(clippy::too_many_arguments)]
     pub fn build_payload_envelope<F>(
         request_id: [u8; 16],
         self_agent_id: &AgentId,
         self_machine_id: &MachineId,
+        machine_keypair: &crate::identity::MachineKeypair,
         recipient_agent_id: &AgentId,
         recipient_kem_public_key: &[u8],
         created_at_unix_ms: u64,
@@ -933,6 +1195,11 @@ impl EnvelopeBuilder {
     where
         F: FnOnce(&[u8]) -> std::result::Result<Vec<u8>, String>,
     {
+        if machine_keypair.machine_id() != *self_machine_id {
+            return Err(DmError::EnvelopeConstruction(
+                "machine keypair does not own self_machine_id".to_string(),
+            ));
+        }
         let body = Self::build_payload_body(
             &request_id,
             self_agent_id.as_bytes(),
@@ -953,12 +1220,21 @@ impl EnvelopeBuilder {
             expires_at_unix_ms,
             body,
             signature: Vec::new(),
+            origin_attestation: None,
         };
         let signed = envelope
             .signed_bytes()
             .map_err(|e| DmError::EnvelopeConstruction(e.to_string()))?;
         envelope.signature =
             sign(&signed).map_err(|e| DmError::EnvelopeConstruction(format!("sign: {e}")))?;
+        // #213: fresh per-DM origin-machine proof. Placed after the agent
+        // signature for clarity only — the attestation is independent of it.
+        let mut attestation = DmOriginAttestation::for_envelope(
+            &envelope,
+            machine_keypair.public_key().as_bytes().to_vec(),
+        );
+        attestation.sign(machine_keypair)?;
+        envelope.origin_attestation = Some(attestation);
         Ok(envelope)
     }
 }
@@ -1243,6 +1519,7 @@ mod tests {
             request_id,
             &sender,
             &machine,
+            &machine_kp,
             &recipient,
             &recipient_kem.public_bytes,
             now,
@@ -1259,6 +1536,12 @@ mod tests {
             !envelope.signature.is_empty(),
             "build_payload_envelope must produce a non-empty signature"
         );
+        // #213: the builder MUST attach a valid origin-machine attestation.
+        let attested = envelope
+            .verify_origin_attestation()
+            .expect("attestation verifies")
+            .expect("attestation present");
+        assert_eq!(attested, machine);
         let signed_bytes = envelope.signed_bytes().expect("signed bytes");
         let sender_pub_bytes = agent_kp.to_bytes().0;
         let pubkey =
@@ -1287,6 +1570,7 @@ mod tests {
             expires_at_unix_ms: now_unix_ms() + 120_000,
             body: ack_body,
             signature: vec![0u8; 64],
+            origin_attestation: None,
         };
         let bytes = env.to_wire_bytes().expect("encode");
         let back = DmEnvelope::from_wire_bytes(&bytes).expect("decode");
@@ -1353,5 +1637,213 @@ mod tests {
         let _rx2 = acks.register(rid2);
         acks.cancel(&rid2);
         assert_eq!(acks.outstanding(), 0);
+    }
+
+    // ── Issue #213: origin-machine attestation ────────────────────────
+
+    /// The pre-#213 envelope shape. Old receivers decode new wire bytes
+    /// with THIS struct: postcard stops after `signature` and ignores the
+    /// trailing attestation. Kept in sync with the historical shape — if
+    /// `DmEnvelope` fields change, update this mirror.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct DmEnvelopeLegacy {
+        protocol_version: u16,
+        request_id: [u8; 16],
+        sender_agent_id: [u8; 32],
+        sender_machine_id: [u8; 32],
+        recipient_agent_id: [u8; 32],
+        created_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        body: DmBody,
+        signature: Vec<u8>,
+    }
+
+    /// Build a fully-signed, attested payload envelope + the owning keys.
+    fn attested_fixture() -> (DmEnvelope, crate::identity::AgentKeypair, crate::identity::MachineKeypair) {
+        use crate::gossip::SigningContext;
+        use crate::groups::kem_envelope::AgentKemKeypair;
+        use crate::identity::{AgentKeypair, MachineKeypair};
+
+        let agent_kp = AgentKeypair::generate().expect("agent keypair");
+        let machine_kp = MachineKeypair::generate().expect("machine keypair");
+        let recipient_kem = AgentKemKeypair::generate().expect("recipient KEM");
+        let recipient = AgentKeypair::generate().expect("recipient").agent_id();
+        let signing = SigningContext::from_keypair(&agent_kp);
+        let now = now_unix_ms();
+        let envelope = EnvelopeBuilder::build_payload_envelope(
+            [7u8; 16],
+            &agent_kp.agent_id(),
+            &machine_kp.machine_id(),
+            &machine_kp,
+            &recipient,
+            &recipient_kem.public_bytes,
+            now,
+            now + 60_000,
+            b"attested".to_vec(),
+            |bytes| signing.sign(bytes).map_err(|e| e.to_string()),
+        )
+        .expect("envelope build");
+        (envelope, agent_kp, machine_kp)
+    }
+
+    #[test]
+    fn attestation_verifies_and_returns_attested_machine() {
+        let (envelope, _agent, machine) = attested_fixture();
+        let attested = envelope
+            .verify_origin_attestation()
+            .expect("verify")
+            .expect("present");
+        assert_eq!(attested, machine.machine_id());
+    }
+
+    #[test]
+    fn attestation_absent_decodes_as_none() {
+        let env = DmEnvelope {
+            protocol_version: DM_PROTOCOL_VERSION,
+            request_id: [5u8; 16],
+            sender_agent_id: dummy_agent_id(1),
+            sender_machine_id: dummy_agent_id(11),
+            recipient_agent_id: dummy_agent_id(2),
+            created_at_unix_ms: now_unix_ms(),
+            expires_at_unix_ms: now_unix_ms() + 120_000,
+            body: EnvelopeBuilder::build_ack_body([3u8; 16], DmAckOutcome::Accepted),
+            signature: vec![0u8; 64],
+            origin_attestation: None,
+        };
+        assert_eq!(env.verify_origin_attestation(), Ok(None));
+    }
+
+    #[test]
+    fn attestation_rejects_unsupported_version() {
+        let (mut envelope, _agent, _machine) = attested_fixture();
+        let attestation = envelope.origin_attestation.as_mut().expect("attested");
+        attestation.attestation_version = DM_ORIGIN_ATTESTATION_VERSION + 1;
+        assert_eq!(
+            envelope.verify_origin_attestation(),
+            Err(OriginAttestationError::UnsupportedVersion(
+                DM_ORIGIN_ATTESTATION_VERSION + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn attestation_rejects_field_mismatch() {
+        let (mut envelope, _agent, _machine) = attested_fixture();
+        envelope.request_id = [8u8; 16]; // attestation still names [7; 16]
+        assert_eq!(
+            envelope.verify_origin_attestation(),
+            Err(OriginAttestationError::EnvelopeMismatch)
+        );
+    }
+
+    #[test]
+    fn attestation_rejects_malformed_machine_key() {
+        let (mut envelope, _agent, _machine) = attested_fixture();
+        let attestation = envelope.origin_attestation.as_mut().expect("attested");
+        attestation.machine_public_key = vec![0u8; 7];
+        assert_eq!(
+            envelope.verify_origin_attestation(),
+            Err(OriginAttestationError::MalformedPublicKey)
+        );
+    }
+
+    #[test]
+    fn attestation_rejects_key_binding_mismatch() {
+        use crate::identity::MachineKeypair;
+        let (mut envelope, _agent, _machine) = attested_fixture();
+        let other = MachineKeypair::generate().expect("other machine");
+        let attestation = envelope.origin_attestation.as_mut().expect("attested");
+        attestation.machine_public_key = other.public_key().as_bytes().to_vec();
+        assert_eq!(
+            envelope.verify_origin_attestation(),
+            Err(OriginAttestationError::KeyBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn attestation_rejects_bad_signature() {
+        let (mut envelope, _agent, _machine) = attested_fixture();
+        let attestation = envelope.origin_attestation.as_mut().expect("attested");
+        // Valid-length, wrong-content signature.
+        attestation.signature = vec![0u8; 3293];
+        assert_eq!(
+            envelope.verify_origin_attestation(),
+            Err(OriginAttestationError::SignatureInvalid)
+        );
+        // Empty signature is also invalid.
+        let attestation = envelope.origin_attestation.as_mut().expect("attested");
+        attestation.signature = Vec::new();
+        assert_eq!(
+            envelope.verify_origin_attestation(),
+            Err(OriginAttestationError::SignatureInvalid)
+        );
+    }
+
+    /// Mixed-version: a NEW (attested) envelope MUST decode under the OLD
+    /// struct shape — the old receiver skips the trailing attestation and
+    /// the agent signature still verifies. This is the wire-level proof
+    /// that the additive field does not break pre-#213 receivers.
+    #[test]
+    fn old_receiver_skips_attestation_field() {
+        let (envelope, agent_kp, _machine) = attested_fixture();
+        assert!(envelope.origin_attestation.is_some());
+        let wire = envelope.to_wire_bytes().expect("encode");
+
+        let legacy: DmEnvelopeLegacy =
+            postcard::from_bytes(&wire).expect("old receivers must decode new envelopes");
+        assert_eq!(legacy.request_id, envelope.request_id);
+        assert_eq!(legacy.sender_machine_id, envelope.sender_machine_id);
+        assert_eq!(legacy.signature, envelope.signature);
+
+        // The agent signature scope is unchanged: verifying the legacy
+        // decode against the legacy signed-bytes layout MUST succeed.
+        let legacy_signed = {
+            let body_bytes = postcard::to_stdvec(&legacy.body).expect("body");
+            let mut out = Vec::new();
+            out.extend_from_slice(b"x0x-dm-v1");
+            out.extend_from_slice(&legacy.protocol_version.to_be_bytes());
+            out.extend_from_slice(&legacy.request_id);
+            out.extend_from_slice(&legacy.sender_agent_id);
+            out.extend_from_slice(&legacy.sender_machine_id);
+            out.extend_from_slice(&legacy.recipient_agent_id);
+            out.extend_from_slice(&legacy.created_at_unix_ms.to_be_bytes());
+            out.extend_from_slice(&legacy.expires_at_unix_ms.to_be_bytes());
+            out.extend_from_slice(&body_bytes);
+            out
+        };
+        let pubkey = ant_quic::MlDsaPublicKey::from_bytes(agent_kp.public_key().as_bytes())
+            .expect("pubkey");
+        let sig = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
+            &legacy.signature,
+        )
+        .expect("sig");
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            &pubkey,
+            &legacy_signed,
+            &sig,
+        )
+        .expect("old-shape signed bytes must verify against the agent key");
+    }
+
+    /// Mixed-version reverse: OLD wire bytes (no trailing attestation) MUST
+    /// decode under the NEW struct with `origin_attestation == None`.
+    #[test]
+    fn new_receiver_tolerates_missing_attestation() {
+        let legacy = DmEnvelopeLegacy {
+            protocol_version: DM_PROTOCOL_VERSION,
+            request_id: [9u8; 16],
+            sender_agent_id: dummy_agent_id(3),
+            sender_machine_id: dummy_agent_id(13),
+            recipient_agent_id: dummy_agent_id(4),
+            created_at_unix_ms: now_unix_ms(),
+            expires_at_unix_ms: now_unix_ms() + 60_000,
+            body: EnvelopeBuilder::build_ack_body([1u8; 16], DmAckOutcome::Accepted),
+            signature: vec![0u8; 32],
+        };
+        let wire = postcard::to_stdvec(&legacy).expect("encode legacy");
+        let decoded = DmEnvelope::from_wire_bytes(&wire)
+            .expect("new receivers must decode old envelopes");
+        assert_eq!(decoded.origin_attestation, None);
+        assert_eq!(decoded.request_id, [9u8; 16]);
     }
 }

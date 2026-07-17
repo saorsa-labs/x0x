@@ -4249,6 +4249,7 @@ impl Agent {
                             signing: &signing,
                             self_agent_id: self.identity.agent_id(),
                             self_machine_id: self.identity.machine_id(),
+                            machine_keypair: self.identity.machine_keypair(),
                             inflight: std::sync::Arc::clone(&self.dm_inflight_acks),
                         },
                         *to,
@@ -4389,6 +4390,7 @@ impl Agent {
             request_id,
             &sender,
             &self.identity.machine_id(),
+            self.identity.machine_keypair(),
             to,
             recipient_kem_public_key,
             now,
@@ -7143,11 +7145,25 @@ impl Agent {
         let signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(
             self.identity.agent_keypair(),
         ));
+        // #213: the inbox signs ACK origin attestations with the machine key.
+        // `MachineKeypair` is not `Clone` (zeroize-on-drop), so reconstruct a
+        // second owned copy from its serialised bytes — the same pattern
+        // `try_relay_fallback` uses for the agent key.
+        let (machine_pub_bytes, machine_sec_bytes) = self.identity.machine_keypair().to_bytes();
+        let machine_keypair = std::sync::Arc::new(
+            identity::MachineKeypair::from_bytes(&machine_pub_bytes, &machine_sec_bytes)
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "DM inbox machine key copy: {e}"
+                    )))
+                })?,
+        );
         let service = dm_inbox::DmInboxService::spawn(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
             self.identity.agent_id(),
             self.identity.machine_id(),
+            machine_keypair,
             std::sync::Arc::clone(&kem_keypair),
             std::sync::Arc::clone(&self.direct_messaging),
             std::sync::Arc::clone(&self.contact_store),
@@ -14424,6 +14440,7 @@ mod tests {
                     body_ciphertext: Vec::new(),
                 }),
                 signature: Vec::new(),
+                origin_attestation: None,
             },
         };
 
