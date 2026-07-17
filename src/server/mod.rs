@@ -1591,10 +1591,6 @@ fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
     Ok(MachineId(arr))
 }
 
-// ---------------------------------------------------------------------------
-// Named group handlers
-// ---------------------------------------------------------------------------
-
 /// Build a uniform `{ "ok": false, "error": <msg> }` JSON error response paired
 /// with the given status code. Used by handlers in place of hand-rolled literals.
 fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
