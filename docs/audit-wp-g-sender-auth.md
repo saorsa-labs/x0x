@@ -54,7 +54,7 @@
   `handle_eager`.
 - **IHAVE / IWANT**: verified before processing (dep lib.rs:6559-6561,
   6586-6588); they carry no subscriber payload. IWANT responses re-send cached
-  (previously verified) messages as EAGER (dep lib.rs:5563-5569).
+  (previously verified) messages as EAGER (dep lib.rs:5534-5560).
 - **publish_local** self-delivers the node's own freshly signed payload to its
   own subscribers without a verification step (dep lib.rs:5197-5198): local
   origin by construction, benign.
@@ -115,10 +115,12 @@ its inner v2 signature, so a relay cannot spoof `msg.sender` past
 
 ## Tripwire — what breaks if the invariant is violated
 
-If a future dependency bump (or a change to `decode_v2` /
-`decode_for_delivery`) lets a relay-injected payload reach consumers with a
-spoofed sender and `verified == true`, these tests fail first — the pair issue
-#215 refers to as tests 8–9:
+The guard tests issue #215 refers to as tests 8–9 construct a `PubSubMessage`
+by hand (verified sender fields, no decode) and call the binding function
+directly. They therefore trip ONLY on regressions of the guard itself
+(`identity_announcement_has_direct_agent_origin` /
+`record_authenticated_machine_binding_from_message`) — NOT on a
+saorsa-gossip-pubsub bump or a `decode_v2` change, which they never exercise:
 - `wrong_origin_machine_announcement_cannot_populate_or_overwrite_binding`
   (src/lib.rs:15399) — attacker's verified envelope carrying the victim's
   announcement must not populate/overwrite the victim's binding.
@@ -126,10 +128,16 @@ spoofed sender and `verified == true`, these tests fail first — the pair issue
   (src/lib.rs:15440) — a relay's verified rebroadcast of the origin's
   announcement must not populate/overwrite the retained binding.
 
+The decode-layer tripwire — the test that fails if `decode_v2` ever accepts a
+forged or tampered signature — is `test_v2_tampered_payload_fails_verification`
+(src/gossip/pubsub.rs:1523). No unit test cited here covers a dependency bump:
+`saorsa-gossip-pubsub` upgrades need an integration-level check (a live
+relay/forward scenario) before merge; the pair above must not be read as
+covering that case.
+
 Supporting guards: `direct_origin_identity_ingest_populates_authenticated_binding`
 (src/lib.rs:15377, positive control),
 `missing_or_invalid_sender_key_cannot_populate_authenticated_binding`
-(src/lib.rs:15478), and at the decode layer
-`test_v2_tampered_payload_fails_verification` (src/gossip/pubsub.rs:1523).
+(src/lib.rs:15478).
 Run on any `saorsa-gossip-pubsub` bump:
 `cargo nextest run -E 'test(wrong_origin_machine_announcement_cannot_populate_or_overwrite_binding) or test(verified_rebroadcast_cannot_populate_or_overwrite_authenticated_binding)'`
