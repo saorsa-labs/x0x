@@ -61,7 +61,7 @@
 //! with zero application bytes exchanged.
 //!
 //! Inbound only, a **second** layer then runs: the connect-ACL gate
-//! ([`stream_acl_gate`], #131). With an `Enabled` connect policy every
+//! (`stream_acl_gate`, #131). With an `Enabled` connect policy every
 //! announced agent on the peer machine must be `(AgentId, MachineId)`-listed
 //! or the stream is reset (`PeerNotInConnectAcl`); a `Disabled` policy adds
 //! no constraint. These chokepoints are what make the T4 inbound forwarder
