@@ -704,9 +704,13 @@ async fn d4_non_creator_admin_ban_commit_advances_binding_and_converges() {
     let charlie = &cluster.charlie; // ban target
     bootstrap_agent_cards(&[alice, bob, charlie]).await;
 
-    let group_id =
-        create_group_preset(alice, "D4 Admin Ban", "non-creator admin ban", "private_secure")
-            .await;
+    let group_id = create_group_preset(
+        alice,
+        "D4 Admin Ban",
+        "non-creator admin ban",
+        "private_secure",
+    )
+    .await;
 
     // Bob (future admin) and charlie (target) join via creator invites.
     let bob_invite = create_invite(alice, &group_id).await;
