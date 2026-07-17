@@ -347,6 +347,16 @@ Direct messages arrive flat — no `data` envelope:
 }
 ```
 
+Opt-in (issue #120): when the daemon sets `observed_prefix_enabled = true`
+and the message arrived over the live point-to-point transport connection,
+an `observed_origin` field is added — a coarse, masked origin token such as
+`{"observed_prefix": "203.0.113.0/24", "direct": true, "cgnat": false}`
+(`/24` IPv4, `/48` IPv6; `direct=false` marks a relayed observation; `cgnat`
+marks RFC 6598 space). When the option is off (the default) the field is
+entirely absent. The same optional field appears on `/ws` and `/ws/direct`
+`direct_message` frames and on per-peer rows of `GET /diagnostics/dm`;
+it is never gossiped, never announced, and never on `/peers`.
+
 ## MLS encrypted groups
 
 Operational invariant (maintainer follow-up): legacy/raw `/mls/groups` helpers

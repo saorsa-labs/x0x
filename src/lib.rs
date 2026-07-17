@@ -274,6 +274,13 @@ pub struct Agent {
     network_event_listener_started: std::sync::atomic::AtomicBool,
     /// Ensures direct message listener is spawned once.
     direct_listener_started: std::sync::atomic::AtomicBool,
+    /// Issue #120: opt-in gate for surfacing the transport-observed peer
+    /// address as a coarsened origin token on point-to-point DM surfaces.
+    /// Sourced from `NetworkConfig::observed_prefix_enabled` (daemon TOML
+    /// `observed_prefix_enabled`, default `false`). When `false` the raw
+    /// DM listener never computes the token and every surface stays
+    /// byte-identical to before the feature existed.
+    observed_prefix_enabled: bool,
     /// Presence system wrapper for beacons, FOAF discovery, and events.
     presence: Option<std::sync::Arc<presence::PresenceWrapper>>,
     /// Whether the user has consented to disclosing their identity in
@@ -8325,6 +8332,7 @@ impl Agent {
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let token = self.shutdown_token.clone();
+        let observed_prefix_enabled = self.observed_prefix_enabled;
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
@@ -8470,9 +8478,28 @@ impl Agent {
                 // Register and mark the sender as connected for future reverse direct sends.
                 dm.mark_connected(sender, machine_id).await;
 
+                // Issue #120: opt-in coarsened origin token from the live
+                // connection table (the same source add_from_connection()
+                // enriches the bootstrap cache from). Computed after the
+                // drop gates so revoked/expired senders never trigger a
+                // table scan; entirely skipped when the daemon has not
+                // opted in, keeping default wire output byte-identical.
+                let observed_origin = if observed_prefix_enabled {
+                    network.observed_peer_origin(&ant_peer_id).await
+                } else {
+                    None
+                };
+
                 // Fan out to all subscribe_direct() receivers with verification info.
                 let delivered = dm
-                    .handle_incoming(machine_id, sender, data, verified, trust_decision)
+                    .handle_incoming(
+                        machine_id,
+                        sender,
+                        data,
+                        verified,
+                        trust_decision,
+                        observed_origin,
+                    )
                     .await;
 
                 tracing::debug!(
@@ -10050,6 +10077,16 @@ impl AgentBuilder {
         let relay_candidates =
             std::sync::Arc::new(tokio::sync::RwLock::new(parsed_relay_candidates));
 
+        // Issue #120: extract the opt-in observed-prefix gate before
+        // `self.network_config` is moved into `NetworkNode::new` (same
+        // pattern as `peer_relay_config` above). With no network config the
+        // feature is off.
+        let observed_prefix_enabled = self
+            .network_config
+            .as_ref()
+            .map(|cfg| cfg.observed_prefix_enabled)
+            .unwrap_or(false);
+
         // X0X-0070b: discovery cache is hoisted out of the `Agent` literal so
         // the relay-DM listener (spawned below) can hold an `Arc` clone of it
         // without going through `&self` - the listener is a sibling task to
@@ -10227,6 +10264,7 @@ impl AgentBuilder {
             direct_messaging,
             network_event_listener_started: std::sync::atomic::AtomicBool::new(false),
             direct_listener_started: std::sync::atomic::AtomicBool::new(false),
+            observed_prefix_enabled,
             presence,
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
@@ -12289,6 +12327,48 @@ mod tests {
             bootstrap_nodes: Vec::new(),
             ..network::NetworkConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn observed_prefix_gate_defaults_off_and_follows_network_config() {
+        // Issue #120: the Agent-side gate must track the NetworkConfig flag —
+        // off with no network config, off by default, on when opted in.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let identity_only = Agent::builder()
+            .with_machine_key(dir.path().join("m1.key"))
+            .with_agent_key_path(dir.path().join("a1.key"))
+            .with_contact_store_path(dir.path().join("c1.json"))
+            .build()
+            .await
+            .expect("identity-only agent");
+        assert!(!identity_only.observed_prefix_enabled);
+        identity_only.shutdown().await;
+
+        let defaulted = Agent::builder()
+            .with_machine_key(dir.path().join("m2.key"))
+            .with_agent_key_path(dir.path().join("a2.key"))
+            .with_contact_store_path(dir.path().join("c2.json"))
+            .with_peer_cache_dir(dir.path().join("p2"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("defaulted-network agent");
+        assert!(!defaulted.observed_prefix_enabled);
+        defaulted.shutdown().await;
+
+        let mut opted_in_cfg = loopback_network_config();
+        opted_in_cfg.observed_prefix_enabled = true;
+        let opted_in = Agent::builder()
+            .with_machine_key(dir.path().join("m3.key"))
+            .with_agent_key_path(dir.path().join("a3.key"))
+            .with_contact_store_path(dir.path().join("c3.json"))
+            .with_peer_cache_dir(dir.path().join("p3"))
+            .with_network_config(opted_in_cfg)
+            .build()
+            .await
+            .expect("opted-in agent");
+        assert!(opted_in.observed_prefix_enabled);
+        opted_in.shutdown().await;
     }
 
     /// Scaling factor for wall-clock deadlines in scheduling-dependent tests
