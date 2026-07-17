@@ -6,6 +6,7 @@
 //! registry category; the router wiring stays in the parent module.
 
 mod contacts;
+mod files;
 mod identity;
 mod machines;
 mod status;
@@ -17,6 +18,11 @@ pub(super) use contacts::UpdateContactRequest;
 pub(super) use contacts::{
     add_contact, delete_contact, list_contacts, list_revocations, quick_trust, revoke_contact,
     update_contact,
+};
+pub(super) use files::{
+    FileChunkAckSlot, file_accept_handler, file_reject_handler, file_send_handler,
+    file_transfer_send_config, file_transfer_status_handler, file_transfers_handler,
+    handle_file_message, wait_for_chunk_window, wait_for_final_acks,
 };
 pub(super) use identity::{
     agent_info, agent_sign, agent_user_id_handler, agent_verify, announce_identity,
