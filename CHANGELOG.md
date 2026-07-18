@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.34.2] - 2026-07-18
+
+### Fixed
+
+- **ant-quic 0.27.33 → 0.27.34: the #262 transport-wedge root cause.**
+  A single ICMP-unreachable peer could deliver a pending socket error to
+  the shared QUIC endpoint socket; the endpoint driver task treated it as
+  fatal and died silently (debug!-level), after which every future dial
+  failed before emitting a packet and the socket was never polled again —
+  the exact wedge the NYC prod bootstrap sat in for 14+ hours. Transient
+  ICMP-derived errors now drop the datagram and keep polling; any real
+  driver death is error!-logged. Together with v0.34.1's degraded /health
+  and zero-peer watchdog, this closes #262: the known cause is cured,
+  and any unknown wedge class is detected within minutes and self-healed
+  under supervision.
+
 ## [v0.34.1] - 2026-07-18
 
 ### Fixed
