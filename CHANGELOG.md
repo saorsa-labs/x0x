@@ -2,6 +2,73 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.34.0] - 2026-07-18
+
+17-PR sprint release (#243–#259 + #260). Validated by a 4-hour full-feature
+soak against the live prod network: 1224/1224 checks green across 80 cycles,
+zero failures, zero WebSocket drops.
+
+### Added
+
+- **DM origin-machine attestation (#213, ADR-0021)** — ML-DSA machine-key
+  attestation protocol-bound into gossip DM envelopes, so zero-state
+  receivers can authenticate a DM's physical origin. Dedupe TTL widened
+  300→600s to close an exact-replay window.
+- **Tailnet per-peer byte streams (#132 deliverable 1, ADR-0022)** —
+  protocol-id framed bidirectional stream API over ant-quic, connect-ACL
+  gated, bounded backpressure; `GET /streams` observability.
+- **A2A-over-x0x message binding (#112 increment 1)** — envelope codec +
+  unary request/response correlation over the DM channel; in-flight waiters
+  dropped on call-future cancellation.
+- **Gossip-plane isolation (#206)** — `network_id` plane hellos on every
+  connection; the daemon maps unset config to the well-known `x0x.prod`
+  plane, so co-located daemons (prod/testnet) are isolated by default.
+  Cross-plane peers are refused with a PolicyRejection tombstone and
+  bootstrap-cache eviction; caches are strictly per-data-dir. Hardened
+  during integration: plane clearance survives connection churn
+  (`PLANE_REVERIFY_TTL`) and hellos retry every 2s so a lost hello cannot
+  legacy-admit a cross-plane peer. **Deploy note:** co-located testnet
+  daemons need `network_id = "x0x.testnet"` in their config.
+- **Digest-verified convergence evidence for checkpoint-less recovery
+  (#240)** — StateServedV2 digest handshake; closes all three #238
+  residuals (created_at-free digest, sole-author prune gate, fresh
+  full-delta tags).
+- **Opt-in observed-prefix origin token on DM surfaces (#120)** — coarse
+  `/24` (v4) / `/48` (v6) masked transport-observed origin on DM-receive
+  events and per-peer DM diagnostics; default-off and byte-identical when
+  disabled.
+- **Internet-Draft candidate (#113)** — `draft-saorsa-x0x-agent-transport-00`,
+  byte layouts verified against code (ADR-0017 workstream 1).
+
+### Fixed
+
+- **Inbound accept loop now consults reconnect suppression (#228)** — a
+  suppressed/revoked peer can no longer re-enter during its backoff window
+  by dialing inbound; closes the root cause of the
+  `wrong_pinned_peer_stays_disconnected_for_full_backoff_window` flake
+  family.
+- **cmd-DM group join (#188)** — transient failures return retryable
+  statuses, join is idempotent, 400 is reserved for malformed requests;
+  oversized payloads are classified 413 `payload_too_large` on all paths.
+- **ForwardV2 attestation observability (#216)** — `warn!` diagnostics on
+  every denial path + codec round-trip tamper suite (happy-path fix shipped
+  pre-sprint on main).
+- **Stale manifest temp-file sweep (#231)** — cancelled `tokio::fs` writes
+  no longer leave `.tmp` debris behind.
+- **Load-flaky reconnect/timeout tests (#241)** — rebuilt on
+  load-independent invariants with `X0X_TEST_TIME_MULTIPLIER` scaling and
+  quiesced-connection setup.
+
+### Changed
+
+- **`src/server/mod.rs` decomposed (#125)** — 27,836 → ~1,600 lines across
+  `routes/` submodules; route registry byte-identical.
+- **Docs** — pubsub sender-auth invariant documented + saorsa-gossip audit
+  (#215); delegated-admin authority docs + admin-ban convergence e2e
+  (#107); SKILL.md now covers the complete 142-endpoint surface and README
+  restructured around human use + agent onboarding (#260); AGENTS.md gate
+  execution rules (#259).
+
 ## [v0.33.1] - 2026-07-17
 
 ### Fixed
