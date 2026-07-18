@@ -166,7 +166,7 @@ async fn main() {
 
 ## Available Endpoints
 
-x0xd exposes 71 REST endpoints. Key categories:
+x0xd exposes 142 REST endpoints. Key categories:
 
 | Category | Endpoints | What you can do |
 |----------|-----------|-----------------|

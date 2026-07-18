@@ -357,6 +357,9 @@ log_level = "info"                    # trace | debug | info | warn | error
 heartbeat_interval_secs = 300         # Re-announce identity every 5 min
 identity_ttl_secs = 900               # Expire stale discoveries after 15 min
 rendezvous_enabled = true             # Global agent findability
+network_id = "x0x.prod"               # Gossip plane isolation (unset = "x0x.prod"; "" = open, no isolation)
+observed_prefix_enabled = false       # Share masked observed-address prefix in beacons (default off)
+zero_peer_restart_secs = 600          # Exit after N s at zero peers so a supervisor restarts us (unset = off)
 ```
 
 ### Storage Locations

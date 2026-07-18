@@ -80,6 +80,9 @@ curl http://127.0.0.1:12700/status
 | POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature; never changes existing trust: floor at existing level, Blocked is sticky) |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
+| GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
+| POST | `/identity/revoke` | `x0x identity revoke` | Issue a signed key revocation (self-revocation always allowed; revoking a third party requires a user-signed AgentCertificate; exactly one of `agent_id` / `machine_id`) |
+| GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
 
 ### Announce request body
 
