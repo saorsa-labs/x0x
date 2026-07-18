@@ -27,6 +27,30 @@ pub(in crate::server) struct HealthData {
     version: String,
     peers: usize,
     uptime_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degraded_reason: Option<String>,
+}
+
+/// Classify liveness for `GET /health` (issue #262).
+///
+/// A daemon that has been up past the bootstrap grace window with ZERO peers
+/// is not "healthy" — the prod NYC bootstrap sat in exactly that state for
+/// 6+ hours (wedged transport, silent socket) while fleet monitoring read
+/// `healthy` and stayed quiet. `ok` remains `true` (the process is alive and
+/// serving); `status: "degraded"` is the monitorable signal.
+fn classify_health(peers: usize, uptime_secs: u64) -> (&'static str, Option<String>) {
+    const ZERO_PEER_GRACE_SECS: u64 = 120;
+    if peers == 0 && uptime_secs >= ZERO_PEER_GRACE_SECS {
+        (
+            "degraded",
+            Some(format!(
+                "zero peers for the whole uptime window (>{ZERO_PEER_GRACE_SECS}s); \
+                 transport may be wedged or the network unreachable"
+            )),
+        )
+    } else {
+        ("healthy", None)
+    }
 }
 
 /// Rich runtime status response.
@@ -51,14 +75,17 @@ pub(in crate::server) async fn health(
     State(state): State<Arc<AppState>>,
 ) -> Json<ApiResponse<HealthData>> {
     let peers = state.agent.peers().await.map(|p| p.len()).unwrap_or(0);
+    let uptime_secs = state.start_time.elapsed().as_secs();
+    let (status, degraded_reason) = classify_health(peers, uptime_secs);
 
     Json(ApiResponse {
         ok: true,
         data: HealthData {
-            status: "healthy".to_string(),
+            status: status.to_string(),
             version: x0x::VERSION.to_string(),
             peers,
-            uptime_secs: state.start_time.elapsed().as_secs(),
+            uptime_secs,
+            degraded_reason,
         },
     })
 }
@@ -184,4 +211,36 @@ pub(in crate::server) async fn get_constitution_json() -> impl IntoResponse {
         "status": x0x::constitution::CONSTITUTION_STATUS,
         "content": x0x::constitution::CONSTITUTION_MD,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_health;
+
+    /// WHY (issue #262): a wedged-transport daemon — up for hours, zero
+    /// peers, silent socket — must not read `healthy` to fleet monitoring.
+    /// That exact state hid the NYC prod bootstrap outage for 6+ hours.
+    #[test]
+    fn zero_peers_past_grace_is_degraded() {
+        let (status, reason) = classify_health(0, 121);
+        assert_eq!(status, "degraded");
+        assert!(reason.is_some(), "degraded must carry a reason");
+    }
+
+    /// Startup gets a grace window: bootstrap takes seconds-to-a-minute, and
+    /// flagging a freshly started daemon would page on every restart.
+    #[test]
+    fn zero_peers_within_grace_is_still_healthy() {
+        let (status, reason) = classify_health(0, 30);
+        assert_eq!(status, "healthy");
+        assert!(reason.is_none());
+    }
+
+    /// Any live peer means the transport works — healthy regardless of age.
+    #[test]
+    fn connected_daemon_is_healthy() {
+        let (status, reason) = classify_health(1, 999_999);
+        assert_eq!(status, "healthy");
+        assert!(reason.is_none());
+    }
 }

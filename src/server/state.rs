@@ -353,6 +353,22 @@ pub struct DaemonConfig {
     ///   [`x0x::network::validate_plane_id`].
     #[serde(default)]
     pub network_id: Option<String>,
+
+    /// Zero-peer watchdog (issue #262, TOML: `zero_peer_restart_secs`).
+    ///
+    /// When set, the daemon exits after `peers == 0` has held continuously
+    /// for this many seconds (a startup grace of the same length applies).
+    /// Intended for supervised deployments (`systemd Restart=always`): a
+    /// wedged transport — process alive, API answering, socket silent, the
+    /// state the NYC prod bootstrap sat in for 6+ hours — self-heals via
+    /// supervisor restart. The exit first attempts graceful shutdown, then
+    /// hard-exits (code 86) after 30s so a hung shutdown cannot defeat it.
+    ///
+    /// Default: unset (off). Do NOT set this on unsupervised daemons or
+    /// machines that are legitimately offline for long stretches — the
+    /// process will exit without anything to restart it.
+    #[serde(default)]
+    pub zero_peer_restart_secs: Option<u64>,
 }
 
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
@@ -563,6 +579,7 @@ impl Default for DaemonConfig {
             directory_resubscribe_jitter_ms: None,
             forward: x0x::forward::ForwardConfig::default(),
             network_id: None,
+            zero_peer_restart_secs: None,
         }
     }
 }
@@ -1057,5 +1074,19 @@ mod tests {
         let config: DaemonConfig =
             toml::from_str("observed_prefix_enabled = true").expect("opt-in parses");
         assert!(config.observed_prefix_enabled);
+    }
+
+    #[test]
+    fn zero_peer_restart_defaults_off_and_parses_opt_in() {
+        // Issue #262: the watchdog exits the PROCESS — it must be impossible
+        // to arm by accident. Off in every construction path; only an
+        // explicit TOML key enables it (supervised fleet deployments).
+        let config: DaemonConfig = toml::from_str("").expect("empty config parses");
+        assert!(config.zero_peer_restart_secs.is_none());
+        assert!(DaemonConfig::default().zero_peer_restart_secs.is_none());
+
+        let config: DaemonConfig =
+            toml::from_str("zero_peer_restart_secs = 900").expect("opt-in parses");
+        assert_eq!(config.zero_peer_restart_secs, Some(900));
     }
 }
