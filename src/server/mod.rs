@@ -469,6 +469,48 @@ pub async fn serve_with_options(
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
+    // Zero-peer watchdog (issue #262): opt-in supervised self-heal for the
+    // wedged-transport state (process alive, API healthy, socket silent,
+    // peers pinned at 0). Samples every 30s; after `window` seconds of
+    // CONTINUOUS zero peers (plus the same startup grace) it attempts a
+    // graceful shutdown and hard-exits 30s later so the known shutdown hang
+    // cannot defeat the restart. Only meaningful under a supervisor
+    // (systemd Restart=always) — off by default.
+    if let Some(window) = config.zero_peer_restart_secs {
+        let watchdog_agent = Arc::clone(&agent);
+        let watchdog_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let window = std::time::Duration::from_secs(window.max(60));
+            let mut zero_since: Option<std::time::Instant> = None;
+            // Startup grace: give bootstrap the same window before arming.
+            tokio::time::sleep(window).await;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let peers = watchdog_agent
+                    .peers()
+                    .await
+                    .map(|p| p.len())
+                    .unwrap_or(usize::MAX);
+                if peers == 0 {
+                    let since = *zero_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= window {
+                        tracing::error!(
+                            window_secs = window.as_secs(),
+                            "zero-peer watchdog tripped (issue #262): no peers for the \
+                             full window — transport presumed wedged; exiting for \
+                             supervisor restart"
+                        );
+                        let _ = watchdog_shutdown.send(()).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        std::process::exit(86);
+                    }
+                } else {
+                    zero_since = None;
+                }
+            }
+        });
+    }
+
     // Tailnet streams + forwarder (#131 × #132): install the loaded connect
     // policy on the agent so the inbound byte-stream accept loop refuses
     // streams from ACL-unlisted peers (default-closed when the policy is

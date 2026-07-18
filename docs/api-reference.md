@@ -17,6 +17,14 @@ Examples:
 {"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"uptime_secs":300}
 ```
 
+`status` is `"healthy"`, or `"degraded"` when the daemon has had zero peers
+for its whole uptime past a 120 s bootstrap grace (issue #262 — the wedged
+transport signal; `ok` stays `true` because the process itself is alive). A
+degraded response carries a `degraded_reason` string. Fleet deployments under
+a supervisor can additionally set `zero_peer_restart_secs = <secs>` in the
+daemon TOML to make the process exit (for `Restart=always` self-heal) after
+that long at zero peers — off by default.
+
 ```json
 {"ok":true,"agent_id":"...","machine_id":"...","user_id":null}
 ```
