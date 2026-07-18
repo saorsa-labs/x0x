@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.34.1] - 2026-07-18
+
+### Fixed
+
+- **`GET /health` reports `degraded` on sustained zero peers (#262)** — a
+  daemon whose transport is wedged (process alive, API answering, socket
+  silent, peers pinned at 0 — the state the NYC prod bootstrap sat in for
+  6+ hours while monitoring read "healthy") now returns
+  `status: "degraded"` with a `degraded_reason` after a 120s bootstrap
+  grace. `ok` stays `true`: the process is alive; the status field is the
+  monitorable signal.
+
+### Added
+
+- **Opt-in zero-peer restart watchdog (#262)** — new daemon TOML key
+  `zero_peer_restart_secs`. Under a supervisor (`systemd Restart=always`)
+  the daemon exits after that long at continuous zero peers: graceful
+  shutdown first, hard `exit(86)` 30s later so a hung shutdown cannot
+  defeat the restart. Off by default; never enable on unsupervised or
+  legitimately-offline daemons.
+
 ## [v0.34.0] - 2026-07-18
 
 17-PR sprint release (#243–#259 + #260). Validated by a 4-hour full-feature
