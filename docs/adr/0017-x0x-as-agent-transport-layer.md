@@ -8,7 +8,7 @@
 - **Reviewers:** TBD
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0001](./0001-bootstrap-peers-are-seed-hints-only.md) (bootstrap = hints, not authority); [ADR 0011](./0011-bootstrap-dual-listen-udp-443.md) (UDP/443 strategy); `docs/design/x0x-transport-protocol-id.md`; `docs/design/a2a-over-x0x-binding.md`; `docs/design/a2a-agent-card-adapter.md`
+- **Related:** [ADR 0001](./0001-bootstrap-peers-are-seed-hints-only.md) (bootstrap = hints, not authority); [ADR 0011](./0011-multi-port-bootstrap.md) (UDP/443 strategy); `docs/design/x0x-transport-protocol-id.md`; `docs/design/a2a-over-x0x-binding.md`; `docs/design/a2a-agent-card-adapter.md`
 - **Follow-up issues:** [#112](https://github.com/saorsa-labs/x0x/issues/112) (A2A-over-x0x message binding, workstream #3); [#113](https://github.com/saorsa-labs/x0x/issues/113) (publish transport+identity Internet-Draft, workstream #1)
 - **Shipped in:** v0.24.0 (signed AgentCard + A2A discovery card)
 

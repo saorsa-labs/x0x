@@ -46,7 +46,7 @@ burst, even though QUIC connections appeared healthy.
 ## Decision
 
 Configure x0x's ant-quic node with:
-- `max_concurrent_uni_streams`: 4,096 (up from default 100; briefly 50,000, deliberately reduced — see below)
+- `max_concurrent_uni_streams`: 50,000 (up from default 100; increased in later release)
 - `data_channel_capacity`: 50,000 (up from default 256; increased in later release)
 
 These values are set in `NetworkNode::new()` via ant-quic's `NodeConfig::builder()`.
@@ -55,17 +55,14 @@ choice specific to x0x's gossip workload.
 
 ## Why These Values
 
-### 4,096 concurrent streams (originally 10,000, briefly 50,000)
+### 50,000 concurrent streams (originally 10,000)
 
 At x0x's typical gossip rate of 1-2 messages per second per peer, with 10 connected
 peers, that's ~20 messages/second or ~1,200 messages/minute. Each stream is
 short-lived (open, write, finish), so the concurrent count is much lower than the
 total count. The original design used 10,000 which provides several hours of headroom even in worst-case burst
 scenarios, without meaningful memory cost (~100 bytes per stream entry = ~1 MB total).
-This was briefly raised to 50,000 for margin, then deliberately reduced to 4,096:
-the advertised per-connection uni-stream credit materializes a streams-table slot
-per advertised stream in ant-quic, so 50,000 cost ~1.6 MB per connection vs
-~130 KB at 4,096 (ant-quic#210 memory investigation; set in `src/network.rs`).
+This was later increased to 50,000 for additional margin.
 
 ### 50,000 channel capacity (originally 1,024)
 
@@ -98,5 +95,4 @@ tune them for its specific workload.
 
 3. **Unbounded streams**: Set `max_concurrent_uni_streams` to `VarInt::MAX`. This
    removes the limit entirely but could mask resource leaks or misbehaving peers.
-   A high-but-finite limit (originally 10,000, now 4,096 after the ant-quic#210
-   memory investigation) is more defensible.
+   A high-but-finite limit (originally 10,000, later increased to 50,000) is more defensible.

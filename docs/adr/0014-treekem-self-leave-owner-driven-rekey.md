@@ -10,9 +10,8 @@
 
 ## Context
 
-PR #99 reworked the TreeKEM self-leave handler (`leave_treekem_group`, now in
-`src/server/routes/named_groups.rs`; the apply-side auth path is
-`self_leave_auth` in the same file). The previous implementation tried to rekey the group from
+PR #99 reworked the TreeKEM self-leave handler (`leave_treekem_group` in
+`src/bin/x0xd.rs`). The previous implementation tried to rekey the group from
 the **leaving member's own** `TreeKemGroup` (`guard.remove_member(local_agent)`)
 and publish the resulting commit. That path could not work:
 

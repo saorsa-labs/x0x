@@ -26,7 +26,10 @@ This directory contains architecture decision records for x0x.
 
 - [ADR 0001: Bootstrap Peers Are Seed Hints Only](./0001-bootstrap-peers-are-seed-hints-only.md) — functional Phase 1 complete, nomenclature rename deferred
 
-## Implemented — pending acceptance review
+## Proposed — implemented, pending acceptance review
+
+(Formal status in each file is `Proposed` — the governance policy forbids
+AI-marking an ADR `Accepted`; a human must flip these.)
 
 - [ADR 0019: Connect ACL — Default-Closed Connectivity Policy](./0019-connect-acl-default-closed.md) — default-closed connect policy engine (`src/connect/`) with fail-closed load and `/diagnostics/connect`; implementation verified 2026-07-19, awaiting human acceptance
 - [ADR 0020: Tailnet Phase 1 — per-peer byte-streams + local port-forwarding](./0020-tailnet-phase-1-byte-streams-and-forwarding.md) — PeerStream over `Node::open_bi`/`accept_bi` with the identity gate inside open/accept; `src/forward.rs` local port-forwarder gated by the connect ACL (#131/ADR-0019) + key lifecycle (#130); loopback-only Phase 1; implementation verified 2026-07-19, awaiting human acceptance
@@ -35,3 +38,25 @@ This directory contains architecture decision records for x0x.
 ## Proposed
 
 - [ADR 0021: DM Origin-Machine Attestation for Gossip DMs](./0021-dm-origin-machine-attestation.md) — machine-key attestation of DM origin; codec scaffolding landed (`DmOriginAttestation` in `src/dm.rs`) but enforcement not yet wired
+
+## Errata (Accepted ADRs are immutable; corrections recorded here)
+
+Documentation-audit corrections, 2026-07-19. The ADR files themselves are
+unchanged per the immutability policy; the decisions stand — these entries
+correct stale facts and pointers:
+
+- **ADR 0004** — the Decision text says `max_concurrent_uni_streams: 50,000`;
+  the shipped value is **4,096** (`src/network.rs:1581`, deliberately reduced
+  during the ant-quic#210 memory investigation: ~130 KB vs ~1.6 MB per
+  connection). `data_channel_capacity: 50,000` is correct as written.
+- **ADR 0012** — the status paragraph's "see ADR-0011 scope note" should read
+  **ADR-0010** (GSS plane); the `src/bin/x0xd.rs` line references predate the
+  routes extraction — that logic now lives in
+  `src/server/routes/named_groups.rs`; the "0.21.0 known limitation"
+  (joiner's `MemberAdded`+`Welcome` not delivered) is **resolved** and covered
+  by `tests/e2e_treekem_membership.py`.
+- **ADR 0014** — `leave_treekem_group` no longer lives in `src/bin/x0xd.rs`;
+  it is in `src/server/routes/named_groups.rs` (apply-side auth:
+  `self_leave_auth`, same file).
+- **ADR 0017** — the Related link `./0011-multi-port-bootstrap.md` should be
+  `./0011-bootstrap-dual-listen-udp-443.md`.

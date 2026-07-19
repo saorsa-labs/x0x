@@ -1,6 +1,6 @@
 # ADR 0012: Real TreeKEM as the Default Secure Group Plane
 
-- Status: Accepted — implemented; **single-member private secure groups work end-to-end** (invite → join → Welcome → bidirectional secure → ban/epoch-advance → forward secrecy, verified on testnet). **x0x 0.21.0** (2026-06-03) added owner-side **multi-member roster convergence** (serialized per group by `group_membership_lock`) plus the direct-delivery + bounded pending/replay + catch-up anti-entropy infrastructure. **Resolved (was a 0.21.0 known limitation):** joiner-side `MemberAdded`+`Welcome` delivery landed in the v0.21.x convergence work; multi-member secure participation now works and is covered by `tests/e2e_treekem_membership.py`, which asserts a second member receives and processes its Welcome. Public encrypted presets remain on the GSS plane (see ADR-0010 scope note and the 0.20.2 fix).
+- Status: Accepted — implemented; **single-member private secure groups work end-to-end** (invite → join → Welcome → bidirectional secure → ban/epoch-advance → forward secrecy, verified on testnet). **x0x 0.21.0** (2026-06-03) added owner-side **multi-member roster convergence** (serialized per group by `group_membership_lock`) plus the direct-delivery + bounded pending/replay + catch-up anti-entropy infrastructure. **Known limitation:** for a 2nd+ member the owner's roster converges but the joiner's `MemberAdded`+`Welcome` is not yet delivered (the joiner's anchor-poll times out), so multi-member *secure participation* is not yet functional — tracked follow-up. Public encrypted presets remain on the GSS plane (see ADR-0011 scope note and the 0.20.2 fix).
 - Date: 2026-05-30 (proposed); 2026-06-03 (accepted — shipped in 0.21.0)
 - Supersedes: ADR-0010 (GSS Before MLS TreeKEM for v1 Secure Groups) — see "Relationship to ADR-0010".
 
@@ -85,7 +85,7 @@ x0x today has **two** group-crypto surfaces, which is itself a problem:
    material at rest — `src/storage.rs` writes keys as plain bincode and relies
    on `write_private_file` (atomic write + Unix `0600`); there is no
    sealed-storage / KEK path to "reuse". `agent_kem.key` (the agent's ML-KEM
-   secret) is stored exactly this way (`load_or_generate_api_token` in `src/server/auth.rs`, mode 0600).
+   secret) is stored exactly this way (x0xd.rs `load_or_generate`, mode 0600).
    Therefore TreeKEM snapshots SHALL be persisted with the **same `0600`
    plain-bincode model** as existing keys — they are no more sensitive than
    `machine.key`/`agent.key`/`agent_kem.key` already on disk, so this is
@@ -173,13 +173,12 @@ Unchanged limits to state honestly:
   - `src/groups/mod.rs`: `derive_message_key`, `rotate_shared_secret`,
     `seal_commit`, `seal_withdrawal`, `shared_secret`/`secret_epoch` fields,
     `security_binding` derivation.
-  - `src/server/routes/named_groups.rs` (moved from `src/bin/x0xd.rs` in the
-    routes extraction): the `SecureShareDelivered` gossip-event handler
-    (~494-546) that KEM-opens and stores the GSS shared secret + sets
+  - `src/bin/x0xd.rs`: the `SecureShareDelivered` gossip-event handler
+    (~7300-7382) that KEM-opens and stores the GSS shared secret + sets
     `secret_epoch`/`security_binding` — TreeKEM has **no** shared secret to
     deliver, so this needs a parallel Commit-delivery path, not a branch inside
     the same handler; `secure_share_aad` and the admin-authorized secret-share
-    send path; the `/mls/groups/:id/encrypt`/`decrypt` handlers and
+    send path (~5601-5690); the `/mls/groups/:id/encrypt`/`decrypt` handlers and
     the named-group secure-content read/write endpoints.
   - Membership: add/remove/ban currently produce a GSS `rotate_shared_secret` +
     per-recipient reseal; the TreeKEM equivalent is a `Commit` (+ `UpdatePath`)
@@ -188,7 +187,7 @@ Unchanged limits to state honestly:
   Define how TreeKEM `Commit`s reach **all** members and `Welcome`s reach
   joiners, and how a member who **misses** a Commit recovers. This is a genuine
   gap vs. GSS: the current `SecureShareDelivered` path is **latest-epoch-wins
-  and order-insensitive** (`named_groups.rs` drops any envelope with
+  and order-insensitive** (x0xd.rs ~7328 drops any envelope with
   `secret_epoch < info.secret_epoch`), which is safe for a flat shared secret
   but **wrong for TreeKEM**, where epoch N's Commit must be applied before
   N+1's. Decide: per-group ordered Commit delivery (sequence numbers +

@@ -2,7 +2,7 @@
 
 <!-- File name: docs/adr/0022-tailnet-stream-api.md -->
 
-- **Status:** Implemented — pending human acceptance review (implementation verified against code 2026-07-19)
+- **Status:** Proposed — implementation landed and verified against code (2026-07-19); awaiting human acceptance review
 - **Date:** 2026-07-17
 - **Decision owners:** David Irvine
 - **Reviewers:** x0x core team (independent adversarial review required before Accepted)
