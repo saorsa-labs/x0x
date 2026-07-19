@@ -16,7 +16,7 @@ use std::path::Path;
 /// fits under `crate::dm::MAX_PAYLOAD_BYTES` (49 152). Using 64 KiB
 /// previously caused `envelope construction failed: payload exceeds
 /// MAX_PAYLOAD_BYTES (87481 > 49152)` and aborted every file transfer
-/// on chunk 0 — see proofs/full-20260421-193705/ for the regression.
+/// on chunk 0 (regression evidence in git history under proofs/full-20260421-193705/).
 pub const DEFAULT_CHUNK_SIZE: usize = 32768;
 
 /// Maximum file transfer size: 1 GB.

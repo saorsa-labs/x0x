@@ -1,7 +1,0 @@
-=== mid-run sanity at 2026-04-24T07:04:35Z ===
-[nyc] alive=1 publish_total=1796
-        log: [nyc] start 2026-04-24T07:03:57Z topic=sustained-60min-1777013937 rate=50/s duration=3500s payload=4KB
-[sfo] alive=1 publish_total=1869
-        log: [sfo] start 2026-04-24T07:04:07Z topic=sustained-60min-1777013937 rate=50/s duration=3500s payload=4KB
-[helsinki] alive=1 publish_total=1710
-        log: [helsinki] start 2026-04-24T07:04:13Z topic=sustained-60min-1777013937 rate=50/s duration=3500s payload=4KB

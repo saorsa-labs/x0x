@@ -8,7 +8,7 @@ the `x0x` CLI consume it so routes and CLI commands stay in lockstep
 (`x0x routes` prints them at runtime). For request/response examples and
 the WebSocket protocol details, see [api-reference.md](api-reference.md).
 
-The daemon currently exposes **129 endpoints**. Authentication is by bearer
+The daemon currently exposes **142 endpoints**. Authentication is by bearer
 token (`Authorization: Bearer …`). The token is auto-discovered from
 `~/.local/share/x0x/api-token` (Linux) or
 `~/Library/Application Support/x0x/api-token` (macOS).
@@ -22,6 +22,7 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | POST | `/shutdown` | `x0x stop` | Graceful shutdown |
 | GET | `/constitution` | `x0x constitution` | x0x Constitution (Markdown) |
 | GET | `/constitution/json` | `x0x constitution --json` | Constitution + version metadata (JSON) |
+| POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token |
 
 ## Identity
 
@@ -33,6 +34,10 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | GET | `/agent/card` | `x0x agent card` | Shareable identity card |
 | GET | `/introduction` | `x0x agent introduction` | Trust-scoped introduction card |
 | POST | `/agent/card/import` | `x0x agent import` | Import identity card into contacts |
+| POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over a caller-supplied payload |
+| POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
+| POST | `/identity/revoke` | `x0x identity revoke` | Issue a signed revocation for an agent-id or machine-id keypair |
+| GET | `/identity/revocations` | `x0x identity revocations` | List all revocation records held by this daemon |
 
 ## Network and diagnostics
 
@@ -49,6 +54,9 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | POST | `/peers/:peer_id/probe` | `x0x peer probe` | Active liveness + RTT probe (ant-quic) |
 | GET | `/peers/:peer_id/health` | `x0x peer health` | Connection health snapshot |
 | GET | `/peers/events` | `x0x peer events` | SSE peer-lifecycle events (Established/Replaced/Closing/Closed) |
+| GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
+| GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
+| GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
 
 ## Presence
 
@@ -194,6 +202,7 @@ admin-equivalent for old groups but are not assignable.
 | Method | Path | CLI | Description |
 |---|---|---|---|
 | GET | `/groups/:id/state` | `x0x group state` | Inspect signed state-commit chain |
+| GET | `/groups/:id/state/commits` | `x0x group state-commits` | Read retained state-commit history (members only, paged) |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal` | Advance commit chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group delete` | Delete group with a terminal withdrawal commit (admin+) |
 
@@ -256,6 +265,15 @@ admin-equivalent for old groups but are not assignable.
 |---|---|---|---|
 | GET | `/upgrade` | `x0x upgrade` | Check for updates |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` | Apply latest verified release manifest |
+
+## Tailnet port-forwarding
+
+| Method | Path | CLI | Description |
+|---|---|---|---|
+| POST | `/forwards` | `x0x forward add` | Add a local port forward to a peer's loopback service |
+| GET | `/forwards` | `x0x forward list` | List registered port forwards |
+| DELETE | `/forwards/:local_addr` | `x0x forward rm` | Remove a port forward by its local bind address |
+| GET | `/streams` | `x0x streams` | Active forward-stream count + connect-ACL counters |
 
 ## WebSocket and GUI
 

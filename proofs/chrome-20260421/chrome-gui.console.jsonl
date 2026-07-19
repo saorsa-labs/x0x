@@ -1,3 +1,0 @@
-{"t":1776774865245,"type":"error","text":"Failed to load resource: the server responded with a status of 400 (Bad Request)","location":{"url":"http://127.0.0.1:12715/peers/not-hex/probe?timeout_ms=500","lineNumber":0,"columnNumber":0}}
-{"t":1776774865247,"type":"error","text":"Failed to load resource: the server responded with a status of 503 (Service Unavailable)","location":{"url":"http://127.0.0.1:12715/peers/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/probe?timeout_ms=500","lineNumber":0,"columnNumber":0}}
-{"t":1776774865250,"type":"error","text":"Failed to load resource: the server responded with a status of 400 (Bad Request)","location":{"url":"http://127.0.0.1:12715/publish","lineNumber":0,"columnNumber":0}}

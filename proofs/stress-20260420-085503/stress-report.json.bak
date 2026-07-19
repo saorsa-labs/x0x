@@ -1,1 +1,0 @@
-{"nodes":3,"messages":100,"topic":"gossip-stress-97003","elapsed_seconds":12,"per_node":[{"idx":1,"publish_total":118,"delivered_to_subscriber":140,"decode_to_delivery_drops":0},{"idx":2,"publish_total":17,"delivered_to_subscriber":102,"decode_to_delivery_drops":0},{"idx":3,"publish_total":17,"delivered_to_subscriber":102,"decode_to_delivery_drops":0}]}

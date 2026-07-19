@@ -7,8 +7,7 @@
     "CHANGELOG.md",
     "README.md",
     "docs/adr/**",
-    "docs/design/**",
-    "docs/2026-03-28-audit-response.md"
+    "docs/design/**"
   ],
   "rules": {
     "version_sync": {

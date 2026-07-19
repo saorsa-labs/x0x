@@ -1287,7 +1287,7 @@ enum ForwardGossipOutcome {
     Enqueued,
     DroppedFull,
     /// A recoverable PubSub control frame was proactively shed under
-    /// near-overload to preserve EAGER delivery (ADR 0010). Like
+    /// near-overload to preserve EAGER delivery (ADR 0013). Like
     /// `DroppedFull`, the recv pump skips it; counted in `shed_priority`.
     Shed,
 }
@@ -1332,7 +1332,7 @@ async fn forward_gossip_payload(
                     channel = channel_name,
                     depth,
                     max,
-                    "[1/6 network] shedding recoverable PubSub control frame (channel >90% full) to preserve EAGER delivery (ADR 0010; rate-limited; see recv_pump.pubsub.shed_priority)"
+                    "[1/6 network] shedding recoverable PubSub control frame (channel >90% full) to preserve EAGER delivery (ADR 0013; rate-limited; see recv_pump.pubsub.shed_priority)"
                 );
             }
             return Ok(ForwardGossipOutcome::Shed);
@@ -4700,7 +4700,8 @@ async fn network_node_in_memory_cache_writes_nothing() {
 /// Due to dual-stack socket complexities on some platforms, not all connections
 /// may succeed — but any connection that does succeed MUST be bidirectional.
 ///
-/// See: .planning/ant-quic-phantom-connections.md
+/// Background: ant-quic phantom-connection investigation (git history:
+/// .planning/ant-quic-phantom-connections.md).
 #[ignore = "timing-sensitive mesh test — run manually with: cargo test test_mesh -- --ignored --nocapture"]
 #[tokio::test]
 async fn test_mesh_connections_are_bidirectional() {

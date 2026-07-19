@@ -31,7 +31,7 @@ fn gui_html_is_valid() {
 
 /// Verify the GUI direct-send composer exposes the require_ack toggle.
 ///
-/// Closes the parity-matrix red cell `Send + receive-ACK / GUI` by proving
+/// Closes the historical parity gap `Send + receive-ACK / GUI` by proving
 /// the composer (a) renders the checkbox and (b) wires it to
 /// `require_ack_ms` on the `/direct/send` body.
 #[test]

@@ -1,17 +1,23 @@
 # x0x Comprehensive Test Suite Guide
 
-**x0x version:** 0.19.17
-**Last updated:** 2026-05-01
+**x0x version:** 0.34.2
+**Last updated:** 2026-07-19
 
 This document describes the production test architecture for x0x — Rust
 unit/integration tests, end-to-end shell harnesses, GUI parity checks, and
-the cross-surface parity proofs against Communitas (Dioxus + Apple).
+the cross-surface parity proofs against Communitas (Dioxus + Apple). For
+the maintained quick reference (integration-test inventory, e2e run
+recipes, VPS ports), see [`tests/CLAUDE.md`](tests/CLAUDE.md).
 
-The capability source of truth is [`docs/parity-matrix.md`](docs/parity-matrix.md):
-every capability in x0x must be reachable — and behave identically — from
-every supported surface (REST, CLI, embedded GUI, Communitas Dioxus,
-Communitas Apple). Each row in the matrix is backed by a test in this
-guide.
+The capability source of truth is the manifest-driven parity test suite:
+the `ENDPOINTS` registry in `src/api/mod.rs` (projected to
+`docs/design/api-manifest.json` by `tests/api_manifest.rs`), enforced by
+`tests/api_coverage.rs`, `tests/parity_cli.rs`, and
+`tests/gui_named_group_parity.rs`. Every capability in x0x must be
+reachable — and behave identically — from every supported surface (REST,
+CLI, embedded GUI, Communitas Dioxus, Communitas Apple). Cross-surface
+status is recorded in
+[`docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md`](docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md).
 
 ---
 
@@ -61,10 +67,10 @@ can be replayed and audited after the fact.
 
 **Runner:** `cargo nextest run --all-features --workspace`
 
-**Scope:** 52 integration files in `tests/`, plus inline `#[cfg(test)]`
-modules. ~1,006 tests at last release-blocking run.
+**Scope:** 81 integration files in `tests/` (plus 37 shell harnesses and
+inline `#[cfg(test)]` modules).
 
-Highlights (full inventory in `tests/`):
+Highlights (curated inventory in [`tests/CLAUDE.md`](tests/CLAUDE.md)):
 
 | File | Coverage |
 |------|----------|
@@ -196,9 +202,9 @@ Related load-isolation harnesses in the same family:
 **Path:** `tests/e2e_gui_chrome.mjs` (driver) + `tests/e2e_gui_chrome.sh`
 (wrapper)
 
-Drives `src/gui/x0x-gui.html` via real Chrome and asserts every capability
-in [`docs/parity-matrix.md`](docs/parity-matrix.md) round-trips against the
-live `x0xd` daemon — same-origin via the daemon's `/gui` route.
+Drives `src/gui/x0x-gui.html` via real Chrome and asserts every GUI-wired
+capability round-trips against the live `x0xd` daemon — same-origin via
+the daemon's `/gui` route.
 
 Captures rich proof artefacts:
 
@@ -534,8 +540,9 @@ Add new actions in three places:
    in `_dispatch_command()` and publish a result with a new `kind`.
 2. **`tests/e2e_vps_mesh.py`** — add a queue / route in `ResultsBus` and a
    collector method in the orchestrator.
-3. **`docs/parity-matrix.md`** — link the new mesh assertion to its REST
-   row so we can see at a glance which capabilities are mesh-tested.
+3. **`docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md`** — record the new mesh
+   assertion against its surface row so we can see at a glance which
+   capabilities are mesh-tested.
 
 Keep payloads small: every command/result envelope rides the gossip
 fabric and counts toward the same drop-detection counters as application
@@ -772,8 +779,9 @@ bash .deployment/health-check.sh --extended        # with peer counts
 
 ## Currently Implemented Capabilities (Tested)
 
-All capabilities below have round-trip coverage in the matrix; see
-[`docs/parity-matrix.md`](docs/parity-matrix.md) for per-surface status.
+All capabilities below have round-trip coverage in the parity test suite;
+see [`docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md`](docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md)
+for per-surface status.
 
 **Network layer**
 - QUIC transport (ant-quic 0.27.3 / 0.27.x, ML-DSA-65 / ML-KEM-768)
@@ -963,8 +971,9 @@ To add new tests:
    `../communitas/communitas-dioxus/tests/e2e/`; Apple in
    `CommunitasGoldenPathsUITests.swift`; cross-region matrix in
    `tests/e2e_vps_mesh.py` (preferred) or `tests/e2e_vps.sh` (legacy).
-2. Update the corresponding row in [`docs/parity-matrix.md`](docs/parity-matrix.md)
-   from 🟡 / ❌ to ✅ once the test is green.
+2. Update the corresponding surface row in
+   [`docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md`](docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md)
+   once the test is green.
 3. Wire the test into `e2e_proof_runner.sh` if it should be part of the
    release proof.
 4. Document expected behaviour in the test header.
@@ -984,5 +993,5 @@ Mesh-harness specific:
 
 - GitHub: https://github.com/saorsa-labs/x0x
 - Email: david@saorsalabs.com
-- Parity matrix: [`docs/parity-matrix.md`](docs/parity-matrix.md)
+- Parity signoff: [`docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md`](docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md)
 - Architecture: [`CLAUDE.md`](CLAUDE.md)

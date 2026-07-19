@@ -4,11 +4,11 @@
 
 Design source of truth — active and evolving.
 
-This document expands and effectively supersedes the narrower ideas in `docs/design/groups-mls-unification.md`.
+This document expands and effectively supersedes the narrower ideas in the earlier `groups-mls-unification` proposal (removed 2026-07-19; see git history).
 
-Implementation is in progress across multiple phases and branches. This document is the architecture target, not proof that the target has been reached. Signoff requires the implementation and review gates described below.
+The phases below have landed (see the Status column); this document now serves as the model reference for the shipped implementation.
 
-> **Shipped milestone (x0x 0.21.0, 2026-06-03):** secure-by-default **TreeKEM** for private groups (ADR-0012, now *Accepted*). **Single-member** private secure groups are fully functional end-to-end (invite → join → Welcome → bidirectional secure → ban/epoch-advance → forward secrecy, verified on testnet). 0.21.0 also fixed owner-side **multi-member roster convergence** (serialized per group by `group_membership_lock`). **Known limitation:** for a 2nd+ member the owner's roster converges but the joiner's `MemberAdded`+`Welcome` is not yet delivered (joiner's anchor-poll times out) → multi-member *secure participation* is a tracked follow-up. Public encrypted presets remain on the GSS plane (ADR-0010 forward-path scope).
+> **Shipped milestone (x0x 0.21.0, 2026-06-03):** secure-by-default **TreeKEM** for private groups (ADR-0012, now *Accepted*). **Single-member** private secure groups are fully functional end-to-end (invite → join → Welcome → bidirectional secure → ban/epoch-advance → forward secrecy, verified on testnet). 0.21.0 also fixed owner-side **multi-member roster convergence** (serialized per group by `group_membership_lock`). The 0.21.0-era limitation (joiner's `MemberAdded`+`Welcome` not delivered for a 2nd+ member) was **resolved** in the subsequent Welcome-delivery fixes and is now covered by `tests/e2e_treekem_membership.py`, which asserts a second member receives and processes its Welcome. Public encrypted presets remain on the GSS plane (ADR-0010 forward-path scope).
 
 ### Execution phases
 
@@ -192,17 +192,18 @@ Canonical evidence:
 C.2 should no longer be described as "proof-debt open" at current
 working-tree HEAD.
 
-### Honest v1 secure model
+### Historical v1 secure model (superseded by TreeKEM)
 
-x0x v1 ships **GSS** (Group Shared Secret) rekey-on-ban, not full MLS
-TreeKEM. This is recorded in
+x0x v1 shipped **GSS** (Group Shared Secret) rekey-on-ban, recorded in
 [ADR 0010](../adr/0010-gss-before-mls-treekem-for-v1-secure-groups.md).
 The `security_binding` field in `GroupStateCommit` carries the current
 `gss:epoch=N` so the state chain cannot silently drift from the secure
 plane. GSS provides cross-daemon encrypt/decrypt + rekey-on-ban
 future-access revocation (proven in `tests/e2e_named_groups.sh` §2); it
-does **not** provide per-message forward secrecy within an epoch or MLS
-TreeKEM semantics. Full TreeKEM is planned follow-up work.
+does **not** provide per-message forward secrecy within an epoch. Since
+x0x 0.21.0, **TreeKEM is the default for private secure groups**
+(ADR-0012); the GSS plane remains for grandfathered groups and public
+encrypted presets (ADR-0010 forward-path scope).
 
 ## Why this exists
 

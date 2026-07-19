@@ -1,7 +1,7 @@
 # x0x C — Direct Messaging over Gossip
 
-**Status**: Design — pending review
-**Target release**: x0x 0.18.0 (with raw-QUIC DM overlap); full cutover in 0.19.0
+**Status**: Implemented — `src/dm.rs` / `src/dm_send.rs` / `src/dm_inbox.rs` implement this design (shipped in the 0.18/0.19 cycle; status updated 2026-07-19)
+**Target release**: x0x 0.18.0 (with raw-QUIC DM overlap); full cutover landed in 0.19.0
 **Motivation**: The current `DirectMessaging` path sits directly on
 ant-quic's transport-level `send`. Transport-level Ok is not
 application-level delivery, and in a churning mesh the two diverge

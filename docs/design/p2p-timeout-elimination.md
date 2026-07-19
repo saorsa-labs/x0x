@@ -440,9 +440,9 @@ The investigation succeeds when **all** of these hold:
 ## 10. References
 
 - `proofs/release-v0.19.17-20260430T133431Z/03-vps/vps.log` — the 4 residual failures
-- `proofs/full-suite-20260429T214746Z/03-vps/SUMMARY.md` — manual three-mode repro
-- `proofs/full-suite-20260429T214746Z/09-soak-8h/SUMMARY.md` — pubsub timed_out at 10 s cap (now 30 s)
-- `docs/debug/cross-region-all-pairs-timeouts.md` — earlier debug brief, supersedes by this document
+- `proofs/full-suite-20260429T214746Z/03-vps/SUMMARY.md` — manual three-mode repro (proofs/ removed 2026-07-19; in git history)
+- `proofs/full-suite-20260429T214746Z/09-soak-8h/SUMMARY.md` — pubsub timed_out at 10 s cap (now 30 s) (in git history)
+- `cross-region-all-pairs-timeouts.md` — earlier debug brief, superseded by this document (removed 2026-07-19; in git history)
 - `src/dm.rs:288–321` — current DmSendConfig
 - `src/dm_send.rs:79–125` — current retry loop
 - `src/direct.rs:229–243` — current broadcast channel

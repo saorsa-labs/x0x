@@ -4536,7 +4536,7 @@ impl Agent {
     /// in-flight send is abandoned and reissued once against the new
     /// generation. If the reissue also fails, the standard error is
     /// returned. This closes the X0X-0041 coverage gap surfaced by the
-    /// Phase A bisect (P1 finding in
+    /// SOTA-Borrow Phase A bisect (P1 finding; evidence in git history under
     /// `proofs/sota-borrow-phaseA-bisect-20260508T214634Z/ANALYSIS.md` §0.1).
     async fn send_direct_raw_quic(
         &self,

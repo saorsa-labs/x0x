@@ -1,5 +1,0 @@
-=== Post-redeploy fleet status (just after restart) ===
-saorsa-2     version=x0xd 0.19.4 service=active health=healthy online=5
-saorsa-3     version=x0xd 0.19.4 service=active health=healthy online=6
-saorsa-6     version=x0xd 0.19.4 service=active health=healthy online=5
-saorsa-7     version=x0xd 0.19.4 service=active health=healthy online=3
