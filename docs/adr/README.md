@@ -24,6 +24,7 @@ This directory contains architecture decision records for x0x.
 - [ADR 0019: Connect ACL — Default-Closed Connectivity Policy](./0019-connect-acl-default-closed.md) — default-closed connect policy engine (`src/connect/`) with fail-closed load and `/diagnostics/connect` (accepted 2026-07-22)
 - [ADR 0020: Tailnet Phase 1 — per-peer byte-streams + local port-forwarding](./0020-tailnet-phase-1-byte-streams-and-forwarding.md) — PeerStream over `Node::open_bi`/`accept_bi` with the identity gate inside open/accept; `src/forward.rs` local port-forwarder gated by the connect ACL (#131/ADR-0019) + key lifecycle (#130); loopback-only Phase 1 (accepted 2026-07-22)
 - [ADR 0022: Tailnet stream API — per-protocol acceptors, connect-ACL gate, bounded backpressure](./0022-tailnet-stream-api.md) — protocol-byte routing to single-owner acceptors (bounded, drop-on-full), stream-layer connect-ACL pair gate after the identity gate, QUIC flow-control backpressure with asserted bounds; issue #132 deliverable 1 (accepted 2026-07-22)
+- [ADR 0023: Durable Local History Is a Core x0x Capability](./0023-durable-local-history.md) (accepted 2026-07-22) — default-on SQLite history store in x0xd (durable/replaceable/ephemeral taxonomy, bounded shed-on-full writer, local-only — never served to the network); lifts the nostr-bridge spike's store design; substrate for tic-tac-toe
 
 ## Accepted (Phase 1 Functionally Complete)
 
