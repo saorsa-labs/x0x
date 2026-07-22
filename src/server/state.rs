@@ -598,6 +598,9 @@ impl Default for DaemonConfig {
 /// Shared state accessible from all route handlers.
 pub(super) struct AppState {
     pub(super) agent: Arc<Agent>,
+    /// Topics this daemon records durably (ADR-0023 §4 opt-in; from
+    /// `[history] record_topics`). Local ingest option only.
+    pub(super) history_record_topics: Vec<String>,
     pub(super) subscriptions: RwLock<HashMap<String, RestSubscription>>,
     pub(super) task_lists: RwLock<HashMap<String, TaskListHandle>>,
     pub(super) kv_stores: RwLock<HashMap<String, KvStoreHandle>>,

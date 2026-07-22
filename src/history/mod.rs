@@ -11,6 +11,7 @@
 //! (no NFS/SMB). The store holds SQLite's `EXCLUSIVE` locking mode so a
 //! second process opening the same database fails loud at open.
 
+pub mod classify;
 pub mod record;
 pub mod store;
 pub mod writer;
@@ -57,6 +58,11 @@ pub struct HistoryConfig {
     /// Explicit database path. `None` ⇒ `<data_dir>/history.db`.
     #[serde(default)]
     pub db_path: Option<PathBuf>,
+    /// Pub/sub topics this daemon records (ADR-0023 §4 "Durable opt-in").
+    /// A **local ingest option**: it never obliges any other daemon, and a
+    /// publisher cannot force recording on a receiver.
+    #[serde(default)]
+    pub record_topics: Vec<String>,
 }
 
 fn default_max_bytes() -> u64 {
@@ -72,6 +78,7 @@ impl Default for HistoryConfig {
             max_age_days: 0,
             scope_limits: Vec::new(),
             db_path: None,
+            record_topics: Vec::new(),
         }
     }
 }

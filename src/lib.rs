@@ -4171,6 +4171,70 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
+        // internal senders) funnels through here — the single outbound
+        // history wiring point. Classify before the send so the payload is
+        // cloned only for durable rows on a history-enabled agent.
+        let history_payload = if self.history_handle.is_some()
+            && matches!(
+                history::classify::classify_dm_payload(&payload),
+                history::classify::DmPayloadClass::Durable(_)
+            ) {
+            Some(payload.clone())
+        } else {
+            None
+        };
+        let result = self
+            .send_direct_with_config_inner(to, payload, config)
+            .await;
+        if let (Ok(receipt), Some(recorded_payload)) = (&result, history_payload) {
+            self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
+        }
+        result
+    }
+
+    /// Record a durable outbound DM row after a successful send (ADR-0023).
+    ///
+    /// Raw-QUIC sends never build a signed envelope, so outbound rows are
+    /// artifact-less (`provenance = LocalSend`) with a nonce-keyed `msg_id`
+    /// (the receipt's `request_id`, so retries of one logical send dedupe).
+    /// The recipient's inbound row carries the re-verifiable artifact when
+    /// an envelope path ran.
+    fn record_dm_outbound(&self, to: &identity::AgentId, payload: &[u8], request_id: [u8; 16]) {
+        let Some(history_handle) = self.history_handle.as_ref() else {
+            return;
+        };
+        let history::classify::DmPayloadClass::Durable(content_type) =
+            history::classify::classify_dm_payload(payload)
+        else {
+            return;
+        };
+        let now = i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX);
+        history_handle.record(history::HistoryRecord {
+            msg_id: history::HistoryRecord::compute_local_send_msg_id(&request_id, payload),
+            scope: history::Scope::Dm(hex::encode(to.as_bytes())),
+            author_agent: Some(hex::encode(self.identity.agent_id().as_bytes())),
+            author_machine: Some(hex::encode(self.identity.machine_id().as_bytes())),
+            author_pubkey: None,
+            sent_at_ms: now,
+            seen_at_ms: now,
+            direction: history::Direction::Outbound,
+            content_type: content_type.to_string(),
+            payload: payload.to_vec(),
+            signed_artifact: None,
+            signature: None,
+            sig_context: None,
+            provenance: history::Provenance::LocalSend,
+            replace_key: None,
+        });
+    }
+
+    async fn send_direct_with_config_inner(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
         if *to == self.identity.agent_id() {
             self.direct_messaging.record_outgoing_started(*to, None);
             if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
@@ -7274,6 +7338,7 @@ impl Agent {
             config,
             std::sync::Arc::clone(&self.revocation_set),
             std::sync::Arc::clone(&self.authenticated_machine_bindings),
+            self.history_handle.clone(),
         )
         .await
         .map_err(|e| {

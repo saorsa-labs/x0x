@@ -203,6 +203,22 @@ impl HistoryRecord {
         }
     }
 
+    /// Dedupe id for an artifact-less locally-sent row.
+    ///
+    /// Outbound DMs on the raw-QUIC path never build a signed envelope, so
+    /// there is no `signed_artifact`; `BLAKE3(payload)` alone would collapse
+    /// two identical sends ("ok" twice) into one row. A per-send nonce keeps
+    /// each logical send distinct while retries of the *same* logical send
+    /// (which reuse the nonce) still dedupe.
+    #[must_use]
+    pub fn compute_local_send_msg_id(nonce: &[u8; 16], payload: &[u8]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x-history-local-send-v1");
+        hasher.update(nonce);
+        hasher.update(payload);
+        *hasher.finalize().as_bytes()
+    }
+
     /// Validate internal consistency before write.
     pub fn validate(&self) -> HistoryResult<()> {
         if self.payload.is_empty() {
@@ -213,11 +229,18 @@ impl HistoryRecord {
                 "signature present without signed_artifact".into(),
             ));
         }
-        let expected = Self::compute_msg_id(self.signed_artifact.as_deref(), &self.payload);
-        if expected != self.msg_id {
-            return Err(HistoryError::InvalidRecord(
-                "msg_id does not match signed_artifact/payload".into(),
-            ));
+        // Artifact-less local sends carry a nonce-derived msg_id (see
+        // `compute_local_send_msg_id`) that cannot be recomputed from the
+        // row alone; every other row must match the canonical computation.
+        let nonce_keyed_local_send =
+            self.provenance == Provenance::LocalSend && self.signed_artifact.is_none();
+        if !nonce_keyed_local_send {
+            let expected = Self::compute_msg_id(self.signed_artifact.as_deref(), &self.payload);
+            if expected != self.msg_id {
+                return Err(HistoryError::InvalidRecord(
+                    "msg_id does not match signed_artifact/payload".into(),
+                ));
+            }
         }
         Ok(())
     }

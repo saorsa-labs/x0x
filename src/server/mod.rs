@@ -313,11 +313,19 @@ pub async fn serve_with_options(
     };
 
     let contacts_path = config.data_dir.join("contacts.json");
+    // ADR-0023: the daemon passes its `[history]` config through (default-on;
+    // `enabled = false` is the escape hatch). Named instances resolve to a
+    // per-instance `history.db` because `data_dir` is per-instance.
+    let mut history_config = config.history.clone();
+    if history_config.db_path.is_none() {
+        history_config.db_path = Some(config.data_dir.join("history.db"));
+    }
     let mut builder = Agent::builder()
         .with_network_config(network_config)
         .with_gossip_config(config.gossip.clone())
         .with_peer_cache_dir(cache_dir)
         .with_contact_store_path(&contacts_path)
+        .with_history(history_config)
         .with_heartbeat_interval(config.heartbeat_interval_secs)
         .with_identity_ttl(config.identity_ttl_secs);
 
@@ -547,6 +555,7 @@ pub async fn serve_with_options(
 
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
+        history_record_topics: config.history.record_topics.clone(),
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
         kv_stores: RwLock::new(HashMap::new()),
