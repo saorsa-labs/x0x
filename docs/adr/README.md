@@ -32,6 +32,7 @@ This directory contains architecture decision records for x0x.
 ## Proposed
 
 - [ADR 0021: DM Origin-Machine Attestation for Gossip DMs](./0021-dm-origin-machine-attestation.md) — machine-key attestation of DM origin; codec scaffolding landed (`DmOriginAttestation` in `src/dm.rs`) but enforcement not yet wired
+- [ADR 0023: Durable Local History Is a Core x0x Capability](./0023-durable-local-history.md) — default-on SQLite history store in x0xd (durable/replaceable/ephemeral taxonomy, bounded shed-on-full writer, local-only — never served to the network); lifts the nostr-bridge spike's store design; substrate for tic-tac-toe
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 
