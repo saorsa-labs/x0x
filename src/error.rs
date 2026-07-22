@@ -48,6 +48,11 @@ pub enum IdentityError {
     #[error("key storage error: {0}")]
     Storage(#[from] std::io::Error),
 
+    /// ADR-0023 history store failed to initialize (e.g. the database is
+    /// exclusively locked by another process).
+    #[error("history initialization failed: {0}")]
+    HistoryInit(String),
+
     /// Serialization or deserialization of keypairs failed.
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -446,6 +451,43 @@ impl From<PresenceError> for NetworkError {
 
 /// Standard Result type for x0x presence operations.
 pub type PresenceResult<T> = std::result::Result<T, PresenceError>;
+
+/// Errors from the durable local history store (ADR-0023).
+#[derive(Error, Debug)]
+pub enum HistoryError {
+    /// SQLite-level failure (open, migrate, statement, transaction).
+    #[error("history database error: {0}")]
+    Database(String),
+
+    /// The history database is already exclusively held by another process.
+    #[error("history database is locked by another process: {0}")]
+    Locked(String),
+
+    /// A scope string could not be parsed (`dm:<agent>`, `group:<id>`, `topic:<name>`).
+    #[error("invalid history scope: {0}")]
+    InvalidScope(String),
+
+    /// A record failed validation before write.
+    #[error("invalid history record: {0}")]
+    InvalidRecord(String),
+
+    /// The writer channel is closed (service shut down).
+    #[error("history writer is shut down")]
+    WriterClosed,
+
+    /// Filesystem error touching the database path.
+    #[error("history io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<rusqlite::Error> for HistoryError {
+    fn from(e: rusqlite::Error) -> Self {
+        HistoryError::Database(e.to_string())
+    }
+}
+
+/// Standard Result type for x0x history operations.
+pub type HistoryResult<T> = std::result::Result<T, HistoryError>;
 
 #[cfg(test)]
 mod network_tests {

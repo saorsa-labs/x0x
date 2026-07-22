@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 142,
+  "endpoint_count": 147,
   "endpoints": [
     {
       "category": "status",
@@ -196,6 +196,41 @@
       "description": "Per-group ingest counters, listener state, and drop buckets",
       "method": "GET",
       "path": "/diagnostics/groups"
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics history",
+      "description": "Durable-history writer/reaper counters (ADR-0023)",
+      "method": "GET",
+      "path": "/diagnostics/history"
+    },
+    {
+      "category": "history",
+      "cli_name": "history list",
+      "description": "List durable history for one scope (dm:/group:/topic:), keyset-paginated",
+      "method": "GET",
+      "path": "/history"
+    },
+    {
+      "category": "history",
+      "cli_name": "history search",
+      "description": "Full-text search over text history payloads within a scope",
+      "method": "GET",
+      "path": "/history/search"
+    },
+    {
+      "category": "history",
+      "cli_name": "history stats",
+      "description": "History row counts, database size, and retention bounds",
+      "method": "GET",
+      "path": "/history/stats"
+    },
+    {
+      "category": "history",
+      "cli_name": "history purge",
+      "description": "Purge one scope from the local history store (local-only)",
+      "method": "DELETE",
+      "path": "/history"
     },
     {
       "category": "exec",

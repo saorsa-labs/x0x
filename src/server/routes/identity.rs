@@ -719,6 +719,40 @@ pub(in crate::server) async fn import_agent_card(
             .await;
     }
 
+    // ADR-0023 §4: agent cards are Replaceable — latest per agent id. Signed
+    // cards were verified above; legacy unsigned imports are recorded as a
+    // locally-accepted fact.
+    if let Some(history) = state.agent.history() {
+        if let Ok(card_json) = serde_json::to_vec(&card) {
+            let now_ms = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
+            let provenance = if card.signature.is_some() {
+                x0x::history::Provenance::VerifiedEnvelope
+            } else {
+                x0x::history::Provenance::LocalAppDecrypt
+            };
+            history.record(x0x::history::HistoryRecord {
+                msg_id: x0x::history::HistoryRecord::compute_msg_id(None, &card_json),
+                scope: x0x::history::Scope::Dm(card.agent_id.clone()),
+                author_agent: Some(card.agent_id.clone()),
+                author_machine: Some(card.machine_id.clone()),
+                author_pubkey: card
+                    .agent_public_key
+                    .as_ref()
+                    .and_then(|pk| hex::decode(pk).ok()),
+                sent_at_ms: now_ms,
+                seen_at_ms: now_ms,
+                direction: x0x::history::Direction::Inbound,
+                content_type: "application/json".to_string(),
+                payload: card_json,
+                signed_artifact: None,
+                signature: None,
+                sig_context: None,
+                provenance,
+                replace_key: Some(format!("agent-card:{}", card.agent_id)),
+            });
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({

@@ -157,15 +157,78 @@ fn direct_message_event_data(msg: &crate::direct::DirectMessage) -> serde_json::
     data
 }
 
+/// Query parameters for `GET /direct/events` (ADR-0023 §7 backfill).
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct DirectEventsParams {
+    /// Replay up to N stored DM rows as `history_direct_message` events,
+    /// then a `live` event, then the live stream.
+    backfill: Option<usize>,
+}
+
 /// GET /direct/events — SSE stream of incoming direct messages.
 pub(super) async fn direct_events_sse(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DirectEventsParams>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     tracing::info!("[6/6 x0xd] SSE client connected to /direct/events");
+    // Live tap FIRST (ADR-0023 seam rule), then the stored backfill.
     let mut rx = state.agent.subscribe_direct();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
 
+    // Stored rows fetched up-front so the stream! block stays simple; the
+    // live tap above is already established, so nothing is missed while the
+    // (blocking) store query runs.
+    let mut backfill_rows: Vec<serde_json::Value> = Vec::new();
+    let mut backfill_hashes: Option<std::collections::HashSet<[u8; 32]>> = None;
+    if let Some(limit) = params.backfill {
+        if let Some(history) = state.agent.history() {
+            let store = std::sync::Arc::clone(history.store());
+            let q = crate::history::HistoryQuery {
+                scope_kind: Some(0), // dm rows
+                limit,
+                ..Default::default()
+            };
+            match tokio::task::spawn_blocking(move || store.query(&q)).await {
+                Ok(Ok(mut rows)) => {
+                    rows.reverse(); // oldest-first replay
+                    let mut hashes = std::collections::HashSet::new();
+                    for row in &rows {
+                        let r = &row.record;
+                        hashes.insert(*blake3::hash(&r.payload).as_bytes());
+                        backfill_rows.push(serde_json::json!({
+                            "sender": r.author_agent,
+                            "machine_id": r.author_machine,
+                            "payload": BASE64.encode(&r.payload),
+                            "received_at": r.seen_at_ms,
+                            "verified": matches!(
+                                r.provenance,
+                                crate::history::Provenance::VerifiedEnvelope
+                            ),
+                        }));
+                    }
+                    backfill_hashes = Some(hashes);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("direct SSE backfill query failed: {e}");
+                }
+                Err(e) => {
+                    tracing::warn!("direct SSE backfill join failed: {e}");
+                }
+            }
+        }
+    }
+    let emit_marker = params.backfill.is_some();
+
     let stream = async_stream::stream! {
+        for data in backfill_rows {
+            yield Ok(Event::default()
+                .event("history_direct_message")
+                .data(data.to_string()));
+        }
+        if emit_marker {
+            yield Ok(Event::default().event("live").data("{}"));
+        }
+        let mut dedupe = backfill_hashes;
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -176,6 +239,19 @@ pub(super) async fn direct_events_sse(
                     let Some(msg) = maybe_msg else {
                         break;
                     };
+                    // Drop live frames already replayed by backfill (each at
+                    // most once); stop checking on first miss — the stream
+                    // has passed the backfill horizon.
+                    if let Some(set) = dedupe.as_mut() {
+                        let h = *blake3::hash(&msg.payload).as_bytes();
+                        if set.remove(&h) {
+                            if set.is_empty() {
+                                dedupe = None;
+                            }
+                            continue;
+                        }
+                        dedupe = None;
+                    }
                     tracing::debug!(
                         target: "dm.trace",
                         stage = "inbound_sse_yielded",

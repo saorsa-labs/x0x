@@ -96,6 +96,31 @@ const COVERED: &[CoveredEndpoint] = &[
         "/diagnostics/groups",
         member_joined_event_propagates_to_inviter
     ),
+    covered!(
+        Get,
+        "/diagnostics/history",
+        rest_history_list_search_stats_purge_roundtrip
+    ),
+    covered!(
+        Get,
+        "/history",
+        rest_history_list_search_stats_purge_roundtrip
+    ),
+    covered!(
+        Get,
+        "/history/search",
+        rest_history_list_search_stats_purge_roundtrip
+    ),
+    covered!(
+        Get,
+        "/history/stats",
+        rest_history_list_search_stats_purge_roundtrip
+    ),
+    covered!(
+        Delete,
+        "/history",
+        rest_history_list_search_stats_purge_roundtrip
+    ),
     covered!(Get, "/diagnostics/exec", daemon_api_diagnostics_exec),
     covered!(Get, "/diagnostics/connect", daemon_api_diagnostics_connect),
     covered!(Get, "/diagnostics/ws", daemon_api_diagnostics_ws),
@@ -445,6 +470,7 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
         "tests/daemon_api_integration.rs",
         include_str!("daemon_api_integration.rs"),
     ),
+    ("tests/history_api.rs", include_str!("history_api.rs")),
     (
         "tests/peer_lifecycle_integration.rs",
         include_str!("peer_lifecycle_integration.rs"),
@@ -806,6 +832,7 @@ fn categories_are_valid() {
         "connect",
         "upgrade",
         "websocket",
+        "history",
     ];
 
     for ep in ENDPOINTS {

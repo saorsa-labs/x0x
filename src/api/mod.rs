@@ -251,6 +251,42 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Get,
+        path: "/diagnostics/history",
+        cli_name: "diagnostics history",
+        description: "Durable-history writer/reaper counters (ADR-0023)",
+        category: "network",
+    },
+    // ── History (ADR-0023 durable local history) ────────────────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/history",
+        cli_name: "history list",
+        description: "List durable history for one scope (dm:/group:/topic:), keyset-paginated",
+        category: "history",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/history/search",
+        cli_name: "history search",
+        description: "Full-text search over text history payloads within a scope",
+        category: "history",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/history/stats",
+        cli_name: "history stats",
+        description: "History row counts, database size, and retention bounds",
+        category: "history",
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/history",
+        cli_name: "history purge",
+        description: "Purge one scope from the local history store (local-only)",
+        category: "history",
+    },
+    EndpointDef {
+        method: Method::Get,
         path: "/diagnostics/exec",
         cli_name: "diagnostics exec",
         description: "Remote exec counters, warnings, active sessions, and ACL summary",

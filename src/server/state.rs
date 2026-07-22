@@ -262,6 +262,12 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) update: DaemonUpdateConfig,
 
+    /// ADR-0023 durable local history (TOML `[history]`). Default-on in the
+    /// daemon; `history.enabled = false` is the escape hatch. The database
+    /// lives at `<data_dir>/history.db` unless `history.db_path` overrides.
+    #[serde(default = "default_history_config")]
+    pub history: x0x::history::HistoryConfig,
+
     /// Gossip overlay configuration (TOML: `[gossip]`).
     #[serde(default)]
     pub gossip: x0x::gossip::GossipConfig,
@@ -493,6 +499,10 @@ fn default_heartbeat_interval() -> u64 {
     x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS
 }
 
+fn default_history_config() -> x0x::history::HistoryConfig {
+    x0x::history::HistoryConfig::daemon_default()
+}
+
 fn default_identity_ttl() -> u64 {
     x0x::IDENTITY_TTL_SECS
 }
@@ -563,6 +573,7 @@ impl Default for DaemonConfig {
             peer_relay: x0x::network::PeerRelayConfig::default(),
             observed_prefix_enabled: false,
             update: DaemonUpdateConfig::default(),
+            history: default_history_config(),
             gossip: x0x::gossip::GossipConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             identity_ttl_secs: default_identity_ttl(),
@@ -587,6 +598,12 @@ impl Default for DaemonConfig {
 /// Shared state accessible from all route handlers.
 pub(super) struct AppState {
     pub(super) agent: Arc<Agent>,
+    /// Topics this daemon records durably (ADR-0023 §4 opt-in; from
+    /// `[history] record_topics`). Local ingest option only.
+    pub(super) history_record_topics: Vec<String>,
+    /// The `[history]` config as loaded — surfaced by `/history/stats` so
+    /// operators can see the retention bounds in force.
+    pub(super) history_config: x0x::history::HistoryConfig,
     pub(super) subscriptions: RwLock<HashMap<String, RestSubscription>>,
     pub(super) task_lists: RwLock<HashMap<String, TaskListHandle>>,
     pub(super) kv_stores: RwLock<HashMap<String, KvStoreHandle>>,

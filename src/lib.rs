@@ -166,6 +166,9 @@ pub mod upgrade;
 /// File transfer protocol types and state management.
 pub mod files;
 
+/// Durable local history store (ADR-0023).
+pub mod history;
+
 pub mod connect;
 /// Secure Tier-1 remote exec protocol and runtime.
 pub mod exec;
@@ -266,6 +269,12 @@ pub struct Agent {
     discovery_cache_reaper_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Whether a rendezvous `ProviderSummary` advertisement is active.
     rendezvous_advertised: std::sync::atomic::AtomicBool,
+    /// Durable local history (ADR-0023). `None` unless enabled via
+    /// `AgentBuilder::with_history` (library default off; daemon default on).
+    history_service: tokio::sync::Mutex<Option<history::HistoryService>>,
+    /// Cheap clone of the history handle for producers/readers; set iff the
+    /// service was started.
+    history_handle: Option<history::HistoryHandle>,
     /// Contact store for trust evaluation of incoming identity announcements.
     contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
     /// Direct messaging infrastructure for point-to-point communication.
@@ -2055,6 +2064,9 @@ pub struct AgentBuilder {
     /// revocations.bin).  When set, revocations are loaded/saved there
     /// instead of the default `~/.x0x/` directory.
     identity_dir: Option<std::path::PathBuf>,
+    /// ADR-0023 durable history. `None` (library default) means no history
+    /// service is started; the daemon passes its `[history]` config here.
+    history_config: Option<history::HistoryConfig>,
 }
 
 /// Context captured by the background identity heartbeat task.
@@ -2426,6 +2438,7 @@ impl Agent {
             presence_offline_timeout_secs: None,
             contact_store_path: None,
             identity_dir: None,
+            history_config: None,
         }
     }
 
@@ -3830,6 +3843,18 @@ impl Agent {
         self.stop_identity_heartbeat().await;
         self.stop_discovery_cache_reaper().await;
 
+        // 2b. Drain and stop the ADR-0023 history writer (bounded grace,
+        // then abandon-with-count — never abort mid-batch).
+        {
+            let service = {
+                let mut guard = self.history_service.lock().await;
+                guard.take()
+            };
+            if let Some(service) = service {
+                service.shutdown().await;
+            }
+        }
+
         // 3. Stop the DM inbox and the capability advert service (current gaps:
         //    neither was stopped by shutdown() before). Both abort their own
         //    spawned tasks.
@@ -4013,6 +4038,15 @@ impl Agent {
         Ok(())
     }
 
+    /// Handle to the ADR-0023 durable history store, when enabled via
+    /// [`AgentBuilder::with_history`]. Producers use it to record durable
+    /// rows; readers reach the store through it (sync reads —
+    /// `spawn_blocking` on async paths).
+    #[must_use]
+    pub fn history(&self) -> Option<&history::HistoryHandle> {
+        self.history_handle.as_ref()
+    }
+
     // === Direct Messaging ===
 
     /// Send data directly to a connected agent.
@@ -4132,6 +4166,70 @@ impl Agent {
     ///
     /// See [`dm::DmError`].
     pub async fn send_direct_with_config(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
+        // internal senders) funnels through here — the single outbound
+        // history wiring point. Classify before the send so the payload is
+        // cloned only for durable rows on a history-enabled agent.
+        let history_payload = if self.history_handle.is_some()
+            && matches!(
+                history::classify::classify_dm_payload(&payload),
+                history::classify::DmPayloadClass::Durable(_)
+            ) {
+            Some(payload.clone())
+        } else {
+            None
+        };
+        let result = self
+            .send_direct_with_config_inner(to, payload, config)
+            .await;
+        if let (Ok(receipt), Some(recorded_payload)) = (&result, history_payload) {
+            self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
+        }
+        result
+    }
+
+    /// Record a durable outbound DM row after a successful send (ADR-0023).
+    ///
+    /// Raw-QUIC sends never build a signed envelope, so outbound rows are
+    /// artifact-less (`provenance = LocalSend`) with a nonce-keyed `msg_id`
+    /// (the receipt's `request_id`, so retries of one logical send dedupe).
+    /// The recipient's inbound row carries the re-verifiable artifact when
+    /// an envelope path ran.
+    fn record_dm_outbound(&self, to: &identity::AgentId, payload: &[u8], request_id: [u8; 16]) {
+        let Some(history_handle) = self.history_handle.as_ref() else {
+            return;
+        };
+        let history::classify::DmPayloadClass::Durable(content_type) =
+            history::classify::classify_dm_payload(payload)
+        else {
+            return;
+        };
+        let now = i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX);
+        history_handle.record(history::HistoryRecord {
+            msg_id: history::HistoryRecord::compute_local_send_msg_id(&request_id, payload),
+            scope: history::Scope::Dm(hex::encode(to.as_bytes())),
+            author_agent: Some(hex::encode(self.identity.agent_id().as_bytes())),
+            author_machine: Some(hex::encode(self.identity.machine_id().as_bytes())),
+            author_pubkey: None,
+            sent_at_ms: now,
+            seen_at_ms: now,
+            direction: history::Direction::Outbound,
+            content_type: content_type.to_string(),
+            payload: payload.to_vec(),
+            signed_artifact: None,
+            signature: None,
+            sig_context: None,
+            provenance: history::Provenance::LocalSend,
+            replace_key: None,
+        });
+    }
+
+    async fn send_direct_with_config_inner(
         &self,
         to: &identity::AgentId,
         payload: Vec<u8>,
@@ -7240,6 +7338,7 @@ impl Agent {
             config,
             std::sync::Arc::clone(&self.revocation_set),
             std::sync::Arc::clone(&self.authenticated_machine_bindings),
+            self.history_handle.clone(),
         )
         .await
         .map_err(|e| {
@@ -9903,6 +10002,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Enable the ADR-0023 durable local history store.
+    ///
+    /// The library default is **off** (zero-footprint embedding); the daemon
+    /// passes its `[history]` config here (default-on there). The database
+    /// lives at `config.db_path`, or `<identity_dir>/history.db`, or
+    /// `~/.x0x/history.db`, in that order. `history.db` must be on local
+    /// disk (WAL requires working file locks).
+    #[must_use]
+    pub fn with_history(mut self, config: history::HistoryConfig) -> Self {
+        self.history_config = Some(config);
+        self
+    }
+
     /// Set the identity heartbeat re-announcement interval.
     ///
     /// Defaults to [`IDENTITY_HEARTBEAT_INTERVAL_SECS`] (300 seconds).
@@ -10357,9 +10469,33 @@ impl AgentBuilder {
             None
         };
 
+        // ADR-0023: start the durable history service when configured.
+        // Failure is loud (a locked history.db means a second daemon shares
+        // this data dir — operator error, never silently ignored).
+        let (history_service, history_handle) = match self.history_config.as_ref() {
+            Some(cfg) if cfg.enabled => {
+                let data_dir = self
+                    .identity_dir
+                    .clone()
+                    .or_else(|| dirs::home_dir().map(|h| h.join(".x0x")))
+                    .ok_or_else(|| {
+                        error::IdentityError::HistoryInit(
+                            "no identity_dir and no home directory for history.db".into(),
+                        )
+                    })?;
+                let service = history::HistoryService::start(cfg, &data_dir)
+                    .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?;
+                let handle = service.handle();
+                (Some(service), Some(handle))
+            }
+            _ => (None, None),
+        };
+
         // Load the revocation set from disk so enforcement takes effect
         // immediately on restart, even before the next gossip heartbeat.
         Ok(Agent {
+            history_service: tokio::sync::Mutex::new(history_service),
+            history_handle,
             identity: std::sync::Arc::new(identity),
             network,
             gossip_runtime,

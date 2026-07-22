@@ -17,6 +17,50 @@ use serde::Deserialize;
 use std::sync::Arc;
 use x0x::logging::LogHexId;
 
+/// Record one verified message from an opted-in topic (ADR-0023 §4).
+///
+/// Pub/sub messages carry no re-serializable signed artifact at this layer,
+/// so rows are artifact-less; `msg_id = BLAKE3(payload)` collapses redundant
+/// gossip deliveries of the same bytes. Unverified messages are never
+/// recorded (history stores communication the node accepted).
+fn record_topic_message(
+    history: &x0x::history::HistoryHandle,
+    topic: &str,
+    msg: &x0x::gossip::PubSubMessage,
+) {
+    if !msg.verified || msg.payload.is_empty() {
+        return;
+    }
+    let payload: Vec<u8> = msg.payload.to_vec();
+    let content_type = if payload.first() == Some(&b'{')
+        && serde_json::from_slice::<serde_json::Value>(&payload).is_ok()
+    {
+        "application/json"
+    } else if std::str::from_utf8(&payload).is_ok() {
+        "text/plain"
+    } else {
+        "application/octet-stream"
+    };
+    let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
+    history.record(x0x::history::HistoryRecord {
+        msg_id: x0x::history::HistoryRecord::compute_msg_id(None, &payload),
+        scope: x0x::history::Scope::Topic(topic.to_string()),
+        author_agent: msg.sender.as_ref().map(|s| hex::encode(s.as_bytes())),
+        author_machine: None,
+        author_pubkey: msg.sender_public_key.clone(),
+        sent_at_ms: now,
+        seen_at_ms: now,
+        direction: x0x::history::Direction::Inbound,
+        content_type: content_type.to_string(),
+        payload,
+        signed_artifact: None,
+        signature: None,
+        sig_context: None,
+        provenance: x0x::history::Provenance::VerifiedEnvelope,
+        replace_key: None,
+    });
+}
+
 /// A live REST `/subscribe` stream tracked so `DELETE /subscribe/:id` can stop it.
 pub(in crate::server) struct RestSubscription {
     /// Topic the subscription the subscription is for (retained for diagnostics/logging).
@@ -83,8 +127,18 @@ pub(in crate::server) async fn subscribe(
             let topic = req.topic.clone();
             let mut recv_sub = sub;
             let sub_id = id.clone();
+            // ADR-0023 §4 topic opt-in: record this topic's verified traffic
+            // when `[history] record_topics` lists it (local ingest option).
+            let history = if state.history_record_topics.contains(&req.topic) {
+                state.agent.history().cloned()
+            } else {
+                None
+            };
             let forwarder = tokio::spawn(async move {
                 while let Some(msg) = recv_sub.recv().await {
+                    if let Some(history) = history.as_ref() {
+                        record_topic_message(history, &topic, &msg);
+                    }
                     tracing::info!(
                         topic = %topic,
                         sub_id = %sub_id,

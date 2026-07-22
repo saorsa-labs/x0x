@@ -109,6 +109,10 @@ enum WsOutbound {
     Unsubscribed { topics: Vec<String> },
     #[serde(rename = "pong")]
     Pong,
+    /// ADR-0023 backfill-then-live marker: everything before this frame on
+    /// `topic` came from the durable store; everything after is live.
+    #[serde(rename = "live")]
+    Live { topic: String },
     #[serde(rename = "error")]
     Error { message: String },
 }
@@ -118,7 +122,13 @@ enum WsOutbound {
 #[serde(tag = "type")]
 enum WsInbound {
     #[serde(rename = "subscribe")]
-    Subscribe { topics: Vec<String> },
+    Subscribe {
+        topics: Vec<String>,
+        /// ADR-0023 §7: optional stored-history backfill before the live
+        /// stream. Additive — absent means live-only (legacy behaviour).
+        #[serde(default)]
+        backfill: Option<WsBackfill>,
+    },
     #[serde(rename = "unsubscribe")]
     Unsubscribe { topics: Vec<String> },
     #[serde(rename = "publish")]
@@ -127,6 +137,14 @@ enum WsInbound {
     SendDirect { agent_id: String, payload: String },
     #[serde(rename = "ping")]
     Ping,
+}
+
+/// Backfill request carried on `Subscribe` (ADR-0023 §7).
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct WsBackfill {
+    /// Max stored rows to replay per topic (server clamps like `/history`).
+    #[serde(default)]
+    limit: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,15 +181,24 @@ pub(super) async fn ws_handler(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, false))
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, false, None))
+}
+
+/// Query parameters for `GET /ws/direct` (ADR-0023 §7 backfill).
+#[derive(Debug, Deserialize)]
+pub(super) struct DirectWsParams {
+    /// Replay up to N stored DM rows (all `dm:` scopes, oldest→newest)
+    /// before the `live` marker and the live stream.
+    backfill: Option<usize>,
 }
 
 /// GET /ws/direct — upgrade to WebSocket (auto-subscribes to direct messages).
 pub(super) async fn ws_direct_handler(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DirectWsParams>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, true))
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, true, params.backfill))
 }
 
 /// GET /ws/sessions — list active WebSocket sessions.
@@ -360,6 +387,7 @@ async fn handle_ws_connection(
     socket: axum::extract::ws::WebSocket,
     state: Arc<AppState>,
     direct_mode: bool,
+    direct_backfill: Option<usize>,
 ) {
     use axum::extract::ws::Message;
     use futures::StreamExt as FutStreamExt;
@@ -420,14 +448,80 @@ async fn handle_ws_connection(
 
     // If direct mode, spawn a forwarder for direct messages
     let direct_handle = if direct_mode {
+        // Live tap FIRST (ADR-0023 seam rule), then the optional stored
+        // backfill, then the `live` marker, then the live forwarder.
         let mut direct_rx = state.agent.subscribe_direct();
+        let mut dm_backfill_hashes: Option<std::collections::HashSet<[u8; 32]>> = None;
+        if let Some(limit) = direct_backfill {
+            if let Some(history) = state.agent.history() {
+                let store = Arc::clone(history.store());
+                let q = crate::history::HistoryQuery {
+                    scope_kind: Some(crate::history::Scope::Dm(String::new()).kind()),
+                    limit,
+                    ..Default::default()
+                };
+                match tokio::task::spawn_blocking(move || store.query(&q)).await {
+                    Ok(Ok(mut rows)) => {
+                        rows.reverse(); // newest-first → oldest-first replay
+                        let mut hashes = std::collections::HashSet::new();
+                        for row in &rows {
+                            let r = &row.record;
+                            hashes.insert(*blake3::hash(&r.payload).as_bytes());
+                            let out = WsOutbound::DirectMessage {
+                                sender: r.author_agent.clone().unwrap_or_default(),
+                                machine_id: r.author_machine.clone().unwrap_or_default(),
+                                payload: BASE64.encode(&r.payload),
+                                received_at: u64::try_from(r.seen_at_ms).unwrap_or_default(),
+                                verified: matches!(
+                                    r.provenance,
+                                    crate::history::Provenance::VerifiedEnvelope
+                                ),
+                                trust_decision: None,
+                                observed_origin: None,
+                            };
+                            // Backfill frames are droppable: the store still
+                            // holds them and `/history` can re-serve them.
+                            if !feed_droppable(&outbound_tx, out, &stats) {
+                                break;
+                            }
+                        }
+                        dm_backfill_hashes = Some(hashes);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(session_id = %session_id, "direct WS backfill query failed: {e}");
+                    }
+                    Err(e) => {
+                        tracing::warn!(session_id = %session_id, "direct WS backfill join failed: {e}");
+                    }
+                }
+            }
+            // Marker is unconditional once backfill was requested.
+            feed_droppable(
+                &outbound_tx,
+                WsOutbound::Live {
+                    topic: "direct".to_string(),
+                },
+                &stats,
+            );
+        }
         let tx = outbound_tx.clone();
         let sid = session_id.clone();
         let dm_stats = Arc::clone(&stats);
         let dm_slow_close = slow_close.clone();
         let dm_counted = Arc::clone(&slow_close_counted);
         Some(tokio::spawn(async move {
+            let mut dedupe = dm_backfill_hashes;
             while let Some(msg) = direct_rx.recv().await {
+                if let Some(set) = dedupe.as_mut() {
+                    let h = *blake3::hash(&msg.payload).as_bytes();
+                    if set.remove(&h) {
+                        if set.is_empty() {
+                            dedupe = None;
+                        }
+                        continue;
+                    }
+                    dedupe = None;
+                }
                 let out = WsOutbound::DirectMessage {
                     sender: hex::encode(msg.sender.as_bytes()),
                     machine_id: hex::encode(msg.machine_id.as_bytes()),
@@ -589,7 +683,7 @@ async fn handle_ws_command(
             feed_droppable(tx, WsOutbound::Pong, stats);
         }
 
-        WsInbound::Subscribe { topics } => {
+        WsInbound::Subscribe { topics, backfill } => {
             // Shared fan-out: one gossip subscription per topic, broadcast to all WS sessions
             let mut handles = Vec::new();
             let already_subscribed = {
@@ -659,14 +753,91 @@ async fn handle_ws_command(
                     }
                 };
 
+                // ADR-0023 backfill-then-live: the live tap (broadcast_rx,
+                // obtained ABOVE) is established before the store query runs
+                // — the seam rule. Stored frames are fed first, then the
+                // `live` marker; frames that raced into the broadcast buffer
+                // during the query are deduped by payload hash below.
+                let mut backfill_hashes: Option<std::collections::HashSet<[u8; 32]>> = None;
+                if let Some(spec) = backfill.as_ref() {
+                    if let Some(history) = state.agent.history() {
+                        let store = Arc::clone(history.store());
+                        let q = crate::history::HistoryQuery {
+                            scope: Some(crate::history::Scope::Topic(topic.clone())),
+                            limit: spec.limit,
+                            ..Default::default()
+                        };
+                        match tokio::task::spawn_blocking(move || store.query(&q)).await {
+                            Ok(Ok(mut rows)) => {
+                                // query returns newest-first; emit oldest-first.
+                                rows.reverse();
+                                let mut hashes = std::collections::HashSet::new();
+                                for row in &rows {
+                                    let r = &row.record;
+                                    hashes.insert(*blake3::hash(&r.payload).as_bytes());
+                                    let out = WsOutbound::Message {
+                                        topic: topic.clone(),
+                                        payload: BASE64.encode(&r.payload),
+                                        origin: r.author_agent.clone(),
+                                    };
+                                    if !feed_droppable(tx, out, stats) {
+                                        break;
+                                    }
+                                }
+                                backfill_hashes = Some(hashes);
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(topic = %topic, "WS backfill query failed: {e}");
+                            }
+                            Err(e) => {
+                                tracing::warn!(topic = %topic, "WS backfill join failed: {e}");
+                            }
+                        }
+                    }
+                    // The marker is emitted even when the store is disabled
+                    // or empty so clients can rely on its presence whenever
+                    // they requested backfill.
+                    feed_droppable(
+                        tx,
+                        WsOutbound::Live {
+                            topic: topic.clone(),
+                        },
+                        stats,
+                    );
+                }
+
                 // Per-session forwarder: broadcast channel → session outbound
                 let tx_clone = tx.clone();
                 let fwd_stats = Arc::clone(&state.ws_outbound_stats);
                 let handle = tokio::spawn(async move {
                     let mut rx = broadcast_rx;
+                    // Dedupe frames already delivered by backfill: drop live
+                    // frames whose payload hash matches a backfilled row,
+                    // each at most once; stop checking on first miss (the
+                    // stream has passed the backfill horizon).
+                    let mut dedupe = backfill_hashes;
                     loop {
                         match rx.recv().await {
                             Ok(msg) => {
+                                if let Some(set) = dedupe.as_mut() {
+                                    if let WsOutbound::Message { payload, .. } = &msg {
+                                        match BASE64.decode(payload) {
+                                            Ok(bytes) => {
+                                                let h = *blake3::hash(&bytes).as_bytes();
+                                                if set.remove(&h) {
+                                                    if set.is_empty() {
+                                                        dedupe = None;
+                                                    }
+                                                    continue;
+                                                }
+                                                dedupe = None;
+                                            }
+                                            Err(_) => {
+                                                dedupe = None;
+                                            }
+                                        }
+                                    }
+                                }
                                 // Topic frames are droppable on a full queue
                                 // (re-obtainable via gossip); never close.
                                 if !feed_droppable(&tx_clone, msg, &fwd_stats) {

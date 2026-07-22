@@ -123,6 +123,11 @@ enum Commands {
         #[command(subcommand)]
         sub: DiagnosticsSub,
     },
+    /// Durable local history (ADR-0023): list, search, stats, purge.
+    History {
+        #[command(subcommand)]
+        sub: HistorySub,
+    },
     /// Session-token management (#127 / WS1.6).
     Auth {
         #[command(subcommand)]
@@ -455,6 +460,56 @@ enum DiagnosticsSub {
     Connect,
     /// Print WebSocket outbound-queue health (capacity, drops, slow-consumer closes).
     Ws,
+    /// Print durable-history writer/reaper counters (ADR-0023).
+    History,
+}
+
+/// History sub-actions (`x0x history …`, ADR-0023).
+#[derive(Subcommand)]
+enum HistorySub {
+    /// List durable history for one scope, newest first.
+    List {
+        /// Scope: `dm:<agent_hex>`, `group:<stable_id>`, or `topic:<name>`.
+        scope: String,
+        /// Inclusive lower bound on local receipt time (unix ms).
+        #[arg(long)]
+        since_ms: Option<u64>,
+        /// Inclusive upper bound on local receipt time (unix ms).
+        #[arg(long)]
+        until_ms: Option<u64>,
+        /// Max rows (server clamps to 500).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keyset cursor: rows strictly older than this row id.
+        #[arg(long)]
+        before_id: Option<i64>,
+    },
+    /// Full-text search over text history within a scope.
+    Search {
+        /// Scope: `dm:<agent_hex>`, `group:<stable_id>`, or `topic:<name>`.
+        scope: String,
+        /// Search terms (treated as literal terms, not FTS operators).
+        query: String,
+        /// Inclusive lower bound on local receipt time (unix ms).
+        #[arg(long)]
+        since_ms: Option<u64>,
+        /// Inclusive upper bound on local receipt time (unix ms).
+        #[arg(long)]
+        until_ms: Option<u64>,
+        /// Max rows (server clamps to 500).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keyset cursor: rows strictly older than this row id.
+        #[arg(long)]
+        before_id: Option<i64>,
+    },
+    /// Print row counts, database size, and retention bounds.
+    Stats,
+    /// Purge one scope from the local store (local-only).
+    Purge {
+        /// Scope: `dm:<agent_hex>`, `group:<stable_id>`, or `topic:<name>`.
+        scope: String,
+    },
 }
 
 /// Auth sub-actions (`x0x auth session`).
@@ -1432,6 +1487,33 @@ async fn run(
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
             DiagnosticsSub::Connect => commands::network::diagnostics_connect(&client).await,
             DiagnosticsSub::Ws => commands::network::diagnostics_ws(&client).await,
+            DiagnosticsSub::History => commands::history::diagnostics(&client).await,
+        },
+        Commands::History { sub } => match sub {
+            HistorySub::List {
+                scope,
+                since_ms,
+                until_ms,
+                limit,
+                before_id,
+            } => {
+                commands::history::list(&client, &scope, since_ms, until_ms, limit, before_id).await
+            }
+            HistorySub::Search {
+                scope,
+                query,
+                since_ms,
+                until_ms,
+                limit,
+                before_id,
+            } => {
+                commands::history::search(
+                    &client, &scope, &query, since_ms, until_ms, limit, before_id,
+                )
+                .await
+            }
+            HistorySub::Stats => commands::history::stats(&client).await,
+            HistorySub::Purge { scope } => commands::history::purge(&client, &scope).await,
         },
         Commands::Auth { sub } => match sub {
             AuthSub::Session => commands::auth::session(&client).await,

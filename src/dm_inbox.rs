@@ -242,6 +242,7 @@ impl DmInboxService {
         config: DmInboxConfig,
         revocation_set: Arc<RwLock<RevocationSet>>,
         authenticated_machine_bindings: AuthenticatedMachineBindings,
+        history: Option<crate::history::HistoryHandle>,
     ) -> NetworkResult<Self> {
         let topic = Self::inbox_topic_name(&self_agent_id);
         let subscription = pubsub
@@ -264,6 +265,7 @@ impl DmInboxService {
             typed_payload_routes: config.typed_payload_routes,
             revocation_set,
             authenticated_machine_bindings,
+            history,
         };
 
         let primary_handle =
@@ -335,6 +337,9 @@ struct InboxPipeline {
     revocation_set: Arc<RwLock<RevocationSet>>,
     /// Authenticated origin-machine bindings retained across discovery eviction.
     authenticated_machine_bindings: AuthenticatedMachineBindings,
+    /// ADR-0023 history handle. Recording is `try_send`-only — this loop
+    /// must never block (see the typed-route comment below).
+    history: Option<crate::history::HistoryHandle>,
 }
 
 impl InboxPipeline {
@@ -530,8 +535,14 @@ impl InboxPipeline {
                 );
             }
             DmBody::Payload(payload) => {
-                self.handle_payload(envelope, payload, sender_machine_id, ack_legacy_bus)
-                    .await;
+                self.handle_payload(
+                    envelope,
+                    payload,
+                    sender_machine_id,
+                    sender_pubkey,
+                    ack_legacy_bus,
+                )
+                .await;
             }
         }
     }
@@ -541,6 +552,7 @@ impl InboxPipeline {
         envelope: DmEnvelope,
         payload: DmPayload,
         sender_machine_id: MachineId,
+        sender_pubkey: Vec<u8>,
         ack_legacy_bus: bool,
     ) {
         let sender_agent_id = AgentId(envelope.sender_agent_id);
@@ -630,6 +642,50 @@ impl InboxPipeline {
             .await;
 
         if !is_typed_payload {
+            // ADR-0023 §4: record durable DM communication after every
+            // signature/trust/revocation gate has passed. Non-blocking
+            // (`HistoryHandle::record` is try_send); plumbing payload
+            // families classify Ephemeral and are skipped.
+            if let Some(history) = self.history.as_ref() {
+                if let crate::history::classify::DmPayloadClass::Durable(content_type) =
+                    crate::history::classify::classify_dm_payload(&plaintext.payload)
+                {
+                    match envelope.to_wire_bytes() {
+                        Ok(artifact) => {
+                            let record = crate::history::HistoryRecord {
+                                msg_id: crate::history::HistoryRecord::compute_msg_id(
+                                    Some(&artifact),
+                                    &plaintext.payload,
+                                ),
+                                scope: crate::history::Scope::Dm(hex::encode(
+                                    envelope.sender_agent_id,
+                                )),
+                                author_agent: Some(hex::encode(envelope.sender_agent_id)),
+                                author_machine: Some(hex::encode(sender_machine_id.as_bytes())),
+                                author_pubkey: Some(sender_pubkey.clone()),
+                                sent_at_ms: i64::try_from(envelope.created_at_unix_ms)
+                                    .unwrap_or(i64::MAX),
+                                seen_at_ms: i64::try_from(now_unix_ms()).unwrap_or(i64::MAX),
+                                direction: crate::history::Direction::Inbound,
+                                content_type: content_type.to_string(),
+                                payload: plaintext.payload.clone(),
+                                signed_artifact: Some(artifact),
+                                signature: Some(envelope.signature.clone()),
+                                // Mirrors `DM_SIGN_DOMAIN` in `dm.rs`.
+                                sig_context: Some("x0x-dm-v1".to_string()),
+                                provenance: crate::history::Provenance::VerifiedEnvelope,
+                                replace_key: None,
+                            };
+                            history.record(record);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "history: DM envelope wire encode failed, row skipped: {e}"
+                            );
+                        }
+                    }
+                }
+            }
             self.dm
                 .handle_incoming(
                     sender_machine_id,
@@ -937,6 +993,7 @@ mod tests {
             typed_payload_routes: Vec::new(),
             revocation_set: Arc::new(RwLock::new(revocation_set)),
             authenticated_machine_bindings,
+            history: None,
         };
 
         InboxHarness {
