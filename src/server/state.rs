@@ -601,6 +601,9 @@ pub(super) struct AppState {
     /// Topics this daemon records durably (ADR-0023 §4 opt-in; from
     /// `[history] record_topics`). Local ingest option only.
     pub(super) history_record_topics: Vec<String>,
+    /// The `[history]` config as loaded — surfaced by `/history/stats` so
+    /// operators can see the retention bounds in force.
+    pub(super) history_config: x0x::history::HistoryConfig,
     pub(super) subscriptions: RwLock<HashMap<String, RestSubscription>>,
     pub(super) task_lists: RwLock<HashMap<String, TaskListHandle>>,
     pub(super) kv_stores: RwLock<HashMap<String, KvStoreHandle>>,

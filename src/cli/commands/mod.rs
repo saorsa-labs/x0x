@@ -13,6 +13,7 @@ pub mod find;
 pub mod forward;
 pub mod group;
 pub mod groups;
+pub mod history;
 pub mod identity;
 pub mod machines;
 pub mod messaging;

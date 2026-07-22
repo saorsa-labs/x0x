@@ -7062,13 +7062,53 @@ pub(in crate::server) async fn get_group_public_messages(
     // Ensure the listener is live on the stable-id topic.
     spawn_public_message_listener(Arc::clone(&state), stable_id.clone()).await;
 
-    let msgs = state
+    let cached = state
         .public_messages
         .read()
         .await
         .get(&stable_id)
         .cloned()
         .unwrap_or_default();
+
+    // ADR-0023 §7: the durable store is the source of truth beyond the
+    // in-memory hot tail — history survives a daemon restart. Store rows
+    // carry the signed `GroupPublicMessage` JSON verbatim as their
+    // `signed_artifact`, so rows deserialize back to the exact wire form.
+    let msgs = match state.agent.history() {
+        Some(history) => {
+            let store = std::sync::Arc::clone(history.store());
+            let stable = stable_id.clone();
+            let stored = tokio::task::spawn_blocking(move || {
+                let q = x0x::history::HistoryQuery {
+                    scope: Some(x0x::history::Scope::Group(stable)),
+                    limit: 500,
+                    ..Default::default()
+                };
+                store.query(&q)
+            })
+            .await;
+            match stored {
+                Ok(Ok(rows)) => {
+                    let mut merged: Vec<x0x::groups::GroupPublicMessage> = rows
+                        .iter()
+                        .filter_map(|r| r.record.signed_artifact.as_deref())
+                        .filter_map(|a| serde_json::from_slice(a).ok())
+                        .collect();
+                    let mut seen: std::collections::HashSet<String> =
+                        merged.iter().map(|m| m.signature.clone()).collect();
+                    for m in cached {
+                        if seen.insert(m.signature.clone()) {
+                            merged.push(m);
+                        }
+                    }
+                    merged.sort_by_key(|m| m.timestamp);
+                    merged
+                }
+                _ => cached,
+            }
+        }
+        None => cached,
+    };
 
     (
         StatusCode::OK,
@@ -7133,6 +7173,7 @@ fn record_mls_history(
     stable_group_id: &str,
     plaintext: &[u8],
     direction: x0x::history::Direction,
+    epoch: u64,
 ) {
     let Some(history) = state.agent.history() else {
         return;
@@ -7146,8 +7187,12 @@ fn record_mls_history(
         "application/octet-stream"
     };
     let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
+    // Epoch-salted id: ciphertext replays within an epoch dedupe, identical
+    // plaintext across epochs survives. Identical plaintext *within* one
+    // epoch still collapses — per-message MLS identity is a future
+    // wire-format change (ADR-0023 §3).
     history.record(x0x::history::HistoryRecord {
-        msg_id: x0x::history::HistoryRecord::compute_msg_id(None, plaintext),
+        msg_id: x0x::history::HistoryRecord::compute_epoch_msg_id(epoch, plaintext),
         scope: x0x::history::Scope::Group(stable_group_id.to_string()),
         author_agent: None,
         author_machine: None,
@@ -11851,6 +11896,7 @@ async fn treekem_group_encrypt(
         stable_group_id.unwrap_or(group_id_hex),
         &plaintext,
         x0x::history::Direction::Outbound,
+        epoch,
     );
     secure_group_effect_response_after_terminality_recheck(
         state,
@@ -11923,6 +11969,7 @@ async fn treekem_group_decrypt(
         stable_group_id.unwrap_or(group_id_hex),
         &plaintext,
         x0x::history::Direction::Inbound,
+        epoch,
     );
     secure_group_effect_response_after_terminality_recheck(
         state,
@@ -12024,6 +12071,7 @@ pub(in crate::server) async fn secure_group_encrypt(
         &group_id_clone,
         &plaintext,
         x0x::history::Direction::Outbound,
+        epoch,
     );
     secure_group_effect_response_after_terminality_recheck(
         state.as_ref(),
@@ -12143,6 +12191,7 @@ pub(in crate::server) async fn secure_group_decrypt(
                 &group_id_clone,
                 &plaintext,
                 x0x::history::Direction::Inbound,
+                req.secret_epoch,
             );
             secure_group_effect_response_after_terminality_recheck(
                 state.as_ref(),
@@ -14599,6 +14648,7 @@ mod tests {
         Ok(Arc::new(AppState {
             agent,
             history_record_topics: Vec::new(),
+            history_config: x0x::history::HistoryConfig::default(),
             subscriptions: RwLock::new(HashMap::new()),
             task_lists: RwLock::new(HashMap::new()),
             kv_stores: RwLock::new(HashMap::new()),

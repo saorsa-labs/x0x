@@ -44,6 +44,9 @@ pub enum InsertOutcome {
 pub struct HistoryQuery {
     /// Restrict to one scope.
     pub scope: Option<Scope>,
+    /// Restrict to one scope *kind* (all DMs / all groups / all topics)
+    /// without naming a scope id. Ignored when `scope` is set.
+    pub scope_kind: Option<i64>,
     /// Inclusive lower bound on `seen_at_ms`.
     pub since_ms: Option<i64>,
     /// Inclusive upper bound on `seen_at_ms`.
@@ -423,6 +426,9 @@ fn push_common_filters(
         params.push(rusqlite::types::Value::from(scope.kind()));
         parts.push("scope_id = ?".into());
         params.push(rusqlite::types::Value::from(scope.id().to_string()));
+    } else if let Some(kind) = q.scope_kind {
+        parts.push("scope_kind = ?".into());
+        params.push(rusqlite::types::Value::from(kind));
     }
     if let Some(since) = q.since_ms {
         parts.push("seen_at_ms >= ?".into());

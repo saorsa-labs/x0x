@@ -39,7 +39,8 @@ use routes::{
     get_kv_value, get_mls_group, get_named_group, get_named_group_members, gossip_diagnostics,
     groups_diagnostics, handle_file_message, handle_join_result_message,
     handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
-    health, identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    health, history_diagnostics, history_list, history_purge, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card,
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
     list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
@@ -556,6 +557,7 @@ pub async fn serve_with_options(
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
         history_record_topics: config.history.record_topics.clone(),
+        history_config: config.history.clone(),
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
         kv_stores: RwLock::new(HashMap::new()),
@@ -1310,6 +1312,11 @@ pub async fn serve_with_options(
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
+        .route("/diagnostics/history", get(history_diagnostics))
+        // ADR-0023 durable-history read surface
+        .route("/history", get(history_list).delete(history_purge))
+        .route("/history/search", get(history_search))
+        .route("/history/stats", get(history_stats))
         .route("/diagnostics/ack", get(ack_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
         .route("/diagnostics/dm", get(dm_diagnostics))

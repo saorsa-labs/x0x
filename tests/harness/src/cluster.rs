@@ -650,13 +650,19 @@ async fn start_instance(
     }
 
     let config_path = config_dir.join("config.toml");
+    // NOTE: `[update] enabled = false` is MANDATORY in every test config —
+    // test binaries otherwise SELF-REPLACE via gossip-delivered auto-update
+    // (x0x#226 standing rule). It goes LAST so table sections opened by
+    // `extra_config` cannot swallow the flat keys above it.
     let config_content = format!(
         "api_address = \"127.0.0.1:{api_port}\"\n\
          bind_address = \"0.0.0.0:{bind_port}\"\n\
          data_dir = \"{}\"\n\
          log_level = \"warn\"\n\
          {bootstrap}\n\
-         {extra_config}\n",
+         {extra_config}\n\
+         [update]\n\
+         enabled = false\n",
         config_dir.display()
     );
     std::fs::write(&config_path, &config_content).expect("write config");

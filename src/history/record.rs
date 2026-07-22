@@ -40,6 +40,18 @@ impl Scope {
         }
     }
 
+    /// The canonical string form used by the REST API — the inverse of
+    /// [`Scope::parse`] (`dm:<agent_hex>`, `group:<stable_id>`,
+    /// `topic:<name>`).
+    #[must_use]
+    pub fn canonical(&self) -> String {
+        match self {
+            Scope::Dm(s) => format!("dm:{s}"),
+            Scope::Group(s) => format!("group:{s}"),
+            Scope::Topic(s) => format!("topic:{s}"),
+        }
+    }
+
     /// Parse the canonical string form used by the REST API
     /// (`dm:<agent_hex>`, `group:<stable_id>`, `topic:<name>`).
     pub fn parse(s: &str) -> HistoryResult<Self> {
@@ -215,6 +227,22 @@ impl HistoryRecord {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"x0x-history-local-send-v1");
         hasher.update(nonce);
+        hasher.update(payload);
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Dedupe id for an unsigned row salted by an epoch (MLS plaintext).
+    ///
+    /// `BLAKE3(salt-domain ‖ epoch ‖ payload)`: ciphertext replays within an
+    /// epoch still dedupe, while identical plaintext sent in different
+    /// epochs survives as distinct rows. Identical plaintext *within* one
+    /// epoch still collapses — per-message MLS identity is a future
+    /// wire-format change (ADR-0023 §3).
+    #[must_use]
+    pub fn compute_epoch_msg_id(epoch: u64, payload: &[u8]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x-history-mls-epoch-v1");
+        hasher.update(&epoch.to_le_bytes());
         hasher.update(payload);
         *hasher.finalize().as_bytes()
     }

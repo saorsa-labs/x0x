@@ -12,6 +12,7 @@ mod discovery;
 mod exec;
 mod files;
 mod groups;
+mod history;
 mod identity;
 mod machines;
 mod messaging;
@@ -46,6 +47,9 @@ pub(super) use files::{
 pub(super) use groups::{
     add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
     mls_decrypt, mls_encrypt, remove_mls_member,
+};
+pub(super) use history::{
+    history_diagnostics, history_list, history_purge, history_search, history_stats,
 };
 pub(super) use identity::{
     agent_info, agent_sign, agent_user_id_handler, agent_verify, announce_identity,
