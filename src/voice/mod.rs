@@ -3,11 +3,11 @@
 //! Implements the two seams the saorsa-webrtc revival design (V1.1/V1.2)
 //! assigns to x0x:
 //!
-//! * [`X0xSignaling`] — [`saorsa_webrtc_core::signaling::SignalingTransport`]
+//! * [`X0xSignaling`](crate::voice::X0xSignaling) — [`saorsa_webrtc_core::signaling::SignalingTransport`]
 //!   over x0x direct messages. Signaling frames ride the DM path with the
 //!   [`crate::history::classify::VOICE_SIGNALING_DM_PREFIX`] typed prefix and
 //!   are classified **Ephemeral** (never recorded to history).
-//! * [`X0xLinkTransport`] — [`saorsa_webrtc_core::link_transport::LinkTransport`]
+//! * [`X0xLinkTransport`](crate::voice::X0xLinkTransport) — [`saorsa_webrtc_core::link_transport::LinkTransport`]
 //!   over ADR-0022 byte streams using
 //!   [`crate::streams::StreamProtocol::WebRtcV1`] (`0x04`). The byte after
 //!   the x0x protocol prefix is the saorsa-webrtc
