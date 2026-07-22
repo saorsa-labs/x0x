@@ -43,6 +43,8 @@ Errors use:
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6) |
+| GET | `/constitution` | `x0x constitution` | Display the x0x Constitution (Markdown) |
+| GET | `/constitution/json` | `x0x constitution --json` | Constitution with version metadata (JSON) |
 
 ### Example: health
 
@@ -212,8 +214,12 @@ Notes:
 | GET | `/presence/online` | `x0x presence online` | Online agents (network-view trust filter) |
 | GET | `/presence/foaf` | `x0x presence foaf` | Friends-of-friends discovery walk (`?ttl=<hops>`, default 3; social-view trust filter) |
 | GET | `/presence/status/:id` · `/presence/find/:id` | `x0x presence status/find` | One agent's presence status / lookup |
+| GET | `/presence/events` | `x0x presence events` | Server-Sent Events stream of presence online/offline events |
 | GET | `/network/status` | `x0x network status` | NAT and connectivity diagnostics |
 | GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
+| GET | `/peers/:peer_id/health` | `x0x peer health <peer_id>` | Connection health snapshot for a peer |
+| POST | `/peers/:peer_id/probe` | `x0x peer probe <peer_id>` | Active `probe_peer` liveness + RTT check |
+| GET | `/peers/events` | `x0x peer events` | SSE stream of peer lifecycle events |
 
 ## Gossip messaging
 
@@ -437,6 +443,13 @@ helper API.
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
 | POST | `/groups/discover/subscribe` | `x0x group discover-subscribe` | **Phase C.2**: subscribe to a tag/name/id shard |
 | DELETE | `/groups/discover/subscribe/:kind/:shard` | `x0x group discover-unsubscribe` | **Phase C.2**: unsubscribe from a shard |
+| GET | `/groups/discover` | `x0x group discover` | **Phase C.2**: list locally known discoverable groups |
+| GET | `/groups/cards/:id` | `x0x group card <group_id>` | Fetch a single group card |
+| POST | `/groups/cards/import` | `x0x group card-import` | Import a group card into local cache |
+| POST | `/groups/:id/secure/encrypt` | `x0x group secure-encrypt <group_id>` | Encrypt content with the group's shared secret (member-only) |
+| POST | `/groups/:id/secure/decrypt` | `x0x group secure-decrypt <group_id>` | Decrypt content with the group's shared secret (member-only, epoch must match) |
+| POST | `/groups/:id/secure/reseal` | `x0x group secure-reseal <group_id>` | Re-seal the current group shared secret to a named recipient (`SecureShareDelivered`-format envelope) |
+| POST | `/groups/secure/open-envelope` | `x0x group secure-open-envelope` | Attempt to open a `SecureShareDelivered` envelope with this daemon's KEM key (adversarial test) |
 | DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. The last admin is blocked; promote another admin first or use `x0x group delete` |
 
 ### Roles
@@ -605,12 +618,18 @@ revisions are silently dropped.
 
 **Secure-group plane (ADR-0012, x0x 0.21.0):** private groups (`private_secure`
 preset — `Hidden` + `MlsEncrypted`) run **real TreeKEM** (forward secrecy +
-post-compromise security). **Single-member** private groups work end-to-end
-(invite → join → bidirectional secure → ban → forward secrecy). **Multi-member
-limitation:** a 2nd+ member converges into the authority roster but its
-`MemberAdded`+`Welcome` is not yet delivered, so it cannot yet encrypt — tracked
-follow-up. Public encrypted presets (`public_request_secure`) and grandfathered
-groups remain on the legacy **GSS** plane. See `docs/primers/groups.md`.
+post-compromise security). Single- and **multi-member** private groups work
+end-to-end (invite → join → bidirectional secure → ban → forward secrecy): a
+2nd+ member's `MemberAdded`+`Welcome` is delivered over redundant channels
+(direct push, the gossip metadata topic, a chunked welcome-blob pull, and the
+anchor join-result poll, with a catch-up listener for repair) and the joiner
+installs the tree and encrypts on the TreeKEM plane. Covered by
+`tests/e2e_treekem_membership.py` (m1+m2 converge; anchor↔m1, anchor↔m2, m1↔m2
+cross-decrypt; ban epoch-advance; post-ban forward secrecy). Convergence
+*latency* depends on direct-connection/gossip formation — a timing
+consideration, not a capability gap. Public encrypted presets
+(`public_request_secure`) and grandfathered groups remain on the legacy **GSS**
+plane. See `docs/primers/groups.md`.
 
 ## Collaborative task lists
 
@@ -871,6 +890,7 @@ Run a command on **another** agent's machine. Disabled by default; every request
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | GET | `/upgrade` | `x0x upgrade` | Check for updates |
+| POST | `/upgrade/apply` | `x0x upgrade --apply` | Apply the latest verified release manifest |
 
 ## WebSocket and GUI
 

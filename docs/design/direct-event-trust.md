@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposal — design doc only, not yet implemented.
+Implemented — direct message events now carry `verified` and `trust_level` annotations (`src/server/routes/messaging.rs`, `src/server/ws.rs`; status updated 2026-07-19).
 
 ## Problem
 

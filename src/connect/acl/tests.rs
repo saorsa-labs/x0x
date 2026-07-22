@@ -1,5 +1,5 @@
 //! Tests for connect::acl — the fail-closed load matrix (A) and loopback-only
-//! target validation matrix (B). See `docs/plans/2026-07-issue-131-connect-acl-plan.md` §5.
+//! target validation matrix (B). See ADR-0019 and `docs/connect-acl.md`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

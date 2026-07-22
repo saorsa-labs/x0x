@@ -19,11 +19,12 @@ yet covered so the reader does not have to infer them.
 `docs/design/api-manifest.json` (schema `x0x-api-manifest/v1`). Every
 downstream surface reads this manifest to assert coverage.
 
-Named-groups surface: **36 endpoints** (the registry has grown since
-the original audit) spanning core CRUD, policy, membership/roles/bans,
-join requests, invite/join, public messaging (Phase E), state chain
-(Phase D.3), discovery (Phase C + C.2), and the secure plane (Phase
-D.2).
+Named-groups surface: **37 endpoints** (updated 2026-07-19; the
+registry has grown since the original audit — the 37th is
+`GET /groups/:id/state/commits`) spanning core CRUD, policy,
+membership/roles/bans, join requests, invite/join, public messaging
+(Phase E), state chain (Phase D.3), discovery (Phase C + C.2), and the
+secure plane (Phase D.2).
 
 ## Surface coverage matrix
 
@@ -35,15 +36,15 @@ unrecorded gap (zero across all surfaces below).
 
 | Surface | Wired / Total | Static proof | Runtime proof |
 |---------|--------------|--------------|---------------|
-| **x0xd REST** | **36 / 36** | `tests/api_coverage.rs` — every route handler in `src/bin/x0xd.rs` is in `ENDPOINTS` and has a test entry. 12 tests. | `tests/e2e_named_groups.sh` — 98 REST-driven assertions over a 3-daemon mesh; 3× clean archived. |
-| **x0x CLI** | **36 / 36** | `tests/parity_cli.rs` — spawns `x0x <cli_name> --help` for every endpoint. | `tests/e2e_feature_parity.sh` — 18 assertions per run, 3× clean archived. |
-| **x0x embedded GUI** (`src/gui/x0x-gui.html`) | **25 / 36** wired, 11 deferred (with reasons) | `tests/gui_named_group_parity.rs` — manifest-driven scan; **fails if a new endpoint is added without either a GUI call site or a `DEFERRED` entry**. Per-endpoint coverage report at `tests/proof-reports/parity/gui-named-groups-coverage.txt`. | Manual; headless harness still queued. |
-| **Communitas Rust client** | **36 / 36** named-groups | `parity_manifest.rs` (vendored manifest copy). The IMPLEMENTED list contains 36 entries; the test fails if any named-groups endpoint in the vendored manifest has no client method. 14 tests. | `live_mutation_contract.rs`. |
+| **x0xd REST** | **37 / 37** | `tests/api_coverage.rs` — every route handler (now in `src/server/routes/named_groups.rs`) is in `ENDPOINTS` and has a test entry. | `tests/e2e_named_groups.sh` — 98 REST-driven assertions over a 3-daemon mesh; 3× clean archived. |
+| **x0x CLI** | **37 / 37** | `tests/parity_cli.rs` — spawns `x0x <cli_name> --help` for every endpoint. | `tests/e2e_feature_parity.sh` — 18 assertions per run, 3× clean archived. |
+| **x0x embedded GUI** (`src/gui/x0x-gui.html`) | **25 / 37** wired, 12 deferred (with reasons) | `tests/gui_named_group_parity.rs` — manifest-driven scan; **fails if a new endpoint is added without either a GUI call site or a `DEFERRED` entry**. Per-endpoint coverage report at `tests/proof-reports/parity/gui-named-groups-coverage.txt`. | Manual; headless harness still queued. |
+| **Communitas Rust client** | **36 / 36** named-groups (at the original 2026-04-14 signoff; re-verify in the communitas repo against the 37-endpoint surface) | `parity_manifest.rs` (vendored manifest copy). The IMPLEMENTED list contains 36 entries; the test fails if any named-groups endpoint in the vendored manifest has no client method. 14 tests. | `live_mutation_contract.rs`. |
 | **Communitas Dioxus UI** | consumes the Rust client; UI surfaces `enum SpacePreset`, discover view, admin sheet, requests panel | preset round-trip unit test; 419/419 unit tests | UI driver queued for Phase 7. |
 | **Communitas Swift client** | **36 / 36** named-groups (every Rust method has a Swift counterpart) | `swift_parity.rs` — `parity_map_covers_all_rust_methods` walks `client.rs` for every public method and `swift_client_has_all_rust_methods` greps the Swift source for each one. | `swift test` — 42/42 pass. |
 | **Communitas SwiftUI** | preset picker, discover sheet, manage sheet (policy + state + roster + requests) | `swift build` clean | XCUITest queued for Phase 7. |
 
-## Embedded GUI — explicit DEFERRED list (11 endpoints)
+## Embedded GUI — explicit DEFERRED list (12 endpoints)
 
 The GUI parity test enumerates every named-groups endpoint and checks
 the GUI HTML for a matching `api(...)` call. The following endpoints
@@ -55,6 +56,7 @@ recorded in `tests/gui_named_group_parity.rs::DEFERRED`:
 | POST | `/groups/:id/members` | admin flow; GUI uses invite links instead of direct add-by-agent |
 | DELETE | `/groups/:id/members/:agent_id` | admin flow; GUI uses ban rather than direct remove-by-agent |
 | DELETE | `/groups/:id/requests/:request_id` | requester-side cancel-request UI not yet wired (admin approve/reject is) |
+| GET | `/groups/:id/state/commits` | verification/audit read surface; exposed via CLI + REST, GUI viewer deferred |
 | GET | `/groups/discover/subscriptions` | power-user surface; CLI covers it |
 | POST | `/groups/discover/subscribe` | power-user surface; CLI covers it |
 | DELETE | `/groups/discover/subscribe/:kind/:shard` | power-user surface; CLI covers it |

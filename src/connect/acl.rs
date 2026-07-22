@@ -2,7 +2,7 @@
 //!
 //! Connection-ACL (default-closed connectivity policy). Modeled line-by-line
 //! on the exec ACL ([`crate::exec::acl`]); see ADR-0019 and
-//! `docs/plans/2026-07-issue-131-connect-acl-plan.md`.
+//! `docs/connect-acl.md`.
 //!
 //! ## Scope
 //!

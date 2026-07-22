@@ -1,8 +1,0 @@
-=== final health after 10-min watch 2026-04-23T20:40:13Z ===
-NODE         IP                VERSION    PEERS    CPU_tid_max
-nyc          142.93.199.50     0.19.0     6        10
-sfo          147.182.234.192   0.19.0     6        0
-helsinki     65.21.157.229     0.19.0     6        10
-nuremberg    116.203.101.172   0.19.0     6        50
-singapore    152.42.210.67     0.19.0     6        0
-sydney       170.64.176.102    0.19.0     6        10

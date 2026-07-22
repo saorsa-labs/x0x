@@ -1,6 +1,6 @@
 # x0x exec — remote command execution over the mesh (Tier 1)
 
-**Status:** Tier-1 implementation in progress — protocol, ACL, daemon routing, REST/CLI, diagnostics, and JSONL audit are wired behind an opt-in ACL.
+**Status:** Tier-1 implemented (`src/exec/`) — protocol, ACL, daemon routing, REST/CLI, diagnostics, and JSONL audit are wired behind an opt-in ACL. Operator guide: `docs/exec.md`.
 **Filed:** 2026-05-01
 **Owner:** dev team (assigned by lead)
 **Trigger:** Replace SSH-per-call in `e2e_vps.sh` with a daemon-native execution path. Generalise the existing `tests/runners/x0x_test_runner.py` control-plane primitive into a first-class daemon feature.

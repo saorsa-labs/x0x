@@ -1,7 +1,0 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
-────────────
- Nextest run ID 3db5adc1-d348-4f7d-9039-326c7122a4aa with nextest profile: default
-    Starting 1 test across 1 binary
-        PASS [  31.038s] (1/1) x0x::named_group_e_live e_moderated_public_positive_cross_daemon_receive
-────────────
-     Summary [  31.040s] 1 test run: 1 passed, 0 skipped

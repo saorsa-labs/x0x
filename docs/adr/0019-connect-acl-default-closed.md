@@ -2,7 +2,7 @@
 
 <!-- File name: docs/adr/0019-connect-acl-default-closed.md -->
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-07-22)
 - **Date:** 2026-07-04
 - **Decision owners:** David Irvine
 - **Reviewers:** x0x core team

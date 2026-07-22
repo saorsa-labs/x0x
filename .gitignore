@@ -51,3 +51,4 @@ wpa-build.log
 
 # Convergence soak harness output (daemon logs, per-run reports)
 tests/convergence/out/
+lcov.info

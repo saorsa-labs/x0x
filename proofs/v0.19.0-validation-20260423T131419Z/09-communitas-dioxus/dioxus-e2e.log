@@ -1,6 +1,0 @@
-[18:47:01] [pass] preflight.x0xd
-[18:47:01] [pass] preflight.dioxus-binary
-[18:47:01] Launching Dioxus binary: /Users/davidirvine/Desktop/Devel/projects/communitas/target/debug/communitas-dioxus
-[18:47:02] [skip] app.handshake — Dioxus binary has no test-mode JSON hook yet
-[18:47:02] Response was: [2m2026-04-23T18:47:02.824738Z[0m [32m INFO[0m [1mbootstrap_async[0m[2m:[0m[1mcore_app_init[0m[2m:[0m [2mcommunitas_ui_service[0m[2m:[0m Creating CommunitasApp
-[18:47:02] Dioxus E2E report → /Users/davidirvine/Desktop/Devel/projects/x0x/proofs/v0.19.0-validation-20260423T131419Z/09-communitas-dioxus/dioxus-capabilities.json

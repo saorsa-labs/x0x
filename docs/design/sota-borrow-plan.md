@@ -139,7 +139,7 @@ Mirror iroh-gossip #43 and iroh #3921. When the lifecycle bus emits `Replaced { 
 
 Pure documentation ticket. Read [Quinn PR #2616](https://github.com/quinn-rs/quinn/pull/2616) (Ralith removed `ZeroRttAccepted` future, replaced with `Connection::authenticated()`); compare to ant-quic's X0X-0034 fix shape; produce a comparison doc.
 
-**Files.** New: `x0x/docs/design/quinn-2616-supersede-race-comparison.md`. Update X0X-0034 in `issues/issues.jsonl` with cross-reference.
+**Files.** New: `x0x/docs/design/quinn-2616-supersede-race-comparison.md` (delivered; removed 2026-07-19 — see git history). Update X0X-0034 in `issues/issues.jsonl` with cross-reference.
 
 **Output.** A 1–2 page comparison: "Quinn killed the racy signal at layer X by removing the future. ant-quic's X0X-0034 gates at layer Y. They are/are-not at the same layer because Z." If the layers diverge, file a follow-up ticket.
 

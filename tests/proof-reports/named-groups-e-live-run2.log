@@ -1,8 +1,0 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
-     Running tests/named_group_e_live.rs (target/debug/deps/named_group_e_live-7f9f957a28189db5)
-
-running 1 test
-test e_moderated_public_positive_cross_daemon_receive ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.30s
-

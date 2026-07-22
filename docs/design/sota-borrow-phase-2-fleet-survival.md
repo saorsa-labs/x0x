@@ -12,7 +12,7 @@ The v1 of this plan made cache bounding (X0X-0068) the lead lever.
 Reviewer feedback recasts the diagnosis: **rising `suppressed_peers`
 ratio in the 4h soak is the overlay going defensive**, not just a
 cache that's too big. The Hunt 12f follow-up
-(`docs/design/hunt-12f-stale-release-fast-drop.md` §147) explicitly
+(`hunt-12f-stale-release-fast-drop.md` §147, resolved hunt — in git history) explicitly
 forecasts this fix: *"a real PubSub admission control path for known
 low-priority topics (x0x/release, discovery anti-entropy, identity
 anti-entropy), preferably before subscriber-channel enqueue."*
@@ -356,8 +356,8 @@ None. Ships first.
 
 #### Detailed plan
 
-See `docs/design/x0x-0068-bounded-discovery-cache.md` — standalone,
-ready for execution in a fresh session.
+See `x0x-0068-bounded-discovery-cache.md` (implemented — the
+`discovery_cache_reaper` now lives in `src/lib.rs`; plan doc in git history).
 
 ---
 
@@ -808,8 +808,8 @@ Per portfolio (after all 6 tickets merge):
 
 ## Related documents
 
-- `docs/design/x0x-0068-bounded-discovery-cache.md` — focused
-  implementation plan for ticket 1, ready for fresh-session execution
+- `x0x-0068-bounded-discovery-cache.md` — focused implementation plan
+  for ticket 1 (implemented; doc in git history)
 - `docs/launch-gates/broad-launch.md` — current broad-launch gate
   (will be updated once portfolio lands)
 - `issues/issues.jsonl` — X0X-0065 (SLO calibration), X0X-0066 (failed

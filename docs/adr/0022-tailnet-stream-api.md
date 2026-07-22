@@ -2,7 +2,7 @@
 
 <!-- File name: docs/adr/0022-tailnet-stream-api.md -->
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-07-22)
 - **Date:** 2026-07-17
 - **Decision owners:** David Irvine
 - **Reviewers:** x0x core team (independent adversarial review required before Accepted)
