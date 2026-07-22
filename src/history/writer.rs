@@ -2,7 +2,7 @@
 //!
 //! Producers `try_send` into a bounded channel; a **dedicated OS thread**
 //! (rusqlite is synchronous — no async executor involvement) drains it in
-//! batches of ≤[`BATCH_MAX`] records or [`BATCH_WINDOW`], whichever comes
+//! batches of ≤`BATCH_MAX` records or `BATCH_WINDOW`, whichever comes
 //! first. On a full channel the record is dropped and counted
 //! (`dropped_full`) — the receive pump and DM/group hot paths never block
 //! on disk.
@@ -113,7 +113,7 @@ impl Writer {
         self.handle.clone()
     }
 
-    /// Drain-then-stop. Bounded by [`SHUTDOWN_DRAIN_GRACE`]; queued records
+    /// Drain-then-stop. Bounded by `SHUTDOWN_DRAIN_GRACE`; queued records
     /// beyond the grace are abandoned and counted — never `abort()`.
     pub fn shutdown(mut self) {
         // Signal the loop; it drains what it can within the grace window.
