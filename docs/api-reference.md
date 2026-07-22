@@ -618,12 +618,18 @@ revisions are silently dropped.
 
 **Secure-group plane (ADR-0012, x0x 0.21.0):** private groups (`private_secure`
 preset — `Hidden` + `MlsEncrypted`) run **real TreeKEM** (forward secrecy +
-post-compromise security). **Single-member** private groups work end-to-end
-(invite → join → bidirectional secure → ban → forward secrecy). **Multi-member
-limitation:** a 2nd+ member converges into the authority roster but its
-`MemberAdded`+`Welcome` is not yet delivered, so it cannot yet encrypt — tracked
-follow-up. Public encrypted presets (`public_request_secure`) and grandfathered
-groups remain on the legacy **GSS** plane. See `docs/primers/groups.md`.
+post-compromise security). Single- and **multi-member** private groups work
+end-to-end (invite → join → bidirectional secure → ban → forward secrecy): a
+2nd+ member's `MemberAdded`+`Welcome` is delivered over redundant channels
+(direct push, the gossip metadata topic, a chunked welcome-blob pull, and the
+anchor join-result poll, with a catch-up listener for repair) and the joiner
+installs the tree and encrypts on the TreeKEM plane. Covered by
+`tests/e2e_treekem_membership.py` (m1+m2 converge; anchor↔m1, anchor↔m2, m1↔m2
+cross-decrypt; ban epoch-advance; post-ban forward secrecy). Convergence
+*latency* depends on direct-connection/gossip formation — a timing
+consideration, not a capability gap. Public encrypted presets
+(`public_request_secure`) and grandfathered groups remain on the legacy **GSS**
+plane. See `docs/primers/groups.md`.
 
 ## Collaborative task lists
 

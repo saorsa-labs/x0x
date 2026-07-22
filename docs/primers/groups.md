@@ -58,11 +58,16 @@ bidirectional secure → ban/epoch-advance → forward secrecy, verified on test
 0.21.0 also fixed authority-side **multi-member roster convergence** (serialized per
 group by `group_membership_lock`).
 
-> **Known limitation (multi-member):** for a 2nd+ member the authority roster
-> converges, but the joiner's `MemberAdded`+`Welcome` is not yet delivered (the
-> joiner's anchor-poll times out), so it never enters the tree and cannot
-> encrypt. Multi-member *secure participation* is a tracked follow-up; today,
-> rely on single-member private secure groups.
+**Multi-member** private secure groups also work end-to-end: a 2nd+ member's
+`MemberAdded`+`Welcome` is delivered over redundant channels (direct push to the
+new member, the gossip metadata topic, a chunked welcome-blob pull, and the
+anchor join-result poll, with a TreeKEM catch-up listener for repair), and the
+joiner installs the tree and encrypts on the TreeKEM plane. Verified by
+`tests/e2e_treekem_membership.py` (m1 + m2 converge, anchor↔m1, anchor↔m2 and
+m1↔m2 cross-decrypt, ban epoch-advance, post-ban forward secrecy) — see the
+ADR-0012 errata in `docs/adr/README.md`. Residual caveat: convergence *latency*
+depends on direct-connection and gossip-mesh formation, so multi-member joins
+can be slow under load; that is a timing consideration, not a capability gap.
 
 The **Group Shared Secret (GSS)** plane below remains in use for **public**
 encrypted presets (`public_request_secure`) and **grandfathered** groups created

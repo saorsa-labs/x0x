@@ -21,19 +21,13 @@ This directory contains architecture decision records for x0x.
 - [ADR 0016: Role-Based Group Authority — Flat Admin/Member, Retiring `Owner`](./0016-role-based-group-authority-flat-admin.md) — named groups use a flat Admin/Member model; `Owner` retired (legacy parse-only), last-admin invariant enforced; amends ADR 0014 (accepted 2026-06-11, shipped v0.27.0)
 - [ADR 0017: Position x0x as the Agent Transport Layer](./0017-x0x-as-agent-transport-layer.md) — transport spec + A2A interop + PQC/zero-registry positioning; signed `AgentCard` and `/.well-known/agent-card.json` (accepted 2026-06-15)
 - [ADR 0018: Key Lifecycle — Expiry, Renewal, and Revocation](./0018-key-lifecycle-expiry-renewal-revocation.md) — key expiry + renewal plus gossip-propagated revocation sets (`/identity/revoke`, `/identity/revocations`) with revoked-subject eviction (accepted 2026-07-04)
+- [ADR 0019: Connect ACL — Default-Closed Connectivity Policy](./0019-connect-acl-default-closed.md) — default-closed connect policy engine (`src/connect/`) with fail-closed load and `/diagnostics/connect` (accepted 2026-07-22)
+- [ADR 0020: Tailnet Phase 1 — per-peer byte-streams + local port-forwarding](./0020-tailnet-phase-1-byte-streams-and-forwarding.md) — PeerStream over `Node::open_bi`/`accept_bi` with the identity gate inside open/accept; `src/forward.rs` local port-forwarder gated by the connect ACL (#131/ADR-0019) + key lifecycle (#130); loopback-only Phase 1 (accepted 2026-07-22)
+- [ADR 0022: Tailnet stream API — per-protocol acceptors, connect-ACL gate, bounded backpressure](./0022-tailnet-stream-api.md) — protocol-byte routing to single-owner acceptors (bounded, drop-on-full), stream-layer connect-ACL pair gate after the identity gate, QUIC flow-control backpressure with asserted bounds; issue #132 deliverable 1 (accepted 2026-07-22)
 
 ## Accepted (Phase 1 Functionally Complete)
 
 - [ADR 0001: Bootstrap Peers Are Seed Hints Only](./0001-bootstrap-peers-are-seed-hints-only.md) — functional Phase 1 complete, nomenclature rename deferred
-
-## Proposed — implemented, pending acceptance review
-
-(Formal status in each file is `Proposed` — the governance policy forbids
-AI-marking an ADR `Accepted`; a human must flip these.)
-
-- [ADR 0019: Connect ACL — Default-Closed Connectivity Policy](./0019-connect-acl-default-closed.md) — default-closed connect policy engine (`src/connect/`) with fail-closed load and `/diagnostics/connect`; implementation verified 2026-07-19, awaiting human acceptance
-- [ADR 0020: Tailnet Phase 1 — per-peer byte-streams + local port-forwarding](./0020-tailnet-phase-1-byte-streams-and-forwarding.md) — PeerStream over `Node::open_bi`/`accept_bi` with the identity gate inside open/accept; `src/forward.rs` local port-forwarder gated by the connect ACL (#131/ADR-0019) + key lifecycle (#130); loopback-only Phase 1; implementation verified 2026-07-19, awaiting human acceptance
-- [ADR 0022: Tailnet stream API — per-protocol acceptors, connect-ACL gate, bounded backpressure](./0022-tailnet-stream-api.md) — protocol-byte routing to single-owner acceptors (bounded, drop-on-full), stream-layer connect-ACL pair gate after the identity gate, QUIC flow-control backpressure with asserted bounds; issue #132 deliverable 1; implementation verified 2026-07-19, awaiting human acceptance
 
 ## Proposed
 

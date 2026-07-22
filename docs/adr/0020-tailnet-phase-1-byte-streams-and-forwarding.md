@@ -2,7 +2,7 @@
 
 <!-- File name: docs/adr/0020-tailnet-phase-1-byte-streams-and-forwarding.md -->
 
-- **Status:** Proposed — implementation landed and verified against code (2026-07-19); awaiting human acceptance review
+- **Status:** Accepted (2026-07-22)
 - **Date:** 2026-07-06
 - **Decision owners:** David Irvine
 - **Reviewers:** x0x core team (independent adversarial review required before Accepted)

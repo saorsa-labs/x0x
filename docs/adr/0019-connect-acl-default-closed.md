@@ -2,7 +2,7 @@
 
 <!-- File name: docs/adr/0019-connect-acl-default-closed.md -->
 
-- **Status:** Proposed — implementation landed and verified against code (2026-07-19); awaiting human acceptance review
+- **Status:** Accepted (2026-07-22)
 - **Date:** 2026-07-04
 - **Decision owners:** David Irvine
 - **Reviewers:** x0x core team
