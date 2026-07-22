@@ -89,11 +89,17 @@ tikv-jemalloc-ctl = { version = "0.6", optional = true }
 # Voice adapters (saorsa-webrtc V1.1/V1.2): trait surfaces only — no
 # webrtc-rs, no codecs. `quic-native` matches x0x's transport philosophy.
 [dependencies.saorsa-webrtc-core]
-version = "0.4.0"
+version = "0.5.0"
 optional = true
 default-features = false
 features = ["quic-native"]
 
+# Real Opus for the voice pipeline (re-exported as `x0x::voice::codecs` so
+# apps get the codec matching the transport without a second dep to pin).
+# Default features = real Opus only; no video codecs.
+[dependencies.saorsa-webrtc-codecs]
+version = "0.5.0"
+optional = true
 
 [features]
 # jemalloc with aggressive purge — eliminates the 50 MB heap-to-RSS
@@ -106,7 +112,7 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 profile-heap = ["dep:dhat"]
 # Voice/video adapters for saorsa-webrtc: X0xSignaling over DMs and
 # X0xLinkTransport over ADR-0022 byte streams (StreamProtocol::WebRtcV1).
-voice = ["dep:saorsa-webrtc-core"]
+voice = ["dep:saorsa-webrtc-core", "dep:saorsa-webrtc-codecs"]
 
 [dev-dependencies]
 # `start_paused` virtual-clock tests for the state-request bootstrap tail
@@ -152,6 +158,14 @@ test = false
 [[bench]]
 name = "gossip_dispatch_throughput"
 harness = false
+
+[[example]]
+name = "voice_call"
+required-features = ["voice"]
+
+[[test]]
+name = "voice_e2e"
+required-features = ["voice"]
 
 [workspace]
 members = [

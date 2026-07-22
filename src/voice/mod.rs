@@ -24,6 +24,11 @@ mod signaling;
 pub use link_transport::X0xLinkTransport;
 pub use signaling::{VoicePeerId, X0xSignaling};
 
+/// The codec crate matching this transport (real Opus; video codecs stay
+/// feature-gated upstream). Re-exported so applications pin exactly one
+/// voice dependency: `x0x` with the `voice` feature.
+pub use saorsa_webrtc_codecs as codecs;
+
 /// Typed DM prefix for voice signaling frames.
 ///
 /// Re-exported from the history taxonomy module, which owns the constant so
