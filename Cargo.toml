@@ -86,6 +86,15 @@ dhat = { version = "0.3", optional = true }
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
 
+# Voice adapters (saorsa-webrtc V1.1/V1.2): trait surfaces only — no
+# webrtc-rs, no codecs. `quic-native` matches x0x's transport philosophy.
+[dependencies.saorsa-webrtc-core]
+version = "0.4.0"
+optional = true
+default-features = false
+features = ["quic-native"]
+
+
 [features]
 # jemalloc with aggressive purge — eliminates the 50 MB heap-to-RSS
 # amplification glibc was producing. Opt-in (not default) so library
@@ -95,6 +104,9 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 # Enable dhat heap profiling in x0xd. Outputs dhat-heap.json at exit.
 # Build: cargo build --bin x0xd --features profile-heap
 profile-heap = ["dep:dhat"]
+# Voice/video adapters for saorsa-webrtc: X0xSignaling over DMs and
+# X0xLinkTransport over ADR-0022 byte streams (StreamProtocol::WebRtcV1).
+voice = ["dep:saorsa-webrtc-core"]
 
 [dev-dependencies]
 # `start_paused` virtual-clock tests for the state-request bootstrap tail

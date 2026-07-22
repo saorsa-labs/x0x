@@ -372,6 +372,13 @@ pub enum StreamProtocol {
     /// machine, then ACL-checks that specific agent. Closes the unannounced-
     /// agent window documented in `docs/connect-acl.md`.
     ForwardV2 = 0x03,
+    /// WebRTC media lane (saorsa-webrtc V1.2, `voice` feature). The first
+    /// byte **after** this prefix is the saorsa-webrtc `StreamType`
+    /// (0x20–0x24: audio/video/screen/rtcp/data), so multiple media lanes
+    /// nest inside one x0x protocol byte. Identity gate + connect-ACL pair
+    /// gate apply exactly as for every other protocol; there is no
+    /// voice-specific bypass.
+    WebRtcV1 = 0x04,
 }
 
 impl StreamProtocol {
@@ -383,6 +390,7 @@ impl StreamProtocol {
             0x01 => Some(Self::ForwardV1),
             0x02 => Some(Self::SocksV1),
             0x03 => Some(Self::ForwardV2),
+            0x04 => Some(Self::WebRtcV1),
             _ => None,
         }
     }
@@ -532,6 +540,7 @@ mod tests {
             StreamProtocol::ForwardV1,
             StreamProtocol::SocksV1,
             StreamProtocol::ForwardV2,
+            StreamProtocol::WebRtcV1,
         ] {
             assert_eq!(StreamProtocol::from_u8(p.as_u8()), Some(p));
         }
@@ -543,7 +552,7 @@ mod tests {
         for byte in 0x00u8..=0xFF {
             let parsed = StreamProtocol::from_u8(byte);
             match byte {
-                0x01..=0x03 => {
+                0x01..=0x04 => {
                     assert!(parsed.is_some(), "byte {byte:#x} should parse")
                 }
                 _ => assert_eq!(parsed, None, "byte {byte:#x} must be unknown"),

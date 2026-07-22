@@ -39,6 +39,8 @@ fn ephemeral_family_payloads() -> Vec<(&'static str, Vec<u8>)> {
     ltc_card.extend_from_slice(b"frame");
     let mut exec = x0x::exec::protocol::EXEC_DM_PREFIX.to_vec();
     exec.extend_from_slice(b"exec-frame");
+    let mut voice_sig = x0x::history::classify::VOICE_SIGNALING_DM_PREFIX.to_vec();
+    voice_sig.extend_from_slice(br#"{"type":"connection_ready","session_id":"call-1"}"#);
 
     vec![
         ("file-chunk", chunk),
@@ -76,6 +78,7 @@ fn ephemeral_family_payloads() -> Vec<(&'static str, Vec<u8>)> {
         ("kv-delta-dm-frame", kv_delta),
         ("ltc-card-frame", ltc_card),
         ("exec-frame", exec),
+        ("voice-signaling-frame", voice_sig),
     ]
 }
 
