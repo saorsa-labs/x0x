@@ -169,6 +169,12 @@ pub mod files;
 /// Durable local history store (ADR-0023).
 pub mod history;
 
+/// Voice adapters for saorsa-webrtc (`voice` feature): signaling over DMs
+/// (`X0xSignaling`) and media lanes over ADR-0022 byte streams
+/// (`X0xLinkTransport`, `StreamProtocol::WebRtcV1`).
+#[cfg(feature = "voice")]
+pub mod voice;
+
 pub mod connect;
 /// Secure Tier-1 remote exec protocol and runtime.
 pub mod exec;

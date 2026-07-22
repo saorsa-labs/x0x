@@ -21,6 +21,12 @@ pub const LTC_CARD_FRAME_PREFIX: &[u8] = b"X0X-LTC-CARD-V1\n";
 /// KV-store delta DM fallback (`server::routes::stores::KV_STORE_DELTA_DM_PREFIX`).
 /// The KV store is its own durable surface.
 pub const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
+/// Voice signaling frames (`voice` feature, saorsa-webrtc V1.1). Call
+/// setup/teardown control traffic — Ephemeral like all signaling; the
+/// conversation itself is media, not DM history. The const lives here
+/// (not in the feature-gated voice module) so classification and the
+/// deny-test hold even when the `voice` feature is off.
+pub const VOICE_SIGNALING_DM_PREFIX: &[u8] = b"x0x-voice-sig-v1\n";
 
 /// JSON `"type"` tag values that are protocol plumbing (never recorded):
 /// file-transfer chunk traffic plus the `WelcomeBlobMessage` /
@@ -71,6 +77,7 @@ pub fn classify_dm_payload(payload: &[u8]) -> DmPayloadClass {
     if payload.starts_with(GROUP_PUBLIC_MESSAGE_DM_PREFIX)
         || payload.starts_with(LTC_CARD_FRAME_PREFIX)
         || payload.starts_with(KV_STORE_DELTA_DM_PREFIX)
+        || payload.starts_with(VOICE_SIGNALING_DM_PREFIX)
         || payload.starts_with(crate::exec::protocol::EXEC_DM_PREFIX)
     {
         return DmPayloadClass::Ephemeral;

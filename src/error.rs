@@ -489,6 +489,30 @@ impl From<rusqlite::Error> for HistoryError {
 /// Standard Result type for x0x history operations.
 pub type HistoryResult<T> = std::result::Result<T, HistoryError>;
 
+/// Errors from the voice adapters (`voice` feature — saorsa-webrtc
+/// signaling over DMs and media over `StreamProtocol::WebRtcV1`).
+#[derive(Debug, thiserror::Error)]
+pub enum VoiceError {
+    /// A signaling message failed JSON (de)serialization.
+    #[error("voice signaling serialization: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    /// The DM path refused or failed to deliver a signaling message.
+    #[error("voice signaling send failed: {0}")]
+    SignalingSend(String),
+
+    /// The inbound signaling channel closed (agent shut down).
+    #[error("voice signaling channel closed")]
+    ChannelClosed,
+
+    /// A voice peer id string was not 32 bytes of hex.
+    #[error("invalid voice peer id: {0}")]
+    InvalidPeerId(String),
+}
+
+/// Standard Result type for x0x voice operations.
+pub type VoiceResult<T> = std::result::Result<T, VoiceError>;
+
 #[cfg(test)]
 mod network_tests {
     #![allow(clippy::unwrap_used)]
