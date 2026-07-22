@@ -1,6 +1,6 @@
 # ADR 0023: Durable Local History Is a Core x0x Capability
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-07-22)
 - **Date:** 2026-07-22
 - **Decision owners:** David Irvine
 - **Reviewers:** <pending>
