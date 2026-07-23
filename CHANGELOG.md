@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.34.3] - 2026-07-23
+
+### Fixed
+
+- **ant-quic 0.27.34 → 0.27.35: zombie-connection memory reap (#278).**
+  Connections whose peer kept transmitting authenticated packets but never
+  acknowledged outstanding data never reached `Drained` — every
+  authenticated packet reset the idle timer — so each zombie pinned ~9.5 MiB
+  of send window, an unbounded per-connection recv-event channel, and
+  endpoint index entries forever. Measured at ~200 MB/h sustained RSS
+  growth on the 4 GB testnet fleet: three kernel-OOM/userland-wedge events
+  in 8h (saorsa-9 OOM-killed at 2.06 GB anon-rss; saorsa-2 and saorsa-7
+  userland-wedged; root-caused via dhat at 190 MB recv / 172 MB send
+  retention on an idle mesh-connected daemon). ant-quic 0.27.35 gates the
+  idle reset on ACK progress (documented RFC 9000 §10.1 hardening
+  deviation), bounds the recv channel (256 events + overflow-kill), caps
+  live connections (4096), and shrinks connection-index maps after reaps.
+  Fleet-verified: all six nodes flat-to-mild RSS (±26 MB/h) for 6h
+  post-rollout while the unfixed co-located prod daemon kept climbing at
+  +136 MB/h on the same host.
+
+### Added
+
+- `tests/leak_hunt_dm.sh` — two-daemon DM ping-pong repro rig with RSS
+  sampling and graceful-shutdown dhat flush (the #278 evidence rig).
+- `scripts/dhat_analyze.py` — ranks dhat-heap program points by
+  retained-at-end bytes (leak-site analysis tool).
+
+### Changed
+
+- Refreshed stale "~2.5 MB per failed dial, unbounded growth" comments in
+  `src/lib.rs` — that retention was ant-quic#210, fixed in 0.27.31/32.
+
 ## [v0.34.2] - 2026-07-18
 
 ### Fixed
