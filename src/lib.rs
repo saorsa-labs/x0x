@@ -9534,10 +9534,12 @@ fn announcement_should_auto_connect(reconnect_suppressed: bool, already_connecte
 /// with its announcements still circulating) would otherwise be redialed on
 /// EVERY received announcement copy — and rebroadcast fan-out delivers each
 /// fresh announcement many times within seconds. Every failed dial drives
-/// ant-quic NAT traversal/hole-punch and accumulates connection state
-/// (~2.5 MB per failed dial measured on a loopback replay repro), which is
-/// unbounded growth on a churning mesh. One dial per cooldown window per agent
-/// bounds that; a first-ever announcement still dials immediately.
+/// ant-quic NAT traversal/hole-punch and churns connection state. (The
+/// ~2.5 MB-per-failed-dial retention measured here was ant-quic#210, fixed
+/// in 0.27.31/32; zombie-connection retention was #278, reaped in 0.27.35.
+/// The churn still costs CPU and transient traversal state.) One dial per
+/// cooldown window per agent bounds that; a first-ever announcement still
+/// dials immediately.
 const ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN: std::time::Duration =
     std::time::Duration::from_secs(60);
 
@@ -14296,8 +14298,9 @@ mod tests {
     /// immediately, refuse a redial inside the cooldown window, and allow it
     /// again once the window has elapsed. WHY: an announcing-but-unreachable
     /// peer is redialed per received announcement copy; every failed dial
-    /// accumulates ant-quic NAT-traversal state (~2.5 MB measured), so an
-    /// unbounded dial rate is an unbounded memory leak (v0.31 testnet OOM).
+    /// churns ant-quic NAT-traversal state (~2.5 MB measured pre-0.27.31 —
+    /// ant-quic#210, since fixed; zombie retention reaped in 0.27.35, #278),
+    /// so an unbounded dial rate was an unbounded memory leak (v0.31 testnet OOM).
     #[test]
     fn announcement_auto_connect_retry_cooldown_gates_redials() {
         let now = std::time::Instant::now();
