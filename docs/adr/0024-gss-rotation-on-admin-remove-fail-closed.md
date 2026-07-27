@@ -17,7 +17,12 @@ therefore carries its own evidence rather than referring to it for load-bearing 
 and cannot be cited there, so every such citation is stamped **at `56d0c4b`** in place —
 the F1 implementation commit `56d0c4bc61fbb649042aad8ea42d25d8f0c85c39` on `glm/f1-fix`,
 which changes exactly one file, `src/server/routes/named_groups.rs` (+231/-40). **An
-unstamped citation is at the baseline.** Because that commit touches no other file, cites
+unstamped citation is at the baseline, and a stamp never carries from one citation to the
+next — adjacency is not a scope.** An enumeration may instead **declare** a single resolving
+commit for all of its rows, in words, immediately before them; that declaration governs
+exactly those rows and nothing else. Anything covered by neither an in-place stamp nor such a
+declaration is at the baseline, and no exception is to be inferred from a neighbouring
+citation. Because that commit touches no other file, cites
 into `src/groups/` resolve identically at either. The +231 lines shift everything below
 them, so a `named_groups.rs` number read during implementation review is not the same
 number at the baseline and must be translated rather than carried across.
@@ -473,8 +478,10 @@ operation which could bypass or substitute for it — explicit returns, `?` prop
 `let`-`else` bindings, `match` and `if` arms, and returns from delegated handlers — and
 account for each.** A scan for `return` is a floor, not a completeness proof; this very
 handler ends in a `match` arm that exits without one. The endpoint of that path is the code
-that performs the property, not the code that reads its inputs. For "a survivor can decrypt",
-the path runs to the key derivation at `56d0c4b:src/server/routes/named_groups.rs:12353` and
+that performs the property, not the code that reads its inputs. **Declaration for the worked
+example that follows: every line number in it resolves at `56d0c4b`, in
+`src/server/routes/named_groups.rs`, and none of them at the baseline.** For "a survivor can
+decrypt", the path runs to the key derivation at `:12353` and
 the cipher at `:12367` — not to the stored-secret read at `:12314` — and it contains **ten**
 exits, not the four that precede the read: `:12291` group-not-found, `:12294` withdrawn,
 `:12298` not-a-member, `:12306` TreeKem-plane, `:12315` no-shared-secret, `:12325`
@@ -488,9 +495,12 @@ read would have hidden six of the ten; drawing it at the derivation would still 
 `:12362`.
 
 **A break list is a set of line numbers, so it means nothing without the commit it resolves
-at, and it must be re-resolved at the commit that ships.** The list above states its commit in
-its first citation and the rest of the rows inherit it; that is a requirement, not a
-formatting habit. A gate that adds production code *above* its own interval moves every line
+at, and it must be re-resolved at the commit that ships.** The list above **declares** its
+resolving commit in words before its rows; it does not leave them to inherit a stamp from a
+neighbour, because a declaration is checkable and adjacency is not. That worked example is an
+illustration of the rule and **not a source any receipt may copy from**: its numbers are
+correct at `56d0c4b` and wrong in any tree that adds production lines above those handlers,
+which the F1 gates themselves do. A gate that adds production code *above* its own interval moves every line
 in that interval, so a list written against the commit the gate was designed on can be wrong
 at the commit the gate lives on — and a rebase invalidates a break list exactly as it
 invalidates a diff. This is not hypothetical: on this rule's first use a gate's own production
