@@ -15999,6 +15999,366 @@ mod tests {
         Ok(())
     }
 
+    // ── F1 GSS-rotation ADR gate tests (§3 ordering + §7a producer) ─────
+    //
+    // These tests exercise the production apply seam
+    // `apply_named_group_metadata_event` (NOT an interior helper) for the
+    // fail-closed GSS rekey on admin-remove. Gate 3 pins both delivery
+    // orderings of the signed `MemberRemoved` commit and the
+    // `SecureShareDelivered` envelope to the same converged committed state.
+    // Gate 7a pins the real `GroupInfo::rotate_shared_secret` producer.
+
+    struct F1GssRotationFixture {
+        state: Arc<AppState>,
+        _dir: tempfile::TempDir,
+        admin_kp: crate::identity::AgentKeypair,
+        victim_hex: String,
+        group_id: String,
+        new_epoch: u64,
+        new_secret: [u8; 32],
+        committed_state_hash: String,
+        remove_event: NamedGroupMetadataEvent,
+        envelope_event: NamedGroupMetadataEvent,
+    }
+
+    // Build an independent, freshly-keyed fixture: a GSS-plane group whose
+    // separately-generated admin creator authors the rotation, the local
+    // daemon is an active survivor (the envelope recipient), and a third
+    // agent is the removal victim. The committed transition is built by
+    // cloning the installed parent, bumping the roster revision, removing the
+    // victim, rotating the GSS, fallibly converting to `[u8; 32]`, and sealing
+    // the commit under the admin's keypair — exactly the production producer
+    // path. The envelope is sealed to the survivor's KEM public key with the
+    // same AAD the opener recomputes.
+    async fn f1_gss_rotation_fixture(group_tag: &str) -> Result<F1GssRotationFixture> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let admin_kp = crate::identity::AgentKeypair::generate()?;
+        let admin_id = admin_kp.agent_id();
+        let admin_hex = hex::encode(admin_id.as_bytes());
+        let victim_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        let group_id = format!("f1-gss-{group_tag}-local");
+        let stable_group_id = format!("f1-gss-{group_tag}-stable");
+        let parent_epoch: u64 = 7;
+
+        let mut parent = x0x::groups::GroupInfo::with_policy(
+            "f1 gss rotation".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        parent.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.clone(),
+            admin_hex.clone(),
+            parent.created_at,
+            String::new(),
+        ));
+        parent.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        parent.secret_epoch = parent_epoch;
+        parent.shared_secret = Some(vec![9; 32]);
+        parent.security_binding = Some(format!("gss:epoch={parent_epoch}"));
+        parent.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        parent.add_member(
+            victim_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        parent.recompute_state_hash();
+
+        // Install the parent (the survivor daemon's pre-event view) in state.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), parent.clone());
+
+        // Producer-side committed transition: remove victim, rotate GSS, seal.
+        let mut committed = parent.clone();
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let roster_revision = committed.roster_revision;
+        committed.remove_member(&victim_hex, Some(admin_hex.clone()));
+        let (new_secret_vec, new_epoch) = committed.rotate_shared_secret();
+        // §2a: the conversion is mandatory (seal needs `&[u8; 32]`) and must
+        // be fallible. `Err(v)` *is* the secret material — bind `v` only to
+        // read its length; never format or log it.
+        let new_secret: [u8; 32] = match new_secret_vec.try_into() {
+            Ok(s) => s,
+            Err(v) => {
+                return Err(anyhow::anyhow!(
+                    "rotate_shared_secret returned {} bytes; expected 32",
+                    v.len()
+                ));
+            }
+        };
+        let commit = committed.seal_commit(&admin_kp, 1_000)?;
+        let committed_state_hash = committed.state_hash.clone();
+
+        // Seal the rotated secret to the survivor daemon. The opener
+        // recomputes AAD from the event's `group_id` (the stable id) +
+        // recipient + epoch, so the sealer must use the identical binding.
+        let aad = secure_share_aad(&stable_group_id, &local_hex, new_epoch);
+        let (kem_ct, aead_nonce, aead_ct) =
+            x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+                &state.agent_kem_keypair.public_bytes,
+                &aad,
+                &new_secret,
+            )?;
+        let envelope_event = NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id: stable_group_id.clone(),
+            recipient: local_hex,
+            secret_epoch: new_epoch,
+            kem_ciphertext_b64: BASE64.encode(&kem_ct),
+            aead_nonce_b64: BASE64.encode(aead_nonce),
+            aead_ciphertext_b64: BASE64.encode(&aead_ct),
+            actor: admin_hex.clone(),
+        };
+
+        let remove_event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: stable_group_id,
+            revision: roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: victim_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(new_epoch),
+            commit: Some(commit),
+        };
+
+        Ok(F1GssRotationFixture {
+            state,
+            _dir,
+            admin_kp,
+            victim_hex,
+            group_id,
+            new_epoch,
+            new_secret,
+            committed_state_hash,
+            remove_event,
+            envelope_event,
+        })
+    }
+
+    // Convergence contract shared by both delivery orderings: after both the
+    // signed remove and the envelope have applied, the stored state must be
+    // identical regardless of arrival order.
+    async fn assert_gss_rotation_converged(
+        state: &Arc<AppState>,
+        group_id: &str,
+        victim_hex: &str,
+        new_epoch: u64,
+        new_secret: &[u8; 32],
+        committed_state_hash: &str,
+    ) -> Result<()> {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id) else {
+            return Err(anyhow::anyhow!(
+                "converged group missing from storage key {group_id}"
+            ));
+        };
+        assert!(
+            !info.has_active_member(victim_hex),
+            "victim must be Removed after admin-remove convergence"
+        );
+        assert!(
+            info.members_v2
+                .get(victim_hex)
+                .is_some_and(|m| m.is_removed()),
+            "victim roster entry must carry the Removed state"
+        );
+        assert_eq!(
+            info.secret_epoch, new_epoch,
+            "secret_epoch must be the rotated epoch E+1"
+        );
+        assert_eq!(
+            info.security_binding,
+            Some(format!("gss:epoch={new_epoch}")),
+            "security_binding must track the rotated epoch"
+        );
+        assert!(
+            info.shared_secret.as_deref() == Some(new_secret.as_slice()),
+            "shared_secret must be the rotated S1 after convergence"
+        );
+        assert_eq!(
+            info.state_hash, committed_state_hash,
+            "committed state_hash must match the producer-sealed transition"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn f1_gss_rotation_metadata_first_removes_then_installs_envelope() -> Result<()> {
+        let f = f1_gss_rotation_fixture("metadata-first").await?;
+        let sender = f.admin_kp.agent_id();
+
+        // Metadata-first: the signed `MemberRemoved` lands before the
+        // envelope. The apply arm fail-closes the GSS (old epoch E < E+1
+        // wipes `shared_secret` to `None`) but advances epoch/binding from
+        // the signed commit alone.
+        let removed =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true).await;
+        assert!(
+            removed,
+            "MemberRemoved with a valid signed commit must apply (returns true)"
+        );
+        {
+            let groups = f.state.named_groups.read().await;
+            let Some(info) = groups.get(&f.group_id) else {
+                return Err(anyhow::anyhow!("metadata-first group missing"));
+            };
+            assert_eq!(
+                info.shared_secret, None,
+                "metadata-first intermediate must fail-close shared_secret to None"
+            );
+            assert_eq!(
+                info.secret_epoch, f.new_epoch,
+                "metadata-first intermediate must already carry the rotated epoch"
+            );
+        }
+
+        // The envelope then delivers the fresh secret to the survivor. The
+        // strict-< stale check accepts equal-epoch delivery while the secret
+        // is still absent.
+        let delivered =
+            apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), sender, true)
+                .await;
+        // SecureShareDelivered signals "no rebroadcast" (returns false);
+        // success is observed in stored state, not in this boolean.
+        assert!(
+            !delivered,
+            "SecureShareDelivered returns false; convergence is asserted on stored state"
+        );
+
+        assert_gss_rotation_converged(
+            &f.state,
+            &f.group_id,
+            &f.victim_hex,
+            f.new_epoch,
+            &f.new_secret,
+            &f.committed_state_hash,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn f1_gss_rotation_envelope_first_installs_then_remove_preserves_secret() -> Result<()> {
+        let f = f1_gss_rotation_fixture("envelope-first").await?;
+        let sender = f.admin_kp.agent_id();
+
+        // Envelope-first: the fresh secret lands before the signed remove.
+        // The strict-< stale check accepts the newer epoch and installs S1.
+        let delivered =
+            apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), sender, true)
+                .await;
+        assert!(
+            !delivered,
+            "SecureShareDelivered returns false; success is observed in stored state"
+        );
+        {
+            let groups = f.state.named_groups.read().await;
+            let Some(info) = groups.get(&f.group_id) else {
+                return Err(anyhow::anyhow!("envelope-first group missing"));
+            };
+            assert!(
+                info.shared_secret.as_deref() == Some(f.new_secret.as_slice()),
+                "envelope-first intermediate must already hold S1"
+            );
+            assert_eq!(
+                info.secret_epoch, f.new_epoch,
+                "envelope-first intermediate must already carry the rotated epoch"
+            );
+        }
+
+        // The signed remove then applies. Because the local epoch already
+        // equals the commit's epoch, the strict `old < new` wipe is a no-op
+        // and the just-installed S1 survives (the secret is preserved).
+        let removed =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true).await;
+        assert!(
+            removed,
+            "MemberRemoved with a valid signed commit must apply (returns true)"
+        );
+
+        assert_gss_rotation_converged(
+            &f.state,
+            &f.group_id,
+            &f.victim_hex,
+            f.new_epoch,
+            &f.new_secret,
+            &f.committed_state_hash,
+        )
+        .await?;
+        Ok(())
+    }
+
+    // ── Gate 7a: real `GroupInfo::rotate_shared_secret` producer invariants ─
+    fn f1_gss_group_for_rotate() -> Result<x0x::groups::GroupInfo> {
+        let creator = crate::identity::AgentKeypair::generate()?;
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "f1 rotate producer".to_string(),
+            String::new(),
+            creator.agent_id(),
+            "f1-rotate-producer-local".to_string(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.recompute_state_hash();
+        Ok(info)
+    }
+
+    #[test]
+    fn f1_gss_rotate_shared_secret_producer_returns_32_byte_secret() -> Result<()> {
+        let mut info = f1_gss_group_for_rotate()?;
+        let (secret, _epoch) = info.rotate_shared_secret();
+        assert_eq!(
+            secret.len(),
+            32,
+            "rotate_shared_secret must yield a 32-byte secret"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn f1_gss_rotate_shared_secret_producer_advances_epoch_by_exactly_one() -> Result<()> {
+        let mut info = f1_gss_group_for_rotate()?;
+        let prev_epoch = info.secret_epoch;
+        let (_secret, new_epoch) = info.rotate_shared_secret();
+        assert_eq!(
+            new_epoch,
+            prev_epoch.saturating_add(1),
+            "returned epoch must be exactly prev + 1"
+        );
+        assert_eq!(
+            info.secret_epoch,
+            prev_epoch.saturating_add(1),
+            "stored epoch must be exactly prev + 1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn f1_gss_rotate_shared_secret_producer_stored_secret_equals_returned_bytes() -> Result<()> {
+        let mut info = f1_gss_group_for_rotate()?;
+        let (secret, _epoch) = info.rotate_shared_secret();
+        assert!(
+            info.shared_secret.as_deref() == Some(secret.as_slice()),
+            "stored shared_secret must be byte-identical to the returned secret"
+        );
+        Ok(())
+    }
+
     fn treekem_metadata_group_info(
         creator: AgentId,
         group_id: &str,
