@@ -401,22 +401,32 @@ same defect one indirection away. Item 5 asserts against the **stored**
 `GroupInfo`, never against the discarded clone; item 6 is the load-bearing one, because a
 green all-new soak proves nothing about a mixed fleet.
 
-**The expression is not anchored at `^`, because nextest's `test()` predicate matches a
-test's full path from the crate root and the F1 gates are in-crate unit tests.** A gate in
-`server::routes::named_groups::tests` is named `server::routes::named_groups::tests::f1_…`,
-so `test(/^f1_/)` selects nothing and the runner then reports success over an empty set —
-the exact failure this item exists to prevent. Measured on this repo at the implementation
-commit `56d0c4b`: `test(/^server::routes::named_groups::tests::/)` selects 131 tests,
+**The expression is not anchored solely at `^`, because nextest's `test()` predicate matches
+a test's full path from the crate root and some F1 gates — currently items 3 and 7a — are
+nested in-crate unit tests.** A gate in `server::routes::named_groups::tests` is named
+`server::routes::named_groups::tests::f1_…`, so a bare `test(/^f1_/)` cannot reach it.
+Measured on this repo at the implementation commit `56d0c4b`:
+`test(/^server::routes::named_groups::tests::/)` selects 131 tests,
 `test(/^named_groups::tests::/)` selects 0, `test(/::named_groups::tests::/)` selects 131.
-The alternation is required rather than the simpler `test(/::f1_/)` because that form is
-bound to today's placement: a later F1 gate added as an integration test under `tests/`
-has the unqualified name `f1_…` with no `::` in it, and `test()` does not see the binary id,
-so the `::` in `x0x::f1_whatever` cannot supply one. Such a gate would be dropped in
-silence. `(^|::)` selects both shapes and admits no third, since the matched segment must
-still begin with `f1_`. Because a filter can only fail by selecting too few tests while
-still reporting green, **a receipt for this recipe must state how many tests were
-selected**; a count of zero, or one below the number of gates this section requires, is a
-failing receipt regardless of the pass/fail split.
+The `^` branch is retained rather than dropped because this section permits a future F1 gate
+to be written as an integration test under `tests/`: such a gate has the unqualified name
+`f1_…` with no `::` in it, and `test()` does not see the binary id, so the `::` in
+`x0x::f1_whatever` cannot supply one. `test(/::f1_/)` alone would drop it in silence, and
+`test(/^f1_/)` alone drops every nested gate. `(^|::)` selects both shapes and admits no
+third, since the matched segment must still begin with `f1_`.
+
+A filter fails by selecting **too few** tests, and only one of the two ways of doing that is
+caught by the runner. An empty selection is already a hard failure: measured at
+cargo-nextest 0.9.126, a filter matching nothing yields `error: no tests to run` and exit
+code 4, and no `no-tests` key is set in `.config/nextest.toml` at `e3013710d7`, `56d0c4b` or
+this commit, so the default stands. A **non-empty subset** is not caught — a filter that
+selects some required gates and omits others runs them, passes them, and exits 0. That is
+the false green this section must exclude, and it is invisible in a pass/fail split.
+Therefore **a receipt for this recipe must state how many tests were selected**, and a count
+below the number of gate functions this section requires is a failing receipt however green
+the split. Zero is likewise invalid, but by the runner's own exit code rather than by this
+rule — and stating the rule over the required gate count rather than over zero keeps it
+sound if that runner default is ever configured away.
 
 1. Fails on the pinned pre-fix commit (or on a mutation) and passes on the patched tree.
 2. Asserts each surviving member can **decrypt content published at the new epoch** — not
