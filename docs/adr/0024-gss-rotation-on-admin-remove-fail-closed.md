@@ -427,9 +427,14 @@ green all-new soak proves nothing about a mixed fleet.
    properties: the returned secret is 32 bytes; `secret_epoch` advanced by exactly one
    (`:433`); the stored `shared_secret` is the same bytes as the returned one (`:434`). The
    pinning mutation is `vec![0u8; 32]` → `vec![0u8; 31]` at `:431`, and it turns the
-   **length** assertion red and only that one — the epoch and stored-identity assertions
-   survive it, so they are carried by this gate but not pinned by this mutation. A separate
-   broken-expectation control proves the runner can report red.
+   **length** assertion red and only that one — under the mutation the epoch and
+   stored-identity assertions still execute and still pass, so they are carried by this
+   gate but not pinned by this mutation. **The three properties must therefore sit in three
+   separate test functions.** Combined into one, the length assertion panics first and the
+   other two never run: the receipt would then show only that "7a turned red" and would
+   demonstrate nothing about which assertion the mutation pins, leaving the claim in this
+   sub-item unfalsifiable by its own gate. A separate broken-expectation control proves the
+   runner can report red.
 
    **7b — source-reviewed defence, not a gate. All citations in this sub-item are at
    `56d0c4b` except those naming `src/groups/`, which are at the baseline.** If the 7a
