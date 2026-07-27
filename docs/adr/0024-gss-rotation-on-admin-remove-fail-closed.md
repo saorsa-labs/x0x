@@ -432,13 +432,21 @@ green all-new soak proves nothing about a mixed fleet.
    broken-expectation control proves the runner can report red.
 
    **7b — source-reviewed defence, not a gate. All citations in this sub-item are at
-   `56d0c4b`.** If the 7a invariant ever fails despite the gate, the §2a conversion
-   (`:8590-8598`) aborts: its `return api_error(...)` statement (`:8593-8596`) precedes
-   `seal_commit` (`:8640`), the map insert (`:8651`), persistence (`:8667`) and publication
-   (`:8688`). Between the `named_groups.write()` acquisition (`:8548`) and that return, the
-   only mutations are to the private clone `next` (`:8567`), which is dropped on return, so
-   there is no stored, persisted or published state for the abort to change. The `Err(v)`
-   arm (`:8592`) binds the secret-bearing `Vec` solely to read `v.len()` (`:8595`).
+   `56d0c4b` except those naming `src/groups/`, which are at the baseline.** If the 7a
+   invariant ever fails despite the gate, the §2a conversion (`:8590-8598`) aborts: its
+   `return api_error(...)` statement (`:8593-8596`) precedes `seal_commit` (`:8640`), the
+   map insert (`:8651`), persistence (`:8667`) and publication (`:8688`). Between the
+   `named_groups.write()` acquisition (`:8548`) and that return, **no live group entry is
+   mutated**, and the reason is structural rather than an enumeration: the only handle to
+   the entry in that window is the shared reference `info` from `named_groups.get(&id)`
+   (`:8549`), through which no mutation is expressible, and the guard is not used again
+   until the insert at `:8651`. Two private clones *are* mutated and both are discarded on
+   return: the ADR-0016 precheck at `:8563` calls `last_admin_precheck` (`:10169-10175`),
+   which delegates to `last_admin_precheck_error` (`src/groups/mod.rs:268-277`) and applies
+   the caller's roster mutation to its own `proposed` clone (`src/groups/mod.rs:272-273`);
+   the handler then mutates its private `next` clone (`:8567`). So there is no stored,
+   persisted or published state for the abort to change. The `Err(v)` arm (`:8592`) binds
+   the secret-bearing `Vec` solely to read `v.len()` (`:8595`).
    **No gate observes the abort, the zero state change, or the absence of an all-zero-key
    envelope** — the branch has no production producer that can reach it, and the only ways
    to drive it are a `#[cfg(test)]` hook on `GroupInfo`, a test parameter on
