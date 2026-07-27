@@ -13,6 +13,15 @@ All line citations are `src/server/routes/named_groups.rs` unless stated, at
 The implementation spec lives outside this repository and is mutable; this ADR
 therefore carries its own evidence rather than referring to it for load-bearing facts.
 
+**Two coordinate systems.** Code that F1 itself introduced does not exist at the baseline
+and cannot be cited there, so every such citation is stamped **at `56d0c4b`** in place —
+the F1 implementation commit `56d0c4bc61fbb649042aad8ea42d25d8f0c85c39` on `glm/f1-fix`,
+which changes exactly one file, `src/server/routes/named_groups.rs` (+231/-40). **An
+unstamped citation is at the baseline.** Because that commit touches no other file, cites
+into `src/groups/` resolve identically at either. The +231 lines shift everything below
+them, so a `named_groups.rs` number read during implementation review is not the same
+number at the baseline and must be translated rather than carried across.
+
 **Citation convention.** Multi-line write sites are cited as **statements** — the full
 statement including `.insert(...)`. The ast-grep pattern used for the audit below matches
 only the sub-expression ending at `.await`, so the matched expression is one line shorter
@@ -118,7 +127,10 @@ conversion aborts with a 500. `impl TryFrom<Vec<T>> for [T; N]` has `Error = Vec
 the error value **is the secret material** — only its length may be read or logged.
 Scoped honestly: not a live defect at this commit (`rotate_shared_secret` allocates 32
 bytes at `mod.rs:431`), but it is the one failure mode the fail-closed design does not
-otherwise cover, because sealing a zero secret *succeeds*.
+otherwise cover, because sealing a zero secret *succeeds*. **Scope: D5 binds the remove
+path only.** It does not reach ban's `:10313-10316`, which this ADR leaves as it found it;
+that surviving instance is recorded under Negative / Trade-offs. D5 must not be read as a
+repo-wide property of the conversion.
 
 **D6 — Self-removal is rejected before the membership lock.** A self-targeted remove is
 rejected between `:8439` and `:8440`, before the lock at `:8443-8444`. It is not
@@ -289,7 +301,9 @@ claim of this shape must be run structurally, not derived from a text search.**
   see the delivery limit under Neutral / Operational.
 - Rotation never becomes observable from a failed attempt: the mutation happens on a
   private clone that is dropped.
-- A group can no longer rotate onto an all-zero key through a silent conversion (D5).
+- **The remove path** can no longer rotate onto an all-zero key through a silent conversion
+  (D5). Scoped to the remove path deliberately — see the ban residue under Negative /
+  Trade-offs; D5 is not a repo-wide property and this consequence must not be read as one.
 - The correctness of D10's evidence is now checkable — the audit's instrument, figures and
   enumeration are recorded, so re-running it is mechanical.
 
@@ -297,6 +311,33 @@ claim of this shape must be run structurally, not derived from a text search.**
 
 - **Availability (D8):** one active member without a roster KEM key blocks all removals in
   that group until they publish one.
+- **The clear predicate and the delivery predicate are not the same predicate, and this
+  ADR does not reconcile them.** The receiver clears on an epoch comparison alone —
+  `if old_epoch < secret_epoch { next.shared_secret = None }` (`:5052-5054` **at
+  `56d0c4b`**, in the arm at `:5048-5055`), which does not consult the receiving node's
+  own membership state. The sender selects envelope recipients by roster state:
+  `active_members()` minus the actor (`:8602-8606` **at `56d0c4b`**), and `active_members()`
+  admits only `GroupMemberState::Active` (`src/groups/mod.rs:1080-1082`,
+  `src/groups/member.rs:226-228`). So any node that holds the old secret and is not
+  `Active` on the sender's roster clears it and receives no replacement. For `Removed` and
+  `Banned` that is the intent. For **`Pending` it is undecided** — D2 is written over
+  "survivors" and never states which predicate defines the set. **Nobody has established
+  that a `Pending` node can hold the live secret when the event applies**, so this is an
+  unexamined reachability and availability risk, not a demonstrated defect; it is recorded
+  so the next reader does not have to rediscover it. There is a standing promise in tension
+  with it: the approval path's `(None, _)` arm (`:10895-10900`) logs *"requester will
+  receive via next rekey"* (`:10898`), and both rekey paths draw from `active_members()`,
+  so that promise holds only for a requester who is `Active` when the next rekey runs.
+  **Pre-existing, not introduced here:** ban already pairs the same two predicates — it
+  clears on the epoch alone at `:5251-5253` (in the arm at `:5247-5254`) and selects
+  `remaining_targets` from `active_members()` at `:10317-10320`.
+- **D5 is scoped to the remove path; ban's silent zero-fill survives F1 untouched.** At
+  ban's `:10313-10316` — the site D5 already cites — the rekey still does
+  `let mut sec = [0u8; 32];` and copies only `if sec_vec.len() == 32`, so a wrong-length
+  rotation there seals an **all-zero key** with no error, the exact defect D5 closes in
+  remove. Out of F1's scope by decision, not by oversight, and recorded here so that D5 is
+  not misread as a repo-wide invariant and the surviving instance is not rediscovered as
+  new. This bullet is what the Positive consequence on D5 points at.
 - **Contention (D9):** N synchronous ML-KEM encapsulations inside the global
   `named_groups` write guard; every named-group operation on the node serialises behind
   one removal.
@@ -313,6 +354,30 @@ claim of this shape must be run structurally, not derived from a text search.**
   receivers ignore `secret_epoch`. Their behaviour is a gate item, not an assumption.
 - The abort path is a bare `return` inside the block expression opened at `:8458` — no
   transaction, no rollback machinery. An implementation that builds one has misread D2.
+- **Preflight abort status codes are recorded, not decided.** Cited as the three
+  `return api_error(...)` statements **at `56d0c4b`**, per the convention stated above: the
+  implementation returns **424 FAILED_DEPENDENCY** for a keyless survivor (`:8613-8618`)
+  and for a build/seal failure (`:8630-8635`), and **500** for the wrong-length rotated
+  secret (`:8593-8596`).
+  424 is the honest shape — a dependency the caller can fix (the survivor's published KEM
+  key) is absent; 500 is right for the conversion because §2a is unreachable through the
+  public API, so reaching it is a server bug rather than a client one. No decision in this
+  ADR fixes these, and a future change to them does not require superseding it.
+- **What makes both publish orderings work is one conjunct, and it is load-bearing.** The
+  clear is gated on *strict* `<` (D7), so an envelope that installed first survives the
+  later commit. The reverse ordering — commit first, envelope second at equal epoch —
+  works only because the stale-envelope guard is
+  `if secret_epoch < info.secret_epoch || (secret_epoch == info.secret_epoch &&
+  info.shared_secret.is_some())` (statement `:5831-5835`; the conjunct is `:5832`), whose
+  own doc comment (`:5827-5830`) states the intent. That guard is pre-existing and F1 does
+  not change it — it is cited at the baseline, and its comment names only a *prior
+  `MemberBanned` commit*, because remove had no GSS rotation to produce the same ordering
+  when it was written. Tightening that predicate to
+  `secret_epoch <= info.secret_epoch` would silently strand every survivor on the
+  commit-first ordering: cleared by the commit, then refusing its own replacement, in
+  consensus with a matching `state_hash` and decrypting nothing. That is the F1 failure
+  re-created by a one-token edit, which is why Validation item 3 must be written to fail
+  when the conjunct is deleted rather than merely to exercise both orderings.
 - **The preflight bounds construction, not delivery, and this ADR claims nothing beyond
   that.** `publish_named_group_metadata_event` (`:1797-1833`) returns `()` and folds both a
   publish error and a timeout into `tracing::warn!`; the direct path's own doc comment
