@@ -8544,7 +8544,7 @@ pub(in crate::server) async fn remove_named_group_member(
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
-    let (metadata_topic, event, members, epoch) = {
+    let (metadata_topic, event, members, epoch, buffered_survivor_envelopes) = {
         let mut named_groups = state.named_groups.write().await;
         let Some(info) = named_groups.get(&id) else {
             return not_found("group not found");
@@ -8568,6 +8568,75 @@ pub(in crate::server) async fn remove_named_group_member(
         next.roster_revision = next.roster_revision.saturating_add(1);
         let revision = next.roster_revision;
         next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
+
+        // F1 §2/§2a/§5a — GSS rekey on admin remove. For MlsEncrypted groups:
+        // rotate the shared secret, fallibly convert Vec<u8> → [u8; 32], then
+        // build every survivor envelope in memory (preflight). Any failure
+        // bare-returns *before* seal_commit/insert/save/publish; the rotated
+        // clone `next` is dropped, so no rotation becomes live, persisted or
+        // published. Sealing deliberately sits AHEAD of persistence — do not
+        // mirror ban's post-save `warn + continue`, which is the fail-open
+        // anti-pattern past its `:10325`.
+        let event_group_id = next.stable_group_id().to_string();
+        let mut new_secret_epoch: Option<u64> = None;
+        let mut buffered_survivor_envelopes: Vec<(String, NamedGroupMetadataEvent)> = Vec::new();
+        let is_encrypted =
+            next.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted;
+        if is_encrypted {
+            let (sec_vec, ep) = next.rotate_shared_secret();
+            // §2a: the conversion is mandatory (seal needs &[u8;32]) and must
+            // be fallible. `Err(v)` *is* the secret material — bind `v` only
+            // to read its length; never format or log it.
+            let sec: [u8; 32] = match sec_vec.try_into() {
+                Ok(s) => s,
+                Err(v) => {
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("rotated secret has wrong length ({} bytes)", v.len()),
+                    );
+                }
+            };
+            new_secret_epoch = Some(ep);
+            // `remove_member` already excluded the removed member; the actor
+            // (admin) is skipped separately — they already hold the secret.
+            let survivors: Vec<(String, Option<String>)> = next
+                .active_members()
+                .map(|m| (m.agent_id.clone(), m.kem_public_key_b64.clone()))
+                .filter(|(recipient, _)| recipient != &local_agent_hex)
+                .collect();
+            for (recipient_hex, kem_b64) in &survivors {
+                let Some(kem) = kem_b64 else {
+                    // §5 fail-closed: no enrollment invariant proves a keyless
+                    // survivor never held the live secret (a stripped-roster
+                    // GSS invite stub reaches `shared_secret: Some(..)` with
+                    // `kem_public_key_b64: None`). Abort — clone discarded.
+                    return api_error(
+                        StatusCode::FAILED_DEPENDENCY,
+                        format!(
+                            "cannot rotate group secret: survivor {recipient_hex} has no roster KEM key"
+                        ),
+                    );
+                };
+                match build_secure_share_event(
+                    &event_group_id,
+                    recipient_hex,
+                    kem,
+                    &local_agent_hex,
+                    &sec,
+                    ep,
+                ) {
+                    Ok(ev) => buffered_survivor_envelopes.push((recipient_hex.clone(), ev)),
+                    Err(_) => {
+                        return api_error(
+                            StatusCode::FAILED_DEPENDENCY,
+                            format!(
+                                "cannot rotate group secret: survivor {recipient_hex} envelope build failed"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         let commit = match next.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
@@ -8578,7 +8647,6 @@ pub(in crate::server) async fn remove_named_group_member(
             }
         };
         let metadata_topic = next.metadata_topic.clone();
-        let event_group_id = next.stable_group_id().to_string();
         let members = named_group_member_values(&next);
         named_groups.insert(id.clone(), next);
         drop(named_groups);
@@ -8605,13 +8673,32 @@ pub(in crate::server) async fn remove_named_group_member(
             agent_id: agent_id_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
-            secret_epoch: None,
+            secret_epoch: new_secret_epoch,
             commit: Some(commit),
         };
-        (metadata_topic, event, members, epoch)
+        (
+            metadata_topic,
+            event,
+            members,
+            epoch,
+            buffered_survivor_envelopes,
+        )
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // F1 §5a step 5: publish the buffered survivor envelopes only after the
+    // removal is live and persisted. Each is broadcast on the metadata topic
+    // plus direct + delayed delivery, mirroring publish_secure_share's shape.
+    for (recipient_hex, ev) in &buffered_survivor_envelopes {
+        publish_named_group_metadata_event(&state, &metadata_topic, ev).await;
+        spawn_named_group_event_delivery(&state, recipient_hex, ev);
+        spawn_named_group_event_delivery_after(
+            &state,
+            recipient_hex,
+            ev,
+            GROUP_BACKGROUND_PUBLISH_DELAY,
+        );
+    }
     maybe_publish_group_card_after_state_change(&state, &id).await;
     (
         StatusCode::OK,
